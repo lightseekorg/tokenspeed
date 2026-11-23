@@ -21,7 +21,7 @@
 """
 MHA attention leaf for TokenSpeed scheduling.
 Uses fused kernels optimized for SM100 (Blackwell).
-Supports sliding window, attention sinks, and FP8 KV cache.
+Supports sliding windows, softmax-denominator sinks, and FP8 KV cache.
 """
 
 from __future__ import annotations
@@ -82,10 +82,11 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     if not need_fix:
         return tensor
 
-    new_strides = [0] * ndim
-    new_strides[-1] = 1
+    new_strides = list(strides)
+    # Page strides may include sibling fields and padding; keep every live axis.
     for i in range(ndim - 2, -1, -1):
-        new_strides[i] = new_strides[i + 1] * sizes[i + 1]
+        if sizes[i] == 1:
+            new_strides[i] = new_strides[i + 1] * sizes[i + 1]
 
     return tensor.as_strided(sizes, new_strides)
 
@@ -405,12 +406,20 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     def _get_kv_cache_permuted(self, layer: PagedAttention, token_to_kv_pool):
         """Get KV cache in [num_pages, num_kv_heads, page_size, head_dim] layout."""
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.kernel_page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.kernel_page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        pages = []
+        for cache, heads in (
+            (k_cache, layer.tp_k_head_num),
+            (v_cache, layer.tp_v_head_num),
+        ):
+            if cache.ndim != 4 or cache.shape[1] != self.kernel_page_size:
+                if cache.ndim == 4 and not cache.is_contiguous():
+                    raise ValueError(
+                        f"strided MHA cache page size {cache.shape[1]} cannot be "
+                        f"viewed at kernel page size {self.kernel_page_size}"
+                    )
+                cache = cache.view(-1, self.kernel_page_size, heads, layer.head_dim)
+            pages.append(cache.permute(0, 2, 1, 3))
+        k_cache, v_cache = pages
 
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)

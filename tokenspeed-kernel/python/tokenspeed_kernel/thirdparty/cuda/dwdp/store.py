@@ -16,15 +16,28 @@
 """Immutable peer weights with composite views and two asynchronous copy slots.
 
 The composite mapping follows TensorRT-LLM DWDP. Peer mappings are grouped by
-owner so the number of fabric access regions does not grow as layers × peers.
+owner so the number of access regions does not grow as layers × peers.
+Owned storage is shared through fabric handles, or through POSIX file
+descriptors passed over a node-local Unix socket when no IMEX channel exists.
 """
 
 from __future__ import annotations
 
+import os
+import socket
+import struct
+import uuid
+from collections.abc import Generator, Iterable
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication._cuda.peer_copy import (
+    CopyEngineWorker,
+    SequenceFlags,
+    build_copy_schedule,
+)
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
     ExpertWeightShard,
@@ -53,12 +66,75 @@ class _Layer:
     fields: tuple[_Field, ...]
 
 
+# Linux caps one SCM_RIGHTS message at 253 descriptors.
+_FDS_PER_MESSAGE = 250
+_FD_EXCHANGE_TIMEOUT_S = 300.0
+
+
+def _check_peer_uid(connection: socket.socket, uid: int) -> None:
+    _, peer_uid, _ = struct.unpack(
+        "iII",
+        connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII")
+        ),
+    )
+    if peer_uid != uid:
+        raise PermissionError(
+            f"Peer descriptor exchange UID {peer_uid} differs from {uid}"
+        )
+
+
+def _send_fds(server: socket.socket, fds: list[int], peers: int, *, uid: int) -> None:
+    for _ in range(peers):
+        connection, _ = server.accept()
+        with connection:
+            connection.settimeout(_FD_EXCHANGE_TIMEOUT_S)
+            _check_peer_uid(connection, uid)
+            for begin in range(0, len(fds), _FDS_PER_MESSAGE):
+                chunk = fds[begin : begin + _FDS_PER_MESSAGE]
+                socket.send_fds(connection, [len(chunk).to_bytes(4, "little")], chunk)
+
+
+def _receive_fds(address: str, count: int, *, uid: int) -> list[int]:
+    received: list[int] = []
+    with ExitStack() as cleanup:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(_FD_EXCHANGE_TIMEOUT_S)
+            client.connect(address)
+            _check_peer_uid(client, uid)
+            while len(received) < count:
+                _, fds, flags, _ = socket.recv_fds(client, 4, _FDS_PER_MESSAGE)
+                for fd in fds:
+                    cleanup.callback(os.close, fd)
+                received.extend(fds)
+                if flags & socket.MSG_CTRUNC:
+                    raise RuntimeError("Peer descriptor message was truncated")
+                if not fds:
+                    raise ConnectionError("Peer closed the descriptor exchange early")
+        if len(received) != count:
+            raise RuntimeError("Peer sent an unexpected number of descriptors")
+        cleanup.pop_all()
+        return received
+
+
 @dataclass
 class _Slot:
-    ready: torch.cuda.Event
-    released: torch.cuda.Event
+    # Sequence numbers of the latest fetch into the slot and the latest reader
+    # release; the GPU flags at _ready_flag/_released_flag reach them in order.
+    fetched: int
+    released: int
+    # Copy-engine worker job that writes the slot's ready flag for ``fetched``.
+    job: int
     layer: int | None
     last_reader_stream: int | None
+
+
+def _ready_flag(slot: int) -> int:
+    return slot
+
+
+def _released_flag(slot: int) -> int:
+    return 2 + slot
 
 
 class CudaPeerWeightStore:
@@ -71,7 +147,10 @@ class CudaPeerWeightStore:
         model_identity: str,
         pool_page_bytes: int,
         copy_implementation: str,
+        handle_type: str,
     ) -> None:
+        if handle_type not in vmm.HANDLE_TYPES:
+            raise ValueError(f"Unsupported peer weight handle type: {handle_type}")
         if copy_implementation != "simple":
             raise ValueError(
                 f"Unsupported peer copy implementation: {copy_implementation}"
@@ -89,20 +168,18 @@ class CudaPeerWeightStore:
         self.device = device
         self.model_identity = model_identity
         self.pool_page_bytes = pool_page_bytes
-        self.granularity = vmm.granularity(device.index)
+        self.handle_type = handle_type
+        self.granularity = vmm.granularity(device.index, handle_type=handle_type)
         if pool_page_bytes <= 0 or pool_page_bytes % self.granularity:
             raise ValueError("Staging page size must be a multiple of VMM granularity")
         self._stream = torch.cuda.Stream(device=device)
         self._published = torch.cuda.Event()
         self._published.record(torch.cuda.current_stream(device))
-        self._slots = [
-            _Slot(torch.cuda.Event(), torch.cuda.Event(), None, None) for _ in range(2)
-        ]
-        for slot in self._slots:
-            slot.released.record(torch.cuda.current_stream(device))
+        self._slots = [_Slot(0, 0, 0, None, None) for _ in range(2)]
+        self._flags = SequenceFlags(4, device)
+        self._copy_engine = CopyEngineWorker(device, self._stream)
         self._layers: dict[int, _Layer] = {}
         self._views: dict[int, dict[str, torch.Tensor]] = {}
-        self._plans: dict[int, list[tuple[int, int, int]]] = {}
         self._mappings: list[tuple[int, int]] = []
         self._reservations: list[tuple[int, int]] = []
         self._handles: list[int] = []
@@ -122,8 +199,12 @@ class CudaPeerWeightStore:
     def staging_bytes(self) -> int:
         return self._staging_bytes
 
-    def _allocate(self, size: int, *, fabric: bool) -> int:
-        handle = vmm.allocate(size, self.device.index, fabric=fabric)
+    def _allocate(self, size: int, *, shared: bool) -> int:
+        handle = vmm.allocate(
+            size,
+            self.device.index,
+            handle_type=self.handle_type if shared else None,
+        )
         self._handles.append(handle)
         self._physical_bytes += size
         return handle
@@ -187,7 +268,7 @@ class CudaPeerWeightStore:
                 result[shard.name] = value
                 continue
             geometry = self._layout(expert_bytes, self.partition.rank)
-            handle = self._allocate(geometry.source_bytes, fabric=True)
+            handle = self._allocate(geometry.source_bytes, shared=True)
             address = self._reserve(geometry.source_bytes)
             self._map(address, geometry.source_bytes, handle)
             vmm.set_access(address, geometry.source_bytes, self.device.index)
@@ -222,6 +303,7 @@ class CudaPeerWeightStore:
     def _descriptors(self) -> tuple:
         return (
             self.model_identity,
+            self.handle_type,
             self.partition.num_experts,
             self.partition.size,
             self.pool_page_bytes,
@@ -239,9 +321,37 @@ class CudaPeerWeightStore:
             ),
         )
 
-    def _peer_sources(self, payloads: list[dict]) -> dict[tuple[int, int, str], int]:
+    def _exchange_descriptors(
+        self,
+        keys: list[tuple[int, str]],
+        exported: dict[tuple[int, str], int],
+        addresses: list[str],
+        server: socket.socket,
+    ) -> Generator[dict[tuple[int, str], int], None, None]:
+        """Yield each owner's descriptors, valid until the iterator advances."""
+        # Startup visits owners in rank order. Import one owner's handles before
+        # advancing, so received FDs never accumulate across owners.
+        for owner, address in enumerate(addresses):
+            if owner == self.partition.rank:
+                _send_fds(
+                    server,
+                    [exported[key] for key in keys],
+                    len(addresses) - 1,
+                    uid=os.geteuid(),
+                )
+                yield {}
+            else:
+                with ExitStack() as cleanup:
+                    fds = _receive_fds(address, len(keys), uid=os.geteuid())
+                    for fd in fds:
+                        cleanup.callback(os.close, fd)
+                    yield dict(zip(keys, fds, strict=True))
+
+    def _peer_sources(
+        self, handles: Iterable[dict[tuple[int, str], bytes | int]]
+    ) -> dict[tuple[int, int, str], int]:
         addresses = {}
-        for peer, payload in enumerate(payloads):
+        for peer, peer_handles in enumerate(handles):
             streamed = [
                 (layer.index, f, self._layout(f.expert_bytes, peer))
                 for layer in self._layers.values()
@@ -258,7 +368,8 @@ class CudaPeerWeightStore:
             arena = self._reserve(size)
             offset = 0
             for index, field, geometry in streamed:
-                handle = vmm.import_handle(payload["handles"][index, field.name])
+                shared = peer_handles[index, field.name]
+                handle = vmm.import_handle(shared, handle_type=self.handle_type)
                 self._handles.append(handle)
                 self._map(arena + offset, geometry.source_bytes, handle)
                 addresses[peer, index, field.name] = arena + offset
@@ -274,7 +385,8 @@ class CudaPeerWeightStore:
         intervals: tuple[tuple[int, int], ...],
         destination: int,
         peer_addresses: dict[tuple[int, int, str], int],
-    ) -> list[tuple[int, int, int]]:
+    ) -> list[tuple[int, int, int, int]]:
+        """(peer, destination, source, bytes) copies of ``intervals`` from every peer."""
         copies = []
         for step in range(1, self.partition.size):
             peer = (self.partition.rank + step) % self.partition.size
@@ -286,6 +398,7 @@ class CudaPeerWeightStore:
                 if begin < end:
                     copies.append(
                         (
+                            peer,
                             destination + begin,
                             source + begin - geometry.page_begin,
                             end - begin,
@@ -297,35 +410,73 @@ class CudaPeerWeightStore:
         if self._closed or self._finalized or not self._layers:
             raise RuntimeError("A nonempty unpublished store is required for finalize")
         self._published.synchronize()
-        payload = {
-            "descriptor": self._descriptors(),
-            "handles": {
-                (layer.index, f.name): vmm.export(f.handle)
-                for layer in self._layers.values()
-                for f in layer.fields
-                if f.handle is not None
-            },
-            "replicas": {
-                (layer.index, f.name): f.replica
-                for layer in self._layers.values()
-                for f in layer.fields
-                if f.replica is not None
-            },
+        keys = [
+            (layer.index, f.name)
+            for layer in self._layers.values()
+            for f in layer.fields
+            if f.handle is not None
+        ]
+        handles = {
+            (layer.index, f.name): f.handle
+            for layer in self._layers.values()
+            for f in layer.fields
+            if f.handle is not None
         }
-        payloads = [None] * self.partition.size
-        dist.all_gather_object(payloads, payload, group=self.group)
-        if any(p["descriptor"] != payload["descriptor"] for p in payloads):
-            raise ValueError(
-                "Peer checkpoint, tensor layout, or ownership metadata differs"
-            )
-        peers = self._peer_sources(payloads)
+        with ExitStack() as cleanup:
+            exported = {}
+            for key, handle in handles.items():
+                shared = vmm.export(handle, handle_type=self.handle_type)
+                if self.handle_type == "posix_fd":
+                    cleanup.callback(os.close, shared)
+                exported[key] = shared
+            server = None
+            address = None
+            if self.handle_type == "posix_fd":
+                # Descriptors are process-local: peers on this node receive them
+                # over an abstract Unix socket bound before the address is shared.
+                server = cleanup.enter_context(
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                )
+                address = f"\0tokenspeed-dwdp-{uuid.uuid4().hex}"
+                server.bind(address)
+                server.listen(self.partition.size)
+                server.settimeout(_FD_EXCHANGE_TIMEOUT_S)
+            payload = {
+                "descriptor": self._descriptors(),
+                "handles": exported if self.handle_type == "fabric" else None,
+                "address": address,
+                "replicas": {
+                    (layer.index, f.name): f.replica
+                    for layer in self._layers.values()
+                    for f in layer.fields
+                    if f.replica is not None
+                },
+            }
+            payloads = [None] * self.partition.size
+            dist.all_gather_object(payloads, payload, group=self.group)
+            if any(p["descriptor"] != payload["descriptor"] for p in payloads):
+                raise ValueError(
+                    "Peer checkpoint, tensor layout, or ownership metadata differs"
+                )
+            if self.handle_type == "fabric":
+                peer_handles = [p["handles"] for p in payloads]
+            else:
+                peer_handles = cleanup.enter_context(
+                    closing(
+                        self._exchange_descriptors(
+                            keys, exported, [p["address"] for p in payloads], server
+                        )
+                    )
+                )
+            # Imported CUDA handles hold their own allocation references.
+            peers = self._peer_sources(peer_handles)
         stream = torch.cuda.current_stream(self.device)
         for layer in self._layers.values():
             for field in layer.fields:
                 if field.layout is None:
                     continue
                 # Only immutable boundary bytes share the owner's physical pages.
-                for dst, src, size in self._copies(
+                for _, dst, src, size in self._copies(
                     layer,
                     field,
                     field.layout.edge_intervals(),
@@ -344,7 +495,7 @@ class CudaPeerWeightStore:
                 ),
             )
         pools = [
-            [self._allocate(self.pool_page_bytes, fabric=False) for _ in range(n)]
+            [self._allocate(self.pool_page_bytes, shared=False) for _ in range(n)]
             for n in slot_pages
         ]
         self._staging_bytes = sum(slot_pages) * self.pool_page_bytes
@@ -389,7 +540,15 @@ class CudaPeerWeightStore:
                     )
                 )
             self._views[layer.index] = views
-            self._plans[layer.index] = plan
+            by_peer: dict[int, list[tuple[int, int, int]]] = {}
+            for peer, dst, src, size in plan:
+                by_peer.setdefault(peer, []).append((dst, src, size))
+            self._copy_engine.set_layer(
+                layer.index,
+                build_copy_schedule(
+                    by_peer, ranks=self.partition.size, rank=self.partition.rank
+                ),
+            )
         stream.synchronize()
         self._finalized = True
 
@@ -406,7 +565,8 @@ class CudaPeerWeightStore:
 
     def prefetch(self, layer: int) -> None:
         self._require_ready()
-        slot = self._slots[self._layers[layer].slot]
+        index = self._layers[layer].slot
+        slot = self._slots[index]
         if slot.layer == layer:
             return
         if (
@@ -416,10 +576,15 @@ class CudaPeerWeightStore:
             raise RuntimeError(
                 "Cannot overwrite a weight slot before releasing its reader"
             )
-        self._stream.wait_event(slot.released)
-        for destination, source, size in self._plans[layer]:
-            vmm.copy(destination, source, size, self._stream)
-        slot.ready.record(self._stream)
+        slot.fetched += 1
+        slot.job = self._copy_engine.fetch(
+            layer,
+            self._flags,
+            wait_index=_released_flag(index),
+            wait_value=slot.released,
+            ready_index=_ready_flag(index),
+            ready_value=slot.fetched,
+        )
         slot.layer = layer
 
     def acquire(self, layer: int) -> None:
@@ -428,10 +593,13 @@ class CudaPeerWeightStore:
             raise RuntimeError("The previous weight reader must be released first")
         self.prefetch(layer)
         stream = torch.cuda.current_stream(self.device)
-        slot = self._slots[self._layers[layer].slot]
+        index = self._layers[layer].slot
+        slot = self._slots[index]
         if slot.last_reader_stream != stream.cuda_stream:
-            stream.wait_event(slot.released)
-        stream.wait_event(slot.ready)
+            self._flags.wait(_released_flag(index), slot.released, stream)
+        # Enqueue the ready wait only after the worker enqueued its write.
+        self._copy_engine.wait_submitted(slot.job)
+        self._flags.wait(_ready_flag(index), slot.fetched, stream)
         self._reader = layer
         self._reader_stream = stream.cuda_stream
 
@@ -442,8 +610,10 @@ class CudaPeerWeightStore:
             raise RuntimeError(
                 "Release must follow the matching reader on its compute stream"
             )
-        slot = self._slots[self._layers[layer].slot]
-        slot.released.record(stream)
+        index = self._layers[layer].slot
+        slot = self._slots[index]
+        slot.released += 1
+        self._flags.write(_released_flag(index), slot.released, stream)
         slot.last_reader_stream = stream.cuda_stream
         self._reader = None
         self._reader_stream = None
@@ -456,9 +626,9 @@ class CudaPeerWeightStore:
                 "Release the final weight reader before closing the store"
             )
         self._published.synchronize()
-        self._stream.synchronize()
-        for slot in self._slots:
-            slot.released.synchronize()
+        self._copy_engine.close()
+        # Readers release on their own streams through device flags.
+        torch.cuda.synchronize(self.device)
         if self._finalized:
             dist.barrier(group=self.group)
         self._views.clear()

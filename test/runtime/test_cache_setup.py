@@ -153,11 +153,13 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     uses_paged_state_verify, expected_bytes
 ):
     backend = Mock(spec=AttentionBackend)
+    backend.preallocate_prefill_workspace.return_value = 0
     backend.preallocate_verify_workspace.return_value = 128
     draft_backend = Mock(spec=AttentionBackend)
+    draft_backend.preallocate_prefill_workspace.return_value = 0
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=backend,
         draft_backend=draft_backend,
         uses_paged_state_verify=uses_paged_state_verify,
@@ -185,7 +187,7 @@ def _model_wide_kwargs(**overrides) -> dict:
         max_bs=2,
     )
     kwargs.update(overrides)
-    return kwargs
+    return {"max_resident_requests": kwargs["max_bs"], **kwargs}
 
 
 def _mha_config() -> AttnConfig:
@@ -204,8 +206,9 @@ def _mha_config() -> AttnConfig:
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
 )
+@pytest.mark.parametrize("resident_requests", [2, 5])
 def test_inkling_construction_matches_ring_reservation(
-    is_draft, width, num_layers, layerwise, ring_rows
+    is_draft, width, num_layers, layerwise, ring_rows, resident_requests
 ):
     from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
         InklingAttnBackend,
@@ -225,6 +228,7 @@ def test_inkling_construction_matches_ring_reservation(
         config,
         components=(spec,),
         is_draft=is_draft,
+        max_resident_requests=resident_requests,
         speculative_num_draft_tokens=width,
     )
     text = SimpleNamespace(
@@ -242,7 +246,12 @@ def test_inkling_construction_matches_ring_reservation(
         is_draft=is_draft,
         enable_layerwise_cache_ready=layerwise,
     )
-    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_pool.conv_state.shape == (
+        num_layers,
+        resident_requests + 2,
+        ring_rows,
+        24,
+    )
     assert backend.conv_spec_num_tokens == width
     assert backend.enable_layerwise_cache_ready is layerwise
     assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
@@ -620,6 +629,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         disaggregation_mode=role,
         mamba_ssm_dtype="float32",
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -668,8 +678,11 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         )
         return
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
-    # conv states; the commit holds two int64 ids per request per layer.
-    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
+    # conv states; the commit holds two int64 ids per request per layer, and
+    # each layer also keeps an int64 destination element stride.
+    assert ple_bytes == (
+        8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 + 2 * 8 if ple_enabled else 0
+    )
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
@@ -753,6 +766,7 @@ def _qwen4_exp_fp8_kv_recipe(
             mamba_ssm_dtype=mamba_ssm_dtype,
             mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
             enable_qsa_prefill_bf16_scratch=False,
+            qwen4_exp_flat_kv=False,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config),
@@ -835,9 +849,10 @@ def test_qwen4_exp_ple_verify_workspace_accepts_uneven_page_strides() -> None:
     assert len(strides) > 1
     # Raised while the commit tables took every layer's stride from the first.
     # Eight verify rows of the int64[2] context and three 9 KiB PLE states,
-    # plus two int64 commit row ids per request and layer.
+    # plus two int64 commit row ids per request and layer; each layer also
+    # keeps an int64 destination element stride.
     assert backend.preallocate_verify_workspace(2, 3) == (
-        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8
+        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8 + 3 * 8
     )
 
 
@@ -882,7 +897,14 @@ def test_qwen4_exp_ple_commit_writes_each_layer_at_its_page_stride() -> None:
     for field_id, rows in scratch.items():
         field = arena.field(field_id)
         for page, row in ((2, 1), (5, 7)):
-            torch.testing.assert_close(field[page], rows[row], rtol=0, atol=0)
+            if field_id == context_id:
+                expected = rows[row]
+            else:
+                channels, history = rows.shape[1:]
+                base = row // 4 * 4
+                inputs = rows[base + 1 : row + 1].flatten(1)[:, :channels].T
+                expected = torch.cat((rows[base], inputs), dim=1)[:, -history:]
+            torch.testing.assert_close(field[page], expected, rtol=0, atol=0)
             field[page].view(torch.uint8).fill_(0x5A)
     assert torch.equal(arena.buffer, poisoned)
 
@@ -1409,12 +1431,17 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
         == "mha"
     )
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", draft_family_declared=False
+    for draft_family in ("mla", "mha"):
+        assert (
+            _resolve_heterogeneous_draft_family(
+                "kimi_k3", draft_family, draft_family_declared=False
+            )
+            == draft_family
         )
-        == "mla"
-    )
+    with pytest.raises(RuntimeError, match="hosts MLA or MHA draft views"):
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "dsa", draft_family_declared=False
+        )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
         _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
@@ -1777,6 +1804,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", None),
+        (None, "gluon", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
@@ -1976,10 +2004,19 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
     from tokenspeed.runtime.execution import device, factory
+    from tokenspeed.runtime.layers.attention import utils as attention_utils
 
     _receive_pool_env(monkeypatch, 16, 256)
     _fake_around_the_budget(monkeypatch, lambda: 60 << 30)
+    groups = ProcessGroupManager()
+    groups.register_process_group(
+        "gloo",
+        (0,),
+        torch.distributed.ProcessGroupGloo(torch.distributed.HashStore(), 0, 1),
+    )
+    monkeypatch.setattr(attention_utils, "pg_manager", groups)
     target = SimpleNamespace(
         model=object(),
         prepare_multimodal_runtime=lambda: None,
@@ -1998,18 +2035,14 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
         device="cuda",
-        mapping=SimpleNamespace(
-            world_size=1,
-            world_group=None,
-            is_first_pp_rank=True,
-            attn=SimpleNamespace(has_kvp=False),
-        ),
+        # Budget each rank locally; collective reductions are tested separately.
+        mapping=Mapping(rank=0, world_size=1),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
             server_args=server_args,
             model_config=SimpleNamespace(
-                is_multimodal=True, is_multimodal_active=active
+                is_multimodal=True, is_multimodal_active=active, dtype=torch.bfloat16
             ),
             draft_model_config=None,
             gpu_id=0,
@@ -2019,7 +2052,9 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     budget, rows = sized.value.args
     assert (rows is not None) == probe

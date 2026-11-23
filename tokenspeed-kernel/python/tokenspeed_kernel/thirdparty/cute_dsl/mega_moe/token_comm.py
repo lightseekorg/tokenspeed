@@ -829,9 +829,8 @@ class TokenInPullTokenBackPush:
             # sign-extended Int64 ids for the scratch table.
             idx_dtype = token_comm_args.topk_idx.element_type
             idx_bytes: cutlass.Constexpr[int] = idx_dtype.width // 8
-            # A word never straddles two tokens: the kernel constructor only
-            # enables dense routing for num_topk == 16 (a raise is not allowed
-            # inside this staged dispatch body).
+            # The kernel entry requires whole 8-byte ID words per token,
+            # so a word never straddles two rows.
             ids_per_word: cutlass.Constexpr[int] = 8 // idx_bytes
             # Row stride of the (T, num_topk) id table in elements. The kernel
             # entry requires a unit column stride; rows may be padded as long

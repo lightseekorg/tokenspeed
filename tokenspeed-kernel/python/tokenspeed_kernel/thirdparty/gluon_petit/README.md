@@ -14,7 +14,8 @@ use `tokenspeed-triton` and no separate Triton package is installed.
 
 The retained runtime supports the registered GFX950 MegaMoE configurations,
 including GPT-OSS 120B (EP8, 128 experts, top-4, 2880x3072, biased OpenAI
-SwiGLU) and DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU).
+SwiGLU), DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU), and
+Muse Spark (EP8, 256 experts, top-8, 4096x4096, bias-free SiLU).
 The HIP VMM binding is compiled on first use through
 `torch.utils.cpp_extension`, so a ROCm development environment is required.
 
@@ -27,13 +28,31 @@ when selecting a kernel plan.
 ## Runtime contract
 
 Select the backend with both `--moe-backend gluon_petit` and
-`--all2all-backend gluon_petit`. It requires one 8-GPU GFX950 node, EP8/TP1,
-BF16 model activations, serialized MXFP4 expert weights, trivial expert
-placement, and no more than 1024 tokens per rank. The registered profiles are
-GPT-OSS 120B and the DeepSeek V4 expert geometry with unclamped SiLU.
-Checkpoints declaring a SiLU activation clamp are rejected because this kernel
-cannot preserve that activation. Explicit FP8 activation requests are also
-rejected; this backend quantizes activations to MXFP4.
+`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (EP4/TP1
+is also accepted for the DeepSeek V4.1 Flash and DSpark geometries), BF16 model
+activations, serialized MXFP4 expert weights, trivial expert placement, and no
+more than 1024 tokens per rank. The registered profiles are GPT-OSS 120B, Kimi
+K3, Muse Spark, the DeepSeek V4 expert geometry with unclamped SiLU, and
+DeepSeek V4.1 Flash (with its DSpark draft) with SiLU clamped at 10. Muse Spark
+and DeepSeek V4 checkpoints that declare a SiLU activation clamp are rejected,
+because Petit registers only unclamped SiLU for those geometries. Explicit FP8
+activation requests are also rejected; this backend quantizes activations to
+MXFP4.
+
+EP4 reuses the EP8 tiles. Measured on MI350X for DeepSeek V4.1 Flash with DSpark
+at about 50K tokens of context, EP4 decodes faster than TP4 at batch 32 and
+above and slower at batch 16 and below (0.62-0.85x). With prompts of 32K tokens
+or more it prefills slightly faster than TP4 once every GPU has a prompt, and at
+0.3x with a single prompt.
+
+## Route outputs
+
+By default, the combine sums each token's routes on its source rank.
+`MegaMoeConfig.run_routes` copies them instead. After the combine handshake,
+`SourceRouteReducer` reads each local token's routes with system-coherent
+loads. It writes them unsummed, each scaled by its expert weight, into a
+`[tokens, topk, model_dim]` BF16 output. Later ordinary kernels therefore
+never read peer-written workspace memory.
 
 ## Retained API
 

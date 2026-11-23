@@ -86,6 +86,10 @@ class _TinyModel(torch.nn.Module):
             params[name].data.copy_(tensor)
 
 
+class _SelectedFileModel(_TinyModel):
+    checkpoint_weight_files = ("draft.safetensors",)
+
+
 def _write_checkpoint(directory: Path, scale: float) -> dict[str, torch.Tensor]:
     """A one-shard safetensors checkpoint, the shape a trainer writes."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -164,6 +168,24 @@ class TestRealCheckpoint:
         return runner.update_weights_from_disk(
             UpdateWeightFromDiskReqInput(model_path=str(path), **kwargs)
         )
+
+    def test_explicit_files_apply_to_reload_and_its_header_check(self):
+        original = _write_checkpoint(self.root / "step-0", scale=1.0)
+        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
+        for step in ("step-0", "step-1"):
+            directory = self.root / step
+            (directory / "model.safetensors").rename(directory / "draft.safetensors")
+            (directory / "model.safetensors").write_bytes(b"not this model")
+            (directory / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"target.weight": "model.safetensors"}})
+            )
+        model = _SelectedFileModel()
+        runner = _runner(model, self.root / "step-0")
+        for step, expected in (("step-1", updated), ("step-0", original)):
+            ok, message = self._load(runner, self.root / step)
+            assert ok, message
+            assert torch.equal(model.w, expected["w"])
+            assert torch.equal(model.b, expected["b"])
 
     def test_weights_arrive_from_the_named_checkpoint(self):
         original = _write_checkpoint(self.root / "step-0", scale=1.0)

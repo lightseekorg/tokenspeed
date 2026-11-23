@@ -26,6 +26,8 @@ and the pool writes keys in the plane's own dtype without converting.
 
 from __future__ import annotations
 
+import json
+from test.ci_system.ci_register import register_cuda_ci
 from test.runtime.dsa_index_k_test_utils import index_k_pool
 
 import pytest
@@ -44,6 +46,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     index_k_field,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 HEAD_DIM = 128
 PREFIX = 64
@@ -76,6 +80,7 @@ def _attn_config(spec: DSAConfig) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         context_len=256,
         max_bs=1,
+        max_resident_requests=1,
         kernel_page_size=PREFIX,
         kv_cache_quant_method="",
         pd_disaggregation_enabled=False,
@@ -84,7 +89,7 @@ def _attn_config(spec: DSAConfig) -> AttnConfig:
 
 
 def test_formats_map_to_one_plane_dtype_and_row_width_each():
-    assert INDEX_K_FORMATS == ("fp8_scaled", "bf16")
+    assert INDEX_K_FORMATS == ("fp8_scaled", "bf16", "mxfp4")
     assert index_k_plane_dtype("fp8_scaled") is torch.uint8
     assert index_k_plane_dtype("bf16") is torch.bfloat16
     assert index_k_row_bytes(HEAD_DIM, "fp8_scaled") == dsa_index_k_row_bytes(HEAD_DIM)
@@ -100,6 +105,7 @@ def test_formats_map_to_one_plane_dtype_and_row_width_each():
     [
         ("fp8_scaled", "uint8", dsa_index_k_row_bytes(HEAD_DIM)),
         ("bf16", "bfloat16", HEAD_DIM),
+        ("mxfp4", "uint8", HEAD_DIM // 2 + HEAD_DIM // 32),
     ],
 )
 def test_recipe_plans_the_declared_plane(index_k_format, dtype_name, width):
@@ -113,7 +119,10 @@ def test_recipe_plans_the_declared_plane(index_k_format, dtype_name, width):
 def test_the_configure_attention_hook_names_the_plane():
     from types import SimpleNamespace
 
-    from tokenspeed.runtime.configs.model_config import configure_dsa_attention
+    from tokenspeed.runtime.configs.model_config import (
+        configure_dsa_attention,
+        configure_kimi_k31_attention,
+    )
 
     text_config = SimpleNamespace(
         kv_lora_rank=512,
@@ -131,9 +140,60 @@ def test_the_configure_attention_hook_names_the_plane():
     # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
     # scores the checkpoint's bf16 keys overrides it after.
     assert model_config.index_k_format == "fp8_scaled"
+    configure_kimi_k31_attention(
+        model_config, ServerArgs(model="x", dsa_index_k_format="mxfp4")
+    )
+    assert model_config.index_k_format == "mxfp4"
+    with pytest.raises(ValueError, match="mxfp4"):
+        configure_kimi_k31_attention(
+            model_config,
+            ServerArgs(model="x", dsa_index_k_format="mxfp4", numerics="rl-bitwise"),
+        )
     # A hook that named no plane is a construction error, not a fallback.
     with pytest.raises(ValueError, match="index_k_format"):
         _dsa_spec(None)
+
+
+_LLAMA_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "dtype": "bfloat16",
+    "vocab_size": 32000,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "max_position_embeddings": 512,
+}
+
+
+def _model_config(path, config: dict, *, is_draft_worker=False, **flags):
+    from tokenspeed.runtime.configs.model_config import ModelConfig
+
+    (path / "config.json").write_text(json.dumps(config))
+    return ModelConfig(
+        str(path),
+        trust_remote_code=False,
+        model_override_args="{}",
+        dtype="bfloat16",
+        is_draft_worker=is_draft_worker,
+        server_args=ServerArgs(model=str(path), **flags),
+    )
+
+
+def test_only_kimi_k31_takes_an_index_k_format(tmp_path):
+    from test.runtime.test_kimi_k31 import _K31_CONFIG_JSON
+
+    _model_config(tmp_path, _K31_CONFIG_JSON, dsa_index_k_format="mxfp4")
+    _model_config(tmp_path, _LLAMA_CONFIG)
+    with pytest.raises(ValueError, match="only to Kimi-K3.1, not LlamaForCausalLM"):
+        _model_config(tmp_path, _LLAMA_CONFIG, dsa_index_k_format="fp8_scaled")
+    # A draft shares its target's launch flags.
+    _model_config(
+        tmp_path, _LLAMA_CONFIG, is_draft_worker=True, dsa_index_k_format="mxfp4"
+    )
 
 
 def test_bf16_plane_costs_its_own_rows():
@@ -170,9 +230,12 @@ def _qcp_attn_config(spec: DSAConfig) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         context_len=256,
         max_bs=1,
+        max_resident_requests=1,
         kernel_page_size=PREFIX,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=False,
+        kvp_size=2,
+        kvp_group=(0, 1),
         qcp_size=2,
         qcp_group=(0, 1),
         components=(spec,),

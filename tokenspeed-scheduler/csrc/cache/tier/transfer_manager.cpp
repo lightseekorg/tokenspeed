@@ -28,6 +28,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -43,6 +44,7 @@ TierTransferManager::TierTransferManager(CacheCoordinator& coordinator) : coordi
 
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard,
                                                                           HostStoreCause cause) {
+    ProfileSpan profile_span{"TierTransferManager::StartPendingStores"};
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
@@ -65,8 +67,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             storing_keys.insert(ticket.key);
         }
     }
-    for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key)) {
+    for (auto& candidate : coordinator_.Host().TakePendingStores()) {
+        if (coordinator_.Host().ContainsHostCachedBlock(candidate.key)) {
             ++stats.host_cached;
             continue;
         }
@@ -93,7 +95,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         return std::nullopt;
     }
 
-    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids, buckets);
+    HostCache::HostAllocationBatch host_allocation = coordinator_.Host().AcquireHostBlocks(group_ids, buckets);
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
     stats.no_placement += host_allocation.stats.unallocated;
 
@@ -114,7 +116,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(*device_block_refs[i]),
             .destination_page = manager.ResolveCacheBlockId(*host_block_ref),
-            .content_hash = keys[i].content_hash,
+            .content_hash = keys[i].content_hash.ToString(),
             .page_offset = keys[i].page_offset,
         });
         // A stream-ordered store resolves the source page id and lets the
@@ -153,7 +155,7 @@ bool TierTransferManager::HasPinnedStoresInFlight() const {
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
     _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
     for (const BlockTransfer& pair : block_transfers) {
-        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(coordinator_.Host().IsHostCachedBlock(pair.source->Location()),
                 "pinned Host block lost its cache entry before load emission");
     }
     LoadBackOperation op = startLoadBack(std::move(block_transfers));
@@ -169,7 +171,11 @@ LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> 
     const std::uint32_t op_id = nextOpId();
     const bool inserted = load_backs_.emplace(op_id, std::move(block_transfers)).second;
     _assert(inserted, "duplicate loadback op id");
-    return LoadBackOperation{op_id, std::move(transfers)};
+    return LoadBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .telemetry = PrefixLoadTelemetry{.op_generation = (next_op_id_ - 1) >> 32},
+    };
 }
 
 std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
@@ -194,7 +200,7 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
     std::vector<HostPublication> published;
     published.reserve(stores.size());
     for (StoreTicket& ticket : stores) {
-        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key, /*inherited_metadata=*/std::nullopt);
+        coordinator_.Host().CacheHostBlock(ticket.host_block_ref, ticket.key, /*inherited_metadata=*/std::nullopt);
         published.push_back(HostPublication{.key = ticket.key, .block = ticket.host_block_ref});
     }
     // A segment publishes at the last ACK it waits for, in drain order,
@@ -207,7 +213,7 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
         }
         const std::size_t num_members = segment->segment.members.size();
         std::vector<HostPublication> settled =
-            coordinator_.SettleEvictedSegment(std::move(segment->segment), /*placed_on_host=*/true);
+            coordinator_.Host().SettleEvictedSegment(std::move(segment->segment), /*placed_on_host=*/true);
         eviction_stats.cancelled += num_members - settled.size();
         published.insert(published.end(), std::make_move_iterator(settled.begin()),
                          std::make_move_iterator(settled.end()));
@@ -217,14 +223,15 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
 }
 
 std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
-    std::vector<CacheCoordinator::EvictedSegment> segments = coordinator_.TakeEvictedSegments();
+    std::vector<CacheEvictor::EvictedSegment> segments = coordinator_.TakeEvictedSegments();
     if (segments.empty()) {
         return std::nullopt;
     }
+    ProfileSpan profile_span{"TierTransferManager::StartEvictionStores"};
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kEviction)];
     // The newest Device access first, recording order among equals: the
     // placement drops whole segments from the back, the oldest first.
-    std::ranges::stable_sort(segments, std::ranges::greater{}, &CacheCoordinator::EvictedSegment::newest_access_epoch);
+    std::ranges::stable_sort(segments, std::ranges::greater{}, &CacheEvictor::EvictedSegment::newest_access_epoch);
     const InFlightHostBlocks in_flight_blocks = inFlightHostBlocks();
     std::vector<std::vector<StoreWait>> stores(segments.size());
     // Per row to place, its member's index in its segment, with the group and
@@ -232,7 +239,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     std::vector<std::size_t> member_of_row;
     std::vector<std::uint32_t> group_ids;
     std::vector<std::int32_t> buckets;
-    std::vector<CacheCoordinator::HostSegmentRows> segment_rows;
+    std::vector<HostCache::HostSegmentRows> segment_rows;
     // The row copying each key. A key recorded twice is copied once: the
     // segments recording it were merged (TakeEvictedSegments), and its later
     // members share that row's block.
@@ -240,7 +247,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const std::size_t first_row = member_of_row.size();
         for (std::size_t m = 0; m < segments[s].members.size(); ++m) {
-            CacheCoordinator::EvictedBlock& member = segments[s].members[m];
+            CacheEvictor::EvictedBlock& member = segments[s].members[m];
             if (member.host_block) {
                 ++stats.host_cached;  // held since the eviction
                 continue;
@@ -262,10 +269,10 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                                   .BucketOf(member.device_location));
         }
         segment_rows.push_back(
-            CacheCoordinator::HostSegmentRows{.first_row = first_row, .past_end_row = member_of_row.size()});
+            HostCache::HostSegmentRows{.first_row = first_row, .past_end_row = member_of_row.size()});
     }
-    CacheCoordinator::HostAllocationBatch host_allocation =
-        coordinator_.AcquireHostSegments(group_ids, buckets, segment_rows);
+    HostCache::HostAllocationBatch host_allocation =
+        coordinator_.Host().AcquireHostSegments(group_ids, buckets, segment_rows);
     _assert(host_allocation.blocks.size() == member_of_row.size(), "Host allocation result must stay aligned");
 
     // A stream-ordered store: the Device sources left the index at the
@@ -278,17 +285,17 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
     for (std::size_t s = 0; s < segments.size(); ++s) {
-        const CacheCoordinator::HostSegmentRows& row_range = segment_rows[s];
+        const HostCache::HostSegmentRows& row_range = segment_rows[s];
         // A segment is placed whole or not at all.
         if (row_range.first_row < row_range.past_end_row && !host_allocation.blocks[row_range.first_row]) {
             // Its rows and the later members that would have shared them.
             stats.no_placement += static_cast<std::uint64_t>(std::ranges::count_if(
-                segments[s].members, [](const CacheCoordinator::EvictedBlock& member) { return !member.host_block; }));
-            coordinator_.SettleEvictedSegment(std::move(segments[s]), /*placed_on_host=*/false);
+                segments[s].members, [](const CacheEvictor::EvictedBlock& member) { return !member.host_block; }));
+            coordinator_.Host().SettleEvictedSegment(std::move(segments[s]), /*placed_on_host=*/false);
             continue;
         }
         for (std::size_t row = row_range.first_row; row < row_range.past_end_row; ++row) {
-            CacheCoordinator::EvictedBlock& member = segments[s].members[member_of_row[row]];
+            CacheEvictor::EvictedBlock& member = segments[s].members[member_of_row[row]];
             CacheBlockRef& host_block = host_allocation.blocks[row];
             _assert(static_cast<bool>(host_block), "a segment is placed whole or not at all");
             const GroupAllocator& allocator = coordinator_.Allocator(static_cast<std::int32_t>(member.key.group_id));
@@ -302,7 +309,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                 .group_id = member.key.group_id,
                 .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
                 .destination_page = allocator.ResolveCacheBlockId(*host_block),
-                .content_hash = member.key.content_hash,
+                .content_hash = member.key.content_hash.ToString(),
                 .page_offset = member.key.page_offset,
             });
             tickets.push_back(StoreTicket{member.key, CacheBlockRef{}, host_block});
@@ -313,7 +320,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             }
         }
         // A key's later members share the block its row was placed in.
-        for (CacheCoordinator::EvictedBlock& member : segments[s].members) {
+        for (CacheEvictor::EvictedBlock& member : segments[s].members) {
             if (!member.host_block) {
                 const std::size_t row = row_of_key.at(member.key);
                 _assert(row >= row_range.first_row && row < row_range.past_end_row,
@@ -329,7 +336,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             // Every member is on the Host already: nothing to wait for.
             const std::size_t num_members = segments[s].members.size();
             stats.cancelled +=
-                num_members - coordinator_.SettleEvictedSegment(std::move(segments[s]), /*placed_on_host=*/true).size();
+                num_members -
+                coordinator_.Host().SettleEvictedSegment(std::move(segments[s]), /*placed_on_host=*/true).size();
             continue;
         }
         in_flight_segments_.push_back(
@@ -364,18 +372,18 @@ std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheK
     // published it since.
     std::unordered_map<CacheKey, std::uint32_t, CacheKeyHash> host_entry_holds;
     for (InFlightSegment& in_flight : in_flight_segments_) {
-        for (CacheCoordinator::EvictedBlock& member : in_flight.segment.members) {
+        for (CacheEvictor::EvictedBlock& member : in_flight.segment.members) {
             if (!demoted_keys.contains(member.key)) {
                 continue;
             }
             const bool holds_host_entry =
-                member.host_block && member.host_block == coordinator_.FindHostCachedBlock(member.key);
+                member.host_block && member.host_block == coordinator_.Store().AcquireHostCachedBlock(member.key);
             if (holds_host_entry) {
                 ++host_entry_holds[member.key];
             }
             if (!member.metadata.demoted) {
-                member.metadata.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
-                member.metadata.was_acquired = false;
+                member.metadata.eviction.last_access_epoch = CacheStore::kDemotedAccessEpoch;
+                member.metadata.eviction.was_acquired = false;
                 member.metadata.demoted = true;
                 // One publishing into a Host entry counts with that entry.
                 demoted += holds_host_entry ? 0 : 1;
@@ -385,7 +393,7 @@ std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheK
     // The settlement keeps the newer of a member's date and its Host entry's,
     // so the Host entry is dated back here.
     for (const auto& [key, holds] : host_entry_holds) {
-        demoted += coordinator_.DemoteHostEntryHeldByWriteBack(key, holds) ? 1 : 0;
+        demoted += coordinator_.Host().DemoteHostEntryHeldByWriteBack(key, holds) ? 1 : 0;
     }
     return demoted;
 }
@@ -394,6 +402,17 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     // Both ends were pinned for the copy; the destinations were published
     // when the admission claimed the Host hit, so the ACK only lets go.
     load_backs_.erase(op_id);
+}
+
+std::vector<std::unordered_set<std::int32_t>> TierTransferManager::LoadBackDestinations() const {
+    std::vector<std::unordered_set<std::int32_t>> destinations(static_cast<std::size_t>(coordinator_.NumGroups()));
+    for (const auto& [op_id, transfers] : load_backs_) {
+        for (const BlockTransfer& transfer : transfers) {
+            const GroupAllocator& allocator = coordinator_.Allocator(static_cast<std::int32_t>(transfer.group_id));
+            destinations[transfer.group_id].insert(allocator.ResolveCacheBlockId(*transfer.destination));
+        }
+    }
+    return destinations;
 }
 
 TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks() const {
@@ -425,7 +444,7 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
     // an earlier store carries it (the image then waits for that store too),
     // else a Host block acquired in the Device block's bucket and copied by
     // the retraction's own write-back -- one row to place.
-    if (coordinator_.HasHostPool()) {
+    if (coordinator_.Host().HasPool()) {
         const InFlightHostBlocks in_flight = inFlightHostBlocks();
         // The rows to place by boundary, each content hash numbered in the
         // order the image's slots first name it, the prefix-closed groups'
@@ -451,7 +470,7 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
                 if (numbered) {
                     rows_by_boundary.emplace_back();
                 }
-                if (CacheBlockRef cached = coordinator_.FindHostCachedBlock(slot.key)) {
+                if (CacheBlockRef cached = coordinator_.Store().AcquireHostCachedBlock(slot.key)) {
                     slot.block = std::move(cached);
                     split.host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
                     continue;
@@ -477,8 +496,8 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
             if (rows.empty()) {
                 continue;  // the Host serves every slot at this hash already
             }
-            split.boundaries.push_back(CacheCoordinator::HostSegmentRows{
-                .first_row = split.slots.size(), .past_end_row = split.slots.size() + rows.size()});
+            split.boundaries.push_back(HostCache::HostSegmentRows{.first_row = split.slots.size(),
+                                                                  .past_end_row = split.slots.size() + rows.size()});
             for (Row& row : rows) {
                 split.group_ids.push_back(row.group_id);
                 split.buckets.push_back(row.bucket);
@@ -499,7 +518,7 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
     };
     if (!split.boundaries.empty()) {
         split.num_host_boundaries =
-            coordinator_.NumHostBoundariesThatFit(split.group_ids, split.buckets, split.boundaries);
+            coordinator_.Host().NumHostBoundariesThatFit(split.group_ids, split.buckets, split.boundaries);
     }
     if (!coordinator_.SnapshotPoolHolds(tables, num_tokens, host_served(split.boundaries.size()))) {
         split.shortfall = ImageShortfall::kSnapshotPool;
@@ -518,7 +537,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     // The split's Host slots: Host entries, or the blocks of stores in flight.
     for (const std::vector<ImageSlot>& slots : split.host_slots) {
         for (const ImageSlot& slot : slots) {
-            if (coordinator_.ContainsHostCachedBlock(slot.key)) {
+            if (coordinator_.Host().ContainsHostCachedBlock(slot.key)) {
                 ++stats.host_cached;
             } else {
                 ++stats.in_flight;
@@ -533,8 +552,8 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     std::vector<StoreTicket> tickets;
     std::vector<BlockTransfer> host_store_pairs;
     if (!split.slots.empty()) {
-        CacheCoordinator::HostAllocationBatch host_blocks =
-            coordinator_.AcquireHostBoundaries(split.group_ids, split.buckets, split.boundaries);
+        HostCache::HostAllocationBatch host_blocks =
+            coordinator_.Host().AcquireHostBoundaries(split.group_ids, split.buckets, split.boundaries);
         const std::size_t num_host_rows =
             split.num_host_boundaries == 0 ? 0 : split.boundaries[split.num_host_boundaries - 1].past_end_row;
         _assert(host_blocks.stats.allocated == num_host_rows,
@@ -575,7 +594,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
         const std::uint32_t op_id = nextOpId();
         std::vector<CacheTransfer> transfers = resolveTransfers(host_store_pairs);
         for (std::size_t i = 0; i < transfers.size(); ++i) {
-            transfers[i].content_hash = host_store_pairs[i].key.content_hash;
+            transfers[i].content_hash = host_store_pairs[i].key.content_hash.ToString();
             transfers[i].page_offset = host_store_pairs[i].key.page_offset;
             ++stats.blocks[transfers[i].group_id];
         }
@@ -616,12 +635,13 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
 }
 
 SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
-    const std::string& request_id, ReqPoolIndex request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-    std::vector<BlockTransfer> load_pairs, std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
+    const std::string& request_id, ReqPoolIndex request_pool_index, DecodeSlotIndex decode_slot,
+    std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<BlockTransfer> load_pairs,
+    std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
     _assert(request_pool_index.valid(), "a restore imports the slot-state blob into a request-pool row");
     _assert(blob_slot != nullptr && blob_slot->valid(), "a restore imports from the image's blob slot");
     for (const BlockTransfer& pair : load_pairs) {
-        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(coordinator_.Host().IsHostCachedBlock(pair.source->Location()),
                 "a restore's Host L2 row must come from a published Host entry");
     }
     SnapshotRestoreOperation op{
@@ -631,6 +651,12 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
         .snapshot_slot = blob_slot->slot_,
         .transfers = resolveTransfers(load_pairs),
         .source_tier = std::vector<HostTier>(load_pairs.size(), HostTier::kL2),
+        .telemetry =
+            RestoreTelemetry{
+                .op_generation = (next_op_id_ - 1) >> 32,
+                .slot_generation = request_pool_index.generation(),
+                .slot_previous_admission_id = request_pool_index.previous_admission_id(),
+            },
     };
     // Only the L2 rows are Host L2 traffic; the snapshot-pool rows follow.
     if (!op.transfers.empty()) {
@@ -652,6 +678,7 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
                                                        .transfers = std::move(transfers),
                                                        .blob_slot = std::move(blob_slot),
                                                        .request_pool_index = std::move(request_pool_index),
+                                                       .decode_slot = std::move(decode_slot),
                                                        .access_epoch = access_epoch})
             .second;
     _assert(inserted, "duplicate snapshot restore op id");
@@ -667,10 +694,10 @@ std::optional<std::string> TierTransferManager::SnapshotRestoreRequest(std::uint
     return it == snapshot_restores_.end() ? std::nullopt : std::optional<std::string>{it->second.request_id};
 }
 
-ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
+TierTransferManager::RestoredSlots TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
     auto it = snapshot_restores_.find(op_id);
     if (it == snapshot_restores_.end()) {
-        return ReqPoolIndex{};
+        return RestoredSlots{};
     }
     // The L2-tier rows are the request's own prefix pages, copied back whole:
     // publish them as they were published before the retraction.
@@ -685,9 +712,10 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
     // The row the blob was imported into goes back to the request (or, for a
     // request that is gone, to the allocator); the blob slot's last owner
     // may be this ticket.
-    ReqPoolIndex request_pool_index = std::move(it->second.request_pool_index);
+    RestoredSlots slots{.request_pool_index = std::move(it->second.request_pool_index),
+                        .decode_slot = std::move(it->second.decode_slot)};
     snapshot_restores_.erase(it);
-    return request_pool_index;
+    return slots;
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
@@ -706,7 +734,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(*block_transfer.source),
             .destination_page = manager.ResolveCacheBlockId(*block_transfer.destination),
-            .content_hash = block_transfer.key.content_hash,
+            .content_hash = block_transfer.key.content_hash.ToString(),
             .page_offset = block_transfer.key.page_offset,
         });
     }

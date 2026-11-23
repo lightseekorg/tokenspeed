@@ -66,23 +66,31 @@ def ascend_dsa_kernels():
     return _kernels
 
 
-def ascend_prefill_cache_metadata(*args, **kwargs):
-    """Map owner pages and current receives without loading Indexer operators."""
+def ascend_qcp_prefill_cache_metadata(*args, **kwargs):
+    """Build QCP workspace addresses and query bounds for DSA/MLA readers."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
-    return AscendDSAKernels.prefill_metadata(*args, **kwargs)
+    return AscendDSAKernels.qcp_prefill_metadata(*args, **kwargs)
 
 
-def ascend_prepare_dsa_resources(*, group, rank):
+def ascend_prepare_dsa_qcp_prefill(*args, **kwargs):
+    """Create QCP KV/Index-K transport without binding numerical operators."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.prepare_qcp_prefill(*args, **kwargs)
+
+
+def ascend_prepare_dsa_resources(*, group, rank, heads):
     """Bind operator-owned views of the existing HCCL windows before capture."""
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     ascend_dsa_kernels()
-    window = torch.ops.custom.dsa_prepare_prolog_window(group, rank)
+    # The shared MLA/DSA entry accepts the model's actual H32/H64 geometry.
+    window = torch.ops.custom.mla_prepare_prolog_window(group, rank, heads, 8)
     try:
         prepared = {
-            rows: torch.ops.custom.dsa_prepare_lse_buffers(group, rows, rank)
-            for rows in (64, 128, 256, 512)
+            rows: torch.ops.custom.mla_prepare_lse_buffers(group, rows, rank, heads, 8)
+            for rows in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
         }
     except BaseException:
         torch.ops.custom.dsa_release_prolog_window(window)
@@ -94,7 +102,193 @@ def ascend_prepare_dsa_resources(*, group, rank):
     )
 
 
+def validate_dsa_context_parallel(*, rank_size, num_heads):
+    """Validate the installed communication ABI before allocating resources.
+
+    This is a resource capability check, not forward computation dispatch.
+    """
+    ascend_dsa_kernels().require_fused_context_parallel(
+        rank_size=rank_size, num_heads=num_heads
+    )
+
+
+def validate_dsa_prolog(*, index_heads):
+    """Validate the native producer ABI before preparing weights and buffers."""
+    ascend_dsa_kernels().require_fused_prolog(index_heads=index_heads)
+
+
+def ascend_dsa_store_index_keys(*args, **kwargs):
+    # Cache writes do not depend on either numerical Indexer/SFA provider.
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.scatter(*args, **kwargs)
+
+
+def ascend_dsa_paged_select_indices(*args, **kwargs):
+    return ascend_dsa_kernels().index(*args, **kwargs)
+
+
+def ascend_dsa_paged_select_candidates(*args, **kwargs):
+    return ascend_dsa_kernels().index_partial(*args, **kwargs)
+
+
+def ascend_dsa_select_local_indices(*args, **kwargs):
+    return ascend_dsa_kernels().select_local(*args, **kwargs)
+
+
+def ascend_dsa_merge_topk(*args, **kwargs):
+    return ascend_dsa_kernels().merge_topk_fused(*args, **kwargs)
+
+
+def ascend_dsa_paged_attention(*args, **kwargs):
+    return ascend_dsa_kernels().attention(*args, **kwargs)
+
+
+def ascend_dsa_paged_attention_partial(*args, **kwargs):
+    return ascend_dsa_kernels().attention_partial(*args, **kwargs)
+
+
+def ascend_dsa_merge_partials(*args, **kwargs):
+    return ascend_dsa_kernels().merge_partials(*args, **kwargs)
+
+
+def ascend_dsa_merge_lse_direct(*args, **kwargs):
+    return ascend_dsa_kernels().merge_lse_direct(*args, **kwargs)
+
+
+def ascend_dsa_prepare_projection_weight(*args, **kwargs):
+    return ascend_dsa_kernels().prepare_projection_weight(*args, **kwargs)
+
+
+def ascend_dsa_fused_prolog(*args, **kwargs):
+    return ascend_dsa_kernels().fused_prolog(*args, **kwargs)
+
+
+def ascend_dsa_output_projection_partial(*args, **kwargs):
+    return ascend_dsa_kernels().output_projection_partial(*args, **kwargs)
+
+
 if platform.is_npu:
+    register_kernel(
+        "attention",
+        "dsa_store_index_keys",
+        name="ascend_dsa_store_index_keys",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_store_index_keys)
+
+    register_kernel(
+        "attention",
+        "dsa_paged_select_indices",
+        name="ascend_dsa_paged_select_indices",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_paged_select_indices)
+
+    register_kernel(
+        "attention",
+        "dsa_paged_select_candidates",
+        name="ascend_dsa_paged_select_candidates",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_paged_select_candidates)
+
+    register_kernel(
+        "attention",
+        "dsa_select_local_indices",
+        name="ascend_dsa_select_local_indices",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.int32))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_select_local_indices)
+
+    register_kernel(
+        "attention",
+        "dsa_merge_topk",
+        name="ascend_dsa_merge_topk",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.int32))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_merge_topk)
+
+    register_kernel(
+        "attention",
+        "dsa_paged_attention",
+        name="ascend_dsa_paged_attention",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_paged_attention)
+
+    register_kernel(
+        "attention",
+        "dsa_paged_attention_partial",
+        name="ascend_dsa_paged_attention_partial",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_paged_attention_partial)
+
+    register_kernel(
+        "attention",
+        "dsa_merge_partials",
+        name="ascend_dsa_merge_partials",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.float32))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_merge_partials)
+
+    register_kernel(
+        "attention",
+        "dsa_merge_lse_direct",
+        name="ascend_dsa_merge_lse_direct",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.float32))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_merge_lse_direct)
+
+    register_kernel(
+        "attention",
+        "dsa_prepare_projection_weight",
+        name="ascend_dsa_prepare_projection_weight",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_prepare_projection_weight)
+
+    register_kernel(
+        "attention",
+        "dsa_fused_prolog",
+        name="ascend_dsa_fused_prolog",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_fused_prolog)
+
+    register_kernel(
+        "attention",
+        "dsa_output_projection_partial",
+        name="ascend_dsa_output_projection_partial",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature(input=dense_tensor_format(torch.bfloat16))],
+        priority=Priority.PERFORMANT,
+    )(ascend_dsa_output_projection_partial)
+
     register_kernel(
         "attention",
         "dsa_prepare_resources",

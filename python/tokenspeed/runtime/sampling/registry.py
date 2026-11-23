@@ -31,6 +31,8 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -130,6 +132,7 @@ def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]
 def create_sampling_backend(
     server_args: ServerArgs,
     *,
+    hf_config: PretrainedConfig,
     max_bs: int,
     max_draft_tokens_per_req: int,
     device: str,
@@ -143,6 +146,7 @@ def create_sampling_backend(
     return cls(
         SamplingBackendConfig.from_server_args(
             server_args,
+            hf_config=hf_config,
             max_bs=max_bs,
             max_draft_tokens_per_req=max_draft_tokens_per_req,
             device=device,

@@ -26,11 +26,11 @@
 //! is given, in a bounded window, and reports per-key facts. It never calls
 //! the scheduler, a collective or the GPU. A job that cannot run (a full
 //! queue, a backend held open after failures, shutdown) completes at once as
-//! a retired failure; a backend that cannot prove retirement disables new
-//! I/O on this rank until restart.
+//! a retired failure; unproven access blocks its generation until explicit
+//! clear recovery while the scheduler keeps its original addresses alive.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -44,7 +44,7 @@ use crate::{
     store::{HostBuffer, IoResult, Store},
 };
 
-/// The executor's limits: the scheduler's storage credits and the workers.
+/// L3 runtime limits: storage credits, workers and the control-plane drain budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutorConfig {
     /// Operations the scheduler keeps in flight (`StorageConfig`).
@@ -61,6 +61,9 @@ pub struct ExecutorConfig {
     pub failure_threshold: u32,
     /// How long an open backend refuses calls before one probe.
     pub recovery_interval: Duration,
+    /// Control-plane grace period for healthy I/O before clear isolates it.
+    /// Zero skips waiting; it never proves retirement or releases unsafe blocks.
+    pub clear_cache_drain_timeout: Duration,
 }
 
 /// A monotonic clock, in seconds.
@@ -201,6 +204,8 @@ impl Kind {
 #[derive(Debug, Clone)]
 struct Job {
     op_id: u64,
+    epoch: u64,
+    prefix: String,
     kind: Kind,
     keys: Vec<String>,
     ranges: Vec<Option<Range>>,
@@ -255,10 +260,28 @@ struct State {
     queues: [VecDeque<u64>; 3],
     counters: [Counters; 3],
     stopping: bool,
+    /// Local I/O generation. Old jobs keep immutable keys and Host ranges.
+    epoch: u64,
+    weight_version: String,
+    cache_generation: Option<String>,
+    /// Unproven I/O in the current generation blocks new jobs until clear.
+    io_blocked: bool,
+    /// Prefixes whose completed calls never proved retirement. Their owning
+    /// scheduler tickets retain the matching Host and operation credits.
+    unretired_prefixes: HashSet<String>,
     unsafe_io: bool,
     last_submitted: u64,
     /// Workers still running.
     running_workers: usize,
+}
+
+impl State {
+    fn namespace_has_unretired_io(&self, prefix: &str) -> bool {
+        self.unretired_prefixes.contains(prefix)
+            || self.jobs.values().any(|job| {
+                !job.completed && job.job.epoch != self.epoch && job.job.prefix == prefix
+            })
+    }
 }
 
 /// A permission to call the backend, from one health epoch.
@@ -333,6 +356,14 @@ impl Health {
             state.unavailable_until = None;
             state.probe_inflight = false;
         }
+    }
+
+    fn reset_for_cache_generation(&self) {
+        let mut state = self.lock();
+        state.epoch += 1;
+        state.failures = 0;
+        state.unavailable_until = None;
+        state.probe_inflight = false;
     }
 
     /// `healthy`, `open` or `half_open`, and the epoch, without taking the
@@ -417,6 +448,10 @@ impl Shared {
         if !result.retired {
             counters.unretired += 1;
             state.unsafe_io = true;
+            state.unretired_prefixes.insert(job.prefix.clone());
+            if job.epoch == state.epoch {
+                state.io_blocked = true;
+            }
         }
         state.results.push_back(StorageCompletion {
             op_id,
@@ -449,7 +484,23 @@ impl Shared {
             // a protocol fault, not a completion to drop silently.
             return Err(ExecutorError::Credits);
         }
-        let (op_id, kind, num_keys) = (job.op_id, job.kind, job.keys.len());
+        let (op_id, kind, num_keys, job_epoch) = (job.op_id, job.kind, job.keys.len(), job.epoch);
+        let scope_blocked = state.namespace_has_unretired_io(&job.prefix);
+        // Old native PUTs keep their original workers and source references.
+        // With no writer left for this epoch, do not accumulate new PUTs whose
+        // queue age would also disable independent query/GET preparation.
+        let old_writers_full = kind == Kind::Put
+            && state
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.job.kind == Kind::Put
+                        && job.job.epoch != state.epoch
+                        && job.started_at.is_some()
+                        && !job.completed
+                })
+                .count()
+                >= self.config.write_workers;
         let num_bytes = job.num_bytes();
         state.counters[kind.index()].accepted += 1;
         state.jobs.insert(
@@ -464,7 +515,13 @@ impl Shared {
             },
         );
         let queue = &state.queues[kind.index()];
-        if state.stopping || state.unsafe_io || queue.len() >= self.config.max_operations {
+        if state.stopping
+            || state.io_blocked
+            || scope_blocked
+            || old_writers_full
+            || job_epoch != state.epoch
+            || queue.len() >= self.config.max_operations
+        {
             state.counters[kind.index()].rejected += 1;
             self.finish(&mut state, op_id, Self::rejected(num_keys));
             return Ok(());
@@ -477,6 +534,10 @@ impl Shared {
 
     fn cancel(&self, op_id: u64) {
         let mut state = self.lock();
+        self.cancel_locked(&mut state, op_id);
+    }
+
+    fn cancel_locked(&self, state: &mut State, op_id: u64) {
         let Some(job_state) = state.jobs.get_mut(&op_id) else {
             return;
         };
@@ -494,7 +555,7 @@ impl Shared {
             // Retire at once, even with every worker blocked in native I/O:
             // the queue entry cannot start after this, and its worker skips
             // it.
-            self.finish(&mut state, op_id, Self::rejected(keys));
+            self.finish(state, op_id, Self::rejected(keys));
         }
     }
 
@@ -519,7 +580,7 @@ impl Shared {
                 self.exited.notify_all();
                 return;
             };
-            let (stopping, unsafe_io) = (state.stopping, state.unsafe_io);
+            let (stopping, io_blocked, epoch) = (state.stopping, state.io_blocked, state.epoch);
             let Some(job_state) = state.jobs.get_mut(&op_id) else {
                 continue;
             };
@@ -527,7 +588,7 @@ impl Shared {
                 continue;
             }
             let job = Arc::clone(&job_state.job);
-            if job_state.cancelled || stopping || unsafe_io {
+            if job_state.cancelled || stopping || io_blocked || job.epoch != epoch {
                 state.counters[kind.index()].rejected += 1;
                 self.finish(&mut state, op_id, Self::rejected(job.keys.len()));
                 continue;
@@ -564,7 +625,22 @@ impl Shared {
                 .map(|&i| job.ranges[i].expect("a local position has a range"))
                 .collect(),
         };
-        let result = match self.health.begin() {
+        // Bind the health permission to the same I/O generation as the job.
+        // Clear also takes state before resetting health, so an old job either
+        // has an old token or never enters the backend after the generation cut.
+        let permission = {
+            let state = self.lock();
+            if state.stopping
+                || state.io_blocked
+                || job.epoch != state.epoch
+                || state.namespace_has_unretired_io(&job.prefix)
+            {
+                None
+            } else {
+                self.health.begin()
+            }
+        };
+        let result = match permission {
             None => {
                 self.lock().counters[job.kind.index()].rejected += 1;
                 Self::rejected(local.len())
@@ -653,6 +729,21 @@ pub struct Executor {
     closed: bool,
 }
 
+/// A fully validated namespace switch, for replica-agreed control commits.
+/// It belongs to one executor and is consumed once. Between prepare and
+/// commit the control gate must prevent new jobs and other namespace changes;
+/// already retained old jobs may finish normally.
+pub struct PreparedWeightNamespace {
+    owner: Arc<Shared>,
+    expected_epoch: u64,
+    expected_prefix: String,
+    next_epoch: u64,
+    weight_version: String,
+    cache_generation: Option<String>,
+    prefix: String,
+    reset_health: bool,
+}
+
 impl Executor {
     /// Start the workers over `store`, which reads and writes `host`, laid
     /// out as `layout`; objects are named in `namespace` under
@@ -688,6 +779,7 @@ impl Executor {
             clock,
             state: Mutex::new(State {
                 running_workers: workers,
+                weight_version: weight_version.to_owned(),
                 ..State::default()
             }),
             work: [Condvar::new(), Condvar::new(), Condvar::new()],
@@ -722,14 +814,24 @@ impl Executor {
         self.shared.config
     }
 
+    /// The active weight version, without changing namespace state.
+    pub fn weight_version(&self) -> String {
+        self.shared.lock().weight_version.clone()
+    }
+
     /// The namespace prefix objects are named under now.
     pub fn key_prefix(&self) -> String {
         self.shared.prefix.lock().expect("L3 prefix lock").clone()
     }
 
-    fn object_keys(&self, keys: &[StorageKey]) -> Result<Vec<String>, ExecutorError> {
+    fn object_keys(
+        &self,
+        keys: &[StorageKey],
+    ) -> Result<(u64, String, Vec<String>), ExecutorError> {
+        let state = self.shared.lock();
         let prefix = self.key_prefix();
-        keys.iter()
+        let names = keys
+            .iter()
             .map(|key| {
                 Ok(keys::object_key(
                     &prefix,
@@ -739,7 +841,8 @@ impl Executor {
                     self.shared.layout.key_rank(key.group)?,
                 ))
             })
-            .collect()
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+        Ok((state.epoch, prefix, names))
     }
 
     /// Freeze `keys`' object names and this rank's Host ranges, in the
@@ -760,10 +863,13 @@ impl Executor {
             .zip(host_blocks)
             .map(|(key, &block)| self.shared.layout.owned_range(key.group, block))
             .collect::<Result<Vec<_>, _>>()?;
+        let (epoch, prefix, keys) = self.object_keys(keys)?;
         Ok(Job {
             op_id,
+            epoch,
+            prefix,
             kind,
-            keys: self.object_keys(keys)?,
+            keys,
             ranges,
         })
     }
@@ -776,12 +882,17 @@ impl Executor {
                     self.shared.cancel(*op_id);
                     continue;
                 }
-                Operation::Query { op_id, keys } => Job {
-                    op_id: *op_id,
-                    kind: Kind::Query,
-                    keys: self.object_keys(keys)?,
-                    ranges: Vec::new(),
-                },
+                Operation::Query { op_id, keys } => {
+                    let (epoch, prefix, keys) = self.object_keys(keys)?;
+                    Job {
+                        op_id: *op_id,
+                        epoch,
+                        prefix,
+                        kind: Kind::Query,
+                        keys,
+                        ranges: Vec::new(),
+                    }
+                }
                 Operation::Get {
                     op_id,
                     keys,
@@ -810,7 +921,11 @@ impl Executor {
         let now = (self.shared.clock)();
         let mut pressure = StoragePressure::default();
         let mut oldest = now;
-        for job_state in state.jobs.values().filter(|job| !job.completed) {
+        for job_state in state
+            .jobs
+            .values()
+            .filter(|job| !job.completed && job.job.epoch == state.epoch)
+        {
             oldest = oldest.min(job_state.submitted_at);
             if job_state.started_at.is_none() {
                 pressure.queued_operations += 1;
@@ -888,34 +1003,225 @@ impl Executor {
                 }
             })
             .collect();
-        drop(state);
+        // Keep the epoch, active prefix and historical lifetime fact in one
+        // snapshot. Clear/version changes use the same state -> prefix order.
+        let prefix = self.key_prefix();
+        let unsafe_io = state.unsafe_io;
+        let io_blocked = state.io_blocked || state.namespace_has_unretired_io(&prefix);
         let (health_state, health_epoch) = self.shared.health.snapshot();
         L3ExecutorSnapshot {
             operations,
             health_state: health_state.to_owned(),
             health_epoch: health_epoch as f64,
-            unsafe_io: self.shared.lock().unsafe_io,
+            unsafe_io,
+            io_blocked,
         }
     }
 
-    /// Switch the namespace to `weight_version`, after the replica agreed to
-    /// clear the caches.
-    pub fn set_weight_version(&self, weight_version: &str) -> Result<(), ExecutorError> {
-        if !self.is_idle() {
-            return Err(ExecutorError::Busy);
+    /// Cancel old jobs and name subsequent I/O in a fresh cache generation.
+    /// Every replica/DP member must receive the same unique 32-digit hex id.
+    /// Old running I/O keeps its immutable keys and Host ranges. The scheduler
+    /// must retain those references until every owner proves retirement.
+    pub fn begin_cache_generation(&self, generation: &str) -> Result<(), ExecutorError> {
+        if generation.len() != 32 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ExecutorError::Invalid("its cache generation"));
         }
-        *self.shared.prefix.lock().expect("L3 prefix lock") =
-            self.shared.namespace.prefix(weight_version);
+        let mut state = self.shared.lock();
+        let next = state
+            .epoch
+            .checked_add(1)
+            .ok_or(ExecutorError::Invalid("exhausted I/O generations"))?;
+        if state.cache_generation.as_deref() == Some(generation) {
+            return Err(ExecutorError::Invalid("a reused cache generation"));
+        }
+        let ids: Vec<u64> = state.jobs.keys().copied().collect();
+        for id in ids {
+            self.shared.cancel_locked(&mut state, id);
+        }
+        // Cancelled queued entries cannot start; remove them even if a native
+        // worker remains blocked, so repeated clears do not grow inert queues.
+        for queue in &mut state.queues {
+            queue.clear();
+        }
+        state.epoch = next;
+        state.io_blocked = false;
+        state.cache_generation = Some(generation.to_owned());
+        self.shared.health.reset_for_cache_generation();
+        *self.shared.prefix.lock().expect("L3 prefix lock") = format!(
+            "{}-g{generation}",
+            self.shared.namespace.prefix(&state.weight_version)
+        );
         Ok(())
     }
 
-    /// Delete the namespace's objects once idle: true when they are gone.
-    pub fn delete_namespace(&self) -> bool {
-        if !self.is_idle() {
-            return false;
+    fn next_weight_epoch(&self, state: &State) -> Result<u64, ExecutorError> {
+        if state.stopping
+            || state.io_blocked
+            || state.jobs.values().any(|job| job.job.epoch == state.epoch)
+        {
+            return Err(ExecutorError::Busy);
         }
-        let prefix = format!("{}_", self.key_prefix());
-        self.shared.store.remove_by_prefix(&prefix)
+        state
+            .epoch
+            .checked_add(1)
+            .ok_or(ExecutorError::Invalid("exhausted I/O generations"))
+    }
+
+    fn weight_prefix(&self, weight_version: &str, generation: Option<&str>) -> String {
+        let base = self.shared.namespace.prefix(weight_version);
+        match generation {
+            Some(generation) => format!("{base}-g{generation}"),
+            None => base,
+        }
+    }
+
+    /// Inspect a weight switch before generating an isolation nonce or
+    /// changing control metadata. A different version selects its shared base
+    /// prefix; the current version preserves its active cache generation.
+    pub fn weight_version_needs_isolation(
+        &self,
+        weight_version: &str,
+    ) -> Result<bool, ExecutorError> {
+        let state = self.shared.lock();
+        self.next_weight_epoch(&state)?;
+        let generation = (state.weight_version == weight_version)
+            .then_some(state.cache_generation.as_deref())
+            .flatten();
+        let prefix = self.weight_prefix(weight_version, generation);
+        Ok(state.namespace_has_unretired_io(&prefix))
+    }
+
+    fn prepare_weight_version_locked(
+        &self,
+        state: &State,
+        weight_version: &str,
+        generation: Option<&str>,
+    ) -> Result<PreparedWeightNamespace, ExecutorError> {
+        let next_epoch = self.next_weight_epoch(state)?;
+        let next_generation = match generation {
+            Some(generation) => {
+                if generation.len() != 32
+                    || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(ExecutorError::Invalid("its cache generation"));
+                }
+                if state.cache_generation.as_deref() == Some(generation) {
+                    return Err(ExecutorError::Invalid("a reused cache generation"));
+                }
+                Some(generation.to_owned())
+            }
+            None if state.weight_version == weight_version => state.cache_generation.clone(),
+            None => None,
+        };
+        let prefix = self.weight_prefix(weight_version, next_generation.as_deref());
+        if state.namespace_has_unretired_io(&prefix) {
+            return Err(ExecutorError::Busy);
+        }
+        Ok(PreparedWeightNamespace {
+            owner: Arc::clone(&self.shared),
+            expected_epoch: state.epoch,
+            expected_prefix: self.key_prefix(),
+            next_epoch,
+            weight_version: weight_version.to_owned(),
+            cache_generation: next_generation,
+            prefix,
+            reset_health: generation.is_some(),
+        })
+    }
+
+    /// Validate and allocate a prospective version/generation switch without
+    /// changing any state. None keeps a same-version generation or selects a
+    /// different version's shared prefix; unsafe target prefixes are refused.
+    pub fn prepare_weight_version(
+        &self,
+        weight_version: &str,
+        generation: Option<&str>,
+    ) -> Result<PreparedWeightNamespace, ExecutorError> {
+        let state = self.shared.lock();
+        self.prepare_weight_version_locked(&state, weight_version, generation)
+    }
+
+    fn commit_weight_version_locked(&self, state: &mut State, prepared: PreparedWeightNamespace) {
+        assert!(
+            Arc::ptr_eq(&self.shared, &prepared.owner),
+            "namespace plan belongs to another executor"
+        );
+        assert_eq!(
+            state.epoch, prepared.expected_epoch,
+            "namespace changed after preparation"
+        );
+        assert!(
+            !state.stopping
+                && !state.io_blocked
+                && !state.jobs.values().any(|job| job.job.epoch == state.epoch),
+            "new current-generation I/O crossed the namespace control gate"
+        );
+        // Keep state -> prefix ordering. The prepared values need no entropy,
+        // backend calls or further fallible validation while committing.
+        let mut active_prefix = self.shared.prefix.lock().expect("L3 prefix lock");
+        assert_eq!(
+            *active_prefix, prepared.expected_prefix,
+            "prefix changed after preparation"
+        );
+        if prepared.reset_health {
+            self.shared.health.reset_for_cache_generation();
+        }
+        state.epoch = prepared.next_epoch;
+        state.weight_version = prepared.weight_version;
+        state.cache_generation = prepared.cache_generation;
+        *active_prefix = prepared.prefix;
+    }
+
+    /// Commit a validated plan after every rank agrees it prepared one. The
+    /// control gate must remain held since prepare; violations are assertions,
+    /// not recoverable partial commits. Retained old I/O may finish meanwhile.
+    pub fn commit_prepared_weight_version(&self, prepared: PreparedWeightNamespace) {
+        let mut state = self.shared.lock();
+        self.commit_weight_version_locked(&mut state, prepared);
+    }
+
+    /// Atomically validate and commit a version/generation switch locally.
+    /// Failure leaves the original epoch, version, generation and prefix.
+    pub fn set_weight_version_with_generation(
+        &self,
+        weight_version: &str,
+        generation: Option<&str>,
+    ) -> Result<(), ExecutorError> {
+        let mut state = self.shared.lock();
+        let prepared = self.prepare_weight_version_locked(&state, weight_version, generation)?;
+        self.commit_weight_version_locked(&mut state, prepared);
+        Ok(())
+    }
+
+    /// Switch weight metadata only to a safe prefix after agreed clearing.
+    /// Retained old generations may drain; current jobs must finish first.
+    pub fn set_weight_version(&self, weight_version: &str) -> Result<(), ExecutorError> {
+        self.set_weight_version_with_generation(weight_version, None)
+    }
+
+    /// The active namespace still has unproven access, including an old I/O
+    /// generation returning to this prefix after a weight-version change.
+    pub fn current_namespace_needs_isolation(&self) -> bool {
+        let state = self.shared.lock();
+        let prefix = self.key_prefix();
+        state.io_blocked || state.namespace_has_unretired_io(&prefix)
+    }
+
+    /// Delete only the active namespace after all its jobs retire. Historical
+    /// unknown I/O in other prefixes still protects shutdown, but cannot touch
+    /// this prefix. The control thread must withhold new submissions throughout.
+    pub fn delete_namespace(&self) -> bool {
+        let prefix = {
+            let state = self.shared.lock();
+            let prefix = self.key_prefix();
+            if state.unretired_prefixes.contains(&prefix)
+                || state.jobs.values().any(|job| job.job.prefix == prefix)
+            {
+                return false;
+            }
+            prefix
+        };
+        self.shared.store.remove_by_prefix(&format!("{prefix}_"))
     }
 
     /// Stop the workers within `timeout` and release the store; a later
@@ -996,6 +1302,14 @@ mod tests {
                 .wait_timeout_while(guard, timeout, |set| !*set)
                 .unwrap()
                 .0
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<Event>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.set();
         }
     }
 
@@ -1084,6 +1398,7 @@ mod tests {
         write_workers: 1,
         failure_threshold: 1,
         recovery_interval: Duration::from_secs(30),
+        clear_cache_drain_timeout: Duration::from_millis(500),
     };
 
     /// Group 0 has 8-byte blocks, group 1 16-byte ones, one each per LCM
@@ -1230,6 +1545,16 @@ mod tests {
     fn fake_clock(now: &Arc<Mutex<f64>>) -> Clock {
         let now = Arc::clone(now);
         Arc::new(move || *now.lock().unwrap())
+    }
+
+    fn version_state(executor: &Executor) -> (u64, String, Option<String>, String) {
+        let state = executor.shared.lock();
+        (
+            state.epoch,
+            state.weight_version.clone(),
+            state.cache_generation.clone(),
+            executor.key_prefix(),
+        )
     }
 
     #[test]
@@ -1401,6 +1726,564 @@ mod tests {
     }
 
     #[test]
+    fn failed_puts_allow_namespace_rotation_only_after_source_retirement() {
+        for retired in [true, false] {
+            let store = TestStore {
+                put: Some(Box::new(move |keys, _, _| {
+                    Ok(IoResult {
+                        success: vec![false; keys.len()],
+                        retired,
+                        object_failures: vec![false; keys.len()],
+                    })
+                })),
+                ..TestStore::new()
+            };
+            let closes = Arc::clone(&store.closes);
+            let mut harness = Harness::new(store, CONFIG);
+            let executor = harness.executor();
+            let old_prefix = executor.key_prefix();
+            executor.submit(&[put(1, "rejected", 1)]).unwrap();
+            let completion = harness.wait(1).remove(0);
+            assert_eq!(completion.success, [false]);
+            assert_eq!(completion.retired, retired);
+            assert_eq!(completion.object_failures, [false]);
+            assert_eq!(executor.snapshot().unsafe_io, !retired);
+            assert_eq!(executor.is_idle(), retired);
+            assert_eq!(executor.delete_namespace(), retired);
+
+            if retired {
+                executor.set_weight_version("v2").unwrap();
+                assert_ne!(executor.key_prefix(), old_prefix);
+                executor.submit(&[put(2, "after-update", 2)]).unwrap();
+                let completion = harness.wait(1).remove(0);
+                assert_eq!(completion.success, [false]);
+                assert!(completion.retired);
+                assert!(executor.is_idle());
+                harness.close(Duration::from_secs(2)).unwrap();
+                assert_eq!(closes.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(
+                    executor.set_weight_version("v2"),
+                    Err(ExecutorError::Busy)
+                ));
+                assert_eq!(executor.key_prefix(), old_prefix);
+                assert!(matches!(
+                    harness.close(Duration::from_secs(2)),
+                    Err(ExecutorError::Unretired)
+                ));
+                assert_eq!(closes.load(Ordering::SeqCst), 0);
+                std::mem::forget(std::mem::take(&mut harness.pool));
+            }
+        }
+    }
+
+    #[test]
+    fn retaining_unknown_io_allows_new_generation_io_without_claiming_a_safe_close() {
+        let memory = Arc::new(MemoryStore::new());
+        let puts = Arc::new(AtomicUsize::new(0));
+        let (stored, count) = (Arc::clone(&memory), Arc::clone(&puts));
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            put: Some(Box::new(move |keys, host, ranges| {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                if call == 0 || call == 2 {
+                    return Ok(IoResult {
+                        success: vec![false; keys.len()],
+                        retired: false,
+                        object_failures: vec![false; keys.len()],
+                    });
+                }
+                stored.batch_put_from(keys, host, ranges)
+            })),
+            ..TestStore::new()
+        };
+        let calls = Arc::clone(&store.calls);
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let host_layout = layout(1, 0, 0);
+        let old_source = host_layout.owned_range(0, 1).unwrap().unwrap();
+        let new_source = host_layout.owned_range(0, 2).unwrap().unwrap();
+        let destination = host_layout.owned_range(0, 3).unwrap().unwrap();
+        harness.pool[old_source.offset..old_source.offset + old_source.size].fill(0x31);
+        harness.pool[new_source.offset..new_source.offset + new_source.size].fill(0x62);
+        let executor = harness.executor();
+        let old_prefix = executor.key_prefix();
+        executor.submit(&[put(1, "unknown", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        assert!(executor.snapshot().unsafe_io);
+        assert!(executor.set_weight_version("v2").is_err());
+        assert_eq!(executor.key_prefix(), old_prefix);
+
+        executor
+            .begin_cache_generation("00000000000000000000000000000001")
+            .unwrap();
+        let cleared_prefix = executor.key_prefix();
+        assert_ne!(cleared_prefix, old_prefix);
+        executor.set_weight_version("v1").unwrap();
+        assert_eq!(executor.key_prefix(), cleared_prefix);
+        executor.set_weight_version("v2").unwrap();
+        assert!(executor
+            .key_prefix()
+            .starts_with(&keys::key_prefix("deployment", "v2", "")));
+        executor.submit(&[put(2, "new", 2)]).unwrap();
+        let written = harness.wait(1).remove(0);
+        assert_eq!(written.success, [true]);
+        assert!(written.retired);
+        executor.submit(&[get(3, "new", 3)]).unwrap();
+        let read = harness.wait(1).remove(0);
+        assert_eq!(read.success, [true]);
+        assert!(read.retired);
+        assert_eq!(
+            &harness.pool[destination.offset..destination.offset + destination.size],
+            &[0x62; 8]
+        );
+        executor.submit(&[query(4, &["new"])]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert!(executor.snapshot().unsafe_io);
+        assert_eq!(executor.snapshot().health_state, "healthy");
+
+        // An unknown result in this generation blocks its new work again.
+        executor.submit(&[put(5, "current-unknown", 2)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        let current_prefix = executor.key_prefix();
+        assert!(executor.set_weight_version("v3").is_err());
+        assert_eq!(executor.key_prefix(), current_prefix);
+        let before = calls.lock().unwrap().len();
+        executor.submit(&[get(6, "new", 3)]).unwrap();
+        let blocked = harness.wait(1).remove(0);
+        assert_eq!(blocked.success, [false]);
+        assert!(blocked.retired);
+        assert_eq!(calls.lock().unwrap().len(), before);
+
+        executor
+            .begin_cache_generation("00000000000000000000000000000002")
+            .unwrap();
+        let second_prefix = executor.key_prefix();
+        assert_ne!(second_prefix, current_prefix);
+        executor.set_weight_version("v2").unwrap();
+        assert_eq!(executor.key_prefix(), second_prefix);
+        executor.submit(&[put(7, "after-second-clear", 3)]).unwrap();
+        let written = harness.wait(1).remove(0);
+        assert_eq!(written.success, [true]);
+        assert!(written.retired);
+        executor.submit(&[get(8, "after-second-clear", 3)]).unwrap();
+        let read = harness.wait(1).remove(0);
+        assert_eq!(read.success, [true]);
+        assert!(read.retired);
+        assert_eq!(puts.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            &harness.pool[old_source.offset..old_source.offset + old_source.size],
+            &[0x31; 8]
+        );
+        assert_eq!(executor.snapshot().health_state, "healthy");
+        assert!(executor.snapshot().unsafe_io);
+        assert!(!executor.is_idle());
+        // Purging the safe active prefix does not prove that older native
+        // access retired, and does not authorize deregistering the Host pool.
+        assert!(executor.delete_namespace());
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        std::mem::forget(std::mem::take(&mut harness.pool));
+    }
+
+    #[test]
+    fn retaining_running_io_cancels_queued_work_and_old_failure_cannot_block_new_health() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let memory = Arc::new(MemoryStore::new());
+        let put_calls = Arc::new(AtomicUsize::new(0));
+        let (s, r, stored, count) = (
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&memory),
+            Arc::clone(&put_calls),
+        );
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            put: Some(Box::new(move |keys, host, ranges| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    s.set();
+                    assert!(r.wait(Duration::from_secs(3)));
+                    let mut result = stored.batch_put_from(keys, host, ranges)?;
+                    // The old backend has no retirement proof, even though
+                    // this stand-in has now finished copying its source.
+                    result.retired = false;
+                    return Ok(result);
+                }
+                stored.batch_put_from(keys, host, ranges)
+            })),
+            ..TestStore::new()
+        };
+        let calls = Arc::clone(&store.calls);
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let host_layout = layout(1, 0, 0);
+        let old_source = host_layout.owned_range(0, 1).unwrap().unwrap();
+        let available = host_layout.owned_range(0, 2).unwrap().unwrap();
+        let destination = host_layout.owned_range(0, 3).unwrap().unwrap();
+        harness.pool[old_source.offset..old_source.offset + old_source.size].fill(0x31);
+        harness.pool[available.offset..available.offset + available.size].fill(0x62);
+        let executor = harness.executor();
+        let old = executor.key_prefix();
+        executor.submit(&[put(1, "running", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        executor.submit(&[put(2, "queued", 2)]).unwrap();
+        executor
+            .begin_cache_generation("00000000000000000000000000000003")
+            .unwrap();
+        executor.set_weight_version("v2").unwrap();
+        let cancelled = harness.wait(1).remove(0);
+        assert_eq!(cancelled.op_id, 2);
+        assert_eq!(cancelled.success, [false]);
+        assert!(cancelled.retired);
+        assert!(!executor.is_idle());
+        assert!(memory.keys().is_empty());
+
+        // The old PUT occupies the only PUT worker. Independent GET workers
+        // can still retrieve a new-generation object from the shared store.
+        let new_key = keys::object_key(&executor.key_prefix(), "readable", 0, 0, 0);
+        let host = HostBuffer {
+            base: harness.pool.as_ptr() as usize,
+            len: harness.pool.len(),
+        };
+        assert_eq!(
+            memory
+                .batch_put_from(std::slice::from_ref(&new_key), host, &[available])
+                .unwrap()
+                .success,
+            [true]
+        );
+        executor.submit(&[get(3, "readable", 3)]).unwrap();
+        let read = harness.wait(1).remove(0);
+        assert_eq!(read.op_id, 3);
+        assert_eq!(read.success, [true]);
+        assert!(read.retired);
+        assert_eq!(
+            &harness.pool[destination.offset..destination.offset + destination.size],
+            &[0x62; 8]
+        );
+        executor.submit(&[query(4, &["readable"])]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+
+        release.set();
+        let running = harness.wait(1).remove(0);
+        assert_eq!(running.op_id, 1);
+        assert_eq!(running.success, [true]);
+        assert!(!running.retired);
+        let old_key = keys::object_key(&old, "running", 0, 0, 0);
+        assert!(memory.keys().contains(&old_key));
+        assert!(!memory
+            .keys()
+            .contains(&keys::object_key(&old, "queued", 0, 0, 0)));
+        assert_eq!(executor.snapshot().health_state, "healthy");
+        assert!(executor.snapshot().unsafe_io);
+        let prefix = executor.key_prefix();
+        assert_ne!(prefix, old);
+        executor.submit(&[put(5, "after-old-result", 2)]).unwrap();
+        let written = harness.wait(1).remove(0);
+        assert_eq!(written.success, [true]);
+        assert!(written.retired);
+        assert_eq!(executor.key_prefix(), prefix);
+        assert_eq!(put_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.lock().unwrap()[0], ("put", vec![old_key]));
+        assert_eq!(
+            &harness.pool[old_source.offset..old_source.offset + old_source.size],
+            &[0x31; 8]
+        );
+        // Neither a new successful job nor the old late report can provide
+        // the missing lifetime proof for an earlier native operation.
+        assert!(!executor.is_idle());
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        std::mem::forget(std::mem::take(&mut harness.pool));
+    }
+
+    #[test]
+    fn a_frozen_old_job_cannot_enter_the_backend_after_a_generation_cut() {
+        let store = TestStore::new();
+        let calls = Arc::clone(&store.calls);
+        let harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        let stale = executor
+            .ranged_job(
+                1,
+                Kind::Put,
+                &[StorageKey {
+                    group: 0,
+                    content_hash: "stale".to_owned(),
+                    page_offset: 0,
+                }],
+                &[1],
+            )
+            .unwrap();
+        executor
+            .begin_cache_generation("00000000000000000000000000000003")
+            .unwrap();
+        // Cover both windows: already selected by a worker but not yet given
+        // a backend permission, and frozen keys not yet submitted at the cut.
+        let rejected = executor.shared.run(&stale);
+        assert_eq!(rejected.success, [false]);
+        assert!(rejected.retired);
+        executor.shared.submit(stale).unwrap();
+        let rejected = harness.wait(1).remove(0);
+        assert_eq!(rejected.success, [false]);
+        assert!(rejected.retired);
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(executor.snapshot().health_state, "healthy");
+        executor.submit(&[put(2, "fresh", 2)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_old_put_holding_the_only_writer_rejects_new_puts_without_pressuring_reads() {
+        let now = Arc::new(Mutex::new(1.0));
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let memory = Arc::new(MemoryStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (s, r, stored, count) = (
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&memory),
+            Arc::clone(&calls),
+        );
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            put: Some(Box::new(move |keys, host, ranges| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    s.set();
+                    assert!(r.wait(Duration::from_secs(5)));
+                }
+                stored.batch_put_from(keys, host, ranges)
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::start(store, CONFIG, layout(1, 0, 0), fake_clock(&now));
+        let _release = ReleaseOnDrop(Arc::clone(&release));
+        harness.pool[..8].fill(0x31);
+        harness.pool[24..32].fill(0x62);
+        let executor = harness.executor();
+        executor.submit(&[put(1, "old-held", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        executor
+            .begin_cache_generation("00000000000000000000000000000041")
+            .unwrap();
+        executor.set_weight_version("v2").unwrap();
+        let before_return = version_state(executor);
+        assert!(executor.weight_version_needs_isolation("v1").unwrap());
+        assert!(matches!(
+            executor.prepare_weight_version("v1", None),
+            Err(ExecutorError::Busy)
+        ));
+        assert_eq!(version_state(executor), before_return);
+        executor.submit(&[put(2, "no-writer", 2)]).unwrap();
+        let poll = executor.poll();
+        assert_eq!(poll.completions.len(), 1);
+        assert_eq!(poll.completions[0].op_id, 2);
+        assert_eq!(poll.completions[0].success, [false]);
+        assert!(poll.completions[0].retired);
+        assert_eq!(poll.completions[0].object_failures, [false]);
+        assert_eq!(poll.pressure, StoragePressure::default());
+        let source = HostBuffer {
+            base: harness.pool.as_ptr() as usize,
+            len: harness.pool.len(),
+        };
+        let readable = keys::object_key(&executor.key_prefix(), "readable", 0, 0, 0);
+        memory
+            .batch_put_from(
+                &[readable],
+                source,
+                &[Range {
+                    offset: 24,
+                    size: 8,
+                }],
+            )
+            .unwrap();
+        // Advance beyond the default shared pressure age without waiting for
+        // the old writer. Its source and global operation credit remain held.
+        *now.lock().unwrap() = 1.75;
+        executor.submit(&[put(3, "still-no-writer", 2)]).unwrap();
+        let poll = executor.poll();
+        assert_eq!(poll.completions.len(), 1);
+        assert_eq!(poll.completions[0].op_id, 3);
+        assert!(poll.completions[0].retired);
+        assert_eq!(poll.completions[0].success, [false]);
+        assert_eq!(poll.pressure, StoragePressure::default());
+        executor.submit(&[query(4, &["readable"])]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        executor.submit(&[get(5, "readable", 3)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert_eq!(&harness.pool[48..56], &[0x62; 8]);
+        assert_eq!(&harness.pool[..8], &[0x31; 8]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let snapshot = executor.snapshot();
+        assert_eq!(value(&row(&snapshot, "put").operations, "running"), 1.0);
+        assert_eq!(value(&row(&snapshot, "put").bytes, "running"), 8.0);
+        assert_eq!(executor.shared.lock().jobs.len(), 1);
+        assert_eq!(executor.poll().pressure, StoragePressure::default());
+        release.set();
+        let old = harness.wait(1).remove(0);
+        assert_eq!(old.op_id, 1);
+        assert!(old.retired);
+        executor.submit(&[put(6, "writer-recovered", 2)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_free_write_worker_can_publish_while_an_old_writer_is_held() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let memory = Arc::new(MemoryStore::new());
+        let (s, r, stored) = (
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&memory),
+        );
+        let store = TestStore {
+            put: Some(Box::new(move |keys, host, ranges| {
+                if keys[0].contains("_old-held") {
+                    s.set();
+                    assert!(r.wait(Duration::from_secs(5)));
+                }
+                stored.batch_put_from(keys, host, ranges)
+            })),
+            memory,
+            ..TestStore::new()
+        };
+        let harness = Harness::new(
+            store,
+            ExecutorConfig {
+                write_workers: 2,
+                ..CONFIG
+            },
+        );
+        let _release = ReleaseOnDrop(Arc::clone(&release));
+        let executor = harness.executor();
+        executor.submit(&[put(1, "old-held", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        executor
+            .begin_cache_generation("00000000000000000000000000000042")
+            .unwrap();
+        executor.submit(&[put(2, "new", 2)]).unwrap();
+        let new = harness.wait(1).remove(0);
+        assert_eq!(new.op_id, 2);
+        assert_eq!(new.success, [true]);
+        assert!(new.retired);
+        assert_eq!(
+            value(&row(&executor.snapshot(), "put").operations, "running"),
+            1.0
+        );
+        release.set();
+        assert_eq!(harness.wait(1)[0].op_id, 1);
+    }
+
+    #[test]
+    fn a_completed_unpolled_old_put_does_not_occupy_a_write_worker() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let memory = Arc::new(MemoryStore::new());
+        let stored = Arc::clone(&memory);
+        let store = TestStore {
+            memory,
+            put: Some(Box::new(move |keys, host, ranges| {
+                if keys[0].contains("_old-held") {
+                    s.set();
+                    assert!(r.wait(Duration::from_secs(5)));
+                }
+                stored.batch_put_from(keys, host, ranges)
+            })),
+            ..TestStore::new()
+        };
+        let harness = Harness::new(store, CONFIG);
+        let _release = ReleaseOnDrop(Arc::clone(&release));
+        let executor = harness.executor();
+        executor.submit(&[put(1, "old-held", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        executor
+            .begin_cache_generation("00000000000000000000000000000043")
+            .unwrap();
+        release.set();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while value(&row(&executor.snapshot(), "put").operations, "completed") != 1.0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The old completion still consumes its operation credit until poll,
+        // but its worker is free to take the current-generation write.
+        executor.submit(&[put(2, "new", 2)]).unwrap();
+        let completions = harness.wait(2);
+        assert!(completions
+            .iter()
+            .all(|fact| fact.retired && fact.success == [true]));
+    }
+
+    #[test]
+    fn purging_a_safe_generation_preserves_an_older_unretired_namespace() {
+        let memory = Arc::new(MemoryStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (stored, puts) = (Arc::clone(&memory), Arc::clone(&calls));
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            put: Some(Box::new(move |keys, host, ranges| {
+                let mut result = stored.batch_put_from(keys, host, ranges)?;
+                if puts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    result.retired = false;
+                }
+                Ok(result)
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        let original = executor.key_prefix();
+        executor.submit(&[put(1, "old", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        assert!(executor.current_namespace_needs_isolation());
+        assert!(!executor.delete_namespace());
+        executor
+            .begin_cache_generation("00000000000000000000000000000004")
+            .unwrap();
+        let fresh = executor.key_prefix();
+        assert!(!executor.current_namespace_needs_isolation());
+        executor.submit(&[put(2, "new", 2)]).unwrap();
+        assert!(harness.wait(1)[0].retired);
+        assert!(executor.delete_namespace());
+        assert_eq!(memory.keys(), [keys::object_key(&original, "old", 0, 0, 0)]);
+        assert!(!memory.keys().iter().any(|key| key.starts_with(&fresh)));
+        assert!(executor.snapshot().unsafe_io);
+        assert!(!executor.is_idle());
+
+        executor.set_weight_version("v2").unwrap();
+        let before_return = executor.key_prefix();
+        assert!(executor.weight_version_needs_isolation("v1").unwrap());
+        assert_eq!(executor.key_prefix(), before_return);
+        assert!(matches!(
+            executor.set_weight_version("v1"),
+            Err(ExecutorError::Busy)
+        ));
+        assert_eq!(executor.key_prefix(), before_return);
+        assert!(!executor.current_namespace_needs_isolation());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        executor
+            .set_weight_version_with_generation("v1", Some("00000000000000000000000000000005"))
+            .unwrap();
+        assert!(executor.key_prefix().starts_with(&format!("{original}-g")));
+        assert!(!executor.current_namespace_needs_isolation());
+        executor.submit(&[put(4, "after-return", 3)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        std::mem::forget(std::mem::take(&mut harness.pool));
+    }
+
+    #[test]
     fn independent_executors_share_objects_through_the_store() {
         let memory = Arc::new(MemoryStore::new());
         let writer = Harness::new(
@@ -1561,6 +2444,66 @@ mod tests {
         harness.wait(1);
         let drained = row(&executor.snapshot(), "get");
         assert!(drained.operations.iter().all(|(_, count)| *count == 0.0));
+    }
+
+    #[test]
+    fn snapshots_separate_historical_unsafety_from_current_namespace_blocking() {
+        let store = TestStore {
+            put: Some(Box::new(|keys, _, _| {
+                Ok(IoResult {
+                    success: vec![false; keys.len()],
+                    retired: false,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        let initial = executor.snapshot();
+        assert!(!initial.unsafe_io);
+        assert!(!initial.io_blocked);
+        executor.submit(&[put(1, "old-unknown", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        let failed = executor.snapshot();
+        assert!(failed.unsafe_io);
+        assert!(failed.io_blocked);
+
+        executor
+            .begin_cache_generation("00000000000000000000000000000031")
+            .unwrap();
+        let recovered = executor.snapshot();
+        assert!(recovered.unsafe_io);
+        assert!(!recovered.io_blocked);
+        assert!(!executor.current_namespace_needs_isolation());
+        assert_eq!(recovered.health_state, "healthy");
+
+        // Namespace identity matters independently of the current epoch's
+        // block flag: inspect before atomically avoiding the unsafe prefix.
+        executor.set_weight_version("v2").unwrap();
+        assert!(executor.weight_version_needs_isolation("v1").unwrap());
+        assert!(matches!(
+            executor.set_weight_version("v1"),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(!executor.snapshot().io_blocked);
+        executor
+            .set_weight_version_with_generation("v1", Some("00000000000000000000000000000032"))
+            .unwrap();
+        assert!(!executor.snapshot().io_blocked);
+        executor.submit(&[put(2, "current-unknown", 2)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        let failed_again = executor.snapshot();
+        assert!(failed_again.unsafe_io);
+        assert!(failed_again.io_blocked);
+
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        std::mem::forget(std::mem::take(&mut harness.pool));
     }
 
     #[test]
@@ -2038,6 +2981,180 @@ mod tests {
     }
 
     #[test]
+    fn preparing_a_weight_namespace_is_pure_and_commit_preserves_same_version_generations() {
+        let harness = Harness::new(TestStore::new(), CONFIG);
+        let executor = harness.executor();
+        executor
+            .begin_cache_generation("00000000000000000000000000000051")
+            .unwrap();
+        let before = version_state(executor);
+        assert!(!executor.weight_version_needs_isolation("v1").unwrap());
+        assert!(!executor.weight_version_needs_isolation("v2").unwrap());
+        let uncommitted = executor.prepare_weight_version("v2", None).unwrap();
+        assert_eq!(version_state(executor), before);
+        drop(uncommitted); // Another rank's preparation or nonce may fail.
+        assert_eq!(version_state(executor), before);
+
+        let same = executor.prepare_weight_version("v1", None).unwrap();
+        assert_eq!(version_state(executor), before);
+        executor.commit_prepared_weight_version(same);
+        assert_eq!(executor.key_prefix(), before.3);
+        assert_eq!(executor.weight_version(), "v1");
+        let changed = executor.prepare_weight_version("v2", None).unwrap();
+        assert_eq!(executor.key_prefix(), before.3);
+        executor.commit_prepared_weight_version(changed);
+        assert_eq!(executor.weight_version(), "v2");
+        assert_eq!(
+            executor.key_prefix(),
+            keys::key_prefix("deployment", "v2", "")
+        );
+
+        let before = version_state(executor);
+        for generation in ["", "bad", "0000000000000000000000000000005z"] {
+            assert!(matches!(
+                executor.prepare_weight_version("v3", Some(generation)),
+                Err(ExecutorError::Invalid(_))
+            ));
+            assert!(matches!(
+                executor.set_weight_version_with_generation("v3", Some(generation)),
+                Err(ExecutorError::Invalid(_))
+            ));
+            assert_eq!(version_state(executor), before);
+        }
+        let fresh = "00000000000000000000000000000052";
+        let plan = executor.prepare_weight_version("v2", Some(fresh)).unwrap();
+        assert_eq!(version_state(executor), before);
+        executor.commit_prepared_weight_version(plan);
+        assert_eq!(executor.key_prefix(), format!("{}-g{fresh}", before.3));
+        let before = version_state(executor);
+        assert!(matches!(
+            executor.prepare_weight_version("v3", Some(fresh)),
+            Err(ExecutorError::Invalid(_))
+        ));
+        assert_eq!(version_state(executor), before);
+    }
+
+    #[test]
+    fn a_return_to_unsafe_weights_requires_a_prepared_safe_generation_without_mutating_on_failure()
+    {
+        let store = TestStore {
+            put: Some(Box::new(|keys, _, _| {
+                Ok(IoResult {
+                    success: vec![false; keys.len()],
+                    retired: false,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        executor.submit(&[put(1, "unsafe-base", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        assert!(matches!(
+            executor.weight_version_needs_isolation("v2"),
+            Err(ExecutorError::Busy)
+        ));
+        let unsafe_generation = "00000000000000000000000000000053";
+        executor.begin_cache_generation(unsafe_generation).unwrap();
+        executor.submit(&[put(2, "unsafe-generation", 2)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        executor
+            .begin_cache_generation("00000000000000000000000000000054")
+            .unwrap();
+        executor.set_weight_version("v2").unwrap();
+        let before = version_state(executor);
+        assert!(executor.weight_version_needs_isolation("v1").unwrap());
+        assert_eq!(version_state(executor), before);
+        assert!(matches!(
+            executor.prepare_weight_version("v1", None),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(matches!(
+            executor.set_weight_version("v1"),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(matches!(
+            executor.prepare_weight_version("v1", Some(unsafe_generation)),
+            Err(ExecutorError::Busy)
+        ));
+        assert_eq!(version_state(executor), before);
+        assert!(!executor.current_namespace_needs_isolation());
+
+        let fresh = "00000000000000000000000000000055";
+        let plan = executor.prepare_weight_version("v1", Some(fresh)).unwrap();
+        assert_eq!(version_state(executor), before);
+        drop(plan);
+        assert_eq!(version_state(executor), before);
+        let plan = executor.prepare_weight_version("v1", Some(fresh)).unwrap();
+        executor.commit_prepared_weight_version(plan);
+        assert_eq!(executor.weight_version(), "v1");
+        assert_eq!(
+            executor.key_prefix(),
+            format!("{}-g{fresh}", keys::key_prefix("deployment", "v1", ""))
+        );
+        assert!(!executor.current_namespace_needs_isolation());
+        assert!(executor.snapshot().unsafe_io);
+        assert!(matches!(
+            harness.close(Duration::from_secs(1)),
+            Err(ExecutorError::Unretired)
+        ));
+        std::mem::forget(std::mem::take(&mut harness.pool));
+    }
+
+    #[test]
+    fn namespace_planning_checks_current_jobs_and_epoch_exhaustion_before_mutation() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            exists: Some(Box::new(move |keys| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(5)));
+                Ok(vec![false; keys.len()])
+            })),
+            ..TestStore::new()
+        };
+        let harness = Harness::new(store, CONFIG);
+        let _release = ReleaseOnDrop(Arc::clone(&release));
+        let executor = harness.executor();
+        executor.submit(&[query(1, &["running"])]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        let before = version_state(executor);
+        let generation = Some("00000000000000000000000000000056");
+        assert!(matches!(
+            executor.weight_version_needs_isolation("v2"),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(matches!(
+            executor.prepare_weight_version("v2", generation),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(matches!(
+            executor.set_weight_version_with_generation("v2", generation),
+            Err(ExecutorError::Busy)
+        ));
+        assert_eq!(version_state(executor), before);
+        release.set();
+        harness.wait(1);
+
+        executor.shared.lock().epoch = u64::MAX;
+        let before = version_state(executor);
+        assert!(matches!(
+            executor.weight_version_needs_isolation("v2"),
+            Err(ExecutorError::Invalid(_))
+        ));
+        assert!(matches!(
+            executor.prepare_weight_version("v2", generation),
+            Err(ExecutorError::Invalid(_))
+        ));
+        assert!(matches!(
+            executor.set_weight_version_with_generation("v2", generation),
+            Err(ExecutorError::Invalid(_))
+        ));
+        assert_eq!(version_state(executor), before);
+    }
+
+    #[test]
     fn clearing_the_namespace_deletes_its_objects_and_keeps_its_name() {
         let harness = Harness::new(TestStore::new(), CONFIG);
         let executor = harness.executor();
@@ -2290,7 +3407,7 @@ mod tests {
                 page_offset: 0,
             },
         ];
-        let names = executor.object_keys(&keys).unwrap();
+        let (_, _, names) = executor.object_keys(&keys).unwrap();
         let mut payload = vec![7_u8; 16];
         memory
             .batch_put_from(

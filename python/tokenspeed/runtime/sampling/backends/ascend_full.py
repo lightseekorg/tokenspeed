@@ -71,8 +71,12 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         # Clamp before the int32 pool write, including values larger than
-        # int32. The disabled sentinel must retain whole-vocabulary sampling.
-        if sp.top_k != _TOP_K_DISABLED and sp.top_k > self._MAX_TOP_K:
+        # int32. Resolve the implicit top-p cap here so eager, graph replay
+        # and chain verification all read the same per-request pool scalars.
+        if sp.top_k == _TOP_K_DISABLED:
+            if self.config.npu_sampling_top_p_top_k_cap and sp.top_p < 1.0:
+                sp = msgspec.structs.replace(sp, top_k=self._MAX_TOP_K)
+        elif sp.top_k > self._MAX_TOP_K:
             sp = msgspec.structs.replace(sp, top_k=self._MAX_TOP_K)
         super()._reset_slot(pool_idx, sp)
 

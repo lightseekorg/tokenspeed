@@ -41,7 +41,9 @@ _LANES = gl.constexpr(64)
 _PARTIAL_BLOCK = gl.constexpr(8192)
 # Tokens the GEMV-projection launch takes: the decode GEMV's MFMA tile.
 _GEMV_TOKENS = range(5, gemv.MAX_M + 1)
-_GEMV_OUTPUT_SIZES = frozenset({6288})
+# The K3 MLA q_a/kv_a/gate projection, K3.1's DSA decode projection (the MLA
+# one with the indexer's key and head-weight rows) and the KDA qkvfab projection.
+_GEMV_OUTPUT_SIZES = frozenset({3648, 3808, 6288})
 # Half the hidden size, padded to a power of two: 8 waves x 64 lanes x 8 elements.
 _HALF = gl.constexpr(4096)
 _HALF_WAVES = gl.constexpr(8)
@@ -149,7 +151,7 @@ def _dual_partial_triton_order(
     gl.store(sum_b_ptr + token, s_b)
 
 
-@gluon.jit(do_not_specialize=("num_tokens",))
+@gluon.jit(do_not_specialize=("num_blocks", "num_tokens"))
 def gluon_linear_attnres_partials_gemv_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -216,7 +218,7 @@ def gluon_linear_attnres_partials_gemv_gfx950(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -387,7 +389,7 @@ def gluon_linear_attnres_partials_gfx950(
     gl.store(sum_b_ptr + token, sum_b)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_m4_gfx950(
     hidden_ptr,
     weight_ptr,

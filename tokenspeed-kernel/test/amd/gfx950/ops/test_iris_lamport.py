@@ -40,7 +40,8 @@ def _require_iris():
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_lamport_buffer_polling_codegen(rank, tmp_path):
+@pytest.mark.parametrize("fused_moe", (False, True))
+def test_lamport_buffer_polling_codegen(rank, fused_moe, tmp_path):
     """Cache flags alone do not prevent a future compiler from hoisting loads.
 
     Compile without launching and require all seven 16-byte peer reads to
@@ -52,26 +53,52 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         iris_arch_policy,
         iris_lamport_allreduce,
     )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+        iris_k3moe_lamport_allreduce_topk,
+    )
 
-    fn = iris_lamport_allreduce
-    signature = {
-        name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+    constants = {
+        "RANK": rank,
+        "WORLD_SIZE": 8,
+        "MAX_ELEMENTS": 6 * 10752,
+        "NUM_STAGES": 3,
+        "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+            ArchVersion(9, 5)
+        ).peer_signal_store,
     }
-    signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    if fused_moe:
+        fn = iris_k3moe_lamport_allreduce_topk
+        signature = {
+            "partials_ptr": "*bf16",
+            "input_sym_ptr": "*bf16",
+            "region_sym_ptr": "*bf16",
+            "output_ptr": "*bf16",
+            "epochs": "*i32",
+            "regions": ("i64",) * 8,
+            "TOTAL_ELEMENTS": "i32",
+            "ROUTED_ELEMENTS": "i32",
+        }
+        constants.update(ROUTED_WIDTH=3584, TOPK=8)
+    else:
+        fn = iris_lamport_allreduce
+        signature = {
+            name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+        }
+        signature.update({name: "i64" for name in fn.arg_names[4:12]})
+        signature["TOTAL_ELEMENTS"] = "i32"
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if name == "regions":
+            attrs.update(
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+            )
+        elif name in signature and name not in ("TOTAL_ELEMENTS", "ROUTED_ELEMENTS"):
+            attrs[(index,)] = [["tt.divisibility", 16]]
     source = gluon._runtime.GluonASTSource(
         fn,
         signature,
-        constexprs={
-            "RANK": rank,
-            "WORLD_SIZE": 8,
-            "TOTAL_ELEMENTS": 6 * 10752,
-            "MAX_ELEMENTS": 6 * 10752,
-            "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
-                ArchVersion(9, 5)
-            ).peer_signal_store,
-        },
-        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+        constexprs=constants,
+        attrs=attrs,
     )
     kernel = triton.compile(
         source,
@@ -102,8 +129,9 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_lamport_two_shot_polling_codegen(tmp_path):
-    """Both two-shot exchanges must reread all seven peer mailboxes per retry."""
+@pytest.mark.parametrize("world_size", (4, 8))
+def test_lamport_two_shot_polling_codegen(world_size, tmp_path):
+    """Both two-shot exchanges must reread every peer mailbox per retry."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
@@ -116,14 +144,14 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         "region_sym_ptr": "*bf16",
         "output_ptr": "*bf16",
         "epochs": "*i32",
-        "regions": ("i64",) * 8,
+        "regions": ("i64",) * world_size,
         "total_elements": "i32",
     }
     attrs = {}
     for index, name in enumerate(fn.arg_names):
         if name == "regions":
             attrs.update(
-                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(world_size)}
             )
         elif name in signature:
             attrs[(index,)] = [["tt.divisibility", 16]]
@@ -132,7 +160,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         signature,
         constexprs={
             "RANK": 3,
-            "WORLD_SIZE": 8,
+            "WORLD_SIZE": world_size,
             "MAX_SHARD_ELEMENTS": 131072,
             "NUM_STAGES": 3,
             "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
@@ -147,7 +175,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         options={"num_warps": 1},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / "two-shot.amdgcn").write_text(assembly)
+    (tmp_path / f"two-shot-{world_size}.amdgcn").write_text(assembly)
     # Group system-scope peer loads by the loop that LLVM reports for them.
     loops = {}
     header = None
@@ -162,10 +190,13 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         for body in loops.values()
         if any("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
     ]
-    assert sorted(
-        sum("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
-        for body in polls
-    ) == [7, 7], "each exchange must poll all seven peers per retry"
+    assert (
+        sorted(
+            sum("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
+            for body in polls
+        )
+        == [world_size - 1] * 2
+    ), "each exchange must poll every peer per retry"
     assert all(
         votes_with_subgroup_mask(body) for body in polls
     ), "each exchange must branch on one subgroup lane mask per retry"
@@ -267,9 +298,6 @@ def _check_lamport_state(rank, device):
     state = _new_state(rank, device, 10 * 10752, torch.bfloat16)
     region = state.lamport.mailbox
     epochs = state.lamport.epochs
-    # Seven-row all-reduce window, wider than the MoE input gather's 64 rows of 1024.
-    assert region.shape == (3, 8, 7 * 10752)
-    assert epochs.shape == (147,)
     # Even rows from 8 take the two-shot through its own mailboxes.
     assert state.two_shot_region.shape == (3, 2, 8, 10 * 10752 // 1024 * 1024 // 8)
     torch.testing.assert_close(

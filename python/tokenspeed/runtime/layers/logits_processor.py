@@ -25,7 +25,11 @@ import functools
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.communication.triton import (
+    TritonRSAGState,
+    all_gather_inner,
+    create_state,
+)
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
@@ -75,6 +79,7 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -177,7 +182,8 @@ class VocabParallelArgmax:
     Each rank packs its shard's row maximum and global index into an int64
     key, and an all-reduce MAX over the group picks the same token the
     argmax of the gathered row would. It exchanges 8 bytes per row instead
-    of the logits shards.
+    of the logits shards, through the group's prepared word MAX where the
+    backend has one.
     """
 
     def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
@@ -187,7 +193,8 @@ class VocabParallelArgmax:
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
         vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
-        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        if not get_global_backend().try_word_max(keys, self.tp_group):
+            keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
         return argmax_key_index(keys, out=torch.empty_like(keys))
 
 
@@ -456,6 +463,12 @@ class LogitsProcessor(nn.Module):
         """The dtype of the shard logits ``sampled_vocab_shard`` hands the sampler: the head's projection dtype."""
         return lm_head.weight.dtype
 
+    def sampled_shard_softcap(self) -> tuple[float | None, str | None]:
+        """The softcap ``_finish_logits`` applies, as ``vocab_shard_topk``'s
+        ``(softcap, softcap_form)``: the fused sigmoid form."""
+        cap = self.final_logit_softcapping
+        return (cap, "sigmoid") if cap else (None, None)
+
     def keep_sampled_logits_vocab_sharded(
         self,
         lm_head: VocabParallelEmbedding,
@@ -478,7 +491,8 @@ class LogitsProcessor(nn.Module):
 
         Returns:
             Whether the head's layout allows it (then it is on): plain TP
-            vocabulary sharding of an unpadded 16-bit head whose token ids are
+            vocabulary sharding of a dense 16-bit head (its rows padded past
+            the vocabulary at most in the last shards) whose token ids are
             exact in the fp32 the candidates travel in, in shards the sampler
             takes.
         """
@@ -494,18 +508,27 @@ class LogitsProcessor(nn.Module):
             or self.dp_lm_head_tp
             or self.dp_sampling_enabled
             or self.do_argmax
-            or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+            # A quantized head's method; a dense head's (Inkling2's FP32
+            # output) only chooses the GEMM's output precision.
+            or (
+                should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+                and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+            )
             or self.config.vocab_size > 2**24
         ):
             return False
         columns = int(shard.num_org_elements)
+        vocab_size = self.config.vocab_size
+        # The real vocabulary ends in the last shard; the head's padding
+        # rows past it are never sampled (the gathered rows drop them).
+        last = vocab_size - columns * (self.tp_size - 1)
         if (
             int(shard.num_added_elements) != 0
             or int(shard.num_org_elements_padded) != columns
-            or columns * self.tp_size != self.config.vocab_size
+            or not 0 < last <= columns
             or int(shard.org_vocab_start_index) != columns * self.tp_rank
             or weight.dtype not in (torch.bfloat16, torch.float16)
-            or not supports(self.sampled_shard_dtype(lm_head), columns, self.tp_size)
+            or not supports(self.sampled_shard_dtype(lm_head), last, self.tp_size)
         ):
             return False
         self._sampled_shard_start = columns * self.tp_rank
@@ -527,11 +550,15 @@ class LogitsProcessor(nn.Module):
             The shard ``forward`` hands the sampler as ``vocab_shard``.
         """
         assert self._sampled_shard_start is not None
+        softcap, softcap_form = self.sampled_shard_softcap()
+        start = self._sampled_shard_start
         return SampledVocabShard(
             logits=logits,
-            vocab_start=self._sampled_shard_start,
+            columns=min(logits.shape[1], self.config.vocab_size - start),
+            vocab_start=start,
             logit_scale=self.logit_scale,
-            softcap=self.final_logit_softcapping,
+            softcap=softcap,
+            softcap_form=softcap_form,
             tp_size=self.tp_size,
             tp_group=self.tp_group,
             gather_full=functools.partial(
@@ -622,7 +649,9 @@ class LogitsProcessor(nn.Module):
             return True
         return group_has_fabric(self.tp_group)
 
-    def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
+    def _init_all_gather_state(
+        self, lm_head: VocabParallelEmbedding, words_per_logit: int
+    ) -> TritonRSAGState | None:
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
@@ -638,13 +667,17 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        key = (self.tp_group, vocab_padded, self._logits_ag_max_tokens)
+        key = (
+            self.tp_group,
+            vocab_padded * words_per_logit,
+            self._logits_ag_max_tokens,
+        )
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
                 max_tokens=self._logits_ag_max_tokens,
-                hidden_size=vocab_padded,
+                hidden_size=vocab_padded * words_per_logit,
                 device=None,
             )
         return self._LOGITS_AG_STATES[key]
@@ -1501,7 +1534,7 @@ class LogitsProcessor(nn.Module):
                 logits, lm_head, require_full_vocab=require_full_vocab
             )
 
-        logits = logits[:, : self.config.vocab_size].contiguous()
+        logits = self._vocab_logits(logits[:, : self.config.vocab_size])
 
         if self.final_logit_softcapping:
             fused_softcap_generic(
@@ -1520,31 +1553,38 @@ class LogitsProcessor(nn.Module):
         require_full_vocab: bool,
     ) -> torch.Tensor:
         """Gather full-vocabulary logits, using a private buffer when required."""
-        # The multicast buffer/kernel is BF16-only; retain other logits dtypes
-        # through the existing collective, including when a state is cached.
+        # The multicast kernel moves BF16 words, or two words per FP32 logit.
         # A private full-vocab result never uses the shared buffer either.
-        state = (
-            self._all_gather_state
-            if logits.dtype == torch.bfloat16 and not require_full_vocab
-            else None
+        words_per_logit = (
+            {torch.bfloat16: 1, torch.float32: 2}.get(logits.dtype, 0)
+            if not require_full_vocab
+            else 0
         )
+        state = self._all_gather_state if words_per_logit else None
         if state is self._LOGITS_AG_STATE_UNINITIALIZED:
             # create_state rendezvouses; leave it for an eager call.
             if is_current_stream_capturing(logits.device):
                 state = None
             else:
-                state = self._all_gather_state = self._init_all_gather_state(lm_head)
+                state = self._all_gather_state = self._init_all_gather_state(
+                    lm_head, words_per_logit
+                )
 
-        if state is not None and logits.size(0) <= self._logits_ag_max_tokens:
+        words = logits.view(torch.bfloat16) if words_per_logit else None
+        if (
+            state is not None
+            and logits.size(0) <= self._logits_ag_max_tokens
+            and words.size(-1) * self.tp_size <= state.hidden_dim
+        ):
             # DP target and draft share this buffer; retain its entry barrier.
             # The existing plain TP path has intervening synchronization.
             logits = all_gather_inner(
                 state,
-                logits,
-                tp_hidden_dim=logits.size(-1) * self.tp_size,
+                words,
+                tp_hidden_dim=words.size(-1) * self.tp_size,
                 skip_entry_sync=not self.dp_lm_head_tp,
                 safe=False,
-            )
+            ).view(logits.dtype)
         elif (
             current_platform().is_cdna4
             and not require_full_vocab
@@ -1575,6 +1615,11 @@ class LogitsProcessor(nn.Module):
                 dim=1,
             )
         return logits
+
+    def _vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """The vocabulary columns as a tensor the caller owns. ``logits`` is a
+        column slice, possibly a view of the group's shared gather buffer."""
+        return logits.contiguous()
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
         state = self._prepared_dist_argmax_state(logits.dtype)

@@ -20,9 +20,9 @@
 
 //! One round's frontend messages as the attention-TP group's first member
 //! relays them to the others: the messages' own wire frames, and whether
-//! the first member is stopping. With the L3 tier, every member's storage
-//! report rides the same exchange ([`join`]), so a round agrees on both in
-//! one collective.
+//! the first member is stopping. Every member's reports (the L3 tier's, peer
+//! sharing's) ride the same exchange ([`join`]), so a round agrees on all of
+//! them in one collective.
 
 use bytes::Bytes;
 use ts_wire::EngineRequest;
@@ -73,25 +73,31 @@ pub fn decode(payload: &[u8]) -> Result<(bool, Vec<EngineRequest>), RelayError> 
     Ok((stop, messages))
 }
 
-/// One member's part of a round's exchange with the L3 tier: the relay
-/// payload (the first member's; the others send none) and its storage
-/// report.
-pub fn join(relay: &[u8], report: &[u8]) -> Vec<u8> {
+/// One member's part of a round's exchange: the relay payload (the first
+/// member's; the others send none) and its reports, in an order every member
+/// shares.
+pub fn join(relay: &[u8], reports: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Writer::new();
     out.bytes(relay);
-    out.bytes(report);
+    out.count(reports.len());
+    for report in reports {
+        out.bytes(report);
+    }
     out.finish()
 }
 
 /// What [`join`] put together.
-pub fn split(payload: &[u8]) -> Result<(&[u8], &[u8]), RelayError> {
+pub fn split(payload: &[u8]) -> Result<(&[u8], Vec<&[u8]>), RelayError> {
     let mut reader = Reader::new(payload);
-    let relay = reader.bytes();
-    let report = reader.bytes();
-    relay
-        .zip(report)
-        .and_then(|parts| reader.finish(parts))
-        .ok_or(RelayError::Truncated)
+    let parts = (|| {
+        let relay = reader.bytes()?;
+        let count = reader.count()?;
+        let reports = (0..count)
+            .map(|_| reader.bytes())
+            .collect::<Option<Vec<_>>>()?;
+        reader.finish((relay, reports))
+    })();
+    parts.ok_or(RelayError::Truncated)
 }
 
 #[cfg(test)]
@@ -130,12 +136,19 @@ mod tests {
     }
 
     #[test]
-    fn a_storage_report_rides_with_the_relay() {
+    fn the_reports_ride_with_the_relay() {
         let relay = encode(true, &[EngineRequest::Abort(vec!["r0".to_owned()])]);
-        let joined = join(&relay, b"report");
-        assert_eq!(split(&joined).unwrap(), (&relay[..], &b"report"[..]));
+        let reports = vec![b"storage".to_vec(), b"peer".to_vec()];
+        let joined = join(&relay, &reports);
+        assert_eq!(
+            split(&joined).unwrap(),
+            (&relay[..], vec![&b"storage"[..], &b"peer"[..]])
+        );
         // A member other than the first relays nothing.
-        assert_eq!(split(&join(&[], b"")).unwrap(), (&[][..], &[][..]));
+        assert_eq!(
+            split(&join(&[], &[Vec::new()])).unwrap(),
+            (&[][..], vec![&[][..]])
+        );
         assert!(matches!(
             split(&joined[..joined.len() - 1]),
             Err(RelayError::Truncated)

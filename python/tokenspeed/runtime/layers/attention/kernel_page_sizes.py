@@ -50,6 +50,10 @@ MLA_PAGE_SIZE = 64
 MSA_PAGE_SIZE = 128
 TRTLLM_MHA_PAGE_SIZE = 64
 
+# The gfx950 Gluon MHA decode kernels (tokenspeed_kernel/ops/attention/mha/
+# gluon.py: page_size {64}) stream one 64-token page per tile.
+GLUON_MHA_DECODE_PAGE_SIZE = 64
+
 # Constrained kernels: default within the supported set.
 TRTLLM_MLA_DEFAULT_PAGE_SIZE = 64
 TOKENSPEED_MLA_DEFAULT_PAGE_SIZE = 64

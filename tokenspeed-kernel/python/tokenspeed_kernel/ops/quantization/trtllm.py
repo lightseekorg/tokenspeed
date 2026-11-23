@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._optional import has_trtllm_kernel
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -28,52 +27,41 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.cuda.trtllm_fp8_quant import (
+    fp8_quantize_1x128,
+    quantize_e4m3_activation,
+)
 
 platform = current_platform()
-_HAS_TRTLLM_KERNEL = platform.is_nvidia and has_trtllm_kernel()
+_IS_NVIDIA = platform.is_nvidia
 __all__ = []
 
 
 def _per_token_group_quant_8bit(
-    x: torch.Tensor, group_size: int, use_ue8m0: bool
+    x: torch.Tensor, group_size: int, use_ue8m0: bool, *, mn_major: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _HAS_TRTLLM_KERNEL:
-        raise RuntimeError(
-            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package "
-            "and deep_ep"
-        )
     if group_size != 128:
         raise ValueError(
             "trtllm fp8_quantize_1x128 only supports group_size=128, "
             f"got {group_size}"
         )
-    q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
-    if scale.ndim == 1:
-        # The flat-buffer ABI uses 4-row alignment and trailing padding.
-        rows, columns = x.shape
-        padded_rows = (rows + 3) // 4 * 4
-        groups = columns // group_size
-        scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
-    return q, scale
+    return fp8_quantize_1x128(x, use_ue8m0, mn_major=mn_major)
 
 
-if _HAS_TRTLLM_KERNEL:
-    # DeepEP must initialize before TRT-LLM's static CUDA runtime.
-    import deep_ep  # noqa: F401
-    import trtllm_kernel  # noqa: F401
+if _IS_NVIDIA:
 
     _FP8_DTYPE = torch.float8_e4m3fn
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
     ) -> None:
-        q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
+        q, s = quantize_e4m3_activation(input)
         output.copy_(q)
         scale.copy_(s.float().squeeze(-1))
 
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
         qweight, _scale = _per_token_group_quant_8bit(
-            x, group_size=128, use_ue8m0=False
+            x, group_size=128, use_ue8m0=False, mn_major=False
         )
         return qweight.float()
 
@@ -114,18 +102,18 @@ if _HAS_TRTLLM_KERNEL:
             # The op's own codes and its scales as FP32 [..., 1]: one launch,
             # no copies into new buffers (the scales are reshaped, or
             # converted only if the op wrote another dtype).
-            q, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
+            q, scale = quantize_e4m3_activation(x)
             if q.dtype != _FP8_DTYPE:
                 raise ValueError(f"TRT-LLM token FP8 wrote {q.dtype}, not E4M3")
             return q.reshape(x.shape), scale.float().reshape(*x.shape[:-1], 1)
 
         if granularity == "token_group":
-            q, scale = _per_token_group_quant_8bit(
+            return _per_token_group_quant_8bit(
                 x,
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
+                mn_major=False,
             )
-            return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 
@@ -158,17 +146,16 @@ if _HAS_TRTLLM_KERNEL:
         scale_encoding: str,
         enable_pdl: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return FP8 values and a logical [M,K/128] view of native scales."""
+        """Return FP8 values and [M, K/128] scales stored MN-major."""
         if granularity != "token_group" or scale_encoding != "float32":
             raise ValueError(
                 "MN-major FP8 quantization requires FP32 token-group scales"
             )
         if enable_pdl:
             raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
-        q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
-        # Preserve the native M stride; padding depends on the TRT-LLM ABI.
-        # Consumers may still need to align or repack these scales.
-        return q, scale.t()
+        return _per_token_group_quant_8bit(
+            x, group_size, use_ue8m0=False, mn_major=True
+        )
 
     __all__ = [
         "trtllm_fp8_token_group_128",

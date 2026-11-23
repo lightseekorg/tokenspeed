@@ -32,13 +32,14 @@ from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import triton_fp8_channel
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize_per_token
 from utils import assert_no_triton_compile, kernel_supported
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not kernel_supported("triton_mm_fp8_channel_small_m"),
-    reason="the small-M FP8 GEMM is registered for SM100 to SM103 (GPU only)",
+    reason="the small-M FP8 GEMM requires NVIDIA SM100 or newer",
 )
 
 FP8 = torch.float8_e4m3fn
@@ -163,7 +164,7 @@ def test_the_quantizer_agrees_with_trtllm():
     trt_codes, trt_scales = quantize_fp8(x, granularity="token", solution="trtllm")
     print(
         f"TRT-LLM scale dtype before the FP32 conversion: "
-        f"{torch.ops.tensorrt_llm.quantize_e4m3_activation(x)[1].dtype}"
+        f"{quant_trtllm.quantize_e4m3_activation(x)[1].dtype}"
     )
     torch.testing.assert_close(trt_scales, scales, rtol=2**-8, atol=0)
     amax = x.float().abs().amax(1, keepdim=True)

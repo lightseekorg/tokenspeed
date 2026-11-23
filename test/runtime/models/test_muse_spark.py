@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -33,6 +34,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 sys.path.insert(
@@ -60,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.models import muse_spark as module
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.monokernel import MonokernelState
 from tokenspeed.runtime.models.muse_spark import (
     RESIDUAL_GATE_EPS,
     MuseSparkAttention,
@@ -236,6 +239,27 @@ def _tiny_model() -> MuseSparkForConditionalGeneration:
         )
 
 
+def _forward_context(mode: str, rows: int) -> "ForwardContext":
+    """A one-request ForwardContext of ``rows`` rows in ``mode`` (DECODE or
+    EXTEND); the attention backend and KV pool are left to the test."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    decode = mode == "DECODE"
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows if decode else 1,
+        num_extends=0 if decode else 1,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode[mode],
+        output_layout=ForwardOutputLayout(
+            0 if decode else 1, 0 if decode else 1, rows if decode else 0, 1
+        ),
+    )
+
+
 def _stub(cls: type) -> torch.nn.Module:
     instance = cls.__new__(cls)
     torch.nn.Module.__init__(instance)
@@ -313,18 +337,25 @@ class _AddLayer(torch.nn.Module):
         hidden_states,
         ctx,
         attention_input,
+        attention_input_fp8,
         next_input_layernorm,
         owned_global_rows,
     ):
         self.received_attention_input = attention_input
+        self.received_attention_input_fp8 = attention_input_fp8
         self.received_next_norm = next_input_layernorm
-        # Emit a marker the model must hand to the next layer untouched.
-        return hidden_states + self.value, hidden_states * self.value
+        # Emit markers the model must hand to the next layer untouched.
+        return (
+            hidden_states + self.value,
+            hidden_states * self.value,
+            (hidden_states - self.value, hidden_states[:, 0]),
+        )
 
 
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -340,6 +371,11 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
     torch.testing.assert_close(
         model.layers[2].received_attention_input, (hidden + 1.0) * 2.0
     )
+    # So do the FP8 copies of those rows.
+    assert model.layers[0].received_attention_input_fp8 is None
+    rows, scales = model.layers[2].received_attention_input_fp8
+    torch.testing.assert_close(rows, hidden + 1.0 - 2.0)
+    torch.testing.assert_close(scales, (hidden + 1.0)[:, 0])
     # Each boundary gets the next layer's input norm; the last layer gets none.
     assert [layer.received_next_norm for layer in model.layers] == [
         "norm2.0",
@@ -359,7 +395,9 @@ class _CaptureSink:
 def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.config = SimpleNamespace(decode_monokernel=False)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -402,6 +440,60 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
     # produced, and rounds what it keeps itself.
     assert [index for index, _ in sink.captures] == [0, 1]
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
+
+
+class _StepState(MonokernelState):
+    """A monokernel state that records the model's calls; its launches
+    store the taps when ``stores_taps``."""
+
+    def __init__(self, stores_taps: bool, taps: torch.Tensor | None) -> None:
+        super().__init__(torch.zeros(0, dtype=torch.int64))
+        self.stores_taps = stores_taps
+        self.taps = taps
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+    def claim_taps(self, rows, ctx) -> bool:
+        self.calls.append("claim_taps")
+        return self.stores_taps
+
+    def tap_rows(self, rows: int) -> torch.Tensor:
+        return self.taps[:rows]
+
+
+def test_a_monokernel_step_brackets_the_layers_and_keeps_the_regular_capture() -> None:
+    # With a capture sink, the launches do not store the taps: the model
+    # captures the rows the layer before the tap returned, as without
+    # monokernels, between start_step and finish_step.
+    model, sink, ctx = _tapping_model([0])  # taps the stream entering layer 1
+    state = _StepState(stores_taps=False, taps=None)
+    model.monokernel_state = state
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert state.calls == ["start", "claim_taps", "finish"]
+    # A sink gets full rows unrounded (it rounds as it copies).
+    torch.testing.assert_close(sink.captures[0][1], hidden + 1.0, rtol=0, atol=0)
+
+
+def test_taps_the_launches_store_replace_the_models_captures() -> None:
+    model, sink, ctx = _tapping_model([0], with_sink=False)
+    stored = torch.full((2, 3), 7.0, dtype=torch.bfloat16)
+    model.monokernel_state = _StepState(stores_taps=True, taps=stored)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    _, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert len(aux) == 1 and aux[0] is not None
+    torch.testing.assert_close(aux[0], stored, rtol=0, atol=0)
 
 
 def test_idle_forward_taps_nothing() -> None:
@@ -489,6 +581,7 @@ def test_muse_mxfp4_honors_quark_expert_exclusions(
     assert kept.quantized_experts is False
     assert kept.expert_quant_kind == "unquant"
     assert kept.experts.w13_weight.dtype == torch.bfloat16
+    assert kept.experts.supports_deferred_finalize is True
     assert quantized.quantized_experts is True
     assert quantized.expert_quant_kind == "mxfp4"
     assert quantized.experts.w13_weight.dtype == torch.uint8
@@ -511,13 +604,23 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     torch.manual_seed(21)
     for parameter in module_.parameters():
         parameter.data.normal_(mean=0.0, std=0.02)
+    # The planned expert kernel may repack its weights; keep the loaded layout.
+    w13 = module_.experts.w13_weight.detach().clone()
+    w2 = module_.experts.w2_weight.detach().clone()
+    module_.experts.process_weights_after_loading(module_.experts)
     module_.gate.process_weights_after_loading(module_.gate)
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
-    output, sentinel, publish = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
+    output, sentinel = module_(
+        hidden,
+        router_input,
+        hidden.shape[0],
+        hidden.shape[0],
+        None,
+        project=True,
+        payload="bf16",
     )
-    assert sentinel is None and publish is None
+    assert sentinel is None
 
     logits = router_input @ module_.gate.weight
     logits *= module_.gate.multiplier
@@ -536,14 +639,12 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     for token in range(5):
         for slot in range(2):
             expert = int(ids[token, slot].item())
-            gate_up = (
-                compressed[token].float() @ module_.experts.w13_weight[expert].float().T
-            )
+            gate_up = compressed[token].float() @ w13[expert].float().T
             gate, up = gate_up.chunk(2)
             activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-            routes[token, slot] = (
-                activated.float() @ module_.experts.w2_weight[expert].float().T
-            ).to(torch.bfloat16)
+            routes[token, slot] = (activated.float() @ w2[expert].float().T).to(
+                torch.bfloat16
+            )
     scaled_routes = routes.float() * (module_.post_expert_norm.weight + 1.0).float()
     normalized_routes = _rmsnorm(scaled_routes, module_.post_expert_norm.eps)
     combined = (normalized_routes * route_weights[..., None]).sum(dim=1)
@@ -1029,28 +1130,44 @@ def test_embedding_norm_applies_to_supplied_input_embeds() -> None:
     torch.testing.assert_close(once, normalized.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("mode", ["DECODE", "EXTEND", "MIXED"])
 def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    """The layer hands raw q/k/v and positions to PagedAttention, whose
-    prologue normalizes, rotates and writes K/V."""
+    """The layer hands raw q/k/v of its QKV projection and the positions to
+    PagedAttention, whose prologue normalizes, rotates and writes K/V."""
     heads, kv_heads, head_dim = 4, 2, 8
     attention = _stub(MuseSparkAttention)
     attention.hidden_size, attention.head_dim = heads * head_dim, head_dim
     attention.num_heads, attention.num_kv_heads = heads, kv_heads
     attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
     attention.rms_norm_eps = 1e-5
-    width = 2 * attention.q_size + 2 * attention.kv_size
-    rows = torch.arange(3 * width, dtype=torch.bfloat16).view(3, width)
-    attention.qkv_proj = lambda x: (rows, None)
+    attention.owned_projections = None
+    attention.qkv_proj = QKVOGateParallelLinear(
+        hidden_size=attention.hidden_size,
+        head_size=head_dim,
+        total_num_heads=heads,
+        total_num_kv_heads=kv_heads,
+        quant_config=None,
+        prefix="qkv_proj",
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        replicate_for_owned_rows=False,
+    )
+    torch.manual_seed(5)
+    attention.qkv_proj.weight.data.normal_(0, 0.1)
     attention._project = lambda x: (x, None, 1)
     attention.attn = Mock(return_value=torch.zeros(3, attention.q_size))
     monkeypatch.setattr(
         module, "weightless_rmsnorm_gated_sigmoid", lambda out, *args: out
     )
     monkeypatch.setattr(module, "pdl_enabled", lambda: False)
-    positions, ctx = torch.arange(3), SimpleNamespace()
-    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None)
+    positions = torch.arange(3)
+    ctx = _forward_context(mode, 3)
+    normalized = torch.randn(3, attention.hidden_size)
+    rows = attention.qkv_proj(normalized)[0]
+    attention(positions, normalized, None, ctx, None, True)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1060,13 +1177,16 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 
 
 @requires_gpu
+@pytest.mark.parametrize("project", [False, True])
 @pytest.mark.parametrize("with_rope", [False, True])
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_owned_attention_stores_prepared_rows_once(
-    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
+    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int, project: bool
 ) -> None:
     """Prepared receiver outputs pass through the real prologue's cache store,
-    preserving prefix slots and reaching attention without another head norm."""
+    preserving prefix slots and reaching attention without another head norm.
+    Without ``project`` the gated heads come back for the token owners'
+    output projection."""
     from tokenspeed_kernel.ops.attention.prologue import HeadKVCache
 
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -1120,10 +1240,15 @@ def test_owned_attention_stores_prepared_rows_once(
         project_owned_rows=lambda value, global_rows: value,
         tp_group=tuple(range(world_size)),
     )
-    attention._project = lambda value: (value, None, 1)
+    attention._project = (
+        (lambda value: (value, None, 1))
+        if project
+        else (lambda value: pytest.fail("heads for the owners were projected"))
+    )
+    attention.owned_projections = None
 
     attention.iris_state = SimpleNamespace(
-        all_to_all_transpose_qkvg_norm_rope=lambda *args: (
+        all_to_all_transpose_qkvg_norm_rope=lambda *args, payload: (
             prepared_q,
             prepared_k,
             prepared_v,
@@ -1156,6 +1281,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            sparse_topk=SparseTopKShare(),
             query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
@@ -1163,7 +1289,7 @@ def test_owned_attention_stores_prepared_rows_once(
             dtype=torch.bfloat16, kv_write_target=write_target
         ),
     )
-    output, sentinel, ranks = attention(positions, local, ctx, rows)
+    output, sentinel, ranks = attention(positions, local, None, ctx, rows, project)
     assert sentinel is None and ranks == 1
     assert torch.equal(output, prepared_q)
     assert len(write_targets) == 1
@@ -1188,7 +1314,14 @@ def test_mixed_rounds_are_rejected_before_any_attention_runs() -> None:
     ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_mixed=lambda: True))
     with pytest.raises(ValueError, match="mixed"):
         MuseSparkDecoderLayer.forward(
-            SimpleNamespace(), torch.arange(3), torch.zeros(3, 8), ctx, None, None, None
+            SimpleNamespace(),
+            torch.arange(3),
+            torch.zeros(3, 8),
+            ctx,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -1224,6 +1357,275 @@ def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
             [full["q"][q_rows], full["k"], full["v"], full["g"][q_rows]]
         )
         assert torch.equal(layer.weight.data, expected)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dense-fp8-small-m qkv runs the QKV projection in FP8 only inside
+    its row window and in decode forwards, and a producer's FP8 copy gives the
+    bits the layer's own quantization gives."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    with torch.device("cuda"):
+        # A TP4 rank's shape: Q 2048 + gate 2048 + K 256 + V 256 of 8192.
+        layer = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    layer.weight.data.copy_(torch.randn_like(layer.weight) * 0.02)
+    assert not layer.dense_fp8.applies(33)
+    layer.prepare_fp8_weight()
+    x = torch.randn(257, 8192, device="cuda").bfloat16()
+    for rows in (1, 16, 32, 129, 172, 257):
+        assert torch.equal(layer.forward_rows(x[:rows], None), layer(x[:rows])[0])
+    for rows in (33, 64, 65, 128):
+        projected = layer.forward_rows(x[:rows], None)
+        reference = layer(x[:rows])[0]
+        assert not torch.equal(projected, reference)
+        # Its numerics: the skinny FP8 GEMM's and the row code's own tests.
+        given = layer.forward_rows(x[:rows], module._quantize_rows_fp8(x[:rows]))
+        assert torch.equal(given, projected)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("mode", ["DECODE", "EXTEND"])
+def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """With --dense-fp8-small-m, a decode forward's attention gets the FP8
+    projection's q/k/v and an extend forward of the same rows the BF16
+    projection's (the two differ at these rows), so prompt K / V stays BF16."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    heads, kv_heads, head_dim, rows = 32, 4, 64, 48
+    attention = _stub(MuseSparkAttention)
+    attention.hidden_size, attention.head_dim = 8192, head_dim
+    attention.num_heads, attention.num_kv_heads = heads, kv_heads
+    attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
+    attention.rms_norm_eps = 1e-5
+    attention.owned_projections = None
+    with torch.device("cuda"):
+        attention.qkv_proj = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=head_dim,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    attention.qkv_proj.weight.data.copy_(
+        torch.randn_like(attention.qkv_proj.weight) * 0.02
+    )
+    attention.qkv_proj.prepare_fp8_weight()
+    attention._project = lambda x: (x, None, 1)
+    attention.attn = Mock(
+        return_value=torch.zeros(rows, attention.q_size, device="cuda")
+    )
+    monkeypatch.setattr(
+        module, "weightless_rmsnorm_gated_sigmoid", lambda out, *args: out
+    )
+    normalized = torch.randn(rows, 8192, device="cuda").bfloat16()
+    fp8 = attention.qkv_proj.forward_rows(normalized, None)
+    bf16 = attention.qkv_proj(normalized)[0]
+    assert not torch.equal(fp8, bf16)
+    expected = fp8 if mode == "DECODE" else bf16
+    ctx = _forward_context(mode, rows)
+    attention(torch.arange(rows, device="cuda"), normalized, None, ctx, None, True)
+    q, k, v, _, _ = attention.attn.call_args.args
+    q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
+    assert torch.equal(q, expected[:, :q_end])
+    assert torch.equal(k, expected[:, q_end:kv_end])
+    assert torch.equal(v, expected[:, kv_end : kv_end + attention.kv_size])
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+def test_dense_fp8_refuses_a_projection_without_a_tuned_gemm_at_load() -> None:
+    """Preparing a projection whose shape the skinny FP8 GEMM has no config
+    for (the TP8 QKV slice) fails at load, naming it, instead of running
+    another FP8 kernel while serving."""
+    fp8 = module._DenseFp8Weight(
+        "qkv_proj",
+        True,
+        module._DENSE_FP8_QKV_MIN_ROWS,
+        module._DENSE_FP8_MAX_ROWS,
+    )
+    with pytest.raises(ValueError, match=r"qkv_proj projection \[2304, 8192\]"):
+        fp8.prepare(torch.zeros(2304, 8192, device="cuda", dtype=torch.bfloat16))
+
+
+def _loaded(model: MuseSparkForConditionalGeneration):
+    """``model`` as if its checkpoint (random weights) had loaded; the caller
+    sets the server arguments the warm-up reads."""
+    model._loaded_audio = {
+        name for name, _ in model.named_parameters() if name.startswith("audio_tower.")
+    }
+    # The loader's post-processing hooks, run before post_quant_warmup.
+    # Like the loader, this walks every module, so it asks for the hooks.
+    for _, layer in model.named_modules():
+        quant_method = getattr(layer, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(layer)
+        process = getattr(layer, "process_weights_after_loading", None)
+        if process is not None:
+            process(layer)
+    return model
+
+
+@requires_gpu
+@pytest.mark.parametrize("value", ["none", "qkv"])
+def test_post_quant_warmup_converts_or_refuses_by_the_flag(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """At the default, loading a real model makes no FP8 copy. With qkv,
+    loading checks that a weight-streaming FP8 GEMM serves the QKV weight:
+    this model's [hidden 256] QKV has none, so loading refuses it by name
+    rather than serving another kernel."""
+    if value != "none" and not current_platform().is_cdna4:
+        pytest.skip("the skinny FP8 GEMM is gfx950-only")
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", value)
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    model = _loaded(_tiny_model())
+    if value == "none":
+        model.post_quant_warmup()
+        for layer in model.model.layers:
+            assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+        return
+    with pytest.raises(
+        ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
+    ):
+        model.post_quant_warmup()
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the boundary's FP8 copy is gfx950-only"
+)
+def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-up compiles the MLP boundary's FP8-copy kernel from a real
+    model's norms: after it, that boundary at any row count compiles
+    nothing. A model without layers warms nothing."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel.ops.residual import post_norm_residual_pre_norm_bf16_fp8
+    from tokenspeed_kernel.ops.residual._triton import gated_boundary_fp8
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    with torch.device("cuda"):
+        model = MuseSparkForConditionalGeneration(
+            config=_config(2),
+            mapping=_single_rank_mapping(),
+            quant_config=None,
+            is_multimodal_active=True,
+            mm_attention_backend="triton_attn",
+        )
+    for norm in model.modules():
+        if isinstance(norm, module.MuseSparkRMSNorm) and norm.weight is not None:
+            norm.weight.data.fill_(0.5)
+    kernel = gated_boundary_fp8._post_norm_residual_pre_norm_fp8_kernel
+    layer, following = model.model.layers[0], model.model.layers[1]
+
+    def boundaries(rows: int) -> None:
+        # The serving MLP boundary, with the norms the warm-up reads.
+        stream = torch.randn(
+            rows, model.config.hidden_size, dtype=torch.float32, device="cuda"
+        )
+        branch = torch.randn_like(stream).bfloat16()
+        post, nxt = layer.post_feedforward_layernorm, following.input_layernorm
+        post_norm_residual_pre_norm_bf16_fp8(
+            stream, branch, post.weight, post.eps, post.weight_offset,
+            *layer.post_feedforward_residual_gate._gate_coefficients(),
+            nxt.weight, nxt.eps, nxt.weight_offset, False, None, 1,
+        )  # fmt: skip
+
+    helpers.assert_warmup_covers(
+        (kernel,),
+        lambda: model._warm_dense_fp8_boundaries(),
+        boundaries,
+        (17, 33, 64, 65, 128),
+    )
+    model.model.layers = torch.nn.ModuleList()
+    # From an empty JIT cache, so a binary from above cannot hide a compile.
+    kernel.device_caches.clear()
+    with helpers.assert_no_triton_compile(kernel):
+        model._warm_dense_fp8_boundaries()
+
+
+def _enabled_copy(name: str) -> "module._DenseFp8Weight":
+    """An enabled FP8 copy over the QKV window; a placeholder stands in for
+    the converted weight, since the writers ask only the window."""
+    fp8 = module._DenseFp8Weight(
+        name, True, module._DENSE_FP8_QKV_MIN_ROWS, module._DENSE_FP8_MAX_ROWS
+    )
+    fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
+    fp8.scale = torch.empty(0)
+    return fp8
+
+
+@pytest.mark.parametrize("rows", [32, 33, 128, 129])
+@pytest.mark.parametrize("owned_rows", [False, True])
+@pytest.mark.parametrize("mailbox", [False, True])
+def test_layer_boundaries_write_an_fp8_copy_only_where_it_is_read(
+    bf16_default_dtype, rows, owned_rows, mailbox
+) -> None:
+    """The MLP boundary writes the next QKV's FP8 copy for rows in the QKV
+    window, not for owned rows or a mailbox branch."""
+    layer = _tiny_model().model.layers[0]
+    layer.self_attn.qkv_proj.dense_fp8 = _enabled_copy("qkv_proj")
+    in_window = 33 <= rows <= 128
+    kwargs = dict(owned_rows=owned_rows, mailbox=mailbox)
+    assert layer.mlp_boundary_writes_fp8(rows, **kwargs) == (
+        in_window and not owned_rows and not mailbox
+    )
+
+
+def test_weight_update_is_refused_with_dense_fp8_copies(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_model()
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+
+    with pytest.raises(RuntimeError, match="dense-fp8-small-m"):
+        with weight_update_session([model], require_complete=False, cpu_group=None):
+            pass
+
+    assert not model._weight_update_active
 
 
 def _forward_ctx(decode: bool) -> SimpleNamespace:
@@ -1350,7 +1752,7 @@ def test_reloaded_gates_refresh_the_cached_coefficients_in_place() -> None:
     assert torch.equal(second[0], expected[0]) and torch.equal(second[1], expected[1])
 
 
-def test_quantized_combined_prepares_routing_once_per_token_count(
+def test_experts_combined_prepares_routing_once_per_token_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
@@ -1387,7 +1789,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
             torch.zeros(tokens, 1, dtype=torch.uint8),
         )
         weights, ids = torch.ones(tokens, 2), torch.zeros(tokens, 2, dtype=torch.int32)
-        moe._quantized_combined(
+        moe._experts_combined(
             torch.zeros(tokens, 8),
             quantized,
             weights,
@@ -1397,6 +1799,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
             tokens,
             prepared,
             False,
+            payload="bf16",
         )
 
     combine(2, None)
@@ -1420,7 +1823,16 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
     owner = SimpleNamespace(
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
-        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    mlp=mlp,
+                    self_attn=SimpleNamespace(owned_heads_to_owners=False),
+                )
+            ],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
     )
 
     prepared = MuseSparkForConditionalGeneration.prepare_communication_runtime(
@@ -1429,6 +1841,90 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
 
     assert prepared is False
     assert mlp.down_columns is None
+
+
+def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
+    """The launches' scratch lives on the Iris heap: with --decode-monokernel,
+    a server whose Iris collectives cannot be prepared fails at startup and
+    names why, instead of at its first decode."""
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=True),
+            owned_projections=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("prefill_collective_payload", "int8-block16"),
+        ("owned_attention_output", "all-to-all"),
+    ],
+)
+def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
+    tmp_path, flag: str, value
+) -> None:
+    """The owned-row prefill flags apply to Muse Spark only: off their
+    defaults, another architecture's checkpoint is refused."""
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"]})
+    )
+    args = ServerArgs(model="x")
+    args.model = str(tmp_path)
+    setattr(args, flag, value)
+    with pytest.raises(ValueError, match="apply to Muse Spark"):
+        args.resolve_model_defaults()
+    setattr(args, flag, ServerArgs.__dataclass_fields__[flag].default)
+    args.resolve_model_defaults()
+
+
+def test_heads_all_to_all_without_iris_fails_startup_with_the_cause() -> None:
+    """--owned-attention-output all-to-all runs only on Iris owned rows: a
+    server whose Iris cannot be prepared refuses it at startup instead of
+    gathering output weights it would never use."""
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(owned_heads_to_owners=True),
+        mlp=SimpleNamespace(down_columns=None),
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[layer],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+def test_int8_payload_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prefill-collective-payload int8-block16 encodes only Iris owned-row
+    collectives: a server whose Iris cannot be prepared refuses it at startup
+    instead of serving with the flag inert."""
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", "int8-block16"
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
 @requires_gpu
@@ -1440,6 +1936,9 @@ def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     # The tiny config is too small to build the copy; attach one.
     layer.mlp.down_columns = MoEDownColumns(4, 128, 64, tp_rank=0, tp_size=8)
     norm = layer.input_layernorm.weight
+    # The parameters are allocated uninitialized and may hold NaN, which
+    # never compares equal; give the norm finite values.
+    norm.data.fill_(1.0)
     before = norm.clone()
 
     with pytest.raises(RuntimeError, match="column-split copy"):
@@ -1685,6 +2184,7 @@ def _gathered_mxfp4_workspace_worker(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
+            int8_payloads=False,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -1747,6 +2247,7 @@ def _gathered_mxfp4_workspace_worker(
                 if not fused:
                     torch.testing.assert_close(rows, expected_rows, atol=0, rtol=0)
                 torch.cuda.synchronize()
+            torch.cuda.synchronize()
     finally:
         dist.destroy_process_group()
 
@@ -1820,10 +2321,10 @@ def test_replicated_pool_preserves_column_projection_after_reload(
 @pytest.mark.skipif(
     not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
 )
-def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
+def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
 ) -> None:
-    """Wider rows reach the mailbox through its word publish, bit for bit; a GEMV row lands in place."""
+    """The block GEMM writes this rank's rows straight into its block, bit for bit with the projection."""
     from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
 
     bound = {}
@@ -1833,7 +2334,7 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
     monkeypatch.setattr(
         module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
     )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
+    hidden, latent, ranks, rank, max_m = 256, 128, 4, 1, 4
     with torch.device("cuda"):
         linear = module._MuseGatheredLinear(
             input_size=hidden,
@@ -1847,123 +2348,33 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
             replicate_for_owned_rows=True,
             workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
         )
+    assert bound["rank_major"] is True
     with torch.no_grad():
         linear.weight.normal_(std=hidden**-0.5)
     weight = linear._local_weight()
     shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
+    mailbox = torch.zeros(max_m, latent, dtype=torch.bfloat16, device="cuda")
     producer = latent_down._MulticastVaGemm(
         multicast_ptr=mailbox.data_ptr(),
         rank=rank,
         shard_dim=shard,
         latent_size=latent,
-        max_m=4,
+        max_m=max_m,
         device=mailbox.device,
         publish_gemm=bound["publish_gemm"],
+        rank_major=True,
     )
-    published_rows, expected_rows = [], []
-    publish = latent_down.multicast_publish
-
-    def record_publish(block, destination):
-        published_rows.append(block.shape[0])
-        publish(block, destination)
-
-    monkeypatch.setattr(latent_down, "multicast_publish", record_publish)
-    for tokens in (1, 3):
-        x = torch.randn(tokens, hidden, device="cuda")
-        if tokens > 1 or not module._use_mv(x, weight):
-            expected_rows.append(tokens)
-        producer(x, weight, mailbox, mailbox.data_ptr())
-        torch.cuda.synchronize()
-        assert torch.equal(
-            mailbox[:tokens, rank * shard : (rank + 1) * shard].view(torch.int16),
-            linear._project(x, weight, None).view(torch.int16),
-        )
-    assert published_rows == expected_rows
-
-
-@requires_gpu
-@pytest.mark.skipif(
-    not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
-)
-def test_gathered_projection_leaves_a_wider_block_for_the_consumer_to_publish(
-    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
-) -> None:
-    """A library GEMM's block comes back for the consumer to store; a GEMV row still lands in place."""
-    from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
-
-    bound = {}
-    monkeypatch.setattr(
-        module.process_group_manager, "get_device_process_group", lambda group: group
-    )
-    monkeypatch.setattr(
-        module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
-    )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
-    with torch.device("cuda"):
-        linear = module._MuseGatheredLinear(
-            input_size=hidden,
-            output_size=latent,
-            prefix="model.layers.0.mlp.pre_expert_proj",
-            tp_rank=rank,
-            tp_size=ranks,
-            tp_group=tuple(range(ranks)),
-            layer_id=0,
-            layer_count=2,
-            replicate_for_owned_rows=True,
-            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
-        )
-    with torch.no_grad():
-        linear.weight.normal_(std=hidden**-0.5)
-    weight = linear._local_weight()
-    shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    producer = latent_down._MulticastVaGemm(
-        multicast_ptr=mailbox.data_ptr(),
-        rank=rank,
-        shard_dim=shard,
-        latent_size=latent,
-        max_m=4,
-        device=mailbox.device,
-        publish_gemm=bound["publish_gemm"],
-    )
-    columns = slice(rank * shard, (rank + 1) * shard)
+    blocks = mailbox.view(ranks, max_m, shard)
     for tokens in (1, 3):
         latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
         x = torch.randn(tokens, hidden, device="cuda")
-        pending = producer.project(x, weight)
+        producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
         expected = linear._project(x, weight, None).view(torch.int16)
-        if tokens == 1 and module._use_mv(x, weight):
-            assert pending is None
-            assert torch.equal(mailbox[:tokens, columns].view(torch.int16), expected)
-            continue
-        assert pending is not None and pending.column == rank * shard
-        assert torch.equal(pending.block.view(torch.int16), expected)
-        assert pending.destination.data_ptr() == mailbox[0, columns].data_ptr()
-        assert pending.destination.stride() == (latent, 1)
-        # Nothing reached the mailbox: the consumer stores the block.
+        assert torch.equal(blocks[rank, :tokens].view(torch.int16), expected)
+        # Other ranks' blocks and the rows past the batch keep the sentinel.
+        blocks[rank, :tokens].view(torch.int16).fill_(-1)
         assert (mailbox.view(torch.int32) == -1).all()
-
-
-def test_publish_leaves_only_small_batches_to_the_consumer() -> None:
-    """Up to the row cap the consumer stores the block; wider batches keep the copy."""
-    calls: list[tuple[str, int]] = []
-
-    class _Op:
-        def publish_by_consumer(self, x, weight):
-            calls.append(("consumer", x.shape[0]))
-            return x, "pending"
-
-        def publish(self, x, weight):
-            calls.append(("copy", x.shape[0]))
-            return x
-
-    cap = module._CONSUMER_PUBLISH_MAX_ROWS
-    assert module._publish(_Op(), torch.zeros(cap, 4), None)[1] == "pending"
-    assert module._publish(_Op(), torch.zeros(cap + 1, 4), None)[1] is None
-    assert calls == [("consumer", cap), ("copy", cap + 1)]
 
 
 class _FakeMailbox:
@@ -1975,9 +2386,9 @@ class _FakeMailbox:
     def handles(self, tokens: int) -> bool:
         return tokens <= 2
 
-    def publish_by_consumer(self, x, weight):
+    def publish(self, x, weight):
         self.calls.append(("publish", x.shape[0], weight.shape[0]))
-        return x.new_full((x.shape[0], 512), float("nan")), None
+        return x.new_full((x.shape[0], 512), float("nan"))
 
     def __call__(self, x, weight, *, output_scale):
         # The real op's signature: Muse gathers BF16, never fused NVFP4.
@@ -2007,13 +2418,564 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     )
     width = attn.o_proj.weight.shape[1]
     one = torch.randn(1, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(one)
-    assert (sentinel, ranks, publish) == (0xFFFFFFFF, 4, None) and rows.isnan().all()
+    rows, sentinel, ranks = attn._project(one)
+    assert (sentinel, ranks) == (0xFFFFFFFF, 4) and rows.isnan().all()
     three = torch.randn(3, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(three)
-    assert (sentinel, ranks, publish) == (None, 1, None)
+    rows, sentinel, ranks = attn._project(three)
+    assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
+
+
+@pytest.mark.parametrize("flag", ["bf16", "int8-block16"])
+def test_prefill_collective_payload_applies_to_extend_forwards_only(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """--prefill-collective-payload selects the owned-row collectives'
+    encoding of extend forwards; every other forward mode stays BF16."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", flag
+    )
+    for mode in ForwardMode:
+        expected = flag if mode == ForwardMode.EXTEND else "bf16"
+        assert module._collective_payload(mode) == expected, mode
+
+
+@pytest.mark.parametrize("flag", ["reduce-scatter", "all-to-all"])
+def test_owned_heads_to_owners_needs_a_bf16_output_projection(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """all-to-all applies only to a BF16, unquantized output projection (the
+    owner projects through the whole gathered weight); reduce-scatter never
+    takes it, whatever the projection."""
+    monkeypatch.setitem(module.global_server_args_dict, "owned_attention_output", flag)
+    projections = {
+        dtype: RowParallelLinear(
+            input_size=64,
+            output_size=64,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=dtype,
+            reduce_results=False,
+            quant_config=None,
+            prefix="model.layers.0.self_attn.o_proj",
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+            use_presharded_weights=False,
+            override_kernel_name=None,
+        )
+        for dtype in (torch.bfloat16, torch.float16)
+    }
+    assert module._owned_heads_to_owners(projections[torch.bfloat16]) == (
+        flag == "all-to-all"
+    )
+    if flag == "all-to-all":
+        with pytest.raises(ValueError, match="BF16 output projection"):
+            module._owned_heads_to_owners(projections[torch.float16])
+    else:
+        assert module._owned_heads_to_owners(projections[torch.float16]) is False
+
+
+def test_owned_output_proj_stays_unset_without_the_flag() -> None:
+    attention = _stub(MuseSparkAttention)
+    attention.owned_heads_to_owners = False
+    attention.owned_output_proj = None
+    attention.prepare_owned_output_weight()
+    assert attention.owned_output_proj is None
+
+
+def test_heads_go_to_owners_only_in_owned_prefill_with_the_gathered_weight() -> None:
+    """The decoder layer sends heads to the owners only for an owned-row extend
+    forward on Iris with the gathered weight; decode, mixed and idle forwards,
+    replicated rows and a missing weight keep the reduce-scatter."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    with_weight = SimpleNamespace(owned_output_proj=torch.empty(1))
+    without_weight = SimpleNamespace(owned_output_proj=None)
+    iris = object()
+    for mode in ForwardMode:
+        assert module._heads_to_owners_applies(2048, iris, mode, with_weight) == (
+            mode == ForwardMode.EXTEND
+        )
+    extend = ForwardMode.EXTEND
+    assert not module._heads_to_owners_applies(None, iris, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, None, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, iris, extend, without_weight)
+
+
+def test_weight_update_is_refused_while_output_projections_are_gathered() -> None:
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(down_columns=None),
+        self_attn=SimpleNamespace(owned_output_proj=torch.empty(1)),
+    )
+    owner = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    with pytest.raises(RuntimeError, match="owned-attention-output all-to-all"):
+        MuseSparkForConditionalGeneration.begin_weight_update(owner)
+
+
+def test_owned_row_flags_are_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--owned-attention-output"):
+        ServerArgs(model="x", owned_attention_output="all-gather")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
+        )
+
+
+@pytest.mark.parametrize(
+    "chunk,numerics,expected",
+    [
+        (None, "auto", 8192),
+        (-1, "auto", 8192),
+        (4096, "auto", 8192),
+        (8192, "auto", 8192),
+        (24576, "auto", 24576),
+        (24576, "rl-bitwise", 8192),
+        (24577, "auto", 24576),
+        (32768, "auto", 24576),
+    ],
+)
+def test_owned_rows_follow_the_prefill_chunk_size(
+    monkeypatch: pytest.MonkeyPatch, chunk, numerics: str, expected: int
+) -> None:
+    """The owned-row layout serves the configured prefill chunk, at least
+    8192 and at most 24576 rows; --numerics rl-bitwise keeps 8192."""
+    monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", numerics)
+    assert module._owned_rows_max_tokens() == expected
+
+
+def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
+    """ServerArgs validates the flag; the Iris state takes the same names."""
+    if not current_platform().is_cdna4:
+        pytest.skip("the Iris state is importable on AMD CDNA4 only")
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
+
+    from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
+
+    assert tuple(PREFILL_COLLECTIVE_PAYLOADS) == tuple(MUSE_PAYLOADS)
+
+
+def test_prefill_collective_payload_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--prefill-collective-payload"):
+        ServerArgs(model="x", prefill_collective_payload="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
+
+
+@requires_gpu
+def test_dense_fp8_refuses_a_quantized_qkv_weight(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dense-fp8-small-m converts a BF16 QKV weight; a QKV projection with
+    a quantization method is refused when it is built, not left in BF16."""
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    with torch.device("cuda"), pytest.raises(ValueError, match="converts a BF16 QKV"):
+        QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=Fp8Config(),
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+
+
+@requires_gpu
+@pytest.mark.parametrize("monokernel_rows", [32, 40])
+def test_dense_fp8_refuses_monokernels_inside_a_window_before_any_copy(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, monokernel_rows: int
+) -> None:
+    """Decode monokernels project in BF16, so a monokernel row limit inside an
+    enabled FP8 window is refused before any FP8 copy is made. With qkv the
+    window starts at 33: a 32-row limit passes that check (loading then
+    refuses this model's untuned QKV shape at the copy), a 40-row one is
+    refused first, with no copy made."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    # The real limit (16 rows) is below every window; raise it to test the check.
+    monkeypatch.setattr(module, "MONOKERNEL_MAX_ROWS", monokernel_rows)
+    model = _loaded(_tiny_model())
+    model.model.config.decode_monokernel = True
+    match = "decode monokernels" if monokernel_rows >= 33 else "no weight-streaming"
+    with pytest.raises(ValueError, match=match):
+        model.post_quant_warmup()
+    for layer in model.model.layers:
+        assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+
+
+@requires_gpu
+def test_dense_fp8_none_keeps_the_bf16_projection_everywhere(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the default, none, preparing makes no copy and a QKV projection's
+    rows at every row count of decode and extend forwards are the BF16
+    projection's own bits (main's call)."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    with torch.device("cuda"):
+        layer = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    layer.weight.data.copy_(torch.randn_like(layer.weight) * 0.02)
+    layer.prepare_fp8_weight()
+    assert layer.dense_fp8.weight is None and layer.dense_fp8.scale is None
+    x = torch.randn(129, 8192, device="cuda").bfloat16()
+    for rows in (1, 16, 17, 32, 33, 64, 65, 128, 129):
+        assert not layer.dense_fp8.applies(rows)
+        assert torch.equal(layer.forward_rows(x[:rows], None), layer(x[:rows])[0])
+
+
+@requires_gpu
+def test_a_decoder_layer_forward_runs_its_boundaries(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real decoder layer of a tiny model runs a decode forward end to end:
+    the attention boundary (residual + norms feeding the MoE) and the MLP
+    boundary (feeding the next layer), with the attention core stubbed. It
+    returns the residual rows and the next attention input, and with the flag
+    off no FP8 copy of it."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    torch.manual_seed(0)
+    model = _tiny_model()
+    # Small weights keep the random layer's BF16 rows finite.
+    for parameter in model.parameters():
+        if parameter.dtype.is_floating_point:
+            parameter.data.normal_(mean=0.0, std=0.02)
+    model = _loaded(model)
+    # One layer: its own input norm stands in for the next layer's.
+    layer = model.model.layers[0]
+    rows, hidden = 3, model.config.hidden_size
+    layer.self_attn.forward = lambda *args, **kwargs: (
+        torch.randn(rows, hidden, device="cuda"),
+        None,
+        1,
+    )
+    # A decode forward of 3 one-token requests.
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows,
+        num_extends=0,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, rows, 1),
+    )
+    stream, next_input, next_input_fp8 = layer(
+        positions=torch.arange(rows, device="cuda"),
+        hidden_states=torch.randn(rows, hidden, device="cuda", dtype=torch.float32),
+        ctx=ctx,
+        attention_input=torch.randn(rows, hidden, device="cuda") * 0.1,
+        attention_input_fp8=None,
+        next_input_layernorm=layer.input_layernorm,
+        owned_global_rows=None,
+    )
+    assert stream.shape == (rows, hidden) and next_input.shape == (rows, hidden)
+    assert torch.isfinite(stream).all() and torch.isfinite(next_input.float()).all()
+    assert next_input_fp8 is None
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the small-M FP8 GEMM is gfx950-only"
+)
+def test_dense_fp8_copy_is_allocated_in_the_weights_region(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the memory saver on, the QKV copy, made while the weights load,
+    opens no region of its own and is allocated in the ``weights`` region the
+    load opens, so releasing ``weights`` releases it. The memory saver is not
+    available in the test environment, so this checks where the copy is
+    allocated, not a release."""
+    from contextlib import contextmanager
+
+    from tokenspeed.runtime.utils import torch_memory_saver_adapter as saver_module
+
+    monkeypatch.setitem(module.global_server_args_dict, "enable_memory_saver", True)
+    regions: list[tuple[str, bool]] = []
+    primary: list[str] = []
+
+    class _Primary:
+        """The weights' saver; records the region a conversion runs in."""
+
+        @contextmanager
+        def region(self, *, tag: str, enable_cpu_backup: bool):
+            primary.append(tag)
+            try:
+                yield
+            finally:
+                primary.pop()
+
+    monkeypatch.setattr(
+        saver_module, "_primary_memory_saver", _Primary(), raising=False
+    )
+
+    class _Pool:
+        """The persistent-buffer saver; records the regions it opens."""
+
+        @contextmanager
+        def region(self, *, tag: str, enable_cpu_backup: bool):
+            regions.append((tag, enable_cpu_backup))
+            yield
+
+    monkeypatch.setattr(
+        saver_module,
+        "_buffer_memory_savers",
+        {"persistent_buffers": _Pool()},
+        raising=False,
+    )
+    in_region: list[tuple[bool, list[str]]] = []
+    convert = module.prepare_fp8_channel_weight
+
+    def recording_convert(weight: torch.Tensor):
+        in_region.append(
+            (saver_module._active_buffer_pool.get() is not None, list(primary))
+        )
+        return convert(weight)
+
+    monkeypatch.setattr(module, "prepare_fp8_channel_weight", recording_convert)
+    fp8 = module._DenseFp8Weight(
+        "qkv_proj", True, module._DENSE_FP8_QKV_MIN_ROWS, module._DENSE_FP8_MAX_ROWS
+    )
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    weight = (
+        torch.randn(4608, 8192, device="cuda", generator=generator).bfloat16() * 0.02
+    )
+    # As weight_loader.py loads the model: inside the weights region.
+    saver = saver_module.TorchMemorySaverAdapter.create(enable=True)
+    with saver.region(tag="weights", enable_cpu_backup=True):
+        fp8.prepare(weight)
+    assert fp8.weight is not None and fp8.scale is not None
+    # The conversion runs inside the weights region and opens no other.
+    assert in_region == [(False, ["weights"])]
+    assert regions == []
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    current_platform().is_cdna4, reason="gfx950 has the skinny FP8 GEMM"
+)
+def test_dense_fp8_check_refuses_where_no_fp8_gemm_serves() -> None:
+    """Off gfx950 the check refuses with its own message, not a registry
+    error from the row quantizer it does not run."""
+    fp8 = module._DenseFp8Weight(
+        "qkv_proj",
+        True,
+        module._DENSE_FP8_QKV_MIN_ROWS,
+        module._DENSE_FP8_MAX_ROWS,
+    )
+    with pytest.raises(
+        ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
+    ):
+        fp8.check(torch.zeros(4608, 8192, dtype=torch.bfloat16, device="cuda"))
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the row quantizer is gfx950-only"
+)
+def test_the_fp8_probe_has_the_row_quantizers_layout() -> None:
+    """The check probes with what the row quantizer would return."""
+    for rows in (17, 33, 128):
+        codes, scales = module._quantize_rows_fp8(
+            torch.randn(rows, 8192, device="cuda").bfloat16()
+        )
+        probe_codes, probe_scales = module._row_fp8_probe(
+            rows, 8192, torch.device("cuda")
+        )
+        for real, probe in ((codes, probe_codes), (scales, probe_scales)):
+            assert (real.dtype, real.shape, real.stride()) == (
+                probe.dtype,
+                probe.shape,
+                probe.stride(),
+            )
+
+
+@requires_gpu
+def test_dense_fp8_monokernel_refuses_a_limit_inside_the_qkv_window(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 40-row monokernel limit is inside qkv's window (from 33 rows): the
+    flag is refused there, before any FP8 copy."""
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    monkeypatch.setattr(module, "MONOKERNEL_MAX_ROWS", 40)
+    model = _loaded(_tiny_model())
+    model.model.config.decode_monokernel = True
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    with pytest.raises(ValueError, match="which starts at 33 rows"):
+        model.post_quant_warmup()
+    for layer in model.model.layers:
+        assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny BF16 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_gathered_projection_warmup_covers_its_gemms(
+    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
+) -> None:
+    """A gathered projection's warm-up leaves none of its GEMMs to compile.
+
+    After its local-GEMM warm-up, its GEMM at any row count compiles no decode
+    or skinny GEMM binary: the pre-expert projection's [1024, 8192] columns at
+    TP4 (the decode GEMM at 9-32 rows, with another config from 17 rows, and
+    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM
+    only)."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm, skinny
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: group
+    )
+    monkeypatch.setattr(module.KimiK3LatentDownOp, "initialize", lambda **kwargs: None)
+    hidden, latent = 8192, 4096
+    with torch.device("cuda"):
+        linear = module._MuseGatheredLinear(
+            input_size=hidden,
+            output_size=latent,
+            prefix="model.layers.0.mlp.pre_expert_proj",
+            tp_rank=1,
+            tp_size=ranks,
+            tp_group=tuple(range(ranks)),
+            layer_id=0,
+            layer_count=2,
+            replicate_for_owned_rows=True,
+            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
+        )
+    with torch.no_grad():
+        linear.weight.normal_(std=hidden**-0.5)
+    weight = linear._local_weight()
+    assert tuple(weight.shape) == (latent // ranks, hidden)
+
+    def project(rows: int) -> None:
+        linear._project(torch.randn(rows, hidden, device="cuda"), weight, None)
+
+    helpers.assert_warmup_covers(
+        (
+            mm.gluon_mm_a16w16_medium_gfx950,
+            skinny.gluon_mm_a16w16_skinny_gfx950,
+            skinny.gluon_mm_a16w16_skinny_reduce_gfx950,
+        ),
+        linear.warm_local_gemm,
+        project,
+        range(2, 129),
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the router + decode GEMM launch is gfx950-only",
+)
+@pytest.mark.parametrize("width", [512, 1024])
+def test_router_with_mm_warmup_covers_every_shared_row_count(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """The router's warm-up covers every row count of the shared launch.
+
+    After it, with this rank's pre-expert columns, the shared launch at any
+    row count it serves compiles nothing, including rows past 16, which a
+    large warm-up extend does not run through it."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32 import router_gemv
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", "auto")
+    hidden, experts = 8192, 256
+    with torch.device("cuda"):
+        router = module.MuseSparkRouter(
+            hidden_size=hidden, num_experts=experts, multiplier=1.0, solution=None
+        )
+    router.weight.data.normal_(0.0, hidden**-0.5)
+    router.process_weights_after_loading(router)
+    columns = torch.randn(width, hidden, dtype=torch.bfloat16, device="cuda")
+    served = []
+
+    def launch(rows: int) -> None:
+        x = torch.randn(rows, hidden, dtype=torch.float32, device="cuda")
+        a = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        if router.supports_with_mm(x, a, columns):
+            served.append(rows)
+            router.forward_with_mm(x, a, columns, a.new_empty((rows, width)))
+
+    helpers.assert_warmup_covers(
+        (router_gemv.gluon_fp32_router_gemv_mm_a16w16_gfx950,),
+        lambda: router.warm_with_mm(columns, 128),
+        launch,
+        range(1, 129),
+    )
+    # The sweep reached the launch past its first 16-row bucket.
+    assert max(served) > 16
+
+
+def test_router_with_mm_warmup_refuses_an_unprepared_weight() -> None:
+    """The router's warm-up raises before its weight is prepared.
+
+    Its forward raises too. Skipping instead would skip the shared launch at
+    every row count and leave those compiles to serving."""
+    router = module.MuseSparkRouter(
+        hidden_size=256, num_experts=16, multiplier=1.0, solution=None
+    )
+    columns = torch.zeros(64, 256, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        router.warm_with_mm(columns, 128)
 
 
 if __name__ == "__main__":

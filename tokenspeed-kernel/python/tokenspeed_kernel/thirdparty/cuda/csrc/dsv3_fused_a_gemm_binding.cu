@@ -1,0 +1,5 @@
+#include "tvm_ffi_utils.h"
+
+void dsv3_fused_a_gemm(TensorView output, TensorView mat_a, TensorView mat_b, bool enable_pdl);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_fused_a_gemm, dsv3_fused_a_gemm);

@@ -17,14 +17,11 @@
 
 """FlashInfer layernorm kernels."""
 
-from functools import wraps
-from inspect import signature
-
 import torch
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
-    pdl_enabled,
+    with_pdl_default,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -34,28 +31,6 @@ gemma_fused_add_rmsnorm = error_fn
 gemma_rmsnorm = error_fn
 layernorm = error_fn
 rmsnorm = error_fn
-
-
-def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
-    return pdl_enabled() if enable_pdl is None else enable_pdl
-
-
-def _with_pdl_default(function):
-    enable_pdl_index = tuple(signature(function).parameters).index("enable_pdl")
-
-    @wraps(function)
-    def wrapper(*args, **kwargs):
-        if len(args) > enable_pdl_index:
-            args = (
-                *args[:enable_pdl_index],
-                _resolve_enable_pdl(args[enable_pdl_index]),
-                *args[enable_pdl_index + 1 :],
-            )
-        else:
-            kwargs["enable_pdl"] = _resolve_enable_pdl(kwargs.get("enable_pdl"))
-        return function(*args, **kwargs)
-
-    return wrapper
 
 
 if current_platform().is_nvidia:
@@ -68,10 +43,10 @@ if current_platform().is_nvidia:
         )
         from flashinfer import rmsnorm as _rmsnorm
 
-        fused_add_rmsnorm = _with_pdl_default(_fused_add_rmsnorm)
-        gemma_fused_add_rmsnorm = _with_pdl_default(_gemma_fused_add_rmsnorm)
-        gemma_rmsnorm = _with_pdl_default(_gemma_rmsnorm)
-        rmsnorm = _with_pdl_default(_rmsnorm)
+        fused_add_rmsnorm = with_pdl_default(_fused_add_rmsnorm)
+        gemma_fused_add_rmsnorm = with_pdl_default(_gemma_fused_add_rmsnorm)
+        gemma_rmsnorm = with_pdl_default(_gemma_rmsnorm)
+        rmsnorm = with_pdl_default(_rmsnorm)
 
         @register_kernel(
             "layernorm",

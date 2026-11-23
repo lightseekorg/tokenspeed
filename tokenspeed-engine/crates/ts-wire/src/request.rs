@@ -100,6 +100,15 @@ wire_struct! {
         pub data_parallel_rank: Option<i64> = None,
         /// Router-only cache retention identity; does not enable continual prompting.
         pub cache_session_id: Option<String> = None,
+        /// Shared cache owner for independent requests; does not change session semantics.
+        pub cache_group_id: Option<String> = None,
+        /// Candidate remote checkpoint boundaries, never proof of a cache hit.
+        pub shared_prefix_tokens: Vec<i32> = Vec::new(),
+        /// The replica the router expects to hold this prompt's prefix (peer
+        /// prefix sharing); a hint the holder confirms.
+        pub peer_holder: Option<String> = None,
+        /// Router estimate of additional usable peer tokens beyond the local prefix.
+        pub peer_expected_tokens: Option<u64> = None,
     }
 }
 
@@ -132,6 +141,10 @@ impl TokenizedGenerateReqInput {
             validation_error: None,
             data_parallel_rank: None,
             cache_session_id: None,
+            cache_group_id: None,
+            shared_prefix_tokens: Vec::new(),
+            peer_holder: None,
+            peer_expected_tokens: None,
         }
     }
 }

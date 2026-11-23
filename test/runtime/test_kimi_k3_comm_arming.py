@@ -80,6 +80,12 @@ def _capture_iris_preparation(monkeypatch):
             sharded=SimpleNamespace(
                 output=torch.empty((kwargs["sharded_max_rows"], 7168), device="meta")
             ),
+            pull_exchange=None,
+            word_max=(
+                SimpleNamespace(max_rows=kwargs["word_max_rows"])
+                if kwargs["word_max_rows"]
+                else None
+            ),
         )
 
     prepare = Mock(side_effect=allocate)
@@ -100,7 +106,9 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
     )
     monkeypatch.setattr(K3AttnComm, "iris_states", {})
     mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
-    config = SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584)
+    config = SimpleNamespace(
+        hidden_size=7168, routed_expert_hidden_size=3584, num_experts=None
+    )
 
     def moe():
         value = kimi_k3.KimiLinearMoE.__new__(kimi_k3.KimiLinearMoE)
@@ -108,6 +116,7 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
         value.iris_state = None
         value.comm = None
         value.shared_experts = SimpleNamespace(shared_parallel=None)
+        value.experts = SimpleNamespace(plan={"weight_dtype": "unquant"})
         # As on CDNA4: the execution plan leaves the decode chain off.
         value.execution_plan = SimpleNamespace(decode_chain=False)
         return value
@@ -175,12 +184,17 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         lambda: SimpleNamespace(is_cdna4=True),
     )
 
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_lamport_word_max_supported,
+    )
+
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=max_rows,
         states={},
+        word_max_rows=1024,
     )
     prepare.assert_called_once_with(
         group=group,
@@ -194,6 +208,8 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
+        word_max_rows=1024 if iris_lamport_word_max_supported(8) else 0,
     )
 
 
@@ -235,6 +251,8 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             all_reduce=None,
             device=torch.device("cuda:0"),
             rank_in_group=0,
+            pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
         call(
             group=moe_group,
@@ -248,6 +266,8 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             all_reduce=None,
             device=torch.device("cuda:0"),
             rank_in_group=0,
+            pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
     ]
 
@@ -289,6 +309,8 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 
@@ -328,6 +350,8 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         all_reduce=None,
         device=torch.device("cuda:0"),
         rank_in_group=0,
+        pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 
@@ -586,11 +610,10 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
 @pytest.mark.parametrize(
     "rows,is_cdna4,eligible",
     [
-        (48, True, False),
-        (56, True, False),
         (64, True, False),
-        (72, True, True),
-        (73, True, False),
+        (192, True, False),
+        (200, True, True),
+        (201, True, False),
         (8192, True, True),
         (8200, True, False),
         (512, False, False),
@@ -687,6 +710,118 @@ def test_take_published_needs_an_iris_state():
     comm.iris_state = SimpleNamespace(take_published=Mock(return_value=record))
     assert comm.take_published(partial) is record
     comm.iris_state.take_published.assert_called_once_with(partial)
+
+
+def _staged_projection_comm(monkeypatch, staged):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.iris_state = None
+    comm.hidden_size = 7168
+    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=8, tp_group=(0, 1)))
+    monkeypatch.setattr(module.K3AttnComm, "staged_projection", staged)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+    )
+    return module, comm
+
+
+@pytest.mark.parametrize(
+    "rows,eligible",
+    [(1024, False), (1025, True), (8192, True), (8193, False)],
+)
+def test_staged_projection_window(monkeypatch, rows, eligible):
+    from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+
+    module, comm = _staged_projection_comm(monkeypatch, ("tp", 8192))
+    view = Mock()
+    take_view = Mock(return_value=view)
+    monkeypatch.setattr(module, "multimem_view", take_view)
+    like = torch.empty((rows, 7168), dtype=torch.bfloat16)
+    projection = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(),
+        weight=torch.empty((7168, 1536), dtype=torch.bfloat16),
+        bias=None,
+        reduce_results=False,
+        input_is_parallel=True,
+    )
+    out = comm.acquire_projection_output(like, projection)
+    assert (out is view) == eligible
+    if not eligible:
+        take_view.assert_not_called()
+        return
+    take_view.assert_called_once_with(rows, 7168, "tp")
+    projection.reduce_results = True
+    assert comm.acquire_projection_output(like, projection) is None
+    projection.reduce_results = False
+    projection.quant_method = object()
+    assert comm.acquire_projection_output(like, projection) is None
+    projection.quant_method = UnquantizedLinearMethod()
+    monkeypatch.setattr(module.K3AttnComm, "staged_projection", None)
+    assert comm.acquire_projection_output(like, projection) is None
+
+
+def test_staged_projection_reduce_returns_a_copy(monkeypatch):
+    module, comm = _staged_projection_comm(monkeypatch, ("tp", 8192))
+    partial = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    reduce = Mock(side_effect=lambda view, group_name: view.mul_(2))
+    plain = Mock(side_effect=lambda tensor, group: tensor)
+    monkeypatch.setattr(module, "multimem_all_reduce_staged", reduce)
+    monkeypatch.setattr(module, "all_reduce", plain)
+    prefix = torch.ones(3, 4, dtype=torch.bfloat16)
+    residual, delta = comm.reduce_for_attnres(partial, prefix, producer_direct=True)
+    reduce.assert_called_once_with(partial, "tp")
+    plain.assert_not_called()
+    assert residual is prefix
+    # AttnRes keeps the sum after the MoE tail restages the buffer.
+    assert delta.data_ptr() != partial.data_ptr()
+    assert torch.equal(delta, torch.arange(12, dtype=torch.bfloat16).view(3, 4) * 2)
+    comm.reduce_for_attnres(partial, None, producer_direct=False)
+    assert reduce.call_count == 1
+    plain.assert_called_once_with(partial, (0, 1))
+
+
+@pytest.mark.parametrize(
+    "is_nvidia,tp_size,max_tokens,flag,prepared",
+    [
+        (True, 8, 8192, None, True),
+        (False, 8, 8192, None, False),
+        (True, 1, 8192, None, False),
+        (True, 8, 1024, None, False),
+        (True, 8, 8192, "force_deterministic_rsag", False),
+        (True, 8, 8192, "batch_invariant_collectives", False),
+    ],
+)
+def test_prepare_staged_projection(
+    monkeypatch, is_nvidia, tp_size, max_tokens, flag, prepared
+):
+    module, comm = _staged_projection_comm(monkeypatch, None)
+    comm.mapping.attn.tp_size = tp_size
+    monkeypatch.setattr(
+        module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=is_nvidia, is_cdna4=False),
+    )
+    monkeypatch.setattr(
+        module, "global_server_args_dict", {} if flag is None else {flag: True}
+    )
+    monkeypatch.setattr(
+        module, "_get_process_group", lambda ranks: SimpleNamespace(group_name="tp")
+    )
+    prealloc = Mock(return_value=True)
+    monkeypatch.setattr(module, "multimem_prealloc", prealloc)
+    assert comm.prepare_staged_projection(max_tokens) == prepared
+    if not prepared:
+        prealloc.assert_not_called()
+        assert module.K3AttnComm.staged_projection is None
+        return
+    prealloc.assert_called_once_with(8192, (7168,), "tp")
+    assert module.K3AttnComm.staged_projection == ("tp", 8192)
+    # Later layers share the buffer; a wider request cannot grow it.
+    assert comm.prepare_staged_projection(4096)
+    assert prealloc.call_count == 1
+    with pytest.raises(RuntimeError, match="Cannot grow"):
+        comm.prepare_staged_projection(16384)
 
 
 if __name__ == "__main__":

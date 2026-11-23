@@ -57,11 +57,17 @@ def absorbed_mla_layouts(
     NUM_WARPS,
     WARP_SIZE,
     K_WIDTH,
+    KEYS_SPLIT=False,
 ):
-    """Build operand, load, and LDS layouts for absorbed MLA."""
+    """Build operand, load, and LDS layouts for absorbed MLA.
+
+    The QK product spreads warps over 16-row tiles, or with ``KEYS_SPLIT``
+    over 16-key tiles of every row.
+    """
     assert WARP_SIZE == 32
     assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
     assert K_WIDTH == 8 or K_WIDTH == 16
+    assert not KEYS_SPLIT or NUM_WARPS <= 4
     is_fp8 = K_WIDTH == 16
     instr_shape = [16, 16, 64] if is_fp8 else [16, 16, 32]
 
@@ -77,6 +83,8 @@ def absorbed_mla_layouts(
     else:
         warp_bases_qk = [(1, 0), (2, 0), (4, 0)]
         warp_bases_pv = [(0, 1), (0, 2), (0, 4)]
+    if KEYS_SPLIT:
+        warp_bases_qk = warp_bases_pv
 
     qk_wmma_layout = gl.amd.AMDWMMALayout(
         version=3,

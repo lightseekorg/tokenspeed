@@ -25,10 +25,9 @@ from __future__ import annotations
 import os
 
 import torch
-import torch.distributed as dist
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
-from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
+from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
 
 @triton.jit
@@ -70,8 +69,24 @@ def _current_page(token, seq_start, seq_end, prefix, total, degree, PAGE: tl.con
     return owner, page_start - owner_start, direct
 
 
-@triton.jit
-def _prefill_metadata(
+@triton.jit(
+    do_not_specialize=[
+        "batch",
+        "columns",
+        "table_stride",
+        "first",
+        "rows",
+        "total",
+        "per_block",
+        "degree",
+        "local_pages",
+        "current_rank_stride",
+        "history_pages",
+        "table_tiles",
+        "query_tiles",
+    ]
+)
+def _qcp_prefill_metadata(
     Table,
     Cum,
     Prefix,
@@ -92,7 +107,7 @@ def _prefill_metadata(
     per_block,
     degree,
     local_pages,
-    send_rows,
+    current_rank_stride,
     history_pages,
     table_tiles,
     query_tiles,
@@ -144,7 +159,9 @@ def _prefill_metadata(
         tail_owner, tail_row, page_direct = _current_page(
             page_token, page_begin, page_end, page_prefix, total, degree, PAGE
         )
-        tail_page = history_pages + (tail_owner * send_rows + tail_row) // PAGE
+        tail_page = (
+            history_pages + (tail_owner * current_rank_stride + tail_row) // PAGE
+        )
         page_mapped = tl.where(page_direct, tail_page, page_mapped)
         tl.store(
             OutTable + page_compact * columns + page_col,
@@ -258,11 +275,17 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
 
 class AscendDSAKernels:
     def __init__(self):
-        import flash_ops
 
         library = os.environ.get("TOKENSPEED_LONGCAT_DSA_LIBRARY")
         if library:
             torch.ops.load_library(library)
+        else:
+            try:
+                import flash_ops  # noqa: F401 -- registers torch.ops.custom
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "DSA requires flash_ops or TOKENSPEED_LONGCAT_DSA_LIBRARY"
+                ) from exc
         self._index = getattr(torch.ops.custom, "npu_lightning_indexer", None)
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None
@@ -275,26 +298,24 @@ class AscendDSAKernels:
         self._full_scan_chunks = {}
 
     @staticmethod
-    def prepare_prefill(
+    def prepare_qcp_prefill(
         kv_cache,
         index_cache,
         *,
         ranks,
         history_group,
-        max_current_rows,
-        history_null_rows,
+        layout,
     ):
-        return AscendDSAPrefill(
+        return AscendQCPPrefillTransport(
             kv_cache,
             index_cache,
             ranks=ranks,
             history_group=history_group,
-            max_current_rows=max_current_rows,
-            history_null_rows=history_null_rows,
+            layout=layout,
         )
 
     @staticmethod
-    def prefill_metadata(
+    def qcp_prefill_metadata(
         table,
         cumulative,
         prefixes,
@@ -305,7 +326,7 @@ class AscendDSAKernels:
         per_block,
         degree,
         local_pages,
-        send_rows,
+        current_rank_stride,
         page_size,
         topk,
         active_requests,
@@ -340,7 +361,9 @@ class AscendDSAKernels:
         block = 256
         table_tiles = active_requests * triton.cdiv(columns, block)
         query_tiles = triton.cdiv(rows, block)
-        _prefill_metadata[(table_tiles + 1 + query_tiles + triton.cdiv(total, block),)](
+        _qcp_prefill_metadata[
+            (table_tiles + 1 + query_tiles + triton.cdiv(total, block),)
+        ](
             table,
             cumulative,
             prefixes,
@@ -361,7 +384,7 @@ class AscendDSAKernels:
             per_block,
             degree,
             local_pages,
-            send_rows,
+            current_rank_stride,
             degree * local_pages if history_pages is None else history_pages,
             table_tiles,
             query_tiles,
@@ -447,6 +470,100 @@ class AscendDSAKernels:
         finally:
             torch.npu.config.allow_internal_format = False
 
+    def require_fused_prolog(self, *, index_heads):
+        """Reject an older native ABI before preparing weights or graph buffers."""
+        if index_heads not in (16, 32, 64):
+            raise ValueError("Fused DSA requires Indexer16/32/64")
+        try:
+            scaled_prolog = torch.ops.custom.npu_dsa_prolog_fused.scaled_scores_out
+        except AttributeError as error:
+            raise RuntimeError(
+                "Upgrade flash_ops: fused DSA requires explicit query/score scales"
+            ) from error
+
+        def meta(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, dtype=dtype, device="meta")
+
+        hidden, heads, query_rank = (
+            (2048, 32, 768) if index_heads == 16 else (4096, 64, 1536)
+        )
+        local_heads = heads // 8
+        qb_columns = 393216 if index_heads == 16 else 1966080
+        down, qb = meta((hidden, query_rank + 704)), meta((16, qb_columns))
+        gq, gkv, gik = meta((query_rank,)), meta((512,)), meta((128,))
+        weight, uk = meta((index_heads, hidden), torch.float32), meta((heads, 128, 512))
+        window = meta((2 * 1024 * 1024,), torch.uint8)
+        kv, ik = meta((1024, 576)), meta((1024, 128))
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512):
+            _, _, score = torch.ops.custom.npu_dsa_prolog_fused(
+                meta((rows, hidden)),
+                down,
+                gq,
+                gkv,
+                gik,
+                weight,
+                qb,
+                uk,
+                window,
+                kv,
+                ik,
+                meta((rows,), torch.int64),
+                1e-5,
+                1e-5,
+                1e-5,
+                None,
+                None,
+                0,
+            )
+            score_dtype = torch.bfloat16 if index_heads == 64 else torch.float32
+            if score.dtype != score_dtype:
+                raise ValueError(
+                    "Upgrade flash_ops: Indexer16/32 fused score must retain FP32"
+                )
+            scaled_prolog(
+                meta((rows, hidden)),
+                down,
+                gq,
+                gkv,
+                gik,
+                weight,
+                qb,
+                uk,
+                window,
+                kv,
+                ik,
+                meta((rows,), torch.int64),
+                1e-5,
+                1e-5,
+                1e-5,
+                1.0,
+                1.0,
+                None,
+                None,
+                0,
+                query=meta((8, rows, local_heads, 576)),
+                index_query=meta((rows, index_heads, 128)),
+                score=meta((rows, index_heads), score_dtype),
+            )
+            torch.ops.custom.npu_dsa_output_projection_partial(
+                meta((local_heads, rows, 512)),
+                meta((local_heads, 512, 128)),
+                meta((hidden, local_heads * 128)),
+            )
+            self.merge_topk_fused(
+                meta((rows, 1, 2048), torch.int32),
+                meta((rows, 1, 2048)),
+                group="tokenspeed-dsa-contract",
+                rank_size=8,
+            )
+            self.merge_lse_direct(
+                meta((heads, rows, 512), torch.float32),
+                meta((1, rows, heads), torch.float32),
+                meta((1, rows, heads), torch.float32),
+                group="tokenspeed-dsa-contract",
+                rank_size=8,
+            )
+
     def fused_prolog(
         self,
         x,
@@ -465,13 +582,15 @@ class AscendDSAKernels:
         eps_q,
         eps_kv,
         eps_index,
+        query_scale,
+        score_scale,
         positions,
         cos_sin,
         rotary_mode,
         out,
     ):
         """Fused projections and cache writes with operator-owned workspace."""
-        return torch.ops.custom.npu_dsa_prolog_fused.out(
+        return torch.ops.custom.npu_dsa_prolog_fused.scaled_scores_out(
             x,
             down,
             gamma_q,
@@ -487,6 +606,8 @@ class AscendDSAKernels:
             eps_q,
             eps_kv,
             eps_index,
+            query_scale,
+            score_scale,
             positions,
             cos_sin,
             rotary_mode,
@@ -589,7 +710,8 @@ class AscendDSAKernels:
             self._full_scan_chunks[key] = chunks
         return chunks
 
-    def scatter(self, x, cache, locations):
+    @staticmethod
+    def scatter(x, cache, locations):
         width = x.shape[-1]
         if x.dtype != torch.bfloat16 or cache.dtype != x.dtype:
             raise ValueError("LongCatDSA scatter requires BF16")

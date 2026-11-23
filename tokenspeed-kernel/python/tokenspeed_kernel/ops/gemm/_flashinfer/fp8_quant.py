@@ -34,12 +34,8 @@ _trtllm_per_token_group_quant_fp8 = error_fn
 
 if platform.is_nvidia:
     from tokenspeed_kernel.ops.quantization.trtllm import (
-        _HAS_TRTLLM_KERNEL,
-        _per_token_group_quant_8bit,
+        _per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
     )
-
-    if _HAS_TRTLLM_KERNEL:
-        _trtllm_per_token_group_quant_fp8 = _per_token_group_quant_8bit
 
 
 @triton.jit
@@ -138,7 +134,10 @@ def flashinfer_fp8_blockscale_quantize_prepacked(
         and x.dtype == torch.bfloat16
         and _trtllm_per_token_group_quant_fp8 is not error_fn
     ):
-        x_q, x_s = _trtllm_per_token_group_quant_fp8(x, group_size, False)
+        x_q, x_s = _trtllm_per_token_group_quant_fp8(
+            x, group_size, False, mn_major=True
+        )
+        x_s = x_s.t()
         expected_shape = (columns // group_size, valid_rows)
         if tuple(x_s.shape) != expected_shape or not x_s.is_contiguous():
             raise RuntimeError(

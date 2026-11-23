@@ -78,7 +78,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
                     "V4.1 KVP requires eager prefill without mixed batches"
                 )
         verify_width = (
-            resolve_speculative_num_tokens(server_args, is_draft)
+            resolve_speculative_num_tokens(
+                server_args, is_draft, sample_from_anchor=False
+            )
             if server_args.speculative_algorithm is not None
             else 1
         )

@@ -75,6 +75,7 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
     specs = SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        cache_storage={},
         num_host_pages=17,
         num_snapshot_pages=1,
         host_group_packing=(),
@@ -87,10 +88,14 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
         storage_config=None,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.max_num_seqs,
+        max_resident_requests=args.max_num_seqs,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
+        peer_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
     assert config.enable_mixed_prefill_decode is mixed
     assert config.max_batch_size == 16

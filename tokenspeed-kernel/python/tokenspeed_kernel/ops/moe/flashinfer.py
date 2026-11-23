@@ -962,21 +962,23 @@ if platform.is_nvidia:
                 x.new_empty((0,), dtype=torch.int32),
             )
 
-        # Per-token group (block=128) FP8 quantization of activations.
-        # Convert canonical scales to the fused MoE kernel's group-major layout.
+        # The fused MoE reads contiguous [K/128, M] scales: MN-major as quantized.
         x_fp8, x_scale = quantize_fp8(
             x,
             granularity="token_group",
             group_size=_FP8_BLOCK,
-            solution="trtllm",
+            override="trtllm_quantize_fp8_mn_major",
         )
-        x_scale = x_scale.t().to(torch.float32).contiguous()
+        x_scale = x_scale.t()
         hidden_blocks = hidden_size // _FP8_BLOCK
-        if x_scale.shape != (hidden_blocks, x_fp8.shape[0]):
+        if (
+            x_scale.shape != (hidden_blocks, x_fp8.shape[0])
+            or not x_scale.is_contiguous()
+        ):
             raise RuntimeError(
-                "unexpected hidden_states_scale shape "
-                f"{tuple(x_scale.shape)}; expected "
-                f"{(hidden_blocks, x_fp8.shape[0])}"
+                "hidden_states_scale must be a contiguous "
+                f"{(hidden_blocks, x_fp8.shape[0])}, got {tuple(x_scale.shape)} "
+                f"with strides {x_scale.stride()}"
             )
 
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
@@ -1979,7 +1981,6 @@ if platform.is_nvidia:
         trtllm_fp4_block_scale_moe,
     )
     from flashinfer.cute_dsl import is_cute_dsl_available
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -1987,6 +1988,9 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.tllm_enums import ActivationType
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
+    )
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -2215,7 +2219,32 @@ if platform.is_nvidia:
         w.hidden_size_padded = hidden_padded
         w.hidden_size_original = getattr(w, "hidden_size", hidden_padded)
         w._flashinfer_trtllm_autotuned = False
-        return None
+
+        from tokenspeed_kernel.ops.communication.peer_weights import (
+            ExpertWeightShard,
+            PreparedExpertWeights,
+        )
+
+        streamed = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
+            "w13_weight_bias",
+            "w2_weight_bias",
+        )
+        replicated = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+        # Read attributes rather than nn.Module parameters: kernel tests pass
+        # plain weight stand-ins. Absent optional tensors (biases, clamp
+        # limit) stay out of the manifest.
+        return PreparedExpertWeights(
+            layout=f"flashinfer-trtllm-mxfp4-{'situ' if situ else 'swiglu'}-v1",
+            shards=tuple(
+                ExpertWeightShard(name, tensor, name in replicated)
+                for name in (*streamed, *replicated)
+                if (tensor := getattr(w, name, None)) is not None
+            ),
+        )
 
     def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         return _flashinfer_trtllm_mxfp4_moe_weights(plan, w, situ=False)
@@ -2313,7 +2342,7 @@ if platform.is_nvidia:
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        result = trtllm_fp4_block_scale_routed_moe(
+        result = tokenspeed_trtllm_fp4_block_scale_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
@@ -3263,9 +3292,6 @@ if platform.is_nvidia:
     from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
-    )
-    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
-        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(

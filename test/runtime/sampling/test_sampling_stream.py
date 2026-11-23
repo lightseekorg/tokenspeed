@@ -162,7 +162,7 @@ def test_per_request_route_reads_the_request_pools(cpu_kernels):
     sp_a = _sp("a", temperature=0.7, top_k=40, top_p=0.9, seed=11)
     sp_b = _sp("b", temperature=1.3, top_k=-1, top_p=1.0, seed=22)
     backend.prepare_step(
-        request_ids=["a", "b"],
+        admission_ids=[1, 2],
         request_pool_indices=[3, 5],
         sampling_params_list=[sp_a, sp_b],
     )
@@ -221,7 +221,7 @@ def test_per_request_route_feeds_the_greedy_overlay_each_rows_top_k(
     )
     backend = FlashInferSamplingBackend(_config("per-request", "cpu"))
     greedy = _sp("g", temperature=0.0, top_k=1)
-    backend.prepare_step(["g", "s"], [2, 6], [greedy, _sp("s", top_k=-1)])
+    backend.prepare_step([1, 2], [2, 6], [greedy, _sp("s", top_k=-1)])
     logits = torch.zeros(2, VOCAB)
     logits[:, 3] = logits[:, 9] = 5.0  # an exact tie; canonical is id 3
     sampled, _ = backend.sample(
@@ -233,7 +233,7 @@ def test_per_request_route_feeds_the_greedy_overlay_each_rows_top_k(
 
 def test_batch_stream_keeps_the_flashinfer_kernel(cpu_kernels):
     backend = FlashInferSamplingBackend(_config("batch", "cpu"))
-    backend.prepare_step(["a"], [2], [_sp("a")])
+    backend.prepare_step([1], [2], [_sp("a")])
     backend.sample(
         LogitsProcessorOutput(next_token_logits=torch.randn(1, VOCAB)),
         _info([2], "cpu"),
@@ -246,7 +246,7 @@ def test_batch_stream_keeps_the_flashinfer_kernel(cpu_kernels):
 
 def test_full_backend_passes_its_min_p_pool(cpu_kernels):
     backend = FlashInferFullSamplingBackend(_config("per-request", "cpu"))
-    backend.prepare_step(["a"], [4], [_sp("a", min_p=0.05)])
+    backend.prepare_step([1], [4], [_sp("a", min_p=0.05)])
     backend.sample(
         LogitsProcessorOutput(next_token_logits=torch.randn(1, VOCAB)),
         _info([4], "cpu"),
@@ -270,7 +270,7 @@ def test_per_request_stream_is_batch_invariant(top_k: int):
     other_rows = torch.randn(MAX_BS - 1, VOCAB, device=device)
 
     solo = FlashInferSamplingBackend(_config("per-request", device))
-    solo.prepare_step([rid], [2], [sp])
+    solo.prepare_step([1], [2], [sp])
     solo_token, _ = solo.sample(
         LogitsProcessorOutput(next_token_logits=row.clone()), _info([2], device)
     )
@@ -278,7 +278,7 @@ def test_per_request_stream_is_batch_invariant(top_k: int):
     packed = FlashInferSamplingBackend(_config("per-request", device))
     # Same request on the same pool slot, now second in a batch of four.
     packed.prepare_step(
-        ["other_0", rid, "other_1", "other_2"],
+        [2, 1, 3, 4],
         [0, 2, 1, 3],
         [others[0], sp, others[1], others[2]],
     )

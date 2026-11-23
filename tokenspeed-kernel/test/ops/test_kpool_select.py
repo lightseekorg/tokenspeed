@@ -37,6 +37,10 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     expand_kpool_to_flat_kv,
     score_kpool_dense,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    round_index_k_scale,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -48,11 +52,15 @@ def _build_cache(num_pages: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]
     generator = torch.Generator(device="cuda").manual_seed(seed)
     rows = num_pages * _PAGE
     values = torch.randn(rows, _DIM, device="cuda", generator=generator) * 0.2
-    scales = values.abs().amax(-1, keepdim=True).clamp(min=1e-4) / _FP8_MAX
+    scales = round_index_k_scale(
+        values.abs().amax(-1, keepdim=True).clamp(min=1e-4) / _FP8_MAX
+    )
     quantized = (values / scales).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
     cache = torch.zeros(num_pages, _PAGE * (_DIM + 4), dtype=torch.uint8, device="cuda")
     cache[:, : _PAGE * _DIM] = quantized.view(torch.uint8).view(num_pages, -1)
-    cache[:, _PAGE * _DIM :] = scales.contiguous().view(torch.uint8).view(num_pages, -1)
+    cache[:, _PAGE * _DIM :] = (
+        encode_index_k_scale(scales).contiguous().view(torch.uint8).view(num_pages, -1)
+    )
     return cache, quantized.float() * scales
 
 
@@ -61,11 +69,15 @@ def _build_monotonic_cache(num_rows: int) -> torch.Tensor:
     rows = num_pages * _PAGE
     values = torch.zeros((rows, _DIM), dtype=torch.float32, device="cuda")
     values[:, 0] = torch.arange(1, rows + 1, dtype=torch.float32, device="cuda")
-    scales = values.abs().amax(-1, keepdim=True).clamp(min=1e-4) / _FP8_MAX
+    scales = round_index_k_scale(
+        values.abs().amax(-1, keepdim=True).clamp(min=1e-4) / _FP8_MAX
+    )
     quantized = (values / scales).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
     cache = torch.zeros(num_pages, _PAGE * (_DIM + 4), dtype=torch.uint8, device="cuda")
     cache[:, : _PAGE * _DIM] = quantized.view(torch.uint8).view(num_pages, -1)
-    cache[:, _PAGE * _DIM :] = scales.view(torch.uint8).view(num_pages, -1)
+    cache[:, _PAGE * _DIM :] = (
+        encode_index_k_scale(scales).contiguous().view(torch.uint8).view(num_pages, -1)
+    )
     return cache
 
 

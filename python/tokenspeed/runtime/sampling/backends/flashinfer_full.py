@@ -470,11 +470,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
-        # Coins were filled in the step's full batch order; a MIXED round's
-        # verify sees only the decode suffix (see FlashInferSamplingBackend).
-        row0 = sampling_info.batch_row_offset
-        coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
-        coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
+        coins, coins_for_final_sampling = self._chain_verify_coins(
+            sampling_info,
+            sampling_info.req_pool_indices,
+            width=num_tokens_per_req,
+            row_offset=sampling_info.batch_row_offset,
+        )
 
         use_draft_prob = sampling_info.draft_probs is not None
         draft_probs = (

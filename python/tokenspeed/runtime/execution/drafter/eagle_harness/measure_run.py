@@ -198,6 +198,7 @@ def attention_samples(
                     return_lse=True,
                     softmax_scale=scale,
                     solution="triton",
+                    block_draft=False,
                 )
                 out = out.view(batch_size, heads, rows, -1).transpose(1, 2)
                 lse = lse.view(batch_size, heads, rows).transpose(1, 2)
@@ -222,6 +223,7 @@ def attention_samples(
                     return_lse=True,
                     softmax_scale=scale,
                     solution="triton",
+                    block_draft=False,
                 )
                 # The window kernel merges in base 2.
                 return out, lse * 1.4426950408889634

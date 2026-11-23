@@ -32,7 +32,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool  # noqa: E402
-from runtime.test_cache_group_router import FULL, _geometry, _StubLeaf  # noqa: E402
+from runtime.test_cache_group_router import FULL, _router_pool, _StubLeaf  # noqa: E402
 from runtime.test_tree_attention_cascade import (  # noqa: E402
     ATOL,
     HKV,
@@ -54,9 +54,6 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.lanes import (  # noqa: 
     Eagle4TreeLanes,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (  # noqa: E402
-    CacheGroupGeometry,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.router import (  # noqa: E402
     CacheGroupRouter,
 )
@@ -93,9 +90,13 @@ def _lane_router():
     """A single-group draft router with sliding-window EAGLE-4 lanes (K = 2, 3 steps) bound."""
     leaf = _StubLeaf(4, is_draft=True, spec=2)
     router = CacheGroupRouter(
-        None, is_draft=True, spec_num_tokens=2, device="cpu", consumed_group_ids=None
+        lambda gid, grain: leaf,
+        is_draft=True,
+        spec_num_tokens=2,
+        device="cpu",
+        consumed_group_ids=(FULL,),
     )
-    router.bind(_geometry(), {FULL: leaf})
+    router.set_cache_pool(_router_pool())
     lanes = Eagle4TreeLanes(2, 3, 4, torch.device("cpu"), slides=True)
     router.bind_tree_draft(lanes)
     router.init_cuda_graph_state(4)
@@ -253,16 +254,13 @@ def test_trtllm_lanes_match_reference(topk, steps, frozen, poison, kv_dtype):
         frontier, topk, window, leaf.max_num_pages, gen, kv_dtype, frozen, poison
     )
     router = CacheGroupRouter(
-        None, is_draft=True, spec_num_tokens=1, device="cuda", consumed_group_ids=None
+        lambda gid, grain: leaf,
+        is_draft=True,
+        spec_num_tokens=1,
+        device="cuda",
+        consumed_group_ids=None,
     )
-    geometry = CacheGroupGeometry(
-        granularities={FULL: PAGE},
-        attn_kinds={FULL: "full_history"},
-        full_history_group_id=FULL,
-        row_geometry={FULL: (PAGE, 1)},
-        windows={FULL: None},
-    )
-    router.bind(geometry, {FULL: leaf})
+    router.set_cache_pool(pool)
     router.init_cuda_graph_state(8)
     lanes = Eagle4TreeLanes(
         topk, steps, 8, torch.device("cuda"), slides=frozen is not None

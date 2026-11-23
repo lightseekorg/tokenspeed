@@ -33,13 +33,15 @@ class TestAutoBackendTopology:
             "mapping",
             SimpleNamespace(nprocs_per_node=4),
         )
-        backend = AutoBackend.__new__(AutoBackend)
+        backend = AutoBackend()
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._iris = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
         backend._trtllm_ar.lamport_all_gather.return_value = None
+        # No group prepared a one-hop exchange.
+        backend._small_exchanges = {}
         # A host-spread group's rsag routing keys on the fabric probe, so pin
         # both the probe and the local device count the tests assume.
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
@@ -692,6 +694,13 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
         expected = torch.cat(output_list, dim=-1)
         result = all_gather(inp, group, dim=-1)
         torch.testing.assert_close(result, expected)
+
+    # middle dim
+    inp = torch.randint(1, 16, (2, 3, 8), dtype=torch.bfloat16, device=device)
+    output_list = [torch.empty_like(inp) for _ in range(world_size)]
+    dist.all_gather(output_list, inp, group=ref_group)
+    result = all_gather(inp, group, dim=1)
+    torch.testing.assert_close(result, torch.cat(output_list, dim=1))
 
 
 def _test_all_gather_single(rank, world_size, device, group, ref_group):

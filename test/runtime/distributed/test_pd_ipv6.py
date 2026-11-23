@@ -18,14 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""PD and EPD transfer setup on IPv6 hosts: ``host:port`` brackets only IPv6
-literals, and the host's Mooncake engines start with ``MC_USE_IPV6`` on an
-IPv6 address. The transfer peers' sockets are ``ts-pd``'s."""
+"""PD, EPD and multi-node setup on IPv6 hosts: ``host:port`` brackets only
+IPv6 literals and parses them back, cross-node listeners bind the host
+address's family, the head node's interface is found over IPv6, and the
+host's Mooncake engines start with ``MC_USE_IPV6`` on an IPv6 address. The
+transfer peers' sockets are ``ts-pd``'s."""
 
 from __future__ import annotations
 
 import os
+import socket
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,7 +46,12 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     enable_mooncake_ipv6_for_host,
 )
-from tokenspeed.runtime.utils.network import join_host_port  # noqa: E402
+from tokenspeed.runtime.utils import launcher  # noqa: E402
+from tokenspeed.runtime.utils.network import (  # noqa: E402
+    join_host_port,
+    split_host_port,
+    wildcard_host_for,
+)
 
 
 @pytest.mark.parametrize(
@@ -57,6 +66,56 @@ from tokenspeed.runtime.utils.network import join_host_port  # noqa: E402
 )
 def test_join_host_port_brackets_only_ipv6_literals(host, expected):
     assert join_host_port(host, 8998) == expected
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("10.0.0.1:4000", ("10.0.0.1", 4000)),
+        ("prefill-0.prefill:4000", ("prefill-0.prefill", 4000)),
+        ("[fd00::1]:4000", ("fd00::1", 4000)),
+        ("[fe80::1%eth0]:4000", ("fe80::1%eth0", 4000)),
+        # Bare, the last colon separates the port.
+        ("fd00::1:4000", ("fd00::1", 4000)),
+    ],
+)
+def test_split_host_port_inverts_join_host_port(address, expected):
+    assert split_host_port(address) == expected
+    assert split_host_port(join_host_port(*expected)) == expected
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["10.0.0.1", "[fd00::1]", "[fd00::1]4000", "fd00::1", "10.0.0.1:0", ":4000"],
+)
+def test_split_host_port_rejects_a_missing_port(address):
+    with pytest.raises(ValueError):
+        split_host_port(address)
+
+
+@pytest.mark.parametrize(
+    ("ip", "expected"), [("fd00::1", "::"), ("10.0.0.1", "0.0.0.0")]
+)
+def test_cross_node_listeners_bind_the_host_ip_family(ip, expected):
+    assert wildcard_host_for(ip) == expected
+
+
+def test_the_interface_reaching_an_ipv6_head_is_found(monkeypatch):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+            sock.connect(("::1", 9))
+    except OSError:
+        pytest.skip("no IPv6 loopback")
+    monkeypatch.setattr(
+        launcher.psutil,
+        "net_if_addrs",
+        lambda: {
+            "lo4": [SimpleNamespace(family=socket.AF_INET, address="127.0.0.1")],
+            "lo6": [SimpleNamespace(family=socket.AF_INET6, address="::1")],
+        },
+    )
+    assert launcher.interface_for_host("::1") == "lo6"
+    assert launcher.interface_for_host("[::1]") == "lo6"
 
 
 @pytest.mark.parametrize(

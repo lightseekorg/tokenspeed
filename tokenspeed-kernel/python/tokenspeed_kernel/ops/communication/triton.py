@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -109,7 +110,7 @@ __all__ = [
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
-    "multicast_publish",
+    "gather_mailbox_blocks",
     "rank_ordered_fold",
 ]
 
@@ -1172,6 +1173,86 @@ def nvidia_rsag_multimem_all_gather(
     )
 
 
+# CTAs of the one-kernel multimem all-reduce. On 8 GB300s over two nodes a
+# [8192, 7168] BF16 sum took 291 us at 8 CTAs and 260 us at 16 to 32.
+_MULTIMEM_ALL_REDUCE_MAX_BLOCKS = 32
+
+
+@triton.jit
+def nvidia_multimem_all_reduce_kernel(
+    multicast_ptr,
+    signal_pad_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+) -> None:
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="relaxed")
+    sync_threads()
+
+    # Each rank sums one contiguous share of the 16-byte vectors in the switch
+    # and stores the sum to every rank's copy.
+    vectors = numel // NUMEL_PER_THREAD
+    share = tl.cdiv(vectors, WORLD_SIZE)
+    end = tl.minimum((RANK + 1) * share, vectors)
+    tid = get_flat_tid()
+    block_start = RANK * share + tl.program_id(axis=0) * BLOCK_SIZE
+    while block_start < end:
+        vector = block_start + tid
+        mask = vector < end
+        ptr = multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64)) + vector * 2
+        x, y, z, w = multimem_ld_reduce_128(ptr, mask)
+        multimem_st_128(ptr, x, y, z, w, mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    sync_threads()
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
+
+
+def nvidia_multimem_all_reduce(
+    multicast_ptr: int,
+    signal_pad_ptrs_dev: torch.Tensor,
+    signal_pad_size: int,
+    numel: int,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Sum ``numel`` BF16 elements at ``multicast_ptr`` over every rank, in place.
+
+    Args:
+        multicast_ptr: Multicast address of the first element; 16-byte aligned.
+        signal_pad_ptrs_dev: The symmetric handle's device array of signal pads.
+        signal_pad_size: Bytes in each rank's signal pad.
+        numel: Elements to sum, a multiple of 8, the same on every rank.
+        rank: This rank in the symmetric handle's group.
+        world_size: Ranks in that group.
+    """
+    num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
+        numel
+    )
+    share = triton.cdiv(numel // numel_per_thread, world_size)
+    num_blocks = max(
+        1, min(_MULTIMEM_ALL_REDUCE_MAX_BLOCKS, triton.cdiv(share, block_size))
+    )
+    # Each CTA's barrier takes one 32-bit slot per rank of every pad.
+    if num_blocks * world_size * 4 > signal_pad_size:
+        raise RuntimeError(
+            f"multimem all-reduce needs {num_blocks * world_size * 4} signal-pad "
+            f"bytes, but the handle has {signal_pad_size}"
+        )
+    nvidia_multimem_all_reduce_kernel[(num_blocks, 1, 1)](
+        multicast_ptr=multicast_ptr,
+        signal_pad_ptr=signal_pad_ptrs_dev,
+        numel=numel,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=rank,
+        WORLD_SIZE=world_size,
+        num_warps=num_warps,
+    )
+
+
 def nvidia_rsag_reduce_scatter(
     state: TritonRSAGState,
     hidden_states: torch.Tensor,
@@ -1235,6 +1316,145 @@ def nvidia_rsag_all_gather(
         return output.clone() if safe else output
     finally:
         rsag_restore_hidden(state, hidden_size_bak, comm_buff_bak)
+
+
+# ------------------------------------------------------------------------------
+# Row reduce-scatter
+# ------------------------------------------------------------------------------
+
+
+def _row_tiles(width: int) -> tuple[int, int]:
+    """Power-of-two tiles that cover ``width`` with the fewest masked lanes."""
+    low = 1 << (width.bit_length() - 1)
+    if low == width:
+        return width // 2, width // 2
+    return low, triton.next_power_of_2(width - low)
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _row_reduce_kernel(
+    buffer_ptrs,  # int64 [world]: every rank's partial buffer, in rank order
+    rows_ptr,  # int32 [num_rows]
+    out_ptr,  # [rows, n_cols] BF16
+    num_rows,
+    n_cols: tl.constexpr,
+    BLOCK0: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """One program per listed row: the ranks' BF16 partials of the row added
+    in FP32 rank order from +0.0 and rounded once."""
+    row = tl.load(rows_ptr + tl.program_id(0)).to(tl.int64)
+    col0 = tl.arange(0, BLOCK0)
+    col1 = BLOCK0 + tl.arange(0, BLOCK1)
+    mask0 = col0 < n_cols
+    mask1 = col1 < n_cols
+    acc0 = tl.zeros([BLOCK0], tl.float32)
+    acc1 = tl.zeros([BLOCK1], tl.float32)
+    for k in tl.static_range(WORLD_SIZE):
+        base = tl.load(buffer_ptrs + k).to(tl.pointer_type(tl.bfloat16)) + row * n_cols
+        acc0 += tl.load(base + col0, mask=mask0, other=0.0).to(tl.float32)
+        acc1 += tl.load(base + col1, mask=mask1, other=0.0).to(tl.float32)
+    out_ptr += row * n_cols
+    tl.store(out_ptr + col0, acc0.to(tl.bfloat16), mask=mask0)
+    tl.store(out_ptr + col1, acc1.to(tl.bfloat16), mask=mask1)
+
+
+_ROW_REDUCE_BUFFER_PTRS: dict[int, torch.Tensor] = {}
+
+
+def row_reduce_scatter(
+    state: TritonRSAGState, rows: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Sum chosen rows of every rank's partial into ``out``.
+
+    Each rank first writes its BF16 ``[T, H]`` partial into
+    ``state.comm_buff[:T]``. A barrier over the group makes every partial
+    visible; then this rank adds row ``r`` of each rank's buffer in FP32 rank
+    order from +0.0, rounds once and stores it to ``out[r]`` for every ``r``
+    in ``rows``. Other rows of ``out`` are not written. A rank must not
+    overwrite its buffer again until every rank has finished reading it (a
+    later group barrier orders that).
+
+    Args:
+        state: Triton RS/AG state of the group (its buffer holds the partials).
+        rows: Contiguous int32 row indices below ``T``; any subset, any order.
+        out: Contiguous BF16 ``[T, H]`` destination, ``H`` the state's width.
+
+    Returns:
+        ``out``.
+    """
+    rows_total, hidden = out.shape
+    if (
+        out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or hidden != state.hidden_dim
+        or rows_total > state.max_token_num
+    ):
+        raise ValueError("row reduce-scatter writes contiguous BF16 [T, H] rows")
+    if rows.dtype != torch.int32 or not rows.is_contiguous():
+        raise ValueError("rows must be contiguous int32 indices")
+    handle = symm_mem.rendezvous(state.comm_buff, group=state.group)
+    handle.barrier(channel=0)
+    key = state.comm_buff.data_ptr()
+    if key not in _ROW_REDUCE_BUFFER_PTRS:
+        _ROW_REDUCE_BUFFER_PTRS[key] = torch.tensor(
+            handle.buffer_ptrs, dtype=torch.int64, device=out.device
+        )
+    if rows.numel() == 0:
+        return out
+    block0, block1 = _row_tiles(hidden)
+    _row_reduce_kernel[(rows.numel(),)](
+        _ROW_REDUCE_BUFFER_PTRS[key],
+        rows,
+        out,
+        rows.numel(),
+        n_cols=hidden,
+        BLOCK0=block0,
+        BLOCK1=block1,
+        WORLD_SIZE=state.world_size,
+        num_warps=8,
+    )
+    return out
+
+
+class MulticastRows:
+    """A symmetric BF16 buffer that every rank of a group receives.
+
+    A rank stores its rows through :meth:`multicast` (stores reach every
+    rank's copy), :meth:`barrier` waits until every rank's stores have
+    landed, and :meth:`local` reads this rank's copy. Views of one shape are
+    contiguous prefixes of the buffer. Creation rendezvouses the group (every
+    rank must build it, outside graph capture) and needs multicast memory.
+    """
+
+    def __init__(
+        self, group: dist.ProcessGroup, numel: int, device: torch.device
+    ) -> None:
+        from tokenspeed_kernel.ops.moe._cute_dsl.multicast_view import (
+            bf16_tensor_on_pointer,
+        )
+
+        with torch.inference_mode(False), torch.no_grad():
+            self._buffer = symm_mem.empty((numel,), dtype=torch.bfloat16, device=device)
+        self._handle = symm_mem.rendezvous(self._buffer, group=group)
+        if not self._handle.multicast_ptr:
+            raise RuntimeError("multicast rows need multicast memory over the group")
+        self._multicast = bf16_tensor_on_pointer(
+            self._handle.multicast_ptr, (numel,), (1,), self._buffer.device.index
+        )
+
+    def local(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """This rank's copy, viewed as a contiguous ``shape``."""
+        return self._buffer[: math.prod(shape)].view(shape)
+
+    def multicast(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """The multicast view of the same elements (stores reach every rank)."""
+        return self._multicast[: math.prod(shape)].view(shape)
+
+    def barrier(self) -> None:
+        """Wait until every rank has reached this point in stream order."""
+        self._handle.barrier(channel=0)
 
 
 # ------------------------------------------------------------------------------
@@ -2178,63 +2398,91 @@ def all_gather_inner(
     )
 
 
-_PUBLISH_BLOCK = 1024
-
-
 @triton.jit
-def _publish_kernel(
-    src_ptr,
-    dst_ptr,
-    width_words,
-    src_stride_words,
-    dst_stride_words,
-    BLOCK: tl.constexpr,
+def _gather_mailbox_blocks_kernel(
+    mailbox_ptr,
+    out_ptr,
+    sentinel_word: tl.constexpr,
+    sentinel_half: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    BLOCK_WIDTH: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < width_words
-    words = tl.load(src_ptr + row * src_stride_words + cols, mask=mask, other=0)
-    tl.store(dst_ptr + row * dst_stride_words + cols, words, mask=mask)
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
+    start = block * BLOCK_STRIDE + row * BLOCK_WIDTH
+    offsets = tl.arange(0, BLOCK_WIDTH)
+    source = mailbox_ptr.to(tl.pointer_type(tl.int16)) + start + offsets
+    halves = tl.load(source, volatile=True)
+    while tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0:
+        halves = tl.load(source, volatile=True)
+    destination = out_ptr.to(tl.pointer_type(tl.int16))
+    tl.store(
+        destination + row * (BLOCKS * BLOCK_WIDTH) + block * BLOCK_WIDTH + offsets,
+        halves,
+    )
+    words = tl.arange(0, BLOCK_WIDTH // 2)
+    tl.store(
+        mailbox_ptr.to(tl.pointer_type(tl.int32)) + start // 2 + words,
+        tl.full([BLOCK_WIDTH // 2], sentinel_word, tl.int32),
+    )
 
 
-def multicast_publish(block: torch.Tensor, destination: torch.Tensor) -> None:
-    """Store ``block`` into ``destination`` as whole 32-bit words for a Lamport reader.
+def gather_mailbox_blocks(
+    mailbox: torch.Tensor, sentinel: int, enable_pdl: bool
+) -> torch.Tensor:
+    """Gather a rank-major Lamport mailbox's rows as they arrive, re-arming what was read.
 
     Args:
-        block: Contiguous BF16 ``[rows, width]`` block, ``width`` even.
-        destination: BF16 ``[rows, width]`` view whose rows may be strided,
-            typically this rank's column block of a multicast mailbox.
+        mailbox: BF16 ``[blocks, rows, block_width]`` view of each block's
+            first rows, one block per producing rank; ``block_width`` is a
+            power of two.
+        sentinel: The 32-bit word the mailbox is armed with, whose 16-bit
+            halves agree; each half is polled until it no longer holds it.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
 
     Returns:
-        None; ``destination`` holds ``block`` bit for bit.
+        BF16 ``[rows, blocks * block_width]``, each row its blocks' rows side
+        by side.
     """
-    rows, width = block.shape
-    if block.dtype != torch.bfloat16 or destination.dtype != torch.bfloat16:
-        raise ValueError("multicast_publish moves BF16 blocks")
-    if destination.shape != (rows, width) or width % 2 or not block.is_contiguous():
-        raise ValueError(
-            "block must be a contiguous [rows, width] tensor of even width"
-        )
+    blocks, rows, block_width = mailbox.shape
+    if mailbox.dtype != torch.bfloat16 or block_width & (block_width - 1):
+        raise ValueError("the mailbox must be BF16 blocks of a power-of-two width")
     if (
-        destination.stride(1) != 1
-        or destination.stride(0) % 2
-        or destination.data_ptr() % 4
+        mailbox.stride()[1:] != (block_width, 1)
+        or mailbox.stride(0) < rows * block_width
     ):
-        raise ValueError("destination rows must be contiguous and 32-bit aligned")
-    if rows == 0 or width == 0:
-        return
-    source_words = block.view(torch.int32)
-    destination_words = destination.view(torch.int32)
-    width_words = width // 2
-    _publish_kernel[(rows, triton.cdiv(width_words, _PUBLISH_BLOCK))](
-        source_words,
-        destination_words,
-        width_words,
-        source_words.stride(0),
-        destination_words.stride(0),
-        BLOCK=_PUBLISH_BLOCK,
-        num_warps=4,
+        raise ValueError(
+            "the mailbox must be the first rows of whole contiguous blocks"
+        )
+    if not 0 <= sentinel <= 0xFFFFFFFF or (sentinel & 0xFFFF) != (sentinel >> 16):
+        raise ValueError("the mailbox sentinel is one word whose halves agree")
+    out = torch.empty(
+        (rows, blocks * block_width), dtype=mailbox.dtype, device=mailbox.device
     )
+    if rows == 0:
+        return out
+    use_pdl = enable_pdl and current_platform().is_hopper_plus
+    launch = {"launch_pdl": True} if use_pdl else {}
+    _gather_mailbox_blocks_kernel[(rows, blocks)](
+        mailbox,
+        out,
+        # The kernel compares int16 halves and stores int32 words: signed images.
+        sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
+        sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
+        BLOCKS=blocks,
+        BLOCK_WIDTH=block_width,
+        BLOCK_STRIDE=mailbox.stride(0),
+        ENABLE_PDL=use_pdl,
+        num_warps=4,
+        **launch,
+    )
+    return out
 
 
 @triton.jit(do_not_specialize=["cols", "stride_world", "stride_row", "stride_out"])

@@ -38,6 +38,11 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import (
+    compile_registered_variants,
+    kernel_launcher,
+    register_triton_warmup,
+)
 
 hip_utils = triton.language.extra.hip.utils
 
@@ -118,45 +123,86 @@ class IrisAllGather:
         else:
             output = tensor.new_empty((num_tokens, total_hidden_size))
         chunk_rows = self.producer.data.numel() // total_hidden_size
-        policy = iris_arch_policy()
-        subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
         for start in range(0, num_tokens, chunk_rows):
             local = tensor[start : start + chunk_rows]
-            rows = local.shape[0]
-            elements_per_word = 8 // self.producer.data.element_size()
-            local_words = rows * local_hidden_size // elements_per_word
-            num_warps = column_gather_num_warps(
-                local_words * 8, self.producer.peers.world_size
-            )
-            block_words = subgroup_size * num_warps * 4
-            num_tiles = triton.cdiv(local_words, block_words)
-            num_programs = min(num_tiles, 84)
             published_input = (
-                rows == 1
+                local.shape[0] == 1
                 and local.data_ptr()
                 == self.producer.data.data_ptr()
                 + self.producer.peers.rank * local_hidden_size * tensor.element_size()
             )
-            iris_pull_allgather_columns[(num_programs,)](
-                local,
-                self.producer.data,
-                output[start : start + chunk_rows],
-                self.ready_flags,
-                self.producer.peers.addresses,
-                RANK=self.producer.peers.rank,
-                WORLD_SIZE=self.producer.peers.world_size,
-                LOCAL_WORDS=local_words,
-                LOCAL_HIDDEN_WORDS=local_hidden_size // elements_per_word,
-                TOTAL_HIDDEN_WORDS=total_hidden_size // elements_per_word,
-                BLOCK_WORDS=block_words,
-                NUM_WARPS=num_warps,
-                WORDS_PER_LANE=4,
-                INPUT_PUBLISHED=published_input,
-                PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
-                PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
-                num_warps=num_warps,
+            num_programs, args, options = self._column_launch(
+                local, output[start : start + chunk_rows], published_input
+            )
+            kernel_launcher(iris_pull_allgather_columns, (num_programs,))(
+                *args, **options
             )
         return output
+
+    def _column_launch(
+        self, local: torch.Tensor, output: torch.Tensor, published_input: bool
+    ) -> tuple[int, tuple, dict]:
+        """Grid size, arguments and options of one column-gather chunk."""
+        rows, local_hidden_size = local.shape
+        world_size = self.producer.peers.world_size
+        elements_per_word = 8 // self.producer.data.element_size()
+        local_words = rows * local_hidden_size // elements_per_word
+        num_warps = column_gather_num_warps(local_words * 8, world_size)
+        subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
+        block_words = subgroup_size * num_warps * 4
+        policy = iris_arch_policy()
+        args = (
+            local,
+            self.producer.data,
+            output,
+            self.ready_flags,
+            self.producer.peers.addresses,
+        )
+        options = dict(
+            RANK=self.producer.peers.rank,
+            WORLD_SIZE=world_size,
+            LOCAL_WORDS=local_words,
+            LOCAL_HIDDEN_WORDS=local_hidden_size // elements_per_word,
+            TOTAL_HIDDEN_WORDS=local_hidden_size * world_size // elements_per_word,
+            BLOCK_WORDS=block_words,
+            NUM_WARPS=num_warps,
+            WORDS_PER_LANE=4,
+            INPUT_PUBLISHED=published_input,
+            PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+            PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+            num_warps=num_warps,
+        )
+        return min(triton.cdiv(local_words, block_words), 84), args, options
+
+    def warmup(self, local_hidden_size: int) -> None:
+        """Compile, without running, every column gather of this shard width.
+
+        The width is ``local_hidden_size`` elements a rank; nothing compiles
+        when the gather cannot serve it. The kernel's compile-time options
+        depend on the shard width and, past a payload size on TP8, its subgroup
+        count; the row count is a runtime argument. Every variant the gather's
+        warmup registration names (``_column_gather_variants``) compiles here,
+        so a startup that never reaches the gather at this width does not
+        compile it while serving.
+
+        Args:
+            local_hidden_size: Elements in each rank-local row.
+        """
+        world_size = self.producer.peers.world_size
+        if not all_gather_columns_can_run(
+            world_size=world_size,
+            num_tokens=1,
+            local_hidden_size=local_hidden_size,
+            dtype=self.producer.data.dtype,
+            max_bytes=self.producer.data.numel() * self.producer.data.element_size(),
+        ):
+            return
+        local = self.producer.data[:local_hidden_size].view(1, local_hidden_size)
+        output = self.output[: local_hidden_size * world_size].view(
+            1, local_hidden_size * world_size
+        )
+        _, args, options = self._column_launch(local, output, published_input=False)
+        compile_registered_variants(iris_pull_allgather_columns, *args, **options)
 
 
 # Measured TP8 BF16: two subgroups per program win from about 768 KiB per shard.
@@ -171,6 +217,22 @@ def column_gather_num_warps(local_bytes: int, world_size: int) -> int:
     if world_size == 8 and local_bytes >= _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES:
         return 2
     return 1
+
+
+def _column_gather_variants(args) -> tuple[dict, ...]:
+    """Both subgroup counts the payload size picks; only one row is published."""
+    subgroup = args["BLOCK_WORDS"] // (args["NUM_WARPS"] * args["WORDS_PER_LANE"])
+    sets = []
+    for warps in (1, 2) if args["WORLD_SIZE"] == 8 else (1,):
+        sets.append(
+            {
+                "NUM_WARPS": (warps,),
+                "num_warps": (warps,),
+                "BLOCK_WORDS": (subgroup * warps * args["WORDS_PER_LANE"],),
+                "INPUT_PUBLISHED": (False, True) if warps == 1 else (False,),
+            }
+        )
+    return tuple(sets)
 
 
 def all_gather_columns_can_run(
@@ -820,3 +882,6 @@ def iris_fused_lamport_allgather_rmsnorm(
     gl.barrier()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
+
+
+register_triton_warmup(iris_pull_allgather_columns, variants=_column_gather_variants)

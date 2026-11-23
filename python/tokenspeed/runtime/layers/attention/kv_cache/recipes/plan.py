@@ -39,6 +39,16 @@ if TYPE_CHECKING:
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
+# Atom-addressed history uses a distinct plane id from native byte-page layouts.
+# Pipeline stages append their index to give each stage its own plane.
+FLAT_KV_PLANE = "flatkv_atoms"
+
+
+def is_flat_kv_plane(plane_id: str) -> bool:
+    """Whether the plane's full-history fields use atom page IDs."""
+    return plane_id == FLAT_KV_PLANE or plane_id.startswith(f"{FLAT_KV_PLANE}.")
+
+
 # Byte width per cache dtype name. This module stays torch-free (pure integer
 # geometry, and the plan travels the PD wire as JSON), so dtypes are named by
 # string and their widths live in this table.
@@ -279,6 +289,45 @@ class CacheMemoryPlan:
 
     def plane(self, plane_id: str) -> CachePlaneLayout:
         return self._planes_by_id[plane_id]
+
+    def validate_kernel_page_range(
+        self,
+        group_id: str,
+        *,
+        atom_pages_per_block: int,
+        kernel_subpages: int,
+        kernel_page_size: int,
+        max_write_slot: int,
+    ) -> None:
+        """Check translated page IDs fit signed int32 and token write slots stay
+        at or below ``max_write_slot``, the largest value their consumer stores.
+
+        ``kernel_subpages`` is the logical pages per scheduler block;
+        ``atom_pages_per_block`` also includes any physical gaps. Capacity
+        includes the null page, so the final address uses ``page_count - 1``.
+        This check uses only metadata, never an arena allocation.
+        """
+        if (
+            kernel_subpages < 1
+            or atom_pages_per_block < kernel_subpages
+            or kernel_page_size < 1
+        ):
+            raise ValueError(f"cache group {group_id!r}: invalid kernel page geometry")
+        max_atom = (
+            (self.group(group_id).page_count - 1) * atom_pages_per_block
+            + kernel_subpages
+            - 1
+        )
+        max_slot = max_atom * kernel_page_size + kernel_page_size - 1
+        for name, value, limit in (
+            ("atom page id", max_atom, _MAX_KERNEL_PAGE_ID),
+            ("kernel write slot", max_slot, max_write_slot),
+        ):
+            if value > limit:
+                raise ValueError(
+                    f"cache group {group_id!r}: {name} {value} exceeds "
+                    f"the maximum {limit}"
+                )
 
     def field_page_byte_offset(self, field_id: str, page_id: int) -> int:
         """Return one field page's byte offset in the shared cache arena."""

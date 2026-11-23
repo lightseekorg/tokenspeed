@@ -1,0 +1,17 @@
+[
+  {
+    "name": "control-b128-p262144-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 7
+    }
+  }
+]

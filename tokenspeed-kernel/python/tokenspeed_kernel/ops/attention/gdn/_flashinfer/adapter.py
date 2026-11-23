@@ -83,7 +83,7 @@ def gated_delta_rule_mtp(
             cache, ``[>=B, >=T, HV, V, K]``. Every live step is overwritten.
         ssm_state_indices: Optional int32 ``[B, T]`` per-token pool write rows;
             mutually exclusive with the intermediate cache and requires
-            state updates, T >= 2 and a contiguous pool (verify scratch).
+            state updates and T >= 2. The pool may have padded page strides.
         disable_state_update: Suppress pool writes. Otherwise the final state
             overwrites the read row unless per-token destinations are supplied.
         use_qk_l2norm: Normalize q/k inside the kernel.

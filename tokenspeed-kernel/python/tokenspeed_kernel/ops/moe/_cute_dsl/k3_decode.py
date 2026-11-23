@@ -205,7 +205,7 @@ class KimiK3DecodePrefetch:
     routed experts' in-kernel prefetch tables.
 
     The points: ``oproj_down`` after the o-projection exit, ``attention_moe``
-    after the KDA input projection or the MLA core, ``next_attention`` once the
+    after the attention input projection, ``next_attention`` once the
     routed experts launch (``k3_decode_prefetch`` has the row counts). A fork
     starts after the main stream's work so far, and :meth:`join` rejoins the
     side stream. The tables hold weight addresses: the weights must keep them
@@ -649,7 +649,7 @@ class KimiK3DecodeAttentionLayer:
         self.exit = PreparedOproj(
             target, owner.mailbox, owner.batches, mla, twoshot=owner.twoshot
         )
-        self.prefetch, self.layer_idx, self.mla = owner.moe.prefetch, layer_idx, mla
+        self.prefetch, self.layer_idx = owner.moe.prefetch, layer_idx
         if moe is not None:  # both on the critical path: urgent launches
             urgent = dict(byte_cap=0, carveout=100, priority=True)
             rows = oproj_down_batches(owner.batches)
@@ -664,8 +664,8 @@ class KimiK3DecodeAttentionLayer:
     def project(self, x: torch.Tensor) -> torch.Tensor:
         """The packed input projection [B, rows] of the attention input ``x``."""
         projected = self.projection.run(x, x.new_empty((x.shape[0], self.rows)))
-        if not self.mla:  # beside the KDA recurrence
-            self.prefetch.fork("attention_moe", self.layer_idx, x.shape[0])
+        # Beside the attention core, so the o-projection and MoE front read L2.
+        self.prefetch.fork("attention_moe", self.layer_idx, x.shape[0])
         return projected
 
     def enter(self, delta, prefix, blocks, out, *, ring: bool) -> torch.Tensor:
@@ -680,8 +680,6 @@ class KimiK3DecodeAttentionLayer:
     def leave(self, local, prefix, blocks, out) -> torch.Tensor:
         """O-projection of ``local`` [B, K], its all-reduce into ``prefix`` and the
         post-attention AttnRes into ``out``, the feed-forward input."""
-        if self.mla:  # the MLA core is done
-            self.prefetch.fork("attention_moe", self.layer_idx, local.shape[0])
         self.exit.run(local, prefix, blocks, out)
         self.prefetch.fork("oproj_down", self.layer_idx, local.shape[0])
         return out

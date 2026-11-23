@@ -37,6 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
@@ -88,6 +89,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": expected_a2a}
+            self.sorted_route_rows = frozenset()
 
     monkeypatch.setattr(
         kimi_k3,
@@ -99,6 +101,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
+        use_cutedsl=False,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
         decode_chain=False,
@@ -372,12 +375,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             received = latent.reshape(-1, width)
         torch.testing.assert_close(local_ids, ids[rank, :rows])
         torch.testing.assert_close(local_weights, weights[rank, :rows])
-        return received, ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
+        return received, ids.reshape(-1, 2), weights.reshape(-1, 2)
 
-    def combine(partial, local_tokens, max_tokens, combine_offset):
+    def combine(partial):
         events.append("combine")
-        assert local_tokens == rows and max_tokens == capacity
-        assert combine_offset == 1234
         torch.testing.assert_close(partial, latent.reshape(-1, width) * (rank + 1))
         return latent[rank, :rows] * 3
 
@@ -416,6 +417,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_hidden=width,
         top_k=2,
         topk=topk,
+        expert_dispatch_info=None,
         experts=SimpleNamespace(
             plan={"weight_dtype": "nvfp4" if nvfp4 else "unquant"},
             w13_input_scale_quant=quant_scale,
@@ -619,12 +621,14 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     routed = mock.Mock(
         side_effect=lambda *args, **kwargs: (events.append("experts"), latent)[1]
     )
-    up = mock.Mock(return_value=hidden + prefix)
+    up = Kimi3LatentProjection(4, 8, params_dtype=torch.bfloat16, solution="torch")
+    up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
         execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
+        expert_dispatch_info=None,
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(
@@ -633,7 +637,7 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         moe_alltoall=None,
         _routed_experts=routed,
         routed_expert_norm=None,
-        routed_expert_up_proj=SimpleNamespace(forward_add3=up),
+        routed_expert_up_proj=up,
         shared_experts=mock.Mock(return_value=hidden),
         routed_hidden=4,
         top_k=2,
@@ -660,10 +664,8 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
             "record_gather",
             "join_gather",
             "join",
-            "reduce",
-            "join",
             "experts",
-            "join",
+            "reduce",
         ]
     else:
         assert events == ["experts"]
@@ -678,10 +680,9 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         quantize.assert_not_called()
     if rows:
         assert call.args[0] is (payload if weight_dtype == "nvfp4" else latent)
-        torch.testing.assert_close(result, hidden + prefix)
+        torch.testing.assert_close(result, up.forward_add3(latent, prefix, hidden))
     else:
         assert result is prefix
-        up.assert_not_called()
 
 
 if __name__ == "__main__":

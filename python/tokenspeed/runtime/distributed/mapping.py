@@ -837,6 +837,25 @@ class Mapping(MappingBase):
         return self.attn.has_dp
 
     @cached_property
+    def all_reduce_groups(self) -> tuple[Group, ...]:
+        """Execution groups, in the same role order on every rank.
+
+        Sorting by rank IDs can reverse narrow/wide group order between peers
+        and assign different symmetric-heap offsets to the wider group.
+        """
+        groups = (
+            self.attn.tp_group,
+            self.attn.kvp_group,
+            self.attn.qcp_group,
+            self.linear_attn.tp_group,
+            self.attn.head_tp_group,
+            self.lm_head.tp_group,
+            self.dense.tp_group,
+            self.moe.tp_ep_group,
+        )
+        return tuple(group for group in dict.fromkeys(groups) if len(group) > 1)
+
+    @cached_property
     def node_rank(self) -> int:
         return self.rank // self.nprocs_per_node
 

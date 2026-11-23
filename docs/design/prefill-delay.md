@@ -38,6 +38,13 @@ only. A round that scheduled prefill resets the counter to 0, and round 0 is
 an ALL point, so a burst drains in consecutive prefill rounds; it is the
 scattered arrival that waits for a window.
 
+`--prefill-single-round` makes a window one prefill round: round 0 is not an
+ALL point while any rank has decode work, so a standing backlog does not
+drain in consecutive prefill rounds and the next ALL point is
+`attempt_interval` rounds later. Round 0 stays an ALL point when no rank
+decodes, so an idle engine still admits at once; ANY points are unchanged.
+The flag is off by default.
+
 The two intervals are the whole policy:
 
 * **ALL** is the throughput knob. Opening the gate costs the group a round on
@@ -54,7 +61,8 @@ by construction, and a decode node's prompts are its peer's work; both ignore
 `allow_prefill`, and `ServerArgs` refuses the intervals with a
 disaggregated launch.
 
-`ServerArgs.prefill_delay` returns `None` only when both intervals are unset.
+`ServerArgs.prefill_delay` returns `None` only when both intervals are unset
+(and `--prefill-single-round` is off; the flag alone is refused).
 An incomplete pair raises `ValueError` at the property as well as during
 startup validation, including after programmatic configuration changes.
 

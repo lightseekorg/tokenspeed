@@ -102,6 +102,20 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             return residual
         return residual.index_select(0, ctx.gather_ids)
 
+    def write_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        slots: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> None:
+        """The layer up to its attention prologue: write each row's K/V to ``slots``."""
+        # The layer's input norm as forward_layer opens it without a residual.
+        hidden_states, _ = self.comm_manager.input_reduce_norm(hidden_states, None)
+        hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
+        q, k, v, _ = self._project_qkv(hidden_states)
+        self.attn.write_kv_at(q, k, v, positions, slots, ctx)
+
 
 class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
     """Causal LM with the draft-variant attention layer injected.
@@ -126,7 +140,13 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
                 f"(got {config.num_hidden_layers}); the draft row narrowing "
                 "happens once, at the single layer's attention."
             )
-        super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            enable_fp8_attn_proj=False,
+        )
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
@@ -269,6 +289,29 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, logits_metadata
             )
+
+    def begin_split_round(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Start a split round: each of ``rows`` rows' draft K/V slot."""
+        attn = self.model.layers[0].attn
+        return (ctx.attn_backend.padded_write_locations(attn, ctx.forward_mode, rows),)
+
+    @torch.no_grad()
+    def write_draft_kv(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        captured_hidden_states: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Step 0 over every row up to its prologue: write each row's draft K/V."""
+        (slots,) = locations
+        input_embeds = self.pre_fc_norm_embedding(self.model.embed_tokens(input_ids))
+        hidden_states = self.pre_fc_norm_hidden(captured_hidden_states)
+        hidden_states = self.fc(torch.cat([input_embeds, hidden_states], dim=-1))
+        self.model.layers[0].write_kv(positions, hidden_states, slots, ctx)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).

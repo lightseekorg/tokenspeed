@@ -1,5 +1,24 @@
 # KDA kernels
 
+## CuTe prefill (`cutedsl_kda`)
+
+The backend selects FlashInfer's ordinary or persistent CuTe KDA scan, reading
+token-strided Q/K/V directly from convolution output. Persistent prefill admits
+BF16 gates, head counts divisible by eight and gate bounds in `[-5, 0)`, and is
+selected when `2 * requests * heads > SM count`; smaller workloads retain the
+ordinary decomposed scan. FP32 initial and final states are
+separate; the runtime retains its LCM gather/writeback and checkpoint policy.
+Live device boundaries build the scan plan for both eager execution and
+capacity-based CUDA graphs. Inputs beyond the live total follow the runtime's
+zero-padding contract: native scans may load a full tile at the tail.
+Persistent planning distributes 32-token chunks
+over resident workers, with at most one exact FP32 handoff per request/head
+chain. Its metadata launch also resets the handoff flags on every replay.
+Scratch belongs to each invocation or its graph
+pool; only compiled code is cached. The FlashInfer adapter owns the pinned
+native launch ABI, avoiding the public wrapper's in-place state updates and
+persistent GPU scratch.
+
 ## RecoverSSM verify (`kda_recoverssm_verify`)
 
 Speculative verify reads each request's checkpoint, runs the candidate window
@@ -118,3 +137,32 @@ of that sum differs from `rmsnorm_gated_sigmoid` on the stored output, so an
 element may move by one BF16 step. Every other verify kernel, and the
 backend's non-verify paths, run `rmsnorm_gated_sigmoid` after the attention
 (`apply_kda_output_norm`).
+
+## Batched commit (`kda_replay_commit`)
+
+After sampling, one launch per state kind commits every layer's accepted
+tokens: the recurrent states fold the accepted corrections and key/gate
+records into the checkpoint, and the convolution histories take the accepted
+window. Two kernels are registered for the recurrent half on NVIDIA:
+
+| Kernel | Platforms | Admits |
+|---|---|---|
+| `cute_dsl_kda_batched_replay_commit` | NVIDIA SM100 to SM103 | BF16 records, FP32 state, 128-wide heads, windows up to 15 tokens (`spec_query_len_max`), a bounded gate |
+| `triton_nvidia_kda_batched_replay_commit` | NVIDIA | FP16 or BF16, FP32 or BF16 state, any window |
+
+The CuTe DSL kernel reproduces the Triton commit's CUDA-core path bit for bit:
+`S <- fma(u_t, kn_t, S * d_t)` per token, with the normalized key `kn_t` and
+decay `d_t` formed with the same instructions, the key's sum of squares in the
+Triton kernel's one-warp lane order. Windows of 16 to 32 tokens, where the
+Triton commit switches to a TF32x3 Tensor Core product, stay on Triton, and an
+unbounded gate runs the Triton commit inside the same call. Both share input
+validation and the convolution commit.
+
+Where the Triton commit splits a head over 8 or 32 one-warp programs that each
+rebuild the token operands, the CuTe DSL kernel runs 2 CTAs of 256 threads
+per (layer, head, request), one per half of the value rows. Each thread issues
+the loads of its 8 rows x 4 keys of the source state first, warp w forms
+tokens w and w + 8 into shared memory, and after one barrier every thread
+folds its values and stores them, so each state byte is read once and written
+once (GB300, 69 layers x 12 heads, 8-token windows: 28 us per commit at 1
+request and 179 us at 8, against 50 us and 228 us).
