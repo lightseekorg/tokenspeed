@@ -583,7 +583,8 @@ def _index_key(mb, L, tok, weights, cache, STAGE: gl.constexpr):
     write = completes & qsa_ok & recent_ok & keep
     mb.stamp(STAGE, trace.COMPUTED)
     mx.put_bf16(mb, "ck", 0, gl.where(write, ck.to(gl.float32), 0.0))
-    qsa_loc = qpage * 256 + L % 256
+    # FlatKV atom pages times 256 tokens pass int32 on large pools.
+    qsa_loc = qpage.to(gl.int64) * 256 + L % 256
     row = (qsa_loc // 256) * 64 + (qsa_loc % 256) // COMPRESS
     dst = (
         cache.compressed

@@ -129,3 +129,52 @@ def test_block_draft_seq_lens_follow_block_causality(causal, expected):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize(
+    "cdna4,granularity,expected",
+    [(True, 128, 64), (True, 64, 64), (True, 32, 32), (False, 128, 128)],
+)
+def test_mha_kernel_page_on_gfx950_is_the_gluon_decode_page(
+    monkeypatch, cdna4, granularity, expected
+):
+    """gfx950 views blocks of whole 64-token pages at the Gluon decode page;
+    other platforms, and QSA everywhere, keep the block's own grain."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.backends.paged import mha as mha_mod
+    from tokenspeed.runtime.layers.attention.backends.paged.qsa import (
+        QSAAttnBackend,
+    )
+
+    monkeypatch.setattr(
+        mha_mod, "current_platform", lambda: SimpleNamespace(is_cdna4=cdna4)
+    )
+    spec = MHAConfig(
+        num_attention_heads=24, num_kv_heads=4, head_dim=256, attn_tp_size=1
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        context_len=65536,
+        max_bs=32,
+        max_resident_requests=32,
+        components=(spec,),
+    )
+    cls = _get_backend_cls("mha", AttentionArch.MHA)
+    assert cls.resolve_kernel_page_size(config, granularity) == expected
+    assert QSAAttnBackend.resolve_kernel_page_size(config, granularity) == granularity
+    pinned = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        context_len=65536,
+        max_bs=32,
+        max_resident_requests=32,
+        kernel_page_size=granularity,
+        components=(spec,),
+    )
+    assert cls.resolve_kernel_page_size(pinned, granularity) == granularity

@@ -370,8 +370,9 @@ class GlmDsaSparseAttentionMixin:
     ``_decode_topk_indices_buffer`` / ``_decode_topk_lens_buffer`` /
     ``_retired_decode_workspaces``, ``prefill_topk_tp_split``, and
     ``decode_topk_fork``: a :class:`StreamFork` whose open scope runs a
-    decode round's top-k beside the query absorption (``StreamFork(None)``
-    keeps it on the main stream).
+    decode round's top-k beside the query absorption, or, for an owned
+    top-k, the absorption beside the indexer and the top-k
+    (``StreamFork(None)`` keeps both on the main stream).
 
     ``prefill_topk_tp_split`` lets a host whose indexer is replicated on every
     attention-TP rank divide the prefill top-k rows among those ranks: each
@@ -629,11 +630,15 @@ class GlmDsaSparseAttentionMixin:
         *,
         logical_num_tokens: int | None = None,
         query_rider: torch.Tensor | None = None,
+        rider_ready: Callable[[], None] | None = None,
     ) -> GlmDsaDecodeTopK | None:
         """The decode rows' top-k. ``query_rider`` (the backend's
         ``dcp_decode_query_rider``) rides an owned top-k's score gather,
         every rank's rows coming back as ``gathered_query``; a top-k
-        selected otherwise leaves the query to its core's own gather."""
+        selected otherwise leaves the query to its core's own gather.
+        ``rider_ready`` orders the current stream after the rider's producer
+        once the scores are enqueued, or is None when the rider is ordered or
+        absent."""
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if metadata is None or metadata.page_table is None:
             return None
@@ -674,6 +679,7 @@ class GlmDsaSparseAttentionMixin:
             num_decode_tokens=decode_window.num_tokens,
             topk=topk,
             query_rider=query_rider,
+            rider_ready=rider_ready,
         )
 
     def _compute_decode_topk_indices_portable(
@@ -689,6 +695,7 @@ class GlmDsaSparseAttentionMixin:
         num_decode_tokens: int,
         topk: int,
         query_rider: torch.Tensor | None = None,
+        rider_ready: Callable[[], None] | None = None,
     ) -> GlmDsaDecodeTopK:
         quantized = indexer_output.quantized_query
         if quantized is None:
@@ -804,6 +811,7 @@ class GlmDsaSparseAttentionMixin:
                     initial_tokens=0,
                     local_tokens=0,
                     rider=query_rider,
+                    rider_ready=rider_ready,
                     q_scales=q_scales,
                     query_group_size=q_len_per_req,
                     out=topk_slice,
@@ -1535,14 +1543,18 @@ class GlmDsaSparseAttentionMixin:
             and backend.takes_owned_decode_topk(self.attn_mqa)
         ):
             q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
-            decode_query = self.forward_absorb_qkv_proj(
-                q[decode_start:decode_end],
-                latent_cache[decode_start:decode_end],
-                positions[decode_start:decode_end],
-                decode_ctx,
-                decode_locs,
-            )
-            query_rider = backend.dcp_decode_query_rider(self.attn_mqa, decode_query)
+            # Absorbed on the fork's stream, beside the indexer on main.
+            with self.decode_topk_fork.branch_after_main():
+                decode_query = self.forward_absorb_qkv_proj(
+                    q[decode_start:decode_end],
+                    latent_cache[decode_start:decode_end],
+                    positions[decode_start:decode_end],
+                    decode_ctx,
+                    decode_locs,
+                )
+                query_rider = backend.dcp_decode_query_rider(
+                    self.attn_mqa, decode_query
+                )
         if should_compute_indexer:
             if index_key_weights is None:
                 hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -1607,12 +1619,21 @@ class GlmDsaSparseAttentionMixin:
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                # After the index-K write; decode joins before attention reads it.
-                with self.decode_topk_fork.branch_after_main():
+                if decode_query is None:
+                    # After the index-K write; joined before attention reads it.
+                    with self.decode_topk_fork.branch_after_main():
+                        decode_topk = self._compute_decode_topk_indices(
+                            indexer_output, ctx, query_rider=None, rider_ready=None
+                        )
+                else:
+                    # Beside the absorption; a rider joins it after scoring.
                     decode_topk = self._compute_decode_topk_indices(
                         indexer_output,
                         ctx,
                         query_rider=query_rider,
+                        rider_ready=(
+                            None if query_rider is None else self.decode_topk_fork.join
+                        ),
                     )
                 if decode_topk is not None and decode_topk.gathered_query is not None:
                     gathered_query = decode_topk.gathered_query
