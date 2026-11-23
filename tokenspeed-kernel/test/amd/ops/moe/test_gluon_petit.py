@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
     _MUSE_SPARK_PROFILE,
+    _compiled_variant_keys,
     _get_workspace,
     _GluonPetitState,
     _import_petit_kernel,
@@ -43,6 +44,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     gluon_petit_mxfp4_megamoe_apply,
     gluon_petit_mxfp4_megamoe_weights,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 
@@ -473,6 +475,93 @@ def test_apply_keeps_zero_token_rank_in_collective() -> None:
     config.run.assert_called_once()
     assert config.run.call_args.args[5] == 0
     overlap.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "warming,capturing,compiles", [(True, False, 1), (False, False, 0), (True, True, 0)]
+)
+def test_apply_compiles_every_variant_once_under_startup_warmup(
+    warming, capturing, compiles
+) -> None:
+    profile = _Profile(
+        name="test",
+        num_experts=8,
+        top_k=1,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+    inputs = SimpleNamespace(
+        tokens=torch.empty((4, 32), dtype=torch.uint8),
+        scales=torch.empty((4, 2), dtype=torch.uint8),
+        expert_ids=torch.empty((4, 1), dtype=torch.int32),
+        expert_weights=torch.empty((4, 1), dtype=torch.float32),
+    )
+    config = mock.Mock()
+    config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
+    heap = object()
+    workspace = SimpleNamespace(config=config, heap=heap, inputs=inputs)
+    state = _GluonPetitState(
+        profile=profile,
+        w13_weight=torch.empty(0),
+        w2_weight=torch.empty(0),
+        w13_scale=torch.empty(0),
+        w2_scale=torch.empty(0),
+        w13_bias=None,
+        w2_bias=None,
+    )
+    layer = SimpleNamespace(_moe_backend_state=state)
+    x = torch.empty((0, profile.model_dim), dtype=torch.bfloat16)
+
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon._get_workspace", return_value=workspace
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon._workspace_key",
+            return_value=(0, profile, 1024),
+        ),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=capturing),
+        kernel_warmup(enabled=warming),
+    ):
+        _compiled_variant_keys.clear()
+        # Two layers of one profile: the variants compile once per workspace.
+        for _ in range(2):
+            gluon_petit_mxfp4_megamoe_apply(
+                plan={},
+                x=x,
+                w=layer,
+                router_logits=torch.empty((0, 0), dtype=torch.bfloat16),
+                topk_weights=torch.empty((0, 1), dtype=torch.float32),
+                topk_ids=torch.empty((0, 1), dtype=torch.int32),
+                num_tokens_global=1,
+                max_num_tokens_per_gpu=1,
+                do_finalize=True,
+                enable_pdl=False,
+                low_latency=None,
+                overlap_fn=None,
+            )
+    _compiled_variant_keys.clear()
+
+    assert config.compile_variants.call_count == compiles
+    if compiles:
+        call = config.compile_variants.call_args
+        assert call.args == (
+            heap,
+            state.w13_weight,
+            state.w2_weight,
+            state.w13_scale,
+            state.w2_scale,
+        )
+        assert call.kwargs == {
+            "w13_bias": None,
+            "w2_bias": None,
+            "inputs": inputs,
+        }
+    # The serving launches are unchanged.
+    assert config.run.call_count == 2
 
 
 # One rank's VMM heap (reserved, physical) bytes at Petit's default 1024-row

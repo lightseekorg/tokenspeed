@@ -522,6 +522,105 @@ def test_distributed_petit_reference(profile_name, capacity):
             dist.barrier()
 
 
+_PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("capacity", (1024, 4096))
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_startup_warmup_compiles_every_variant(
+    profile_name, capacity
+):
+    """After one Petit call under startup warmup, no serving count compiles.
+
+    The warmup call compiles (without launching) every kernel variant a rank
+    can launch at this capacity; afterwards Triton's in-process cache must
+    hit for every count, including the 848-row tail of a 50,000-token prompt
+    that once compiled for 27-28 s inside a serving step.
+    """
+    import triton
+    from tokenspeed_kernel.ops.moe import gluon as petit
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    plan["gluon_petit_max_tokens_per_rank"] = capacity
+    kernel_moe_process_weights(plan, layer)
+    state = layer._moe_backend_state
+    workspace = petit._get_workspace(device, state.profile, capacity)
+    # Another test in this process may have compiled this workspace already.
+    petit._compiled_variant_keys.discard(
+        petit._workspace_key(device, state.profile, capacity)
+    )
+
+    def run(counts, do_finalize=True):
+        count = counts[rank]
+        x = torch.zeros((count, profile.hidden), device=device, dtype=torch.bfloat16)
+        ids, weights = _routing(count, rank, profile, ws, device)
+        out = kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((count, 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=do_finalize,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        return out
+
+    with kernel_warmup(enabled=True):
+        run([16] * ws)
+    counts = workspace.config.variant_token_counts()
+    expected = {
+        "dsv41_flash": (0, 1, 2, 480, 481, 512, 513, 1008, 1009),
+        "dsv41_flash_dspark": (0, 1, 2, 12, 16, 24, 32, 352, 353, 704, 705),
+    }
+    assert counts == expected[profile_name]
+
+    compiled = []
+    previous = triton.knobs.runtime.jit_cache_hook
+
+    def cache_hook(**kwargs):
+        # Triton calls this on every in-process cache miss, before it compiles
+        # or loads a kernel from its disk cache.
+        if kwargs["fn"].name in _PETIT_KERNELS:
+            compiled.append((kwargs["fn"].name, kwargs["key"]))
+        return previous(**kwargs) if previous is not None else None
+
+    triton.knobs.runtime.jit_cache_hook = cache_hook
+    try:
+        for count in sorted({*counts, 848, 849, 1023, 1024, capacity - 1, capacity}):
+            for do_finalize in (True, False):
+                run([count] * ws, do_finalize)
+        # Uneven ranks, as data-parallel attention produces them.
+        run([848, 0, 1, capacity])
+        run([3, 848, 1009, 0], do_finalize=False)
+    finally:
+        triton.knobs.runtime.jit_cache_hook = previous
+    assert not compiled, f"rank {rank} compiled Petit kernels in serving: {compiled}"
+
+
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
     reason="requires torchrun with eight gfx950 GPUs",

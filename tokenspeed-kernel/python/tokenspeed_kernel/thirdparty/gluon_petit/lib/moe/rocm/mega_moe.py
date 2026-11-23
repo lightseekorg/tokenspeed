@@ -190,7 +190,14 @@ class MegaMoESolutionAdapter:
             C.kActDType,
         )
 
-    def Invoke(self, params):
+    def Invoke(self, params, compile_only=False):
+        """Launch the three kernels, or with ``compile_only`` only compile them.
+
+        ``compile_only`` builds exactly the specializations a launch with the
+        same params would (tile, producer geometry, rank, Triton's integer
+        classes of ``num_tokens``) and launches nothing, so it is not a
+        collective and may run on one rank alone.
+        """
         C, p = self.Config, params
         external_input_count = sum(
             x is not None
@@ -214,8 +221,15 @@ class MegaMoESolutionAdapter:
         import torch
         from lib.streams import native_stream
 
+        def Launch(kernel, grid):
+            return kernel.warmup if compile_only else kernel[grid]
+
+        def Grid(blocks):
+            # warmup() takes the grid as a keyword; a launch takes it above.
+            return {"grid": blocks} if compile_only else {}
+
         with torch.cuda.stream(native_stream(p.stream, p.workspace.device)):
-            MegaMoEStage1[(C.kNumSMs,)](
+            Launch(MegaMoEStage1, (C.kNumSMs,))(
                 p.w13,
                 p.scales_w13,
                 p.num_tokens,
@@ -228,8 +242,9 @@ class MegaMoESolutionAdapter:
                 stage1,
                 num_warps=stage1.kNumWarps,
                 enable_fp_fusion=False,
+                **Grid((C.kNumSMs,)),
             )
-            MegaMoEStage2[(stage2.kStage2GridBlocks,)](
+            Launch(MegaMoEStage2, (stage2.kStage2GridBlocks,))(
                 p.w2,
                 p.scales_w2,
                 p.w2_bias,
@@ -238,8 +253,9 @@ class MegaMoESolutionAdapter:
                 stage2,
                 num_warps=stage2.kNumWarps,
                 enable_fp_fusion=False,
+                **Grid((stage2.kStage2GridBlocks,)),
             )
-            MegaMoECombine[(combine.kNumSMs,)](
+            Launch(MegaMoECombine, (combine.kNumSMs,))(
                 p.out,
                 p.num_tokens,
                 p.output_row_stride,
@@ -248,6 +264,7 @@ class MegaMoESolutionAdapter:
                 combine,
                 num_warps=combine.kNumWarps,
                 enable_fp_fusion=False,
+                **Grid((combine.kNumSMs,)),
             )
         return 0
 
@@ -282,13 +299,14 @@ def _MegaMoESolution(solution_id):
         ) from exc
 
 
-def MegaMoECompute(params, solution_id):
+def MegaMoECompute(params, solution_id, compile_only=False):
+    """Launch MegaMoE, or with ``compile_only`` compile its kernels only."""
     adapter = _MegaMoESolution(int(solution_id))
     if adapter is None:
         return kFusedMoEErrorInvalidSolution
     if not IsGfx950(params.stream, params.workspace.device):
         return kFusedMoEErrorUnsupported
-    return adapter.Invoke(params)
+    return adapter.Invoke(params, compile_only)
 
 
 def GetMegaMoEWorkspaceInfo(rank, solution_id):

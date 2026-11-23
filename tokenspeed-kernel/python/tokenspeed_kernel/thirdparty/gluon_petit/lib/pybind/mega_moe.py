@@ -164,11 +164,14 @@ def MegaMoe(
     input_tokens=None,
     input_topk_ids=None,
     input_topk_weights=None,
+    compile_only=False,
 ):
     """Launch MegaMoE; return reduced rows or, without reduction, the routes.
 
     If ``reduce_routes`` is false, ``out`` holds ``[num_tokens, topk, hidden]``
-    routes, each scaled by its expert weight.
+    routes, each scaled by its expert weight. With ``compile_only`` the same
+    checks run and the kernels this launch needs are compiled, but nothing is
+    launched (no collective) and ``out`` is left unwritten.
     """
     info = LookupSolution(heap, solution_id)
     device = heap.device_index
@@ -278,5 +281,5 @@ def MegaMoe(
             reduce_routes,
             torch.cuda.current_stream(device),
         )
-        CheckKernelStatus(MegaMoECompute(params, solution_id), "MegaMoE")
+        CheckKernelStatus(MegaMoECompute(params, solution_id, compile_only), "MegaMoE")
     return out

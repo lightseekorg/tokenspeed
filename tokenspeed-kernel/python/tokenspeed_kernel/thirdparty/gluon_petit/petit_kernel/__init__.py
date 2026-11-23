@@ -254,6 +254,20 @@ def _select_mega_moe_producer_geometry(
     return _MegaMoeProducerGeometry.cta56
 
 
+def _triton_int_class(value: int) -> str:
+    """Name Triton's specialization of a plain integer kernel argument.
+
+    Triton compiles a separate kernel for an int argument equal to 1 (folded
+    to a constant), for one divisible by 16 (0 included; an alignment
+    attribute) and for any other 32-bit value, so a launch's per-rank
+    ``num_tokens`` selects one of these classes as well as its tile.
+    """
+    value = int(value)
+    if value == 1:
+        return "one"
+    return "div16" if value % 16 == 0 else "plain"
+
+
 def create_vmm_symmetric_heap(world_size: int):
     """Collectively create an intra-node VMM symmetric heap."""
     return ops.VmmSymmetricHeap(int(world_size))
@@ -428,6 +442,86 @@ class MegaMoeConfig:
             ops.mega_moe_stage1_tile(solution_id, num_tokens),
         )
 
+    def variant_key(self, num_tokens: int) -> tuple[str, str, str]:
+        """Return ``(producer geometry, stage-1 tile, num_tokens class)``.
+
+        Launches with equal keys on one rank reuse one set of compiled
+        MegaMoE kernels (stage 1, stage 2 and combine; the rank and the
+        external-input and reduce-routes choices are fixed per caller).
+        """
+        return (*self.launch_choice(num_tokens), _triton_int_class(num_tokens))
+
+    def variant_token_counts(self) -> tuple[int, ...]:
+        """Return one per-rank row count for each kernel variant a rank can launch.
+
+        Scans every count from 0 to ``max_tokens_per_rank`` through the same
+        selectors a launch uses (``variant_key``) and keeps the smallest count
+        of each distinct key, ascending.
+        """
+        first: dict[tuple[str, str, str], int] = {}
+        for num_tokens in range(self.max_tokens_per_rank + 1):
+            first.setdefault(self.variant_key(num_tokens), num_tokens)
+        return tuple(sorted(first.values()))
+
+    def compile_variants(
+        self,
+        heap: object,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        *,
+        w13_bias: torch.Tensor | None,
+        w2_bias: torch.Tensor | None,
+        inputs: MegaMoeInputViews,
+        reduce_routes: tuple[bool, ...] = (True, False),
+        token_counts: tuple[int, ...] | None = None,
+    ) -> tuple[int, ...]:
+        """Compile, without launching, every kernel variant this rank can launch.
+
+        Each count of ``token_counts`` (default ``variant_token_counts()``) is
+        prepared exactly as ``run``/``run_routes`` prepare it with external
+        ``inputs`` views, for each ``reduce_routes`` choice, and its kernels are
+        compiled but not launched: nothing is a collective, no buffer is
+        written, and ranks may call this independently. Compiles hit Triton's
+        cache after the first process. Returns the counts compiled.
+        """
+        counts = self.variant_token_counts() if token_counts is None else token_counts
+        for num_tokens in counts:
+            views = MegaMoeInputViews(
+                inputs.tokens[:num_tokens],
+                None if inputs.scales is None else inputs.scales[:num_tokens],
+                inputs.expert_ids[:num_tokens],
+                inputs.expert_weights[:num_tokens],
+            )
+            for reduce in reduce_routes:
+                # A reduced launch writes [num_tokens, model_dim] rows, as
+                # TokenSpeed's adapter allocates them; routes allocate their own.
+                out = (
+                    torch.empty(
+                        (num_tokens, self.model_dim),
+                        dtype=torch.bfloat16,
+                        device=inputs.tokens.device,
+                    )
+                    if reduce
+                    else None
+                )
+                self._launch(
+                    heap,
+                    w13,
+                    w2,
+                    fc1_scale,
+                    fc2_scale,
+                    num_tokens,
+                    reduce_routes=reduce,
+                    w13_bias=w13_bias,
+                    w2_bias=w2_bias,
+                    out=out,
+                    inputs=views,
+                    compile_only=True,
+                )
+        return tuple(counts)
+
     @property
     def compute_model_dim(self) -> int:
         return ((self.model_dim + 511) // 512) * 512
@@ -546,6 +640,7 @@ class MegaMoeConfig:
         w2_bias: torch.Tensor | None,
         out: torch.Tensor | None,
         inputs: MegaMoeInputViews | None,
+        compile_only: bool = False,
     ) -> torch.Tensor:
         num_tokens = int(num_tokens)
         if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
@@ -597,4 +692,5 @@ class MegaMoeConfig:
             input_tokens,
             input_topk_ids,
             input_topk_weights,
+            compile_only=compile_only,
         )

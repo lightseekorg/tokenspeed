@@ -3481,6 +3481,38 @@ def _get_workspace(
     return workspace
 
 
+# Workspace keys whose launchable kernel variants this process has compiled.
+_compiled_variant_keys: set[tuple[int, _Profile, int]] = set()
+
+
+def _compile_variants(
+    device: torch.device, state: _GluonPetitState, workspace: _Workspace
+) -> None:
+    """Compile every Petit kernel variant one rank can launch, once per workspace.
+
+    A launch compiles a kernel per producer geometry, stage-1 tile and Triton
+    class of the rank's row count. Only the counts startup forwards reach were
+    compiled before, so a later count in a new class (e.g. an 848-row prefill
+    tail at EP4, the m64/w4 tile) compiled for 14-28 s inside a serving step
+    while the peers spun in the collective. Compiling launches nothing, so the
+    ranks need not call it together.
+    """
+    key = _workspace_key(device, state.profile, state.max_tokens_per_rank)
+    if key in _compiled_variant_keys:
+        return
+    workspace.config.compile_variants(
+        workspace.heap,
+        state.w13_weight,
+        state.w2_weight,
+        state.w13_scale,
+        state.w2_scale,
+        w13_bias=state.w13_bias,
+        w2_bias=state.w2_bias,
+        inputs=workspace.inputs,
+    )
+    _compiled_variant_keys.add(key)
+
+
 def _slice_inputs(inputs: Any, num_tokens: int) -> Any:
     """Return exact-row views required by Petit's quantize and run APIs."""
     return type(inputs)(
@@ -3667,6 +3699,8 @@ def gluon_petit_mxfp4_megamoe_apply(
 
     profile = state.profile
     workspace = _get_workspace(x.device, profile, capacity)
+    if is_warming_up() and not torch.cuda.is_current_stream_capturing():
+        _compile_variants(x.device, state, workspace)
     inputs = _slice_inputs(workspace.inputs, num_tokens)
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)
