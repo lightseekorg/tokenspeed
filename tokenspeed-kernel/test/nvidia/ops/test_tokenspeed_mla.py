@@ -364,26 +364,37 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         import torch
         from tokenspeed_mla import tokenspeed_mla_decode_split_kvs, tokenspeed_mla_decode_task_capacity
         from tokenspeed_mla.mla_decode import (
-            _get_split_kv_and_workspace_size, _mla_decode_split_kvs_kernel,
-            _per_request_split_kv_width,
+            _decode_query_layout, _get_split_kv, _mla_decode_split_kvs_kernel,
+            _per_request_split_kv_width, _split_wave,
         )
         from tokenspeed_mla.utils import get_num_sm
         from utils import assert_no_triton_compile
 
-        def check(lengths, out, max_seq_len):
+        def check(lengths, out, max_seq_len, heads=128, q_len=1):
             batch = lengths.numel()
-            args = dict(num_heads=128, q_len=1, max_seq_len=max_seq_len,
+            sms = get_num_sm(lengths.device)
+            args = dict(num_heads=heads, q_len=q_len, max_seq_len=max_seq_len,
                         min_split_kv=1, dtype=torch.bfloat16)
-            splits, _ = _get_split_kv_and_workspace_size(
-                batch, 1, 128, 512, get_num_sm(lengths.device), max_seq_len,
-                torch.bfloat16, (128, 128), 1)
-            width = _per_request_split_kv_width(max_seq_len, (128, 128), 1)
+            tiler, _, _, tiles, _ = _decode_query_layout(
+                heads, q_len, is_fp8=False,
+                compute_capability=torch.cuda.get_device_capability(), packable=True)
+            splits = _get_split_kv(
+                batch, tiles, sms, max_seq_len, torch.bfloat16, tiler, 1)
+            width = _per_request_split_kv_width(max_seq_len, tiler, 1)
+            if batch == 1 and splits == 1:
+                width = 1
             source = lengths.to(torch.int64)
             chunks = batch * splits
-            chunk = ((source.sum() + chunks - 1) // chunks).clamp(min=1)
-            expected = ((source + chunk - 1) // chunk).clamp(1, width).int()
+            chunk = ((source.sum() + chunks - 1) // chunks).clamp(min=tiler[1])
+            nearest = ((source + chunk // 2) // chunk).clamp(1, width)
+            rounded = ((source + chunk - 1) // chunk).clamp(max=width)
+            up = torch.where(source >= 2 * chunk, rounded, nearest)
+            wave = max(chunks, _split_wave(tiles, sms, torch.bfloat16, tiler))
+            expected = (up if up.sum() <= wave else nearest).int()
             offsets = torch.empty_strided((batch + 1,), (3,), dtype=torch.int32, device="cuda")
-            tasks = torch.empty(tokenspeed_mla_decode_task_capacity(batch, 128, 1, 1, get_num_sm(lengths.device)), dtype=torch.int64, device="cuda")
+            tasks = torch.empty(
+                tokenspeed_mla_decode_task_capacity(batch, heads, q_len, 1, sms),
+                dtype=torch.int64, device="cuda")
             tokenspeed_mla_decode_split_kvs(lengths, out, offsets, tasks, **args)
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
             torch.testing.assert_close(offsets[0], torch.zeros((), dtype=torch.int32, device="cuda"), rtol=0, atol=0)
@@ -392,6 +403,7 @@ def test_split_counts_match_torch_without_recompiling() -> None:
             split_ids = torch.cat([torch.arange(int(n), device="cuda", dtype=torch.int64) for n in expected])
             expected_tasks = (requests << 32) | split_ids
             torch.testing.assert_close(tasks[:expected_tasks.numel()], expected_tasks, rtol=0, atol=0)
+            return bool(up.sum() <= wave)
 
         lengths = torch.zeros(2049 * 3, dtype=torch.int32, device="cuda")[::3]
         out = torch.empty(2049 * 5, dtype=torch.int32, device="cuda")[::5]
@@ -402,6 +414,22 @@ def test_split_counts_match_torch_without_recompiling() -> None:
                     lengths[:batch].copy_(torch.arange(batch, device="cuda", dtype=torch.int64)
                                          * (max_seq_len // max(batch, 1)))
                     check(lengths[:batch], out[:batch], max_seq_len)
+
+        # A short request and a batch near its average length plan no partials.
+        lengths[:1].fill_(130)
+        check(lengths[:1], out[:1], 32768, heads=96, q_len=7)
+        assert out[0].item() == 1
+        lengths[:8].copy_(torch.arange(8, device="cuda") * 13 + 91)
+        check(lengths[:8], out[:8], 32768, heads=96, q_len=7)
+        assert out[:8].eq(1).all()
+        # Mixed batches round up within one wave and to the nearest count past it.
+        rounded_up = set()
+        for batch in (8, 12, 16, 20, 24, 32, 48, 64):
+            spread = torch.arange(batch, device="cuda") * 60000 // (batch - 1)
+            lengths[:batch].copy_(70000 + spread)
+            rounded_up.add(
+                check(lengths[:batch], out[:batch], 1 << 17, heads=16, q_len=1))
+        assert rounded_up == {True, False}
 
         # Only the three live rows are touched, including an offset above 2**31 elements.
         wide_lengths = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")

@@ -134,10 +134,26 @@ def _decode_query_layout(
     return mma_qk_tiler_mn, fold_sq_factor, H_eff, q_len_eff, pack_q
 
 
+@triton.jit
+def _nearest_splits(lengths, chunk, capacity):
+    """Chunks per request, rounded to the nearest count of at least one."""
+    return tl.minimum(tl.maximum((lengths + chunk // 2) // chunk, 1), capacity)
+
+
+@triton.jit
+def _rounded_up_splits(lengths, chunk, capacity):
+    """Chunks per request, rounded up from two chunks on."""
+    up = tl.minimum((lengths + chunk - 1) // chunk, capacity)
+    # A request shorter than two chunks gains less than its reduction costs.
+    return tl.where(lengths >= 2 * chunk, up, _nearest_splits(lengths, chunk, capacity))
+
+
 @triton.jit(
     do_not_specialize=[
         "num_requests",
         "total_chunks",
+        "min_chunk",
+        "wave",
         "capacity",
         "input_stride",
         "output_stride",
@@ -146,6 +162,8 @@ def _decode_query_layout(
     do_not_specialize_on_alignment=[
         "num_requests",
         "total_chunks",
+        "min_chunk",
+        "wave",
         "capacity",
         "input_stride",
         "output_stride",
@@ -159,6 +177,8 @@ def _mla_decode_split_kvs_kernel(
     tasks,
     num_requests,
     total_chunks,
+    min_chunk,
+    wave,
     capacity,
     input_stride,
     output_stride,
@@ -177,14 +197,28 @@ def _mla_decode_split_kvs_kernel(
         lengths = tl.load(seq_lens + rows * input_stride, rows < num_requests, other=0)
         partial += lengths.to(tl.int64)
     total = tl.sum(partial, 0)
-    chunk = tl.maximum((total + total_chunks - 1) // total_chunks, 1)
+    chunk = tl.maximum((total + total_chunks - 1) // total_chunks, min_chunk)
+    # Rounding up only pays while the chunks still fit one wave of the grid.
+    planned = tl.full((1024,), 0, tl.int64)
+    for start in range(0, num_requests, 1024):
+        rows = start.to(tl.int64) + tl.arange(0, 1024)
+        lengths = tl.load(
+            seq_lens + rows * input_stride, rows < num_requests, other=0
+        ).to(tl.int64)
+        splits = _rounded_up_splits(lengths, chunk, capacity)
+        planned += tl.where(rows < num_requests, splits, 0)
+    round_up = tl.sum(planned, 0) <= wave
     offset = tl.full((), 0, tl.int64)
     for start in range(0, num_requests, 1024):
         rows = start.to(tl.int64) + tl.arange(0, 1024)
         lengths = tl.load(
             seq_lens + rows * input_stride, rows < num_requests, other=0
         ).to(tl.int64)
-        splits = tl.minimum(tl.maximum((lengths + chunk - 1) // chunk, 1), capacity)
+        splits = tl.where(
+            round_up,
+            _rounded_up_splits(lengths, chunk, capacity),
+            _nearest_splits(lengths, chunk, capacity),
+        )
         splits = tl.where(rows < num_requests, splits, 0)
         prefix = tl.cumsum(splits)
         tl.store(
@@ -217,10 +251,13 @@ def tokenspeed_mla_decode_split_kvs(
 
     The counts feed ``tokenspeed_mla_decode(block_split_kvs=...)``. A uniform
     split cuts every request into the same number of chunks, so the
-    longest request of a mixed batch sets the kernel time. This keeps the
-    uniform split's chunk budget and gives each request chunks of about the
-    same length, subject to rounding and the grid capacity. For one request,
-    a uniform budget of one proves there is no need for partials or reduction.
+    longest request of a mixed batch sets the kernel time. This divides the
+    uniform split's chunk budget into chunks of about the same length, at
+    least one KV tile each. Counts round up while the whole plan fits one
+    wave of the decode grid and to the nearest count otherwise; a request
+    shorter than two chunks always rounds to the nearest count, since its
+    reduction costs more than the split saves. For one request, a uniform
+    budget of one proves there is no need for partials or reduction.
     One Triton launch refreshes counts, offsets and the chunk map in place,
     including inside a CUDA graph. The map is shared by all attention layers
     using this plan.
@@ -261,10 +298,11 @@ def tokenspeed_mla_decode_split_kvs(
         compute_capability=compute_capability,
         packable=True,
     )
+    num_sms = get_num_sm(seq_lens.device)
     uniform_split_kv = _get_split_kv(
         B,
         q_len_eff,
-        get_num_sm(seq_lens.device),
+        num_sms,
         max_seq_len,
         dtype,
         mma_qk_tiler_mn,
@@ -278,13 +316,16 @@ def tokenspeed_mla_decode_split_kvs(
     required = min(B * width, B * uniform_split_kv + B - 1)
     if tasks.numel() < required:
         raise ValueError(f"tasks requires at least {required} entries")
+    budget = B * uniform_split_kv
     _mla_decode_split_kvs_kernel[(1,)](
         seq_lens,
         out,
         offsets,
         tasks,
         B,
-        B * uniform_split_kv,
+        budget,
+        mma_qk_tiler_mn[1],
+        max(budget, _split_wave(q_len_eff, num_sms, dtype, mma_qk_tiler_mn)),
         width,
         seq_lens.stride(0),
         out.stride(0),
@@ -292,6 +333,18 @@ def tokenspeed_mla_decode_split_kvs(
         num_warps=4,
     )
     return out
+
+
+def _split_wave(
+    q_len: int,
+    max_active_blocks: int,
+    torch_dtype: torch.dtype,
+    mma_qk_tiler_mn: tuple[int, int],
+) -> int:
+    """Chunks one wave of the decode grid holds, in ``_get_split_kv``'s units."""
+    # M64 FP8 launches one CTA per query tile; the other kernels launch two.
+    is_m64_fp8 = torch_dtype == torch.float8_e4m3fn and mma_qk_tiler_mn[0] == 64
+    return max(1, max_active_blocks // (q_len * (1 if is_m64_fp8 else 2)))
 
 
 @functools.cache
