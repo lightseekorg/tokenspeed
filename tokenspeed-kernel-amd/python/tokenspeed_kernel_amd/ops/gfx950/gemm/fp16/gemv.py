@@ -796,17 +796,20 @@ def gluon_rmsnorm_gemv_a16w16_gfx950(
     BLOCK_K: gl.constexpr,
     NORM_M: gl.constexpr,
     BLOCK_KV: gl.constexpr,
+    KV_SPLIT: gl.constexpr,
 ):
     """The MFMA tile of ``gluon_gemv_a16w16_gfx950`` on ``rmsnorm(x, norm_w)``.
 
     Every program loads the first ``NORM_M`` rows of ``x`` ahead of its
     weights and normalizes them as ``rmsnorm_fused_parallel`` does, bit for
     bit; all programs compute the same rows, and program 0 also stores them
-    to ``x_norm``. With ``KV > 0``, program ``tiles`` instead normalizes the
-    ``[M, KV]`` rows of ``kv`` in place with ``kv_norm_w``.
+    to ``x_norm``. With ``KV > 0`` the ``[M, KV]`` rows of ``kv`` are
+    normalized in place with ``kv_norm_w``: row ``t`` by tile ``t`` beside
+    its weights with ``KV_SPLIT`` (every row a tile), else all of them by an
+    extra program ``tiles``. A row sums in the same order either way.
     """
     tile = gl.program_id(0)
-    if KV > 0:
+    if KV > 0 and not KV_SPLIT:
         if tile == tiles:
             _rmsnorm_rows_in_place(
                 kv_ptr, kv_norm_w_ptr, M, stride_kvm, eps, KV, BLOCK_KV, NORM_M
@@ -834,11 +837,22 @@ def gluon_rmsnorm_gemv_a16w16_gfx950(
         other=0.0,
     )
     norm_w = cdna4.buffer_load(norm_w_ptr, x_k, mask=k_ok, other=0.0)
-    w_offs, _, _ = _mfma_weight_offsets(tile, N, rows, K, BLOCK_N, BLOCK_K, 8)
+    if KV > 0 and KV_SPLIT:
+        # The tile's kv row also goes out ahead of the weights.
+        kv_l: gl.constexpr = _norm_rows_layout(BLOCK_KV, KS)
+        kv_m = gl.arange(0, 1, gl.SliceLayout(1, kv_l))
+        kv_d = gl.arange(0, BLOCK_KV, gl.SliceLayout(0, kv_l))
+        kv_mask = (kv_m < 1)[:, None] & (kv_d < KV)[None, :] & (tile < M)
+        kv_offs = (kv_m[:, None] + tile) * stride_kvm + kv_d[None, :]
+        kv_row = cdna4.buffer_load(kv_ptr, kv_offs, mask=kv_mask, other=0.0)
+        kv_w = cdna4.buffer_load(kv_norm_w_ptr, kv_d, mask=kv_d < KV, other=0.0)
+    # Weight rows past the tile's are masked: they would only feed the
+    # columns it never stores.
+    w_offs, w_mask, _ = _mfma_weight_offsets(tile, N, rows, K, BLOCK_N, BLOCK_K, 8)
     gl.amd.hint.sched_barrier()
     ws = ()
     for it in gl.static_range(ITERS):
-        ws += (cdna4.buffer_load(w_ptr, w_offs + it * KITER, cache=".cg"),)
+        ws += (cdna4.buffer_load(w_ptr, w_offs + it * KITER, mask=w_mask, cache=".cg"),)
     gl.amd.hint.sched_barrier()
     values = x.to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(values * values, axis=1) / K + eps)
@@ -852,6 +866,16 @@ def gluon_rmsnorm_gemv_a16w16_gfx950(
             x_m[:, None] * stride_nm + x_k[None, :],
             mask=(x_m < M)[:, None] & k_ok[None, :],
         )
+    if KV > 0 and KV_SPLIT:
+        if tile < M:
+            kv_values = kv_row.to(gl.float32)
+            kv_inverse_rms = gl.rsqrt(gl.sum(kv_values * kv_values, axis=1) / KV + eps)
+            kv_normed = (
+                kv_values * kv_inverse_rms[:, None] * kv_w.to(gl.float32)[None, :]
+            )
+            cdna4.buffer_store(
+                kv_normed.to(kv_ptr.dtype.element_ty), kv_ptr, kv_offs, mask=kv_mask
+            )
     # [K iteration * wave, row, BLOCK_K]: a K iteration's slice is the MFMA
     # tile's A operand, one BLOCK_K block of columns per wave.
     blocks: gl.constexpr = BLOCK_X // BLOCK_K
@@ -1345,7 +1369,8 @@ def launch_gluon_rmsnorm_gemv_a16w16_gfx950(
     block_k, num_warps = _mfma_k_step(k)
     tiles = triton.cdiv(n, rows)
     kv_width = 0 if kv is None else kv.shape[1]
-    gluon_rmsnorm_gemv_a16w16_gfx950[(tiles + (kv is not None),)](
+    kv_split = tiles >= m
+    gluon_rmsnorm_gemv_a16w16_gfx950[(tiles + (kv is not None and not kv_split),)](
         x,
         norm_weight,
         weight,
@@ -1369,6 +1394,7 @@ def launch_gluon_rmsnorm_gemv_a16w16_gfx950(
         BLOCK_K=block_k,
         NORM_M=max(triton.next_power_of_2(m), 4),
         BLOCK_KV=triton.next_power_of_2(max(kv_width, 1)),
+        KV_SPLIT=kv_split,
         num_warps=num_warps,
     )
     return out
