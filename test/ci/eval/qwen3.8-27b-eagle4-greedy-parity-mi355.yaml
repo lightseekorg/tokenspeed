@@ -15,8 +15,13 @@ workflow_stage: model-test
 triggers:
   - post-submit
   - manual
-# The model modules this task serves; pull requests changing only other models skip it.
+# The modules the target model (qwen3_5*, qwen3_vision) and the EAGLE-4 draft
+# model (llama, nemotron_h, through llama_eagle4 and llama_eagle3) import.
+# Changes to EAGLE draft modules (shared) and to code outside models/ always
+# run this task; only PRs changing nothing but other models' modules skip it.
 model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/nemotron_h.py
   - python/tokenspeed/runtime/models/qwen3_5.py
   - python/tokenspeed/runtime/models/qwen3_5_moe.py
   - python/tokenspeed/runtime/models/qwen3_vision.py
