@@ -471,7 +471,6 @@ class FusedVerifyWindow(RecoverSsmVerify):
             self._load_base_tile(
                 shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
 
         # Issued here and first used after the wait, so no load stalls before it.
         channels = []
@@ -496,6 +495,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
         norm_scale_value = None
         if const_expr(self.gated_norm):
             norm_scale_value = _load(norm_weight, value_start + channel)
+        if live:
+            # After this warp's own loads, so its wait for the count overlaps them.
+            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
 
         cute.arch.griddepcontrol_wait()
         if const_expr(self.cluster > 1):
@@ -569,8 +571,6 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     cute.arch.mbarrier_wait(shared.token_barrier, 0)
                     # The v tile is this CTA's own plain stores.
                     cute.arch.barrier()
-                # Reduce the 64-bit start before narrowing so ring positions stay exact.
-                ring_start = Int32(start % ring_capacity)
                 if tidx < W:
                     shared.sums[self.sums.beta + tidx] = _div(
                         Float32(1.0), Float32(1.0) + _exp(-raw_beta.to(Float32))
@@ -583,17 +583,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         & (tidx < W)
                         & (tidx < valid_tokens)
                     ):
-                        stamp = cute.make_tensor(
-                            stamps
-                            + (
-                                stamp_slot * ring_capacity
-                                + (ring_start + tidx) % ring_capacity
-                            )
-                            * 2,
-                            cute.make_layout((2,)),
+                        self._stamp_position(
+                            stamps, stamp_slot, ring_capacity, start, generation, tidx
                         )
-                        stamp[0] = start + tidx
-                        stamp[1] = generation
                 self._project_window(
                     shared,
                     tidx,

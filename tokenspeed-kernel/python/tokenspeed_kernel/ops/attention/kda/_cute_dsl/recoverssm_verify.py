@@ -671,8 +671,6 @@ class RecoverSsmVerify:
                 stamp_slot = Int64(_load(metadata, request * 3))
                 generation = Int64(_load(metadata, request * 3 + 1))
                 start = Int64(_load(metadata, request * 3 + 2))
-            # Reduce the 64-bit start before narrowing so ring positions stay exact.
-            ring_start = Int32(start % ring_capacity)
             gate_scale = _exp(_load(a_log, head).to(Float32))
             gate_bias = Float32(0.0)
             if tidx < K:
@@ -686,17 +684,9 @@ class RecoverSsmVerify:
             if const_expr(self.has_metadata):
                 # One CTA per request stamps the positions this window records.
                 if (value_tile == 0) & (head == 0) & (tidx < W) & (tidx < valid_tokens):
-                    stamp = cute.make_tensor(
-                        stamps
-                        + (
-                            stamp_slot * ring_capacity
-                            + (ring_start + tidx) % ring_capacity
-                        )
-                        * 2,
-                        cute.make_layout((2,)),
+                    self._stamp_position(
+                        stamps, stamp_slot, ring_capacity, start, generation, tidx
                     )
-                    stamp[0] = start + tidx
-                    stamp[1] = generation
             cute.arch.mbarrier_wait(shared.token_barrier, 0)
             self._project_window(
                 shared,
@@ -1147,6 +1137,33 @@ class RecoverSsmVerify:
             _store_if(
                 stored, (row + t * decay.stride[2]).toint(), _exp(steps[t]), False
             )
+
+    @cute.jit
+    def _stamp_position(
+        self,
+        stamps,
+        stamp_slot: Int64,
+        ring_capacity: Int64,
+        start: Int64,
+        generation: Int64,
+        tidx: Int32,
+    ):
+        """Stamp window position ``tidx``'s ring entry with its position and generation.
+
+        The ring usually has the history's capacity, a compile-time modulus; a
+        64-bit remainder by a runtime value takes a long software sequence.
+        """
+        position = start + Int64(tidx)
+        ring = Int64(0)
+        if ring_capacity == Int64(self.capacity):
+            ring = position % Int64(self.capacity)
+        else:
+            ring = position % ring_capacity
+        stamp = cute.make_tensor(
+            stamps + (stamp_slot * ring_capacity + ring) * 2, cute.make_layout((2,))
+        )
+        stamp[0] = position
+        stamp[1] = generation
 
     def _early_history_registers(self):
         """Registers for the records' channels loaded at the CTA's start.
