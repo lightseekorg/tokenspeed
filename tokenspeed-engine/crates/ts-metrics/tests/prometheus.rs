@@ -497,6 +497,7 @@ fn io_snapshot(get_ages: [f64; 3]) -> L3ExecutorSnapshot {
         health_state: "open".to_owned(),
         health_epoch: 1.0,
         unsafe_io: false,
+        io_blocked: false,
     }
 }
 

@@ -609,7 +609,8 @@ their payload-byte totals and each state's oldest job age. Completed jobs
 remain charged until their facts are polled. Ages count from submission on
 the executor's monotonic clock, as the pressure age does, so a detached
 running job keeps aging until it retires. Separate scheduler gauges retain
-visibility of Ready holds and quarantined references after runtime completion. Waiting soft timeouts and
+visibility of Ready holds and quarantined references after runtime
+completion. Waiting soft timeouts and
 Ready expiration are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique

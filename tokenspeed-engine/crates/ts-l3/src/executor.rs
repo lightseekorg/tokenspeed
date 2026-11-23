@@ -948,8 +948,8 @@ impl Executor {
 
     /// The counters, without backend or GPU work. Completed jobs count until
     /// a poll delivers them. Each state's oldest age is measured from the
-    /// job's submission, as the poll's pressure age is: a cancelled running
-    /// job stays running until its native I/O ends.
+    /// job's submission: a cancelled running job stays running until its
+    /// native I/O ends. Unlike pressure, these gauges retain older generations.
     pub fn snapshot(&self) -> L3ExecutorSnapshot {
         let state = self.shared.lock();
         let now = (self.shared.clock)();
@@ -2712,6 +2712,49 @@ mod tests {
 
         gates[1].1.set();
         assert_eq!(harness.wait(1)[0].op_id, 2);
+        assert_eq!(ages(executor, "get"), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn old_generation_ages_remain_visible_without_driving_current_pressure() {
+        let now = Arc::new(Mutex::new(10.0));
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let store_started = Arc::clone(&started);
+        let store_release = Arc::clone(&release);
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                store_started.set();
+                assert!(store_release.wait(Duration::from_secs(5)));
+                Ok(IoResult {
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let harness = Harness::start(
+            store,
+            ExecutorConfig {
+                read_workers: 1,
+                ..CONFIG
+            },
+            layout(1, 0, 0),
+            fake_clock(&now),
+        );
+        let executor = harness.executor();
+        executor.submit(&[get(1, "old", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        *now.lock().unwrap() = 12.0;
+        executor
+            .begin_cache_generation("00000000000000000000000000000091")
+            .unwrap();
+        executor.submit(&[get(2, "new", 2)]).unwrap();
+        *now.lock().unwrap() = 13.0;
+        assert_eq!(ages(executor, "get"), [1.0, 3.0, 0.0]);
+        assert_eq!(executor.poll().pressure.oldest_operation_us, 1_000_000);
+        release.set();
+        assert!(harness.wait(2).iter().all(|completion| completion.retired));
         assert_eq!(ages(executor, "get"), [0.0, 0.0, 0.0]);
     }
 

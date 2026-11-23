@@ -4,9 +4,7 @@ With `--enable-metrics`, the `prometheus` reporter and a
 `--kvstore-storage-backend`, every engine rank exports the Mooncake Store L3
 tier's metrics on the node's `/metrics` endpoint
 ([Prometheus metrics](../configuration/server.md#prometheus-metrics)). This
-page explains what the series mean and how to alert on them;
-[`examples/monitoring/tokenspeed-l3-alerts.yaml`](https://github.com/lightseekorg/tokenspeed/blob/main/examples/monitoring/tokenspeed-l3-alerts.yaml)
-is a ready rule file. The design is in
+page explains what the series mean and how to alert on them. The design is in
 [asynchronous L3](../design/async-l3-cache.md).
 
 ## How the values are sampled
@@ -21,11 +19,13 @@ and the engine's request metrics.
 
 ## Labels and scope
 
-Every L3 series carries `model_name`, `app_key`, `dp_rank`, `tp_rank` and
-`engine_role`, plus at most two fixed labels: `kind` (`query`, `get`,
+The `tokenspeed:l3_*` executor and scheduler series carry `model_name`,
+`app_key`, `dp_rank`, `tp_rank`, and `engine_role`, plus at most two fixed labels: `kind` (`query`, `get`,
 `put`), `state` (`queued`, `running`, `completed`), `event`, `result`,
 `stage`, `resource`, `phase` or `reason`. No request ID, object key or other
-unbounded value becomes a label.
+unbounded value becomes a label. The `tokenspeed:prefix_*` counters instead
+carry only `model_name`, `app_key`, and `dp_rank`; they have no TP-rank or
+engine-role label.
 
 The series come from two owners, and they aggregate differently:
 
@@ -53,9 +53,11 @@ the state holds no job.
 - `completed`: finished, including rejected and cancelled queued jobs, but
   not yet collected by the event loop. It returns to 0 once collected.
 
-All three count from submission, not from entering the state, so the
-largest `queued` or `running` age on a rank is the operation age it reports
-to the scheduler's pressure gate (`operation_high_age_ms`). A running age
+All three count from submission, not from entering the state. The gauges
+include retained jobs from older cache generations. The scheduler's pressure
+age (`operation_high_age_ms`) instead uses only unfinished jobs in the
+current generation, so an older running job can dominate a gauge without
+closing current-generation pressure admission. A running age
 well past `wait_timeout_ms` means a store call that has not returned: its
 request has already fallen back to recomputation, but the job still holds
 its operation credit and Host references. A high `completed` age can also
@@ -97,7 +99,8 @@ These states are independent, and each needs a different response:
 | Signal | Meaning | Recovery |
 | --- | --- | --- |
 | `tokenspeed:l3_backend_state` 1 (open) or 2 (half-open) | Store calls failed. The executor refuses jobs (`tokenspeed:l3_io_events_total{event="rejected"}`) for `recovery_interval_ms`, then lets one probe call through | Automatic, once a probe succeeds. A probe needs a job, so an idle rank stays open |
-| `tokenspeed:l3_io_quarantined` 1, `tokenspeed:l3_scheduler_resources{resource="quarantined"}` above 0 | A store call could not prove it stopped touching Host memory. New L3 I/O stays off and those Host blocks stay held | Restart the engine process |
+| `tokenspeed:l3_io_quarantined` 1, `tokenspeed:l3_scheduler_resources{resource="quarantined"}` above 0 | Historical native retirement is unproven and old Host references remain held; this does not identify whether the active namespace accepts work | Plan a process restart to reclaim retained memory |
+| `tokenspeed:l3_io_blocked` 1 | The active namespace cannot accept new native work safely | Explicit clear can isolate a fresh generation; old references stay held until retirement is proven or the process restarts |
 | `tokenspeed:l3_scheduler_resources{resource="pressure_gate_closed"}` 1 | Queue depth, queued bytes or operation age crossed a high watermark. New requests skip L3 preparation (`tokenspeed:l3_pressure_bypasses_total`) and backups are dropped | Automatic, once every observation is below its low watermark |
 
 None of these is a readiness signal. Under `ts serve` the gateway (SMG)
@@ -113,19 +116,21 @@ The [example rules](https://github.com/lightseekorg/tokenspeed/blob/main/example
 use only the series above. Their thresholds assume the default `async`
 settings; scale them with your `wait_timeout_ms` and watermarks.
 
+The example rules fire the following alerts:
+
 | Alert | Fires when | Severity |
 | --- | --- | --- |
 | `TokenSpeedL3OperationStuck` | A queued or running age stays above 30 s for 5 minutes | warning |
 | `TokenSpeedL3CompletionsUndelivered` | A completed age stays above 30 s for 5 minutes | warning |
 | `TokenSpeedL3Quarantined` | A rank or the scheduler reports quarantine for 1 minute | critical |
-| `TokenSpeedL3BackendUnavailable` | The backend stays open while it rejects jobs, without quarantine, for 10 minutes | warning |
+| `TokenSpeedL3BackendUnavailable` | The backend stays open while it rejects jobs, without active-namespace blocking, for 10 minutes | warning |
 | `TokenSpeedL3PressureGateClosed` | The pressure gate stays closed while requests bypass L3, for 10 minutes | warning |
 
 `ts-metrics`' tests check that every series, label value and aggregated
 label these rules read is exported.
 
 The Prometheus rule tests check firing delays, the age threshold, idle
-traffic suppression, quarantine suppression and deduplication of mirrored
+traffic suppression, active-blocking suppression, historical-quarantine recovery, and deduplication of mirrored
 TP reports. Run them from the repository root with `promtool`:
 
 ```bash

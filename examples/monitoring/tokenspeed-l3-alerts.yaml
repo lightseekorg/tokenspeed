@@ -48,7 +48,8 @@ groups:
             that has not returned; it keeps its Host references and operation
             credit even after its request was cancelled. Check the store's
             latency and transport; requests past wait_timeout_ms already
-            recompute.
+            recompute. A queued job has not reached a worker: check queued
+            counts, worker saturation, and the pressure gate.
 
       - alert: TokenSpeedL3CompletionsUndelivered
         expr: >-
@@ -80,17 +81,18 @@ groups:
             L3 native I/O retirement is unproven on DP rank
             {{ $labels.dp_rank }}; restart required.
           description: >-
-            New L3 I/O stays disabled and the quarantined Host blocks stay
-            held until the process restarts. Serving continues on L1/L2 and
-            recomputation. Find the rank with tokenspeed:l3_io_quarantined,
-            then plan a restart.
+            Native retirement is unproven and retained Host blocks cannot be
+            reclaimed yet. A fresh generation may still accept safe operations;
+            inspect tokenspeed:l3_io_blocked for the active namespace. Plan a
+            process restart to reclaim retained memory; use gateway readiness
+            for routing.
 
       - alert: TokenSpeedL3BackendUnavailable
         expr: >-
           tokenspeed:l3_backend_state > 0
           and sum without (kind, event)
           (rate(tokenspeed:l3_io_events_total{event="rejected"}[5m])) > 0
-          unless tokenspeed:l3_io_quarantined == 1
+          unless tokenspeed:l3_io_blocked == 1
         for: 10m
         labels:
           severity: warning
