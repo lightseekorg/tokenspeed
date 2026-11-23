@@ -1962,6 +1962,100 @@ register_kernel(
 )(gluon_simt_gemm_fp32)
 
 
+# ===-----------------------------------------------------------------------===#
+# FP8 with row and channel scales: skinny Gluon GEMM (AMD gfx950)
+# ===-----------------------------------------------------------------------===#
+
+
+if platform.is_amd:
+    from tokenspeed_kernel.signature import format_signatures
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.skinny import (
+        launch_gluon_mm_fp8_skinny_gfx950 as _mm_fp8_skinny_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.skinny import (
+        supports_gluon_mm_fp8_skinny_gfx950 as _supports_mm_fp8_skinny,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.skinny import (
+        warm_gluon_mm_fp8_skinny_gfx950 as _warm_mm_fp8_skinny,
+    )
+
+    _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_skinny_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=format_signatures(
+            ("a", "b"), "scaled-fp8", {_FP8_DTYPE}, scale=_FP8_CHANNEL_SCALE
+        ),
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_fp8_skinny}),
+            "a_contiguous": frozenset({True}),
+            "a_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({False}),
+            "b_scales_contiguous": frozenset({True}),
+            "b_layout": frozenset({"KN"}),
+            "b_t_contiguous": frozenset({True}),
+            "out_contiguous": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "operands_aligned_16": frozenset({True}),
+            "out_aligned_16": frozenset({True}),
+            "scales_aligned_16": frozenset({True}),
+            "a_scales_per_row": frozenset({True}),
+            "a_scales_contiguous": frozenset({True}),
+            "b_scales_per_channel": frozenset({True}),
+            "has_alpha": frozenset({False}),
+        },
+        # Any FP8 call with row and channel scales gets this kernel inside its
+        # problem filter: the measured (N, K) shapes at 17-128 rows, the only
+        # shapes with configs. Calls it cannot serve (offset or strided
+        # operands) decline through the traits above.
+        features=frozenset({"weight_streaming"}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mm_fp8_skinny_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor,
+        B_scales: torch.Tensor,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Skinny FP8 GEMM with per-row and per-output-channel FP32 scales.
+
+        Args:
+            A: Contiguous ``[M, K]`` FP8 E4M3 activation codes.
+            B: ``[K, N]`` FP8 E4M3 weight, a transposed contiguous ``[N, K]``.
+            A_scales: FP32 per-row scales, ``[M]`` or ``[M, 1]``, contiguous.
+            B_scales: FP32 per-output-channel scales, ``[N]`` or ``[N, 1]``.
+            out_dtype: Must be BF16.
+            alpha: Must be None; the scales carry the dequantization.
+            block_size: Must be None.
+            out: Optional contiguous ``[M, N]`` BF16 output.
+
+        Returns:
+            ``[M, N]`` BF16 ``(A * A_scales) @ (B * B_scales^T)``; a row's bits
+            do not depend on the other rows of the batch.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("the skinny FP8 GEMM takes no alpha or block_size")
+        if out_dtype != torch.bfloat16:
+            raise ValueError(f"the skinny FP8 GEMM writes BF16, not {out_dtype}")
+        weight = B.t()
+        if is_warming_up():
+            # Both row tiles and the reduce, so no row count compiles later.
+            _warm_mm_fp8_skinny(weight.shape[0], weight.shape[1], A.device)
+        return _mm_fp8_skinny_impl(
+            A, A_scales.reshape(-1), weight, B_scales.reshape(-1), out=out
+        )
+
+
 def warm_gluon_mm_a16w16_skinny(x: torch.Tensor, weight: torch.Tensor) -> None:
     """Compile the gfx950 skinny GEMM's binaries during startup kernel warmup.
 
