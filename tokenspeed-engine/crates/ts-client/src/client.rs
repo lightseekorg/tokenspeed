@@ -640,8 +640,10 @@ impl EngineClient {
         self.shared.send(engine, frames).await
     }
 
-    /// Ask the engine to abort a request. Its stream then ends with an
-    /// `"abort"` chunk. Returns `false` if the request is not in flight.
+    /// Send an abort for a locally tracked request; return false if absent.
+    /// The engine handles client aborts silently. Success acknowledges only
+    /// the send, not scheduler cancellation or transfer retirement, and does
+    /// not close this client's stream. Use a fresh RID for a new request.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
         let engine = match lock(&self.shared.requests).get(rid) {
             Some(pending) => pending.engine,

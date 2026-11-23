@@ -588,9 +588,27 @@ every point where the scheduler's state advances, and why:
   request whose stored prefix landed in Host, a suspended request's restore,
   which waits for both of its store ACKs, then its own -- are delayed by a
   full round.
-* **Tail of the round** — forward results and PD transfer events, funneled
+* **Tail of the round** — aborts, forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
+
+A client abort marks output state silently and queues native abort feedback.
+Once the request is submitted, that feedback leads the round's result events;
+it does not wait for another forward to commit. This also cancels requests
+whose retraction image or restore is waiting for a cache ACK. The current
+round can already have dispatched work: the scheduler keeps its in-flight
+resources until all results arrive. PD cancellation and storage agreement
+keep their existing retirement paths. Unscheduled grammar, embedding and
+withheld admissions remain with their owners until those owners reap them.
+Output state that has no later commit or PD result is released after the
+scheduler removes the aborted request, through the usual logging, tracing
+and data-plane release path. Cache tickets can outlive that release: only
+their real, replica-agreed ACK retires their copy pins and restore row.
+
+Sending an abort is not an abort-applied or transfer-retired receipt. The
+wire still identifies requests by RID alone; callers must use fresh RIDs.
+The CPU serving regression can inspect the native scheduler while an ACK is
+held, but this is not a public control capability or proof of GPU copy timing.
 
 Anything that produces scheduler events (a new transfer backend, a new async
 op kind) either returns events into one of these two points or adds a new
