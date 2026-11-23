@@ -66,6 +66,10 @@ pub enum Error {
 /// Why a request's output stream ended without a finished output.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamError {
+    /// This client explicitly cancelled the stream. Engine resource
+    /// retirement may still be in progress.
+    #[error("the request was cancelled by this client")]
+    Cancelled,
     /// An engine announced its shutdown. On this wire the announcement does
     /// not say which engine, and an engine group cannot serve with a rank
     /// missing, so every stream ends.

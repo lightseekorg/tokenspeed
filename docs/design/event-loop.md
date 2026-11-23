@@ -106,6 +106,26 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+The native frontend's `abort(rid)` only sends the ordinary wire abort. A
+client abort suppresses terminal output in the engine, so callers must not
+wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
+`Frontend.cancel`) sends that same abort and then detaches the local stream.
+The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
+`(rid, RequestCancelled)` exception value, after any already queued outputs.
+It creates no finish chunk or token/finish metrics. Only that stream and the
+client's in-flight count change; engine-reported load and slot, cache and
+transfer retirement keep their existing owners and fences.
+
+Cancellation returns true only when it closes the local stream. If a finish,
+stream error or another cancellation wins, its result is preserved and
+cancellation returns false. A failed send or a dropped cancellation future
+does not detach the stream: the caller can retry, even if the engine already
+received the abort. Stream drop and send cleanup compare the original local
+admission's channel before removing an entry. This protects a later local
+owner, but adds no wire identity: new submissions must use fresh request ids
+to avoid delayed output or abort messages reaching a reused id. Local closure
+is never evidence that engine resources are free.
+
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
 request — including fan-out children and retries — must use a fresh room. At
