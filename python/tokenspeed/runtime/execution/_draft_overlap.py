@@ -26,11 +26,105 @@ stream; the result fence always covers the graph tail and output copies.
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+from tokenspeed.runtime.utils import get_colorful_logger
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+
+logger = get_colorful_logger(__name__)
+
+# Unset: on wherever the configuration is eligible; "1": required; "0": off.
+DRAFT_GRAPH_OVERLAP_ENV = "TOKENSPEED_DRAFT_GRAPH_OVERLAP"
+
+
+def draft_overlap_ineligibility(
+    *,
+    nvidia_decode_graphs: bool,
+    pp_size: int,
+    dp_size: int,
+    spec_algo: str | None,
+    drafter: BaseDrafter | None,
+    grammar_backend: str,
+    shared_moe_row_masks: bool,
+    cache_layers: Callable[[], tuple[set[int], set[int]]],
+    separate_metadata: bool,
+) -> str | None:
+    """The first condition a configuration misses for draft-tail overlap.
+
+    Args:
+        nvidia_decode_graphs: CUDA (not HIP) decode graphs are captured.
+        pp_size: Pipeline-parallel size.
+        dp_size: Data-parallel size.
+        spec_algo: The speculative algorithm, or None.
+        drafter: The drafter, or None without speculation.
+        grammar_backend: The grammar backend name.
+        shared_moe_row_masks: Expert-load recording or MegaMoE's live-request
+            mask is installed.
+        cache_layers: Returns the target and draft KV cache layer sets; read
+            only once the conditions above hold.
+        separate_metadata: Target and drafter own separate attention backends.
+
+    Returns:
+        The unmet condition, or None when the overlap can be enabled.
+    """
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+    if not nvidia_decode_graphs or pp_size != 1 or dp_size != 1:
+        return "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+    if spec_algo != "MTP" or type(drafter) is not Eagle:
+        return "Draft graph overlap requires the Eagle MTP drafter"
+    reason = drafter.decode_overlap_ineligibility()
+    if reason is not None:
+        return reason
+    if grammar_backend != "none":
+        return "Draft graph overlap does not support grammar"
+    if shared_moe_row_masks:
+        return "Draft graph overlap does not support shared MoE row masks"
+    target_layers, draft_layers = cache_layers()
+    if (
+        not target_layers
+        or not draft_layers
+        or not target_layers.isdisjoint(draft_layers)
+        or not separate_metadata
+    ):
+        return "Draft graph overlap requires separate target/draft cache layers and metadata"
+    return None
+
+
+def resolve_draft_overlap(
+    setting: str | None, ineligibility: Callable[[], str | None]
+) -> bool:
+    """Whether decode graphs overlap their draft tail with the next round's preparation.
+
+    Args:
+        setting: The ``TOKENSPEED_DRAFT_GRAPH_OVERLAP`` value. Unset (None) turns
+            the overlap on wherever ``ineligibility`` finds no unmet condition
+            and logs the condition otherwise; "1" requires it; "0" turns it off
+            without checking.
+        ineligibility: Returns the first unmet condition, or None.
+
+    Raises:
+        ValueError: A value other than 0 or 1, or "1" on a configuration that
+            misses a condition.
+    """
+    if setting not in (None, "0", "1"):
+        raise ValueError(f"{DRAFT_GRAPH_OVERLAP_ENV} must be 0 or 1")
+    if setting == "0":
+        return False
+    reason = ineligibility()
+    if reason is None:
+        return True
+    if setting == "1":
+        raise ValueError(reason)
+    logger.info(f"Draft graph overlap off: {reason}")
+    return False
 
 
 @dataclass(frozen=True)
