@@ -84,6 +84,42 @@ def _view(value):
     ).mark_layout_dynamic(leading_dim=value.ndim - 1)
 
 
+def _mixer_operands(x, xs, down, ds, up, us, workspace, out, inject):
+    return tuple(
+        _view(value)
+        for value in (
+            x,
+            xs.reshape(-1),
+            down,
+            ds.reshape(-1),
+            up,
+            us.reshape(-1),
+            workspace.partials,
+            workspace.activation,
+            workspace.alpha,
+            workspace.epochs,
+            out,
+            out if inject is None else inject,
+        )
+    )
+
+
+def _allocate_workspace(rows, r, p, splits, epoch_slots, device):
+    return Workspace(
+        torch.empty((splits, rows, p), device=device, dtype=torch.float32),
+        torch.empty((rows, r), device=device, dtype=torch.float8_e4m3fn),
+        torch.empty((rows,), device=device, dtype=torch.float32),
+        torch.zeros((epoch_slots,), device=device, dtype=torch.int64),
+    )
+
+
+def _compiled_function(compiled, device):
+    compiled.to(device=device.index)
+    library = driver.CUlibrary(int(compiled.jit_module.cuda_library[0]))
+    handle = _checked(driver.cuLibraryEnumerateKernels(1, library))[0]
+    return _checked(driver.cuKernelGetFunction(handle))
+
+
 def _supports_sm103(device: torch.device) -> bool:
     return (
         _AVAILABLE
@@ -186,38 +222,14 @@ def _execute(
             )
             if plan is None:
                 # Compile with one safe cooperative block, then query real capacity.
-                scratch = Workspace(
-                    torch.empty(
-                        (kernel.splits, token_bucket, p),
-                        device=x.device,
-                        dtype=torch.float32,
-                    ),
-                    torch.empty(
-                        (token_bucket, r), device=x.device, dtype=torch.float8_e4m3fn
-                    ),
-                    torch.empty((token_bucket,), device=x.device, dtype=torch.float32),
-                    torch.zeros((2,), device=x.device, dtype=torch.int64),
+                scratch = _allocate_workspace(
+                    token_bucket, r, p, kernel.splits, 2, x.device
                 )
-                values = (
-                    x,
-                    xs.reshape(-1),
-                    down,
-                    ds.reshape(-1),
-                    up,
-                    us.reshape(-1),
-                    scratch.partials,
-                    scratch.activation,
-                    scratch.alpha,
-                    scratch.epochs,
-                    out,
-                    out if inject is None else inject,
+                operands = _mixer_operands(
+                    x, xs, down, ds, up, us, scratch, out, inject
                 )
-                operands = tuple(_view(v) for v in values)
                 compiled = cute_ext.compile(kernel, *operands, cutlass.Int32(1), stream)
-                compiled.to(device=x.device.index)
-                library = driver.CUlibrary(int(compiled.jit_module.cuda_library[0]))
-                handle = _checked(driver.cuLibraryEnumerateKernels(1, library))[0]
-                function = _checked(driver.cuKernelGetFunction(handle))
+                function = _compiled_function(compiled, x.device)
                 blocks = _checked(
                     driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
                         function, kernel.threads, kernel.shared_bytes
@@ -252,34 +264,11 @@ def _execute(
                 plan = Plan(compiled, grid, kernel, resources)
                 _PLANS[key] = plan
             with torch.inference_mode(False):
-                workspace = Workspace(
-                    torch.empty(
-                        (plan.kernel.splits, token_bucket, p),
-                        device=x.device,
-                        dtype=torch.float32,
-                    ),
-                    torch.empty(
-                        (token_bucket, r), device=x.device, dtype=torch.float8_e4m3fn
-                    ),
-                    torch.empty((token_bucket,), device=x.device, dtype=torch.float32),
-                    torch.zeros((plan.grid + 1,), device=x.device, dtype=torch.int64),
+                workspace = _allocate_workspace(
+                    token_bucket, r, p, plan.kernel.splits, plan.grid + 1, x.device
                 )
             _WORKSPACES[stream_key] = workspace
-    values = (
-        x,
-        xs.reshape(-1),
-        down,
-        ds.reshape(-1),
-        up,
-        us.reshape(-1),
-        workspace.partials,
-        workspace.activation,
-        workspace.alpha,
-        workspace.epochs,
-        out,
-        out if inject is None else inject,
-    )
-    operands = tuple(_view(v) for v in values)
+    operands = _mixer_operands(x, xs, down, ds, up, us, workspace, out, inject)
     plan.compiled(*operands, cutlass.Int32(plan.grid), stream)
     return out, inject
 

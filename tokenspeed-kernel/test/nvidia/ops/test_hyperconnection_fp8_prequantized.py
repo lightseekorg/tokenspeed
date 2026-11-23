@@ -371,14 +371,16 @@ def test_narrow_fp8_graph_reuses_activation_workspace(
 
 @pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
 @pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("tensor_scale", [True, False])
 @torch.inference_mode()
-def test_runtime_rows_and_tensor_scales(model, enable_pdl):
+def test_runtime_rows_and_scales(model, enable_pdl, tensor_scale):
     pdl_enabled(enable_pdl)
-    v = _inputs(model, 257, False, True)
+    v = _inputs(model, 257, False, tensor_scale)
     _warm(v, model, torch.bfloat16, True)
     with assert_no_cute_compile():
         for rows in [1, 3, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257]:
-            values = Inputs(v.x[:rows], v.xs, v.down, v.ds, v.up, v.us)
+            xs = v.xs if tensor_scale else v.xs[:rows]
+            values = Inputs(v.x[:rows], xs, v.down, v.ds, v.up, v.us)
             actual = _run(values, model, torch.bfloat16, True)
             torch.cuda.synchronize()
             _check(actual, values, model, torch.bfloat16)

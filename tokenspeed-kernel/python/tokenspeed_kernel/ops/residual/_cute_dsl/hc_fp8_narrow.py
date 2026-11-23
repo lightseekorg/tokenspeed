@@ -33,7 +33,8 @@ from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
     Plan,
     Workspace,
     _checked,
-    _view,
+    _compiled_function,
+    _mixer_operands,
 )
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.narrow import (
@@ -46,10 +47,14 @@ _LOCK = threading.RLock()
 # Phase ordinals must never reuse scratch initialized with round generations.
 _EPOCH_PROTOCOL_VERSION = 8
 
-
-def _select_entry_down_prefill(g, h, r, token_bucket):
-    """Choose actual first-ring issue during independent entry setup."""
-    return (g, h, r) == (4, 2560, 320)
+# Token bucket to (projection tile, split count, K tile, stages).
+_DOWN_TACTICS = {
+    16: (64, 16, 320, 2),
+    32: (64, 16, 320, 2),
+    64: (64, 8, 640, 2),
+    128: (64, 8, 640, 2),
+    256: (64, 4, 512, 3),
+}
 
 
 def _select_residual_issue(g, h, r, p, token_bucket):
@@ -67,8 +72,8 @@ def _select_residual_transfer(g, h, r, token_bucket):
     return "tma" if (g, h, r, token_bucket) == (4, 2560, 320, 128) else "lane"
 
 
-def _select_up_retirement(g, h, r, token_bucket, narrow_b300):
-    if narrow_b300 and token_bucket in (32, 64):
+def _select_up_retirement(g, h, r, token_bucket, has_injection):
+    if has_injection and token_bucket in (32, 64):
         return "skip_final_and_tail_join"
     if (g, h, r) == (4, 2560, 320):
         return "skip_final"
@@ -84,32 +89,32 @@ def _select_up_hidden_columns(g, h, r, p, token_bucket):
     return 1
 
 
-def _select_up_gate_exchange(narrow_b300, token_bucket):
-    return "row_pairs_scalar" if narrow_b300 and token_bucket == 64 else "native"
+def _select_up_gate_exchange(has_injection, token_bucket):
+    return "row_pairs_scalar" if has_injection and token_bucket == 64 else "native"
 
 
-def _select_quant_copy_warp(narrow_b300, token_bucket):
-    return 5 if narrow_b300 and token_bucket == 32 else -1
+def _select_quant_copy_warp(has_injection, token_bucket):
+    return 5 if has_injection and token_bucket == 32 else -1
 
 
-def _select_warp_owned_gates(narrow_b300, token_bucket):
-    return narrow_b300 and token_bucket == 32
+def _select_warp_owned_gates(has_injection, token_bucket):
+    return has_injection and token_bucket == 32
 
 
 def _select_up_scale_issue(g, h, r, token_bucket):
     return "up_async" if (g, h, r, token_bucket) == (4, 2560, 320, 128) else "native"
 
 
-def _select_quant_down_overlap(narrow_b300, token_bucket):
-    return "early_scalar" if narrow_b300 and token_bucket == 16 else "native"
+def _select_quant_down_overlap(has_injection, token_bucket):
+    return "early_scalar" if has_injection and token_bucket == 16 else "native"
 
 
-def _select_quant_down_poll(narrow_b300, token_bucket):
-    return "acquire_fence" if narrow_b300 and token_bucket == 16 else "native"
+def _select_quant_down_poll(has_injection, token_bucket):
+    return "acquire_fence" if has_injection and token_bucket == 16 else "native"
 
 
-def _select_aligned_partial_rows(narrow_b300, token_bucket):
-    return narrow_b300 and token_bucket == 16
+def _select_aligned_partial_rows(has_injection, token_bucket):
+    return has_injection and token_bucket == 16
 
 
 def _allocate_partials(kernel, rows, projection_rows, device):
@@ -121,12 +126,12 @@ def _allocate_partials(kernel, rows, projection_rows, device):
     return torch.empty(shape, device=device, dtype=torch.float32)
 
 
-def _select_quant_activation_store(narrow_b300, token_bucket):
-    return "pack_max" if narrow_b300 and token_bucket in (16, 32, 64) else "native"
+def _select_quant_activation_store(has_injection, token_bucket):
+    return "pack_max" if has_injection and token_bucket in (16, 32, 64) else "native"
 
 
-def _select_up_activation_prefix(narrow_b300, token_bucket):
-    return (3, True) if narrow_b300 and token_bucket == 64 else (0, False)
+def _select_up_activation_prefix(has_injection, token_bucket):
+    return (3, True) if has_injection and token_bucket == 64 else (0, False)
 
 
 def _select_activation_retry_ns(g, h, r, token_bucket):
@@ -146,12 +151,8 @@ def _select_stage_handoff(g, h, r, p, token_bucket, async_phase_arrivals):
     return "grid", False
 
 
-def _select_activation_poll_group(narrow_b300, token_bucket):
-    return 0
-
-
-def _select_down_input_refill_hint(narrow_b300, token_bucket):
-    return (3, 4) if narrow_b300 and token_bucket == 256 else ()
+def _select_down_input_refill_hint(has_injection, token_bucket):
+    return (3, 4) if has_injection and token_bucket == 256 else ()
 
 
 def _select_up_activation_transport(g, h, r, token_bucket):
@@ -161,24 +162,6 @@ def _select_up_activation_transport(g, h, r, token_bucket):
         if token_bucket == 64:
             return "bulk"
     return "native"
-
-
-def _select_down_tactic(g, h, r, token_bucket):
-    """Choose startup-static (projection rows, splits, K width, stages)."""
-    if (g, h, r) == (4, 2560, 320) and token_bucket in (64, 128):
-        return 64, 8, 640, 2
-    if (g, h, r, token_bucket) == (4, 2560, 320, 256):
-        return 64, 4, 512, 3
-    if r == 1024:
-        return (
-            64,
-            8,
-            512 if token_bucket == 16 else 256,
-            2 if token_bucket == 256 else 3,
-        )
-    if token_bucket <= 128:
-        return 64, 16, g * h // 32, 2
-    return 64, 16, 128, 4
 
 
 def _select_up_resident_tactic(g, h, r, token_bucket):
@@ -194,10 +177,6 @@ def _select_down_token_tile(g, h, r, token_bucket):
     return token_bucket
 
 
-def _select_omit_up_empty(g, h, r, token_bucket):
-    return (g, h, r) == (4, 2560, 320)
-
-
 def _select_cta_reader_handoff(r, token_bucket):
     return r == 320 and token_bucket <= 128
 
@@ -209,13 +188,6 @@ def _select_partial_geometry(r, token_bucket):
     if r == 320 and token_bucket == 32:
         return True, True
     return False, False
-
-
-def _select_native_warp_max(device):
-    # Float32 redux is available on the supported SM100 family; keep the
-    # shuffle implementation for other architectures.
-    major, _ = torch.cuda.get_device_capability(device)
-    return major == 10
 
 
 def _select_quant_max_join(g, h, r, token_bucket):
@@ -237,8 +209,8 @@ def _select_down_release(g, h, r, token_bucket):
     return "native"
 
 
-def _select_down_writer_release(narrow_b300, token_bucket):
-    return 1, narrow_b300 and token_bucket == 16, False
+def _select_down_writer_release(has_injection, token_bucket):
+    return 1, has_injection and token_bucket == 16, False
 
 
 def _select_async_phase_arrivals(device, g, h, r, token_bucket):
@@ -258,22 +230,6 @@ def _select_omit_down_empty(g, h, r, token_bucket):
 
 def _select_up_register_rows(g, h, r, token_bucket):
     return (g, h, r, token_bucket) == (4, 2560, 320, 256)
-
-
-def _select_entry_transport(g, h, r, token_bucket):
-    """Choose entry copy transport and compiler minimum occupancy."""
-    return ("deferred", 1) if (g, h, r) == (4, 2560, 320) else ("native", 0)
-
-
-def _select_private_epoch_order(g, h, r, token_bucket):
-    transport, _ = _select_entry_transport(g, h, r, token_bucket)
-    return "coherent" if transport == "deferred" else "store" if r == 320 else "ordered"
-
-
-def _select_up_cluster(g, h, r, token_bucket):
-    if (g, h, r, token_bucket) == (4, 2560, 320, 32):
-        return 1, "private_deferred"
-    return 1, "native"
 
 
 def _activation_workspace(rows, width, device, bundle_alpha):
@@ -302,103 +258,8 @@ def _allocate_activation(kernel, device):
         kernel.n,
         kernel.r,
         device,
-        kernel.bundle_alpha or kernel.up_cluster == "private_deferred",
+        kernel.copied_alpha,
     )
-
-
-def _query_cluster_resources(
-    compiled, operands, function, threads, cluster_size, device
-):
-    """Capture without replay and query the actual cooperative cluster launch."""
-    with torch.cuda.device(device):
-        probe_stream = _checked(
-            driver.cuStreamCreate(driver.CUstream_flags.CU_STREAM_NON_BLOCKING)
-        )
-        graph = None
-        try:
-            _checked(
-                driver.cuStreamBeginCapture(
-                    probe_stream,
-                    driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )
-            )
-            try:
-                compiled(*operands, cutlass.Int32(cluster_size), probe_stream)
-            finally:
-                graph = _checked(driver.cuStreamEndCapture(probe_stream))
-            _, count = _checked(driver.cuGraphGetNodes(graph, 0))
-            nodes, _ = _checked(driver.cuGraphGetNodes(graph, count))
-            kernels = [
-                node
-                for node in nodes
-                if _checked(driver.cuGraphNodeGetType(node))
-                == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
-            ]
-            if len(kernels) != 1:
-                raise RuntimeError("Expected one cooperative cluster compute node")
-            params = _checked(driver.cuGraphKernelNodeGetParams(kernels[0]))
-            if int(params.func) != int(function) or params.blockDimX != threads:
-                raise RuntimeError(
-                    "Captured cluster function or threads differ from the compiled geometry"
-                )
-            cluster_value = _checked(
-                driver.cuGraphKernelNodeGetAttribute(
-                    kernels[0],
-                    driver.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
-                )
-            )
-            cooperative_value = _checked(
-                driver.cuGraphKernelNodeGetAttribute(
-                    kernels[0],
-                    driver.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
-                )
-            )
-            if (
-                cluster_value.clusterDim.x,
-                cluster_value.clusterDim.y,
-                cluster_value.clusterDim.z,
-            ) != (cluster_size, 1, 1) or cooperative_value.cooperative != 1:
-                raise RuntimeError(
-                    "Captured cooperative cluster attributes differ from the plan"
-                )
-            cluster = driver.CUlaunchAttribute()
-            cluster.id = (
-                driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-            )
-            (
-                cluster.value.clusterDim.x,
-                cluster.value.clusterDim.y,
-                cluster.value.clusterDim.z,
-            ) = (cluster_size, 1, 1)
-            cooperative = driver.CUlaunchAttribute()
-            cooperative.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_COOPERATIVE
-            cooperative.value.cooperative = 1
-            config = driver.CUlaunchConfig()
-            config.gridDimX, config.gridDimY, config.gridDimZ = (
-                params.gridDimX,
-                params.gridDimY,
-                params.gridDimZ,
-            )
-            config.blockDimX, config.blockDimY, config.blockDimZ = (
-                params.blockDimX,
-                params.blockDimY,
-                params.blockDimZ,
-            )
-            config.sharedMemBytes = params.sharedMemBytes
-            config.hStream = probe_stream
-            config.attrs = [cluster, cooperative]
-            config.numAttrs = 2
-            clusters = _checked(driver.cuOccupancyMaxActiveClusters(function, config))
-            blocks = _checked(
-                driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                    function, threads, params.sharedMemBytes
-                )
-            )
-            return params.sharedMemBytes, blocks, clusters
-        finally:
-            if graph is not None:
-                _checked(driver.cuGraphDestroy(graph))
-            _checked(driver.cuStreamDestroy(probe_stream))
 
 
 def _execute(
@@ -426,14 +287,9 @@ def _execute(
     if rows == 0:
         return out, inject
     stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
-    down_tactic = _select_down_tactic(g, h, r, token_bucket)
-    if (g, h, r, p, token_bucket) == (
-        4,
-        2560,
-        320,
-        324,
-        16,
-    ) and torch.cuda.get_device_capability(x.device) == (10, 3):
+    has_injection = p == r + g
+    down_tactic = _DOWN_TACTICS[token_bucket]
+    if has_injection and token_bucket == 16:
         # Fit 120 shorter Down tasks and 16 dedicated quantization CTAs in one resident grid.
         down_tactic = 64, 20, 256, 2
     down_token_tile = _select_down_token_tile(g, h, r, token_bucket)
@@ -448,15 +304,15 @@ def _execute(
     async_phase_arrivals = _select_async_phase_arrivals(x.device, g, h, r, token_bucket)
     omit_down_empty = _select_omit_down_empty(g, h, r, token_bucket)
     up_register_rows = _select_up_register_rows(g, h, r, token_bucket)
-    omit_up_empty = _select_omit_up_empty(g, h, r, token_bucket)
-    use_native_warp_max = _select_native_warp_max(x.device)
-    private_epoch_order = _select_private_epoch_order(g, h, r, token_bucket)
-    entry_transport, minimum_blocks_per_sm = _select_entry_transport(
-        g, h, r, token_bucket
-    )
-    entry_down_prefill = _select_entry_down_prefill(g, h, r, token_bucket)
-    entry_down_input_ring_first = (g, h, r) == (4, 2560, 320) and token_bucket <= 64
-    evict_down_weights_last = (g, h, r) == (4, 2560, 320)
+    # These launch settings apply to every SM103 narrow bucket.
+    omit_up_empty = True
+    use_native_warp_max = True
+    private_epoch_order = "coherent"
+    entry_transport = "deferred"
+    minimum_blocks_per_sm = 1
+    entry_down_prefill = True
+    entry_down_input_ring_first = token_bucket <= 64
+    evict_down_weights_last = True
     residual_issue = _select_residual_issue(g, h, r, p, token_bucket)
     residual_transfer = _select_residual_transfer(g, h, r, token_bucket)
     if residual_transfer == "tma" and rows >= 1 << 31:
@@ -466,35 +322,31 @@ def _execute(
     activation_handoff, dedicated_quant_ctas = _select_stage_handoff(
         g, h, r, p, token_bucket, async_phase_arrivals
     )
-    narrow_b300 = (g, h, r, p) == (
-        4,
-        2560,
-        320,
-        324,
-    ) and torch.cuda.get_device_capability(x.device) == (10, 3)
-    down_writer_release = _select_down_writer_release(narrow_b300, token_bucket)
-    up_gate_exchange = _select_up_gate_exchange(narrow_b300, token_bucket)
-    warp_owned_gates = _select_warp_owned_gates(narrow_b300, token_bucket)
-    quant_copy_warp = _select_quant_copy_warp(narrow_b300, token_bucket)
-    up_retirement = _select_up_retirement(g, h, r, token_bucket, narrow_b300)
-    quant_down_overlap = _select_quant_down_overlap(narrow_b300, token_bucket)
-    quant_down_poll = _select_quant_down_poll(narrow_b300, token_bucket)
-    quant_activation_store = _select_quant_activation_store(narrow_b300, token_bucket)
-    up_activation_prefix = _select_up_activation_prefix(narrow_b300, token_bucket)
-    stamped_activation = narrow_b300 and token_bucket == 16
-    aligned_partial_rows = _select_aligned_partial_rows(narrow_b300, token_bucket)
-    pad_residual_rows = narrow_b300 and token_bucket == 64
-    paired_up_sigmoid = narrow_b300 and token_bucket == 32
-    activation_poll_group = _select_activation_poll_group(narrow_b300, token_bucket)
-    input_refill_hint = _select_down_input_refill_hint(narrow_b300, token_bucket)
-    split_activation_counter = narrow_b300 and token_bucket == 64
-    prefetch_up_weights_on_down_retire = narrow_b300 and token_bucket == 64
+    down_writer_release = _select_down_writer_release(has_injection, token_bucket)
+    up_gate_exchange = _select_up_gate_exchange(has_injection, token_bucket)
+    warp_owned_gates = _select_warp_owned_gates(has_injection, token_bucket)
+    quant_copy_warp = _select_quant_copy_warp(has_injection, token_bucket)
+    up_retirement = _select_up_retirement(g, h, r, token_bucket, has_injection)
+    quant_down_overlap = _select_quant_down_overlap(has_injection, token_bucket)
+    quant_down_poll = _select_quant_down_poll(has_injection, token_bucket)
+    quant_activation_store = _select_quant_activation_store(has_injection, token_bucket)
+    up_activation_prefix = _select_up_activation_prefix(has_injection, token_bucket)
+    stamped_activation = has_injection and token_bucket == 16
+    aligned_partial_rows = _select_aligned_partial_rows(has_injection, token_bucket)
+    pad_residual_rows = has_injection and token_bucket == 64
+    paired_up_sigmoid = has_injection and token_bucket == 32
+    input_refill_hint = _select_down_input_refill_hint(has_injection, token_bucket)
+    split_activation_counter = has_injection and token_bucket == 64
+    prefetch_up_weights_on_down_retire = has_injection and token_bucket == 64
     up_activation_transport = _select_up_activation_transport(g, h, r, token_bucket)
     activation_retry_ns = _select_activation_retry_ns(g, h, r, token_bucket)
-    cluster_size, up_cluster = _select_up_cluster(g, h, r, token_bucket)
     if activation_handoff == "row_tags_quant":
-        up_cluster = "bundle_deferred"
-    if up_cluster != "native" or activation_handoff == "row_async_bulk":
+        up_activation_delivery = "bundle_deferred"
+    elif token_bucket == 32:
+        up_activation_delivery = "private_deferred"
+    else:
+        up_activation_delivery = "native"
+    if up_activation_delivery != "native" or activation_handoff == "row_async_bulk":
         up_activation_transport = "bulk"
     key = (
         x.device.index,
@@ -550,10 +402,8 @@ def _execute(
         aligned_partial_rows,
         up_activation_transport,
         activation_retry_ns,
-        activation_poll_group,
         input_refill_hint,
-        cluster_size,
-        up_cluster,
+        up_activation_delivery,
         _EPOCH_PROTOCOL_VERSION,
         token_bucket,
     )
@@ -620,10 +470,8 @@ def _execute(
                 aligned_partial_rows=aligned_partial_rows,
                 up_activation_transport=up_activation_transport,
                 activation_retry_ns=activation_retry_ns,
-                activation_poll_group=activation_poll_group,
                 input_refill_hint=input_refill_hint,
-                cluster_size=cluster_size,
-                up_cluster=up_cluster,
+                up_activation_delivery=up_activation_delivery,
             )
             if plan is None:
                 # Compile with one safe cooperative block, then query real capacity.
@@ -631,65 +479,33 @@ def _execute(
                     _allocate_partials(kernel, token_bucket, p, x.device),
                     *_allocate_activation(kernel, x.device),
                     torch.zeros(
-                        (cluster_size + 1 + kernel.extra_epoch_slots,),
+                        (2 + kernel.extra_epoch_slots,),
                         device=x.device,
                         dtype=torch.int64,
                     ),
                 )
-                values = (
-                    x,
-                    xs.reshape(-1),
-                    down,
-                    ds.reshape(-1),
-                    up,
-                    us.reshape(-1),
-                    scratch.partials,
-                    scratch.activation,
-                    scratch.alpha,
-                    scratch.epochs,
-                    out,
-                    out if inject is None else inject,
+                operands = _mixer_operands(
+                    x, xs, down, ds, up, us, scratch, out, inject
                 )
-                operands = tuple(_view(v) for v in values)
-                compiled = cute_ext.compile(
-                    kernel, *operands, cutlass.Int32(cluster_size), stream
-                )
-                compiled.to(device=x.device.index)
-                library = driver.CUlibrary(int(compiled.jit_module.cuda_library[0]))
-                handle = _checked(driver.cuLibraryEnumerateKernels(1, library))[0]
-                function = _checked(driver.cuKernelGetFunction(handle))
-                query_shared = kernel.shared_bytes
-                active_clusters = None
-                if cluster_size > 1:
-                    query_shared, blocks, active_clusters = _query_cluster_resources(
-                        compiled,
-                        operands,
+                compiled = cute_ext.compile(kernel, *operands, cutlass.Int32(1), stream)
+                function = _compiled_function(compiled, x.device)
+                blocks = _checked(
+                    driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
                         function,
                         kernel.threads,
-                        cluster_size,
-                        x.device,
+                        kernel.shared_bytes,
                     )
-                else:
-                    blocks = _checked(
-                        driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                            function,
-                            kernel.threads,
-                            query_shared,
-                        )
-                    )
+                )
                 properties = torch.cuda.get_device_properties(x.device)
                 capacity = blocks * properties.multi_processor_count
-                if active_clusters is not None:
-                    capacity = min(capacity, active_clusters * cluster_size)
-                if capacity < cluster_size:
+                if capacity <= 0:
                     raise RuntimeError(
                         "prequantized FP8 cooperative kernel has no resident capacity"
                     )
                 desired_grid = max(kernel.down_tasks, kernel.up_tasks)
                 if dedicated_quant_ctas:
                     desired_grid += kernel.quant_groups
-                desired_clusters = (desired_grid + cluster_size - 1) // cluster_size
-                grid = min(capacity // cluster_size, desired_clusters) * cluster_size
+                grid = min(capacity, desired_grid)
                 resources = {
                     "registers": _checked(
                         driver.cuFuncGetAttribute(
@@ -703,9 +519,7 @@ def _execute(
                             function,
                         )
                     ),
-                    "query_shared_bytes": query_shared,
-                    "cluster_size": cluster_size,
-                    "active_clusters": active_clusters,
+                    "query_shared_bytes": kernel.shared_bytes,
                     "resident_capacity": capacity,
                     "blocks_per_sm": blocks,
                     "sm_count": properties.multi_processor_count,
@@ -725,20 +539,6 @@ def _execute(
                     ),
                 )
             _WORKSPACES[stream_key] = workspace
-    values = (
-        x,
-        xs.reshape(-1),
-        down,
-        ds.reshape(-1),
-        up,
-        us.reshape(-1),
-        workspace.partials,
-        workspace.activation,
-        workspace.alpha,
-        workspace.epochs,
-        out,
-        out if inject is None else inject,
-    )
-    operands = tuple(_view(v) for v in values)
+    operands = _mixer_operands(x, xs, down, ds, up, us, workspace, out, inject)
     plan.compiled(*operands, cutlass.Int32(plan.grid), stream)
     return out, inject

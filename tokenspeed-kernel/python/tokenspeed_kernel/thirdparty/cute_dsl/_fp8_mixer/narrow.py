@@ -36,6 +36,21 @@ from cutlass.experimental.cuda import (
     create_tensor_map_tiled,
 )
 from cutlass.experimental.primitives import tcgen05_fence
+from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
+    _acquire,
+    _commit_residual,
+    _copy_residual_16,
+    _decode_residual,
+    _invalidate,
+    _load_f32,
+    _mul_hidden_float_pair,
+    _operand_at,
+    _operand_storage,
+    _release,
+    _store_private_epoch,
+    _wait_residual,
+    _x_scale,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
     Fp8GatedResidualGemm,
     _epilogue_barrier,
@@ -44,28 +59,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import (
     _publish_activation_proxy,
 )
-
-
-@cute.experimental.jit
-def _decode_residual(codes):
-    # Every E4M3 value is exactly representable in BF16 and FP32.
-    words = cute.recast_tensor(codes, cutlass.Uint16)
-    decoded = cute.make_rmem_tensor(cute.size(codes), cutlass.Float32)
-    for i in cutlass.range_constexpr(cute.size(codes) // 2):
-        result = llvm.inline_asm(
-            llvm.StructType.get_literal([T.f32(), T.f32()]),
-            [words[i].ir_value()],
-            "{ .reg .b32 pair; .reg .b16 lo, hi;\n"
-            "cvt.rn.bf16x2.e4m3x2 pair, $2;\n"
-            "mov.b32 {lo, hi}, pair;\n"
-            "cvt.f32.bf16 $0, lo; cvt.f32.bf16 $1, hi; }",
-            "=f,=f,h",
-            has_side_effects=False,
-            asm_dialect=0,
-        )
-        decoded[2 * i] = cutlass.Float32(llvm.extractvalue(T.f32(), result, [0]))
-        decoded[2 * i + 1] = cutlass.Float32(llvm.extractvalue(T.f32(), result, [1]))
-    return decoded
 
 
 @cute.experimental.jit
@@ -101,38 +94,6 @@ def _up_sigmoid_pair(value0, value1):
 
 
 @cute.experimental.jit
-def _mul_hidden_float_pair(lhs0, lhs1, rhs0, rhs1):
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32()]),
-        [lhs0.ir_value(), lhs1.ir_value(), rhs0.ir_value(), rhs1.ir_value()],
-        "{ .reg .b64 a,b,c; mov.b64 a, {$2,$3}; mov.b64 b, {$4,$5}; "
-        "mul.rn.f32x2 c,a,b; mov.b64 {$0,$1},c; }",
-        "=f,=f,f,f,f,f",
-        has_side_effects=False,
-        asm_dialect=0,
-    )
-    return cutlass.Float32(llvm.extractvalue(T.f32(), result, [0])), cutlass.Float32(
-        llvm.extractvalue(T.f32(), result, [1])
-    )
-
-
-@cute.experimental.jit
-def _copy_residual_16(destination, source, size):
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(destination.toint()).ir_value(),
-            source.toint().ir_value(),
-            size.ir_value(),
-        ],
-        "cp.async.ca.shared.global [$0], [$1], 16, $2;",
-        "r,l,r,~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
 def _copy_entry_epoch(destination, source):
     # The private ordinal is 8-byte aligned. It is consumed only after the
     # first Down handoff has waited for this thread's asynchronous group.
@@ -143,44 +104,6 @@ def _copy_entry_epoch(destination, source):
         "r,l,~{memory}",
         has_side_effects=True,
         asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
-def _commit_residual():
-    llvm.inline_asm(
-        None,
-        [],
-        "cp.async.commit_group;",
-        "~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
-def _wait_residual():
-    llvm.inline_asm(
-        None,
-        [],
-        "cp.async.wait_group 0;",
-        "~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
-def _acquire(ptr):
-    return cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [ptr.toint().ir_value()],
-            "ld.global.acquire.gpu.u64 $0, [$1];",
-            "=l,l,~{memory}",
-            has_side_effects=True,
-            asm_dialect=0,
-        )
     )
 
 
@@ -370,18 +293,6 @@ def _write_compact_plane_word(arena, linear, bits):
 
 
 @cute.experimental.jit
-def _release(ptr, value):
-    llvm.inline_asm(
-        None,
-        [ptr.toint().ir_value(), value.ir_value()],
-        "st.global.release.gpu.u64 [$0], $1;",
-        "l,l,~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
 def _load_private_epoch(ptr):
     return cutlass.Int64(
         llvm.inline_asm(
@@ -392,18 +303,6 @@ def _load_private_epoch(ptr):
             has_side_effects=True,
             asm_dialect=0,
         )
-    )
-
-
-@cute.experimental.jit
-def _store_private_epoch(ptr, value):
-    llvm.inline_asm(
-        None,
-        [ptr.toint().ir_value(), value.ir_value()],
-        "st.global.cg.u64 [$0], $1;",
-        "l,l,~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
     )
 
 
@@ -491,21 +390,6 @@ def _grid_barrier(epochs, expected, wait_for_all, async_arrival: cutlass.Constex
 
 
 @cute.experimental.jit
-def _invalidate(barriers, count: cutlass.Constexpr):
-    with cute.arch.elect_one():
-        for index in cutlass.range_constexpr(count):
-            address = cutlass.Int32((barriers + index).toint())
-            llvm.inline_asm(
-                None,
-                [address.ir_value()],
-                "mbarrier.inval.shared::cta.b64 [$0];",
-                "r,~{memory}",
-                has_side_effects=True,
-                asm_dialect=0,
-            )
-
-
-@cute.experimental.jit
 def _down_weight_cache_policy():
     return cutlass.Int64(
         llvm.inline_asm(
@@ -516,46 +400,6 @@ def _down_weight_cache_policy():
             has_side_effects=False,
             asm_dialect=0,
         )
-    )
-
-
-@cute.experimental.jit
-def _operand_storage(arena, first_layout, second_layout):
-    dtype = cutlass.Float8E4M3FN
-    first = cute.make_tensor(
-        cute.make_ptr(
-            dtype,
-            arena.iterator.toint(),
-            cute.AddressSpace.smem,
-            assumed_align=1024,
-            swizzle_=cute.get_swizzle_portion(first_layout),
-        ),
-        cute.get_nonswizzle_portion(first_layout),
-    )
-    second = cute.make_tensor(
-        cute.make_ptr(
-            dtype,
-            arena.iterator.toint() + cute.cosize(first_layout),
-            cute.AddressSpace.smem,
-            assumed_align=1024,
-            swizzle_=cute.get_swizzle_portion(second_layout),
-        ),
-        cute.get_nonswizzle_portion(second_layout),
-    )
-    return first, second
-
-
-@cute.experimental.jit
-def _operand_at(arena, layout, offset):
-    return cute.make_tensor(
-        cute.make_ptr(
-            cutlass.Float8E4M3FN,
-            arena.iterator.toint() + offset,
-            cute.AddressSpace.smem,
-            assumed_align=1024,
-            swizzle_=cute.get_swizzle_portion(layout),
-        ),
-        cute.get_nonswizzle_portion(layout),
     )
 
 
@@ -580,64 +424,6 @@ def _activation_bulk_copy(destination, source, full, size: cutlass.Constexpr):
 def _copy_activation_bytes(destination, source, full, size: cutlass.Constexpr):
     with cute.arch.elect_one():
         _activation_bulk_copy(destination, source, full, size)
-
-
-@cute.experimental.jit
-def _multicast_activation_bytes(
-    destination,
-    source,
-    full,
-    size: cutlass.Constexpr,
-    mask: cutlass.Constexpr,
-    acquire_peer: cutlass.Constexpr,
-):
-    with cute.arch.elect_one():
-        if cutlass.const_expr(acquire_peer):
-            llvm.inline_asm(
-                None,
-                [],
-                "fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;",
-                "~{memory}",
-                has_side_effects=True,
-                asm_dialect=0,
-            )
-        llvm.inline_asm(
-            None,
-            [
-                cutlass.Uint32(destination.toint()).ir_value(),
-                source.toint().ir_value(),
-                cutlass.Uint32(size).ir_value(),
-                cutlass.Uint32(full.toint()).ir_value(),
-            ],
-            f"{{ .reg .b16 peers; mov.b16 peers, {mask}; "
-            "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster "
-            "[$0], [$1], $2, [$3], peers; }",
-            "r,l,r,r,~{memory}",
-            has_side_effects=True,
-            asm_dialect=0,
-        )
-
-
-@cute.experimental.jit
-def _load_f32(ptr):
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [ptr.toint().ir_value()],
-            "ld.global.cg.f32 $0, [$1];",
-            "=f,l,~{memory}",
-            has_side_effects=True,
-            asm_dialect=0,
-        )
-    )
-
-
-@cute.experimental.jit
-def _x_scale(scales, row):
-    index = cutlass.Int64(0)
-    if scales.shape[0] != 1:
-        index = cutlass.Int64(row)
-    return _load_f32(scales.iterator + index)
 
 
 class _DownPhase(Fp8GatedResidualGemm):
@@ -1196,10 +982,8 @@ class Fp8FusedGatedResidualKernel:
         aligned_partial_rows,
         up_activation_transport,
         activation_retry_ns,
-        activation_poll_group,
         input_refill_hint,
-        cluster_size,
-        up_cluster,
+        up_activation_delivery,
     ):
         if type(entry_down_input_ring_first) is not bool or (
             entry_down_input_ring_first
@@ -1214,77 +998,17 @@ class Fp8FusedGatedResidualKernel:
                 "Input-first ring requires two resident small narrow Down stages"
             )
         self.entry_down_input_ring_first = entry_down_input_ring_first
-        if type(cluster_size) is not int or cluster_size not in (1, 2, 4):
-            raise ValueError("Select the CTA cluster size explicitly")
-        self.restricted_cluster_release = up_cluster in (
-            "direct_restricted",
-            "multicast_restricted",
-            "leader_restricted",
-            "bundle_multicast_restricted",
-            "bundle_leader_restricted",
-        )
-        if self.restricted_cluster_release:
-            up_cluster = up_cluster.removesuffix("_restricted")
-        if up_cluster not in (
+        if up_activation_delivery not in (
             "native",
-            "direct",
-            "join_only",
-            "relaxed_join_only",
-            "private",
-            "private_no_join",
             "private_deferred",
-            "multicast",
-            "leader",
-            "bundle_private",
-            "bundle_private_no_join",
             "bundle_deferred",
-            "bundle_multicast",
-            "bundle_leader",
         ):
-            raise ValueError("Select the Up cluster transport explicitly")
-        if cluster_size > 1 and (
-            (g, h, r) != (4, 2560, 320) or token_bucket not in (16, 32, 64)
-        ):
-            raise ValueError("Up cluster placement is scoped to the small narrow tiles")
-        if up_cluster != "native" and up_activation_transport != "bulk":
+            raise ValueError("Select the Up activation delivery explicitly")
+        if up_activation_delivery != "native" and up_activation_transport != "bulk":
             raise ValueError("The Up delivery mode requires a packed activation")
-        self.cluster_size = cluster_size
-        self.up_cluster = up_cluster
-        self.copied_alpha = up_cluster not in (
-            "native",
-            "direct",
-            "join_only",
-            "relaxed_join_only",
-        )
-        self.bundle_alpha = up_cluster in (
-            "bundle_private",
-            "bundle_private_no_join",
-            "bundle_deferred",
-            "bundle_multicast",
-            "bundle_leader",
-        )
-        self.cluster_rendezvous = up_cluster not in (
-            "native",
-            "private_no_join",
-            "private_deferred",
-            "bundle_private_no_join",
-            "bundle_deferred",
-        )
-        if self.cluster_rendezvous and cluster_size == 1:
-            raise ValueError("A peer rendezvous requires a multi-CTA cluster")
-        self.cluster_multicast = up_cluster in (
-            "direct",
-            "multicast",
-            "leader",
-            "bundle_multicast",
-            "bundle_leader",
-        )
-        self.only_leader_acquires = up_cluster in (
-            "leader",
-            "bundle_leader",
-            "private_deferred",
-            "bundle_deferred",
-        )
+        self.up_activation_delivery = up_activation_delivery
+        self.copied_alpha = up_activation_delivery != "native"
+        self.bundle_alpha = up_activation_delivery == "bundle_deferred"
         if up_activation_transport not in ("native", "packed_tma", "bulk"):
             raise ValueError("Select the Up activation transport explicitly")
         self.up_activation_transport = up_activation_transport
@@ -1379,8 +1103,6 @@ class Fp8FusedGatedResidualKernel:
             (g, h, r, p) != (4, 2560, 320, 324)
             or token_bucket not in (16, 32, 64)
             or not use_cta_reader_handoff
-            or self.cluster_size != 1
-            or self.cluster_rendezvous
         ):
             raise ValueError(
                 "Independent warp exit requires the local narrow TMEM handoff"
@@ -1658,20 +1380,12 @@ class Fp8FusedGatedResidualKernel:
                 "Row publication requires one quantized row and hidden-major Up"
             )
         self.activation_handoff = activation_handoff
-        if activation_poll_group not in (0, 1, 4, 8):
-            raise ValueError("Select the activation polling group explicitly")
-        if activation_poll_group and (
-            (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 32)
-            or activation_handoff != "row_tags_quant"
-        ):
-            raise ValueError("Partial tag polling requires the narrow32 row-tag plan")
-        self.activation_poll_group = activation_poll_group
         if type(split_activation_counter) is not bool or (
             split_activation_counter
             and (
                 (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 64)
                 or activation_handoff != "warp"
-                or up_cluster != "native"
+                or up_activation_delivery != "native"
                 or dedicated_quant_ctas
                 or async_phase_arrivals != "native"
             )
@@ -1717,7 +1431,7 @@ class Fp8FusedGatedResidualKernel:
                 (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 16)
                 and self.activation_row_tags
                 and dedicated_quant_ctas
-                and up_cluster == "native"
+                and up_activation_delivery == "native"
                 and up_activation_transport == "bulk"
                 and async_phase_arrivals == "both"
                 and self.up_stages == 1
@@ -1727,7 +1441,7 @@ class Fp8FusedGatedResidualKernel:
                 (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 32)
                 and self.quant_only_down_acquire
                 and not dedicated_quant_ctas
-                and up_cluster in ("private_deferred", "bundle_deferred")
+                and up_activation_delivery in ("private_deferred", "bundle_deferred")
                 and up_activation_transport == "bulk"
                 and async_phase_arrivals == "down"
             )
@@ -1904,10 +1618,6 @@ class Fp8FusedGatedResidualKernel:
                 "The Up weight hint requires the narrow64 single-stage Up tile"
             )
         self.prefetch_up_weights_on_down_retire = prefetch_up_weights_on_down_retire
-        if up_cluster != "native" and self.up_tasks % cluster_size:
-            raise ValueError(
-                "Each multicast destination cluster must serve a complete Up task group"
-            )
         self.up_full_bytes = (
             self.up_channels + self.up_rows * self.up_parts
         ) * self.up_k
@@ -1927,8 +1637,7 @@ class Fp8FusedGatedResidualKernel:
             != (320, 1, 1, 1)
             or self.token_major_up
             or self.residual_tma
-            or up_cluster != "native"
-            or cluster_size != 1
+            or up_activation_delivery != "native"
             or up_activation_transport != "bulk"
         ):
             raise ValueError(
@@ -1960,8 +1669,7 @@ class Fp8FusedGatedResidualKernel:
                 or self.up_tiles != 1
                 or self.up_parts != 1
                 or self.token_major_up
-                or up_cluster != "native"
-                or cluster_size != 1
+                or up_activation_delivery != "native"
                 or prefix_planes
                 or quant_activation_store not in ("pack", "pack_sat", "pack_max")
                 or not self.quant_early_scales
@@ -2095,9 +1803,6 @@ class Fp8FusedGatedResidualKernel:
                 swizzle=TensorMapSwizzle.none,
                 l2_promotion=TensorMapL2Promotion.none,
             )
-        cluster = None
-        if cutlass.const_expr(self.cluster_size > 1):
-            cluster = (self.cluster_size, 1, 1)
         self.kernel(
             x,
             xs,
@@ -2122,9 +1827,9 @@ class Fp8FusedGatedResidualKernel:
         ).launch(
             grid=(grid_ctas, 1, 1),
             block=(self.threads, 1, 1),
+            cluster=None,
             stream=stream,
             cooperative=True,
-            cluster=cluster,
             use_pdl=self.pdl,
             min_blocks_per_mp=self.minimum_blocks_per_sm,
         )
@@ -2186,7 +1891,7 @@ class Fp8FusedGatedResidualKernel:
             activation_counter = epochs.iterator + ((ctas + 16) & -16)
         elif cutlass.const_expr(self.activation_handoff != "grid"):
             activation_counter = epochs.iterator + ctas + 1
-        elif cutlass.const_expr(self.only_leader_acquires):
+        elif cutlass.const_expr(self.copied_alpha):
             activation_counter = epochs.iterator
         second_down_counter = None
         if cutlass.const_expr(self.down_publish_row_halves):
@@ -2371,16 +2076,6 @@ class Fp8FusedGatedResidualKernel:
                         pid,
                         up_weight_map,
                     )
-                    if cutlass.const_expr(self.cluster_rendezvous):
-                        # Signal after arming local completion. Quantization
-                        # and the weight transaction can overlap this arrive.
-                        if cutlass.const_expr(
-                            self.up_cluster == "relaxed_join_only"
-                            or self.restricted_cluster_release
-                        ):
-                            cute.arch.cluster_arrive_relaxed()
-                        else:
-                            cute.arch.cluster_arrive()
                     if cutlass.const_expr(self.residual_issue == "handoff"):
                         if cutlass.const_expr(self.residual_tma):
                             if warp == self.producer_warp:
@@ -2520,7 +2215,7 @@ class Fp8FusedGatedResidualKernel:
                 activation_target = (phase_base + 2) * ctas
                 if cutlass.const_expr(self.dedicated_quant_ctas):
                     activation_target = phase_base + down_arrivals + ctas
-                if cutlass.const_expr(self.only_leader_acquires):
+                if cutlass.const_expr(self.copied_alpha):
                     _grid_barrier(
                         epochs, activation_target, False, self.async_activation_arrival
                     )
@@ -2542,9 +2237,6 @@ class Fp8FusedGatedResidualKernel:
                     )
             elif cutlass.const_expr(not self.activation_row_gate):
                 activation_target = (phase_base + 1) * self.activation_rows_per_counter
-            if cutlass.const_expr(self.cluster_rendezvous):
-                if pid < self.up_tasks:
-                    cute.arch.cluster_wait()
             task = cutlass.Int32(pid)
             while task < self.up_tasks:
                 weights_prepared = cutlass.Boolean(False)
@@ -2590,12 +2282,12 @@ class Fp8FusedGatedResidualKernel:
                     cute.arch.sync_threads()
                 task = task + cutlass.Int32(ctas)
             more_rounds = global_base + self.n < x.shape[0]
-            if cutlass.const_expr(self.up_cluster != "native"):
+            if cutlass.const_expr(self.up_activation_delivery != "native"):
                 if tid == 0 and more_rounds and pid >= self.up_tasks:
                     # A non-Up CTA has no local MMA completion to order
                     # arrival at the reuse barrier after the earlier phase.
                     if cutlass.const_expr(
-                        self.only_leader_acquires and self.activation_handoff == "grid"
+                        self.copied_alpha and self.activation_handoff == "grid"
                     ):
                         _wait_activation(epochs.iterator, activation_target)
                     elif cutlass.const_expr(self.activation_handoff == "warp"):
@@ -3359,17 +3051,6 @@ class Fp8FusedGatedResidualKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bars + stage, self.up_first_tx_bytes
                     )
-                    if cutlass.const_expr(self.restricted_cluster_release):
-                        # The arm of this local event is the only additional
-                        # shared operation the peer sender needs to observe.
-                        llvm.inline_asm(
-                            None,
-                            [],
-                            "fence.release.sync_restrict::shared::cta.cluster;",
-                            "~{memory}",
-                            has_side_effects=True,
-                            asm_dialect=0,
-                        )
                 if cutlass.const_expr(self.warp_owned_gates):
                     self._load_warp_grouped_weights(
                         sw[None, None, None, stage],
@@ -3767,33 +3448,13 @@ class Fp8FusedGatedResidualKernel:
             cute.copy(atom, src, dst, tma_bar_ptr=full)
 
     @cute.experimental.jit
-    def _issue_cluster_activation(self, dst, codes, alpha, alpha_dst, full, multicast):
+    def _issue_deferred_activation(self, dst, codes, alpha, alpha_dst, full):
         payload_bytes = self.up_rows * self.up_k
         if cutlass.const_expr(self.bundle_alpha):
             payload_bytes += self.up_rows * 4
-        if multicast:
-            mask = (1 << self.cluster_size) - 1
-            _multicast_activation_bytes(
-                dst,
-                codes,
-                full,
-                payload_bytes,
-                mask,
-                self.restricted_cluster_release,
-            )
-            if cutlass.const_expr(self.copied_alpha and not self.bundle_alpha):
-                _multicast_activation_bytes(
-                    alpha_dst,
-                    alpha,
-                    full,
-                    self.up_rows * 4,
-                    mask,
-                    self.restricted_cluster_release,
-                )
-        else:
-            _copy_activation_bytes(dst, codes, full, payload_bytes)
-            if cutlass.const_expr(self.copied_alpha and not self.bundle_alpha):
-                _copy_activation_bytes(alpha_dst, alpha, full, self.up_rows * 4)
+        _copy_activation_bytes(dst, codes, full, payload_bytes)
+        if cutlass.const_expr(not self.bundle_alpha):
+            _copy_activation_bytes(alpha_dst, alpha, full, self.up_rows * 4)
 
     @cute.experimental.jit
     def _load_hidden_packet(
@@ -4157,12 +3818,6 @@ class Fp8FusedGatedResidualKernel:
             ma = cute_ext.get_cta_v_map_ab(wv, tiler, mma, "A")
             mb = cute_ext.get_cta_v_map_ab(av, tiler, mma, "B")
         if warp == self.producer_warp:
-            send_activation = cutlass.Boolean(True)
-            multicast = cutlass.Boolean(False)
-            if cutlass.const_expr(self.cluster_multicast):
-                multicast = weights_prepared
-                if multicast:
-                    send_activation = hidden_tile % self.cluster_size == 0
             if cutlass.const_expr(self.activation_row_count):
                 if cute.arch.lane_idx() == 0:
                     if cutlass.const_expr(self.activation_retry_ns > 0):
@@ -4180,16 +3835,6 @@ class Fp8FusedGatedResidualKernel:
             elif cutlass.const_expr(
                 self.activation_row_tags and not self.stamped_activation
             ):
-                if cutlass.const_expr(self.activation_poll_group > 0):
-                    # Spread the smaller initial poll across the Up tiles.
-                    width = self.activation_poll_group
-                    first = (hidden_tile % (self.n // width)) * width
-                    _wait_activation_rows(
-                        activation_counter + cutlass.Int64(first),
-                        activation_target,
-                        width,
-                        self.activation_retry_ns,
-                    )
                 _wait_activation_rows(
                     activation_counter,
                     activation_target,
@@ -4202,24 +3847,16 @@ class Fp8FusedGatedResidualKernel:
                 )
                 self._join_activation_readers()
             elif cutlass.const_expr(self.copied_alpha):
-                if cutlass.const_expr(
-                    self.only_leader_acquires or self.activation_handoff == "warp"
-                ):
-                    do_acquire = (
-                        send_activation
-                        if cutlass.const_expr(self.only_leader_acquires)
-                        else cutlass.Boolean(True)
-                    )
-                    if do_acquire and cute.arch.lane_idx() == 0:
-                        if cutlass.const_expr(self.activation_retry_ns > 0):
-                            _wait_activation_with_delay(
-                                activation_counter,
-                                activation_target,
-                                self.activation_retry_ns,
-                            )
-                        else:
-                            _wait_activation(activation_counter, activation_target)
-                    cute.arch.sync_warp()
+                if cute.arch.lane_idx() == 0:
+                    if cutlass.const_expr(self.activation_retry_ns > 0):
+                        _wait_activation_with_delay(
+                            activation_counter,
+                            activation_target,
+                            self.activation_retry_ns,
+                        )
+                    else:
+                        _wait_activation(activation_counter, activation_target)
+                cute.arch.sync_warp()
             elif cutlass.const_expr(self.activation_handoff == "warp"):
                 if cute.arch.lane_idx() == 0:
                     if cutlass.const_expr(self.activation_retry_ns > 0):
@@ -4267,16 +3904,14 @@ class Fp8FusedGatedResidualKernel:
                             cta_v_map=mb,
                             update_expect_tx=False,
                         )
-                    elif cutlass.const_expr(self.up_cluster != "native"):
-                        if send_activation:
-                            self._issue_cluster_activation(
-                                sw.iterator,
-                                activation.iterator,
-                                alpha.iterator,
-                                cached.iterator,
-                                full + slot,
-                                multicast,
-                            )
+                    elif cutlass.const_expr(self.up_activation_delivery != "native"):
+                        self._issue_deferred_activation(
+                            sw.iterator,
+                            activation.iterator,
+                            alpha.iterator,
+                            cached.iterator,
+                            full + slot,
+                        )
                     else:
                         self._issue_packed_activation(
                             arena,

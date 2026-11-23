@@ -607,6 +607,11 @@ graph replay needs no reset kernel. Startup warms finite token buckets
 16/32/64/128/256, with runtime row masks and additional rounds for larger
 batches. PDL waits precede producer-owned input, weight and scale reads.
 
+The prequantized registry entry selects the SM103 narrow or wide schedule
+by model dimensions. Each schedule uses one kernel definition for its token
+buckets. Both share operand binding and the CuTe operations for residual
+decode, shared operand storage, and epoch loads and stores.
+
 In the SM103 narrow mixer's 32-token plan, a separate warp issues the
 residual copies on quantizing CTAs. The Up output warp reads its own gate
 values after the shared inputs and MMA results are ready.

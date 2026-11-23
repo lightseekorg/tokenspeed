@@ -31,9 +31,10 @@ from cuda.bindings.driver import CUstream
 from cutlass.cute import experimental as cute_ext
 from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
     Plan,
-    Workspace,
+    _allocate_workspace,
     _checked,
-    _view,
+    _compiled_function,
+    _mixer_operands,
 )
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.wide import (
@@ -46,10 +47,14 @@ _LOCK = threading.RLock()
 # Phase ordinals must never reuse scratch initialized with round generations.
 _EPOCH_PROTOCOL_VERSION = 2
 
-
-def _select_entry_down_prefill(g, h, r, token_bucket):
-    """Overlap first Down operand TMA with entry TMEM/epoch setup."""
-    return (g, h, r) == (4, 8192, 1024)
+# Token bucket to (projection tile, split count, K tile, stages).
+_DOWN_TACTICS = {
+    16: (64, 8, 512, 3),
+    32: (64, 8, 512, 3),
+    64: (64, 8, 256, 6),
+    128: (64, 8, 256, 4),
+    256: (128, 16, 128, 4),
+}
 
 
 def _select_early_entry_weights(g, h, r, token_bucket):
@@ -96,24 +101,11 @@ def _select_quant_max_mode(g, h, r, token_bucket, device):
     return "shuffle"
 
 
-def _select_down_tactic(g, h, r, token_bucket):
-    """Choose explicit startup-static (projection rows, splits, K, stages)."""
-    if r == 1024:
-        if token_bucket <= 32:
-            return 64, 8, 512, 3
-        if token_bucket == 256:
-            return 128, 16, 128, 4
-        if token_bucket == 64:
-            return 64, 8, 256, 6
-        return 64, 8, 256, 4
-    return 64, 16, 128, 3
-
-
 def _select_down_mma_unroll(g, h, r, token_bucket, issue_style):
     if issue_style == "cute":
         return 4
-    # Native dense E4M3 instructions consume32K elements per issue.
-    return _select_down_tactic(g, h, r, token_bucket)[2] // 32
+    # A native dense E4M3 instruction consumes 32 elements along K.
+    return _DOWN_TACTICS[token_bucket][2] // 32
 
 
 def _select_up_tactic(g, h, r, token_bucket):
@@ -266,10 +258,6 @@ def _select_up_mix_input_prefetch(g, h, r, p, token_bucket, device):
     return "none"
 
 
-def _select_up_reader_pair_arithmetic(g, h, r, p, token_bucket):
-    return "separate"
-
-
 def _select_up_hidden_pair_mul(device, g, h, r, p, token_bucket):
     return (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 64) and (
         torch.cuda.get_device_capability(device) == (10, 3)
@@ -357,31 +345,11 @@ def _select_native_down_partials(g, h, r, token_bucket):
     return (g, h, r, token_bucket) == (4, 8192, 1024, 128)
 
 
-def _select_private_epoch_order(g, h, r, token_bucket):
-    return "store" if r == 1024 else "ordered"
-
-
 def _select_async_phase_arrivals(device, g, h, r, token_bucket):
     if (g, h, r) == (4, 8192, 1024) and token_bucket in (128, 256):
         if torch.cuda.get_device_capability(device)[0] == 10:
             return "both" if token_bucket == 256 else "activation"
     return "native"
-
-
-def _select_release_phase_arrivals(g, h, r, token_bucket):
-    return r == 1024
-
-
-def _select_tma_fetch(g, h, r, token_bucket):
-    return (
-        (("explicit", "explicit"), (0, 0, 0, 0), 1)
-        if g == 4 and r == 1024
-        else (("native", "native"), (0, 0, 0, 0), 0)
-    )
-
-
-def _select_weight_eviction(g, h, r, token_bucket):
-    return (True, (1, 1)) if g == 4 and r == 1024 else (False, (0, 0))
 
 
 def _execute(
@@ -428,7 +396,7 @@ def _execute(
     if rows == 0:
         return out, inject
     stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
-    down_tactic = _select_down_tactic(g, h, r, token_bucket)
+    down_tactic = _DOWN_TACTICS[token_bucket]
     issue_style = _select_issue_style(g, h, r, token_bucket)
     down_mma_unroll = _select_down_mma_unroll(g, h, r, token_bucket, issue_style[0])
     up_tactic = _select_up_tactic(g, h, r, token_bucket)
@@ -447,9 +415,7 @@ def _execute(
     up_mix_input_prefetch = _select_up_mix_input_prefetch(
         g, h, r, p, token_bucket, x.device
     )
-    up_reader_pair_arithmetic = _select_up_reader_pair_arithmetic(
-        g, h, r, p, token_bucket
-    )
+    up_reader_pair_arithmetic = "separate"
     if (g, h, r, p, token_bucket) == (
         4,
         8192,
@@ -470,45 +436,21 @@ def _execute(
     up_w2_issue_site = _select_up_w2_issue_site(g, h, r, p, token_bucket)
     if up_w2_issue_site != "activation_demand":
         up_prefetch_stages = 3
-    if up_w2_issue_site == "down_retire":
-        up_weight_handoff = "reuse_three"
     up_barrier_placement = _select_up_barrier_placement(g, h, r, token_bucket)
     down_arrival_actor = _select_down_arrival_actor(g, h, r, token_bucket)
-    if up_weight_handoff in ("prefix_three", "join_three", "reuse_three"):
-        up_prefetch_stages = 3
     partial_store_packet = _select_partial_store_packet(g, h, r, token_bucket)
     native_down_partials = _select_native_down_partials(g, h, r, token_bucket)
     up_scale_cache = _select_up_scale_cache(g, h, r, token_bucket)
-    private_epoch_order = _select_private_epoch_order(g, h, r, token_bucket)
-    release_phase_arrivals = _select_release_phase_arrivals(g, h, r, token_bucket)
+    private_epoch_order = "store"
+    release_phase_arrivals = True
     async_phase_arrivals = _select_async_phase_arrivals(x.device, g, h, r, token_bucket)
-    operand_transport, tma_l2_promotion, minimum_blocks_per_sm = _select_tma_fetch(
-        g, h, r, token_bucket
-    )
-    if len(tma_l2_promotion) != 4 or any(
-        type(v) is not int or v not in (0, 64, 128, 256) for v in tma_l2_promotion
-    ):
-        raise ValueError(
-            "Four TMA L2 fetch policies must explicitly select0,64,128or256bytes"
-        )
-    tma_l2_ids = tuple(
-        cutlass.Int32({0: 0, 64: 1, 128: 2, 256: 3}[v]) for v in tma_l2_promotion
-    )
-    weight_cache_hint, weight_priorities = _select_weight_eviction(
-        g, h, r, token_bucket
-    )
-    if (
-        type(weight_cache_hint) is not bool
-        or len(weight_priorities) != 2
-        or any(type(v) is not int or v not in (0, 1, 2) for v in weight_priorities)
-    ):
-        raise ValueError(
-            "Explicit cache-hint bool and two priorities0normal/1first/2last are required"
-        )
-    if not weight_cache_hint and weight_priorities != (0, 0):
-        raise ValueError("Disabled weight hints cannot discard non-normal priorities")
-    weight_priority_ids = tuple(cutlass.Int32(v) for v in weight_priorities)
-    entry_down_prefill = _select_entry_down_prefill(g, h, r, token_bucket)
+    # All wide buckets use explicit Down and Up fetches with these policies.
+    operand_transport = ("explicit", "explicit")
+    minimum_blocks_per_sm = 1
+    tma_l2_ids = (cutlass.Int32(0),) * 4
+    weight_cache_hint = True
+    weight_priority_ids = (cutlass.Int32(1),) * 2
+    entry_down_prefill = True
     early_entry_weights = _select_early_entry_weights(g, h, r, token_bucket)
     activation_wait = _select_activation_wait(g, h, r, token_bucket)
     quant_scale_mode = _select_quant_scale_mode(g, h, r, token_bucket)
@@ -641,37 +583,12 @@ def _execute(
             )
             if plan is None:
                 # Compile with one safe cooperative block, then query real capacity.
-                scratch = Workspace(
-                    torch.empty(
-                        (kernel.splits, token_bucket, p),
-                        device=x.device,
-                        dtype=torch.float32,
-                    ),
-                    torch.empty(
-                        (token_bucket, r), device=x.device, dtype=torch.float8_e4m3fn
-                    ),
-                    torch.empty((token_bucket,), device=x.device, dtype=torch.float32),
-                    torch.zeros(
-                        (2,),
-                        device=x.device,
-                        dtype=torch.int64,
-                    ),
+                scratch = _allocate_workspace(
+                    token_bucket, r, p, kernel.splits, 2, x.device
                 )
-                values = (
-                    x,
-                    xs.reshape(-1),
-                    down,
-                    ds.reshape(-1),
-                    up,
-                    us.reshape(-1),
-                    scratch.partials,
-                    scratch.activation,
-                    scratch.alpha,
-                    scratch.epochs,
-                    out,
-                    out if inject is None else inject,
+                operands = _mixer_operands(
+                    x, xs, down, ds, up, us, scratch, out, inject
                 )
-                operands = tuple(_view(v) for v in values)
                 compiled = cute_ext.compile(
                     kernel,
                     *operands,
@@ -680,10 +597,7 @@ def _execute(
                     *weight_priority_ids,
                     stream,
                 )
-                compiled.to(device=x.device.index)
-                library = driver.CUlibrary(int(compiled.jit_module.cuda_library[0]))
-                handle = _checked(driver.cuLibraryEnumerateKernels(1, library))[0]
-                function = _checked(driver.cuKernelGetFunction(handle))
+                function = _compiled_function(compiled, x.device)
                 actual_shared, blocks = _query_actual_resources(
                     compiled,
                     operands,
@@ -724,38 +638,11 @@ def _execute(
                 plan = Plan(compiled, grid, kernel, resources)
                 _PLANS[key] = plan
             with torch.inference_mode(False):
-                workspace = Workspace(
-                    torch.empty(
-                        (plan.kernel.splits, token_bucket, p),
-                        device=x.device,
-                        dtype=torch.float32,
-                    ),
-                    torch.empty(
-                        (token_bucket, r), device=x.device, dtype=torch.float8_e4m3fn
-                    ),
-                    torch.empty((token_bucket,), device=x.device, dtype=torch.float32),
-                    torch.zeros(
-                        (plan.grid + 1,),
-                        device=x.device,
-                        dtype=torch.int64,
-                    ),
+                workspace = _allocate_workspace(
+                    token_bucket, r, p, plan.kernel.splits, plan.grid + 1, x.device
                 )
             _WORKSPACES[stream_key] = workspace
-    values = (
-        x,
-        xs.reshape(-1),
-        down,
-        ds.reshape(-1),
-        up,
-        us.reshape(-1),
-        workspace.partials,
-        workspace.activation,
-        workspace.alpha,
-        workspace.epochs,
-        out,
-        out if inject is None else inject,
-    )
-    operands = tuple(_view(v) for v in values)
+    operands = _mixer_operands(x, xs, down, ds, up, us, workspace, out, inject)
     plan.compiled(
         *operands, cutlass.Int32(plan.grid), *tma_l2_ids, *weight_priority_ids, stream
     )
