@@ -16,8 +16,9 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
-# The row and page strides stay specialized: they are fixed for a model, and
-# their divisibility by 16 lets the loads and stores of each row vectorize.
+# The input row, output row and conv page strides are compile-time values:
+# they are fixed for a model, and folding them into the addresses lets each
+# row's loads and stores vectorize.
 @triton.jit(do_not_specialize=["query_stride", "read_stride", "total_tokens", "pages"])
 def fused_kda_verify_conv_update_kernel(
     qkv_raw,
@@ -33,9 +34,9 @@ def fused_kda_verify_conv_update_kernel(
     out,
     original_qkv,
     stride_original_tok,
-    stride_raw_tok,
-    stride_out_tok,
-    stride_conv_page,
+    stride_raw_tok: tl.constexpr,
+    stride_out_tok: tl.constexpr,
+    stride_conv_page: tl.constexpr,
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -45,8 +46,6 @@ def fused_kda_verify_conv_update_kernel(
     i_c = tl.program_id(1).to(tl.int64)
     i_n = i_row // T
     i_t = i_row % T
-    begin = i_n * T
-    token_valid = True
     begin = tl.load(query_start_loc + i_n * query_stride).to(tl.int64)
     end = tl.load(query_start_loc + (i_n + 1) * query_stride).to(tl.int64)
     token_valid = (

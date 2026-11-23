@@ -319,3 +319,54 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
         else:
             for value, saved in zip(current, snapshots):
                 torch.testing.assert_close(value, saved, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("batch", [1, 17])
+def test_retained_verify_benchmark_keeps_the_raw_qkv_rows(monkeypatch, batch):
+    """Each producer arrangement leaves the window's pre-convolution rows.
+
+    One request fuses the producers into the window kernel; 17 requests run
+    the split producers, whose convolution keeps the rows as serving does.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    request = BenchmarkRequest(
+        family="attention",
+        mode="kda_fused_paged_verify",
+        parameters=dict(
+            model_profile="kimi_k3_tp8",
+            heads=12,
+            key_dim=128,
+            value_dim=128,
+            dtype="bfloat16",
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+            batch=batch,
+            draft_token_num=4,
+            conv_kernel_size=4,
+            state_pages=batch + 2,
+            state_page_bytes=884736,
+            history_length=4,
+        ),
+        solution=None,
+        registration=None,
+        cold_cache=False,
+        seed=47,
+    )
+    layers = []
+    original_prepare = kda_generator._retained_benchmark_layer
+
+    def capture_layer(*args):
+        layer = original_prepare(*args)
+        layers.append(layer)
+        return layer
+
+    monkeypatch.setattr(kda_generator, "_retained_benchmark_layer", capture_layer)
+    prepared = kda_generator.prepare_kda_fused_paged_verify(request, current_platform())
+    (layer,) = layers
+    raw_rows = layer["records"].original_qkv
+    raw_rows.fill_(float("nan"))
+    prepared.invocation.reset()
+    prepared.invocation.invoke()
+    torch.testing.assert_close(raw_rows, layer["projection"].mixed_qkv, atol=0, rtol=0)

@@ -478,8 +478,20 @@ class FusedVerifyWindow(RecoverSsmVerify):
         cute.arch.barrier()
         # Loaded once, early: phase 1 branches on it.
         count = Int32(0)
+        history_keys, history_decays, history_us = self._early_history_registers()
         if live:
             count = retained_length(retained, slot)
+            self._start_early_history(
+                retained,
+                slot,
+                head,
+                count,
+                value_start,
+                tidx,
+                history_keys,
+                history_decays,
+                history_us,
+            )
             if tidx == 0:
                 # The gate weights first: the projection reads them before the tile.
                 cute.arch.mbarrier_arrive_and_expect_tx(
@@ -632,6 +644,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     value_start,
                     Int32(value_tile == 0),
                     valid_tokens,
+                    history_keys,
+                    history_decays,
+                    history_us,
                 )
 
                 # Phase 3, one thread per value channel; the surplus warps repeat

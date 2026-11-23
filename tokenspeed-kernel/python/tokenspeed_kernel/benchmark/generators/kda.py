@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -654,6 +654,8 @@ def _invoke_retained_layer(layer, common, *, override, solution):
         producers["g_raw"] = torch.nn.functional.linear(
             projection.f_a_out, weights.f_b_weight
         )
+        # As in serving, the convolution keeps the pre-convolution rows, so
+        # the split verify has none to copy.
         producers["conv_qkv"] = kda_ops.kda_verify_conv_update(
             projection.mixed_qkv,
             weights.conv_weights,
@@ -663,8 +665,10 @@ def _invoke_retained_layer(layer, common, *, override, solution):
             head_dim=profile.head_dim,
             draft_token_num=layer["window"],
             query_start_loc=records.query_start_loc,
+            original_qkv=records.original_qkv,
             recurrent_layout=common["recurrent_layout"],
         )
+        records = replace(records, original_qkv=None)
     return kda_ops.kda_fused_paged_verify(
         projection.mixed_qkv,
         weights.conv_weights,
