@@ -1026,6 +1026,13 @@ class CacheGroupRouter(AttentionBackend):
             return False
         return self._leaf_for(layer).takes_owned_decode_topk(layer)
 
+    def projects_decode_values(self, layer, **sizes):
+        if self._offload_adapter is not None and self._offload_adapter.offloads_layer(
+            layer.layer_id
+        ):
+            return False
+        return self._leaf_for(layer).projects_decode_values(layer, **sizes)
+
     def dcp_decode_query_rider(self, layer, q):
         if not self.takes_owned_decode_topk(layer):
             return None

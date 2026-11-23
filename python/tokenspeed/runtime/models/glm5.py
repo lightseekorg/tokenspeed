@@ -1916,11 +1916,27 @@ class GlmDsaSparseAttentionMixin:
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Other backends than an owned top-k's keep their signature.
+        # Backends that neither take an owned top-k nor project decode values
+        # keep their signature.
         owned = {"topk_owned": True} if topk_owned else {}
         if gathered_query is not None:
             owned["gathered_query"] = gathered_query
-        value_weight = self.owned_decode_value_weight() if topk_owned else None
+        value_weight = self.owned_decode_value_weight()
+        if value_weight is not None and not (
+            topk_owned
+            or (
+                topk_indices is not None
+                and ctx.attn_backend.projects_decode_values(
+                    self.attn_mqa,
+                    tokens=Q.shape[0],
+                    topk=topk_indices.shape[-1],
+                    q_len_per_req=Q.shape[0] // max(ctx.bs, 1),
+                    value_head_dim=value_weight.shape[2],
+                    gated=output_gate is not None,
+                )
+            )
+        ):
+            value_weight = None
         if value_weight is not None:
             owned["value_projection"] = ValueProjection(
                 weight=value_weight, gate=output_gate, out=output
@@ -1942,10 +1958,11 @@ class GlmDsaSparseAttentionMixin:
         return output
 
     def owned_decode_value_weight(self) -> torch.Tensor | None:
-        """The ``w_vc`` an owned decode top-k's KVP combine projects with, or None.
+        """The ``w_vc`` a decode projects with as it merges, or None: an owned
+        top-k's KVP combine, or a backend that ``projects_decode_values``.
 
-        With a weight the combine projects as it merges (``ValueProjection``);
-        without one the values project after it.
+        With a weight the merge projects (``ValueProjection``); without one the
+        values project after it.
         """
         return None
 

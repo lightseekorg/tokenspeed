@@ -153,6 +153,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def takes_owned_decode_topk(self, layer):
         return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
 
+    def projects_decode_values(self, layer, **sizes):
+        return self._backend_for_layer(layer.layer_id).projects_decode_values(
+            layer, **sizes
+        )
+
     def dcp_decode_query_rider(self, layer, q):
         return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
 
