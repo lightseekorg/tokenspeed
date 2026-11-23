@@ -391,12 +391,20 @@ impl L3Executor {
         py.detach(|| self.with(|executor| Ok(executor.delete_namespace())))
     }
 
-    /// Stop the workers within ``timeout_s`` and release the store; raises
-    /// when native I/O could not prove its retirement (the store and the
-    /// Host pool's registration then stay for the process). A failed close
-    /// keeps the executor: its snapshot and counters stay readable for
-    /// diagnosis, the quarantine gauges included, and a later call
-    /// retries. A successful close is final; later calls do nothing.
+    /// Stop the workers within ``timeout_s`` and release the store after
+    /// native I/O retirement is proven. A successful close is final;
+    /// later calls with valid timeouts do nothing.
+    ///
+    /// A failed close keeps the executor and its Host registration. Its
+    /// snapshot and counters, including quarantine gauges, remain readable.
+    ///
+    /// Raises:
+    ///     ValueError: ``timeout_s`` is negative, nonfinite, or outside the
+    ///         duration or monotonic clock range. Validation happens before
+    ///         shutdown begins or the handle changes.
+    ///     RuntimeError: Native retirement cannot be proven. A join timeout
+    ///         can be retried after workers retire; historical unretired I/O
+    ///         permanently prevents store release.
     fn close(&self, py: Python<'_>, timeout_s: f64) -> PyResult<()> {
         let timeout = Duration::try_from_secs_f64(timeout_s)
             .map_err(|_| PyValueError::new_err("timeout_s must be finite and nonnegative"))?;

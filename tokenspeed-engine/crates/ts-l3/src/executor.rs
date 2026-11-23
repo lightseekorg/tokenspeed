@@ -1293,7 +1293,7 @@ impl Executor {
         self.shared.store.remove_by_prefix(&format!("{prefix}_"))
     }
 
-    /// Stop the workers within `timeout` and, once every native I/O proved
+    /// Stop the workers within `timeout` and, after every native I/O proved
     /// its retirement, release the store. A successful call joins the
     /// workers and closes the store exactly once; later calls do nothing.
     ///
@@ -1307,9 +1307,17 @@ impl Executor {
     /// their retirement is observed. Historical quarantine permanently
     /// prevents store release, independently of recovery into a new cache
     /// generation: every later close fails and only process exit reclaims
-    /// the store. A failed call keeps this
-    /// executor's ownership. Dropping an executor whose retirement remains
+    /// the store. A failed call keeps this executor's ownership.
+    /// Dropping an executor whose retirement remains
     /// unproven retains one shared reference for the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Invalid`] before starting shutdown if an
+    /// open executor's timeout exceeds the monotonic clock's range.
+    /// Returns [`ExecutorError::Unretired`] when native retirement cannot
+    /// be proven. A join timeout can be retried after workers retire;
+    /// historical unretired I/O permanently prevents a successful close.
     pub fn close(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         if self.closed {
             return Ok(());

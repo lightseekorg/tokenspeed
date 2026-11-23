@@ -606,18 +606,23 @@ Shutdown closes the L3 executor when the host's event loop ends, before the
 data plane's device-copy cleanup. L3 joins its workers with a deadline and then
 closes its store; if native retirement remains unknown it refuses store
 close/Host deregistration and keeps the store client for the process, as the
-data plane keeps the Host allocation. A failed close releases nothing and never
+data plane keeps the Host allocation.
+
+A failed close releases nothing and never
 becomes a silent success: every later call reports the same failure until
 worker retirement is actually observed. A failure caused only by the join
 deadline is retryable — a later call succeeds after workers retire and then
 closes the store exactly once. Historical quarantine permanently prevents
 store release; it does not block a safely isolated new cache generation.
+
 A failed close keeps the executor's ownership; if dropping it
 still cannot prove retirement, one shared reference is retained for the process.
 A successful retry releases the client normally, with no retained reference.
 Through the Python binding, a failed close keeps the executor
 attached so its quarantine gauges and counters remain readable and a retry is
-possible. Worker exit accounting is RAII: a worker that ends for any reason,
+possible.
+
+Worker exit accounting is RAII: a worker that ends for any reason,
 including an unwinding panic, still releases its count, so a close never waits
 on a dead worker. An unwinding worker or poisoned state lock permanently marks
 retirement as unproven: a worker's exit alone never permits deregistration.
