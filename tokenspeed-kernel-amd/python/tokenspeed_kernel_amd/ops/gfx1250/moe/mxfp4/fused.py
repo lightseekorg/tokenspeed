@@ -2154,18 +2154,14 @@ _SMALL_ROUTE_MAX_TOKENS = 512
 _SMALL_ROUTE_MAX_GATES = 2048
 # A route that also quantizes the MoE input keeps the one-launch kernel much
 # further. Past it the apply launches the four stages of the staged route,
-# and with FP8 activations the cast as well; each launch costs about 1.1 us
-# before its programs do anything. One launch against those measured, per
-# apply: Kimi K3 TP8 120.4 vs 130.0 us at 144 requests, 129.5 vs 146.2 us at
-# 256, 159.7 vs 175.2 us at 512 and 211.3 vs 229.5 us at 1024; Qwen3.8 Flash
-# TP2 74.0 vs 85.5 us at 384 and 100.9 vs 109.4 us at 768; Muse Spark TP8
-# 104.4 vs 112.7 us at 512; DSV4.1 Flash TP4 184.4 vs 196.8 us at 640.
+# and with FP8 activations the cast as well, and every launch has a fixed cost
+# before its programs do anything.
 #
 # Every program of the one-launch route works over the routed rows rounded up
 # to a power of two, so just past 8192 rows it does twice the work for the
-# same rows: from there to 12288 rows it measured even on Kimi K3 and 4%
-# slower on Qwen3.8 Flash, and that stretch stays on the staged route. Past
-# 16384 rows it measured 11% slower than baseline on Kimi K3.
+# same rows: from there to 12288 rows it measured even or slower, and that
+# stretch stays on the staged route. Past 16384 rows it measured slower than
+# the staged route.
 _QUANT_SMALL_ROUTE_MAX_TOKENS = 1024
 _QUANT_SMALL_ROUTE_MAX_GATES = 16384
 _QUANT_SMALL_ROUTE_STAGED_GATES = (8192, 12288)
