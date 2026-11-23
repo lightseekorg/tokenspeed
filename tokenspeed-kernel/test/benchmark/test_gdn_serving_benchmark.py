@@ -177,7 +177,10 @@ def test_wait_until_idle_timeout_covers_metrics_response():
     asyncio.run(run())
 
 
-def test_measure_starts_requests_after_warmup_pages_are_released(tmp_path):
+@pytest.mark.parametrize("structured_finish", [False, True])
+def test_measure_starts_requests_after_warmup_pages_are_released(
+    tmp_path, structured_finish
+):
     async def run():
         active_pages = [0.0]
         observed = asyncio.Event()
@@ -194,9 +197,12 @@ def test_measure_starts_requests_after_warmup_pages_are_released(tmp_path):
                 active_pages[0] = 0.1
             elif active_pages[0] > 0:
                 raise web.HTTPConflict(text="warmup forward still owns pages")
+            finish = (
+                {"type": "length", "length": tokens} if structured_finish else "length"
+            )
             updates = [
                 {"meta_info": {"completion_tokens": 1, "finish_reason": None}},
-                {"meta_info": {"completion_tokens": tokens, "finish_reason": "length"}},
+                {"meta_info": {"completion_tokens": tokens, "finish_reason": finish}},
             ]
             return web.Response(
                 text="".join(f"data: {json.dumps(item)}\n\n" for item in updates),

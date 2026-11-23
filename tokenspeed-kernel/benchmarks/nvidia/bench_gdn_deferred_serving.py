@@ -28,6 +28,8 @@ ITL divides each stream interval by its emitted token count and weights that
 interval by those tokens; speculation can emit several tokens together.
 Acceptance counts are emitted tokens per stream update, including the target
 token. Server logs also retain accepted lengths for queued stopped rows.
+A complete request reaches its token limit and reports a length finish, either
+as a string or as the type in the native finish-reason object.
 """
 
 import argparse
@@ -151,6 +153,8 @@ async def measure(args):
                             previous_time, previous_tokens = now, count
                         if info.get("finish_reason") is not None:
                             finish = info["finish_reason"]
+                            if isinstance(finish, dict):
+                                finish = finish["type"]
                 if previous_tokens != tokens or finish != "length":
                     raise RuntimeError(
                         f"incomplete generation: {previous_tokens} tokens, finish {finish}"
