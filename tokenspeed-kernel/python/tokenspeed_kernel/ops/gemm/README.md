@@ -85,6 +85,25 @@ than one row only for measured shapes, through its `mnk_problem_filter`.
 
 On CDNA4, ordinary GEMM dispatch admits the measured single-row
 `[1,8192] @ [4608,8192].T` projection alongside the existing multirow cases.
+The gfx950 skinny GEMM, `gluon_mm_a16w16_skinny_gfx950`, is an `mv` kernel
+too: its `mnk_problem_filter` admits only the weight shapes and row counts it
+was measured on, and a row's bits there do not depend on the other rows of the
+batch. It needs 16-byte-aligned operands and output and declares the
+`operands_aligned_16` and `out_aligned_16` traits, which `mv` and `mm`'s `mv`
+branch supply: an offset view selects what it would without this kernel.
+Supplying them reads tensor addresses only on a platform that registers a
+kernel declaring them; other CUDA platforms and CPU read none.
+Like every `mv` kernel it is selected by the row count alone, in any forward.
+Startup kernel warmup compiles its binaries from any `mm` call that meets
+such a weight (`warm_gluon_mm_a16w16_skinny`, beside the TGV warm hook), so
+the row counts it takes need not run before serving; outside warmup the
+hooks cost `mm` one `is_warming_up()` check. `warm_gluon_mm_a16w16_decode`
+does the same for the gfx950 decode GEMM: it compiles every config measured
+for the weight, whose row buckets a startup may not all reach. Both hooks
+fire on `mm`'s plain BF16 path only: a startup that reaches the weight no
+other way than through a direct `mv`, a `plan`, `solution`, or `override`, or
+a GEMM outside `mm` compiles the missed binaries at their first launch,
+unless it runs a row count that selects them. The AMD ops README records the kernel's contract.
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
@@ -217,14 +236,32 @@ either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
 
 `hipblaslt.py` is the runtime entry point; the loader, the stack check and the
 tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
-`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
-`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
-`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
-automatically, through `hipblaslt.py`, once per process and before graph
-capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
-does not list keep the default solution. Serving never rewrites the file, and
-tunes only with the opt-in switch below. A GPU without a file keeps the
-defaults.
+`_hipblaslt/configs/`, in two kinds, because TunableOp checks solutions against
+the GPU architecture and library builds stamped in a file, not the GPU model,
+and some drivers report a generic device name such as `AMD Radeon Graphics`:
+
+- `gcn_arch=`*`architecture`*`.csv` serves every GPU whose `gcnArchName` equals the
+  file's `GCN_ARCH_NAME` stamp. It holds only rows verified on every GPU model
+  of that architecture to write the default solution's bits and not be slower.
+- `device_name=`*`name`*`.csv`, named after `torch.cuda.get_device_name()` with
+  spaces replaced by underscores, adds rows for one GPU model. Its solutions
+  may be chosen for speed alone and change result bits. It never lists a GEMM
+  its architecture file lists.
+
+Serving loads the architecture file and then the device file of its GPU
+(`find_hipblaslt_tuned_files`) automatically, through `hipblaslt.py`, once per
+process and before graph capture, and replays them read-only through PyTorch
+TunableOp. GEMMs the files do not list keep the default solution. Serving never
+rewrites a file, and tunes only with the opt-in switch below. A GPU with
+neither file logs a warning that its GEMMs run untuned and keeps the defaults.
+Each file loads only when its own stamp matches the running stack; a stale
+device file is skipped with a warning and the architecture file still loads.
+
+The tuning tool, run as in the following command, writes the device file of
+the GPU it runs on: it reads the architecture file first, so those GEMMs are
+not re-timed, and keeps them out of its output. A row moves to the
+architecture file only once it is checked on every model of the architecture
+to keep the default's bits and not be slower.
 
 A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
 versions and the GPU architecture stamped in its `Validator` rows. On any
@@ -239,13 +276,21 @@ python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
     --rows 64,128,192,256,384,512
 ```
 
-Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+Without `--out`, the tool writes this GPU's device file in
+`_hipblaslt/configs/`, except on a GPU whose driver reports a generic device
+name (`GENERIC_DEVICE_NAMES`): a file named after it would load on every model
+reporting that name, so the tool refuses and `--out` must be passed. If
 the file exists with the running stack's stamp, its GEMMs are kept and only
 new ones are timed, so one file can cover several models; on another stack
 the tool stops, and the file must be deleted to re-tune. Tuning rotates
 weight copies through `--cold-bytes`, so each timing reads the weight from
 HBM as a serving step does. Another solution can sum K in another order, so
 results differ from the default within BF16 rounding.
+
+A row of an architecture file is chosen among the solutions that give the
+default's bits, not only the fastest, and checked on every GPU model of the
+architecture. Re-tuning should keep those rows, or re-pick them by the same
+rule.
 
 To cover GEMMs the file does not list without regenerating it, such as a new
 model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).

@@ -251,7 +251,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     @override
     def parent_id_limit(self, layout: CacheLayout) -> int:
-        """Keep every target and draft atom write slot inside signed int32."""
+        """Keep every int32 kernel address of the target and draft fields in range."""
         limit = super().parent_id_limit(layout)
         if not self._flat_kv:
             return limit
@@ -259,17 +259,24 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         packing = dict(layout.group_packing)
         for field in layout.fields:
             spec = specs[field.group_id]
-            if spec.attn_kind != "full_history":
+            if spec.attn_kind == "state":
                 continue
-            # The last slot is block * stride / payload * block_tokens
+            # The last slot or atom ID is block * stride / payload * block_tokens
             # + block_tokens - 1, independent of the kernel page size.
             # Include each view's payload and the final page's token span.
             block_tokens = spec.block_granularity
+            stride, payload = field.page_stride_bytes, field.payload_bytes
+            if spec.attn_kind != "full_history":
+                # Raw scheduler IDs carry no atom multiplier.
+                stride = payload
+            if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP:
+                # Its write slots are int64; its int32 atom IDs assume binding at block granularity.
+                block_tokens = 1
             limit = min(
                 limit,
                 ((1 << 31) - block_tokens)
-                * field.payload_bytes
-                // (packing[field.group_id] * field.page_stride_bytes * block_tokens),
+                * payload
+                // (packing[field.group_id] * stride * block_tokens),
             )
         return limit
 
@@ -457,7 +464,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             field.field_id.endswith(".conv") for field in self._ple_fields()
         )
         # Source and destination int64 row ids, shared by every batch size.
-        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
+        # Each layer also keeps an int64 destination element stride.
+        ple_commit_bytes = num_ple_layers * (2 * self.attn_config.max_bs + 1) * 8
         return (
             super().workspace_bytes()
             + ple_commit_bytes

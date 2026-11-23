@@ -29,6 +29,7 @@ step exchanges candidates and partials over NCCL.
 import sys
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -141,7 +142,9 @@ def _prepare_value_tail():
     process_group_manager.register_process_group(
         "gloo", group, dist.new_group(backend="gloo")
     )
-    comm.prepare_decode_exchange(group, 120, value_heads=_HEADS, decode_rows=64)
+    comm.prepare_decode_exchange(
+        group, 120, value_heads=_HEADS, decode_rows=64, float_words=True
+    )
     return mock.patch.object(
         DcpValueTail, "__call__", autospec=True, side_effect=DcpValueTail.__call__
     )
@@ -227,6 +230,73 @@ def _selection_case(
     # gfx950 scores KVP candidates with the Triton leaf and one rank with Gluon's.
     if current_platform().is_amd:
         return
+    assert torch.equal(counts, expected_counts)
+    for row in range(spec_width):
+        live = int(counts[row])
+        assert sorted(slots[row, :live].tolist()) == sorted(
+            expected_slots[row, :live].tolist()
+        )
+    for got, reference in zip(outputs, expected, strict=True):
+        _assert_close_to_reference(got, reference.float(), fraction)
+
+
+def _overlap_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
+    """An owned top-k's decode query is absorbed beside the indexer.
+
+    The absorption runs on the fork's stream beside the top-k on main, which
+    joins it before reading a rider. The round selects and attends as on one
+    stream, eagerly and replayed from a CUDA graph.
+    """
+    from test.runtime.test_kimi_k31 import (
+        _assert_close_to_reference,
+        _prefill_then_decode_twice,
+    )
+
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    hidden = torch.randn(
+        1200 + 2 * spec_width,
+        256,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=torch.Generator(device="cuda").manual_seed(7),
+    )
+    blocks = [9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
+    run = dict(prompt=1200, spec_width=spec_width, blocks=blocks)
+    attention, *rest = _sharded_layer(
+        rank, kv_cache_dtype=kv_cache_dtype, spec_width=spec_width, index_topk=512
+    )
+    expected = _prefill_then_decode_twice(attention, *rest, hidden, **run)
+    aux = torch.cuda.Stream()
+    fork = attention.decode_topk_fork = StreamFork(aux)
+    absorb = attention.forward_absorb_qkv_proj
+    select = attention._compute_decode_topk_indices
+    absorbed, selected = [], []
+
+    def record_absorb(*args, **kwargs):
+        absorbed.append(torch.cuda.current_stream())
+        return absorb(*args, **kwargs)
+
+    def record_select(*args, **kwargs):
+        rider = kwargs["query_rider"] is not None
+        selected.append((torch.cuda.current_stream(), rider, kwargs["rider_ready"]))
+        return select(*args, **kwargs)
+
+    # The prefill rewrites what the first round's decode read.
+    with patch.object(
+        attention, "forward_absorb_qkv_proj", record_absorb
+    ), patch.object(attention, "_compute_decode_topk_indices", record_select):
+        *outputs, (slots, counts) = _prefill_then_decode_twice(
+            attention, *rest, hidden, **run
+        )
+    # The eager step and the capture each absorb on the fork's stream.
+    assert absorbed.count(aux) == 2
+    assert len(selected) == 2
+    for stream, rider, ready in selected:
+        assert stream != aux
+        assert ready == (fork.join if rider else None)
+    *expected, (expected_slots, expected_counts) = expected
+    # The KVP selection's order, and with it the rounding, varies run to run.
     assert torch.equal(counts, expected_counts)
     for row in range(spec_width):
         live = int(counts[row])
@@ -363,6 +433,17 @@ def test_kvp2_value_tail_merges_and_projects_like_one_rank(
     ):
         pytest.skip("the fused decode value tail runs on SM100 and SM103")
     _spawn(tmp_path, _selection_case, kv_cache_dtype, spec_width, fraction, False, True)
+
+
+@pytest.mark.parametrize("kv_cache_dtype, spec_width, fraction", _DTYPES)
+def test_kvp2_absorbs_the_decode_query_beside_the_indexer(
+    tmp_path, kv_cache_dtype, spec_width, fraction
+):
+    from tokenspeed_kernel.platform import current_platform
+
+    if torch.cuda.is_available() and not current_platform().is_nvidia:
+        pytest.skip("only NVIDIA decode rounds fork the top-k")
+    _spawn(tmp_path, _overlap_case, kv_cache_dtype, spec_width, fraction)
 
 
 @pytest.mark.parametrize(

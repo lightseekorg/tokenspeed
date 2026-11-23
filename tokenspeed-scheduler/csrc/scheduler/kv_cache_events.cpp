@@ -79,10 +79,12 @@ void KvEventPrefixView::Reconcile(std::uint64_t hash) {
         const Node* parent = node.parent ? &nodes_.at(*node.parent) : nullptr;
         constexpr auto kDevice = static_cast<std::size_t>(KvEventMedium::kDevice);
         constexpr auto kHost = static_cast<std::size_t>(KvEventMedium::kHost);
-        const bool parent_out = parent == nullptr || parent->visible[kDevice] || parent->visible[kHost];
+        constexpr auto kDisk = static_cast<std::size_t>(KvEventMedium::kDisk);
+        const bool parent_out = parent == nullptr || std::ranges::any_of(parent->visible, [](bool out) { return out; });
         const std::array<bool, kNumKvEventMedia> visible{
             node.resident[kDevice] && (parent == nullptr || parent->visible[kDevice]),
             node.resident[kHost] && parent_out,
+            node.resident[kDisk] && parent_out,
         };
         if (visible == node.visible) continue;
         if (node.changed_round != round_) {
@@ -92,7 +94,9 @@ void KvEventPrefixView::Reconcile(std::uint64_t hash) {
         }
         node.visible = visible;
         // A boundary out on some medium has its parent out on some medium.
-        if (visible[kDevice] || visible[kHost]) node.depth = parent != nullptr ? parent->depth + 1 : 0;
+        if (std::ranges::any_of(visible, [](bool out) { return out; })) {
+            node.depth = parent != nullptr ? parent->depth + 1 : 0;
+        }
         pending_.insert(pending_.end(), node.children.begin(), node.children.end());
     }
 }

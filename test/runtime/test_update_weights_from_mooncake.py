@@ -931,7 +931,12 @@ def test_host_bootstrap_requires_peer_outbox_for_peer_prefix_sharing(
     built = object()
     build = mock.Mock(return_value=built)
     monkeypatch.setattr(rust_host, "HostBootstrap", build)
-    args = ServerArgs(model="x", device="cuda", peer_prefix_port=7100)
+    args = ServerArgs(
+        model="x",
+        device="cuda",
+        peer_prefix_port=7100,
+        peer_prefix_landing_tier="device",
+    )
     peer_outbox = object() if has_peer_outbox else None
     receiver, sender = Pipe(duplex=True)
     with receiver, sender:

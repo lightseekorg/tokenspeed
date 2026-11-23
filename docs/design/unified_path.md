@@ -816,7 +816,8 @@ express.
 `init_forward_metadata_capture_cuda_graph` has a base default — run the
 idle-refresh arm (`actual_bs=0`, `for_graph_replay=True`) over the same
 persistent buffers replay refreshes — at both tiers: `AttentionBackend`
-(runner-facing; the router's version idle-fills its table stacks, republishes
+(runner-facing; the router's version runs the refresh's idle stack fill, the
+same `fill_decode` kernel replay launches, republishes
 the decode write-location views, then runs each leaf's capture hook) and
 `PagedAttentionBackend` (kernel-facing leaves). That default IS the capture
 for every backend except a closed list of sanctioned overrides, each tied to
@@ -1537,6 +1538,38 @@ unification still can NOT test: mempool reuse and hostfunc semantics — the
 e2e regression matrix keeps graph-on and graph-off configurations for this
 reason.
 
+## Model-facing attention operations
+
+Models call the outer `AttentionBackend`; they do not inspect a composite's
+Python type or extract its children. The composite routes operations by the
+layer and owns graph breaks, transfer step recording and state acceptance.
+A linear-attention composite's paged metadata, cache-group views and sparse
+cache access follow its full-attention child. The MSA composite publishes the
+shared request layout through its dense router and routes model bindings to
+the same dense or sparse router as the layer's compute.
+
+`prefill_request_layout()` returns an immutable `PrefillRequestLayout` containing
+host `input_lengths` and `prefix_lengths` for the active extend requests. The
+paged router and recurrent backend publish it from the scheduler's CPU mirrors
+when they initialize extend/mixed metadata. Mixed state-attention rounds publish
+the complete extend layout after preparing their separate decode metadata.
+Pure decode/idle refresh, decode graph capture seeding and pool rebinding clear
+the layout. Snapshots contain no device tensor or padding rows and do
+not alias reusable input buffers. Models that partition an input span use this
+view rather than reading another attention family's private metadata. Decode
+rows continue to use the forward's explicit decode width.
+
+A model/backend pair can define a small typed interface for input operands or
+loaded-weight preparation and request it through
+`model_binding(layer_id, binding_type)`. The selected owner explicitly returns
+its bound implementation; unsupported types return `None`. Composites route the
+request by layer rather than searching the tree for a matching class. Bindings
+should expose the required operations, not the backend object or a second
+attention forward. Numerical planning stays with its existing owner, and all
+attention execution, metadata refresh, cache binding and state commits continue
+through the outer backend. A binding must read current owner readiness across
+pool/weight changes rather than caching an admission-time answer.
+
 ## Backend package layout
 
 `layers/attention/backends/` is organized by the role a node plays in the
@@ -2115,6 +2148,11 @@ The same extend/mixed metadata owns a device int64 mirror of the int32
 query boundaries. KDA layers share it for scan ABIs instead of casting
 per layer; the host int64 mirror still supplies launch planning without
 D2H. Decode refresh/capture does not allocate this prefill-only mirror.
+
+CuTe KDA may select an ordinary or persistent scan internally. Both consume
+the live device boundaries and zero-padded inputs supplied by the runtime;
+the persistent scan may load whole tail tiles. Scheduling scratch belongs to
+the invocation or captured graph, and replay rebuilds it from the live bounds.
 
 Each metadata build allocates fresh index storage, including when two
 forwards have the same total token count but different request partitions.

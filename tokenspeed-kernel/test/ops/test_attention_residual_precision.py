@@ -693,3 +693,199 @@ def test_add_rmsnorm_precision_is_the_sum_then_the_norm(
     )
     assert torch.equal(normalized.view(torch.int16), expected.view(torch.int16))
     assert torch.equal(stored, summed.to(torch.bfloat16))
+
+
+def _message_gate_inputs(device, tokens, width):
+    generator = torch.Generator(device="cpu").manual_seed(tokens * 7 + width)
+    destination = torch.randn((tokens, width), generator=generator) * 3
+    message = torch.randn((tokens, width), generator=generator)
+    gates = torch.randn((tokens, 2 * width), generator=generator) * 2
+    return (x.to(device) for x in (destination, message, gates))
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("tokens,width", [(1, 2304), (37, 2304), (5, 100), (0, 64)])
+def test_message_gate_matches_the_eager_fp32_statements(device_name, tokens, width):
+    """``(1 - tanh(forget)) * x + tanh(gain) * message`` with every operation
+    rounded separately, as the eager FP32 statements round it."""
+    from tokenspeed_kernel.ops.residual.attention import message_gate
+
+    device = _device(device_name)
+    destination, message, gates = _message_gate_inputs(device, tokens, width)
+    gain, forget = gates[:, :width], gates[:, width:]
+    expected = (1.0 - torch.tanh(forget)) * destination + torch.tanh(gain) * message
+    torch.testing.assert_close(
+        message_gate(destination, message, gates), expected, atol=0, rtol=0
+    )
+
+
+def test_message_gate_rejects_mismatched_rows():
+    from tokenspeed_kernel.ops.residual.attention import message_gate
+
+    destination, message, gates = _message_gate_inputs(torch.device("cpu"), 3, 8)
+    with pytest.raises(ValueError, match="message gate"):
+        message_gate(destination, message, gates[:, :8].contiguous())
+    with pytest.raises(ValueError, match="message gate"):
+        message_gate(destination.bfloat16(), message, gates)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+def test_message_gate_token_counts_do_not_recompile():
+    from tokenspeed_kernel.ops.residual._triton.attention import _message_gate_kernel
+    from tokenspeed_kernel.ops.residual.attention import message_gate
+    from utils import assert_no_triton_compile
+
+    def run(tokens):
+        message_gate(*_message_gate_inputs(torch.device("cuda"), tokens, 2304))
+
+    run(1)
+    with assert_no_triton_compile(_message_gate_kernel):
+        for tokens in (2, 3, 16, 57, 300):
+            run(tokens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+def test_message_gate_offsets_past_int32():
+    """The last token of a batch whose gate-logit offset passes 2**31."""
+    from tokenspeed_kernel.ops.residual.attention import message_gate
+
+    width = 2304
+    tokens = (1 << 31) // (2 * width) + 2
+    # FP32 destination, message and output rows, and gate logits twice as wide.
+    required = 5 * tokens * width * 4
+    if torch.cuda.mem_get_info()[0] < required + (256 << 20):
+        pytest.skip(f"needs {required / (1 << 30):.1f} GiB of free device memory")
+    destination = torch.zeros((tokens, width), device="cuda")
+    message = torch.zeros_like(destination)
+    gates = torch.zeros((tokens, 2 * width), device="cuda")
+    destination[-1] = 2.0
+    message[-1] = 3.0
+    gates[-1, :width] = 0.5
+    gates[-1, width:] = -0.25
+    output = message_gate(destination, message, gates)
+    expected = (1.0 - torch.tanh(gates[-1, width:])) * 2.0 + torch.tanh(
+        gates[-1, :width]
+    ) * 3.0
+    torch.testing.assert_close(output[-1], expected, atol=0, rtol=0)
+
+
+def _controller_inputs(device, tokens, width, count, rank=64, seed=0):
+    generator = torch.Generator(device="cpu").manual_seed(seed + tokens * 11 + count)
+    destinations = tuple(
+        torch.randn((tokens, width), generator=generator) * 3 for _ in range(count)
+    )
+    messages = torch.randn((count, tokens, width), generator=generator)
+    downs = tuple(
+        (torch.randn((rank, 2 * width), generator=generator) * 0.02).bfloat16()
+        for _ in range(count)
+    )
+    gates = tuple(
+        (torch.randn((2 * width, rank), generator=generator) * 0.05).bfloat16()
+        for _ in range(count)
+    )
+    norms = tuple(
+        (1 + 0.1 * torch.randn((width,), generator=generator)).bfloat16()
+        for _ in range(count)
+    )
+    move = lambda xs: tuple(x.to(device) for x in xs)  # noqa: E731
+    return (
+        move(destinations),
+        messages.to(device),
+        move(downs),
+        move(gates),
+        move(norms),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+@pytest.mark.parametrize("count", [1, 3])
+@pytest.mark.parametrize("tokens,width", [(1, 2304), (8, 2304), (37, 768), (300, 2304)])
+def test_message_controller_inputs_matches_the_reference(count, tokens, width):
+    """The fused controller against the CPU statements: the down and gate
+    projections sum in another order, so a BF16 output may move one step."""
+    from tokenspeed_kernel.ops.residual.attention import message_controller_inputs
+
+    cpu = _controller_inputs(torch.device("cpu"), tokens, width, count)
+    gpu = _controller_inputs(torch.device("cuda"), tokens, width, count)
+    expected = message_controller_inputs(*cpu, 1e-6, 1e-6)
+    actual = message_controller_inputs(*gpu, 1e-6, 1e-6)
+    assert actual.shape == (count, tokens, width) and actual.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        actual.cpu().float(), expected.float(), rtol=2**-7, atol=2**-7
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+def test_message_controller_rows_do_not_depend_on_the_batch():
+    """A row's output is the same alone, in a batch, and with the Q, K and V
+    inputs sharing one destination tensor."""
+    from tokenspeed_kernel.ops.residual.attention import message_controller_inputs
+
+    destinations, messages, downs, gates, norms = _controller_inputs(
+        torch.device("cuda"), 300, 2304, 3
+    )
+    batch = message_controller_inputs(
+        destinations, messages, downs, gates, norms, 1e-6, 1e-6
+    )
+    for rows in (slice(0, 1), slice(0, 8), slice(17, 81)):
+        alone = message_controller_inputs(
+            tuple(d[rows].contiguous() for d in destinations),
+            messages[:, rows].contiguous(),
+            downs,
+            gates,
+            norms,
+            1e-6,
+            1e-6,
+        )
+        assert torch.equal(alone, batch[:, rows])
+    shared = (destinations[0],) * 3
+    separate = (destinations[0], destinations[0].clone(), destinations[0].clone())
+    assert torch.equal(
+        message_controller_inputs(shared, messages, downs, gates, norms, 1e-6, 1e-6),
+        message_controller_inputs(separate, messages, downs, gates, norms, 1e-6, 1e-6),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+def test_message_controller_token_counts_do_not_recompile():
+    from tokenspeed_kernel.ops.residual._triton.attention import (
+        _controller_down_kernel,
+        _controller_gate_kernel,
+        _grouped_rmsnorm_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.attention import message_controller_inputs
+    from utils import assert_no_triton_compile
+
+    def run(tokens):
+        message_controller_inputs(
+            *_controller_inputs(torch.device("cuda"), tokens, 2304, 3), 1e-6, 1e-6
+        )
+
+    run(1)
+    with assert_no_triton_compile(
+        _controller_down_kernel, _controller_gate_kernel, _grouped_rmsnorm_kernel
+    ):
+        for tokens in (2, 3, 16, 57, 300):
+            run(tokens)
+
+
+def test_message_controller_rejects_mismatched_inputs():
+    from tokenspeed_kernel.ops.residual.attention import message_controller_inputs
+
+    destinations, messages, downs, gates, norms = _controller_inputs(
+        torch.device("cpu"), 3, 768, 2
+    )
+    with pytest.raises(ValueError, match="matching inputs"):
+        message_controller_inputs(
+            destinations, messages[:1], downs, gates, norms, 1e-6, 1e-6
+        )
+    with pytest.raises(ValueError, match="BF16"):
+        message_controller_inputs(
+            destinations,
+            messages,
+            tuple(d.float() for d in downs),
+            gates,
+            norms,
+            1e-6,
+            1e-6,
+        )

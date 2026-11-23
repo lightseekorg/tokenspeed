@@ -442,6 +442,22 @@ class IrisBackend(CommBackend):
                 return gather.run(tensor)
         return self._fallback.all_gather(tensor, group, dim)
 
+    def gathers_in_one_launch(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Whether the column all-gather of ``tensor`` fits the group's
+        symmetric buffer: larger ones run a launch, each with its own peer
+        handshake, a chunk of the buffer's rows."""
+        gather = self.get_prepared_all_gather(group, tensor.dtype)
+        if gather is not None:
+            capacity = gather.producer.data.numel()
+        else:
+            state = self.state(group, tensor.dtype)
+            capacity = (
+                state.producer_direct_max_numel
+                if state is not None
+                else self._producer_direct_max_bytes // tensor.element_size()
+            )
+        return tensor.numel() * len(group) <= capacity
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:

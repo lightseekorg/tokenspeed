@@ -37,6 +37,13 @@ and encode ranks. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
 an output stream can remain stalled.
 
+[Cache observations](cache-observations.md) use the same nonblocking writer
+when explicitly enabled. Native callbacks report immutable ownership metadata;
+the ordinary ACK poll is followed by a drain of completed CPU copy metadata.
+Neither sideband feeds the scheduler or establishes replica-wide completion.
+The protocol makes rank scope, operation/admission joins, and diagnostic loss
+explicit; incomplete or lossy traces cannot qualify recovery.
+
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
 groups (`Ranks`): the replica, the pipeline (one rank per stage), the
@@ -478,7 +485,10 @@ data-plane calls and their waits for the GIL on the control thread, and each
 operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
-category, the rest under `host`. The recording follows the torch profiler's window and
+category, the rest under `host`. Work that overlaps on one thread, as Disk
+operations in flight and peer landings do, records on lane rows instead
+(`profile::Lanes`): each piece holds the lowest free row of its family until
+it ends. The recording follows the torch profiler's window and
 costs one atomic load per span outside it; it keeps only the spans that began
 inside the window, so an operation open as a by-stage profile switches stages
 stays out of the next stage's trace. A trace the merge fails on is written
@@ -885,6 +895,26 @@ until deployment restart. Discard requires both the model and its resolved
 quantization configuration to opt in; quantized post-load derivation must
 rebuild codes and scales in place from the complete new checkpoint, never
 reuse discarded values or mark remapped storage usable on its own.
+
+An L3 full-clear separates logical invalidation from native memory lifetime.
+After the non-storage preflight, healthy I/O is given
+`async.clear_cache_drain_timeout_ms` (default 500 ms) through ordinary rounds;
+the pending flush replies and weight-operation head are preserved while no new
+forward/storage plan starts. Polling, completion agreement and control queries
+continue. The budget does not bound the normal synchronous remote purge.
+An unsafe active namespace skips that healthy wait; a timeout or unsafe scope
+selects retaining clear on every rank. Old tickets detach and keep their exact
+Host addresses, while local indexes clear and new L3 work uses a fresh agreed
+generation. This path performs no remote purge and proves no native retirement.
+A slow healthy timeout still selects this private scope; it does not restore
+cross-Prefill sharing with independent services outside the rank agreement.
+
+Retained memory alone does not keep the serving loop busy. Request/Device-copy
+readiness and progress-pending storage determine frontend idle waiting and
+stall diagnostics; every round still polls and agrees old completions. Metrics
+keep historical `l3_io_quarantined` separate from active-namespace
+`l3_io_blocked`, backend health and capacity pressure. The historical flag guards
+shutdown deregistration; it is not a reason to reject all new-generation I/O.
 The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
@@ -899,11 +929,16 @@ all-to-all EP, broadcasting the committed placement), which the profile's
 is a frontend operation on the first queue that starts the same internal
 sequence. The loop refuses a memory release while a rebalance is in progress
 and, once drained, the release waits while chunk steps still write the
-weights. A cache clear MIN-reduces the scheduler's non-mutating
-`can_clear_cache` across the replica and then across attention DP — DP
-replicas share Mooncake objects — then MIN-reduces an error-returning L3
-namespace deletion, before any rank mutates Device/Host. The frontend
-combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+weights. A cache clear agrees its selected non-mutating preflight across the
+replica and attention DP. Without storage it retains ordinary
+`can_clear_cache` semantics. With healthy storage, preparation checks normal
+indexed Device pins and indexed Host owners after accounting for the storage
+references that draining can release. Exact physical-block reference counts,
+active parents and occupied-slot coverage are required when local invalidation
+must retain old storage references, not for every ordinary clear. The strict
+path agrees remote namespace deletion before local mutation; retaining recovery
+instead agrees isolation and performs no remote deletion. The frontend combines
+every engine's reply. Independent TokenSpeed jobs that share a tenant are not
 in those groups.
 
 **The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the
@@ -1004,14 +1039,15 @@ polls and keep the pages until the retirement event and local forwards complete.
 
 The prefill control receiver handles cancellation even when no native request
 claimed the room or its scheduler is paused. Unclaimed rooms therefore need
-not wait for the bootstrap timeout after the decode request is cancelled.
-P and D must run versions supporting this cancellation protocol. If a target
+not wait for the bootstrap timeout after the decode request is cancelled. P
+and D must run versions supporting this cancellation protocol. If a target
 cannot acknowledge retirement, the receiver retains its pages and the drain
 remains pending; a transport failure alone cannot make those pages safe to
-reuse. Cancellation tombstones are retired with their destination cache
-identities. A prefill cancellation that never learns a destination identity
-must retain its room tombstone until that peer exits, since an arbitrarily
-late manifest must not revive the transfer.
+reuse. Only a revocation (below) releases them without the acknowledgment.
+Cancellation tombstones are retired with their destination cache identities. A
+prefill cancellation that never learns a destination identity must retain its
+room tombstone until that peer exits, since an arbitrarily late manifest must
+not revive the transfer.
 
 These records include every prefill failure and bootstrap timeout, not just
 explicit client cancellation. There is currently no count or age limit:
@@ -1036,8 +1072,43 @@ with memory release, from completing. Recovery requires verified retirement
 of the writers or transport invalidation that makes further access to these
 registrations impossible; local forwards must also have completed before
 pages are released. A timeout can trigger diagnostics or recovery but cannot
-authorize page reuse; the current protocol provides no forced retirement
-for an uncertain room.
+authorize page reuse.
+
+**PD receive revocation.** A failed receive whose cancellation some target
+has still not acknowledged `waiting_timeout` after it failed, while its
+manifest names the current transfer engine, starts a revocation off the
+scheduling loop: the writer died, restarted at another control port, or has
+a write that may still land. The decode peer registers its cache under a
+fresh transfer engine and cache identity and makes it the one transfers use
+and registrations name; every receive attached to the replaced transport
+fails, whether it published a manifest or still waits for admission; then
+the cache is deregistered from the replaced engine. An RDMA NIC checks every
+incoming write against the destination's registration, and deregistration
+returns only once the NIC no longer uses it (this relies on the Mooncake
+library deregistering synchronously on every device), so after it succeeds
+no write through the replaced engine's keys lands: the receives whose
+manifests named that engine retire without acknowledgments. The fence, not
+the timeout, authorizes the reuse; the timeout only picks when to pay for
+it. If the deregistration fails, those receives keep waiting for
+acknowledgments and no longer trigger revocations of later engines, and
+since the replaced engine may still reach the cache, the cache is never
+released. Nor is it released while a revocation runs. Each room's
+cancellation, and its announcement under `deferred` decode allocation, names
+the cache identity its route registered, so a receive that failed before
+admission still reaches prefill under an identity it knows. Rooms that were
+still connecting, including those waiting for a registration acknowledgment,
+connect again under the fresh identity, registering it with their prefill
+ranks, and a failed receive never publishes its manifest later. The replaced
+engine stays alive for the peer's lifetime without the cache registered, so
+its session (host and RPC port) cannot be reused by a later engine that a
+revoked writer resolving its old session would reach. Only the `rdma`
+transport revokes; with others such receives stay pinned. Each outcome is
+logged as an event: `ts_decode_revocation_fenced`,
+`ts_decode_revocation_unfenced` (with the pinned rooms), or
+`ts_decode_revocation_not_started`; a release refused for an unfenced cache
+logs `ts_decode_release_refused_unfenced`. Each revocation costs every
+receive attached to that rank at that moment, which its replica peers fail
+too through the agreed transfer status, and one idle engine.
 
 **PD failure isolation.** Control messages use one bounded FIFO per destination
 endpoint. Connect and send each have a five-second deadline; a failed endpoint
@@ -1055,6 +1126,25 @@ registry entry. The next send recreates them. Idle retirement and enqueue
 share a lock so a new message cannot be stranded on a closing FIFO; an old
 task's teardown cannot erase its replacement. Socket retirement does not
 retire cache identities, room tombstones or possible remote writes.
+
+A decode cache's registration with a route is therefore acknowledged. Each
+registration carries an id; a prefill rank acknowledges it once the
+registration is installed, so the manifests that follow find the cache. An
+identical registration, such as a resend or the same cache registering again
+after a route change, replaces nothing and is installed without waiting for
+writes. The decode connection worker resends the registration every second to
+the targets that have not acknowledged it, also when their queue refused it,
+and records the route as registered only when every target has. A target that
+rejects the registration replies with its reason, which fails the room at
+once. A room whose route is not acknowledged within 10 seconds fails before
+publishing a manifest, so it retires locally, and the next room registers
+again; since one worker serves a bootstrap address, an unreachable target
+delays that address's later rooms by up to 10 seconds. Recording a route when
+its registration is merely queued would leave a lost registration's route
+recorded but unknown to prefill: every later room on it would fail and keep
+its pages pinned. Prefill ranks still install the id-less registration of an
+older decode rank, without acknowledging it; a decode rank needs prefill ranks
+that acknowledge, so prefill ranks are upgraded first.
 
 Decode bootstrap lookups are serialized per bootstrap address, with independent
 workers for other addresses. Polling (including idle polls) and registration
@@ -1281,6 +1371,8 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+In particular, a signal can interrupt a buffered stderr write. Logging again
+can raise before the callback records a failure or requests shutdown.
 
 While serving generation, a fatal control-loop or forward-thread error
 signals the owning launcher once from the thread that detects it. The

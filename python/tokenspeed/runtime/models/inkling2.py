@@ -24,17 +24,23 @@ The target keeps its checkpoint precision and depth residuals within each
 forward. Persistent convolution state belongs to the shared cache subsystem.
 Image patches use the shared multimodal embedder. DSpark draft execution and
 frontend image preprocessing are not implemented here.
+
+A looped Inkling2 runs its core layers once per pass. The first pass is the
+ordinary layer; later passes restart the residual state from the core's entry
+and gate messages from the previous pass into the core layers' inputs
+(``inkling2_loop``). Each pass of a core layer has its own caches.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 
 # tanh_softcap is outside the registry; its Triton kernel serves every supported vendor.
 from tokenspeed_kernel.ops.activation.triton import (
     tanh_softcap,
+    tanh_softcap_cap_normal,
     tanh_softcap_rejection,
 )
 
@@ -66,6 +72,7 @@ from tokenspeed.runtime.layers.attention_residual import (
     AttentionResidual,
     AttentionResidualState,
     PrecisionRMSNorm,
+    ResidualLoopEntry,
     norm_gains,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
@@ -83,6 +90,12 @@ from tokenspeed.runtime.models.inkling2_attention import (
     Inkling2Attention,
     Inkling2ShortConvolution,
 )
+from tokenspeed.runtime.models.inkling2_loop import (
+    LOOP_INPUTS,
+    Inkling2LoopMessages,
+    Inkling2MessageController,
+)
+from tokenspeed.runtime.models.inkling2_monokernel import Inkling2Monokernel
 from tokenspeed.runtime.models.inkling2_sequence import (
     Inkling2SequenceParallel,
     SequenceShare,
@@ -132,6 +145,27 @@ class Inkling2LogitsProcessor(LogitsProcessor):
     def fuse_argmax(self) -> None:
         """Keep full logits so padded vocabulary rows cannot win an argmax."""
 
+    def keep_sampled_logits_vocab_sharded(
+        self,
+        lm_head: VocabParallelEmbedding,
+        supports: Callable[[torch.dtype, int, int], bool],
+    ) -> bool:
+        cap = self.logit_softcap
+        if cap is not None and cap > 0 and not tanh_softcap_cap_normal(cap):
+            # The shard selection caps as tanh_softcap does, which takes
+            # only normal FP32 caps.
+            return False
+        return super().keep_sampled_logits_vocab_sharded(lm_head, supports)
+
+    def sampled_shard_dtype(self, lm_head: VocabParallelEmbedding) -> torch.dtype:
+        """The head projects into FP32 (``Inkling2LMHeadMethod``)."""
+        return torch.float32
+
+    def sampled_shard_softcap(self) -> tuple[float | None, str | None]:
+        """``_vocab_logits``'s cap: ``tanh_softcap`` on the FP32 logits."""
+        cap = self.logit_softcap
+        return (cap, "tanh") if cap is not None and cap > 0 else (None, None)
+
     def _vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
         cap = self.logit_softcap
         if cap is not None and cap > 0:
@@ -169,6 +203,9 @@ class Inkling2DecoderLayer(nn.Module):
                 config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
             )
 
+        # The model's monokernel seam, when it launches this layer
+        # (inkling2_monokernel.py; set after loading).
+        self.monokernel = None
         self.attn_norm = norm() if self.is_local else None
         self.q_input_norm = None if self.is_local else norm()
         self.k_input_norm = None if self.is_local else norm()
@@ -179,7 +216,7 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size,
             config.sconv_kernel_size,
             InklingConvStream.ATTN,
-            layer_id,
+            self.attn.conv_layer_ids,
             layout[InklingConvStream.ATTN][0],
             tp_rank=0,
             dynamic=None,
@@ -188,10 +225,28 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size,
             config.sconv_kernel_size,
             InklingConvStream.MLP,
-            layer_id,
+            self.attn.conv_layer_ids,
             layout[InklingConvStream.MLP][0],
             tp_rank=0,
             dynamic=None,
+        )
+        # A looped core layer gates a message into each of its inputs in
+        # passes after the first; its index in the core picks the queries.
+        core = config.loop_core_layers
+        self.core_index: int | None = (
+            layer_id - core.start if layer_id in core else None
+        )
+        self.controllers = (
+            None
+            if self.core_index is None
+            else nn.ModuleDict(
+                {
+                    name: Inkling2MessageController(
+                        config.hidden_size, config.loop_config["gate_rank"]
+                    )
+                    for name in LOOP_INPUTS
+                }
+            )
         )
         # The three full-layer input gains, stacked for the depth-mix kernel.
         self.register_buffer(
@@ -210,10 +265,53 @@ class Inkling2DecoderLayer(nn.Module):
         return (self.q_input_norm, self.k_input_norm, self.v_input_norm)
 
     def derive_input_norm_gains(self) -> None:
-        """Write ``input_norm_gains`` from the loaded norms; safe to repeat."""
+        """Write ``input_norm_gains`` (and the controllers' gate weights) from
+        the loaded weights; safe to repeat."""
         if self.input_norm_gains is not None:
             with torch.no_grad():
                 self.input_norm_gains.copy_(norm_gains(self.input_norms()))
+        if self.controllers is not None:
+            for controller in self.controllers.values():
+                controller.derive_gate_weight()
+
+    def attention_input(
+        self, state: AttentionResidualState, messages: Inkling2LoopMessages | None
+    ) -> tuple[torch.Tensor, ...]:
+        """The normalized attention sources. With ``messages`` (a later pass
+        of the core) Q, K and V each get their message before the input norm,
+        so a local layer takes three sources."""
+        norms = self.input_norms()
+        if messages is None:
+            return state.attention_input(
+                self.layer_id,
+                norms,
+                norm_gains(norms) if self.is_local else self.input_norm_gains,
+            )
+        mixtures = state.attention_mixtures(self.layer_id)
+        if self.is_local:
+            mixtures, norms = mixtures * 3, norms * 3
+        return messages.gate_normalized(
+            self.core_index, 0, mixtures, self.controllers, norms
+        )
+
+    def mlp_input(
+        self,
+        state: AttentionResidualState,
+        attention: torch.Tensor,
+        messages: Inkling2LoopMessages | None,
+    ) -> torch.Tensor:
+        """The normalized MoE input, with its message in a later pass."""
+        if messages is None:
+            return state.mlp_input(self.layer_id, attention, self.mlp_norm)
+        mixture = state.mlp_mixture(self.layer_id, attention)
+        (normalized,) = messages.gate_normalized(
+            self.core_index,
+            LOOP_INPUTS.index("mlp"),
+            (mixture,),
+            self.controllers,
+            (self.mlp_norm,),
+        )
+        return normalized
 
     def forward(
         self,
@@ -222,13 +320,19 @@ class Inkling2DecoderLayer(nn.Module):
         log_scaling_tau: torch.Tensor | None,
         mailbox: Mailbox | None,
         share: SequenceShare | None,
+        pass_idx: int,
+        messages: Inkling2LoopMessages | None,
     ) -> None:
-        norms = self.input_norms()
-        normalized = state.attention_input(
-            self.layer_id,
-            norms,
-            norm_gains(norms) if self.is_local else self.input_norm_gains,
-        )
+        """Run one visit of the layer: pass ``pass_idx`` of a looped core
+        (0 otherwise), with the previous pass's ``messages`` after the first."""
+        if (messages is None) != (pass_idx == 0):
+            raise ValueError("exactly the later passes of a core read messages")
+        if self.monokernel is not None and self.monokernel.serves(
+            self.layer_id, pass_idx, state, ctx, mailbox, share
+        ):
+            self.monokernel.run(self, state, ctx, log_scaling_tau, pass_idx, messages)
+            return
+        normalized = self.attention_input(state, messages)
         tokens = normalized[0].shape[0]
         # With a mailbox, both sublayers' partials go straight to the ranks'
         # output convolutions (the attention's output projection and the
@@ -248,21 +352,26 @@ class Inkling2DecoderLayer(nn.Module):
                 normalized,
                 ctx,
                 log_scaling_tau,
+                pass_idx=pass_idx,
                 reduce_output=False,
                 publish_into=attention_out,
                 partial_out=None,
             )
-            attention = self.attn_sconv.from_mailbox(attention_out, tokens, ctx)
-            mlp_input = state.mlp_input(self.layer_id, attention, self.mlp_norm)
+            attention = self.attn_sconv.from_mailbox(
+                attention_out, tokens, ctx, pass_idx
+            )
+            mlp_input = self.mlp_input(state, attention, messages)
             self.mlp(mlp_input, ctx, reduce=False, fold_into=mlp_out)
-            mlp = self.mlp_sconv.from_mailbox(mlp_out, tokens, ctx)
+            mlp = self.mlp_sconv.from_mailbox(mlp_out, tokens, ctx, pass_idx)
         elif share is not None:
+            if messages is not None:
+                raise ValueError("a looped core does not run sequence parallel")
             attention, mlp = self._shared_sublayers(
                 state, normalized, ctx, log_scaling_tau, share
             )
         else:
             attention, mlp = self._reduced_sublayers(
-                state, normalized, ctx, log_scaling_tau
+                state, normalized, ctx, log_scaling_tau, pass_idx, messages
             )
         if ctx.attn_backend.enable_layerwise_cache_ready:
             mlp = ctx.attn_backend.record_layer_cache_ready(mlp, ctx.forward_mode)
@@ -285,6 +394,7 @@ class Inkling2DecoderLayer(nn.Module):
             normalized,
             ctx,
             log_scaling_tau,
+            pass_idx=0,
             reduce_output=False,
             publish_into=None,
             partial_out=share.attention_partials.comm_buff[:tokens],
@@ -292,6 +402,7 @@ class Inkling2DecoderLayer(nn.Module):
         attention = self.attn_sconv(
             share.reduce(attention, share.attention_partials),
             ctx,
+            pass_idx=0,
             all_reduce_group=None,
             token_range=share.token_range,
         )
@@ -305,6 +416,7 @@ class Inkling2DecoderLayer(nn.Module):
         mlp = self.mlp_sconv(
             share.reduce(mlp, share.mlp_partials),
             ctx,
+            pass_idx=0,
             all_reduce_group=None,
             token_range=share.token_range,
         )
@@ -316,6 +428,8 @@ class Inkling2DecoderLayer(nn.Module):
         normalized: tuple[torch.Tensor, ...],
         ctx: ForwardContext,
         log_scaling_tau: torch.Tensor | None,
+        pass_idx: int,
+        messages: Inkling2LoopMessages | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The attention and MoE outputs, each summed over its group by an
         all-reduce (with the output convolution where ``all_reduce_sconv``
@@ -328,6 +442,7 @@ class Inkling2DecoderLayer(nn.Module):
             normalized,
             ctx,
             log_scaling_tau,
+            pass_idx=pass_idx,
             reduce_output=not conv_sums_attn,
             publish_into=None,
             partial_out=None,
@@ -335,10 +450,11 @@ class Inkling2DecoderLayer(nn.Module):
         attention = self.attn_sconv(
             attention,
             ctx,
+            pass_idx=pass_idx,
             all_reduce_group=attn_group if conv_sums_attn else None,
             token_range=None,
         )
-        mlp_input = state.mlp_input(self.layer_id, attention, self.mlp_norm)
+        mlp_input = self.mlp_input(state, attention, messages)
         mlp_group = self.mlp.mapping.moe.ep_group
         conv_sums_mlp = self.mlp.all_reduces(
             mlp_input.shape[0]
@@ -347,6 +463,7 @@ class Inkling2DecoderLayer(nn.Module):
         mlp = self.mlp_sconv(
             self.mlp(mlp_input, ctx, reduce=not conv_sums_mlp, fold_into=None),
             ctx,
+            pass_idx=pass_idx,
             all_reduce_group=mlp_group if conv_sums_mlp else None,
             token_range=None,
         )
@@ -354,7 +471,11 @@ class Inkling2DecoderLayer(nn.Module):
 
 
 class Inkling2TextModel(nn.Module):
-    """The target decoder. Depth history is local to one forward invocation."""
+    """The target decoder. Depth history is local to one forward invocation.
+
+    ``layers_to_capture`` holds layer-visit indices: the partial entering each
+    listed visit is captured for the draft.
+    """
 
     def __init__(
         self,
@@ -365,6 +486,8 @@ class Inkling2TextModel(nn.Module):
         super().__init__()
         self.config = config
         self.mapping = mapping
+        # (layer, pass) of each layer visit in execution order.
+        self.layer_visits = tuple(config.layer_visits)
         self.layers_to_capture: list[int] = []
         # The decode chain's mailbox (prepare_communication_runtime); None keeps the
         # sublayers' all-reduces.
@@ -391,6 +514,8 @@ class Inkling2TextModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        # The decode monokernel seam (--decode-monokernel), built after loading.
+        self.monokernel: Inkling2Monokernel | None = None
         # Block-set partials run here, alongside the attention ahead of their
         # first mix.
         self.attnres_stream: torch.cuda.Stream | None = (
@@ -406,6 +531,60 @@ class Inkling2TextModel(nn.Module):
         self.norm = PrecisionRMSNorm(
             config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
         )
+        # A looped core's message pseudo-queries: rows 2i and 2i + 1 of core
+        # layer i serve its attention Q and MoE inputs, and of the KV queries
+        # its K and V inputs.
+        core = config.loop_core_layers
+        shape = (2 * len(core), config.hidden_size)
+        for name in (
+            "middle_cycle_cross_pass_queries",
+            "middle_cycle_cross_pass_kv_queries",
+        ):
+            self.register_parameter(
+                name,
+                (
+                    nn.Parameter(
+                        torch.zeros(shape, dtype=torch.float32), requires_grad=False
+                    )
+                    if core
+                    else None
+                ),
+            )
+        # [core layers, LOOP_INPUTS, hidden] scaled by hidden**-0.5.
+        self.register_buffer(
+            "loop_score_weights",
+            (
+                torch.zeros(
+                    (len(core), len(LOOP_INPUTS), config.hidden_size),
+                    dtype=torch.float32,
+                )
+                if core
+                else None
+            ),
+            persistent=False,
+        )
+
+    def derive_loop_score_weights(self) -> None:
+        """Write ``loop_score_weights`` from the loaded message queries; safe
+        to repeat."""
+        if self.loop_score_weights is None:
+            return
+        scale = self.config.hidden_size**-0.5
+        queries = self.middle_cycle_cross_pass_queries.view(
+            -1, 2, self.config.hidden_size
+        )
+        kv_queries = self.middle_cycle_cross_pass_kv_queries.view(
+            -1, 2, self.config.hidden_size
+        )
+        rows = {
+            "attn": queries[:, 0],
+            "k": kv_queries[:, 0],
+            "v": kv_queries[:, 1],
+            "mlp": queries[:, 1],
+        }
+        with torch.no_grad():
+            for index, name in enumerate(LOOP_INPUTS):
+                self.loop_score_weights[:, index].copy_(rows[name].float() * scale)
 
     def forward(
         self,
@@ -438,13 +617,13 @@ class Inkling2TextModel(nn.Module):
         elif floor is not None:
             ratio = ((positions + 1).float() / floor).clamp_min(1)
             tau = 1.0 + alpha * ratio.log()
-        # The aux stream joins back one sublayer later: prefill graphs break
-        # at attention, so only decode-family forwards fork it.
         share = None
         if self.sequence_parallel is not None and self.sequence_parallel.serves(
             ctx, hidden.shape[0]
         ):
             share = self.sequence_parallel.share(ctx, hidden.shape[0])
+        # The aux stream joins back one sublayer later: prefill graphs break
+        # at attention, so only decode-family forwards fork it.
         state = AttentionResidualState(
             self.attn_res,
             hidden,
@@ -453,14 +632,38 @@ class Inkling2TextModel(nn.Module):
         )
         auxiliary: list[torch.Tensor] = []
         mailbox = None if ctx.forward_mode.is_extend_or_mixed() else self.decode_mailbox
-        for layer_id, layer in enumerate(self.layers):
-            if layer_id in self.layers_to_capture:
+        if self.monokernel is not None:
+            self.monokernel.start_step(ctx)
+        core = self.config.loop_core_layers
+        entry: ResidualLoopEntry | None = None
+        messages: Inkling2LoopMessages | None = None
+        # Draft taps count layer visits: a core layer's later passes are
+        # visits of their own. Each later pass of a looped core restarts from
+        # the core's entry and reads the blocks the previous pass wrote.
+        for visit, (layer_id, pass_idx) in enumerate(self.layer_visits):
+            if core and layer_id == core.start:
+                if pass_idx == 0:
+                    entry = state.loop_entry(layer_id)
+                else:
+                    stored, partial = state.loop_bank(entry)
+                    messages = Inkling2LoopMessages(
+                        stored,
+                        partial,
+                        self.loop_score_weights,
+                        AttentionResidualState.eps,
+                    )
+                    state.rewind_loop(entry)
+            elif core and layer_id == core.stop:
+                messages = None
+            if visit in self.layers_to_capture:
                 auxiliary.append(state.full_partial().to(torch.bfloat16))
                 if ctx.target_capture_sink is not None:
                     ctx.target_capture_sink.on_target_capture(
                         len(auxiliary) - 1, auxiliary[-1]
                     )
-            layer(state, ctx, tau, mailbox, share)
+            self.layers[layer_id](state, ctx, tau, mailbox, share, pass_idx, messages)
+        if self.monokernel is not None:
+            self.monokernel.finish_step()
         hidden = state.compute_output(self.norm)
         if auxiliary:
             auxiliary.append(hidden)
@@ -527,6 +730,21 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
             raise NotImplementedError(
                 "Inkling2 supports static expert placements only, not --enable-eplb"
             )
+        # The condition under which the attention backend enables layerwise
+        # cache transfer (enable_layerwise_cache_ready), which assumes cache
+        # layers finish in id order: a looped core's later passes write cache
+        # layers past every decoder layer before the coda writes its own, or,
+        # sharing one cache layer per decoder layer, rewrite core layers after
+        # later ones finish.
+        if (
+            config.text_config.loop_core_layers
+            and global_server_args_dict["disaggregation_mode"] == "prefill"
+            and global_server_args_dict["disaggregation_layerwise_interval"] > 0
+        ):
+            raise NotImplementedError(
+                "Looped Inkling2 checkpoints do not support layerwise cache "
+                "transfer; pass --disaggregation-layerwise-interval 0"
+            )
         super().__init__(
             config=config,
             mapping=mapping,
@@ -573,12 +791,20 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Build the decode chain's mailbox and the prefill's sequence-parallel
-        buffers (eager, before capture)."""
+        buffers, and the decode monokernel's mailbox (eager, before
+        capture)."""
+        monokernel = self.model.monokernel
+        if monokernel is not None and monokernel.state is None:
+            monokernel.reserve()
+            monokernel.prepare(torch.device("cuda", torch.cuda.current_device()))
         if self.model.decode_mailbox is None:
             self.model.decode_mailbox = _decode_mailbox(self.model.config, self.mapping)
+        # A looped core restarts the residual state each pass, which the
+        # sequence-parallel residual share does not support.
         if (
             self.model.decode_mailbox is not None
             and self.model.sequence_parallel is None
+            and not self.model.config.loop_core_layers
         ):
             # The same group and platform as the mailbox.
             self.model.sequence_parallel = Inkling2SequenceParallel(
@@ -591,12 +817,22 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
         return self.model.decode_mailbox is not None
 
     def post_load_weights(self) -> None:
-        """Derive the fused-kernel weights from the loaded queries, norms and
-        convolution taps."""
+        """Derive the fused-kernel weights from the loaded queries, norms,
+        controllers and convolution taps, and (with --decode-monokernel) pack
+        the monokernel layers from them."""
         self.model.attn_res.derive_score_weights()
+        self.model.derive_loop_score_weights()
         for layer in self.model.layers:
             layer.derive_input_norm_gains()
             layer.attn.derive_projected_taps()
+        if self.model.config.decode_monokernel:
+            if self.model.monokernel is None:
+                self.model.monokernel = Inkling2Monokernel(
+                    self.model,
+                    self.mapping,
+                    chain=global_server_args_dict["speculative_num_draft_tokens"] or 1,
+                )
+            self.model.monokernel.pack()
 
     def resolve_lm_head(
         self,
@@ -775,10 +1011,12 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
         return input_embeds
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        """Capture trained raw layer entries followed by the final-norm output.
+        """Capture trained raw layer-visit entries followed by the final-norm
+        output. Taps count layer visits, which are the decoder layers unless
+        the core loops.
 
         Args:
-            layer_ids: Exact checkpoint taps, including the final-layer sentinel.
+            layer_ids: Exact checkpoint taps, including the final-visit sentinel.
         """
         trained = Inkling2MTPConfig.from_target(self.config).target_layer_ids
         if layer_ids != trained:
@@ -880,4 +1118,9 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
         return loaded
 
 
-EntryClass = Inkling2ForConditionalGeneration
+class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
+    """The architecture name of ``inkling2_loop`` checkpoints; the loop itself
+    comes from ``text_config.loop_config``."""
+
+
+EntryClass = [Inkling2ForConditionalGeneration, Inkling2LoopForConditionalGeneration]

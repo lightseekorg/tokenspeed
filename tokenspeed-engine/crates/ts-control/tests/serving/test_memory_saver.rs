@@ -56,13 +56,13 @@ async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() 
         )
     };
 
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(StorageProbe::default());
     let engine = start_ranks_with(
         Layout::Tp(2),
         1,
         Tiers::L3,
         Setup {
-            l3_memory_store: Some(store.clone()),
+            l3_store: Some(store.clone()),
             weight_load_refused: Some(|rank| rank == 1),
             ..Setup::default()
         },
@@ -77,7 +77,7 @@ async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() 
     assert_eq!(before.storage_namespace, old_namespace);
     assert!(before.cache_epoch > 0);
     assert_eq!(before.confirmed_prefix_tokens, 64);
-    let old_keys = store.keys();
+    let old_keys = store.memory.keys();
     assert!(!old_keys.is_empty());
     assert!(old_keys.iter().all(|key| key.starts_with(&old_namespace)));
 
@@ -92,7 +92,7 @@ async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() 
     );
     let refused = publication(&engine, false).await;
     assert_eq!(snapshot(&refused), snapshot(&before));
-    let refused_keys = store.keys();
+    let refused_keys = store.memory.keys();
     assert!(old_keys.iter().all(|key| refused_keys.contains(key)));
     for rank in &engine.ranks {
         assert!(rank.device_ops.lock().unwrap().is_empty());
@@ -126,7 +126,7 @@ async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() 
         );
     }
     assert!(
-        store.keys().is_empty(),
+        store.memory.keys().is_empty(),
         "the old L3 namespace survived the flush"
     );
     let flushed = publication(&engine, false).await;
@@ -144,8 +144,9 @@ async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() 
     assert_eq!(after.confirmed_prefix_tokens, 64);
     assert_eq!(after.cache_epoch, flushed.cache_epoch);
     assert_eq!(after.storage_namespace, new_namespace);
-    assert!(!store.keys().is_empty());
+    assert!(!store.memory.keys().is_empty());
     assert!(store
+        .memory
         .keys()
         .iter()
         .all(|key| key.starts_with(&new_namespace)));

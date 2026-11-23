@@ -952,6 +952,99 @@ class TestGDNStatePagingGPUTest:
                     assert torch.equal(slab[1], saved)
                     assert (slab[0].abs().max().item()) == (0.0)
 
+    def test_prefill_conv_writing_qkv_matches_conv_then_split(self):
+        """Two prefill chunks give the same outputs and states bit for bit
+        whether the convolution writes q, k and v or the split pass does."""
+        from tokenspeed_kernel.platform import current_platform
+
+        import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
+
+        torch = self.torch
+        h, d, total, boundary = self.H, self.D, 45, 19
+        channels = 3 * h * d
+        # Every platform but Hopper takes the direct write in serving.
+        assert mamba._prefill_conv_writes_qkv(h * d, h * d) is not (
+            current_platform().is_hopper
+        )
+        raw = torch.randn(total, channels, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(total, h, device="cuda", dtype=torch.float32)
+        b = torch.randn_like(a)
+        weights = torch.randn(channels, self.WIDTH, device="cuda") * 0.1
+        common = dict(
+            conv_weights=weights.to(torch.bfloat16),
+            bias=None,
+            activation="silu",
+            key_dim=h * d,
+            value_dim=h * d,
+            attention_tp_size=1,
+            head_k_dim=d,
+            head_v_dim=d,
+            A_log=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            dt_bias=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            layer_id=0,
+        )
+
+        def run(direct):
+            conv = torch.zeros(
+                5, channels, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
+            )
+            recurrent = torch.zeros(5, h, d, d, device="cuda", dtype=torch.float32)
+            pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
+            backend = self._make_backend(pool, spec_num_tokens=1, replay_ssm=False)
+            outputs = []
+            for before, after, row in (
+                (0, boundary, [0, 1]),
+                (boundary, total, [1, 3]),
+            ):
+                backend.init_forward_metadata(
+                    bs=1,
+                    num_extends=1,
+                    req_pool_indices=torch.tensor(
+                        [1], dtype=torch.int32, device="cuda"
+                    ),
+                    seq_lens=torch.tensor([after], dtype=torch.int32, device="cuda"),
+                    forward_mode=self.ForwardMode.EXTEND,
+                    block_tables={
+                        "linear_attention": torch.tensor(
+                            [row], dtype=torch.int32, device="cuda"
+                        )
+                    },
+                    **_extend_kwargs(
+                        torch,
+                        torch.tensor([after - before], dtype=torch.int32),
+                        torch.tensor([before], dtype=torch.int32),
+                        "cuda",
+                    ),
+                )
+                with patch.object(mamba, "_prefill_conv_writes_qkv", lambda *_: direct):
+                    outputs.append(
+                        backend.forward_extend(
+                            None,
+                            None,
+                            None,
+                            layer=None,
+                            out_cache_loc=None,
+                            token_to_kv_pool=backend.kv_pool,
+                            bs=1,
+                            forward_mode=self.ForwardMode.EXTEND,
+                            mixed_qkv=raw[before:after],
+                            a=a[before:after],
+                            b=b[before:after],
+                            seq_len=after - before,
+                            **common,
+                        )
+                    )
+            return outputs, conv, recurrent
+
+        (direct, direct_conv, direct_state), (split, split_conv, split_state) = (
+            run(True),
+            run(False),
+        )
+        for actual, expected in zip(direct, split, strict=True):
+            assert torch.equal(actual, expected)
+        assert torch.equal(direct_conv, split_conv)
+        assert torch.equal(direct_state, split_state)
+
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
         conv_dim = 3 * self.H * self.D

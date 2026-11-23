@@ -50,11 +50,16 @@ IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
 _TWO_SHOT_WORLD_SIZES = (4, 8)
 _PRODUCER_TWO_SHOT_MIN_BYTES = {4: 160 << 10, 8: 96 << 10}
-_PRODUCER_DIRECT_GL_DTYPES = {
-    torch.bfloat16: gl.bfloat16,
-    torch.float16: gl.float16,
-    torch.float32: gl.float32,
-}
+# Model discovery imports this module on backends without Gluon.
+_PRODUCER_DIRECT_GL_DTYPES = (
+    {
+        torch.bfloat16: gl.bfloat16,
+        torch.float16: gl.float16,
+        torch.float32: gl.float32,
+    }
+    if gl is not None
+    else {}
+)
 IRIS_AR_RMSNORM_STATES: dict = {}
 
 
@@ -91,6 +96,19 @@ def reserve_iris_heap(owner: str, nbytes: int) -> None:
     from tokenspeed_kernel.ops.communication._iris import reserve_heap
 
     reserve_heap(owner, nbytes)
+
+
+def create_iris_heap() -> None:
+    """Create the shared Iris heap now, at the minimum size plus every
+    reservation, for a caller that allocates from it before any collective
+    creates it (``iris_symmetric_heap``). Every rank of the world calls it;
+    a later creator reuses the heap."""
+    from tokenspeed_kernel.ops.communication._iris import (
+        MIN_HEAP_BYTES,
+        get_or_create_context,
+    )
+
+    get_or_create_context(heap_size=MIN_HEAP_BYTES)
 
 
 def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:

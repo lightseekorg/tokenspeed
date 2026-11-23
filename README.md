@@ -2,6 +2,8 @@
   <img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/banner/tokenspeed-banner.png" alt="TokenSpeed: Tokens at the speed of light" width="100%" />
 </p>
 
+[![Publish nightly](https://github.com/lightseekorg/tokenspeed/actions/workflows/nightly-release.yml/badge.svg)](https://github.com/lightseekorg/tokenspeed/actions/workflows/nightly-release.yml)
+
 TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workloads**, with TensorRT-LLM-level performance and vLLM-level usability. The goal is to be the most performant inference engine for production agentic workloads.
 
 Core components:

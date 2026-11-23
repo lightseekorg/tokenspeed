@@ -21,6 +21,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops._triton_ptx import rcp_approx_ftz_f32
+from tokenspeed_kernel.ops.quantization._triton_fp8_rows import fp8_row_codes
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -831,6 +832,90 @@ def triton_quantize_fp8_per_token_portable(
     return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
+@triton.jit
+def triton_quantize_fp8_per_token_amax_div_kernel(
+    x_ptr, codes_ptr, scales_ptr, k, BLOCK: tl.constexpr
+):
+    # One program per row; the row is one block (k <= BLOCK).
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < k
+    values = tl.load(x_ptr + row * k + offsets, mask=mask, other=0.0).to(tl.float32)
+    codes, scale = fp8_row_codes(values, mask)
+    tl.store(codes_ptr + row * k + offsets, codes, mask=mask)
+    tl.store(scales_ptr + row, scale)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_amax_div",
+    solution="triton",
+    features={"token_fp8_amax_div"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    # Below the shared token quantizer: only callers asking for this recipe
+    # (required_features={"token_fp8_amax_div"}) select it.
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_per_token_amax_div(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The small-M FP8 GEMMs' quantize step, not a general token recipe.
+
+    The scale is ``max(row amax / 448, 1e-12)`` and the codes are
+    ``x / scale`` rounded once to nearest even, both by IEEE FP32 division
+    (``_triton_fp8_rows.fp8_row_codes``), the row code the weight conversion
+    and the layer boundary's FP8 copy share bit for bit; the shared token
+    quantizer multiplies by a rounded reciprocal instead, so it could not
+    match them. ``x`` must be finite; a row holding an infinite or NaN
+    element gets an unspecified scale and codes.
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations, contiguous.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Must be False.
+
+    Returns:
+        FP8 E4M3 ``[M, K]`` codes and FP32 ``[M, 1]`` dequant scales.
+    """
+    if (
+        granularity != "token"
+        or group_size is not None
+        or scale_encoding != "float32"
+        or enable_pdl
+        or x.dim() != 2
+        or not x.is_contiguous()
+    ):
+        raise ValueError(
+            "the amax-division FP8 token quantizer takes a contiguous 2-D x, "
+            "token granularity, float32 scales and no PDL"
+        )
+    m, k = x.shape
+    codes = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m:
+        triton_quantize_fp8_per_token_amax_div_kernel[(m,)](
+            x, codes, scales, k, triton.next_power_of_2(k), num_warps=8
+        )
+    return codes, scales
+
+
 # The widest SwiGLU half (intermediate size) one program holds: a row per
 # program, for the per-token amax of the FP8 output.
 _SILU_AND_MUL_FP8_MAX_INTERMEDIATE_SIZE = 16384
@@ -1079,7 +1164,9 @@ def _mxfp4_quantize_block(x):
     amax = amax.to(tl.float32, bitcast=True)
     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+    # Add the bias before narrowing: the unbiased exponent is negative for
+    # small blocks, and converting a negative float to uint8 is undefined.
+    scale_byte = (scale_e8m0_unbiased + 127).to(tl.uint8)
     qx = x * tl.exp2(-scale_e8m0_unbiased)
     qx = qx.to(tl.uint32, bitcast=True)
 

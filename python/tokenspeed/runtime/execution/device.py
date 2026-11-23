@@ -147,10 +147,14 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.cache.disk import host_block_alignment
 from tokenspeed.runtime.cache.l2.sizing import (
     NO_POOL,
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
+)
+from tokenspeed.runtime.cache.transfer.observations import (
+    cache_observation_capacity_from_env,
 )
 from tokenspeed.runtime.distributed.cuda_stack import (
     restore_cuda_stack,
@@ -291,6 +295,8 @@ class DeviceSpecs:
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
+        cache_observation_capacity: Startup capacity of optional completed
+            CPU copy observations; zero when diagnostics are disabled.
     """
 
     cache_geometry: Any
@@ -310,6 +316,7 @@ class DeviceSpecs:
     host_group_packing: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
+    cache_observation_capacity: int = 0
 
 
 def speculative_widths(
@@ -748,6 +755,12 @@ class DeviceHandle:
                 "snapshot pool"
             )
         return l2.poll_results()
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """Drain completed CPU diagnostics only; no event query or device work."""
+        if self._l2 is None:
+            return [], 0
+        return self._l2.poll_cache_observations()
 
     def shutdown_model(self) -> None:
         """Drain local readers, then release shared model weights
@@ -1608,6 +1621,7 @@ def build_device_side(
         A ``DeviceBuild``. No device object escapes except inside the
         handle; the specs hold none at all.
     """
+    cache_observation_capacity = cache_observation_capacity_from_env(os.environ)
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
@@ -1673,14 +1687,16 @@ def build_device_side(
         if server_args.mapping.attn.has_kvp:
             # A fused decode value tail for the attentions that project as they merge.
             value_heads = set()
+            # The DSA attentions' owned decode top-k gathers float words.
+            float_words = False
             for runner in (target, draft):
                 if runner is None:
                     continue
                 for module in runner.model.modules():
-                    if (
-                        isinstance(module, GlmDsaSparseAttentionMixin)
-                        and module.owned_decode_value_weight() is not None
-                    ):
+                    if not isinstance(module, GlmDsaSparseAttentionMixin):
+                        continue
+                    float_words = True
+                    if module.owned_decode_value_weight() is not None:
                         value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
@@ -1691,6 +1707,7 @@ def build_device_side(
                 ),
                 value_heads=value_heads.pop() if len(value_heads) == 1 else None,
                 decode_rows=max_batch_size * decode_input_tokens,
+                float_words=float_words,
             )
         # Large startup batches can select RCCL while a later prefix hit selects
         # Iris. Prepare that small-batch route before the serving sync guard.
@@ -1826,6 +1843,23 @@ def build_device_side(
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
         _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
+        if current_platform().is_amd:
+            # Kernels warmed above read the probe's small KV arena. On AMD,
+            # Triton keys a compilation on whether each tensor's storage fits
+            # in 2 GB (buffer ops address it with 32-bit offsets), so a kernel
+            # that specializes the arena's pointers does not serve the
+            # full-size arena: without this, it compiles on its first live
+            # batch instead, mid-serve. Kernels that do not specialize the
+            # arena's pointers compile once and are not affected. Other
+            # platforms' kernels do not key on the arena's size and skip the
+            # second warm-up. Warm again on the final pools with the tactics
+            # tuned above; tuning now would allocate workspaces outside the
+            # reserve the rebind sized.
+            with (
+                startup_phase("kernels.rewarm"),
+                current_platform().restore_stack_limit(),
+            ):
+                executor.warm_kernels()
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or
@@ -1860,7 +1894,11 @@ def build_device_side(
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
                 layout.groups,
-                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                compute_host_group_packing(
+                    layout,
+                    group_specs=contract.group_specs,
+                    block_alignment=host_block_alignment(server_args),
+                ),
                 strict=True,
             )
         }
@@ -1880,23 +1918,47 @@ def build_device_side(
             process_group_manager as pg_manager,
         )
 
+        cpu_group = (
+            pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+            if server_args.mapping.world_size > 1
+            else None
+        )
+        if server_args.kvstore_release_checkpoint_cache:
+            from tokenspeed.runtime.cache.l2.executor import (
+                release_checkpoint_file_cache,
+            )
+            from tokenspeed.runtime.cache.l3.factory import model_checkpoint_id
+
+            configs = (
+                [model_config]
+                if draft_model_config is None
+                else [model_config, draft_model_config]
+            )
+            if server_args.peer_prefix_port is not None:
+                # Compute the mandatory identity while the loaded shards are still cached.
+                for config in configs:
+                    model_checkpoint_id(server_args, config)
+            release_checkpoint_file_cache(
+                [config.model_path for config in configs],
+                node_leader=(global_rank % server_args.mapping.nprocs_per_node == 0),
+                cpu_group=cpu_group,
+            )
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
             draft_pool=views.draft_token_to_kv_pool,
             l2_tier=server_args.enable_kvstore,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_headroom_bytes=server_args.kvstore_host_headroom_gib * 1024**3,
             snapshot_pool=snapshot_pool,
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
+            block_alignment=host_block_alignment(server_args),
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,
-            world_cpu_group=(
-                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
-                if server_args.mapping.world_size > 1
-                else None
-            ),
+            cache_observation_capacity=cache_observation_capacity,
+            world_cpu_group=cpu_group,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1942,6 +2004,7 @@ def build_device_side(
     peer_geometry = None
     if peer_outbox is not None:
         from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
         if host_cache is None:
             raise ValueError(
@@ -1960,6 +2023,7 @@ def build_device_side(
             },
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
+            host_region_planner=get_peer_host_region_planner(server_args.device),
         )
 
     kv_transfer = kv_transfer_builder(
@@ -1981,6 +2045,7 @@ def build_device_side(
         executor.config.spec_num_tokens,
     )
     specs = DeviceSpecs(
+        cache_observation_capacity=cache_observation_capacity,
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
