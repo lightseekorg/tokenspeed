@@ -665,7 +665,7 @@ if platform.is_nvidia:
 
 
 # ===-----------------------------------------------------------------------===#
-# FP8 block-scaled experts: CUTLASS (NVIDIA SM90+)
+# FP8 block-scaled experts: CUTLASS (NVIDIA SM90)
 # ===-----------------------------------------------------------------------===#
 
 

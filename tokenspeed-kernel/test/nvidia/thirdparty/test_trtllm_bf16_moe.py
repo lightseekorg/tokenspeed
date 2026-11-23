@@ -852,7 +852,8 @@ def _plan(platform, weight_dtype, routing_mode=None, **kwargs):
             "flashinfer_trtllm_unquant_routed_moe_apply",
         ),
         # In-kernel routers without the hook plan precomputed top-k.
-        ("fp8", None, None, "flashinfer_cutlass_fp8_moe_apply"),
+        # Blackwell runs block-scaled FP8 on precomputed top-k in Triton only.
+        ("fp8", None, None, "triton_fp8_block_precomputed_moe_apply"),
         ("nvfp4", None, None, "flashinfer_trtllm_nvfp4_routed_moe_apply"),
         ("mxfp4", None, None, "flashinfer_trtllm_mxfp4_moe_apply"),
     ],
