@@ -20,9 +20,16 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
+from tokenspeed_kernel.ops.embedding.triton import (
+    MLARopeSetKVBufferLaunch,
+    _mla_rope_set_kv_buffer_lanes,
+    _mla_rope_set_kv_buffer_token,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     _index_k_layernorm_fp8_scatter_args,
     _index_k_layernorm_fp8_scatter_row,
@@ -37,6 +44,7 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
@@ -2651,6 +2659,226 @@ def _index_k_write_pack_query_kernel(
 
 
 @triton.jit
+def _absorb_query_tile(
+    A,
+    W,
+    O,
+    tile,
+    num_tokens,
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    HEADS: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Output tile ``tile`` of ``O[t, h] = A[t, h] @ W[h].T``: one chain of
+    16x16x32 MFMAs over K in order per element, rounded to ``A``'s dtype
+    before ``O``'s store converts it, as the grouped decode GEMM computes it."""
+    tl.static_assert(BLOCK_M == 16 and BLOCK_N == 16)
+    blocks: tl.constexpr = N // BLOCK_N
+    m = tile // (HEADS * blocks) * BLOCK_M + tl.arange(0, BLOCK_M)
+    h = tile // blocks % HEADS
+    n = tile % blocks * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.arange(0, K)
+    rows = m[:, None] < num_tokens
+    a = tl.load(A + m[:, None] * A0 + h * A1 + k[None, :], mask=rows, other=0.0)
+    w = tl.load(W + h * W0 + n[None, :] * W1 + k[:, None])
+    q = tl.dot(a, w).to(A.dtype.element_ty)
+    tl.store(O + m[:, None] * O0 + h * O1 + n[None, :], q, mask=rows)
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2", "num_tokens"])
+def _index_k_write_pack_query_mla_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    X,
+    V,
+    S,
+    X0,
+    X1,
+    X2,
+    q_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    q_out_rope_ptr,
+    kv_buffer_ptr,
+    kv_loc_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_nope_ptr,
+    num_tokens,
+    kv_write_mask_ptr,
+    kv_loc_stride: tl.constexpr,
+    q_rope_stride_t: tl.constexpr,
+    q_rope_stride_h: tl.constexpr,
+    k_nope_stride_t: tl.constexpr,
+    k_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_h: tl.constexpr,
+    kv_buffer_stride_t,
+    kv_buffer_stride_p,
+    KV_PAGE_SIZE: tl.constexpr,
+    cos_sin_stride_p: tl.constexpr,
+    q_nope_stride_t: tl.constexpr,
+    q_nope_stride_h: tl.constexpr,
+    num_q_heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    A,
+    W,
+    O,
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
+    HEADS: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    ASSEMBLE_FULL_QUERY: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    INDEX_INT64: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+    ABSORB: tl.constexpr,
+    ABSORB_K: tl.constexpr,
+    ABSORB_N: tl.constexpr,
+    ABSORB_BLOCK_M: tl.constexpr,
+    ABSORB_BLOCK_N: tl.constexpr,
+):
+    """One program each: with ``ABSORB``, first the absorbed query's tiles
+    (:func:`_absorb_query_tile`); then a token's index query head, as
+    :func:`_index_k_write_pack_query_kernel` (a token's first head also
+    writing its key); then a token's NoPE ``_mla_rope_set_kv_buffer_kernel``
+    query head or latent row."""
+    pid = tl.program_id(0)
+    if ABSORB:
+        tiles = (
+            tl.cdiv(num_tokens, ABSORB_BLOCK_M)
+            * num_q_heads
+            * (ABSORB_N // ABSORB_BLOCK_N)
+        )
+        if pid < tiles:
+            _absorb_query_tile(
+                A,
+                W,
+                O,
+                pid,
+                num_tokens,
+                A0,
+                A1,
+                W0,
+                W1,
+                O0,
+                O1,
+                num_q_heads,
+                ABSORB_K,
+                ABSORB_N,
+                ABSORB_BLOCK_M,
+                ABSORB_BLOCK_N,
+            )
+            return
+        pid -= tiles
+    if pid < num_tokens * HEADS:
+        token = (pid // HEADS).to(tl.int64)
+        head = pid % HEADS
+        _pack_index_query_row(X, V, S, X0, X1, X2, token * HEADS + head, HEADS)
+        if head == 0:
+            _index_k_layernorm_fp8_scatter_row(
+                fp8_buf_ptr,
+                scale_buf_ptr,
+                x_ptr,
+                norm_weight_ptr,
+                norm_bias_ptr,
+                loc_ptr,
+                write_mask_ptr,
+                token,
+                x_row_stride,
+                page_bytes,
+                scale_base_off,
+                eps,
+                HAS_WRITE_MASK,
+                PAGE_SIZE,
+                HD,
+                GROUP,
+                NG,
+                BLOCK_NG,
+                FP8_MAX,
+                MXFP4,
+                UE8M0,
+            )
+        return
+    pid -= num_tokens * HEADS
+    token_idx = pid // (num_q_heads + 1)
+    if INDEX_INT64:
+        token_idx = token_idx.to(tl.int64)
+    _mla_rope_set_kv_buffer_token(
+        token_idx,
+        (pid % (num_q_heads + 1)).to(tl.int64),
+        _mla_rope_set_kv_buffer_lanes(
+            nope_dim, rope_dim, NOPE_BLOCK, HALF_BLOCK, IS_NEOX
+        ),
+        q_rope_ptr,
+        k_nope_ptr,
+        k_rope_ptr,
+        q_out_rope_ptr,
+        kv_buffer_ptr,
+        kv_loc_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        q_nope_ptr,
+        kv_write_mask_ptr,
+        kv_loc_stride,
+        q_rope_stride_t,
+        q_rope_stride_h,
+        k_nope_stride_t,
+        k_rope_stride_t,
+        q_out_rope_stride_t,
+        q_out_rope_stride_h,
+        kv_buffer_stride_t,
+        kv_buffer_stride_p,
+        KV_PAGE_SIZE,
+        cos_sin_stride_p,
+        q_nope_stride_t,
+        q_nope_stride_h,
+        num_q_heads,
+        nope_dim,
+        rope_dim,
+        IS_NEOX,
+        ASSEMBLE_FULL_QUERY,
+        APPLY_ROPE,
+        SANITIZE,
+        MAX_FINITE,
+    )
+
+
+@triton.jit
 def _quantize_index_queries_kernel(
     Q,
     W,
@@ -2743,6 +2971,75 @@ def pack_index_queries(values):
     return data, scales
 
 
+# The bmm kernel whose sums the absorbed query tiles reproduce: per output
+# element one chain of 16x16x32 MFMAs over K in order, no split-K.
+_ABSORB_BMM_KERNEL = "gluon_grouped_bmm_a16w16_decode_gfx950"
+_ABSORB_BLOCK_M = 16
+_ABSORB_BLOCK_N = 16
+
+
+@lru_cache(maxsize=256)
+def _absorb_bmm_reproduced(
+    heads: int, tokens: int, n: int, k: int, dtype: torch.dtype
+) -> bool:
+    signature = format_signature(
+        a=dense_tensor_format(dtype), b=dense_tensor_format(dtype)
+    )
+    traits = {
+        "batch": heads,
+        "m": tokens,
+        "n": n,
+        "k": k,
+        "a_inner_stride_one": True,
+        "b_n_stride_one": False,
+        "out_dtype": dtype,
+        "out_inner_stride_one": True,
+    }
+    try:
+        kernel = select_kernel("gemm", "bmm", signature, traits=traits)
+    except NoKernelFoundError:
+        return False
+    if kernel.name != _ABSORB_BMM_KERNEL:
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_grouped_mm_a16w16_decode_num_counters_gfx950,
+        supports_gluon_grouped_mm_a16w16_decode_gfx950,
+    )
+
+    return (
+        supports_gluon_grouped_mm_a16w16_decode_gfx950(tokens, heads, n, k)
+        and gluon_grouped_mm_a16w16_decode_num_counters_gfx950(tokens, heads, n, k) == 0
+    )
+
+
+def mla_query_absorb_folds(q_nope: torch.Tensor, w_kc: torch.Tensor) -> bool:
+    """Whether :func:`index_k_layernorm_scatter_and_pack_query` can absorb the
+    MLA query (``mla_absorb``) as ``bmm(q_nope.transpose(0, 1),
+    w_kc.transpose(1, 2))`` without a plan does, bit for bit for finite
+    ``q_nope`` rows.
+
+    Args:
+        q_nope: ``[tokens, heads, K]`` BF16 query part with unit inner stride.
+        w_kc: ``[heads, K, N]`` BF16 absorption weight, K-major.
+    """
+    if q_nope.ndim != 3 or w_kc.ndim != 3 or q_nope.shape[0] == 0:
+        return False
+    tokens, heads, k = q_nope.shape
+    n = w_kc.shape[2]
+    return (
+        q_nope.dtype == w_kc.dtype == torch.bfloat16
+        and w_kc.shape[:2] == (heads, k)
+        and k in (64, 128, 256)
+        and n % _ABSORB_BLOCK_N == 0
+        and q_nope.stride(2) == 1
+        and q_nope.stride(0) % 8 == 0
+        and q_nope.stride(1) % 8 == 0
+        and q_nope.data_ptr() % 16 == 0
+        and w_kc.transpose(1, 2).is_contiguous()
+        and _absorb_bmm_reproduced(heads, tokens, n, k, q_nope.dtype)
+    )
+
+
 def index_k_layernorm_scatter_and_pack_query(
     buf: torch.Tensor,
     index_k: torch.Tensor,
@@ -2754,6 +3051,8 @@ def index_k_layernorm_scatter_and_pack_query(
     eps: float,
     page_size: int,
     write_mask: torch.Tensor | None,
+    mla_rope: MLARopeSetKVBufferLaunch | None = None,
+    mla_absorb: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Write mxfp4 index keys and pack the same rows' index queries in one launch.
 
@@ -2775,6 +3074,17 @@ def index_k_layernorm_scatter_and_pack_query(
         page_size: Rows per page of the plane.
         write_mask: Optional bool ``[tokens]`` ownership mask; False rows'
             keys are not written. None writes every row.
+        mla_rope: Optional NoPE ``mla_rope_set_kv_buffer_args`` of the same
+            tokens, whose MLA query assembly and latent cache write the
+            launch then also makes, bit for bit as
+            ``apply_rope_mla_set_kv_buffer_triton`` does. A rotation is
+            refused: its FMA rounding depends on that kernel's compile
+            options, which the index pack does not take.
+        mla_absorb: Optional ``(q_nope, w_kc, out)`` with ``mla_rope``: the
+            launch also stores ``bmm(q_nope.transpose(0, 1), w_kc.transpose(1,
+            2))`` into ``out`` (``[tokens, heads, N]``, unit inner stride),
+            rounded to ``q_nope``'s dtype first, where
+            :func:`mla_query_absorb_folds` holds.
 
     Returns:
         uint8 ``[tokens, heads, 64]`` E2M1 codes and int32 ``[tokens, heads]``
@@ -2800,9 +3110,74 @@ def index_k_layernorm_scatter_and_pack_query(
             f"index_k has {index_k.shape[0]} rows and q has {tokens}; the "
             "fused write packs the queries of its own rows"
         )
+    if mla_rope is not None and mla_rope.num_tokens != tokens:
+        raise ValueError(
+            f"the MLA write has {mla_rope.num_tokens} tokens and q has {tokens}"
+        )
+    if mla_rope is not None and mla_rope.constexprs["APPLY_ROPE"]:
+        raise ValueError("the fused index-K write takes a NoPE MLA write only")
+    absorb = {"A": None, "W": None, "O": None, "A0": 0, "A1": 0}
+    absorb.update(W0=0, W1=0, O0=0, O1=0, ABSORB=False, ABSORB_K=0, ABSORB_N=0)
+    absorb_tiles = 0
+    if mla_absorb is not None:
+        q_nope, w_kc, out = mla_absorb
+        if mla_rope is None or not mla_query_absorb_folds(q_nope, w_kc):
+            raise ValueError(
+                "the fused index-K write absorbs with an MLA write, where "
+                "mla_query_absorb_folds holds"
+            )
+        q_heads, k = q_nope.shape[1:]
+        n = w_kc.shape[2]
+        if (
+            q_nope.shape[0] != tokens
+            or q_heads != mla_rope.num_q_heads
+            or out.shape != (tokens, q_heads, n)
+            or out.stride(2) != 1
+        ):
+            raise ValueError(
+                f"absorbing {tuple(q_nope.shape)} by {tuple(w_kc.shape)} into "
+                f"{tuple(out.shape)} does not match the write's {tokens} tokens "
+                f"and {mla_rope.num_q_heads} heads"
+            )
+        weight = w_kc.transpose(1, 2)
+        absorb = dict(
+            A=q_nope,
+            W=weight,
+            O=out,
+            A0=q_nope.stride(0),
+            A1=q_nope.stride(1),
+            W0=weight.stride(0),
+            W1=weight.stride(1),
+            O0=out.stride(0),
+            O1=out.stride(1),
+            ABSORB=True,
+            ABSORB_K=k,
+            ABSORB_N=n,
+            matrix_instr_nonkdim=16,
+        )
+        absorb_tiles = (
+            triton.cdiv(tokens, _ABSORB_BLOCK_M) * q_heads * (n // _ABSORB_BLOCK_N)
+        )
     data = torch.empty((tokens, heads, 64), dtype=torch.uint8, device=q.device)
     scales = torch.empty((tokens, heads), dtype=torch.int32, device=q.device)
-    if tokens:
+    if tokens and mla_rope is not None:
+        programs = absorb_tiles + tokens * (heads + mla_rope.num_q_heads + 1)
+        _index_k_write_pack_query_mla_kernel[(programs,)](
+            *key_args,
+            q,
+            data,
+            scales,
+            *q.stride(),
+            *mla_rope.args,
+            **key_constexprs,
+            HEADS=heads,
+            **mla_rope.constexprs,
+            **absorb,
+            ABSORB_BLOCK_M=_ABSORB_BLOCK_M,
+            ABSORB_BLOCK_N=_ABSORB_BLOCK_N,
+            num_warps=1,
+        )
+    elif tokens:
         _index_k_write_pack_query_kernel[(tokens, heads)](
             *key_args,
             q,

@@ -47,6 +47,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.embedding.triton import MLARopeSetKVBufferLaunch
+
     from tokenspeed.runtime.layers.layernorm import LayerNorm
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -352,6 +354,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         write_mask: torch.Tensor | None,
         key_norm: LayerNorm,
         query: torch.Tensor,
+        mla_rope: MLARopeSetKVBufferLaunch | None = None,
+        mla_absorb: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Write pre-norm index keys into an mxfp4 plane and pack the same rows'
         queries to mxfp4 in one launch.
@@ -367,6 +371,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
             write_mask: Optional bool ``[rows]`` ownership mask of the keys.
             key_norm: The LayerNorm the keys still need.
             query: ``[rows, heads, index_head_dim]`` BF16 index queries.
+            mla_rope: Optional NoPE MLA query assembly and latent write of the
+                same rows for the launch to make too
+                (``mla_rope_set_kv_buffer_args``).
+            mla_absorb: Optional ``(q_nope, w_kc, out)`` MLA query absorption
+                for the launch to make too, with ``mla_rope``.
 
         Returns:
             uint8 ``[rows, heads, index_head_dim / 2]`` E2M1 codes and int32
@@ -389,4 +398,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             eps=key_norm.variance_epsilon,
             page_size=self.index_k_page_size,
             write_mask=write_mask,
+            mla_rope=mla_rope,
+            mla_absorb=mla_absorb,
         )
