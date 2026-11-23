@@ -138,21 +138,23 @@ def expand_k_row_lengths(
     )
 
 
-@triton.jit(do_not_specialize=["rows"])
+# The row count and width are runtime values: every batch and width share one binary.
+@triton.jit(do_not_specialize=["rows", "k"])
 def _expand_k_row_requests_kernel(
     lengths_ptr,
     requests_out_ptr,
     ends_out_ptr,
     rows,
-    K: tl.constexpr,
+    k,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = row < rows
-    request = row // K
+    request = row // k
+    offset = (row - request * k).to(tl.int32)
     length = tl.load(lengths_ptr + request, mask=live, other=0).to(tl.int32)
-    tl.store(requests_out_ptr + row, request, mask=live)
-    tl.store(ends_out_ptr + row, length + (row - request * K) - (K - 1), mask=live)
+    tl.store(requests_out_ptr + row, request.to(tl.int32), mask=live)
+    tl.store(ends_out_ptr + row, length + offset - (k - 1), mask=live)
 
 
 def expand_k_row_requests(
@@ -214,7 +216,7 @@ def expand_k_row_requests(
         requests_out,
         ends_out,
         rows,
-        K=k,
+        k,
         BLOCK=_BLOCK,
         num_warps=4,
     )

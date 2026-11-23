@@ -129,17 +129,19 @@ def test_request_rows_match_the_tensor_op_chain(device, requests, k, dtype):
 
 
 def test_request_rows_reuse_one_compiled_kernel():
-    def expand(requests):
+    def expand(requests, k):
         lengths = torch.arange(requests, dtype=torch.int32, device="cuda") + 9
-        rows = torch.empty(requests * 9, dtype=torch.int32, device="cuda")
-        ends = torch.empty(requests * 9, dtype=torch.int32, device="cuda")
-        expand_k_row_requests(lengths, k=9, requests_out=rows, ends_out=ends)
+        rows = torch.empty(requests * k, dtype=torch.int32, device="cuda")
+        ends = torch.empty(requests * k, dtype=torch.int32, device="cuda")
+        expand_k_row_requests(lengths, k=k, requests_out=rows, ends_out=ends)
+        want_rows, want_ends = _requests_reference(lengths, requests * k, k)
+        assert torch.equal(rows, want_rows) and torch.equal(ends, want_ends)
 
-    expand(2)
-    expand(32)
+    expand(2, 9)
+    # Batch sizes and widths (a verify's, a draft step's) share one binary.
     with assert_no_triton_compile(_expand_k_row_requests_kernel):
-        for requests in (1, 3, 16, 17, 64):
-            expand(requests)
+        for requests, k in ((1, 9), (3, 1), (16, 4), (17, 9), (64, 1), (5, 16)):
+            expand(requests, k)
 
 
 def test_request_rows_reject_mismatched_shapes():
