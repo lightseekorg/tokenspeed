@@ -162,6 +162,8 @@ class GlmDsaIndexerOutput:
     query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
     # When set, the decode rows' E4M3 query and FP32 weights folding its scales and the score scale.
     quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None
+    # mxfp4 index queries the index-K write packed: codes and scale words.
+    packed_query: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def query_rows(self, start: int, end: int) -> torch.Tensor:
         rows = self.query[start:end]
@@ -751,7 +753,13 @@ class GlmDsaSparseAttentionMixin:
                 "the KV-parallel decode top-k quantizes its own index queries"
             )
         softmax_scale = self.indexer.weights_softmax_scale
-        if quantized is None:
+        if quantized is None and indexer_output.packed_query is not None:
+            if decode_start != 0 or q.shape[0] != indexer_output.packed_query[0].shape[0]:
+                raise RuntimeError(
+                    "the index-K write packed rows outside the decode window"
+                )
+            q, q_scales = indexer_output.packed_query
+        elif quantized is None:
             q, q_scales = self._scorer_index_query(q, index_k_cache)
         else:
             # Unit query scales: the weights carry them and the score scale.
@@ -1601,6 +1609,23 @@ class GlmDsaSparseAttentionMixin:
                     softmax_scale=self.indexer.weights_softmax_scale,
                 )
                 indexer_output = replace(indexer_output, quantized_query=quantized)
+            elif (
+                self.index_query_mxfp4
+                and num_prefill_tokens == 0
+                and placement is None
+                and indexer_output.key_norm is not None
+                and ctx.token_to_kv_pool.index_k_format == "mxfp4"
+            ):
+                # A decode round packs its mxfp4 index queries in the write's launch.
+                packed = ctx.token_to_kv_pool.set_index_k_buffer_and_pack_query(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                    query=indexer_output.query_rows(0, num_attn_tokens),
+                )
+                indexer_output = replace(indexer_output, packed_query=packed)
             else:
                 index_slots, index_mask = resolve_write_slots(
                     out_cache_loc, placement, shared_topk
