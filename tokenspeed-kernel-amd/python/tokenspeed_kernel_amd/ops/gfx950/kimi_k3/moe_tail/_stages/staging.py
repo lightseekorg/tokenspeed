@@ -64,18 +64,9 @@ def store_row_words(xl, words, first, K: gl.constexpr):
 
 
 @gluon.jit
-def gated_rows_to_lds(
-    core,
-    gate,
-    norm_w,
-    xl,
-    S: gl.constexpr,
-    GATE_STRIDE: gl.constexpr,
-    EPS: gl.constexpr,
-):
-    """Stage ``rmsnorm_gated_sigmoid(core, gate, norm_w)``'s rows as
-    ``rows_to_lds`` stages rows, bit for bit, from the raw 1536-column
-    attention output and its gate logits."""
+def gated_rows_loads(core, gate, norm_w, S: gl.constexpr, GATE_STRIDE: gl.constexpr):
+    """Issue :func:`gated_rows_store`'s loads: the norm weight, then each
+    32-head-row chunk's attention output and gate logits."""
     # _rmsnorm_gated_kernel's layout over a head's 128 values, so each head
     # reduces in its order; a lane's 8 values are the 8 that rows_to_lds
     # gives it, so the words go to store_row_words unmoved.
@@ -84,7 +75,7 @@ def gated_rows_to_lds(
     CHUNKS: gl.constexpr = S * HEADS // 32
     gl.static_assert(S * HEADS % 32 == 0)
     d = gl.arange(0, 128, layout=gl.SliceLayout(0, NL))
-    w = gl.load(norm_w + d).to(gl.float32)
+    w = gl.load(norm_w + d)
     xs = ()
     gs = ()
     for i in gl.static_range(CHUNKS):
@@ -93,6 +84,18 @@ def gated_rows_to_lds(
         h = head_row % HEADS
         xs += (gl.load(core + (t * 1536 + h * 128)[:, None] + d[None, :]),)
         gs += (gl.load(gate + (t * GATE_STRIDE + h * 128)[:, None] + d[None, :]),)
+    return w, xs, gs
+
+
+@gluon.jit
+def gated_rows_store(loaded, xl, S: gl.constexpr, EPS: gl.constexpr):
+    """Stage ``rmsnorm_gated_sigmoid(core, gate, norm_w)``'s rows as
+    ``rows_to_lds`` stages rows, bit for bit, from the raw 1536-column
+    attention output and its gate logits that :func:`gated_rows_loads`
+    loaded."""
+    CHUNKS: gl.constexpr = S * (1536 // 128) // 32
+    w, xs, gs = loaded
+    w = w.to(gl.float32)
     for i in gl.static_range(CHUNKS):
         x = xs[i].to(gl.float32)
         g = gs[i].to(gl.float32)
