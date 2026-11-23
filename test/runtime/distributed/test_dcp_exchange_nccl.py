@@ -1063,8 +1063,13 @@ def _decode_rider_worker(rank, degree, rendezvous):
         leaf = _decode_records_leaf(dsa, group, rank, requests, records_core=False)
         rider = leaf.dcp_decode_query_rider(layer, q)
         assert rider is not None
-        gathered = rider.new_empty((degree, *rider.shape))
-        dist.all_gather_into_tensor(gathered, rider)
+        # Every rank's rider lands after its scores, as the score gather has it.
+        score_bytes = tokens * leaf.index_topk * 4
+        send = rider.new_zeros(score_bytes + rider.numel())
+        send[score_bytes:].view_as(rider).copy_(rider)
+        landed = send.new_empty((degree, send.numel()))
+        dist.all_gather_into_tensor(landed, send)
+        gathered = landed[:, score_bytes:].view(degree, tokens, -1)
         owned_slots, owned_lens = compact_owned_cache_slots(
             slots, lengths, leaf.cache_placement(layer)
         )
