@@ -230,7 +230,7 @@ def test_w8a16_graph_with_offset_scales(rows, dtype, tensor_scales):
     _check(actual, values, model, "none")
 
 
-@pytest.mark.parametrize("rows", [128, 256])
+@pytest.mark.parametrize("rows", [64, 128, 256])
 @pytest.mark.parametrize("use_pdl", [False, True])
 @torch.inference_mode()
 def test_projection_updates_in_captured_graph(rows, use_pdl):

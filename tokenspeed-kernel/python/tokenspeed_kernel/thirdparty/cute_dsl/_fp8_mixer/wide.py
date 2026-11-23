@@ -20,6 +20,8 @@
 
 """Single-launch native FP8 mixer for prequantized activation and weights."""
 
+from typing import NamedTuple
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cute_utils
@@ -40,17 +42,12 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _commit_residual,
     _copy_residual_16,
     _decode_residual,
-    _hidden_major_reader,
-    _invalidate,
     _load_f32,
     _make_down_operands,
     _mul_hidden_float_pair,
     _operand_at,
-    _prefetch_branch_residual,
     _reduce_split_partials,
     _store_private_epoch,
-    _store_token_major_mix,
-    _token_major_reader,
     _wait_residual,
     _x_scale,
 )
@@ -59,6 +56,12 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.raw_issue import (
     fp8_instruction,
     fp8_mbarrier_wait,
     fp8_mma_encoded,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
+    MixerOperands,
+    ResidentMixer,
+    _mixer_cta,
+    _mixer_shared,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
     Fp8GatedResidualGemm,
@@ -897,7 +900,16 @@ class _DownPhase(Fp8GatedResidualGemm):
                 )
 
 
-class Fp8FusedGatedResidualKernel:
+class _WideMaps(NamedTuple):
+    down_weight_map: TensorMap
+    down_input_map: TensorMap
+    up_weight_map: TensorMap
+    up_input_map: TensorMap
+    down_weight_priority: cutlass.Int32
+    up_weight_priority: cutlass.Int32
+
+
+class Fp8FusedGatedResidualKernel(ResidentMixer):
     """Resident phases reuse one operand arena and one TMEM allocation."""
 
     def __init__(
@@ -1279,7 +1291,8 @@ class Fp8FusedGatedResidualKernel:
             if self.token_major_up
             else (self.up_channels // self.up_channel_parts, self.up_rows)
         )
-        self.hidden_reader_columns = min(32, token_bucket // 4)
+        self.reader_groups = self.compute_threads // 128
+        self.hidden_reader_columns = min(32, token_bucket // self.reader_groups)
         self.hidden_reader_passes = 1
         group_modes = (
             "reader_rows_group",
@@ -1341,7 +1354,7 @@ class Fp8FusedGatedResidualKernel:
                 "Packed FP32 multiplication requires the wide64 vector mix"
             )
         self.up_hidden_pair_mul = up_hidden_pair_mul
-        self.reader_columns = self.up_hidden // 4
+        self.reader_columns = self.up_hidden // self.reader_groups
         self.up_tiles = (r + self.up_k - 1) // self.up_k
         first, count, stride = up_activation_prefetch
         if type(count) is not int or count < 0 or stride not in (1, 2, 4):
@@ -1498,6 +1511,7 @@ class Fp8FusedGatedResidualKernel:
             raise ValueError("Issuing Up W2 at the handoff requires the entry barriers")
         self.up_early_weight_stages = self.up_reuse_stages
         self.separate_up_barriers = True
+        self.down_token_parts = 1
         self.down_barrier_count = 2 * down_stages + 2
         self.down_tiles = (p + self.down_m - 1) // self.down_m
         self.down_tasks = self.down_tiles * self.splits
@@ -1712,29 +1726,10 @@ class Fp8FusedGatedResidualKernel:
         down_weight_priority: cutlass.Int32,
         up_weight_priority: cutlass.Int32,
     ):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        pid = cute.arch.block_idx()[0]
-        ctas = cutlass.Int64(cute.arch.grid_dim()[0])
-        arena = cute_ext.allocate(
-            cutlass.Uint8,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.arena_bytes),
-            alignment=1024,
-        )
-        bars = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.barrier_count),
-            alignment=8,
-        )
-        up_bars = bars.iterator
-        up_bars = up_bars + self.down_barrier_count
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        )
-        epoch = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        cta = _mixer_cta()
+        tid, warp, pid, ctas = cta
+        shared = _mixer_shared(
+            self.arena_bytes, self.barrier_count, self.down_barrier_count
         )
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
@@ -1744,8 +1739,8 @@ class Fp8FusedGatedResidualKernel:
             self.down.prepare_entry(
                 x,
                 down,
-                arena,
-                bars.iterator,
+                shared.arena,
+                shared.down_barriers,
                 pid // self.splits,
                 pid % self.splits,
                 cutlass.Int64(0),
@@ -1758,7 +1753,7 @@ class Fp8FusedGatedResidualKernel:
                 # The existing entry join publishes Up barriers before any
                 # producer can use them. Down's operand copies can run now.
                 self._init_up_barriers(
-                    up_bars, cutlass.Int32(0), use_existing_join=True
+                    shared.up_barriers, cutlass.Int32(0), use_existing_join=True
                 )
         self._prefetch_last_up_weight_at("entry", up_weight_map, pid, ctas, warp)
         if cutlass.const_expr(
@@ -1769,237 +1764,263 @@ class Fp8FusedGatedResidualKernel:
             if warp == 17:
                 self._prefetch_scale_lines(ds, us, xs, pid)
         if tid == 0:
-            epoch[0] = _acquire(epochs.iterator + cutlass.Int64(pid) + 1)
+            shared.epoch[0] = _acquire(epochs.iterator + cutlass.Int64(pid) + 1)
         if warp == 17:
-            cute.arch.alloc_tmem(self.columns, base.iterator, is_two_cta=False)
+            cute.arch.alloc_tmem(self.columns, shared.tmem, is_two_cta=False)
             cute.arch.relinquish_tmem_alloc_permit()
         cute.arch.sync_threads()
-        phase_base = epoch[0]
-        token_round = cutlass.Int64(0)
-        global_base = cutlass.Int64(0)
-        while global_base < x.shape[0]:
-            task = cutlass.Int32(pid)
-            while task < self.down_tasks:
-                entry_prefilled = cutlass.Boolean(False)
-                entry_prefilled = (global_base == 0) & (task == cutlass.Int32(pid))
-                is_last_down_task = task + cutlass.Int32(ctas) >= self.down_tasks
-                prepare_up_weights = cutlass.Boolean(False)
-                prepare_up_weights = (pid < self.up_tasks) & is_last_down_task
-                self.down.project(
-                    x,
-                    down,
-                    partials,
-                    arena,
-                    bars.iterator,
-                    base.iterator,
-                    task // self.splits,
-                    task % self.splits,
-                    token_round,
-                    down_weight_map,
-                    down_input_map,
-                    cache_priority=down_weight_priority,
-                    entry_prefilled=entry_prefilled,
-                    prepare_up_weights=prepare_up_weights,
-                    up_bars=up_bars,
-                    up_weight_map=up_weight_map,
-                    up_weight_priority=up_weight_priority,
-                    up_hidden_tile=pid,
-                )
-                if cutlass.const_expr(self.mma_down_arrival):
-                    if (warp == self.mma_warp) & is_last_down_task:
-                        # The existing read_done acquire orders the partials.
-                        # Earlier tasks have already joined this CTA.
-                        with cute.arch.elect_one():
-                            _arrive_phase(
-                                epochs.iterator,
-                                self.release_phase_arrivals,
-                                self.async_down_arrival,
-                            )
-                cute.arch.sync_threads()
-                if cutlass.const_expr(
-                    self.last_up_weight_prefetch[0] == "before_invalidate"
-                ):
-                    if is_last_down_task:
-                        self._prefetch_last_up_weight_at(
-                            "before_invalidate", up_weight_map, pid, ctas, warp
-                        )
-                if warp == 17:
-                    _invalidate(bars.iterator, 2 * self.down.stages + 2)
-                cute.arch.sync_threads()
-                task = task + cutlass.Int32(ctas)
-            cute.arch.sync_threads()
-            if tid == 0:
-                if cutlass.const_expr(self.mma_down_arrival):
-                    if pid >= self.down_tasks:
-                        _arrive_phase(
-                            epochs.iterator,
-                            self.release_phase_arrivals,
-                            self.async_down_arrival,
-                        )
-                else:
-                    _arrive_phase(
-                        epochs.iterator,
-                        self.release_phase_arrivals,
-                        self.async_down_arrival,
-                    )
-            self._prefetch_last_up_weight_at(
-                "after_release", up_weight_map, pid, ctas, warp
-            )
-            if pid < self.up_tasks:
-                prepared_weight_stages = cutlass.Int32(0)
-                if cutlass.const_expr(self.up_early_weight_stages > 0):
-                    if pid < self.down_tasks:
-                        prepared_weight_stages = cutlass.Int32(
-                            self.up_early_weight_stages
-                        )
-                self._prefetch_up_weights(
-                    up,
-                    arena,
-                    up_bars,
-                    pid,
-                    up_weight_map,
-                    cache_priority=up_weight_priority,
-                    prepared_weight_stages=prepared_weight_stages,
-                    during_down=False,
-                    after_acquire=False,
-                )
-            if tid == 0:
-                while _acquire(epochs.iterator) < (phase_base + 1) * ctas:
-                    pass
-            cute.arch.sync_threads()
-            if cutlass.const_expr(self.up_late_prefetch_stages):
-                if pid < self.up_tasks and pid % self.up_late_prefetch_stride == 0:
-                    self._prefetch_up_weights(
-                        up,
-                        arena,
-                        up_bars,
-                        pid,
-                        up_weight_map,
-                        cache_priority=up_weight_priority,
-                        prepared_weight_stages=cutlass.Int32(0),
-                        during_down=False,
-                        after_acquire=True,
-                    )
-            row = cutlass.Int64(pid) * self.quant_rows
-            while row < self.n:
-                self._epilogue(
-                    partials,
-                    xs,
-                    ds,
-                    activation,
-                    alpha,
-                    out,
-                    inject,
-                    global_base,
-                    row,
-                    x.shape[0],
-                    row + ctas * self.quant_rows < self.n,
-                )
-                row = row + ctas * self.quant_rows
-            _publish_activation_proxy()
-            activation_target = (phase_base + 2) * ctas
-            if cutlass.const_expr(self.activation_wait == "grid"):
-                _grid_barrier(
-                    epochs,
-                    activation_target,
-                    True,
-                    self.release_phase_arrivals,
-                    self.async_activation_arrival,
-                )
-            else:
-                # Keep the same release from each CTA. Only real readers acquire.
-                cute.arch.sync_threads()
-                if tid == 0:
-                    _arrive_phase(
-                        epochs.iterator,
-                        self.release_phase_arrivals,
-                        self.async_activation_arrival,
-                    )
-            task = cutlass.Int32(pid)
-            while task < self.up_tasks:
-                weights_prepared = cutlass.Boolean(False)
-                weights_prepared = task == cutlass.Int32(pid)
-                terminal_up_task = cutlass.Boolean(False)
-                if cutlass.const_expr(
-                    self.up_tmem_dealloc_site != "kernel_tail" or self.up_skip_final
-                ):
-                    terminal_up_task = (task + cutlass.Int32(ctas) >= self.up_tasks) & (
-                        global_base + self.n >= x.shape[0]
-                    )
-                self._up(
-                    activation,
-                    alpha,
-                    x,
-                    xs,
-                    up,
-                    us,
-                    out,
-                    arena,
-                    up_bars,
-                    base.iterator,
-                    task,
-                    global_base,
-                    weights_prepared,
-                    up_weight_map,
-                    up_input_map,
-                    cache_priority=up_weight_priority,
-                    activation_counter=epochs.iterator,
-                    activation_target=activation_target,
-                    terminal_up_task=terminal_up_task,
-                )
-                reuse_up_barriers = cutlass.Boolean(True)
-                if cutlass.const_expr(self.up_skip_final):
-                    # Retire the Up events before another task uses their addresses.
-                    reuse_up_barriers = not terminal_up_task
-                if reuse_up_barriers:
-                    cute.arch.sync_threads()
-                    if warp == 17:
-                        _invalidate(up_bars, self.up_barrier_count)
-                    cute.arch.sync_threads()
-                task = task + cutlass.Int32(ctas)
-            more_rounds = global_base + self.n < x.shape[0]
-            phase_base = phase_base + 2
-            if more_rounds:
-                phase_base = phase_base + 1
-            if tid == 0:
-                # Stream completion or the original PDL wait orders the next
-                # call's read of this private per-CTA ledger.
-                _store_private_epoch(
-                    epochs.iterator + cutlass.Int64(pid) + 1, phase_base
-                )
-            # Only another token round needs a global handoff before reuse.
-            # Stream completion or the successor's PDL wait orders a new call.
-            if more_rounds:
-                if cutlass.const_expr(self.up_barriers_at_entry):
-                    if pid < self.up_tasks:
-                        # The last Up task invalidated its barriers. The
-                        # existing grid barrier joins the CTA before reuse.
-                        self._init_up_barriers(
-                            up_bars, cutlass.Int32(0), use_existing_join=True
-                        )
-                if cutlass.const_expr(self.activation_wait != "grid"):
-                    if pid >= self.up_tasks and tid == 0:
-                        # No Up task acquired phase two on this CTA. Its reuse
-                        # arrival must not satisfy a pending activation acquire.
-                        while _acquire(epochs.iterator) < activation_target:
-                            pass
-                _grid_barrier(
-                    epochs, phase_base * ctas, True, self.release_phase_arrivals, False
-                )
-            token_round = token_round + 1
-            global_base = global_base + self.n
+        phase_base = shared.epoch[0]
+        self._run_mixer_rounds(
+            MixerOperands(
+                x,
+                xs,
+                down,
+                ds,
+                up,
+                us,
+                partials,
+                activation,
+                alpha,
+                epochs,
+                out,
+                inject,
+            ),
+            cta,
+            shared,
+            _WideMaps(
+                down_weight_map,
+                down_input_map,
+                up_weight_map,
+                up_input_map,
+                down_weight_priority,
+                up_weight_priority,
+            ),
+            None,
+            phase_base,
+            entry_prefills_down=True,
+            prefetch_residual_before_down=False,
+            skip_last_up_join=self.up_skip_final,
+            track_last_up_task=self.up_tmem_dealloc_site != "kernel_tail"
+            or self.up_skip_final,
+        )
         dealloc_at_tail = cutlass.Boolean(True)
         if cutlass.const_expr(self.up_tmem_dealloc_site != "kernel_tail"):
             dealloc_at_tail = (pid >= self.up_tasks) | (x.shape[0] == 0)
         if (warp == 17) & dealloc_at_tail:
             cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base.iterator),
+                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, shared.tmem),
                 self.columns,
             )
         cute.arch.sync_threads()
         if cutlass.const_expr(self.pdl):
             if tid == 0:
                 cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.experimental.jit
+    def _project_down_tile(self, io, cta, shared, maps, state, tile, global_base):
+        prepare_up_weights = cutlass.Boolean(False)
+        prepare_up_weights = (cta.pid < self.up_tasks) & tile.last
+        self.down.project(
+            io.x,
+            io.down,
+            io.partials,
+            shared.arena,
+            shared.down_barriers,
+            shared.tmem,
+            tile.output_tile,
+            tile.split,
+            tile.token_tile,
+            maps.down_weight_map,
+            maps.down_input_map,
+            cache_priority=maps.down_weight_priority,
+            entry_prefilled=tile.entry_prefilled,
+            prepare_up_weights=prepare_up_weights,
+            up_bars=shared.up_barriers,
+            up_weight_map=maps.up_weight_map,
+            up_weight_priority=maps.up_weight_priority,
+            up_hidden_tile=cta.pid,
+        )
+        if cutlass.const_expr(self.mma_down_arrival):
+            if (cta.warp == self.mma_warp) & tile.last:
+                # The existing read_done acquire orders the partials.
+                # Earlier tasks have already joined this CTA.
+                with cute.arch.elect_one():
+                    _arrive_phase(
+                        io.epochs.iterator,
+                        self.release_phase_arrivals,
+                        self.async_down_arrival,
+                    )
+        cute.arch.sync_threads()
+        if cutlass.const_expr(self.last_up_weight_prefetch[0] == "before_invalidate"):
+            if tile.last:
+                self._prefetch_last_up_weight_at(
+                    "before_invalidate",
+                    maps.up_weight_map,
+                    cta.pid,
+                    cta.count,
+                    cta.warp,
+                )
+
+    @cute.experimental.jit
+    def _begin_quantization(
+        self, io, cta, shared, maps, state, phase_base, global_base
+    ):
+        cute.arch.sync_threads()
+        if cta.tid == 0:
+            if cutlass.const_expr(self.mma_down_arrival):
+                if cta.pid >= self.down_tasks:
+                    _arrive_phase(
+                        io.epochs.iterator,
+                        self.release_phase_arrivals,
+                        self.async_down_arrival,
+                    )
+            else:
+                _arrive_phase(
+                    io.epochs.iterator,
+                    self.release_phase_arrivals,
+                    self.async_down_arrival,
+                )
+        self._prefetch_last_up_weight_at(
+            "after_release", maps.up_weight_map, cta.pid, cta.count, cta.warp
+        )
+        if cta.pid < self.up_tasks:
+            prepared_weight_stages = cutlass.Int32(0)
+            if cutlass.const_expr(self.up_early_weight_stages > 0):
+                if cta.pid < self.down_tasks:
+                    prepared_weight_stages = cutlass.Int32(self.up_early_weight_stages)
+            self._prefetch_up_weights(
+                io.up,
+                shared.arena,
+                shared.up_barriers,
+                cta.pid,
+                maps.up_weight_map,
+                cache_priority=maps.up_weight_priority,
+                prepared_weight_stages=prepared_weight_stages,
+                during_down=False,
+                after_acquire=False,
+            )
+        if cta.tid == 0:
+            while _acquire(io.epochs.iterator) < (phase_base + 1) * cta.count:
+                pass
+        cute.arch.sync_threads()
+        if cutlass.const_expr(self.up_late_prefetch_stages):
+            if cta.pid < self.up_tasks and cta.pid % self.up_late_prefetch_stride == 0:
+                self._prefetch_up_weights(
+                    io.up,
+                    shared.arena,
+                    shared.up_barriers,
+                    cta.pid,
+                    maps.up_weight_map,
+                    cache_priority=maps.up_weight_priority,
+                    prepared_weight_stages=cutlass.Int32(0),
+                    during_down=False,
+                    after_acquire=True,
+                )
+        row = cutlass.Int64(cta.pid) * self.quant_rows
+        return phase_base, row, None
+
+    @cute.experimental.jit
+    def _quantize_row(self, io, cta, state, quant, phase_base, global_base, row):
+        self._epilogue(
+            io.partials,
+            io.xs,
+            io.ds,
+            io.activation,
+            io.alpha,
+            io.out,
+            io.inject,
+            global_base,
+            row,
+            io.x.shape[0],
+            row + cta.count * self.quant_rows < self.n,
+        )
+
+    @cute.experimental.jit
+    def _finish_quantization(self, io, cta, state, phase_base, quant):
+        _publish_activation_proxy()
+        activation_target = (phase_base + 2) * cta.count
+        if cutlass.const_expr(self.activation_wait == "grid"):
+            _grid_barrier(
+                io.epochs,
+                activation_target,
+                True,
+                self.release_phase_arrivals,
+                self.async_activation_arrival,
+            )
+        else:
+            # Keep the same release from each CTA. Only real readers acquire.
+            cute.arch.sync_threads()
+            if cta.tid == 0:
+                _arrive_phase(
+                    io.epochs.iterator,
+                    self.release_phase_arrivals,
+                    self.async_activation_arrival,
+                )
+        return activation_target
+
+    @cute.experimental.jit
+    def _project_up_tile(
+        self, io, shared, maps, state, tile, global_base, activation_target
+    ):
+        self._up(
+            io.activation,
+            io.alpha,
+            io.x,
+            io.xs,
+            io.up,
+            io.us,
+            io.out,
+            shared.arena,
+            shared.up_barriers,
+            shared.tmem,
+            tile.hidden_tile,
+            global_base,
+            tile.weights_prepared,
+            maps.up_weight_map,
+            maps.up_input_map,
+            cache_priority=maps.up_weight_priority,
+            activation_counter=io.epochs.iterator,
+            activation_target=activation_target,
+            terminal_up_task=tile.last,
+        )
+
+    @cute.experimental.jit
+    def _finish_round(
+        self, io, cta, shared, state, phase_base, activation_target, more_rounds
+    ):
+        phase_base = phase_base + 2
+        if more_rounds:
+            phase_base = phase_base + 1
+        if cta.tid == 0:
+            # Stream completion or the original PDL wait orders the next
+            # call's read of this private per-CTA ledger.
+            _store_private_epoch(
+                io.epochs.iterator + cutlass.Int64(cta.pid) + 1, phase_base
+            )
+        # Only another token round needs a global handoff before reuse.
+        # Stream completion or the successor's PDL wait orders a new call.
+        if more_rounds:
+            if cutlass.const_expr(self.up_barriers_at_entry):
+                if cta.pid < self.up_tasks:
+                    # The last Up task invalidated its barriers. The
+                    # existing grid barrier joins the CTA before reuse.
+                    self._init_up_barriers(
+                        shared.up_barriers, cutlass.Int32(0), use_existing_join=True
+                    )
+            if cutlass.const_expr(self.activation_wait != "grid"):
+                if cta.pid >= self.up_tasks and cta.tid == 0:
+                    # No Up task acquired phase two on this CTA. Its reuse
+                    # arrival must not satisfy a pending activation acquire.
+                    while _acquire(io.epochs.iterator) < activation_target:
+                        pass
+            _grid_barrier(
+                io.epochs,
+                phase_base * cta.count,
+                True,
+                self.release_phase_arrivals,
+                False,
+            )
+        return phase_base
 
     @cute.experimental.jit
     def _partials(
@@ -2224,54 +2245,6 @@ class Fp8FusedGatedResidualKernel:
                         cutlass.Float8E4M3FN
                     )
         cute.arch.sync_threads()
-
-    @cute.experimental.jit
-    def _reader(
-        self,
-        mma,
-        base,
-        original,
-        tid,
-        branch: cutlass.Constexpr,
-        part: cutlass.Constexpr,
-    ):
-        return _token_major_reader(
-            mma,
-            base,
-            original,
-            tid,
-            branch,
-            part,
-            (self.up_rows, self.up_channels, self.up_k),
-            self.up_parts,
-            self.up_hidden,
-            self.reader_columns,
-        )
-
-    @cute.experimental.jit
-    def _hidden_reader(
-        self,
-        mma,
-        base,
-        original,
-        tid,
-        token_slice: cutlass.Constexpr,
-        part: cutlass.Constexpr,
-    ):
-        layout = cute_ext.make_tmem_layout_acc(mma, self.up_mn, acc_stage=self.up_parts)
-        accumulator = cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base),
-            layout,
-        )[((None, None), 0, 0, part)]
-        group = tid // 128 + token_slice * 4
-        return _hidden_major_reader(
-            accumulator,
-            original,
-            tid,
-            group,
-            (128, self.up_rows, self.up_k),
-            self.hidden_reader_columns,
-        )
 
     @cute.experimental.jit
     def _load_hidden_pair(self, tensor, offset, dtype: cutlass.Constexpr):
@@ -2552,31 +2525,6 @@ class Fp8FusedGatedResidualKernel:
                     2 * self.up_rows + branch * self.up_hidden + column
                 ]
         return residual_codes, weight_scales
-
-    @cute.experimental.jit
-    def _prefetch_branch_x(
-        self,
-        target,
-        coords,
-        x,
-        hidden_tile,
-        global_base,
-        part: cutlass.Constexpr,
-        branch: cutlass.Constexpr,
-    ):
-        _prefetch_branch_residual(
-            target,
-            coords,
-            x,
-            hidden_tile,
-            global_base,
-            part,
-            branch,
-            self.up_rows,
-            self.up_hidden,
-            self.g,
-            self.h,
-        )
 
     @cute.experimental.jit
     def _prefetch_up_residual_prefix(self, ring, coords, x, hidden_tile, global_base):
@@ -3541,144 +3489,35 @@ class Fp8FusedGatedResidualKernel:
                         channel if self.up_per_channel else 0
                     ]
                 _epilogue_barrier(self.compute_threads, cutlass.Int32(5))
-                for part in cutlass.range_constexpr(self.up_parts):
-                    if cutlass.const_expr(self.up_early_residual_count and part == 0):
-                        template, coords = first_template, first_coords
-                    else:
-                        _, _, template, coords = self._reader(
-                            mma, base, x, tid, 0, part
+                self._mix_token_major_up(
+                    mma,
+                    base,
+                    x,
+                    xs,
+                    alpha,
+                    out,
+                    cached,
+                    tid,
+                    hidden_tile,
+                    global_base,
+                    done,
+                    read_done,
+                    (first_template, first_coords, first_ring),
+                    row_scale_source=(
+                        "global"
+                        if self.up_register_rows
+                        else (
+                            "shared_element"
+                            if self.up_scale_cache == "native"
+                            else "shared_row"
                         )
-                    sums = cute.make_rmem_tensor(cute.size(template), cutlass.Float32)
-                    sums.fill(0.0)
-                    row_activation_scale = cutlass.Float32(0.0)
-                    row_input_scale = cutlass.Float32(0.0)
-                    if cutlass.const_expr(self.up_scale_cache != "native"):
-                        row0, _ = coords[0]
-                        scale_row = part * self.up_rows + row0
-                        if cutlass.const_expr(self.up_register_rows):
-                            global_row = global_base + cutlass.Int64(scale_row)
-                            if global_row < x.shape[0]:
-                                row_input_scale = _x_scale(xs, global_row)
-                                row_activation_scale = _load_f32(
-                                    alpha.iterator + cutlass.Int64(scale_row)
-                                )
-                        else:
-                            row_activation_scale = cached[scale_row]
-                            row_input_scale = cached[self.n + scale_row]
-                    if cutlass.const_expr(self.up_early_residual_count and part == 0):
-                        x_ring = first_ring
-                    else:
-                        x_ring = cute.make_rmem_tensor(
-                            (cute.size(template), 2), cutlass.Float8E4M3FN
-                        )
-                        x_ring.fill(0.0)
-                        self._prefetch_branch_x(
-                            x_ring[None, 0],
-                            coords,
-                            x,
-                            hidden_tile,
-                            global_base,
-                            part,
-                            0,
-                        )
-                    for branch in cutlass.range_constexpr(self.g):
-                        if cutlass.const_expr(
-                            branch + 1 < self.g
-                            and (
-                                part != 0 or branch + 1 >= self.up_early_residual_count
-                            )
-                        ):
-                            self._prefetch_branch_x(
-                                x_ring[None, (branch + 1) % 2],
-                                coords,
-                                x,
-                                hidden_tile,
-                                global_base,
-                                part,
-                                branch + 1,
-                            )
-                        decoded_x = _decode_residual(x_ring[None, branch % 2])
-                        if cutlass.const_expr(not self.up_wait_once or branch == 0):
-                            cute.arch.mbarrier_wait(done + part, 0)
-                        acc, reader, values, _ = self._reader(
-                            mma, base, x, tid, branch, part
-                        )
-                        cute_ext.partition_and_copy(reader, acc, values)
-                        cute.arch.fence_view_async_tmem_load()
-                        if cutlass.const_expr(
-                            self.up_tmem_dealloc_site == "after_reads"
-                            and part + 1 == self.up_parts
-                            and branch + 1 == self.g
-                        ):
-                            tcgen05_fence("before_thread_sync")
-                            cute.arch.mbarrier_arrive(read_done)
-                        channel_scales = cute.make_rmem_tensor(
-                            cute.size(template), cutlass.Float32
-                        )
-                        if cutlass.const_expr(self.up_vector_weight_scales):
-                            _, col0 = coords[0]
-                            scale_pointer = cute.make_ptr(
-                                cutlass.Float32,
-                                (
-                                    cached.iterator
-                                    + self.up_cached_weight_base
-                                    + branch * self.up_hidden
-                                    + col0
-                                ).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                            )
-                            scale_source = cute.make_tensor(
-                                scale_pointer, cute.make_layout(cute.size(template))
-                            )
-                            cute.copy(
-                                cute.make_copy_atom(
-                                    CopyUniversalOp(),
-                                    cutlass.Float32,
-                                    num_bits_per_copy=128,
-                                ),
-                                scale_source,
-                                channel_scales,
-                            )
-                        for i in cutlass.range_constexpr(cute.size(values)):
-                            row, col = coords[i]
-                            local_row = part * self.up_rows + row
-                            global_row = global_base + cutlass.Int64(local_row)
-                            if global_row < x.shape[0]:
-                                if cutlass.const_expr(self.up_scale_cache == "native"):
-                                    factor = (
-                                        cached[local_row]
-                                        * cached[
-                                            2 * self.n + branch * self.up_hidden + col
-                                        ]
-                                    )
-                                    xv = decoded_x[i] * cached[self.n + local_row]
-                                else:
-                                    weight_scale = cutlass.Float32(0.0)
-                                    if cutlass.const_expr(self.up_vector_weight_scales):
-                                        weight_scale = channel_scales[i]
-                                    else:
-                                        weight_scale = cached[
-                                            2 * self.n + branch * self.up_hidden + col
-                                        ]
-                                    factor = row_activation_scale * weight_scale
-                                    xv = decoded_x[i] * row_input_scale
-                                sums[i] = sums[i] + xv * _up_sigmoid_tanh(
-                                    values[i] * factor
-                                )
-                    _store_token_major_mix(
-                        out,
-                        sums,
-                        coords,
-                        hidden_tile,
-                        global_base,
-                        x.shape[0],
-                        part,
-                        self.up_rows,
-                        self.up_hidden,
-                        self.g,
-                        self.h,
-                    )
+                    ),
+                    weight_cache_offset=self.up_cached_weight_base,
+                    vector_weight_scales=self.up_vector_weight_scales,
+                    prefetched_branches=self.up_early_residual_count,
+                    wait_once=self.up_wait_once,
+                    release_after_reads=self.up_tmem_dealloc_site == "after_reads",
+                )
                 if cutlass.const_expr(self.up_tmem_dealloc_site != "after_reads"):
                     tcgen05_fence("before_thread_sync")
                     cute.arch.mbarrier_arrive(read_done)

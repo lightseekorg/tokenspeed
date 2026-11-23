@@ -53,9 +53,7 @@ try:
         Fp8GatedResidualTokenReuseUp,
         W8GatedResidualBranchUp,
         W8GatedResidualCachedScaleTokenReuse,
-        W8GatedResidualCachedScaleUp,
         W8GatedResidualDecodedRingUp,
-        W8GatedResidualRotatedProjection,
         W8GatedResidualTmemProjection,
     )
 
@@ -333,11 +331,7 @@ def _independent_up(
             if compiled is None:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("warm token-reuse Up before graph capture")
-                kernel = (
-                    W8GatedResidualCachedScaleUp
-                    if up_token_rows == 128
-                    else W8GatedResidualDecodedRingUp
-                )(
+                kernel = W8GatedResidualDecodedRingUp(
                     hc_count=g,
                     hidden_size=h,
                     lowrank=r,
@@ -475,11 +469,7 @@ def _gemm(
                         "warm the FP8 mixer tile before CUDA graph capture"
                     )
                 if use_tmem_weights:
-                    kernel = (
-                        W8GatedResidualRotatedProjection
-                        if n > 64
-                        else W8GatedResidualTmemProjection
-                    )(
+                    kernel = W8GatedResidualTmemProjection(
                         role=role,
                         hc_count=g,
                         hidden_size=h,
@@ -501,6 +491,7 @@ def _gemm(
                         shared_up_scales=False,
                         interleave_tma=False,
                         weight_scale_vectorized=weight_scale_vectorized,
+                        rotate_k_tiles=n > 64,
                         raw_stages=(
                             10 if n == 16 else 9 if n == 32 else 8 if n <= 128 else 6
                         ),

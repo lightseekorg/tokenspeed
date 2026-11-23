@@ -32,20 +32,20 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _acquire,
     _commit_residual,
     _copy_residual_16,
-    _decode_residual,
     _has_full_up_tiles,
-    _hidden_major_reader,
-    _invalidate,
     _load_f32,
     _make_down_operands,
     _operand_at,
-    _prefetch_branch_residual,
     _reduce_split_partials,
     _release,
-    _store_token_major_mix,
-    _token_major_reader,
     _wait_residual,
     _x_scale,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
+    MixerOperands,
+    ResidentMixer,
+    _mixer_cta,
+    _mixer_shared,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
     Fp8GatedResidualGemm,
@@ -247,7 +247,7 @@ class _DownPhase(Fp8GatedResidualGemm):
             cute.arch.mbarrier_arrive(read_done)
 
 
-class Fp8FusedGatedResidualKernel:
+class Fp8FusedGatedResidualKernel(ResidentMixer):
     """Resident phases reuse one operand arena and one TMEM allocation."""
 
     def __init__(
@@ -289,9 +289,10 @@ class Fp8FusedGatedResidualKernel:
             if self.token_major_up
             else (self.up_channels, self.up_rows)
         )
-        self.hidden_reader_columns = min(32, token_bucket // 4)
+        self.reader_groups = 4
+        self.hidden_reader_columns = min(32, token_bucket // self.reader_groups)
         self.hidden_reader_passes = 1
-        self.reader_columns = self.up_hidden // 4
+        self.reader_columns = self.up_hidden // self.reader_groups
         self.up_k = 128 if full_up_tiles else 64
         self.up_stages = 3
         self.up_tiles = r // self.up_k
@@ -341,6 +342,9 @@ class Fp8FusedGatedResidualKernel:
             self.up_operand_bytes,
             0 if self.token_major_up else token_bucket * self.up_channels * 4,
         )
+        self.down_token_parts = self.quant_rows = 1
+        self.mma_warp = 17
+        self.down_barrier_count = 2 * self.down.stages + 2
         self.barrier_count = max(2 * down_stages + 2, self.up_barrier_count)
         # A conservative occupancy query includes alignment and epilogue scratch.
         self.shared_bytes = (
@@ -383,116 +387,127 @@ class Fp8FusedGatedResidualKernel:
     def kernel(
         self, x, xs, down, ds, up, us, partials, activation, alpha, epochs, out, inject
     ):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        pid = cute.arch.block_idx()[0]
-        ctas = cutlass.Int64(cute.arch.grid_dim()[0])
-        arena = cute_ext.allocate(
-            cutlass.Uint8,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.arena_bytes),
-            alignment=1024,
-        )
-        bars = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.barrier_count),
-            alignment=8,
-        )
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        )
-        epoch = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
-        )
+        cta = _mixer_cta()
+        tid, warp, pid, ctas = cta
+        shared = _mixer_shared(self.arena_bytes, self.barrier_count, 0)
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
         if tid == 0:
-            epoch[0] = _acquire(epochs.iterator + cutlass.Int64(pid) + 1) + 1
+            shared.epoch[0] = _acquire(epochs.iterator + cutlass.Int64(pid) + 1) + 1
         if warp == 17:
-            cute.arch.alloc_tmem(self.columns, base.iterator, is_two_cta=False)
+            cute.arch.alloc_tmem(self.columns, shared.tmem, is_two_cta=False)
             cute.arch.relinquish_tmem_alloc_permit()
         cute.arch.sync_threads()
-        generation = epoch[0]
-        token_round = cutlass.Int64(0)
-        global_base = cutlass.Int64(0)
-        while global_base < x.shape[0]:
-            task = cutlass.Int32(pid)
-            while task < self.down_tasks:
-                self.down.project(
-                    x,
-                    down,
-                    partials,
-                    arena,
-                    bars.iterator,
-                    base.iterator,
-                    task // self.splits,
-                    task % self.splits,
-                    token_round,
-                )
-                cute.arch.sync_threads()
-                if warp == 17:
-                    _invalidate(bars.iterator, 2 * self.down.stages + 2)
-                cute.arch.sync_threads()
-                task = task + cutlass.Int32(ctas)
-            _grid_barrier(epochs, ((generation - 1) * 3 + 1) * ctas, True)
-            row = cutlass.Int64(pid)
-            while row < self.n:
-                self._epilogue(
-                    partials,
-                    xs,
-                    ds,
-                    activation,
-                    alpha,
-                    out,
-                    inject,
-                    global_base,
-                    row,
-                    x.shape[0],
-                )
-                row = row + ctas
-            _publish_activation_proxy()
-            _grid_barrier(epochs, ((generation - 1) * 3 + 2) * ctas, True)
-            task = cutlass.Int32(pid)
-            while task < self.up_tasks:
-                self._up(
-                    activation,
-                    alpha,
-                    x,
-                    xs,
-                    up,
-                    us,
-                    out,
-                    arena,
-                    bars.iterator,
-                    base.iterator,
-                    task,
-                    global_base,
-                )
-                cute.arch.sync_threads()
-                if warp == 17:
-                    _invalidate(bars.iterator, self.up_barrier_count)
-                cute.arch.sync_threads()
-                task = task + cutlass.Int32(ctas)
-            if tid == 0:
-                _release(epochs.iterator + cutlass.Int64(pid) + 1, generation)
-            # Another round needs a wait before scratch reuse. On the final
-            # round, stream/PDL ordering protects the next invocation instead.
-            _grid_barrier(
-                epochs, generation * 3 * ctas, global_base + self.n < x.shape[0]
-            )
-            generation = generation + 1
-            token_round = token_round + 1
-            global_base = global_base + self.n
+        generation = shared.epoch[0]
+        self._run_mixer_rounds(
+            MixerOperands(
+                x,
+                xs,
+                down,
+                ds,
+                up,
+                us,
+                partials,
+                activation,
+                alpha,
+                epochs,
+                out,
+                inject,
+            ),
+            cta,
+            shared,
+            None,
+            None,
+            generation,
+            entry_prefills_down=False,
+            prefetch_residual_before_down=False,
+            skip_last_up_join=False,
+            track_last_up_task=False,
+        )
         if warp == 17:
             cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base.iterator),
+                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, shared.tmem),
                 self.columns,
             )
         cute.arch.sync_threads()
         if cutlass.const_expr(self.pdl):
             if tid == 0:
                 cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.experimental.jit
+    def _project_down_tile(self, io, cta, shared, maps, state, tile, global_base):
+        self.down.project(
+            io.x,
+            io.down,
+            io.partials,
+            shared.arena,
+            shared.down_barriers,
+            shared.tmem,
+            tile.output_tile,
+            tile.split,
+            tile.token_tile,
+        )
+        cute.arch.sync_threads()
+
+    @cute.experimental.jit
+    def _begin_quantization(
+        self, io, cta, shared, maps, state, generation, global_base
+    ):
+        _grid_barrier(io.epochs, ((generation - 1) * 3 + 1) * cta.count, True)
+        row = cutlass.Int64(cta.pid)
+        return generation, row, None
+
+    @cute.experimental.jit
+    def _quantize_row(self, io, cta, state, quant, generation, global_base, row):
+        self._epilogue(
+            io.partials,
+            io.xs,
+            io.ds,
+            io.activation,
+            io.alpha,
+            io.out,
+            io.inject,
+            global_base,
+            row,
+            io.x.shape[0],
+        )
+
+    @cute.experimental.jit
+    def _finish_quantization(self, io, cta, state, generation, quant):
+        _publish_activation_proxy()
+        _grid_barrier(io.epochs, ((generation - 1) * 3 + 2) * cta.count, True)
+        return None
+
+    @cute.experimental.jit
+    def _project_up_tile(
+        self, io, shared, maps, state, tile, global_base, activation_target
+    ):
+        self._up(
+            io.activation,
+            io.alpha,
+            io.x,
+            io.xs,
+            io.up,
+            io.us,
+            io.out,
+            shared.arena,
+            shared.up_barriers,
+            shared.tmem,
+            tile.hidden_tile,
+            global_base,
+        )
+
+    @cute.experimental.jit
+    def _finish_round(
+        self, io, cta, shared, state, generation, activation_target, more_rounds
+    ):
+        if cta.tid == 0:
+            _release(io.epochs.iterator + cutlass.Int64(cta.pid) + 1, generation)
+        # Another round needs a wait before scratch reuse. On the final
+        # round, stream/PDL ordering protects the next invocation instead.
+        _grid_barrier(io.epochs, generation * 3 * cta.count, more_rounds)
+        generation = generation + 1
+        return generation
 
     @cute.experimental.jit
     def _partials(self, partial, row, col):
@@ -577,73 +592,6 @@ class Fp8FusedGatedResidualKernel:
                     )
                     activation[row, col + i] = value.to(cutlass.Float8E4M3FN)
         cute.arch.sync_threads()
-
-    @cute.experimental.jit
-    def _reader(
-        self,
-        mma,
-        base,
-        original,
-        tid,
-        branch: cutlass.Constexpr,
-        part: cutlass.Constexpr,
-    ):
-        return _token_major_reader(
-            mma,
-            base,
-            original,
-            tid,
-            branch,
-            part,
-            (self.up_rows, self.up_channels, self.up_k),
-            self.up_parts,
-            self.up_hidden,
-            self.reader_columns,
-        )
-
-    @cute.experimental.jit
-    def _hidden_reader(self, mma, base, original, tid, token_slice: cutlass.Constexpr):
-        fragment = mma.get_slice(0).make_fragment_C(
-            mma.partition_shape_C((128, self.up_rows))
-        )
-        accumulator = cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base),
-            fragment.layout,
-        )[(None, None), 0, 0]
-        group = tid // 128 + token_slice * 4
-        return _hidden_major_reader(
-            accumulator,
-            original,
-            tid,
-            group,
-            (128, self.up_rows, self.up_k),
-            self.hidden_reader_columns,
-        )
-
-    @cute.experimental.jit
-    def _prefetch_branch_x(
-        self,
-        target,
-        coords,
-        x,
-        hidden_tile,
-        global_base,
-        part: cutlass.Constexpr,
-        branch: cutlass.Constexpr,
-    ):
-        _prefetch_branch_residual(
-            target,
-            coords,
-            x,
-            hidden_tile,
-            global_base,
-            part,
-            branch,
-            self.up_rows,
-            self.up_hidden,
-            self.g,
-            self.h,
-        )
 
     @cute.experimental.jit
     def _up(
@@ -892,61 +840,27 @@ class Fp8FusedGatedResidualKernel:
                     )
                     cached[2 * self.n + tid] = ws[channel if self.up_per_channel else 0]
                 _epilogue_barrier(512, cutlass.Int32(5))
-                for part in cutlass.range_constexpr(self.up_parts):
-                    _, _, template, coords = self._reader(mma, base, x, tid, 0, part)
-                    sums = cute.make_rmem_tensor(cute.size(template), cutlass.Float32)
-                    sums.fill(0.0)
-                    x_ring = cute.make_rmem_tensor(
-                        (cute.size(template), 2), cutlass.Float8E4M3FN
-                    )
-                    x_ring.fill(0.0)
-                    self._prefetch_branch_x(
-                        x_ring[None, 0], coords, x, hidden_tile, global_base, part, 0
-                    )
-                    for branch in cutlass.range_constexpr(self.g):
-                        if cutlass.const_expr(branch + 1 < self.g):
-                            self._prefetch_branch_x(
-                                x_ring[None, (branch + 1) % 2],
-                                coords,
-                                x,
-                                hidden_tile,
-                                global_base,
-                                part,
-                                branch + 1,
-                            )
-                        decoded_x = _decode_residual(x_ring[None, branch % 2])
-                        cute.arch.mbarrier_wait(done + part, 0)
-                        acc, reader, values, _ = self._reader(
-                            mma, base, x, tid, branch, part
-                        )
-                        cute_ext.partition_and_copy(reader, acc, values)
-                        cute.arch.fence_view_async_tmem_load()
-                        for i in cutlass.range_constexpr(cute.size(values)):
-                            row, col = coords[i]
-                            local_row = part * self.up_rows + row
-                            global_row = global_base + cutlass.Int64(local_row)
-                            if global_row < x.shape[0]:
-                                factor = (
-                                    cached[local_row]
-                                    * cached[2 * self.n + branch * self.up_hidden + col]
-                                )
-                                xv = decoded_x[i] * cached[self.n + local_row]
-                                sums[i] = sums[i] + xv * _up_sigmoid_tanh(
-                                    values[i] * factor
-                                )
-                    _store_token_major_mix(
-                        out,
-                        sums,
-                        coords,
-                        hidden_tile,
-                        global_base,
-                        x.shape[0],
-                        part,
-                        self.up_rows,
-                        self.up_hidden,
-                        self.g,
-                        self.h,
-                    )
+                self._mix_token_major_up(
+                    mma,
+                    base,
+                    x,
+                    xs,
+                    alpha,
+                    out,
+                    cached,
+                    tid,
+                    hidden_tile,
+                    global_base,
+                    done,
+                    read_done,
+                    None,
+                    row_scale_source="shared_element",
+                    weight_cache_offset=2 * self.n,
+                    vector_weight_scales=False,
+                    prefetched_branches=0,
+                    wait_once=False,
+                    release_after_reads=False,
+                )
                 tcgen05_fence("before_thread_sync")
                 cute.arch.mbarrier_arrive(read_done)
             else:
@@ -1006,7 +920,7 @@ class Fp8FusedGatedResidualKernel:
                 )
                 for token_slice in cutlass.range_constexpr(self.hidden_reader_passes):
                     acc, reader, values, coords = self._hidden_reader(
-                        mma, base, x, tid, token_slice
+                        mma, base, x, tid, token_slice, None
                     )
                     cute_ext.partition_and_copy(reader, acc, values)
                     cute.arch.fence_view_async_tmem_load()

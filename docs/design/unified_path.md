@@ -734,7 +734,8 @@ weight tiles and W8A8 quantizes inputs per token for native FP8 MMA. These
 paths use three and four compute launches respectively. Both reduce split-K
 partials in FP32 split order, then round post-SiLU activations to the output
 dtype before Up. W8A8 applies the canonical FP8 scale floor and independently
-rounded multiplier.
+rounded multiplier. W8A16 uses compile-time parameters for Down K-tile
+rotation and the token layout of the decoded Up pipeline.
 
 Prequantized W8A8 accepts E4M3 input codes, an FP32 tensor or row scale,
 and an explicit BF16 or FP16 output dtype. Down, reduction, SiLU, activation
@@ -746,12 +747,14 @@ stage reuse. PDL waits precede reads of producer-owned data.
 
 The launch plans take model dimensions from the operator. Startup warms
 finite bucket variants with the ordinary dispatch. Actual row counts control
-masks and additional token rounds at runtime. SM103 schedules share
-operand layouts, split reduction and Up readers and stores. The compact
-16-token injection plan publishes epoch-tagged activation records so Up can
-start on the first K plane. The full K128 Up schedule can issue weight loads
-as Down releases its operand stages. At 256 tokens it can share weight
-stages across both token parts.
+masks and additional token rounds at runtime. The prequantized schedules
+compile from a shared resident loop for Down, quantization, and Up. They
+also share the TMEM readers and token-major Up epilogue. Each schedule owns
+its operand binding and stage handoff. The compact 16-token injection plan
+publishes epoch-tagged activation records so Up can start on the first K
+plane. The full K128 Up schedule can issue weight loads as Down releases its
+operand stages. At 256 tokens it can share weight stages across both token
+parts.
 
 The weight preparation helper can build a tiled Up weight for the SM103
 full K128 injection schedule through 128 tokens. The owner refreshes the

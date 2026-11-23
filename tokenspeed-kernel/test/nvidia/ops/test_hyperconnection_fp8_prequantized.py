@@ -276,12 +276,12 @@ def test_prepared_fp8_up_validates_input_and_storage(invalid):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
-    "rows,independent", [(33, False), (33, True), (129, False), (257, False)]
+    "rows,independent", [(33, False), (33, True), (129, False), (513, False)]
 )
 @torch.inference_mode()
 def test_mutable_one_kernel_graph(model, dtype, enable_pdl, rows, independent):
     pdl_enabled(enable_pdl)
-    # Partial token parts and another 256-row round must see every replay update.
+    # Reused rounds and the partial tail must see every replay update.
     v = _inputs(model, rows, True, False)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
