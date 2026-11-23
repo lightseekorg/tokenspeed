@@ -167,15 +167,71 @@ def test_sm107_qwen_tiles_follow_one_round_capacity(
 ):
     # The batched FP64 tests cover these row counts.
     _on_architecture(monkeypatch, ArchVersion(10, 7))
+    # Without single-CTA residency the streaming tactic never fits one round.
     monkeypatch.setattr(
         cute_fused,
         "_cluster_capacity_hint",
-        lambda index, stream, split_k: {8: capacity}[split_k],
+        lambda index, stream, split_k: {1: 0, 8: capacity}[split_k],
     )
     split_k, m, n, _, _, stages, _ = cute_fused._model_tactic(
         rows, 4, 2560, 320, projection_rows
     )[:7]
     assert (split_k, m, n, stages) == tactic
+
+
+@pytest.mark.parametrize(
+    "projection_rows,ctas,rows,tactic",
+    [
+        # 212 single CTAs: one streaming token tile takes 48 (324) or 40 (320).
+        (324, 212, 16, (16, 64, 16, 1)),
+        (324, 212, 32, (16, 64, 32, 1)),
+        (324, 212, 64, (16, 64, 64, 1)),
+        (324, 212, 65, (1, 64, 64, 16)),
+        (324, 212, 128, (1, 64, 64, 16)),
+        (324, 212, 192, (1, 64, 64, 16)),
+        (324, 212, 256, (1, 64, 64, 16)),
+        (324, 212, 257, (4, 64, 64, 1)),
+        (320, 212, 64, (16, 64, 64, 1)),
+        (320, 212, 65, (1, 64, 64, 16)),
+        (320, 212, 320, (1, 64, 64, 16)),
+        (320, 212, 321, (4, 64, 64, 1)),
+        # Smaller contexts keep the split-K tiles once streaming needs two rounds.
+        (324, 191, 192, (1, 64, 64, 16)),
+        (324, 191, 193, (4, 64, 64, 1)),
+        (324, 192, 193, (1, 64, 64, 16)),
+        (324, 95, 65, (8, 64, 64, 1)),
+        (324, 96, 65, (1, 64, 64, 16)),
+        (324, 96, 128, (1, 64, 64, 16)),
+        (324, 96, 129, (8, 64, 64, 1)),
+        (320, 79, 65, (8, 64, 64, 1)),
+        (320, 80, 128, (1, 64, 64, 16)),
+    ],
+)
+def test_sm107_streaming_needs_two_token_tiles_in_one_round(
+    monkeypatch, projection_rows, ctas, rows, tactic
+):
+    _on_architecture(monkeypatch, ArchVersion(10, 7))
+    monkeypatch.setattr(
+        cute_fused,
+        "_cluster_capacity_hint",
+        lambda index, stream, split_k: {1: ctas, 8: 22}[split_k],
+    )
+    chosen = cute_fused._model_tactic(rows, 4, 2560, 320, projection_rows)
+    assert (*chosen[:3], chosen[9]) == tactic
+
+
+@pytest.mark.parametrize("version", [ArchVersion(10, 0), ArchVersion(10, 3)])
+def test_sm100_and_sm103_never_stream_qwen_dimensions(monkeypatch, version):
+    _on_architecture(monkeypatch, version)
+    monkeypatch.setattr(
+        cute_fused,
+        "_cluster_capacity_hint",
+        lambda index, stream, split_k: {1: 212, 8: 22}[split_k],
+    )
+    for projection_rows in (320, 324):
+        for rows in range(1, 1025):
+            chosen = cute_fused._model_tactic(rows, 4, 2560, 320, projection_rows)
+            assert chosen[0] > 1 and chosen[9] == 1
 
 
 @pytest.mark.parametrize(
