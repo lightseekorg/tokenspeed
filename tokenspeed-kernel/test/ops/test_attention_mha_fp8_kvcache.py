@@ -294,19 +294,64 @@ def test_fp8_query_dtype_names_a_servable_read(
         )
 
 
-@pytest.mark.skipif(
-    not current_platform().is_amd, reason="gfx950 hd256 has no FP8-query kernel"
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 kernels")
+@pytest.mark.parametrize(
+    "mode,head_dim,page_size,expected",
+    [
+        # The Gluon decode reads FP8 queries at hd256 over 64-token pages.
+        (DECODE, 256, 64, FP8),
+        (DECODE, 128, 64, FP8),
+        # It reads 64-token pages only; Triton widens the cache instead.
+        (DECODE, 256, 16, torch.bfloat16),
+        # The Gluon extend has no hd256 kernel.
+        (EXTEND, 256, 64, torch.bfloat16),
+    ],
 )
-def test_fp8_query_dtype_keeps_hd256_queries_in_bf16_on_amd():
+def test_gfx950_fp8_query_dtype(mode, head_dim, page_size, expected):
     q_dtype = mha_fp8_kvcache_query_dtype(
-        mode=DECODE,
+        mode=mode,
         kv_cache_dtype=FP8,
         activation_dtype=torch.bfloat16,
-        head_dim=256,
-        page_size=64,
+        head_dim=head_dim,
+        page_size=page_size,
         window_left=-1,
         logit_cap=0.0,
         sinks=None,
         solution=None,
     )
-    assert q_dtype == torch.bfloat16
+    assert q_dtype == expected
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 kernels")
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(24, 4), (4, 4)])
+def test_gfx950_fp8_query_decode_reads_hd256_fp8_cache(num_q_heads, num_kv_heads):
+    """The hd256 decode the resolution picks on gfx950 (FP8 queries, page 64)
+    against the fp32 reference over the FP8 query and the dequantized cache.
+
+    That kernel rounds the probabilities to e4m3 (3 mantissa bits) before
+    P.V, which is at most 2**-4 relative per key, so an output element may
+    be off by up to 2**-4 * sum_x p_x |v_x| (the reference over |V|), plus
+    the bf16 rounding of the output."""
+    head_dim, page_size = 256, 64
+    gen = torch.Generator().manual_seed(1)
+    cache_lens = [1, 64, 700, 5000]
+    k, v, table = _paged_cache(cache_lens, page_size, num_kv_heads, head_dim, gen)
+    q = torch.randn(len(cache_lens), num_q_heads, head_dim, generator=gen).to(FP8)
+    q_lens = [1] * len(cache_lens)
+    ref, _ = _reference(q, k, v, table, cache_lens, q_lens, head_dim**-0.5)
+    ref_abs_v, _ = _reference(
+        q, k, v.float().abs().to(FP8), table, cache_lens, q_lens, head_dim**-0.5
+    )
+    lens = torch.tensor(cache_lens, dtype=torch.int32, device="cuda")
+    out = mha_decode_with_kvcache(
+        q=q.cuda(),
+        k_cache=k.cuda(),
+        v_cache=v.cuda(),
+        page_table=table.cuda(),
+        cache_seqlens=lens,
+        max_seqlen_k=max(cache_lens),
+        max_seqlen_q=1,
+        block_draft=False,
+    )
+    error = (out.float().cpu() - ref).abs()
+    assert (error <= 2**-4 * ref_abs_v + 2**-8 * ref.abs() + 1e-5).all()

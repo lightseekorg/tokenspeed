@@ -130,10 +130,11 @@ def test_fp8_decode_query_dtype_names_a_kernel(head_dim, page_size):
 @pytest.mark.parametrize(
     "head_dim,page_size,expected",
     [
-        # The Gluon decode reads FP8 queries at hd128, page 64.
+        # The Gluon decode reads FP8 queries at hd128 and hd256, page 64.
         (128, 64, FP8),
-        # hd256 has no FP8-query kernel; Triton widens the cache.
-        (256, 64, BF16),
+        (256, 64, FP8),
+        # It reads 64-token pages only; Triton widens the cache instead.
+        (256, 16, BF16),
         (128, 16, BF16),
     ],
 )
