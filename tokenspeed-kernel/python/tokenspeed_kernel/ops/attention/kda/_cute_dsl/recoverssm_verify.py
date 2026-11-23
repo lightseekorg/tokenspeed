@@ -448,6 +448,11 @@ class RecoverSsmVerify:
             and self.rows_per_thread * self.padded_columns + self._history_u_count()
             <= 64
         )
+        # Those tiles also multiply their history rows by M in the base rows'
+        # product, beside them, instead of a pass of their own (0.3-0.6 us of a
+        # batch-1 layer with records on GB300: the pass's every chunk waited on
+        # its loads).
+        self.merge_history_pass = self.preload_history_us
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
@@ -852,8 +857,8 @@ class RecoverSsmVerify:
                 )
 
         # Phase 2: tile @ M; the barrier after it frees the tile for partials.
-        # The history rows need no base, so their pass runs while it lands.
-        if const_expr(has_history):
+        # The history rows need no base, so their own pass runs while it lands.
+        if const_expr(has_history and not self.merge_history_pass):
             if record_start > 0:
                 self._history_times_columns(shared, record_start, warp, lane)
         cute.arch.mbarrier_wait(shared.state_barrier, 0)
@@ -862,7 +867,26 @@ class RecoverSsmVerify:
         )
         if const_expr(has_history):
             if record_start > 0:
-                self._tile_times_columns(shared, warp, lane, products, True)
+                if const_expr(self.merge_history_pass):
+                    history_products = cute.make_rmem_tensor(
+                        ((self.history_rows // 16) * self.padded_columns,), Float32
+                    )
+                    self._rows_times_columns(
+                        shared,
+                        warp,
+                        lane,
+                        0,
+                        self.tile_rows,
+                        products,
+                        True,
+                        history_products,
+                    )
+                    if warp * (self.history_rows // 4) < record_start:
+                        self._store_history_products(
+                            shared, history_products, warp, lane
+                        )
+                else:
+                    self._tile_times_columns(shared, warp, lane, products, True)
             else:
                 self._tile_times_columns(shared, warp, lane, products, False)
         else:
@@ -1322,27 +1346,40 @@ class RecoverSsmVerify:
         if warp * (rows // 4) < count:
             products = cute.make_rmem_tensor(((rows // 16) * columns,), Float32)
             self._rows_times_columns(
-                shared, warp, lane, self.history_row, rows, products, False
+                shared, warp, lane, self.history_row, rows, products, False, None
             )
-            split = lane % KEY_SPLITS
-            row_group = lane // KEY_SPLITS
-            for i in cutlass.range_constexpr(rows // 16):
-                row = warp * (rows // 4) + row_group + 4 * i
-                values = [products[i * columns + c] for c in range(columns)]
-                for offset in (1, 2, 4):
-                    values = [
-                        value
-                        + cute.arch.shuffle_sync_bfly(
-                            value, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                        for value in values
-                    ]
-                if split == 0:
-                    for vector in cutlass.range_constexpr(self.column_vectors):
-                        _sts_f32x4(
-                            shared.history_addr + (row * columns + 4 * vector) * 4,
-                            values[4 * vector : 4 * vector + 4],
-                        )
+            self._store_history_products(shared, products, warp, lane)
+
+    @cute.jit
+    def _store_history_products(
+        self, shared: _Shared, products, warp: Int32, lane: Int32
+    ):
+        """Add the key splits' partials of this warp's history rows and store D.
+
+        The eight key-split lanes of a lane group add their partials of a row
+        with shuffles, and the first stores the row's D[p, :].
+        """
+        columns = self.padded_columns
+        rows = self.history_rows
+        split = lane % KEY_SPLITS
+        row_group = lane // KEY_SPLITS
+        for i in cutlass.range_constexpr(rows // 16):
+            row = warp * (rows // 4) + row_group + 4 * i
+            values = [products[i * columns + c] for c in range(columns)]
+            for offset in (1, 2, 4):
+                values = [
+                    value
+                    + cute.arch.shuffle_sync_bfly(
+                        value, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    for value in values
+                ]
+            if split == 0:
+                for vector in cutlass.range_constexpr(self.column_vectors):
+                    _sts_f32x4(
+                        shared.history_addr + (row * columns + 4 * vector) * 4,
+                        values[4 * vector : 4 * vector + 4],
+                    )
 
     def _history_u_count(self):
         """This thread's u values in ``_add_history_products``: its blocks' rows."""
@@ -1626,7 +1663,7 @@ class RecoverSsmVerify:
         each key channel, the base part of S_L (``_store_history_rows``).
         """
         self._rows_times_columns(
-            shared, warp, lane, 0, self.tile_rows, products, decayed
+            shared, warp, lane, 0, self.tile_rows, products, decayed, None
         )
 
     @cute.jit
@@ -1639,6 +1676,7 @@ class RecoverSsmVerify:
         rows: cutlass.Constexpr[int],
         products,
         decayed: cutlass.Constexpr[bool],
+        history_products,
     ):
         """Fill ``products`` with this lane's partial of some tile rows @ M.
 
@@ -1647,15 +1685,20 @@ class RecoverSsmVerify:
         g, g + 4, ..., each over its key split. With ``decayed`` each row
         before the value tile's end (a base row) is multiplied, as it is read,
         by the records' total decay of each key channel, rounded before the
-        product as a separate scaling pass would round it.
+        product as a separate scaling pass would round it. ``history_products``,
+        unless None, gets the partials of the history rows that
+        ``_history_times_columns`` would give this lane, in the same order.
         """
         K = self.key_dim
         VT = self.value_tile_rows
         columns = self.padded_columns
         rows_per_thread = rows // 16
+        history_per_thread = self.history_rows // 16
         split = lane % KEY_SPLITS
         row_group = lane // KEY_SPLITS
         products.fill(0.0)
+        if const_expr(history_products is not None):
+            history_products.fill(0.0)
         for chunk in cutlass.range(K // 32, unroll=1):
             key0 = 4 * (split + KEY_SPLITS * chunk)
             decay = None
@@ -1682,6 +1725,18 @@ class RecoverSsmVerify:
                                 held[r] = scaled[r]
                         values = [held[r] for r in range(4)]
                 tile_values.append(values)
+            history_values = []
+            if const_expr(history_products is not None):
+                for i in cutlass.range_constexpr(history_per_thread):
+                    row = (
+                        self.history_row
+                        + warp * (self.history_rows // 4)
+                        + row_group
+                        + 4 * i
+                    )
+                    history_values.append(
+                        _lds_f32x4(shared.tile_addr + (row * K + key0) * 4)
+                    )
             for within in cutlass.range_constexpr(4):
                 m_row = []
                 for vector in cutlass.range_constexpr(self.column_vectors):
@@ -1698,6 +1753,17 @@ class RecoverSsmVerify:
                                     products[i * columns + n],
                                     products[i * columns + n + 1],
                                 ),
+                            )
+                        )
+                for i in cutlass.range_constexpr(len(history_values)):
+                    s = history_values[i][within]
+                    for n in cutlass.range_constexpr(0, columns, 2):
+                        a, b = i * columns + n, i * columns + n + 1
+                        history_products[a], history_products[b] = (
+                            cute.arch.fma_packed_f32x2(
+                                (s, s),
+                                (m_row[n], m_row[n + 1]),
+                                (history_products[a], history_products[b]),
                             )
                         )
 
