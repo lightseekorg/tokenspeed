@@ -170,7 +170,7 @@ def _prepare_mega_moe_input_buffers(plan: dict, w: torch.nn.Module):
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
     runner = get_runner(plan, w, prequantized=True)
-    runner.input_buffers(0, 1)
+    runner._ensure_workspace()
     return runner.input_buffers
 
 
