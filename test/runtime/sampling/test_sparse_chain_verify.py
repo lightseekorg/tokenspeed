@@ -160,11 +160,12 @@ def _logits(rows: int, seed: int) -> torch.Tensor:
 
 
 def _chains(logits: torch.Tensor, seed: int) -> torch.Tensor:
-    """Drafts mostly among the previous row's three best tokens, sometimes anywhere."""
+    """Drafts mostly the previous row's best token, else its second or third or anywhere."""
     gen = torch.Generator().manual_seed(seed)
     bs = logits.shape[0] // N
     best = torch.topk(logits.float().cpu(), 3, dim=1).indices.view(bs, N, 3)
-    pick = torch.randint(0, 3, (bs, N, 1), generator=gen)
+    pick = torch.randint(1, 3, (bs, N, 1), generator=gen)
+    pick = torch.where(torch.rand(bs, N, 1, generator=gen) < 0.8, 0, pick)
     chains = torch.gather(best, 2, pick).squeeze(2).roll(1, dims=1)
     anywhere = torch.randint(0, VOCAB, chains.shape, generator=gen)
     chains = torch.where(

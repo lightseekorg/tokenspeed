@@ -228,14 +228,19 @@ def test_first_token_follows_the_filtered_target(draft_rank, device: str) -> Non
     is distributed as the filtered target, whether the draft is its best token,
     a lower kept token, or outside the kept set. Pearson chi-square, p >= 1e-4."""
     draws, vocab = 200000, 4096
-    # Both rows of every request are one logits row (stride 0): the bonus row never shows in the first token.
-    rows = _logits(1, vocab, 11, device).expand(draws * 2, vocab)
+    # Thirty graded logits over a low floor, so top-k 20 and top-p 0.9 both cut.
+    gen = torch.Generator().manual_seed(11)
+    row = torch.randn(vocab, generator=gen) * 0.3 - 3.0
+    row[torch.randperm(vocab, generator=gen)[:30]] = torch.linspace(2.0, 0.0, 30)
+    # Both rows of every request are this row (stride 0): the bonus row never shows in the first token.
+    rows = row.to(device, torch.bfloat16).view(1, vocab).expand(draws * 2, vocab)
     temperatures = torch.full((draws * 2,), 0.8, device=device)
     top_ks = torch.full((draws * 2,), 20, dtype=torch.int32, device=device)
     top_ps = torch.full((draws * 2,), 0.9, device=device)
     topk = _select(rows)
     target = topk_chain_rows(topk[:1], K, temperatures[:1], top_ks[:1], top_ps[:1])[0]
     kept = sorted(target, key=target.get, reverse=True)
+    assert 10 <= len(kept) < 20
     outside = next(t for t in range(vocab) if t not in target)
     draft = outside if draft_rank is None else kept[draft_rank]
     chains = (

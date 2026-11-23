@@ -95,7 +95,7 @@ if TYPE_CHECKING:
 
 # Sampler graph variant of the batches sparse_chain_verify_eligible admits.
 CUDA_GRAPH_VARIANT_TOPK_SPARSE = "topk_sparse"
-# Candidates per row of the sparse chain verify; wider selections cost 40-60% more per doubling.
+# Candidates per row of the sparse chain verify; each doubling of the selection costs 30-65% more.
 SPARSE_CHAIN_VERIFY_WIDTH = 32
 
 
