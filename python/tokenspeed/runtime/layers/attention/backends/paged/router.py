@@ -65,6 +65,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry imp
     learn_cache_group_geometry,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    GROUP_WRITE_SLOT_DTYPE,
     GroupTableSpec,
     GroupTableStacks,
 )
@@ -382,7 +383,9 @@ class CacheGroupRouter(AttentionBackend):
                 kernel_page_size=leaf.kernel_page_size,
                 max_num_pages=leaf.max_num_pages,
                 atom_pages_per_block=self.cache_pool.atom_pages_per_block(
-                    gid, leaf.kernel_page_size
+                    gid,
+                    leaf.kernel_page_size,
+                    write_slot_dtype=GROUP_WRITE_SLOT_DTYPE,
                 ),
             )
             for gid, leaf in self.leaves.items()

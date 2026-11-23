@@ -66,10 +66,15 @@ _SLIDING_DECODE_STAGES = 2
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
 _GFX950_MAX_VMCNT = 63
+# LDS bytes a gfx950 work-group may allocate.
+_GFX950_LDS_BYTES = 160 * 1024
 # Full-attention decode takes its split count as a constexpr, so it is not held to
 # the runtime-reduce bound MAX_KV_SPLITS. Above 64, the split reduce and the
 # per-split prologue outweigh the extra waves.
 _FULL_DECODE_MAX_SPLITS = 64
+# Floats of split partials the one-wave decode reduce holds per tile: 128
+# registers per lane.
+_REDUCE_TILE_ELEMS = gl.constexpr(64 * 128)
 # Rows of a decode work-group: four waves of one 16-row MFMA tile each.
 _DECODE_MAX_BLOCK_M = 64
 # Sliding windows, or contexts, of at most this many pages are short: their
@@ -139,7 +144,7 @@ class AttentionConfig:
         q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
-        assert HEAD_DIM in (64, 128)
+        assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         # The waves split the rows into whole 16-row MFMA tiles.
         assert BLOCK_M % (16 * NUM_WARPS) == 0
@@ -1493,27 +1498,49 @@ def gluon_mha_decode_reduce_gfx950(
 
     # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
     SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
+    # The partials stream in SPLIT_CHUNK-split tiles of at most
+    # _REDUCE_TILE_ELEMS floats, 128 registers per lane: 64 splits of head dim
+    # 256 in one tile would spill.
+    SPLIT_CHUNK: gl.constexpr = (
+        SPLIT_TILE
+        if SPLIT_TILE * cfg.HEAD_DIM <= _REDUCE_TILE_ELEMS
+        else _REDUCE_TILE_ELEMS // cfg.HEAD_DIM
+    )
     offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, cfg.reduce_layout))
+    offs_c = gl.arange(0, SPLIT_CHUNK, layout=gl.SliceLayout(1, cfg.reduce_layout))
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
     # Every split stores its partial, with lse = -inf when it has no tokens, so
     # the loads need not wait on cache_seqlens; only the padding tail is masked.
-    split_valid = offs_s < cfg.NUM_KV_SPLITS
-    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
-    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
-    o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
-    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
+    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS
+    all_lse = gl.load(
+        mid_lse_ptr + base + offs_s,
+        mask=offs_s < cfg.NUM_KV_SPLITS,
+        other=-float("inf"),
+    )
 
     # Global softmax max over all splits (folding in the sink).
-    m_i = max(part_lse, axis=0)
+    m_i = max(all_lse, axis=0)
     if HAS_SINK:
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
         m_i = maximum(m_i, sink)
     # Weighted sum of the split partials, normalized by the total softmax mass.
-    beta = gl.exp2(part_lse - m_i)
-    l_i = gl.sum(beta, axis=0)
+    l_i = gl.sum(gl.exp2(all_lse - m_i), axis=0)
     if HAS_SINK:
         l_i = l_i + gl.exp2(sink - m_i)
-    acc = gl.sum(part_o * beta[:, None], axis=0)
+    acc = gl.zeros(
+        [cfg.HEAD_DIM], gl.float32, layout=gl.SliceLayout(0, cfg.reduce_layout)
+    )
+    for chunk_start in gl.static_range(0, SPLIT_TILE, SPLIT_CHUNK):
+        split = chunk_start + offs_c
+        split_valid = split < cfg.NUM_KV_SPLITS
+        part_lse = gl.load(
+            mid_lse_ptr + base + split, mask=split_valid, other=-float("inf")
+        )
+        o_off = (base + split)[:, None] * cfg.HEAD_DIM + offs_d[None, :]
+        part_o = cdna4.buffer_load(
+            mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0
+        )
+        acc += gl.sum(part_o * gl.exp2(part_lse - m_i)[:, None], axis=0)
 
     output = acc * (1.0 / l_i)
     if HAS_GATE:
@@ -1599,6 +1626,11 @@ def _full_decode_stages(
     # tiles, 16 bytes per lane per buffer_load_dwordx4.
     copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16 * num_warps)
     if (_FULL_DECODE_STAGES - 1) * copies_per_page > _GFX950_MAX_VMCNT:
+        return 1
+    # Head dim 256 pages fill the LDS with fewer buffers than the pipeline
+    # holds (one K and one V page per stage).
+    page_bytes = page_size * head_dim * element_size
+    if _FULL_DECODE_STAGES * 2 * page_bytes > _GFX950_LDS_BYTES:
         return 1
     return _FULL_DECODE_STAGES
 

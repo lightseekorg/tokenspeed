@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import pathlib
 import subprocess
 import sys
 
@@ -36,8 +38,9 @@ if not is_amd() or torch.version.hip is None:
 # Loading goes through the hipblaslt.py entry point that serving uses;
 # tuning and the file stamp are the _hipblaslt implementation's.
 from tokenspeed_kernel.ops.gemm._hipblaslt.tuning import (  # noqa: E402
+    TUNED_CONFIG_DIR,
+    find_hipblaslt_tuned_files,
     hipblaslt_file_validators,
-    hipblaslt_tuned_file,
     tune_hipblaslt_solutions,
 )
 from tokenspeed_kernel.ops.gemm.hipblaslt import (  # noqa: E402
@@ -167,9 +170,133 @@ def test_tuning_refuses_file_from_another_stack(tuned_file, tmp_path):
     assert stale.read_bytes() == before
 
 
-def test_default_file_is_this_gpus():
+def test_this_gpu_finds_its_architectures_committed_file():
+    arch_name = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName
+    committed = [
+        path
+        for path in glob.glob(os.path.join(TUNED_CONFIG_DIR, "gcn_arch=*.csv"))
+        if hipblaslt_file_validators(path)["GCN_ARCH_NAME"] == arch_name
+    ]
+    if not committed:
+        pytest.skip(f"no committed gcn_arch= file for {arch_name}")
+    # Whatever name the driver reports, the architecture's file comes first.
+    paths = find_hipblaslt_tuned_files(torch.cuda.get_device_name(), arch_name)
+    assert paths[:1] == committed
+
+
+def _committed_pair(tmp_path, tuned_file, device_file):
+    """Lay out architecture and device files for a test."""
+    arch_name = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "gcn_arch=test.csv").write_text(pathlib.Path(tuned_file).read_text())
     name = torch.cuda.get_device_name().replace(" ", "_")
-    assert hipblaslt_tuned_file().endswith(f"/configs/device_name={name}.csv")
+    (configs / f"device_name={name}.csv").write_text(
+        pathlib.Path(device_file).read_text()
+    )
+    assert hipblaslt_file_validators(tuned_file)["GCN_ARCH_NAME"] == arch_name
+    return configs
+
+
+def _tuned_keys(path: str) -> set[tuple[str, str]]:
+    with open(path) as f:
+        return {tuple(line.split(",")[:2]) for line in f if line.startswith("Gemm")}
+
+
+def test_architecture_and_device_files_load_together(tuned_file, tmp_path):
+    device_file = str(tmp_path / "device.csv")
+    assert tune_hipblaslt_solutions(
+        shapes=[(N, K)],
+        rows=[UNTUNED_M],
+        dtype=torch.bfloat16,
+        path=device_file,
+        cold_bytes=64 * 2**20,
+    )
+    configs = _committed_pair(tmp_path, tuned_file, device_file)
+    expected = sorted(_tuned_keys(tuned_file) | _tuned_keys(device_file))
+    assert len(expected) == 2
+    _run_fresh_process(
+        "import torch\n"
+        "from unittest.mock import patch\n"
+        "from tokenspeed_kernel.ops.gemm._hipblaslt import tuning\n"
+        f"with patch.object(tuning, 'TUNED_CONFIG_DIR', {str(configs)!r}):\n"
+        "    assert tuning.load_hipblaslt_tuned_solutions()\n"
+        "keys = sorted(tuple(r[:2]) for r in torch.cuda.tunable.get_results())\n"
+        f"assert keys == {expected!r}, keys\n",
+        tmp_path,
+    )
+
+
+def test_stale_device_file_leaves_the_architecture_file_loaded(tuned_file, tmp_path):
+    stale = tmp_path / "stale-device.csv"
+    stale.write_text(
+        pathlib.Path(tuned_file).read_text().replace(f"_{TUNED_M}_", f"_{UNTUNED_M}_")
+    )
+    _restamp(str(stale), stale, "HIPBLASLT_VERSION", "0-0")
+    configs = _committed_pair(tmp_path, tuned_file, str(stale))
+    expected = sorted(_tuned_keys(tuned_file))
+    _run_fresh_process(
+        "import torch\n"
+        "from unittest.mock import patch\n"
+        "from tokenspeed_kernel.ops.gemm._hipblaslt import tuning\n"
+        f"with patch.object(tuning, 'TUNED_CONFIG_DIR', {str(configs)!r}):\n"
+        "    assert tuning.load_hipblaslt_tuned_solutions()\n"
+        "keys = sorted(tuple(r[:2]) for r in torch.cuda.tunable.get_results())\n"
+        f"assert keys == {expected!r}, keys\n",
+        tmp_path,
+    )
+
+
+def test_tuning_keeps_architecture_rows_out_of_the_device_file(tuned_file, tmp_path):
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "gcn_arch=test.csv").write_text(pathlib.Path(tuned_file).read_text())
+    device_file = tmp_path / "device.csv"
+    # A fresh process, so TunableOp's own writes at exit are covered too.
+    _run_fresh_process(
+        "import torch\n"
+        "from unittest.mock import patch\n"
+        "from tokenspeed_kernel.ops.gemm._hipblaslt import tuning\n"
+        f"with patch.object(tuning, 'TUNED_CONFIG_DIR', {str(configs)!r}):\n"
+        "    tuning.tune_hipblaslt_solutions(\n"
+        f"        shapes=[({N}, {K})], rows=[{TUNED_M}, {UNTUNED_M}],\n"
+        f"        dtype=torch.bfloat16, path={str(device_file)!r},\n"
+        "        cold_bytes=64 * 2**20)\n",
+        tmp_path,
+    )
+    written = _tuned_keys(str(device_file))
+    assert len(written) == 1
+    assert not written & _tuned_keys(tuned_file)
+
+
+def test_regenerating_the_architecture_file_through_a_symlink_keeps_its_rows(
+    tuned_file, tmp_path
+):
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    architecture_file = configs / "gcn_arch=test.csv"
+    architecture_file.write_text(pathlib.Path(tuned_file).read_text())
+    link = tmp_path / "link.csv"
+    link.symlink_to(architecture_file)
+    # A fresh process: TunableOp results already in this one would be written too.
+    _run_fresh_process(
+        "import torch\n"
+        "from unittest.mock import patch\n"
+        "from tokenspeed_kernel.ops.gemm._hipblaslt import tuning\n"
+        f"with patch.object(tuning, 'TUNED_CONFIG_DIR', {str(configs)!r}):\n"
+        "    written = tuning.tune_hipblaslt_solutions(\n"
+        f"        shapes=[({N}, {K})], rows=[{TUNED_M}],\n"
+        f"        dtype=torch.bfloat16, path={str(link)!r},\n"
+        "        cold_bytes=64 * 2**20)\n"
+        # Its own rows are not filtered out as another architecture file's.
+        "assert written == 1, written\n",
+        tmp_path,
+    )
+    assert _tuned_keys(str(architecture_file)) == _tuned_keys(tuned_file)
 
 
 def test_missing_file_keeps_tunableop_disabled(tmp_path):

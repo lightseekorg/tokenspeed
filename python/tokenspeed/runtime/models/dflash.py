@@ -208,6 +208,28 @@ class DFlashAttention(nn.Module):
         )
 
 
+def prepare_reduce_norm_fusion(mapping: Mapping, hidden_size: int) -> bool:
+    """Arm the fused all-reduce + norm of a draft's layer boundaries.
+
+    Collective: every rank arms the same groups in order, or declines alike,
+    before cache sizing and graph capture.
+
+    Args:
+        mapping: The draft's parallel layout.
+        hidden_size: Width of the rows the boundaries reduce.
+
+    Returns:
+        Whether both groups span several ranks and armed a workspace for
+        ``comm_fusion_max_num_tokens`` rows.
+    """
+    cap = int(global_server_args_dict["comm_fusion_max_num_tokens"])
+    groups = dict.fromkeys((mapping.dense.tp_group, mapping.attn.tp_group))
+    return cap > 0 and all(
+        len(group) > 1 and prepare_all_reduce_fusion(group, hidden_size, cap)
+        for group in groups
+    )
+
+
 def reduce_norm(
     norm: RMSNorm,
     hidden_states: torch.Tensor,
@@ -696,15 +718,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             Whether the draft prepared anything.
         """
         prepared = self._prepare_fused_reduce_norm(max_num_tokens)
-        cap = int(global_server_args_dict["comm_fusion_max_num_tokens"])
-        groups = dict.fromkeys(
-            (self.mapping.dense.tp_group, self.mapping.attn.tp_group)
-        )
-        # Collective: every rank arms the same groups in order, or declines alike.
-        self.allreduce_fusion = cap > 0 and all(
-            len(group) > 1
-            and prepare_all_reduce_fusion(group, int(self.config.hidden_size), cap)
-            for group in groups
+        self.allreduce_fusion = prepare_reduce_norm_fusion(
+            self.mapping, int(self.config.hidden_size)
         )
         for layer in self.layers:
             layer.allreduce_fusion = self.allreduce_fusion
