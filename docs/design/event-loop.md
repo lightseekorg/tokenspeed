@@ -106,6 +106,20 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+On disaggregated engines, `bootstrap_room` carries the same one-active-request
+rule across distinct request ids. Peer state is keyed by room, so every new
+request — including fan-out children and retries — must use a fresh room. At
+admission, before data-plane registration or scheduling, the loop refuses with
+409 any request whose room is already reserved by an unscheduled request (same
+round, grammar queue, EPD staging, or pause withholding) or tracked by
+`TransferPeer` (including draining rooms awaiting `Stopped`). Both checks read
+only replica-identical loop state, never worker-thread state such as a prefill
+peer's cancellation tombstones, so every replica member makes the same decision;
+reusing a previously failed or cancelled room after retirement still fails in
+the prefill peer under its tombstone contract. `TransferPeer::register` enforces
+the same uniqueness invariant at the peer boundary, and `abort_room` ignores
+rooms owned by another active request.
+
 Each accepted request gets a monotonically increasing admission identity
 before data-plane registration. The output processor allocates it once;
 the Python request record, planned forwards and snapshot/restore operations

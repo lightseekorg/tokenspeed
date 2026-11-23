@@ -31,7 +31,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use ts_pd::{BootstrapInfo, PdEvent, TransferPeer};
+use ts_pd::{BootstrapInfo, PdEvent, RemotePrefill, TransferPeer};
 
 #[path = "../src/tests_support.rs"]
 mod native;
@@ -170,4 +170,140 @@ fn replacing_a_cache_retires_queued_layerwise_reads_before_releasing_the_room() 
         "retired cache work must not resume writes after its producer advances"
     );
     assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
+}
+
+#[test]
+fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let mut destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    let bootstrap = pair.bootstrap.clone();
+    let room = bootstrap.room;
+
+    assert!(!pair.prefill.has_room(room));
+    assert!(!pair.decode.has_room(room));
+
+    pair.prefill.register("original", &bootstrap).unwrap();
+    pair.decode.register("original", &bootstrap).unwrap();
+    assert!(pair.prefill.has_room(room));
+    assert!(pair.decode.has_room(room));
+
+    // Re-registering the same request id or a second request id on the active
+    // room fails cleanly without mutating the original transfer's state.
+    let err = pair
+        .prefill
+        .register("original", &bootstrap)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already registered"), "{err}");
+    let err = pair
+        .decode
+        .register("original", &bootstrap)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already registered"), "{err}");
+
+    let err = pair
+        .prefill
+        .register("duplicate", &bootstrap)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already active"), "{err}");
+    let err = pair
+        .decode
+        .register("duplicate", &bootstrap)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already active"), "{err}");
+
+    // The original transfer finishes cleanly and releases the room.
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped("original".to_owned())
+    );
+    pair.admit("original");
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped("original".to_owned())
+    );
+    pair.prefill.record_usage("original", 128, Some(-0.5));
+    pair.send("original", 777, vec![1, 2, 3]).unwrap();
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Succeeded("original".to_owned())
+    );
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::RemotePrefillDone(RemotePrefill {
+            rid: "original".to_owned(),
+            bootstrap_token: 777,
+            cached_tokens: 128,
+            bootstrap_logprob: Some(-0.5),
+            spec_candidate_ids: Some(vec![1, 2, 3]),
+            request_pool_index: 3,
+        })
+    );
+    assert!(landed(&destination, &source));
+    assert!(!pair.prefill.has_room(room));
+    assert!(!pair.decode.has_room(room));
+
+    // Once both peers forgot the healthy transfer, the room can be reused.
+    destination.fill(0);
+    transfer_one(&mut pair, "reused", room, &mut mesh, &group);
+    assert!(landed(&destination, &source));
+}
+
+#[test]
+fn abort_room_ignores_a_room_owned_by_an_active_prefill_request() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    let room = pair.bootstrap.room;
+
+    pair.prefill.register("original", &pair.bootstrap).unwrap();
+    pair.decode.register("original", &pair.bootstrap).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped("original".to_owned())
+    );
+    pair.admit("original");
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped("original".to_owned())
+    );
+
+    // An unscheduled conflict failing in EPD or submission must never tear
+    // down the active transfer owning the room.
+    pair.prefill.abort_room("unscheduled-conflict", room);
+    pair.send("original", 555, Vec::new()).unwrap();
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Succeeded("original".to_owned())
+    );
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::RemotePrefillDone(RemotePrefill {
+            rid: "original".to_owned(),
+            bootstrap_token: 555,
+            cached_tokens: 0,
+            bootstrap_logprob: None,
+            spec_candidate_ids: None,
+            request_pool_index: 3,
+        })
+    );
+    assert!(landed(&destination, &source));
 }
