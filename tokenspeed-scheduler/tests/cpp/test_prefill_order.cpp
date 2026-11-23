@@ -231,7 +231,7 @@ TEST_P(ShortPrefillOrderTest, EqualWorkPreservesSubmissionOrder) {
     EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}));
 }
 
-// Twice the oldest prompt's 16 tokens is eight 4-token prompts, so it ages within one batch.
+// The oldest prompt's 16 tokens is four 4-token prompts' work, so it ages within one batch.
 TEST_P(ShortPrefillOrderTest, AgingIsAppliedWithinOneBatch) {
     std::vector<RequestSpec> requests{{.request_id = "old-long", .tokens = MakeTokens(16, 101), .max_new_tokens = 1}};
     for (int i = 0; i < 20; ++i) {
@@ -244,9 +244,9 @@ TEST_P(ShortPrefillOrderTest, AgingIsAppliedWithinOneBatch) {
     ASSERT_NE(batch, nullptr);
     const auto old = std::find(batch->request_ids.begin(), batch->request_ids.end(), "old-long");
     ASSERT_NE(old, batch->request_ids.end());
-    EXPECT_EQ(old - batch->request_ids.begin(), 8);
+    EXPECT_EQ(old - batch->request_ids.begin(), 4);
     EXPECT_EQ(batch->input_lengths.at(static_cast<std::size_t>(old - batch->request_ids.begin())), 16);
-    EXPECT_EQ(batch->request_ids.size(), 13u) << "four more short prompts fill the 64-token budget";
+    EXPECT_EQ(batch->request_ids.size(), 13u) << "eight more short prompts fill the 64-token budget";
 }
 
 // Each oldest prompt's allowance counts the work that went ahead of it from when it became the oldest.
@@ -279,8 +279,8 @@ TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnShareOfTheWork) {
     std::vector<std::string> expected;
     for (int i = 0; i < 17; ++i) {
         expected.push_back("short" + std::to_string(i));
-        if (i == 7 || i == 15) {
-            expected.push_back("long" + std::to_string(i / 8));
+        if (i == 3 || i == 7) {
+            expected.push_back("long" + std::to_string(i / 4));
         }
     }
     EXPECT_EQ(first_admissions, expected);
@@ -342,10 +342,10 @@ TEST_P(ShortPrefillOrderTest, ContinuousShortArrivalsAdvanceEveryEarlierLongProm
         }
         Land(plan);
     }
-    EXPECT_EQ(overtakes.front(), 8);
+    EXPECT_EQ(overtakes.front(), 4);
     for (int i = 0; i < 3; ++i) {
         EXPECT_GE(overtakes[i], 0);
-        EXPECT_LE(overtakes[i], 8 * (i + 1));
+        EXPECT_LE(overtakes[i], 4 * (i + 1));
         EXPECT_EQ(long_tokens[i], 128);
         EXPECT_EQ(scheduler_->RequestTokenSize("long" + std::to_string(i)), -1);
     }

@@ -383,10 +383,10 @@ local prefill; D's remote admission and decode ordering are unchanged.
 
 Only the oldest waiting prompt counts the later first admissions that go
 ahead of it, by their prefill work (prompt tokens less the hit they resume
-from). Once they have taken twice its own work (`kPrefillAgingShare`), it
+from). Once they have taken as much work as its own (`kPrefillAgingShare`), it
 receives selection priority; once it starts or leaves, the next oldest gets
 its own allowance. Counting work rather than admissions bounds the share of
-the prefill budget an aged prompt takes to about a third while it is the
+the prefill budget an aged prompt takes to about half while it is the
 oldest: a fixed count of short admissions would age a long prompt every few
 admissions and let its chunks hold the head of line (§1.1) for most of the
 budget, and under a backlog every mid-sized prompt would wait behind it.

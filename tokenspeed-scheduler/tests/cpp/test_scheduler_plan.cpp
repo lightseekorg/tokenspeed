@@ -1558,16 +1558,16 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesTheLeastWorkFirstWhenShortPrefillsGoF
 }
 
 // The fill takes a protected prompt first, protection reevaluated after each
-// admission. "ahead" (10 tokens) ages once twice its work went ahead of it:
-// seven 2-token prompts filling a 7-row batch take 14, and their transfers
+// admission. "ahead" (10 tokens) ages once its own work went ahead of it:
+// seven 1-token prompts filling a 7-row batch take 7, and their transfers
 // then hold the request slots for a round. The holder ranks first as above,
-// and its own admission (8 tokens past its checkpoint) brings the work to 22:
+// and its own admission (8 tokens past its checkpoint) brings the work to 15:
 // protected, ahead fills 10 of the 28 tokens left before the three 9-token
 // prompts that rank ahead of it by work, two of which fill the rest.
-// After seven 1-token passes the holder brings it to 15 and f1's admission to
-// 24: ahead follows f1, then f2. A protected prompt the budget left cannot
-// take is passed over, not a stop: at 30 tokens, ahead ages after two rounds
-// of seven 4-token passes and the holder (64 of 60), leaves the 28 to the
+// At 16 tokens the holder brings it to 15 and f1's admission to 24: ahead
+// follows f1 and takes the 16 tokens f2 would have. A protected prompt the
+// budget left cannot take is passed over, not a stop: at 30 tokens, ahead ages
+// after seven 4-token passes and the holder (36 of 30), leaves the 28 to the
 // three 9-token prompts and starts next round.
 TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
     const auto run = [this](int pass_rounds, std::int32_t pass_tokens, std::int32_t ahead_tokens) {
@@ -1595,13 +1595,12 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
         }
         return std::vector<PrefillRows>{Round(), Round()};
     };
-    EXPECT_EQ(run(1, 2, 10),
+    EXPECT_EQ(run(1, 1, 10),
               (std::vector<PrefillRows>{{{"ahead", 0, 10, 10}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(1, 1, 10),
-              (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 10, 10}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
-                                        {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(2, 4, 30),
+    EXPECT_EQ(run(1, 1, 16), (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 16, 16}, {"holder", 8, 12, 16}},
+                                                       {{"holder", 12, 16, 16}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}}}));
+    EXPECT_EQ(run(1, 4, 30),
               (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"ahead", 0, 28, 30}}}));
 }
@@ -2585,14 +2584,11 @@ TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantedFirstAdmissionCountsTowa
         }
         SendAbortEvent("short");
 
-        // The grant was the first bypass. Two ordinary admissions fill the
-        // remaining allowance; each consumes the round's entire token budget.
-        for (int i = 0; i < 2; ++i) {
-            const std::string id = "s" + std::to_string(i);
-            Submit(MakeRequestSpec(id, 4, /*start=*/1000 + i * 100));
-            EXPECT_EQ(Round(), "P:" + id);
-            SendFinish(id);
-        }
+        // The grant was the first bypass. One ordinary admission fills the
+        // remaining allowance; it consumes the round's entire token budget.
+        Submit(MakeRequestSpec("s0", 4, /*start=*/1000));
+        EXPECT_EQ(Round(), "P:s0");
+        SendFinish("s0");
         Submit(MakeRequestSpec("later", 4, /*start=*/2000));
         EXPECT_EQ(Round({"old"}), "P:old");
     }

@@ -78,7 +78,7 @@ constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
 // The oldest waiting prompt ages once the work admitted ahead of it reaches this multiple of its own (scheduler.md).
-constexpr std::int64_t kPrefillAgingShare = 2;
+constexpr std::int64_t kPrefillAgingShare = 1;
 
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
