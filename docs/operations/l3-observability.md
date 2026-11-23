@@ -20,9 +20,10 @@ and the engine's request metrics.
 ## Labels and scope
 
 The `tokenspeed:l3_*` executor and scheduler series carry `model_name`,
-`app_key`, `dp_rank`, `tp_rank`, and `engine_role`, plus at most two fixed labels: `kind` (`query`, `get`,
+`app_key`, `dp_rank`, `tp_rank`, and `engine_role`, plus at most two
+fixed labels: `kind` (`query`, `get`,
 `put`), `state` (`queued`, `running`, `completed`), `event`, `result`,
-`stage`, `resource`, `phase` or `reason`. No request ID, object key or other
+`stage`, `resource`, `phase`, or `reason`. No request ID, object key, or other
 unbounded value becomes a label. The `tokenspeed:prefix_*` counters instead
 carry only `model_name`, `app_key`, and `dp_rank`; they have no TP-rank or
 engine-role label.
@@ -113,7 +114,8 @@ For quarantine, drain traffic and plan a process restart.
 ## Alerts
 
 The [example rules](https://github.com/lightseekorg/tokenspeed/blob/main/examples/monitoring/tokenspeed-l3-alerts.yaml)
-use only the series above. Their thresholds assume the default `async`
+use only the series documented on this page. Their thresholds assume the
+default `async`
 settings; scale them with your `wait_timeout_ms` and watermarks.
 
 The example rules fire the following alerts:
@@ -126,12 +128,13 @@ The example rules fire the following alerts:
 | `TokenSpeedL3BackendUnavailable` | The backend stays open while it rejects jobs, without active-namespace blocking, for 10 minutes | warning |
 | `TokenSpeedL3PressureGateClosed` | The pressure gate stays closed while requests bypass L3, for 10 minutes | warning |
 
-`ts-metrics`' tests check that every series, label value and aggregated
+`ts-metrics`' tests check that every series, label value, and aggregated
 label these rules read is exported.
 
 The Prometheus rule tests check firing delays, the age threshold, idle
-traffic suppression, active-blocking suppression, historical-quarantine recovery, and deduplication of mirrored
-TP reports. Run them from the repository root with `promtool`:
+traffic suppression, active-blocking suppression, historical-quarantine
+recovery, and deduplication of mirrored TP reports. Run them from the
+repository root with `promtool`:
 
 ```bash
 promtool check rules examples/monitoring/tokenspeed-l3-alerts.yaml
