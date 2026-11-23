@@ -55,8 +55,8 @@ def config(
     *,
     kv_events=False,
     role=ROLES.Fused,
-    max_writes=2,
-    max_write_keys=64,
+    max_writes_in_flight=2,
+    max_keys_per_write=64,
     device_pages=64,
     chunk=64,
 ):
@@ -76,7 +76,7 @@ def config(
     cfg.max_resident_requests = cfg.max_batch_size
     cfg.cache_groups = groups(device_pages)
     cfg.shared_l2_config = ts.SharedL2Config(
-        max_writes=max_writes, max_write_keys=max_write_keys
+        max_writes_in_flight=max_writes_in_flight, max_keys_per_write=max_keys_per_write
     )
     return cfg
 
@@ -96,7 +96,7 @@ def owner(blocks=64):
 
 class Runtime:
     """One scheduler's runtime: it answers the scheduler's lookups and
-    carries out its pool commands against the pool, as the event loop, the
+    carries out its shared L2 ops against the pool, as the event loop, the
     pool client and the load executor do."""
 
     def __init__(self, pool, client, *, complete_loads=True, complete_writes=True):
@@ -115,21 +115,23 @@ class Runtime:
         request_id, hashes, tokens, max_tokens = lookup
         return (
             request_id,
-            *self.pool.probe(self.client, hashes, tokens, max_tokens),
+            *self.pool.lookup(self.client, hashes, tokens, max_tokens),
         )
 
     def apply(self, s, answers):
-        for group, block, _, page in s.apply_shared_l2_lookups(answers):
-            self.pages[(group, block)] = page
+        for group, host_block, _, pool_page in s.apply_shared_l2_answers(answers):
+            self.pages[(group, host_block)] = pool_page
 
     def lookup(self, s):
-        lookups = s.take_shared_l2_lookups()
+        lookups = s.start_shared_l2_lookups()
         self.lookups.extend(lookups)
         self.apply(s, [self.answer(lookup) for lookup in lookups])
 
     def write(self, op):
         ticket, pages = self.pool.reserve(self.client, op.keys, op.buckets)
-        self.pool.commit(self.client, ticket, op.publications)
+        # Ticket 0 reserves nothing: there is nothing to commit.
+        if ticket != 0:
+            self.pool.commit(self.client, ticket, op.checkpoints)
         return ticket, pages
 
     def plan(self, s, *, lookup=True):
@@ -159,7 +161,7 @@ class Runtime:
                 self.writes.append(op)
                 if self.complete_writes:
                     self.write(op)
-                    e.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
+                    e.add_event(ts.Cache.SharedL2WriteDone(op.op_id))
                 else:
                     self.open_writes.append(op)
             elif isinstance(op, ts.Cache.SharedL2TouchOp):
@@ -184,7 +186,7 @@ class Runtime:
         event = ts.ExecutionEvent()
         for op in self.open_writes:
             self.write(op)
-            event.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
+            event.add_event(ts.Cache.SharedL2WriteDone(op.op_id))
         self.open_writes = []
         return event
 
@@ -214,7 +216,7 @@ def settled(s, pool):
         s.host_pool_cached_blocks() == 0
         and pool.stats()["pinned_blocks"] == 0
         and pool.stats()["reserved_blocks"] == 0
-        and pool.stats()["lookups"] == 0
+        and pool.stats()["open_lookups"] == 0
     )
 
 
@@ -226,12 +228,12 @@ def test_a_rank_resumes_from_the_pool_where_another_rank_published():
 
     first = publish(writer, writer_rt, "a", prompt)
     assert list(first.extend_prefix_lens) == [0]
-    # Four pages, the tail's block and the State checkpoint, with the
-    # checkpoint's lineage: its tokens, page hashes and tail.
+    # Four pages, the tail's block and the State block, with the
+    # checkpoint: its tokens, page hashes and tail.
     [write] = writer_rt.writes
     assert [key[1] for key in write.keys] == [0] * 5 + [1]
     assert write.buckets == [0] * 6
-    [(tokens, hashes, tail, _)] = write.publications
+    [(tokens, hashes, tail, _)] = write.checkpoints
     assert len(tokens) == 4 * len(prompt) and len(hashes) == 4 and tail[0] == 1
     assert tail[1] == write.keys[-1][2]
     assert pool.stats()["cached_blocks"] == 6
@@ -262,7 +264,7 @@ def test_a_waiting_prompt_is_admitted_only_after_its_lookup():
     reader.submit_requests([_spec("b", prompt + [50, 51])])
     # Not asked yet, then asked and not answered: no plan admits it.
     reader_rt.plan(reader, lookup=False)
-    [lookup] = reader.take_shared_l2_lookups()
+    [lookup] = reader.start_shared_l2_lookups()
     assert lookup[0] == "b" and lookup[3] == len(prompt) + 1
     for _ in range(3):
         reader_rt.plan(reader, lookup=False)
@@ -323,12 +325,12 @@ def test_a_request_gone_before_admission_lets_its_hit_go():
     # lookup in the call that sent it never sees: the answer names a request
     # the scheduler no longer knows, so no lookup that waits, and is refused.
     reader.submit_requests([_spec("c", prompt + [60, 61])])
-    [lookup] = reader.take_shared_l2_lookups()
+    [lookup] = reader.start_shared_l2_lookups()
     late = reader_rt.answer(lookup)
     abort("c")
     reader_rt.plan(reader)
     with pytest.raises(ValueError, match="no lookup that waits"):
-        reader.apply_shared_l2_lookups([late])
+        reader.apply_shared_l2_answers([late])
     assert "b" not in reader_rt.forwarded and "c" not in reader_rt.forwarded
     assert not reader_rt.loads and reader.host_pool_cached_blocks() == 0
 
@@ -488,12 +490,12 @@ def test_a_junction_cut_publishes_its_checkpoint_to_the_pool(role):
     if "other" in rows:
         _advance(s, "other", [1000])
     # Its next admission publishes the checkpoint there, and the write that
-    # carries it brings the pool the State block and its lineage alone: the
+    # carries it brings the pool the State block and its checkpoint alone: the
     # pool holds the KV pages already.
     for _ in range(3):
         runtime.plan(s)
     carried = [
-        op for op in runtime.writes if any(len(p[1]) == 4 for p in op.publications)
+        op for op in runtime.writes if any(len(p[1]) == 4 for p in op.checkpoints)
     ]
     assert carried
     assert pool.stats()["checkpoints"] > checkpoints
@@ -535,12 +537,14 @@ def test_an_answer_outside_its_prompt_is_refused():
     publish(writer, writer_rt, "a", prompt)
 
     reader.submit_requests([_spec("b", prompt + [50, 51])])
-    [lookup] = reader.take_shared_l2_lookups()
-    request_id, ticket, num_tokens, kv_tokens, tail, slots = reader_rt.answer(lookup)
-    with pytest.raises(ValueError, match="outside the prompt"):
-        reader.apply_shared_l2_lookups(
-            [(request_id, ticket, 40, kv_tokens, tail, slots)]
-        )
+    [lookup] = reader.start_shared_l2_lookups()
+    request_id, ticket, num_tokens, kv_tokens, tail, pages = reader_rt.answer(lookup)
+    # A hit past the prompt, and a KV reach past what the lookup asked for.
+    for hit_tokens, reach in ((40, kv_tokens), (num_tokens, 40)):
+        with pytest.raises(ValueError, match="outside the prompt"):
+            reader.apply_shared_l2_answers(
+                [(request_id, ticket, hit_tokens, reach, tail, pages)]
+            )
     # Nothing of the answer was taken, and no plan runs the prompt.
     assert reader.host_pool_cached_blocks() == 0
     reader_rt.plan(reader, lookup=False)
@@ -576,6 +580,10 @@ def _without_host_tier(cfg):
     cfg.disable_l2_cache = True
 
 
+def _without_prefix_caching(cfg):
+    cfg.disable_prefix_cache = True
+
+
 def _on_the_decode_role(cfg):
     cfg.role = ROLES.D
 
@@ -604,7 +612,9 @@ def _writing_evictions_back(cfg):
 
 
 def _without_write_room(cfg):
-    cfg.shared_l2_config = ts.SharedL2Config(max_writes=0, max_write_keys=64)
+    cfg.shared_l2_config = ts.SharedL2Config(
+        max_writes_in_flight=0, max_keys_per_write=64
+    )
 
 
 def _with_peer_sharing(cfg):
@@ -622,11 +632,12 @@ def _with_peer_sharing(cfg):
 @pytest.mark.parametrize(
     "breaks, message",
     [
-        (_with_l3, "exclusive"),
-        (_without_host_tier, "proxy Host tier"),
+        (_with_l3, "excludes L3 storage"),
+        (_without_host_tier, "requires a Host L2 cache"),
+        (_without_prefix_caching, "requires prefix caching"),
         (_on_the_decode_role, "decode role"),
-        (_with_a_snapshot_pool, "do not retract"),
-        (_with_sharded_groups, "replicated groups"),
+        (_with_a_snapshot_pool, "never retract and take no snapshot pool"),
+        (_with_sharded_groups, "requires replicated groups"),
         (_writing_evictions_back, "WriteThrough"),
         (_without_write_room, "positive write limits"),
         (_with_peer_sharing, "peer prefix sharing"),
@@ -642,7 +653,7 @@ def test_a_shared_l2_config_refuses_what_its_proxy_cannot_serve(breaks, message)
 def test_a_flush_refused_for_a_write_in_flight_keeps_the_queued_writes():
     written = []
     for flush_while_writing in (False, True):
-        pool, s = owner(), scheduler(max_writes=1, max_write_keys=1)
+        pool, s = owner(), scheduler(max_writes_in_flight=1, max_keys_per_write=1)
         rt = Runtime(pool, 1, complete_writes=False)
         publish(s, rt, "a", list(range(9)))
         assert len(rt.writes) == 1
@@ -658,7 +669,7 @@ def test_a_flush_refused_for_a_write_in_flight_keeps_the_queued_writes():
 
 
 def test_a_flush_drops_the_queued_writes_once_none_is_in_flight():
-    pool, s = owner(), scheduler(max_writes=1, max_write_keys=1)
+    pool, s = owner(), scheduler(max_writes_in_flight=1, max_keys_per_write=1)
     rt = Runtime(pool, 1, complete_writes=False)
     prefill(s, rt, "a", list(range(9)))
     _finish(s, "a")
@@ -677,7 +688,7 @@ def test_a_flush_drops_the_queued_writes_once_none_is_in_flight():
 
 def test_writes_left_open_pin_no_more_than_their_bound_and_admissions_go_on():
     pool = owner()
-    s = scheduler(max_writes=2, max_write_keys=3, device_pages=24)
+    s = scheduler(max_writes_in_flight=2, max_keys_per_write=3, device_pages=24)
     rt = Runtime(pool, 1, complete_writes=False)
     # Six prompts of nine tokens publish six blocks each; the runtime never
     # completes a write.
@@ -732,15 +743,15 @@ def test_a_finish_offers_its_entries_again_and_the_pool_takes_the_new_ones():
     assert granted and not set(granted) & set(first.keys)
     assert all(page == -1 for key, page in zip(last.keys, pages) if key in first.keys)
     rt.open_writes = []
-    s.advance(_event_write_done(last.write_id))
+    s.advance(_event_write_done(last.op_id))
     rt.plan(s)
     assert settled(s, pool)
     # Only a write in flight has a completion.
     with pytest.raises(ValueError, match="unknown shared L2 write"):
-        s.advance(_event_write_done(last.write_id))
+        s.advance(_event_write_done(last.op_id))
 
 
-def _event_write_done(write_id):
+def _event_write_done(op_id):
     event = ts.ExecutionEvent()
-    event.add_event(ts.Cache.SharedL2WriteDone(write_id))
+    event.add_event(ts.Cache.SharedL2WriteDone(op_id))
     return event

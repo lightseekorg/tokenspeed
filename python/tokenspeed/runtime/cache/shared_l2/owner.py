@@ -32,28 +32,31 @@ and reservations, and its next request is answered with an error.
 
 Requests (``wire``), by ``op``; every reply also carries ``ok``:
 
-* ``provider``: ``session`` (the provider's ``host:port``), ``base``,
+* ``add_provider``: ``session`` (the provider's ``host:port``), ``base_address``,
   ``bytes``.
 * ``hello``: ``client``, ``geometry``, ``deployment_id`` -> ``ready``, and once
-  ready ``providers``, ``lcm_bytes``.
+  ready ``providers``, ``lcm_block_bytes``.
 * ``ping``: ``client``.
-* ``probe_many``: ``client``, ``lookups`` ``[[prefix_hashes, tokens,
-  max_tokens]]`` -> ``hits`` ``[[ticket, num_tokens, kv_tokens, tail,
-  [[key, bucket, page]]]]``, one per lookup. Each hit is pinned under its
-  ticket; ticket 0 pins nothing.
+* ``lookup``: ``client``, ``lookups`` ``[[prefix_hashes, tokens,
+  max_tokens]]`` (``tokens`` are the prompt's token ids, not a count) ->
+  ``hits`` ``[[ticket, num_tokens, kv_tokens, tail, [[key, bucket, page]]]]``,
+  one per lookup. Each hit is pinned under its ticket; ticket 0 pins nothing.
 * ``release``: ``client``, ``ticket``.
 * ``reserve``: ``client``, ``keys``, ``buckets`` -> ``ticket``, ``pages`` (one
-  per key; negative: nothing to write).
-* ``commit``: ``client``, ``ticket``, ``publications`` ``[[tokens,
-  prefix_hashes, tail, publisher]]`` -> ``committed``.
-* ``touch``: ``client``, ``keys``, ``buckets``.
-* ``clear`` -> ``cleared``; ``stats`` -> ``stats``, ``providers``, ``clients``.
+  per key; negative: no page for the key now, -1 the pool holds it, -2 no
+  page is free, -3 another reservation writes it).
+* ``commit``: ``client``, ``ticket``, ``checkpoints`` ``[[tokens,
+  prefix_hashes, tail, access_epoch]]`` (``tokens`` are a checkpoint's token
+  ids, not a count).
+* ``touch``: ``client``, ``keys``.
+* ``clear`` -> ``cleared``; ``stats`` -> ``stats``, ``providers``, ``num_clients``.
 
 A client's geometry is its scheduler's view of the cache: ``prefix_granularity``,
-``lcm_bytes`` and, per cache group in the scheduler's order, ``group_id``,
-``attn_kind``, ``block_granularity``, ``cache_blocks_per_lcm_block``,
-``host_packing``, ``shard_count``, ``sliding_window_tokens``, ``sink_tokens``,
-``replayable`` and ``checkpoint_granularity``.
+``lcm_block_bytes`` and ``groups``, which holds, per cache group in the scheduler's
+order, ``group_id``, ``attn_kind``, ``block_granularity``,
+``cache_blocks_per_lcm_block``, ``host_group_packing``, ``shard_count``,
+``sliding_window_tokens``, ``sink_tokens``, ``replayable`` and
+``checkpoint_granularity``.
 """
 
 from __future__ import annotations
@@ -81,14 +84,14 @@ class SharedL2Owner:
         address: str,
         num_providers: int,
         client_timeout_s: float,
-        make_pool: Callable[[dict[str, Any], int], Any],
+        make_shared_l2_pool: Callable[[dict[str, Any], int], Any],
     ):
         """
         Args:
             address: ZMQ bind address.
             num_providers: Providers to wait for before the pool is built.
             client_timeout_s: Silence after which a client is dropped.
-            make_pool: ``(geometry, num_lcm_blocks)`` to an object with
+            make_shared_l2_pool: ``(geometry, num_lcm_blocks)`` to an object with
                 the scheduler's ``SharedL2Pool``'s methods; called once,
                 with the first client's geometry.
         """
@@ -97,10 +100,10 @@ class SharedL2Owner:
         self._socket.bind(address)
         self._num_providers = int(num_providers)
         self._client_timeout_s = float(client_timeout_s)
-        self._make_pool = make_pool
+        self._make_shared_l2_pool = make_shared_l2_pool
         # The providers that joined, with their bytes, and once the pool is
         # built each one's share of it: its LCM blocks and where they start.
-        self._joined: list[dict[str, Any]] = []
+        self._announced_providers: list[dict[str, Any]] = []
         self._providers: list[dict[str, Any]] = []
         self._geometry: dict[str, Any] | None = None
         self._deployment_id: str | None = None
@@ -130,9 +133,9 @@ class SharedL2Owner:
             now = time.monotonic()
             if now >= next_sweep:
                 next_sweep = now + self._client_timeout_s / 4
-                self.disconnect_silent(now)
+                self._disconnect_timed_out_clients(now)
 
-    def disconnect_silent(self, now: float) -> None:
+    def _disconnect_timed_out_clients(self, now: float) -> None:
         for client, heard in list(self._clients.items()):
             if now - heard > self._client_timeout_s:
                 logger.warning(f"shared L2 client {client} timed out")
@@ -144,7 +147,7 @@ class SharedL2Owner:
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         op = request["op"]
-        if op == "provider":
+        if op == "add_provider":
             return self._add_provider(request)
         if op == "hello":
             return self._hello(request)
@@ -152,12 +155,12 @@ class SharedL2Owner:
             if self._pool is None:
                 raise RuntimeError("the shared L2 pool is not ready")
             if op == "clear":
-                return {"ok": True, "cleared": self._pool.clear()}
+                return {"ok": True, "cleared": self._pool.clear_cache()}
             return {
                 "ok": True,
                 "stats": self._pool.stats(),
                 "providers": self._providers,
-                "clients": len(self._clients),
+                "num_clients": len(self._clients),
             }
         client = int(request["client"])
         if client not in self._clients:
@@ -171,9 +174,9 @@ class SharedL2Owner:
         pool = self._pool
         if op == "ping":
             return {"ok": True}
-        if op == "probe_many":
+        if op == "lookup":
             hits = [
-                pool.probe(client, prefix_hashes, tokens, int(max_tokens))
+                pool.lookup(client, prefix_hashes, tokens, int(max_tokens))
                 for prefix_hashes, tokens, max_tokens in request["lookups"]
             ]
             return {"ok": True, "hits": hits}
@@ -186,62 +189,61 @@ class SharedL2Owner:
             )
             return {"ok": True, "ticket": ticket, "pages": pages}
         if op == "commit":
-            publications = [
+            checkpoints = [
                 (
                     tokens,
                     prefix_hashes,
                     None if tail is None else tuple(tail),
-                    publisher,
+                    access_epoch,
                 )
-                for tokens, prefix_hashes, tail, publisher in request["publications"]
+                for tokens, prefix_hashes, tail, access_epoch in request["checkpoints"]
             ]
-            committed = pool.commit(client, int(request["ticket"]), publications)
-            return {"ok": True, "committed": committed}
+            pool.commit(client, int(request["ticket"]), checkpoints)
+            return {"ok": True}
         if op == "touch":
-            # The pool's touch takes no bucket: it holds one per group so far.
-            if any(request["buckets"]):
-                raise ValueError("the shared L2 pool holds bucket 0 only")
             pool.touch([tuple(key) for key in request["keys"]])
             return {"ok": True}
         raise ValueError(f"unknown shared L2 request {op!r}")
 
     def _add_provider(self, request: dict[str, Any]) -> dict[str, Any]:
-        if self._pool is not None:
-            raise RuntimeError("providers cannot join a running pool")
         session, size = str(request["session"]), int(request["bytes"])
-        if len(self._joined) == self._num_providers:
+        if len(self._announced_providers) == self._num_providers:
             raise RuntimeError("every expected provider has already joined")
-        self._joined.append(
-            {"session": session, "base": int(request["base"]), "bytes": size}
+        self._announced_providers.append(
+            {
+                "session": session,
+                "base_address": int(request["base_address"]),
+                "bytes": size,
+            }
         )
         logger.info(f"shared L2 provider {session} joined: {size} bytes")
         return {"ok": True}
 
     def _hello(self, request: dict[str, Any]) -> dict[str, Any]:
-        if len(self._joined) < self._num_providers:
+        if len(self._announced_providers) < self._num_providers:
             return {"ok": True, "ready": False}
         geometry, deployment_id = request["geometry"], str(request["deployment_id"])
         if self._pool is None:
-            lcm_bytes = int(geometry["lcm_bytes"])
+            lcm_block_bytes = int(geometry["lcm_block_bytes"])
             providers: list[dict[str, Any]] = []
-            start = 0
-            for provider in self._joined:
-                blocks = provider["bytes"] // lcm_bytes
-                if blocks <= 0:
+            num_lcm_blocks = 0
+            for provider in self._announced_providers:
+                provider_lcm_blocks = provider["bytes"] // lcm_block_bytes
+                if provider_lcm_blocks <= 0:
                     raise ValueError(
                         f"provider {provider['session']} holds {provider['bytes']} "
-                        f"bytes, less than one LCM block of {lcm_bytes} bytes"
+                        f"bytes, less than one LCM block of {lcm_block_bytes} bytes"
                     )
                 providers.append(
                     {
                         "session": provider["session"],
-                        "base": provider["base"],
-                        "lcm_blocks": blocks,
-                        "start": start,
+                        "base_address": provider["base_address"],
+                        "num_lcm_blocks": provider_lcm_blocks,
+                        "first_lcm_block": num_lcm_blocks,
                     }
                 )
-                start += blocks
-            self._pool = self._make_pool(geometry, start)
+                num_lcm_blocks += provider_lcm_blocks
+            self._pool = self._make_shared_l2_pool(geometry, num_lcm_blocks)
             self._providers = providers
             self._geometry, self._deployment_id = geometry, deployment_id
             logger.info(
@@ -259,11 +261,11 @@ class SharedL2Owner:
             "ok": True,
             "ready": True,
             "providers": self._providers,
-            "lcm_bytes": int(self._geometry["lcm_bytes"]),
+            "lcm_block_bytes": int(self._geometry["lcm_block_bytes"]),
         }
 
 
-def make_pool(
+def make_shared_l2_pool(
     geometry: dict[str, Any],
     num_lcm_blocks: int,
     *,
@@ -298,12 +300,14 @@ def make_pool(
         config.replayable = bool(group["replayable"])
         config.checkpoint_granularity = int(group["checkpoint_granularity"])
         groups.append(config)
-    scheduler = ts.SchedulerConfig()
-    scheduler.prefix_granularity = int(geometry["prefix_granularity"])
-    scheduler.cache_groups = groups
-    scheduler.host_group_packing = [
-        int(group["host_packing"]) for group in geometry["groups"]
+    scheduler_config = ts.SchedulerConfig()
+    scheduler_config.prefix_granularity = int(geometry["prefix_granularity"])
+    scheduler_config.cache_groups = groups
+    scheduler_config.host_group_packing = [
+        int(group["host_group_packing"]) for group in geometry["groups"]
     ]
-    scheduler.checkpoint_retention_requests = checkpoint_retention_requests
-    scheduler.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
-    return ts.SharedL2Pool(scheduler, num_lcm_blocks, headroom_lcm_blocks)
+    scheduler_config.checkpoint_retention_requests = checkpoint_retention_requests
+    scheduler_config.checkpoint_retention_leaf_distance = (
+        checkpoint_retention_leaf_distance
+    )
+    return ts.SharedL2Pool(scheduler_config, num_lcm_blocks, headroom_lcm_blocks)

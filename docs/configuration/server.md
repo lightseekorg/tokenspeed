@@ -1979,8 +1979,8 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 
 ### Shared L2 pool
 
-`--shared-l2-config` joins a rank to one paged pool that every prefill rank of
-a deployment uses in place of its Host L2: one cache index and one eviction
+`--shared-l2-config` joins a rank to one paged pool that every rank of a
+deployment's prefill and fused instances uses in place of its Host L2: one cache index and one eviction
 policy (the Host L2's), with the bytes spread over the nodes' host memory. A
 prefix one rank computed is loaded by any rank on any node, straight from the
 pool into its GPU cache by RDMA.
@@ -2021,17 +2021,17 @@ owner, then the providers, then the engines.
   | Flag | Meaning |
   |---|---|
   | `--address tcp://HOST:PORT` | Where the ranks and providers reach it. There is no authentication: bind it to a cluster-internal address. |
-  | `--providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
+  | `--num-providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
   | `--headroom-lcm-blocks H` | When fewer than `H/2` LCM blocks are empty, a write evicts back up to `H` in one pass. |
   | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations, and the owner answers its next request with an error, which stops the rank's engine. A rank pings the owner whenever it has had no release or touch to send for 5 seconds; a ping fails after at most the rank's `request_timeout_ms`, and the engine's loop reads the failure at the head of its next round (an idle rank runs a round about every 10 ms). A running rank that cannot reach the owner therefore stops about 5 seconds plus its `request_timeout_ms` after the owner last heard it: keep `S` well above that, so that it stops before the owner drops its pins, and well above any pause a rank process can take (the frozen rank under *Known limits*). |
   | `--checkpoint-retention-requests R` | `--checkpoint-retention-requests` of the scheduler, counted over the lookups of every rank together, hit or miss. A rank sends one lookup for each new prompt its own GPU cache does not cover already; a prompt it covers sends none and is not counted. A rank's own default is 16 x its batch size; for the pool use about 16 x the sum of the ranks' batch sizes. `0` ranks every entry by its own last use. |
   | `--checkpoint-retention-leaf-distance D` | As the scheduler's option of that name. |
 
-* `provider --owner ADDRESS --hostname HOST --device-name NICS --bytes B`: one
+* `provider --owner-address ADDRESS --hostname HOST --device-name NICS --bytes B`: one
   per node, hosting `B` bytes of pool memory registered for RDMA. A provider
   announces its memory once, at start, and the owner counts every
   announcement as one provider: a provider that is started again counts as one
-  more until `--providers` have joined, and is refused after that. The owner
+  more until `--num-providers` have joined, and is refused after that. The owner
   cannot tell that the earlier one's memory is gone, so restart the owner
   together with a provider.
 
@@ -2079,22 +2079,22 @@ in a 64 GiB pool.
 The rank's JSON names every field:
 
 ```json
-{"owner": "tcp://HOST:PORT",
+{"owner_address": "tcp://HOST:PORT",
  "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1"],
- "request_timeout_ms": 2000, "connect_timeout_s": 600,
- "load_workers": 4, "write_workers": 4,
- "scheduler": {"max_writes": 4, "max_write_keys": 512}}
+ "request_timeout_ms": 2000, "join_timeout_s": 600,
+ "read_workers": 4, "write_workers": 4,
+ "scheduler": {"max_writes_in_flight": 4, "max_keys_per_write": 512}}
 ```
 
 | Field | Meaning |
 |---|---|
-| `owner` | The owner's address. |
+| `owner_address` | The owner's address. |
 | `device_names` | A list: the RDMA devices of each local GPU index, as Mooncake names them. Name the fastest GPU-side NICs. |
 | `request_timeout_ms` | How long a request may wait for the owner's answer, from the moment the rank sends it. A request that passes it has failed, which stops the rank's engine: set it above the longest pause the owner can have. A lookup holds the rank's scheduling until it is answered or has failed, for up to this long. |
-| `connect_timeout_s` | How long a starting rank waits for the pool to be ready; the rank fails to start after it. |
-| `load_workers` | Threads reading one load's providers in parallel. A layer is read with one request for each provider that holds its pages, so more threads than providers are never busy. |
+| `join_timeout_s` | How long a starting rank waits for the pool to be ready; the rank fails to start after it. |
+| `read_workers` | Threads reading one load's providers in parallel. A layer is read with one request for each provider that holds its pages, so more threads than providers are never busy. |
 | `write_workers` | Threads writing newly published blocks to the pool. |
-| `scheduler.max_writes`, `scheduler.max_write_keys` | Writes in flight at once, and blocks in one write; Device blocks stay pinned only while their write is in flight. |
+| `scheduler.max_writes_in_flight`, `scheduler.max_keys_per_write` | Writes in flight at once, and blocks in one write; Device blocks stay pinned only while their write is in flight. |
 
 Before it plans a round, the engine's loop sends the owner one request with
 the lookup of each waiting prompt that has none yet, and waits for the answer.
@@ -2111,7 +2111,8 @@ With `--kv-events-config`, a pool rank reports the Host entries that stand
 for the pages of a hit with the Host medium (`CPU_PINNED`) for as long as it
 holds the hit, although the bytes are in the pool.
 
-No request is sent twice, and a rank does not serve without its pool. Each of
+A starting rank repeats its hello until the pool is ready; after the join no
+request is sent twice, and a rank does not serve without its pool. Each of
 these failures stops the rank's engine, as a failed forward does; under
 attention DP the other ranks of the instance stop with it (they report that a
 rank left the mesh):
@@ -2147,7 +2148,7 @@ names its objects under (checkpoint, cache layout and quantization, attention
 backends, runtime compatibility). The first rank sets both; a rank that
 differs is refused at start.
 
-A load reads the pool pages layer by layer, `load_workers` providers at a
+A load reads the pool pages layer by layer, `read_workers` providers at a
 time, and the forward waits per layer as for a Host L2 load. It needs GPUDirect
 RDMA writes ordered for the GPU that owns the memory and CUDA stream memory
 operations; a rank refuses to start on a device without either.

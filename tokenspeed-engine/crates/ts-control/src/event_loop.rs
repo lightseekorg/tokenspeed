@@ -446,7 +446,7 @@ pub enum LoopError {
     StorageExecutor(#[from] ts_l3::ExecutorError),
     /// The shared L2 pool's client or its owner failed.
     #[error(transparent)]
-    Pool(#[from] PoolError),
+    SharedL2(#[from] PoolError),
     /// The replica could not agree on its peer sharing reports.
     #[error(transparent)]
     Peer(#[from] PeerError),
@@ -558,7 +558,7 @@ pub struct Subsystems {
     pub l3: Option<ts_l3::Executor>,
     /// With a shared L2 pool as the Host tier, this rank's client of the
     /// pool's owner. `None` without one.
-    pub pool: Option<Box<dyn PoolClient + Send>>,
+    pub shared_l2: Option<Box<dyn PoolClient + Send>>,
     /// With peer prefix sharing, this rank's part of it: started over the
     /// loop's scheduler, which its endpoint serves between rounds. `None`
     /// without.
@@ -587,7 +587,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     l3: Option<Tier>,
     l3_metrics: Option<L3Metrics>,
     /// The shared L2 pool: this rank's client and the writes in flight there.
-    pool: Option<Pool>,
+    shared_l2: Option<Pool>,
     peer: Option<Peer>,
     /// The peer clock the replica agreed on this round.
     peer_now_us: i64,
@@ -670,7 +670,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .then(|| HistoryRows::new(config.request_token_history_lookback)),
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
-            pool: subsystems.pool.map(Pool::new),
+            shared_l2: subsystems.shared_l2.map(Pool::new),
             peer: subsystems.peer,
             peer_now_us: 0,
             scheduler: scheduler.lock_arc(),
@@ -772,7 +772,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !self.in_flight.is_empty()
             || self.cache_ops.open() != 0
             || self.outputs.num_running() != 0
-            || self.pool.as_ref().is_some_and(|pool| pool.open() != 0)
+            || self
+                .shared_l2
+                .as_ref()
+                .is_some_and(|shared_l2| shared_l2.open_writes() != 0)
         {
             return false;
         }
@@ -866,12 +869,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             Vec::new()
         };
-        // A shared L2 pool's finished writes are acknowledgments too. Its
-        // client is asked in every round, frozen or not, whether or not a
-        // write is in flight: the poll also raises a failure the client
-        // stored.
-        if let Some(pool) = self.pool.as_mut() {
-            ready.extend(pool.finished_writes()?);
+        // A shared L2 pool's finished writes are acknowledgments too: polled
+        // in every round, frozen or not.
+        if let Some(shared_l2) = self.shared_l2.as_mut() {
+            ready.extend(shared_l2.poll_writes()?);
         }
         if storage.tick.is_some() || !ready.is_empty() {
             if !ready.is_empty() {
@@ -901,8 +902,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if let Some(l3) = &self.l3 {
                 busy |= l3.submit(&plan)?;
             }
-            if let Some(pool) = self.pool.as_mut() {
-                busy |= pool.dispatch(&plan, self.in_flight.len())?;
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                busy |= shared_l2.dispatch(&plan, self.in_flight.len())?;
             }
             let cache_ops = plan.cache_ops();
             self.cache_ops.dispatched(&cache_ops);
@@ -927,7 +928,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
             });
         } else {
-            busy |= self.pool_round()?;
+            busy |= self.shared_l2_round()?;
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
                 &mut stop,
@@ -1048,10 +1049,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             Some(l3) => l3.submit(&plan)?,
             None => false,
         };
-        // So do a shared L2 pool's commands, on its client; its writes once
+        // So do a plan's shared L2 ops, on the pool's client; its writes once
         // the forwards in flight landed.
-        let pool_work = match self.pool.as_mut() {
-            Some(pool) => pool.dispatch(&plan, self.in_flight.len())?,
+        let shared_l2_work = match self.shared_l2.as_mut() {
+            Some(shared_l2) => shared_l2.dispatch(&plan, self.in_flight.len())?,
             None => false,
         };
         // Counted here because `execute` below always runs this plan.
@@ -1158,7 +1159,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             0
         };
         self.commit_down_to(depth, events, outputs, released)?;
-        Ok(device_work || storage_work || pool_work)
+        Ok(device_work || storage_work || shared_l2_work)
     }
 
     /// Export a round's snapshot on both serving and paused paths. The
@@ -1308,22 +1309,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// recomputed. An answer is no event of the head's batch: the proxy
     /// blocks it creates go back to the pool's client. Returns whether any
     /// prompt was asked about.
-    fn pool_round(&mut self) -> Result<bool, LoopError> {
-        let Some(pool) = self.pool.as_mut() else {
+    fn shared_l2_round(&mut self) -> Result<bool, LoopError> {
+        let Some(shared_l2) = self.shared_l2.as_mut() else {
             return Ok(false);
         };
-        let lookups = self.scheduler.take_shared_l2_lookups();
+        let lookups = self.scheduler.start_shared_l2_lookups();
         if lookups.is_empty() {
             return Ok(false);
         }
-        let _span = profile::span("Pool::lookup");
-        for answer in pool.lookup(&lookups)? {
-            let pages = self
-                .scheduler
-                .apply_shared_l2_lookup(&answer)
-                .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
-            pool.map_proxy_pages(&pages)?;
-        }
+        let _span = profile::span("EventLoop::shared_l2_round");
+        let answers = shared_l2.lookup(&lookups)?;
+        let proxy_blocks = self
+            .scheduler
+            .apply_shared_l2_answers(&answers)
+            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        shared_l2.map_proxy_blocks(&proxy_blocks);
         Ok(true)
     }
 
@@ -2355,14 +2355,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // A shared L2 pool has no weight version: its pages would be read
         // back under weights or a forward that did not compute them. Such an
         // operation is refused here, before it drains or flushes anything.
-        if self.pool.is_some()
+        if self.shared_l2.is_some()
             && (control::is_weight_load(&request)
                 || matches!(request, ControlRequest::ReloadForward(_)))
         {
             let refusal = "a shared L2 pool holds KV of the weights and forward the server \
                            started with; restart the ranks and clear the pool instead"
                 .to_owned();
-            tracing::info!(op = request.tag(), message = refusal, "refused with a pool");
+            tracing::info!(
+                op = request.tag(),
+                message = refusal,
+                "refused with a shared L2 pool"
+            );
             self.controls
                 .reply(control::gated_reply(&request, false, refusal));
             return Ok(());
@@ -2911,8 +2915,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let data_plane = &mut self.data_plane;
             let result =
                 ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
-            if let Some(pool) = self.pool.as_mut() {
-                pool.forward_committed()?;
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                shared_l2.forward_landed()?;
             }
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;

@@ -804,25 +804,25 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 65;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    config_.shared_l2_config = SharedL2Config{.max_writes = 1, .max_write_keys = 4};
+    config_.shared_l2_config = SharedL2Config{.max_writes_in_flight = 1, .max_keys_per_write = 4};
     config_ = WithHostPackingFromDevice(config_);
     scheduler_ = std::make_unique<Scheduler>(config_);
     CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
     const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
     // The pool holds nothing: every lookup is a miss.
     const auto miss = [&] {
-        std::vector<SharedL2LookupResult> answers;
-        for (const SharedL2Lookup& lookup : scheduler_->TakeSharedL2Lookups()) {
-            answers.push_back(SharedL2LookupResult{.request_id = lookup.request_id});
+        std::vector<SharedL2Answer> answers;
+        for (const SharedL2Lookup& lookup : scheduler_->StartSharedL2Lookups()) {
+            answers.push_back(SharedL2Answer{.request_id = lookup.request_id});
         }
-        scheduler_->ApplySharedL2Lookups(answers);
+        scheduler_->ApplySharedL2Answers(answers);
     };
     // The runtime's round: the last plan's writes are done, then the plan.
     std::vector<std::uint64_t> writing;
     const auto next_plan = [&] {
-        for (const std::uint64_t write_id : writing) {
+        for (const std::uint64_t op_id : writing) {
             ExecutionEvent done;
-            done.With(cache::SharedL2WriteDone{.write_id = write_id});
+            done.With(cache::SharedL2WriteDone{.op_id = op_id});
             scheduler_->Advance(std::move(done));
         }
         writing.clear();
@@ -832,12 +832,12 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
             if (write == nullptr) {
                 continue;
             }
-            writing.push_back(write->write_id);
+            writing.push_back(write->op_id);
             for (std::size_t i = 0; i < write->keys.size(); ++i) {
                 const auto& copies = plan.pages_to_copy.at(config_.cache_groups[write->keys[i].group_id].group_id);
-                EXPECT_TRUE(
-                    std::ranges::none_of(copies, [&](const auto& copy) { return copy.second == write->blocks[i]; }))
-                    << "a pool write reads block " << write->blocks[i] << ", which the plan's copy fills";
+                EXPECT_TRUE(std::ranges::none_of(
+                    copies, [&](const auto& copy) { return copy.second == write->device_blocks[i]; }))
+                    << "a pool write reads block " << write->device_blocks[i] << ", which the plan's copy fills";
             }
         }
         return plan;
@@ -917,24 +917,24 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 65;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    config_.shared_l2_config = SharedL2Config{.max_writes = 1, .max_write_keys = 16};
+    config_.shared_l2_config = SharedL2Config{.max_writes_in_flight = 1, .max_keys_per_write = 16};
     config_ = WithHostPackingFromDevice(config_);
     scheduler_ = std::make_unique<Scheduler>(config_);
     CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
     // The pool holds nothing: every lookup is a miss.
     const auto miss = [&] {
-        std::vector<SharedL2LookupResult> answers;
-        for (const SharedL2Lookup& lookup : scheduler_->TakeSharedL2Lookups()) {
-            answers.push_back(SharedL2LookupResult{.request_id = lookup.request_id});
+        std::vector<SharedL2Answer> answers;
+        for (const SharedL2Lookup& lookup : scheduler_->StartSharedL2Lookups()) {
+            answers.push_back(SharedL2Answer{.request_id = lookup.request_id});
         }
-        scheduler_->ApplySharedL2Lookups(answers);
+        scheduler_->ApplySharedL2Answers(answers);
     };
     // The runtime's round: the last plan's writes are done, then the plan.
     std::vector<std::uint64_t> writing;
     const auto next_plan = [&] {
-        for (const std::uint64_t write_id : writing) {
+        for (const std::uint64_t op_id : writing) {
             ExecutionEvent done;
-            done.With(cache::SharedL2WriteDone{.write_id = write_id});
+            done.With(cache::SharedL2WriteDone{.op_id = op_id});
             scheduler_->Advance(std::move(done));
         }
         writing.clear();
@@ -944,12 +944,12 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
             if (write == nullptr) {
                 continue;
             }
-            writing.push_back(write->write_id);
+            writing.push_back(write->op_id);
             for (std::size_t i = 0; i < write->keys.size(); ++i) {
                 const auto& copies = plan.pages_to_copy.at(config_.cache_groups[write->keys[i].group_id].group_id);
-                EXPECT_TRUE(
-                    std::ranges::none_of(copies, [&](const auto& copy) { return copy.second == write->blocks[i]; }))
-                    << "a pool write reads block " << write->blocks[i] << ", which the plan's copy fills";
+                EXPECT_TRUE(std::ranges::none_of(
+                    copies, [&](const auto& copy) { return copy.second == write->device_blocks[i]; }))
+                    << "a pool write reads block " << write->device_blocks[i] << ", which the plan's copy fills";
             }
         }
         return plan;

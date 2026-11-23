@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "cache/core/cache_types.h"
+#include "cache/prefix/checkpoint_tree.h"
 
 namespace tokenspeed {
 
@@ -41,26 +42,13 @@ struct SharedL2Config {
     // The pool writes in flight at once and the blocks one write carries:
     // together, the Device blocks pool writes pin. Publications beyond them
     // wait in the store queue, pinning nothing.
-    std::int32_t max_writes;
-    std::int32_t max_write_keys;
+    std::int32_t max_writes_in_flight;
+    std::int32_t max_keys_per_write;
     void Validate() const {
-        if (max_writes <= 0 || max_write_keys <= 0) {
+        if (max_writes_in_flight <= 0 || max_keys_per_write <= 0) {
             throw std::invalid_argument("shared L2 needs positive write limits");
         }
     }
-};
-
-// A State checkpoint's lineage, which the pool's owner records with the
-// checkpoint's State block: its tokens, the chain hashes of its full pages
-// and its tail. `publisher` is the access epoch of the request that published
-// it on this rank.
-struct SharedL2Publication {
-    std::vector<std::int32_t> tokens;
-    std::vector<std::string> prefix_hashes;
-    std::optional<TailPublication> tail;
-    std::uint64_t publisher{0};
-
-    bool operator==(const SharedL2Publication&) const = default;
 };
 
 // A waiting prompt's question to the pool: its full-page hashes and its
@@ -76,7 +64,7 @@ struct SharedL2Lookup {
 // prompt, pinned under `ticket` (0 pins nothing), each key with its bucket
 // and its pool page. kv_tokens is how far the pool's KV reaches, past the
 // checkpoint num_tokens resumes from. A miss is an answer that names no key.
-struct SharedL2LookupResult {
+struct SharedL2Answer {
     std::string request_id;
     std::uint64_t ticket;
     std::int32_t num_tokens;
@@ -84,27 +72,29 @@ struct SharedL2LookupResult {
     std::optional<TailPublication> tail;
     std::vector<CacheKey> keys;
     std::vector<std::int32_t> buckets;
-    std::vector<std::int32_t> pages;
+    std::vector<std::int32_t> pool_pages;
 };
 
 // A proxy Host block and the pool page whose bytes it stands for: a
 // load-back from the block reads the page.
-struct SharedL2ProxyPage {
+struct SharedL2ProxyBlock {
     std::uint32_t group_id;
-    std::int32_t block;
+    std::int32_t host_block;
     std::int32_t bucket;
-    std::int32_t page;
+    std::int32_t pool_page;
 };
 
 // Copies Device blocks into pool pages the owner grants and commits them
-// with the lineage of the checkpoints among them. Its Device blocks stay
+// with the checkpoints among them. Its Device blocks stay
 // pinned until the runtime reports cache::SharedL2WriteDone.
 struct SharedL2WriteOperation {
-    std::uint64_t write_id;
+    std::uint32_t op_id;
     std::vector<CacheKey> keys;
     std::vector<std::int32_t> buckets;
-    std::vector<std::int32_t> blocks;
-    std::vector<SharedL2Publication> publications;
+    std::vector<std::int32_t> device_blocks;
+    // Each State checkpoint among the blocks, which the
+    // pool's owner records with the checkpoint's State block.
+    std::vector<CheckpointTree::Checkpoint> checkpoints;
 
     bool operator==(const SharedL2WriteOperation&) const = default;
 };
@@ -131,7 +121,7 @@ namespace cache {
 // The runtime committed a pool write: the write's Device blocks are
 // released. A write that fails stops the runtime instead.
 struct SharedL2WriteDone {
-    std::uint64_t write_id;
+    std::uint32_t op_id;
 };
 
 }  // namespace cache

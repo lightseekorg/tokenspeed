@@ -1727,6 +1727,12 @@ class ServerArgs:
         return self.disaggregation_mode not in ("prefill", "encode")
 
     @property
+    def has_host_tier(self) -> bool:
+        """Whether this engine's scheduler has a Host tier: the local Host L2,
+        or a shared L2 pool in its place."""
+        return self.enable_kvstore or self.shared_l2_config is not None
+
+    @property
     def writes_state_checkpoints_in_forward(self) -> bool:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
@@ -3676,9 +3682,10 @@ class ServerArgs:
             "this rank's Host L2 (requires --disable-kvstore; prefill and fused "
             "instances of attention TP 1; not with L3 storage, KV offloading, "
             "retraction, --enable-memory-saver or --kvstore-write-policy "
-            "write_back). Fields: owner, device_names, request_timeout_ms, "
-            "connect_timeout_s, load_workers, write_workers, scheduler "
-            "{max_writes, max_write_keys}; see docs/configuration/server.md.",
+            "write_back). Fields: owner_address, device_names, "
+            "request_timeout_ms, join_timeout_s, read_workers, write_workers, "
+            "scheduler {max_writes_in_flight, max_keys_per_write}; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

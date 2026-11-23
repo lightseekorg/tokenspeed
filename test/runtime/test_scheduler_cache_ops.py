@@ -208,13 +208,13 @@ def test_plan_adapter_leaves_a_shared_l2_pools_commands_to_the_host():
     spec.request_id = "r"
     spec.tokens = list(range(1, 8))
     scheduler.submit_requests([spec])
-    [lookup] = scheduler.take_shared_l2_lookups()
+    [lookup] = scheduler.start_shared_l2_lookups()
     # The pool holds the prompt's first two pages.
     slots = [
         ((0, 0, page_hash, 0), 0, 11 + i) for i, page_hash in enumerate(lookup[1][:2])
     ]
     assert (
-        len(scheduler.apply_shared_l2_lookups([(lookup[0], 7, 4, 4, None, slots)])) == 2
+        len(scheduler.apply_shared_l2_answers([(lookup[0], 7, 4, 4, None, slots)])) == 2
     )
 
     # The load-back from the proxy blocks is the device's.
@@ -282,14 +282,16 @@ def _pool_config():
         disable_l2_cache=False,
         host_group_packing=(1,),
         cache_groups=[ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)],
-        shared_l2_config=ts.SharedL2Config(max_writes=2, max_write_keys=8),
+        shared_l2_config=ts.SharedL2Config(
+            max_writes_in_flight=2, max_keys_per_write=8
+        ),
     )
 
 
 def test_make_config_makes_the_host_tier_a_shared_l2_pools_proxy():
     assert _config().shared_l2_config is None
     limits = _pool_config().shared_l2_config
-    assert (limits.max_writes, limits.max_write_keys) == (2, 8)
+    assert (limits.max_writes_in_flight, limits.max_keys_per_write) == (2, 8)
 
 
 def test_make_config_states_the_snapshot_pool_on_every_role():

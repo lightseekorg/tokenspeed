@@ -124,6 +124,18 @@ def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
     specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
     without = _config(args, specs)
     assert without.shared_l2_config is None and without.disable_l2_cache is True
+    # The rank joined a pool (--shared-l2-config).
+    args.shared_l2_config = json.dumps(
+        {
+            "owner_address": "tcp://127.0.0.1:1",
+            "device_names": [""],
+            "request_timeout_ms": 1000,
+            "join_timeout_s": 5,
+            "read_workers": 1,
+            "write_workers": 1,
+            "scheduler": {"max_writes_in_flight": 3, "max_keys_per_write": 16},
+        }
+    )
     cfg = scheduler_config_from_args(
         args,
         specs,
@@ -136,10 +148,12 @@ def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
-        shared_l2_config=ts.SharedL2Config(max_writes=3, max_write_keys=16),
+        shared_l2_config=ts.SharedL2Config(
+            max_writes_in_flight=3, max_keys_per_write=16
+        ),
     )
     limits = cfg.shared_l2_config
-    assert (limits.max_writes, limits.max_write_keys) == (3, 16)
+    assert (limits.max_writes_in_flight, limits.max_keys_per_write) == (3, 16)
     # The pool is the Host L2: the local one is off, the proxy tier stays.
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
 

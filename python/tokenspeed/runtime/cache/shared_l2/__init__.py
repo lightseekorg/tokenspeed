@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared L2: one paged Host L2 pool that every prefill rank uses.
+"""Shared L2: one paged Host L2 pool that every rank joined to it uses.
 
 ``owner`` serves the pool's cache index (the scheduler's ``SharedL2Pool``)
 and holds no bytes; ``provider`` hosts one node's pool memory; ``wire`` is the
 request-reply wire to the owner.
 
-On a rank, ``client`` holds the pool's settings and the rank's hello,
+On a rank, ``client`` holds the rank's config and its hello,
 ``layout`` says where its Device blocks are and how a pool page holds one,
 ``executor`` is the forward thread's part of a load in the Host cache
 executor's place, and ``rank`` joins all of it to the pool at device

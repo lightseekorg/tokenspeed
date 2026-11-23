@@ -53,7 +53,7 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.layout import SharedL2Layout  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.owner import (  # noqa: E402
     SharedL2Owner,
-    make_pool,
+    make_shared_l2_pool,
 )
 from tokenspeed.runtime.cache.shared_l2.provider import run_provider  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
@@ -106,19 +106,17 @@ def connect():
 
 def store(connection: OwnerConnection, client: int, prompt) -> list:
     """Reserve and commit ``prompt``'s blocks and checkpoint; its keys."""
-    keys, buckets, _, publications = write_fields(prompt)
+    keys, buckets, _, checkpoints = write_fields(prompt)
     ticket = connection.request("reserve", client=client, keys=keys, buckets=buckets)[
         "ticket"
     ]
-    assert connection.request(
-        "commit", client=client, ticket=ticket, publications=publications
-    )["committed"]
+    connection.request("commit", client=client, ticket=ticket, checkpoints=checkpoints)
     return keys
 
 
-def probe(connection: OwnerConnection, client: int, prompt) -> list:
+def lookup(connection: OwnerConnection, client: int, prompt) -> list:
     (hit,) = connection.request(
-        "probe_many", client=client, lookups=[lookup_fields(prompt)]
+        "lookup", client=client, lookups=[lookup_fields(prompt)]
     )["hits"]
     return hit
 
@@ -137,11 +135,21 @@ def test_a_hello_is_not_ready_until_every_provider_joined(serve):
 
     owner.add_provider("node1", 4)
     reply = owner.admin.request("hello", client=1, **hello)
-    assert reply["ready"] and reply["lcm_bytes"] == LCM_BYTES
+    assert reply["ready"] and reply["lcm_block_bytes"] == LCM_BYTES
     # A provider's LCM blocks follow those of the providers before it.
     assert reply["providers"] == [
-        {"session": "node0", "base": 1 << 40, "lcm_blocks": 8, "start": 0},
-        {"session": "node1", "base": 1 << 40, "lcm_blocks": 4, "start": 8},
+        {
+            "session": "node0",
+            "base_address": 1 << 40,
+            "num_lcm_blocks": 8,
+            "first_lcm_block": 0,
+        },
+        {
+            "session": "node1",
+            "base_address": 1 << 40,
+            "num_lcm_blocks": 4,
+            "first_lcm_block": 8,
+        },
     ]
     assert owner.pool.num_lcm_blocks == 12 and owner.pool.geometry == GEOMETRY
     assert owner.admin.request("ping", client=1) == {"ok": True}
@@ -156,7 +164,7 @@ def test_the_first_client_sets_the_geometry_and_deployment_later_ones_match(
     assert len(owner.pools) == 1
 
     other_layout = copy.deepcopy(GEOMETRY)
-    other_layout["groups"][0]["host_packing"] = 4
+    other_layout["groups"][0]["host_group_packing"] = 4
     with pytest.raises(OwnerError, match="geometry differs"):
         owner.admin.request(
             "hello", client=3, geometry=other_layout, deployment_id=deployment_id()
@@ -170,12 +178,12 @@ def test_the_first_client_sets_the_geometry_and_deployment_later_ones_match(
         owner.admin.request(
             "hello",
             client=3,
-            geometry={**GEOMETRY, "lcm_bytes": 128},
+            geometry={**GEOMETRY, "lcm_block_bytes": 128},
             deployment_id=deployment_id(),
         )
     with pytest.raises(OwnerError, match="has not joined the pool"):
         owner.admin.request("ping", client=3)
-    assert owner.admin.request("stats")["clients"] == 2
+    assert owner.admin.request("stats")["num_clients"] == 2
 
 
 def test_providers_join_before_the_pool_runs(serve, connect):
@@ -184,25 +192,37 @@ def test_providers_join_before_the_pool_runs(serve, connect):
     with pytest.raises(OwnerError, match="every expected provider"):
         owner.add_provider("node2", 8)
     connect(owner, 1)
-    with pytest.raises(OwnerError, match="cannot join a running pool"):
+    with pytest.raises(OwnerError, match="every expected provider"):
         owner.add_provider("node2", 8)
 
 
 def test_the_first_client_sets_the_providers_shares(serve):
     owner = serve(num_providers=2, joined_providers=0)
     # Providers join with their bytes, whatever a block will hold.
-    owner.admin.request("provider", session="node0", base=4096, bytes=200)
-    owner.admin.request("provider", session="node1", base=8192, bytes=LCM_BYTES)
+    owner.admin.request("add_provider", session="node0", base_address=4096, bytes=200)
+    owner.admin.request(
+        "add_provider", session="node1", base_address=8192, bytes=LCM_BYTES
+    )
     hello = dict(geometry=GEOMETRY, deployment_id=deployment_id())
 
     reply = owner.admin.request("hello", client=1, **hello)
 
     # The pool is cut into the first client's LCM blocks; a provider's bytes
     # short of a whole block are left out.
-    assert reply["ready"] and reply["lcm_bytes"] == LCM_BYTES
+    assert reply["ready"] and reply["lcm_block_bytes"] == LCM_BYTES
     assert reply["providers"] == [
-        {"session": "node0", "base": 4096, "lcm_blocks": 3, "start": 0},
-        {"session": "node1", "base": 8192, "lcm_blocks": 1, "start": 3},
+        {
+            "session": "node0",
+            "base_address": 4096,
+            "num_lcm_blocks": 3,
+            "first_lcm_block": 0,
+        },
+        {
+            "session": "node1",
+            "base_address": 8192,
+            "num_lcm_blocks": 1,
+            "first_lcm_block": 3,
+        },
     ]
     assert owner.pool.num_lcm_blocks == 4
     assert owner.admin.request("stats")["providers"] == reply["providers"]
@@ -211,7 +231,7 @@ def test_the_first_client_sets_the_providers_shares(serve):
         owner.admin.request(
             "hello",
             client=2,
-            geometry={**GEOMETRY, "lcm_bytes": 128},
+            geometry={**GEOMETRY, "lcm_block_bytes": 128},
             deployment_id=deployment_id(),
         )
     assert owner.admin.request("hello", client=2, **hello)["providers"] == (
@@ -221,8 +241,12 @@ def test_the_first_client_sets_the_providers_shares(serve):
 
 def test_a_provider_smaller_than_a_block_stops_the_pool_from_being_built(serve):
     owner = serve(num_providers=2, joined_providers=0)
-    owner.admin.request("provider", session="node0", base=4096, bytes=10 * LCM_BYTES)
-    owner.admin.request("provider", session="small", base=8192, bytes=LCM_BYTES - 1)
+    owner.admin.request(
+        "add_provider", session="node0", base_address=4096, bytes=10 * LCM_BYTES
+    )
+    owner.admin.request(
+        "add_provider", session="small", base_address=8192, bytes=LCM_BYTES - 1
+    )
     hello = dict(client=1, geometry=GEOMETRY, deployment_id=deployment_id())
 
     # Every hello says which provider is too small, and no pool is built.
@@ -239,36 +263,38 @@ def test_a_provider_smaller_than_a_block_stops_the_pool_from_being_built(serve):
         owner.admin.request("ping", client=1)
 
 
-def test_probe_many_answers_every_lookup_in_order_and_pins_each_hit(serve, connect):
+def test_one_lookup_request_answers_every_prompt_in_order_and_pins_each_hit(
+    serve, connect
+):
     owner = serve()
     writer, reader = connect(owner, 1), connect(owner, 2)
     keys = store(writer, 1, PROMPT)
 
     hits = reader.request(
-        "probe_many",
+        "lookup",
         client=2,
         lookups=[lookup_fields(PROMPT + [6, 7]), lookup_fields([9, 9, 9])],
     )["hits"]
 
-    ticket, num_tokens, kv_tokens, tail, slots = hits[0]
+    ticket, num_tokens, kv_tokens, tail, pages = hits[0]
     assert ticket != 0 and (num_tokens, kv_tokens) == (5, 5)
     assert tail == list(prompt_keys(PROMPT)[1])
-    # Every slot is a key with its bucket and its pool page.
-    assert [(tuple(key), bucket) for key, bucket, _ in slots] == [
+    # Every page is a key with its bucket and its pool page.
+    assert [(tuple(key), bucket) for key, bucket, _ in pages] == [
         (key, 0) for key in keys
     ]
-    assert all(page > 0 for _, _, page in slots)
+    assert all(page > 0 for _, _, page in pages)
     assert hits[1] == [0, 0, 0, None, []]
     assert owner.stats()["pinned_blocks"] == len(keys)
     # The prompt's tokens reached the pool as the int32 bytes they left as.
     hashes, tokens, max_tokens = lookup_fields([9, 9, 9])
-    assert owner.pool.received["probe"] == (hashes, tokens, max_tokens)
+    assert owner.pool.received["lookup"] == (hashes, tokens, max_tokens)
 
 
 def test_a_write_is_reserved_then_committed(serve, connect):
     owner = serve(provider_blocks=4)
     first, second = connect(owner, 1), connect(owner, 2)
-    keys, buckets, _, publications = write_fields(PROMPT)
+    keys, buckets, _, checkpoints = write_fields(PROMPT)
     reserve = dict(keys=keys, buckets=buckets)
 
     reply = first.request("reserve", client=1, **reserve)
@@ -279,20 +305,21 @@ def test_a_write_is_reserved_then_committed(serve, connect):
     assert second.request("reserve", client=2, **reserve) == {
         "ok": True,
         "ticket": 0,
-        "pages": [-1] * len(keys),
+        "pages": [-3] * len(keys),
     }
     assert owner.stats()["reserved_blocks"] == len(keys)
 
     assert first.request(
-        "commit", client=1, ticket=reply["ticket"], publications=publications
-    )["committed"]
-    assert owner.pool.received["commit"] == publications
+        "commit", client=1, ticket=reply["ticket"], checkpoints=checkpoints
+    ) == {"ok": True}
+    assert owner.pool.received["commit"] == checkpoints
     stats = owner.stats()
     assert (stats["reserved_blocks"], stats["cached_blocks"]) == (0, len(keys))
-    # A ticket that reserves nothing commits nothing.
-    assert not first.request(
-        "commit", client=1, ticket=reply["ticket"], publications=publications
-    )["committed"]
+    # A ticket that reserves nothing is refused.
+    with pytest.raises(OwnerError, match="reserves nothing"):
+        first.request(
+            "commit", client=1, ticket=reply["ticket"], checkpoints=checkpoints
+        )
 
     # One free page is left of four: the second new block has no room.
     more = [(0, 0, "x", 0), (0, 0, "y", 0)]
@@ -306,15 +333,16 @@ def test_a_release_unpins_what_its_clients_lookup_hit(serve, connect):
     writer, reader = connect(owner, 1), connect(owner, 2)
     keys = store(writer, 1, PROMPT)
 
-    first = probe(reader, 2, PROMPT)[0]
-    second = probe(reader, 2, PROMPT)[0]
+    first = lookup(reader, 2, PROMPT)[0]
+    second = lookup(reader, 2, PROMPT)[0]
     assert first != second
     assert owner.stats()["pinned_blocks"] == 2 * len(keys)
 
     assert reader.request("release", client=2, ticket=first) == {"ok": True}
     assert owner.stats()["pinned_blocks"] == len(keys)
-    # A ticket is its client's: another client's release does not touch it.
-    writer.request("release", client=1, ticket=second)
+    # A ticket is its client's: another client's release is refused.
+    with pytest.raises(OwnerError, match="no lookup of its client holds"):
+        writer.request("release", client=1, ticket=second)
     assert owner.stats()["pinned_blocks"] == len(keys)
 
 
@@ -322,7 +350,7 @@ def test_a_silent_client_loses_what_it_held_and_is_told_so(serve, connect):
     owner = serve(client_timeout_s=0.5)
     silent, alive = connect(owner, 1), connect(owner, 2)
     store(alive, 2, PROMPT)
-    probe(silent, 1, PROMPT)
+    lookup(silent, 1, PROMPT)
     silent.request("reserve", client=1, keys=[(0, 0, "new", 0)], buckets=[0])
     assert owner.stats()["pinned_blocks"] > 0 and owner.stats()["reserved_blocks"] == 1
 
@@ -339,7 +367,7 @@ def test_a_silent_client_loses_what_it_held_and_is_told_so(serve, connect):
     with pytest.raises(OwnerError, match="has not joined the pool"):
         silent.request("release", client=1, ticket=1)
     assert alive.request("ping", client=2) == {"ok": True}
-    assert owner.admin.request("stats")["clients"] == 1
+    assert owner.admin.request("stats")["num_clients"] == 1
 
 
 def test_touch_clear_and_stats(serve, connect):
@@ -347,20 +375,17 @@ def test_touch_clear_and_stats(serve, connect):
     client = connect(owner, 1)
     keys = store(client, 1, PROMPT)
 
-    client.request("touch", client=1, keys=keys[:2], buckets=[0, 0])
+    client.request("touch", client=1, keys=keys[:2])
     assert owner.pool.touched == keys[:2]
-    # The pool holds one bucket per group so far.
-    with pytest.raises(OwnerError, match="bucket 0 only"):
-        client.request("touch", client=1, keys=keys[:1], buckets=[1])
 
-    ticket = probe(client, 1, PROMPT)[0]
+    ticket = lookup(client, 1, PROMPT)[0]
     assert owner.admin.request("clear") == {"ok": True, "cleared": False}
     client.request("release", client=1, ticket=ticket)
     assert owner.admin.request("clear") == {"ok": True, "cleared": True}
 
     reply = owner.admin.request("stats")
     assert reply["stats"]["cached_blocks"] == 0
-    assert reply["clients"] == 1 and len(reply["providers"]) == 1
+    assert reply["num_clients"] == 1 and len(reply["providers"]) == 1
 
 
 def test_a_failed_request_gets_an_error_and_the_owner_keeps_serving(serve, connect):
@@ -387,7 +412,7 @@ def test_a_stalled_owner_times_a_request_out_and_answers_the_next(serve, connect
             client.request("ping", client=1)
         owner.resume()
         # The late answer to the first ping is not taken for this request's.
-        assert client.request("stats")["clients"] == 1
+        assert client.request("stats")["num_clients"] == 1
         wait_until(lambda: client.request("ping", client=1) == {"ok": True})
     finally:
         client.close()
@@ -439,7 +464,7 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(
     provider = threading.Thread(
         target=run_provider,
         kwargs=dict(
-            owner=owner.address,
+            owner_address=owner.address,
             hostname="127.0.0.1",
             device_name="mlx5_0",
             size_bytes=8 * LCM_BYTES + 1,
@@ -454,7 +479,12 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(
         ((base, size),) = TransferEngine.registered.items()
         assert size == 8 * LCM_BYTES + 1
         assert owner.admin.request("hello", **hello)["providers"] == [
-            {"session": "127.0.0.1:12345", "base": base, "lcm_blocks": 8, "start": 0}
+            {
+                "session": "127.0.0.1:12345",
+                "base_address": base,
+                "num_lcm_blocks": 8,
+                "first_lcm_block": 0,
+            }
         ]
     finally:
         stop.set()
@@ -466,7 +496,7 @@ def test_a_provider_that_finds_no_mooncake_library_does_not_start(
     monkeypatch, tmp_path
 ):
     provider = dict(
-        owner="tcp://127.0.0.1:1",
+        owner_address="tcp://127.0.0.1:1",
         hostname="127.0.0.1",
         device_name="mlx5_0",
         size_bytes=LCM_BYTES,
@@ -497,7 +527,7 @@ def test_the_owner_service_runs_from_the_command_line():
             "tokenspeed.runtime.cache.shared_l2",
             "owner",
             f"--address={address}",
-            "--providers=1",
+            "--num-providers=1",
             "--headroom-lcm-blocks=0",
             "--client-timeout-s=60",
             "--checkpoint-retention-requests=0",
@@ -555,7 +585,7 @@ def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
             buffers=(bytearray(1),),
             consumers=(("k", "s", "w"),),
         ),
-        view_layers=(1,),
+        view_num_layers=(1,),
         group_specs=specs,
         cache_groups=[
             cache_group_config(spec, total_pages=0, cache_blocks_per_lcm_block=packing)
@@ -569,8 +599,8 @@ def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
         address=f"tcp://127.0.0.1:{get_free_port()}",
         num_providers=1,
         client_timeout_s=60.0,
-        make_pool=functools.partial(
-            make_pool,
+        make_shared_l2_pool=functools.partial(
+            make_shared_l2_pool,
             headroom_lcm_blocks=0,
             checkpoint_retention_requests=0,
             checkpoint_retention_leaf_distance=0,
@@ -579,10 +609,10 @@ def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
     try:
         owner.handle(
             {
-                "op": "provider",
+                "op": "add_provider",
                 "session": "node0",
-                "base": 0,
-                "bytes": 16 * geometry["lcm_bytes"],
+                "base_address": 0,
+                "bytes": 16 * geometry["lcm_block_bytes"],
             }
         )
         for client in (1, 2):
@@ -605,22 +635,22 @@ def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
         # An LCM block holds one KV page, three States or two window pages, as
         # the rank's Host tier packs them; each group numbers its own pages.
         assert reserved["pages"] == [1, 2, 3, 4, 5, 6, 19, 15, 16, 17, 18, 19, 20]
-        assert owner.handle(
+        owner.handle(
             {
                 "op": "commit",
                 "client": 1,
                 "ticket": reserved["ticket"],
-                "publications": write_fields(prompt)[3],
+                "checkpoints": write_fields(prompt)[3],
             }
-        )["committed"]
+        )
 
         # The owner matches as the rank's scheduler does. Of the window group
         # a hit needs, and pins, the sink's page and the last page.
-        ((_, num_tokens, _, _, slots),) = owner.handle(
-            {"op": "probe_many", "client": 2, "lookups": [lookup_fields(prompt)]}
+        ((_, num_tokens, _, _, pages),) = owner.handle(
+            {"op": "lookup", "client": 2, "lookups": [lookup_fields(prompt)]}
         )["hits"]
         assert num_tokens == len(prompt)
-        assert [key for key, _, _ in slots] == keys + [window[0], window[-1]]
+        assert [key for key, _, _ in pages] == keys + [window[0], window[-1]]
         assert owner.handle({"op": "stats"})["stats"]["pinned_blocks"] == len(keys) + 2
     finally:
         owner.close()

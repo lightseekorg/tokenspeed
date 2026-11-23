@@ -211,20 +211,21 @@ public:
     // and one new request counted toward the checkpoint retention window,
     // also for a probe that hit nothing. Per group the Host hits (holes
     // empty), then the tail's blocks.
-    CoordinatorMatch AcquireHostPrefix(PrefixProbe&& probe);
+    CoordinatorMatch PinHostPrefix(PrefixProbe&& probe);
     // Publishes `blocks` under `keys` on the Host with no Device publication,
     // and with them the State checkpoints whose block is among them, in a
     // Device publication's order (CacheCompletedBlocks): every checkpoint's
     // boundary is linked, the blocks register, then each checkpoint and its
-    // tail are recorded. publishers[i] stands for the request that published
+    // tail are recorded. access_epochs[i] stands for the request that published
     // checkpoints[i], as an access epoch does on the Device: the retention
     // ranking only compares it.
-    void PublishHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
-                           std::span<const CompletedPages> checkpoints, std::span<const std::uint64_t> publishers);
-    // The keys of the Device entries prefix hits acquire are collected from
-    // now on, for the caller to take once per plan: a shared L2 pool refreshes
+    void CacheWrittenHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                                std::span<const CompletedPages> checkpoints,
+                                std::span<const std::uint64_t> access_epochs);
+    // On, the keys of the Device entries prefix hits acquire are collected,
+    // for the caller to take once per plan: a shared L2 pool refreshes
     // its copies of them, as a rank's own Host tier refreshes its entries.
-    void CollectDeviceHits() { collects_device_hits_ = true; }
+    void SetDeviceHitCollection(bool enabled) { collects_device_hits_ = enabled; }
     std::vector<CacheKey> TakeDeviceHits() { return std::exchange(device_hits_, {}); }
 
     // Admit consumes the probe (PrefixProber) whether or not it admits; a
@@ -588,9 +589,9 @@ private:
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
-    // CollectDeviceHits: the keys of the blocks a Device hit acquired
+    // SetDeviceHitCollection: the keys of the blocks a Device hit acquired
     // (blocks[j] under keys[j], holes empty).
-    void collectDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks);
+    void recordDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
@@ -653,7 +654,7 @@ private:
     StorageQueries storage_;
     // The cache owners of the admitted requests.
     SessionRegistry sessions_;
-    // CollectDeviceHits.
+    // SetDeviceHitCollection.
     bool collects_device_hits_{false};
     std::vector<CacheKey> device_hits_;
 };

@@ -30,7 +30,6 @@ number). A prompt's tokens travel as int32 bytes.
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 
 import msgspec
@@ -43,24 +42,20 @@ class OwnerError(RuntimeError):
     reply of the wire."""
 
 
-class _ThreadSocket(threading.local):
-    """The calling thread's socket; None before its first request."""
-
-    def __init__(self):
-        self.socket: zmq.Socket | None = None
-
-
 class OwnerConnection:
-    """One REQ socket per calling thread; the owner reads a thread's requests
-    in the order the thread sent them."""
+    """One REQ socket, for one thread at a time; the owner reads its requests
+    in the order they were sent."""
 
     def __init__(self, address: str, *, timeout_ms: int):
-        self._context = zmq.Context.instance()
-        self._address = address
-        self._timeout_ms = timeout_ms
-        self._local = _ThreadSocket()
-        self._sockets: list[zmq.Socket] = []
-        self._lock = threading.Lock()
+        self._socket = zmq.Context.instance().socket(zmq.REQ)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        # A timed-out request leaves the socket usable for the next one,
+        # and its late reply is not taken for the next one's.
+        self._socket.setsockopt(zmq.REQ_RELAXED, 1)
+        self._socket.setsockopt(zmq.REQ_CORRELATE, 1)
+        self._socket.connect(address)
 
     def request(self, op: str, **fields: Any) -> dict[str, Any]:
         """Send one request and return its reply.
@@ -75,23 +70,9 @@ class OwnerConnection:
             OwnerError: The owner rejected the request, or the reply cannot
                 be decoded or lacks a field of the wire's reply.
         """
-        socket = self._local.socket
-        if socket is None:
-            socket = self._context.socket(zmq.REQ)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-            # A timed-out request leaves the socket usable for the next one,
-            # and its late reply is not taken for the next one's.
-            socket.setsockopt(zmq.REQ_RELAXED, 1)
-            socket.setsockopt(zmq.REQ_CORRELATE, 1)
-            socket.connect(self._address)
-            self._local.socket = socket
-            with self._lock:
-                self._sockets.append(socket)
         try:
-            socket.send(msgspec.msgpack.encode({"op": op, **fields}))
-            payload = socket.recv()
+            self._socket.send(msgspec.msgpack.encode({"op": op, **fields}))
+            payload = self._socket.recv()
         except zmq.Again as exc:
             raise TimeoutError(f"the shared L2 owner did not answer {op!r}") from exc
         try:
@@ -106,7 +87,4 @@ class OwnerConnection:
         raise OwnerError(f"the shared L2 owner rejected {op!r}: {reason}")
 
     def close(self) -> None:
-        with self._lock:
-            for socket in self._sockets:
-                socket.close(0)
-            self._sockets.clear()
+        self._socket.close(0)

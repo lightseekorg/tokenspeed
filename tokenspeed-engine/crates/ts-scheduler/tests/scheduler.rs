@@ -1544,7 +1544,7 @@ cfg.max_scheduled_tokens = 16
 cfg.max_batch_size = 4
 cfg.max_resident_requests = 4
 cfg.disable_l2_cache = False
-cfg.shared_l2_config = ts.SharedL2Config(max_writes=2, max_write_keys=8)
+cfg.shared_l2_config = ts.SharedL2Config(max_writes_in_flight=2, max_keys_per_write=8)
 cfg.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
 result = ts.Scheduler(cfg)
 "#;
@@ -1568,7 +1568,7 @@ fn pool_answer(lookup: &SharedL2LookupView, ticket: u64, pages: usize) -> Shared
             })
             .collect(),
         buckets: vec![0; pages],
-        pages: (11..11 + pages as i32).collect(),
+        pool_pages: (11..11 + pages as i32).collect(),
     }
 }
 
@@ -1580,7 +1580,7 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     scheduler
         .submit_requests(&[spec("waiting", (1..=7).collect())])
         .unwrap();
-    let lookups = scheduler.take_shared_l2_lookups();
+    let lookups = scheduler.start_shared_l2_lookups();
     let [lookup] = &lookups[..] else {
         panic!("one lookup, got {lookups:?}");
     };
@@ -1589,7 +1589,7 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     assert_eq!((lookup.max_tokens, lookup.prefix_hashes.len()), (6, 3));
     assert_eq!(lookup.tokens, [1, 2, 3, 4, 5, 6]);
     assert!(
-        scheduler.take_shared_l2_lookups().is_empty(),
+        scheduler.start_shared_l2_lookups().is_empty(),
         "handed out once"
     );
 
@@ -1598,13 +1598,13 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     assert!(!plan.needs_device());
     assert!(plan.shared_l2_ops().is_empty());
 
-    let pages = scheduler
-        .apply_shared_l2_lookup(&pool_answer(lookup, 7, 2))
+    let proxy_blocks = scheduler
+        .apply_shared_l2_answers(&[pool_answer(lookup, 7, 2)])
         .unwrap();
     assert_eq!(
-        pages
+        proxy_blocks
             .iter()
-            .map(|page| (page.group_id, page.bucket, page.page))
+            .map(|block| (block.group_id, block.bucket, block.pool_page))
             .collect::<Vec<_>>(),
         [(0, 0, 11), (0, 0, 12)]
     );
@@ -1637,7 +1637,7 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     let [release, write] = &ops[..] else {
         panic!("a release and a write, got {ops:?}");
     };
-    assert_eq!((release.kind, release.id), (SharedL2OpKind::Release, 7));
+    assert_eq!((release.kind, release.ticket), (SharedL2OpKind::Release, 7));
     // What the prompt computed goes to the pool: its third page and its
     // tail, not the two pages it loaded from there.
     assert_eq!(write.kind, SharedL2OpKind::Write);
@@ -1653,9 +1653,9 @@ fn a_pool_write_ends_with_its_completion() {
     scheduler
         .submit_requests(&[spec("writer", (1..=7).collect())])
         .unwrap();
-    let lookup = scheduler.take_shared_l2_lookups().remove(0);
+    let lookup = scheduler.start_shared_l2_lookups().remove(0);
     assert!(scheduler
-        .apply_shared_l2_lookup(&pool_answer(&lookup, 0, 0))
+        .apply_shared_l2_answers(&[pool_answer(&lookup, 0, 0)])
         .unwrap()
         .is_empty());
     scheduler.next_execution_plan(true, false);
@@ -1678,15 +1678,15 @@ fn a_pool_write_ends_with_its_completion() {
         lookup.prefix_hashes
     );
     assert_eq!(write.buckets, [0, 0, 0, 0]);
-    assert_eq!(write.blocks.len(), 4);
-    assert!(write.publications.is_empty(), "no State checkpoint");
+    assert_eq!(write.device_blocks.len(), 4);
+    assert!(write.checkpoints.is_empty(), "no State checkpoint");
     assert!(!scheduler.can_clear_cache());
 
     // Its completion joins the head batch as an acknowledgment and lets its
     // blocks go; a completion of a write that is not in flight is an error.
     let done = CacheEvent {
         kind: CacheEventKind::SharedL2WriteDone,
-        op_id: u32::try_from(write.id).unwrap(),
+        op_id: write.op_id,
     };
     scheduler
         .advance_head(&StorageRound::default(), std::slice::from_ref(&done))
@@ -1708,7 +1708,7 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
             spec("hit", (11..=17).collect()),
         ])
         .unwrap();
-    let lookups = scheduler.take_shared_l2_lookups();
+    let lookups = scheduler.start_shared_l2_lookups();
     let [missed, hit] = &lookups[..] else {
         panic!("two lookups, got {lookups:?}");
     };
@@ -1717,17 +1717,17 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
     // proxy cannot mirror: nothing of either is kept.
     let mut misfit = pool_answer(hit, 3, 1);
     misfit.num_tokens = 3;
-    let error = scheduler.apply_shared_l2_lookup(&misfit).unwrap_err();
+    let error = scheduler.apply_shared_l2_answers(&[misfit]).unwrap_err();
     assert!(error.what().contains("outside the prompt"), "{error}");
     let mut unhashed = pool_answer(hit, 3, 1);
     unhashed.keys[0].content_hash.clear();
-    let error = scheduler.apply_shared_l2_lookup(&unhashed).unwrap_err();
+    let error = scheduler.apply_shared_l2_answers(&[unhashed]).unwrap_err();
     assert!(error.what().contains("names keys"), "{error}");
     // A tail is its tokens and its hash: a hash without tokens is refused.
     let mut tokenless_tail = pool_answer(hit, 3, 1);
     tokenless_tail.tail_hash = hit.prefix_hashes[0].clone();
     let error = scheduler
-        .apply_shared_l2_lookup(&tokenless_tail)
+        .apply_shared_l2_answers(&[tokenless_tail])
         .unwrap_err();
     assert!(
         error.what().contains("tail lies strictly inside"),
@@ -1738,17 +1738,21 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
     let plan = scheduler.next_execution_plan(true, false);
     assert!(!plan.needs_device() && plan.shared_l2_ops().is_empty());
 
-    // A miss and a hit settle their lookups; a second answer for a request
-    // names no lookup that waits.
-    assert!(scheduler
-        .apply_shared_l2_lookup(&pool_answer(missed, 0, 0))
-        .unwrap()
-        .is_empty());
-    scheduler
-        .apply_shared_l2_lookup(&pool_answer(hit, 5, 2))
+    // A miss and a hit settle their lookups in one call, which returns the
+    // hit's proxy blocks alone; a second answer for a request names no
+    // lookup that waits.
+    let proxy_blocks = scheduler
+        .apply_shared_l2_answers(&[pool_answer(missed, 0, 0), pool_answer(hit, 5, 2)])
         .unwrap();
+    assert_eq!(
+        proxy_blocks
+            .iter()
+            .map(|block| block.pool_page)
+            .collect::<Vec<_>>(),
+        [11, 12]
+    );
     let error = scheduler
-        .apply_shared_l2_lookup(&pool_answer(hit, 6, 2))
+        .apply_shared_l2_answers(&[pool_answer(hit, 6, 2)])
         .unwrap_err();
     assert!(error.what().contains("no lookup that waits"), "{error}");
     // Neither does an answer for a request whose lookup was not handed out,
@@ -1761,7 +1765,7 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
             request_id: request_id.to_owned(),
             ..pool_answer(missed, 0, 0)
         };
-        let error = scheduler.apply_shared_l2_lookup(&answer).unwrap_err();
+        let error = scheduler.apply_shared_l2_answers(&[answer]).unwrap_err();
         assert!(error.what().contains("no lookup that waits"), "{error}");
     }
     let plan = scheduler.next_execution_plan(true, false);
@@ -1778,9 +1782,9 @@ fn a_plan_of_pool_commands_alone_needs_no_device() {
     scheduler
         .submit_requests(&[spec("gone", (1..=7).collect())])
         .unwrap();
-    let lookup = scheduler.take_shared_l2_lookups().remove(0);
+    let lookup = scheduler.start_shared_l2_lookups().remove(0);
     scheduler
-        .apply_shared_l2_lookup(&pool_answer(&lookup, 7, 2))
+        .apply_shared_l2_answers(&[pool_answer(&lookup, 7, 2)])
         .unwrap();
     // The request leaves before a plan admitted it: nothing holds the proxy
     // blocks of its hit, and the next plan releases the ticket.
@@ -1791,7 +1795,7 @@ fn a_plan_of_pool_commands_alone_needs_no_device() {
     assert_eq!(
         plan.shared_l2_ops()
             .iter()
-            .map(|op| (op.kind, op.id))
+            .map(|op| (op.kind, op.ticket))
             .collect::<Vec<_>>(),
         [(SharedL2OpKind::Release, 7)]
     );
@@ -1808,7 +1812,7 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
     scheduler
         .submit_requests(&[spec("plain", (1..=40).collect())])
         .unwrap();
-    assert!(scheduler.take_shared_l2_lookups().is_empty());
+    assert!(scheduler.start_shared_l2_lookups().is_empty());
     let answer = SharedL2AnswerView {
         request_id: "plain".to_owned(),
         ticket: 0,
@@ -1818,9 +1822,9 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
         tail_hash: String::new(),
         keys: Vec::new(),
         buckets: Vec::new(),
-        pages: Vec::new(),
+        pool_pages: Vec::new(),
     };
-    let error = scheduler.apply_shared_l2_lookup(&answer).unwrap_err();
+    let error = scheduler.apply_shared_l2_answers(&[answer]).unwrap_err();
     assert!(
         error.what().contains("without a configured pool"),
         "{error}"

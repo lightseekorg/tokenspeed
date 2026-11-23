@@ -42,14 +42,14 @@ from tokenspeed.runtime.utils.network import get_free_port
 LCM_BYTES = 64
 GEOMETRY = {
     "prefix_granularity": 2,
-    "lcm_bytes": LCM_BYTES,
+    "lcm_block_bytes": LCM_BYTES,
     "groups": [
         {
             "group_id": "kv",
             "attn_kind": "Full",
             "block_granularity": 2,
             "cache_blocks_per_lcm_block": 2,
-            "host_packing": 2,
+            "host_group_packing": 2,
             "shard_count": 1,
             "sliding_window_tokens": None,
             "sink_tokens": 0,
@@ -61,7 +61,7 @@ GEOMETRY = {
             "attn_kind": "State",
             "block_granularity": 0,
             "cache_blocks_per_lcm_block": 1,
-            "host_packing": 1,
+            "host_group_packing": 1,
             "shard_count": 1,
             "sliding_window_tokens": None,
             "sink_tokens": 0,
@@ -111,7 +111,7 @@ def prompt_keys(prompt: list[int]) -> tuple[list[str], tuple | None, list[tuple]
 
 
 def write_fields(prompt: list[int]) -> tuple[list, list, list, list]:
-    """The keys, buckets, Device blocks and publications of the write that
+    """The keys, buckets, Device blocks and checkpoints of the write that
     stores ``prompt`` with the checkpoint at its end."""
     hashes, tail, keys = prompt_keys(prompt)
     return (
@@ -136,7 +136,7 @@ def wait_until(predicate, *, timeout_s: float = 5.0) -> None:
 class FakePool:
     """The scheduler's ``SharedL2Pool``'s interface over plain dicts.
 
-    A committed publication is a checkpoint: a probe whose tokens start with
+    A committed checkpoint is one a lookup can hit: a lookup whose tokens start with
     its tokens hits it and pins the blocks its write asked for.
     """
 
@@ -148,7 +148,7 @@ class FakePool:
         self.cached = {}
         # (tokens, tail, [(key, bucket)]).
         self.checkpoints = []
-        # (client, ticket) -> slots.
+        # (client, ticket) -> pages.
         self.pins = {}
         # (client, ticket) -> ({(key, bucket): page}, every (key, bucket)).
         self.reserved = {}
@@ -165,8 +165,8 @@ class FakePool:
         if method in self.failing:
             raise RuntimeError(f"{method} failed")
 
-    def probe(self, client, prefix_hashes, tokens, max_tokens):
-        self._called("probe", received=(prefix_hashes, tokens, max_tokens))
+    def lookup(self, client, prefix_hashes, tokens, max_tokens):
+        self._called("lookup", received=(prefix_hashes, tokens, max_tokens))
         hit = max(
             (found for found in self.checkpoints if tokens.startswith(found[0])),
             key=lambda found: len(found[0]),
@@ -176,21 +176,27 @@ class FakePool:
             return (0, 0, 0, None, [])
         hit_tokens, tail, blocks = hit
         ticket = next(self._tickets)
-        slots = [(key, bucket, self.cached[key, bucket]) for key, bucket in blocks]
-        self.pins[client, ticket] = slots
-        return (ticket, len(hit_tokens) // 4, len(hit_tokens) // 4, tail, slots)
+        pages = [(key, bucket, self.cached[key, bucket]) for key, bucket in blocks]
+        self.pins[client, ticket] = pages
+        return (ticket, len(hit_tokens) // 4, len(hit_tokens) // 4, tail, pages)
 
     def release(self, client, ticket):
         self._called("release")
-        self.pins.pop((client, ticket), None)
+        if (client, ticket) not in self.pins:
+            raise ValueError(
+                "a shared L2 release names a ticket no lookup of its client holds"
+            )
+        del self.pins[client, ticket]
 
     def reserve(self, client, keys, buckets):
         self._called("reserve", received=(keys, buckets))
         writing = {block for placed, _ in self.reserved.values() for block in placed}
         placed, pages = {}, []
         for block in zip(keys, buckets, strict=True):
-            if block in self.cached or block in writing or block in placed:
+            if block in self.cached:
                 pages.append(-1)
+            elif block in writing or block in placed:
+                pages.append(-3)
             elif not self._free:
                 pages.append(-2)
             else:
@@ -202,15 +208,17 @@ class FakePool:
         self.reserved[client, ticket] = (placed, list(zip(keys, buckets)))
         return (ticket, pages)
 
-    def commit(self, client, ticket, publications):
-        self._called("commit", received=publications)
-        placed, blocks = self.reserved.pop((client, ticket), (None, None))
-        if placed is None:
-            return False
+    def commit(self, client, ticket, checkpoints):
+        self._called("commit", received=checkpoints)
+        if (client, ticket) not in self.reserved:
+            raise ValueError(
+                "a shared L2 commit names a ticket under which its client "
+                "reserves nothing"
+            )
+        placed, blocks = self.reserved.pop((client, ticket))
         self.cached.update(placed)
-        for tokens, _, tail, _ in publications:
+        for tokens, _, tail, _ in checkpoints:
             self.checkpoints.append((tokens, tail, blocks))
-        return True
 
     def touch(self, keys):
         self.touched.extend(keys)
@@ -222,7 +230,7 @@ class FakePool:
                 if owner == client:
                     del held[owner, ticket]
 
-    def clear(self):
+    def clear_cache(self):
         if self.pins or self.reserved:
             return False
         self._free.extend(self.cached.values())
@@ -232,12 +240,12 @@ class FakePool:
 
     def stats(self):
         return {
-            "total_lcm_blocks": self.num_lcm_blocks,
-            "free_lcm_blocks": len(self._free),
+            "num_lcm_blocks": self.num_lcm_blocks,
+            "empty_lcm_blocks": len(self._free),
             "cached_blocks": len(self.cached),
-            "pinned_blocks": sum(len(slots) for slots in self.pins.values()),
+            "pinned_blocks": sum(len(pages) for pages in self.pins.values()),
             "reserved_blocks": sum(len(placed) for placed, _ in self.reserved.values()),
-            "lookups": len(self.pins),
+            "open_lookups": len(self.pins),
             "evicted_blocks": 0,
             "checkpoints": len(self.checkpoints),
         }
@@ -273,7 +281,7 @@ class ServedOwner:
                     address=self.address,
                     num_providers=num_providers,
                     client_timeout_s=client_timeout_s,
-                    make_pool=self._make_pool,
+                    make_shared_l2_pool=self._make_pool,
                 )
                 break
             except zmq.ZMQError:
@@ -298,7 +306,10 @@ class ServedOwner:
 
     def add_provider(self, session: str, blocks: int) -> None:
         self.admin.request(
-            "provider", session=session, base=1 << 40, bytes=blocks * LCM_BYTES
+            "add_provider",
+            session=session,
+            base_address=1 << 40,
+            bytes=blocks * LCM_BYTES,
         )
 
     def stats(self) -> dict:

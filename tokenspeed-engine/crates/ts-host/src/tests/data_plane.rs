@@ -210,7 +210,7 @@ fn plane() -> (Py<PyAny>, Scheduler) {
 /// The data plane of a rank that joined no shared L2 pool.
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
     let (plane, shared_l2_handle) = Python::attach(|py| {
-        let shared_l2_handle = Py::new(py, crate::pool::Handle::new()).unwrap();
+        let shared_l2_handle = Py::new(py, crate::shared_l2::Handle::new()).unwrap();
         (plane.clone_ref(py), shared_l2_handle)
     });
     PythonDataPlane::start(plane, None, shared_l2_handle).unwrap()
@@ -792,12 +792,12 @@ def settings(owner_address, signal_words_address):
         owner_address=owner_address,
         client_id=7,
         request_timeout_ms=5000,
-        load_workers=2,
+        read_workers=2,
         write_workers=1,
-        lcm_bytes=64,
+        lcm_block_bytes=64,
         providers=[
-            Fields(session="node0", base=10000, lcm_blocks=3, start=0),
-            Fields(session="node1", base=20000, lcm_blocks=5, start=3),
+            Fields(session="node0", base_address=10000, num_lcm_blocks=3, first_lcm_block=0),
+            Fields(session="node1", base_address=20000, num_lcm_blocks=5, first_lcm_block=3),
         ],
         groups=[
             # Two KV pages in an LCM block, k then v; a State page fills one.
@@ -809,14 +809,14 @@ def settings(owner_address, signal_words_address):
                         device_address=0,
                         device_stride=32,
                         bytes=12,
-                        page_offset=0,
+                        offset_in_page=0,
                         layer=0,
                     ),
                     Fields(
                         device_address=16,
                         device_stride=32,
                         bytes=16,
-                        page_offset=12,
+                        offset_in_page=12,
                         layer=1,
                     ),
                 ],
@@ -829,7 +829,7 @@ def settings(owner_address, signal_words_address):
                         device_address=2000,
                         device_stride=64,
                         bytes=64,
-                        page_offset=0,
+                        offset_in_page=0,
                         layer=1,
                     )
                 ],
@@ -865,7 +865,7 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
     };
 
     use ts_control::peer::read::Arena;
-    use ts_scheduler::{CacheEvent, CacheEventKind, SharedL2PageView};
+    use ts_scheduler::{CacheEvent, CacheEventKind, SharedL2ProxyBlockView};
 
     // The rank's Python data plane: it acknowledges a write-back whenever
     // it is asked for cache acknowledgments.
@@ -879,7 +879,7 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
         let globals = PyDict::new(py);
         py.run(&CString::new(POOL_RANK).unwrap(), Some(&globals), None)
             .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
-        let handle = Bound::new(py, crate::pool::Handle::new()).unwrap();
+        let handle = Bound::new(py, crate::shared_l2::Handle::new()).unwrap();
         (handle.unbind(), globals.unbind())
     });
     let mut data_plane = {
@@ -919,7 +919,7 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
             .unwrap()
             .call1((&address, words.as_ptr() as usize))
             .unwrap();
-        crate::pool::client_settings(&settings)
+        crate::shared_l2::settings_from_python(&settings)
             .unwrap_or_else(|error| panic!("{}", describe(py, &error)))
     });
     assert_eq!(
@@ -928,7 +928,7 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
     );
     assert_eq!(settings.request_timeout, Duration::from_secs(5));
     assert_eq!(
-        (settings.load_workers.get(), settings.write_workers.get()),
+        (settings.read_workers.get(), settings.write_workers.get()),
         (2, 1)
     );
     assert_eq!(settings.geometry.num_layers, 2);
@@ -964,22 +964,20 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
 
     // The forward thread hands a load over; a proxy block that stands for
     // no page is refused there.
-    client
-        .map_proxy_pages(&[
-            SharedL2PageView {
-                group_id: 0,
-                block: 100,
-                bucket: 0,
-                page: 7,
-            },
-            SharedL2PageView {
-                group_id: 1,
-                block: 101,
-                bucket: 0,
-                page: 2,
-            },
-        ])
-        .unwrap();
+    client.map_proxy_blocks(&[
+        SharedL2ProxyBlockView {
+            group_id: 0,
+            host_block: 100,
+            bucket: 0,
+            pool_page: 7,
+        },
+        SharedL2ProxyBlockView {
+            group_id: 1,
+            host_block: 101,
+            bucket: 0,
+            pool_page: 2,
+        },
+    ]);
     assert!(call("unmapped")
         .unwrap_err()
         .contains("stands for no pool page"));

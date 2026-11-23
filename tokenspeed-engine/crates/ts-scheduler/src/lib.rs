@@ -210,7 +210,8 @@ mod ffi {
         Cancel,
     }
 
-    /// A content-addressed cache key a storage operation names (`CacheKey`).
+    /// A content-addressed cache key that a storage operation, a shared L2
+    /// answer or a shared L2 op names (`CacheKey`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct StorageKeyView {
         /// The cache group, by index.
@@ -625,7 +626,7 @@ mod ffi {
         max_tokens: i32,
     }
 
-    /// The pool's answer to a lookup (`SharedL2LookupResult`): its longest
+    /// The pool's answer to a lookup (`SharedL2Answer`): its longest
     /// reusable prefix of the prompt, pinned under `ticket`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SharedL2AnswerView {
@@ -646,27 +647,27 @@ mod ffi {
         /// Each key's shard.
         buckets: Vec<i32>,
         /// Each key's pool page.
-        pages: Vec<i32>,
+        pool_pages: Vec<i32>,
     }
 
     /// A proxy Host block an answer created, and the pool page a load-back
-    /// from it reads (`SharedL2ProxyPage`).
+    /// from it reads (`SharedL2ProxyBlock`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct SharedL2PageView {
+    struct SharedL2ProxyBlockView {
         /// The cache group, by index.
         group_id: u32,
         /// The proxy Host block.
-        block: i32,
+        host_block: i32,
         /// The page's shard.
         bucket: i32,
         /// The pool page, within the group.
-        page: i32,
+        pool_page: i32,
     }
 
-    /// A State checkpoint's lineage, which a pool write commits with the
-    /// checkpoint's block (`SharedL2Publication`).
+    /// A State checkpoint, which a pool write commits with the
+    /// checkpoint's block (`CheckpointTree::Checkpoint`).
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SharedL2PublicationView {
+    struct SharedL2CheckpointView {
         /// The checkpoint's tokens.
         tokens: Vec<i32>,
         /// The chain hashes of its full pages.
@@ -675,11 +676,11 @@ mod ffi {
         tail_tokens: i32,
         /// The partial last page's hash, with `tail_tokens`.
         tail_hash: String,
-        /// The request that published it, as the owner tells requests apart.
-        publisher: u64,
+        /// The access epoch of the request that published it on this rank.
+        access_epoch: u64,
     }
 
-    /// The kind of a plan's shared L2 pool command.
+    /// The kind of a plan's shared L2 op.
     #[derive(Debug)]
     enum SharedL2OpKind {
         /// Copy Device blocks into the pool (`SharedL2WriteOperation`).
@@ -690,21 +691,23 @@ mod ffi {
         Touch,
     }
 
-    /// A shared L2 pool command a plan carries, for the rank's pool client.
+    /// A shared L2 op a plan carries, for the rank's pool client.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SharedL2OpView {
         /// What it does.
         kind: SharedL2OpKind,
-        /// A write's id, a release's ticket; unused by a touch.
-        id: u64,
+        /// A write's id; unused by the other kinds.
+        op_id: u32,
+        /// A release's ticket; unused by the other kinds.
+        ticket: u64,
         /// A write's or a touch's keys.
         keys: Vec<StorageKeyView>,
         /// A write's shard per key.
         buckets: Vec<i32>,
         /// A write's source Device block per key.
-        blocks: Vec<i32>,
+        device_blocks: Vec<i32>,
         /// The checkpoints among a write's blocks.
-        publications: Vec<SharedL2PublicationView>,
+        checkpoints: Vec<SharedL2CheckpointView>,
     }
 
     unsafe extern "C++" {
@@ -792,11 +795,11 @@ mod ffi {
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
-        fn take_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
-        fn apply_shared_l2_lookup(
+        fn start_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
+        fn apply_shared_l2_answers(
             scheduler: Pin<&mut Scheduler>,
-            answer: &SharedL2AnswerView,
-        ) -> Result<Vec<SharedL2PageView>>;
+            answers: &[SharedL2AnswerView],
+        ) -> Result<Vec<SharedL2ProxyBlockView>>;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
@@ -828,8 +831,8 @@ pub use ffi::{
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
     PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
-    SharedL2PageView, SharedL2PublicationView, StorageCancellationView, StorageDoneView,
+    SchedulerSizes, SharedL2AnswerView, SharedL2CheckpointView, SharedL2LookupView, SharedL2OpKind,
+    SharedL2OpView, SharedL2ProxyBlockView, StorageCancellationView, StorageDoneView,
     StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
     TransferBatchView,
 };
@@ -1003,21 +1006,21 @@ impl Scheduler {
     /// out yet, each once. A prompt is admitted only once its lookup is
     /// answered; one whose Device prefix covers what it may reuse asks
     /// nothing.
-    pub fn take_shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
-        let _span = profile::span("Scheduler::take_shared_l2_lookups");
-        ffi::take_shared_l2_lookups(self.pinned())
+    pub fn start_shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
+        let _span = profile::span("Scheduler::start_shared_l2_lookups");
+        ffi::start_shared_l2_lookups(self.pinned())
     }
 
-    /// Settle a lookup with the pool's answer. Returns the proxy Host blocks
-    /// created, for the pool's loader. Fails on an answer the scheduler
-    /// cannot take: one no lookup waits for, or that does not fit its
-    /// prompt.
-    pub fn apply_shared_l2_lookup(
+    /// Settle the lookups with the pool's answers, in order. Returns the
+    /// proxy Host blocks created, for the pool's loader. Fails on an answer
+    /// the scheduler cannot take: one no lookup waits for, or that does not
+    /// fit its prompt; the answers after it are not applied.
+    pub fn apply_shared_l2_answers(
         &mut self,
-        answer: &SharedL2AnswerView,
-    ) -> Result<Vec<SharedL2PageView>, cxx::Exception> {
-        let _span = profile::span("Scheduler::apply_shared_l2_lookup");
-        ffi::apply_shared_l2_lookup(self.pinned(), answer)
+        answers: &[SharedL2AnswerView],
+    ) -> Result<Vec<SharedL2ProxyBlockView>, cxx::Exception> {
+        let _span = profile::span("Scheduler::apply_shared_l2_answers");
+        ffi::apply_shared_l2_answers(self.pinned(), answers)
     }
 
     /// Feed the round head's peer events back: the agreed peer clock, then
@@ -1319,7 +1322,7 @@ impl ExecutionPlan {
 
     /// Whether the data plane has anything to do for this plan: a batch,
     /// a Host copy (cache op), pages to zero or copy, or a remote stream.
-    /// Storage operations are the L3 executor's and shared L2 pool commands
+    /// Storage operations are the L3 executor's and shared L2 ops
     /// the pool client's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
@@ -1373,7 +1376,7 @@ impl ExecutionPlan {
         ffi::plan_storage_ops(&self.0)
     }
 
-    /// The shared L2 pool commands the plan carries, in plan order; the
+    /// The shared L2 ops the plan carries, in plan order; the
     /// rank's pool client runs them.
     pub fn shared_l2_ops(&self) -> Vec<SharedL2OpView> {
         ffi::plan_shared_l2_ops(&self.0)

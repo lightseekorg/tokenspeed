@@ -164,11 +164,16 @@ void SchedulerConfig::Validate() const {
     }
     if (shared_l2_config) {
         shared_l2_config->Validate();
+        // A lookup asks for a prompt's cacheable prefix, and a write stores
+        // what prefix caching publishes.
+        if (disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: shared L2 requires prefix caching");
+        }
         if (enable_l3_storage) {
-            throw std::invalid_argument("Scheduler: shared L2 and L3 storage are exclusive");
+            throw std::invalid_argument("Scheduler: shared L2 excludes L3 storage");
         }
         if (!HasHostCache()) {
-            throw std::invalid_argument("Scheduler: shared L2 needs its proxy Host tier");
+            throw std::invalid_argument("Scheduler: shared L2 requires a Host L2 cache");
         }
         if (role == Role::kD) {
             throw std::invalid_argument("Scheduler: the decode role does not use shared L2");
@@ -182,7 +187,9 @@ void SchedulerConfig::Validate() const {
         // A retraction image's L2 leg would write into the proxy, which holds
         // no bytes.
         if (HasSnapshotPool()) {
-            throw std::invalid_argument("Scheduler: shared L2 ranks do not retract");
+            throw std::invalid_argument(
+                "Scheduler: shared L2 ranks never retract and take no snapshot pool (--retraction-snapshot-host-gb "
+                "must be 0)");
         }
         // A peer holder would export the proxy's Host entries, which hold no
         // bytes for the reader.
@@ -191,7 +198,7 @@ void SchedulerConfig::Validate() const {
         }
         for (const CacheGroupConfig& group : cache_groups) {
             if (group.shard_count != 1) {
-                throw std::invalid_argument("Scheduler: shared L2 needs replicated groups");
+                throw std::invalid_argument("Scheduler: shared L2 requires replicated groups");
             }
         }
     }

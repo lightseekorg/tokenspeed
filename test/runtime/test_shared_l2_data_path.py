@@ -63,7 +63,7 @@ from tokenspeed.runtime.cache.l2.layerwise_load import (  # noqa: E402
 )
 from tokenspeed.runtime.cache.shared_l2 import executor as executor_module  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.client import (  # noqa: E402
-    SharedL2PoolView,
+    JoinedSharedL2Pool,
     SharedL2Provider,
 )
 from tokenspeed.runtime.cache.shared_l2.executor import (  # noqa: E402
@@ -113,13 +113,13 @@ SPECS = (
 CONSUMERS = (("layer.0.k",), ("layer.1.v", "layer.1.s"))
 # A pool of 8 LCM blocks on two providers, as a hello describes it.
 PROVIDER_BLOCKS = (3, 5)
-POOL = SharedL2PoolView(
-    client=1,
+POOL = JoinedSharedL2Pool(
+    client_id=1,
     providers=(
         SharedL2Provider("p0", 1 << 40, 3, 0),
         SharedL2Provider("p1", 1 << 41, 5, 3),
     ),
-    lcm_bytes=28,
+    lcm_block_bytes=28,
 )
 
 
@@ -152,7 +152,7 @@ class Arena:
                 buffers=(self.kv, self.state),
                 consumers=CONSUMERS,
             ),
-            view_layers=(len(CONSUMERS),),
+            view_num_layers=(len(CONSUMERS),),
             group_specs=SPECS,
             cache_groups=[
                 cache_group_config(spec, total_pages=0, cache_blocks_per_lcm_block=n)
@@ -347,11 +347,11 @@ class Rank:
         self.executor = SharedL2LoadExecutor(
             self.arena.layout,
             self.shared_l2_handle,
-            signals=words,
-            trackers=[(self.tracker, len(CONSUMERS))],
-            pool=POOL,
+            make_signal_words=words,
+            load_trackers=[(self.tracker, len(CONSUMERS))],
+            joined_pool=POOL,
         )
-        self.words = self.executor._signals
+        self.words = self.executor._signal_words
         self.shared_l2_handle.words = self.words
         # The stream the forward's layer waits go to.
         self.forward = executor_module.device_module.current_stream()
@@ -416,13 +416,13 @@ def assert_loaded(reader: Arena, writer: Arena) -> None:
 
 def test_a_pool_is_laid_out_as_a_ranks_host_tier():
     layout = Arena().layout
-    transfer = layout.transfer
-    lcm_bytes = layout.geometry["lcm_bytes"]
-    assert lcm_bytes == compute_host_lcm_block_bytes(transfer, group_specs=SPECS)
-    assert layout.host_packing == compute_host_group_packing(
+    transfer = layout.transfer_layout
+    lcm_block_bytes = layout.geometry["lcm_block_bytes"]
+    assert lcm_block_bytes == compute_host_lcm_block_bytes(transfer, group_specs=SPECS)
+    assert layout.host_group_packing == compute_host_group_packing(
         transfer, group_specs=SPECS
     )
-    assert (lcm_bytes, layout.host_packing) == (28, (1, 2))
+    assert (lcm_block_bytes, layout.host_group_packing) == (28, (1, 2))
     assert (layout.block_bytes, layout.field_offsets) == ((28, 12), ((0, 12), (0,)))
 
 
@@ -431,15 +431,19 @@ def test_the_host_gets_every_field_of_a_group_in_page_order():
     kv, state = arena.kv.data_ptr(), arena.state.data_ptr()
     assert arena.layout.page_fields(KV) == (
         SharedL2PageField(
-            device_address=kv, device_stride=32, bytes=12, page_offset=0, layer=0
+            device_address=kv, device_stride=32, bytes=12, offset_in_page=0, layer=0
         ),
         SharedL2PageField(
-            device_address=kv + 16, device_stride=32, bytes=16, page_offset=12, layer=1
+            device_address=kv + 16,
+            device_stride=32,
+            bytes=16,
+            offset_in_page=12,
+            layer=1,
         ),
     )
     assert arena.layout.page_fields(STATE) == (
         SharedL2PageField(
-            device_address=state, device_stride=16, bytes=12, page_offset=0, layer=1
+            device_address=state, device_stride=16, bytes=12, offset_in_page=0, layer=1
         ),
     )
 
@@ -448,14 +452,14 @@ def test_the_geometry_is_the_schedulers_view_of_the_groups():
     layout = Arena().layout
     assert layout.geometry == {
         "prefix_granularity": 2,
-        "lcm_bytes": 28,
+        "lcm_block_bytes": 28,
         "groups": [
             {
                 "group_id": "kv",
                 "attn_kind": "Full",
                 "block_granularity": 2,
                 "cache_blocks_per_lcm_block": 4,
-                "host_packing": 1,
+                "host_group_packing": 1,
                 "shard_count": 1,
                 "sliding_window_tokens": None,
                 "sink_tokens": 0,
@@ -467,7 +471,7 @@ def test_the_geometry_is_the_schedulers_view_of_the_groups():
                 "attn_kind": "State",
                 "block_granularity": 0,
                 "cache_blocks_per_lcm_block": 8,
-                "host_packing": 2,
+                "host_group_packing": 2,
                 "shard_count": 1,
                 "sliding_window_tokens": None,
                 "sink_tokens": 0,
@@ -479,7 +483,7 @@ def test_the_geometry_is_the_schedulers_view_of_the_groups():
     # What crosses the owner's wire unchanged.
     assert json.loads(json.dumps(layout.geometry)) == layout.geometry
     assert layout.registration_regions() == tuple(
-        (buffer.data_ptr(), buffer.nbytes) for buffer in layout.transfer.buffers
+        (buffer.data_ptr(), buffer.nbytes) for buffer in layout.transfer_layout.buffers
     )
 
 
@@ -498,8 +502,8 @@ def test_a_sharded_group_cannot_join_a_pool():
     )
     with pytest.raises(ValueError, match="replicated cache groups only"):
         SharedL2Layout.build(
-            layout.transfer,
-            view_layers=layout.view_layers,
+            layout.transfer_layout,
+            view_num_layers=layout.view_num_layers,
             group_specs=sharded,
             cache_groups=[],
             prefix_granularity=2,
@@ -522,7 +526,7 @@ class CachePoolView:
 
 def test_the_layout_is_read_from_the_cache_pools():
     by_hand = Arena().layout
-    target = CachePoolView(by_hand.transfer)
+    target = CachePoolView(by_hand.transfer_layout)
     # The scheduler's groups, as the device build hands them over.
     cache_groups = [
         cache_group_config(spec, total_pages=0, cache_blocks_per_lcm_block=packing)
@@ -568,9 +572,13 @@ def test_the_layout_is_read_from_the_cache_pools():
     layout = build_shared_l2_layout(
         target, draft, cache_groups=cache_groups, prefix_granularity=2
     )
-    assert layout.view_layers == (2, 1)
-    assert layout.transfer.consumers == CONSUMERS + (("layer.2.k",),)
-    assert (layout.block_bytes, layout.geometry["lcm_bytes"], layout.host_packing) == (
+    assert layout.view_num_layers == (2, 1)
+    assert layout.transfer_layout.consumers == CONSUMERS + (("layer.2.k",),)
+    assert (
+        layout.block_bytes,
+        layout.geometry["lcm_block_bytes"],
+        layout.host_group_packing,
+    ) == (
         (34, 12),
         34,
         (1, 2),
@@ -583,7 +591,7 @@ def test_the_layout_is_read_from_the_cache_pools():
         device_address=arena.data_ptr() + 48,
         device_stride=64,
         bytes=6,
-        page_offset=28,
+        offset_in_page=28,
         layer=2,
     )
 
@@ -764,11 +772,10 @@ def test_the_executor_describes_the_proxy_tier_to_the_device_build(ranks):
     executor = ranks().executor
     # No local Host bytes, no snapshot pool; the proxy tier has room for the
     # pool twice over, packed as the pool is.
-    assert executor.host_storage is None and executor.block_owners is None
+    assert executor.host_storage is None
     assert executor.num_host_pages == 2 * sum(PROVIDER_BLOCKS) + 1
     assert executor.host_group_packing == (1, 2)
     assert (executor.num_snapshot_pages, executor.max_retracted_requests) == (1, 0)
-    assert len(executor.layout.groups) == 2
 
 
 @pytest.fixture
@@ -817,13 +824,13 @@ def test_a_shutdown_leaves_the_words_a_thread_that_still_runs_uses(ranks, synchr
 def pool_config() -> str:
     return json.dumps(
         {
-            "owner": "tcp://127.0.0.1:1",
+            "owner_address": "tcp://127.0.0.1:1",
             "device_names": ["mlx5_0"],
             "request_timeout_ms": 1000,
-            "connect_timeout_s": 60,
-            "load_workers": 2,
+            "join_timeout_s": 60,
+            "read_workers": 2,
             "write_workers": 2,
-            "scheduler": {"max_writes": 4, "max_write_keys": 256},
+            "scheduler": {"max_writes_in_flight": 4, "max_keys_per_write": 256},
         }
     )
 
@@ -832,7 +839,8 @@ def test_server_args_take_a_pool_in_place_of_the_host_l2():
     args = ServerArgs(
         model="x", max_num_seqs=8, disable_kvstore=True, shared_l2_config=pool_config()
     )
-    assert not args.enable_kvstore
+    # The pool is the Host tier in the local Host L2's place.
+    assert not args.enable_kvstore and args.has_host_tier
     # The pool is written when a page is published, and its ranks never retract.
     assert args.kvstore_write_policy == "write_through"
     assert args.retraction_snapshot_pool_disabled
@@ -909,7 +917,10 @@ def test_server_args_take_a_pool_in_place_of_the_host_l2():
             {"enable_startup_requests": True},
             "--enable-startup-requests is not supported with --shared-l2-config$",
         ),
-        ({"shared_l2_config": '{"owner": "tcp://127.0.0.1:1"}'}, "needs exactly"),
+        (
+            {"shared_l2_config": '{"owner_address": "tcp://127.0.0.1:1"}'},
+            "needs exactly",
+        ),
     ],
 )
 def test_server_args_refuse_what_a_pool_does_not_support(settings, message):

@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def run_provider(
     *,
-    owner: str,
+    owner_address: str,
     hostname: str,
     device_name: str,
     size_bytes: int,
@@ -79,8 +79,10 @@ def run_provider(
         f"shared L2 provider {session} registered {size_bytes} bytes in "
         f"{time.monotonic() - started:.1f}s"
     )
-    connection = OwnerConnection(owner, timeout_ms=60_000)
-    connection.request("provider", session=session, base=base, bytes=size_bytes)
+    connection = OwnerConnection(owner_address, timeout_ms=60_000)
+    connection.request(
+        "add_provider", session=session, base_address=base, bytes=size_bytes
+    )
     stop.wait()
     connection.close()
     engine.unregister(base)

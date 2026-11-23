@@ -62,8 +62,8 @@ hold each piece:
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
-- ``shared_l2_config`` — the config of the shared L2 pool the rank joined
-  (``--shared-l2-config``), or None without a pool. The rank's client of the
+- ``shared_l2_client_config`` — the rank's client config for the shared L2
+  pool (``--shared-l2-config``), or None without a pool. The rank's client of the
   pool's owner runs in the engine host.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
@@ -136,7 +136,7 @@ The two planes exchange information ONLY through the two channels below.
 
    - Shared L2 proxy pages. With a shared L2 pool the control thread hands
      the host's pool client the pool page behind each proxy Host block an
-     answer created (``map_proxy_pages``), and the forward thread's
+     answer created (``map_proxy_blocks``), and the forward thread's
      hand-over of a plan's load-backs reads that map
      (``SharedL2LoadExecutor.submit_load_backs``, through the host's shared
      L2 handle, ``SharedL2Handle.submit_load``). The discipline is ordering:
@@ -353,8 +353,8 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
-        shared_l2_config: The config of the shared L2 pool the rank joined
-            (``--shared-l2-config``), or None without a pool. The pool's
+        shared_l2_client_config: The rank's client config for the shared L2
+            pool (``--shared-l2-config``), or None without a pool. The pool's
             loads run behind ``handle`` like Host L2 loads.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts the
@@ -371,7 +371,7 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
-    shared_l2_config: SharedL2ClientConfig | None
+    shared_l2_client_config: SharedL2ClientConfig | None
     encoder_model_facts: Any
     peer_geometry: PeerGeometry | None
 
@@ -763,8 +763,8 @@ class DeviceHandle:
         l2 = self._l2
         if l2 is None:
             raise RuntimeError(
-                "cache results polled without --enable-kvstore or a "
-                "retraction snapshot pool"
+                "cache results polled without --enable-kvstore or a retraction "
+                "snapshot pool"
             )
         return l2.poll_results()
 
@@ -1874,12 +1874,8 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    shared_l2_config = None
-    if (
-        server_args.shared_l2_config is not None
-        or server_args.enable_kvstore
-        or not snapshot_pool.disabled
-    ):
+    shared_l2_client_config = None
+    if server_args.has_host_tier or not snapshot_pool.disabled:
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager as pg_manager,
         )
@@ -1905,7 +1901,7 @@ def build_device_side(
         # The pool is this rank's Host L2: the scheduler's Host tier is its
         # proxy and Host loads read it by RDMA, so its executor takes the
         # Host cache executor's place (no local Host bytes, no snapshot pool).
-        shared_l2_config, host_cache_executor = join_shared_l2_pool(
+        shared_l2_client_config, host_cache_executor = join_shared_l2_pool(
             server_args,
             model_config,
             draft_model_config,
@@ -2078,7 +2074,7 @@ def build_device_side(
 
     return DeviceBuild(
         host_cache=host_cache,
-        shared_l2_config=shared_l2_config,
+        shared_l2_client_config=shared_l2_client_config,
         peer_geometry=peer_geometry,
         specs=specs,
         transfer=kv_transfer,

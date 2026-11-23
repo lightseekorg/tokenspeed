@@ -29,7 +29,7 @@ use std::{
 use ts_scheduler::{SharedL2LookupView, StorageKeyView};
 use ts_wire::Value;
 
-use crate::shared_l2::{load::SignalWords, owner::OwnerConnection};
+use crate::shared_l2::{load::SignalWords, wire::OwnerConnection};
 
 pub(crate) mod owner;
 
@@ -100,7 +100,7 @@ pub(crate) fn key(group_id: u32, content_hash: &str) -> StorageKeyView {
     }
 }
 
-/// A key as it travels: `[namespace, group, content hash, page offset]`.
+/// A key as it travels: `[namespace_id, group_id, content_hash, page_offset]`.
 pub(crate) fn key_value(key: &StorageKeyView) -> Value {
     Value::Array(vec![
         Value::from(0),

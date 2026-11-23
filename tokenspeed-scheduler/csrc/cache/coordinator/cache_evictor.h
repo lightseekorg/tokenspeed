@@ -219,7 +219,7 @@ public:
         // the boundary's checkpoints, while the Device still held its key.
         HostEvictionCounts duplicate_kv;
         // A shared L2 rank's proxy entry nothing held any more
-        // (HostCache::DropHostEntry): the pool keeps the page it stood for.
+        // (HostCache::TryEvictHostEntry): the pool keeps the page it stood for.
         HostEvictionCounts released;
     };
 

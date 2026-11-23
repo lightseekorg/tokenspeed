@@ -401,10 +401,10 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
     // KV a shared L2 pool holds past its last checkpoint is a junction too:
     // the checkpoint cut there is where the next prompt sharing that KV, on
     // any rank, resumes. The proxy mirrors only the hit, so the reach comes
-    // from the lookup's answer.
+    // from the lookup's answer, which lies within the probe bound
+    // (ApplySharedL2Answers).
     match.probe.host.kv_tokens =
-        std::max(match.probe.host.kv_tokens,
-                 std::min(request->GetIf<fsm::Submitted>()->admission.pool_kv_tokens, max_cacheable_tokens));
+        std::max(match.probe.host.kv_tokens, request->GetIf<fsm::Submitted>()->admission.shared_l2_kv_tokens);
     request->GetIf<fsm::Submitted>()->admission.cached_prefix_tokens =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     if (config_.role != Role::kD && coordinator_.Prober().EvictionStoresExtendPrefix(prompt, match.probe)) {

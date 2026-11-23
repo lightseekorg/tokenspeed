@@ -20,40 +20,38 @@
 
 #include "scheduler/scheduler.h"
 
-#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
 namespace tokenspeed {
 
 void Scheduler::handleEvent(const cache::SharedL2WriteDone& event) {
-    tier_transfers_.CompletePoolWrite(event);
+    tier_transfers_.CompleteSharedL2Write(event);
 }
 
-std::vector<SharedL2Lookup> Scheduler::TakeSharedL2Lookups() {
+std::vector<SharedL2Lookup> Scheduler::StartSharedL2Lookups() {
     std::vector<SharedL2Lookup> lookups;
-    if (!shared_l2_ || config_.disable_prefix_cache) {
+    if (!shared_l2_proxy_) {
         return lookups;
     }
     for (const auto& request : requests_) {
         auto* admission = request->AdmissionResourcesPtr();
-        if (admission == nullptr || admission->pool_prepared || admission->pool_lookup_asked) {
+        if (admission == nullptr || admission->shared_l2_lookup_state != fsm::SharedL2LookupState::kNotAsked) {
             continue;
         }
         const std::int32_t max_tokens = cacheablePrefixTokens(*request);
-        const std::span<const std::string> prompt_hashes = request->PromptPrefixHashes();
-        const std::span<const std::string> hashes = prompt_hashes.first(
-            std::min(prompt_hashes.size(), static_cast<std::size_t>(max_tokens / config_.prefix_granularity)));
+        const std::span<const std::string> hashes =
+            request->PromptPrefixHashes(max_tokens / config_.prefix_granularity);
         const PromptPrefix prompt{
             .prefix_hashes = hashes, .tokens = request->TokenSlice(0, max_tokens), .max_tokens = max_tokens};
         // The Device alone: a proxy entry another prompt's lookup holds may
         // be gone by this prompt's admission.
         if (max_tokens == 0 || coordinator_.Prober().ProbePromptPrefix(prompt).device_only_hit_tokens >= max_tokens) {
             // Nothing the pool could add.
-            admission->pool_prepared = true;
+            admission->shared_l2_lookup_state = fsm::SharedL2LookupState::kSettled;
             continue;
         }
-        admission->pool_lookup_asked = true;
+        admission->shared_l2_lookup_state = fsm::SharedL2LookupState::kAsked;
         lookups.push_back(SharedL2Lookup{.request_id = request->Id(),
                                          .prefix_hashes = {hashes.begin(), hashes.end()},
                                          .tokens = {prompt.tokens.begin(), prompt.tokens.end()},
@@ -62,36 +60,40 @@ std::vector<SharedL2Lookup> Scheduler::TakeSharedL2Lookups() {
     return lookups;
 }
 
-std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results) {
-    if (!shared_l2_) {
+std::vector<SharedL2ProxyBlock> Scheduler::ApplySharedL2Answers(const std::vector<SharedL2Answer>& answers) {
+    if (!shared_l2_proxy_) {
         throw std::invalid_argument("shared L2 lookup answers without a configured pool");
     }
-    std::vector<SharedL2ProxyPage> pages;
-    for (const SharedL2LookupResult& result : results) {
+    std::vector<SharedL2ProxyBlock> proxy_blocks;
+    for (const SharedL2Answer& answer : answers) {
         // A lookup waits in its request's pre-admission state.
-        Request* request = findRequest(result.request_id);
+        Request* request = findRequest(answer.request_id);
         auto* admission = request != nullptr ? request->AdmissionResourcesPtr() : nullptr;
-        if (admission == nullptr || !admission->pool_lookup_asked || admission->pool_prepared) {
+        if (admission == nullptr || admission->shared_l2_lookup_state != fsm::SharedL2LookupState::kAsked) {
             throw std::invalid_argument("a shared L2 answer names no lookup that waits for it");
         }
-        const std::int32_t tail_tokens = result.tail ? result.tail->tail_tokens : 0;
-        if (result.num_tokens < 0 || result.num_tokens > cacheablePrefixTokens(*request) || result.kv_tokens < 0 ||
-            tail_tokens < 0 || tail_tokens >= config_.prefix_granularity ||
-            (result.num_tokens - tail_tokens) % config_.prefix_granularity != 0) {
+        const std::int32_t tail_tokens = answer.tail ? answer.tail->tail_tokens : 0;
+        // The lookup asked up to the prompt's cacheable prefix
+        // (StartSharedL2Lookups): neither the hit nor the pool's KV reach
+        // lies past it.
+        const std::int32_t max_tokens = cacheablePrefixTokens(*request);
+        if (answer.num_tokens < 0 || answer.num_tokens > max_tokens || answer.kv_tokens < 0 ||
+            answer.kv_tokens > max_tokens || tail_tokens < 0 || tail_tokens >= config_.prefix_granularity ||
+            (answer.num_tokens - tail_tokens) % config_.prefix_granularity != 0) {
             throw std::invalid_argument("a shared L2 answer lies outside the prompt it answers");
         }
         ContentHash tail_prior;
-        if (const std::int32_t full_pages = (result.num_tokens - tail_tokens) / config_.prefix_granularity;
-            result.tail && full_pages > 0) {
+        if (const std::int32_t full_pages = (answer.num_tokens - tail_tokens) / config_.prefix_granularity;
+            answer.tail && full_pages > 0) {
             tail_prior = ContentHash{request->PromptPrefixHashes()[static_cast<std::size_t>(full_pages - 1)]};
         }
-        std::vector<SharedL2ProxyPage> created =
-            shared_l2_->ApplyAnswer(result, tail_prior, admission->pool_hit_blocks);
-        admission->pool_kv_tokens = result.kv_tokens;
-        admission->pool_prepared = true;
-        pages.insert(pages.end(), created.begin(), created.end());
+        std::vector<SharedL2ProxyBlock> created =
+            shared_l2_proxy_->MirrorAnswer(answer, tail_prior, admission->shared_l2_hit_blocks);
+        admission->shared_l2_kv_tokens = answer.kv_tokens;
+        admission->shared_l2_lookup_state = fsm::SharedL2LookupState::kSettled;
+        proxy_blocks.insert(proxy_blocks.end(), created.begin(), created.end());
     }
-    return pages;
+    return proxy_blocks;
 }
 
 }  // namespace tokenspeed

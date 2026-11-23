@@ -33,7 +33,7 @@ from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
 from tokenspeed.runtime.cache.shared_l2.client import (
     SharedL2ClientConfig,
     SharedL2Provider,
-    join_pool,
+    hello_until_ready,
 )
 from tokenspeed.runtime.cache.shared_l2.executor import (
     SharedL2LoadExecutor,
@@ -84,9 +84,9 @@ class SharedL2ClientSettings:
         owner_address: The owner's ZMQ address.
         client_id: The rank's id at the owner, from its hello.
         request_timeout_ms: How long a request waits for the owner's answer.
-        load_workers: Threads reading one load's providers in parallel.
+        read_workers: Threads reading one load's providers in parallel.
         write_workers: Threads writing to the pool.
-        lcm_bytes: Bytes of one pool LCM block.
+        lcm_block_bytes: Bytes of one pool LCM block.
         providers: Where the pool's bytes are.
         groups: The cache groups' pages, in the scheduler's order.
         num_layers: The rank's layers, the target's and then the draft's.
@@ -98,9 +98,9 @@ class SharedL2ClientSettings:
     owner_address: str
     client_id: int
     request_timeout_ms: int
-    load_workers: int
+    read_workers: int
     write_workers: int
-    lcm_bytes: int
+    lcm_block_bytes: int
     providers: tuple[SharedL2Provider, ...]
     groups: tuple[SharedL2PageGroup, ...]
     num_layers: int
@@ -148,7 +148,7 @@ def join_shared_l2_pool(
             loads run there.
 
     Returns:
-        The pool's config, and the executor that takes the Host cache
+        The rank's client config, and the executor that takes the Host cache
         executor's place.
     """
     config = SharedL2ClientConfig.from_json(server_args.shared_l2_config)
@@ -168,7 +168,7 @@ def join_shared_l2_pool(
         server_args,
         model_config,
         draft_model_config,
-        cache_layout=layout.transfer,
+        cache_layout=layout.transfer_layout,
         checkpoint_granularities=checkpoint_granularities,
         group_shard_counts=tuple(
             spec.shard_count for spec in device_pool.arena.runtime_contract.group_specs
@@ -181,16 +181,18 @@ def join_shared_l2_pool(
     enable_mooncake_ipv6_for_host(local_ip)
     # Before the hello: registering the cache takes time, and the owner
     # drops a client it does not hear from.
-    shared_l2_handle.start_engine(
+    shared_l2_handle.start_transfer_engine(
         library=mooncake_library(),
         hostname=local_ip,
         protocol=mooncake_protocol(),
         device_filter=config.device_names[gpu_id],
         regions=layout.registration_regions(),
     )
-    connection = OwnerConnection(config.owner, timeout_ms=config.request_timeout_ms)
+    connection = OwnerConnection(
+        config.owner_address, timeout_ms=config.request_timeout_ms
+    )
     try:
-        pool = join_pool(
+        joined_pool = hello_until_ready(
             config,
             geometry=layout.geometry,
             deployment_id=deployment_id,
@@ -201,7 +203,7 @@ def join_shared_l2_pool(
     executor = build_shared_l2_load_executor(
         layout,
         shared_l2_handle,
-        pool=pool,
+        joined_pool=joined_pool,
         device_pool=device_pool,
         draft_pool=draft_pool,
         gpu_id=gpu_id,
@@ -210,22 +212,22 @@ def join_shared_l2_pool(
     # The client's keepalive starts here, right after the hello.
     shared_l2_handle.start_client(
         SharedL2ClientSettings(
-            owner_address=config.owner,
-            client_id=pool.client,
+            owner_address=config.owner_address,
+            client_id=joined_pool.client_id,
             request_timeout_ms=config.request_timeout_ms,
-            load_workers=config.load_workers,
+            read_workers=config.read_workers,
             write_workers=config.write_workers,
-            lcm_bytes=pool.lcm_bytes,
-            providers=pool.providers,
+            lcm_block_bytes=joined_pool.lcm_block_bytes,
+            providers=joined_pool.providers,
             groups=tuple(
                 SharedL2PageGroup(
-                    packing=layout.host_packing[group],
+                    packing=layout.host_group_packing[group],
                     page_bytes=layout.block_bytes[group],
                     fields=layout.page_fields(group),
                 )
-                for group in range(len(layout.transfer.groups))
+                for group in range(len(layout.transfer_layout.groups))
             ),
-            num_layers=len(layout.transfer.consumers),
+            num_layers=len(layout.transfer_layout.consumers),
             signal_words_address=signal_words_address,
             num_signal_words=num_signal_words,
         )

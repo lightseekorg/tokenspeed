@@ -47,10 +47,10 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
 )
 
 from tokenspeed.runtime.cache.shared_l2.client import (  # noqa: E402
+    JoinedSharedL2Pool,
     SharedL2ClientConfig,
-    SharedL2PoolView,
     SharedL2Provider,
-    join_pool,
+    hello_until_ready,
 )
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
@@ -60,13 +60,13 @@ from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
 
 def config_fields(address: str) -> dict:
     return {
-        "owner": address,
+        "owner_address": address,
         "device_names": [""],
         "request_timeout_ms": 1000,
-        "connect_timeout_s": 5,
-        "load_workers": 1,
+        "join_timeout_s": 5,
+        "read_workers": 1,
         "write_workers": 1,
-        "scheduler": {"max_writes": 2, "max_write_keys": 64},
+        "scheduler": {"max_writes_in_flight": 2, "max_keys_per_write": 64},
     }
 
 
@@ -84,13 +84,13 @@ def serve():
         owner.close()
 
 
-def join(owner: ServedOwner, *, geometry=GEOMETRY, **settings) -> SharedL2PoolView:
+def join(owner: ServedOwner, *, geometry=GEOMETRY, **settings) -> JoinedSharedL2Pool:
     """Join a rank to an owner's pool, as the device build does."""
     fields = {**config_fields(owner.address), **settings}
     config = SharedL2ClientConfig.from_json(json.dumps(fields))
     connection = OwnerConnection(owner.address, timeout_ms=config.request_timeout_ms)
     try:
-        return join_pool(
+        return hello_until_ready(
             config,
             geometry=geometry,
             deployment_id=deployment_id(),
@@ -109,22 +109,36 @@ def test_a_rank_joins_once_the_pool_is_ready(serve):
 
     late.join()
     assert pool.providers == (
-        SharedL2Provider(session="node0", base=1 << 40, lcm_blocks=8, start=0),
+        SharedL2Provider(
+            session="node0", base_address=1 << 40, num_lcm_blocks=8, first_lcm_block=0
+        ),
     )
-    assert (pool.lcm_bytes, pool.num_lcm_blocks) == (LCM_BYTES, 8)
-    assert owner.admin.request("stats")["clients"] == 1
+    assert (pool.lcm_block_bytes, pool.num_lcm_blocks) == (LCM_BYTES, 8)
+    assert owner.admin.request("stats")["num_clients"] == 1
     # The owner knows the rank by the id the join chose, which the rank's
     # client in the host goes on with.
-    assert 0 <= pool.client < 1 << 63
-    assert owner.admin.request("ping", client=pool.client)["ok"]
+    assert 0 <= pool.client_id < 1 << 63
+    assert owner.admin.request("ping", client=pool.client_id)["ok"]
     # Every join is a client of its own.
-    assert join(owner).client != pool.client
-    assert owner.admin.request("stats")["clients"] == 2
+    assert join(owner).client_id != pool.client_id
+    assert owner.admin.request("stats")["num_clients"] == 2
 
 
 def test_a_rank_does_not_start_without_a_pool_it_can_use(serve):
-    with pytest.raises(TimeoutError, match="did not become ready"):
-        join(serve(joined_providers=0), connect_timeout_s=0.2)
+    # The error says what the last attempt met: an owner that still waits
+    # for providers, or no owner answering.
+    waiting = serve(joined_providers=0)
+    with pytest.raises(
+        TimeoutError,
+        match=f"the owner at {waiting.address} replied that the pool is not ready",
+    ):
+        join(waiting, join_timeout_s=0.2)
+    silent = serve()
+    silent.stall()
+    with pytest.raises(
+        TimeoutError, match=f"no reply from the owner at {silent.address}"
+    ):
+        join(silent, request_timeout_ms=100, join_timeout_s=0.2)
 
     owner = serve()
     join(owner)
@@ -141,16 +155,16 @@ def test_a_rank_does_not_start_without_a_pool_it_can_use(serve):
         (lambda fields: fields.pop("request_timeout_ms"), "needs exactly"),
         (lambda fields: fields.update(namespace="model"), "needs exactly"),
         (
-            lambda fields: fields["scheduler"].pop("max_writes"),
+            lambda fields: fields["scheduler"].pop("max_writes_in_flight"),
             "scheduler needs exactly",
         ),
         (
-            lambda fields: fields["scheduler"].update(max_write_keys=0),
+            lambda fields: fields["scheduler"].update(max_keys_per_write=0),
             "positive write limits",
         ),
-        (lambda fields: fields.update(write_workers=0), "at least one"),
+        (lambda fields: fields.update(write_workers=0), "must be at least 1"),
         (lambda fields: fields.update(request_timeout_ms=0), "positive timeouts"),
-        (lambda fields: fields.update(connect_timeout_s=-1), "positive timeouts"),
+        (lambda fields: fields.update(join_timeout_s=-1), "positive timeouts"),
         (lambda fields: fields.update(device_names="mlx5_0"), "list of strings"),
         (lambda fields: fields.update(device_names=[0]), "list of strings"),
     ],
@@ -167,12 +181,12 @@ def test_a_client_config_keeps_every_field():
         json.dumps(config_fields("tcp://127.0.0.1:1"))
     )
     assert config == SharedL2ClientConfig(
-        owner="tcp://127.0.0.1:1",
+        owner_address="tcp://127.0.0.1:1",
         device_names=("",),
         request_timeout_ms=1000,
-        connect_timeout_s=5.0,
-        load_workers=1,
+        join_timeout_s=5.0,
+        read_workers=1,
         write_workers=1,
-        max_writes=2,
-        max_write_keys=64,
+        max_writes_in_flight=2,
+        max_keys_per_write=64,
     )

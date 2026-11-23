@@ -28,13 +28,13 @@
 //! what to write to it; the client ([`PoolClient`]) talks to the owner. The
 //! loop only relays. Before a plan, the waiting prompts not looked up yet
 //! ask the owner in one request, which the round waits for
-//! ([`Pool::lookup`]); a plan's pool commands go to the client when the
+//! ([`Pool::lookup`]); a plan's shared L2 ops go to the client when the
 //! plan is dispatched, and the client carries them out on threads of its
 //! own. At the head of every round the loop asks the client for the writes
-//! it finished and for a failure it stored ([`Pool::finished_writes`]).
+//! it finished and for a failure it stored ([`Pool::poll_writes`]).
 //!
 //! The client of a serving rank is [`client::RankClient`]: it speaks the
-//! owner's wire ([`owner`]) and copies between the rank's Device blocks and
+//! owner's wire ([`wire`]) and copies between the rank's Device blocks and
 //! the providers' pages ([`geometry`]). Its loads ([`load`]) are handed
 //! over by the data plane's forward thread, not by the loop.
 //!
@@ -42,7 +42,7 @@
 //! load-back does; a miss is an answer of the owner that names no page. A
 //! load from the pool that failed lets its forward go over pages it never
 //! filled: the client holds that failure, and the loop asks for it when the
-//! forward has landed, before it commits it ([`Pool::forward_committed`]). The
+//! forward has landed, before it commits it ([`Pool::forward_landed`]). The
 //! client answers one rank, so the pool needs a replica of one member
 //! (attention TP 1).
 
@@ -55,13 +55,13 @@ use std::{
 
 use ts_scheduler::{
     CacheEvent, CacheEventKind, ExecutionPlan, SharedL2AnswerView, SharedL2LookupView,
-    SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+    SharedL2OpKind, SharedL2OpView, SharedL2ProxyBlockView,
 };
 
 pub mod client;
 pub mod geometry;
 pub mod load;
-pub mod owner;
+pub mod wire;
 
 /// The pool's client or its owner failed; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -118,34 +118,42 @@ pub trait PoolClient {
     ) -> Result<Vec<SharedL2AnswerView>, PoolError>;
 
     /// The ids of the writes finished since the last poll; never waits.
-    /// Fails when a write or a notice to the owner (a release, a touch, a
-    /// ping) failed.
+    /// Fails once a load from the pool, a write or a notice to the owner (a
+    /// release, a touch, a ping) has failed.
     fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError>;
 
-    /// The proxy Host blocks an answer created, each with the pool page a
-    /// load-back from it reads; before the plan that may plan that load.
-    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError>;
+    /// The proxy Host blocks a round's answers created, each with the pool
+    /// page a load-back from it reads; before the plan that may plan that
+    /// load.
+    fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]);
 
-    /// Pool commands: writes to start, and releases and touches to tell the
-    /// owner. Over all calls, the commands of one kind come in plan order.
+    /// Shared L2 ops: writes to start, and releases and touches to tell the
+    /// owner. Over all calls, the ops of one kind come in plan order.
     /// Between kinds no order is kept: a plan's writes may come in a later
-    /// call than its other commands ([`Pool::dispatch`]).
-    fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError>;
+    /// call than its other ops ([`Pool::dispatch`]).
+    fn submit(&mut self, ops: &[SharedL2OpView]) -> Result<(), PoolError>;
 
     /// Fails once a load from the pool, a write or a notice has failed;
     /// never waits. A load's failure is there before the forward that waited
     /// on the load is let go.
-    fn check_failure(&mut self) -> Result<(), PoolError>;
+    fn check_failure(&self) -> Result<(), PoolError>;
+}
+
+/// A plan's writes, withheld until the forwards that were in flight when the
+/// plan was made have landed.
+struct WithheldWrites {
+    /// The forwards that must still land first.
+    forwards_to_land: usize,
+    writes: Vec<SharedL2OpView>,
 }
 
 /// The pool on this rank: its client, and the writes in flight there.
 pub struct Pool {
     client: Box<dyn PoolClient + Send>,
     /// Writes the client has not finished.
-    writes: Vec<u64>,
-    /// Writes not handed to the client yet, each batch with the forwards
-    /// that must still be committed first, in plan order.
-    held_writes: VecDeque<(usize, Vec<SharedL2OpView>)>,
+    open_writes: Vec<u32>,
+    /// Writes not handed to the client yet, in plan order.
+    withheld_writes: VecDeque<WithheldWrites>,
 }
 
 impl Pool {
@@ -153,8 +161,8 @@ impl Pool {
     pub fn new(client: Box<dyn PoolClient + Send>) -> Self {
         Self {
             client,
-            writes: Vec::new(),
-            held_writes: VecDeque::new(),
+            open_writes: Vec::new(),
+            withheld_writes: VecDeque::new(),
         }
     }
 
@@ -168,28 +176,25 @@ impl Pool {
         self.client.lookup(lookups)
     }
 
-    /// The scheduler took an answer: the proxy blocks it created go to the
-    /// client.
-    pub fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        self.client.map_proxy_pages(pages)
+    /// The scheduler applied a round's answers: the proxy blocks they
+    /// created go to the client.
+    pub fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]) {
+        self.client.map_proxy_blocks(proxy_blocks);
     }
 
     /// Writes not finished: the loop is not idle while there are any.
-    pub fn open(&self) -> usize {
-        self.writes.len()
+    pub fn open_writes(&self) -> usize {
+        self.open_writes.len()
     }
 
     /// The acknowledgments of the writes the client finished since the last
     /// call, for the head of every round. The client is asked whether or not
-    /// a write is in flight: its poll also raises the failure a write or a
-    /// notice stored, a failed ping of an idle rank among them.
-    pub fn finished_writes(&mut self) -> Result<Vec<CacheEvent>, PoolError> {
+    /// a write is in flight: its poll also raises the failure a load from
+    /// the pool, a write or a notice stored, a failed ping of an idle rank
+    /// among them.
+    pub fn poll_writes(&mut self) -> Result<Vec<CacheEvent>, PoolError> {
         let finished = self.client.poll_writes()?;
-        self.writes
-            .retain(|id| !finished.iter().any(|done| u64::from(*done) == *id));
+        self.open_writes.retain(|id| !finished.contains(id));
         Ok(finished
             .into_iter()
             .map(|op_id| CacheEvent {
@@ -199,42 +204,44 @@ impl Pool {
             .collect())
     }
 
-    /// Hand `plan`'s pool commands to the client; none waits for the owner.
+    /// Hand `plan`'s shared L2 ops to the client; none waits for the owner.
     /// Returns whether the plan had any.
     ///
-    /// A write is held back while a forward dispatched before the plan is
+    /// A write is withheld while a forward dispatched before the plan is
     /// not committed (`forwards_in_flight` of them). The scheduler starts a
     /// publication's write in the plan after its chunk's, whether or not the
     /// chunk's forward landed, and the client reads the Device blocks over
     /// RDMA, which nothing orders behind the device's streams: the forward
-    /// may still be filling them. [`Pool::forward_committed`] lets the
+    /// may still be filling them. [`Pool::forward_landed`] lets the
     /// writes go.
     pub fn dispatch(
         &mut self,
         plan: &ExecutionPlan,
         forwards_in_flight: usize,
     ) -> Result<bool, PoolError> {
-        let mut commands = plan.shared_l2_ops();
-        if commands.is_empty() {
+        let mut ops = plan.shared_l2_ops();
+        if ops.is_empty() {
             return Ok(false);
         }
-        self.writes.extend(
-            commands
-                .iter()
-                .filter(|command| command.kind == SharedL2OpKind::Write)
-                .map(|command| command.id),
+        self.open_writes.extend(
+            ops.iter()
+                .filter(|op| op.kind == SharedL2OpKind::Write)
+                .map(|op| op.op_id),
         );
         if forwards_in_flight > 0 {
-            let (writes, rest): (Vec<_>, Vec<_>) = commands
+            let (writes, rest): (Vec<_>, Vec<_>) = ops
                 .into_iter()
-                .partition(|command| command.kind == SharedL2OpKind::Write);
+                .partition(|op| op.kind == SharedL2OpKind::Write);
             if !writes.is_empty() {
-                self.held_writes.push_back((forwards_in_flight, writes));
+                self.withheld_writes.push_back(WithheldWrites {
+                    forwards_to_land: forwards_in_flight,
+                    writes,
+                });
             }
-            commands = rest;
+            ops = rest;
         }
-        if !commands.is_empty() {
-            self.client.submit(&commands)?;
+        if !ops.is_empty() {
+            self.client.submit(&ops)?;
         }
         Ok(true)
     }
@@ -245,20 +252,20 @@ impl Pool {
     /// results are committed and before a write of the pages it computed
     /// starts. Otherwise the writes that waited for the forward, and for no
     /// later one, go to the client.
-    pub fn forward_committed(&mut self) -> Result<(), PoolError> {
+    pub fn forward_landed(&mut self) -> Result<(), PoolError> {
         self.client.check_failure()?;
-        for (forwards, _) in &mut self.held_writes {
-            *forwards -= 1;
+        for withheld in &mut self.withheld_writes {
+            withheld.forwards_to_land -= 1;
         }
         // A plan's forwards in flight are also in flight for the plans
         // before it: the batches are released in plan order.
         while self
-            .held_writes
+            .withheld_writes
             .front()
-            .is_some_and(|(forwards, _)| *forwards == 0)
+            .is_some_and(|withheld| withheld.forwards_to_land == 0)
         {
-            let (_, writes) = self.held_writes.pop_front().expect("checked above");
-            self.client.submit(&writes)?;
+            let withheld = self.withheld_writes.pop_front().expect("checked above");
+            self.client.submit(&withheld.writes)?;
         }
         Ok(())
     }
@@ -273,7 +280,7 @@ mod tests {
 
     use super::*;
 
-    /// A client that records the pages it is given.
+    /// A client that records the proxy blocks it is given.
     #[derive(Default)]
     struct Recorder {
         mapped: Arc<Mutex<Vec<usize>>>,
@@ -291,34 +298,31 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
-            self.mapped.lock().unwrap().push(pages.len());
-            Ok(())
+        fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]) {
+            self.mapped.lock().unwrap().push(proxy_blocks.len());
         }
 
         fn submit(&mut self, _: &[SharedL2OpView]) -> Result<(), PoolError> {
             Ok(())
         }
 
-        fn check_failure(&mut self) -> Result<(), PoolError> {
+        fn check_failure(&self) -> Result<(), PoolError> {
             Ok(())
         }
     }
 
     #[test]
-    fn a_hits_pages_go_to_the_client() {
+    fn a_hits_proxy_blocks_go_to_the_client() {
         let client = Recorder::default();
         let mapped = client.mapped.clone();
         let mut pool = Pool::new(Box::new(client));
-        let page = SharedL2PageView {
+        let proxy_block = SharedL2ProxyBlockView {
             group_id: 0,
-            block: 3,
+            host_block: 3,
             bucket: 0,
-            page: 9,
+            pool_page: 9,
         };
-        pool.map_proxy_pages(&[page, page]).unwrap();
-        // A miss maps nothing.
-        pool.map_proxy_pages(&[]).unwrap();
+        pool.map_proxy_blocks(&[proxy_block, proxy_block]);
         assert_eq!(*mapped.lock().unwrap(), [2]);
     }
 }

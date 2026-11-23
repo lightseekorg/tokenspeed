@@ -148,8 +148,7 @@ def test_default_loader_loads_native_draft_from_target_directory(
         resolve_dspark_prefix_replay_tokens(
             speculative_algorithm="DSPARK",
             enable_prefix_caching=prefix_caching,
-            enable_kvstore=False,
-            shared_l2_pool=False,
+            has_host_tier=False,
             disaggregation_mode="null",
             draft_model_path_use_base=True,
             draft_model_config=metadata,

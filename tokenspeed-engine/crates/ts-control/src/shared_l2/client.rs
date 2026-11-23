@@ -51,7 +51,7 @@ use std::{
 
 use parking_lot::Mutex;
 use ts_scheduler::{
-    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2ProxyBlockView,
     StorageKeyView,
 };
 
@@ -63,8 +63,9 @@ use crate::{
     shared_l2::{
         geometry::{PageCopy, PoolGeometry},
         load::{Loads, ProxyPages, SignalWords},
-        owner::OwnerConnection,
-        panic_as_failure, FailureLatch, PoolClient, PoolError,
+        panic_as_failure,
+        wire::OwnerConnection,
+        FailureLatch, PoolClient, PoolError,
     },
 };
 
@@ -110,7 +111,7 @@ pub struct ClientSettings {
     /// drops a client it has not heard for its client timeout.
     pub keepalive: Duration,
     /// Threads reading one load's providers in parallel.
-    pub load_workers: NonZeroUsize,
+    pub read_workers: NonZeroUsize,
     /// Threads writing to the pool.
     pub write_workers: NonZeroUsize,
     /// The pool and the rank's Device cache.
@@ -133,9 +134,8 @@ pub struct RankClient {
     geometry: Arc<PoolGeometry>,
     proxy_pages: Arc<ProxyPages>,
     failure: Arc<FailureLatch>,
-    /// The plan's write commands, each with its id as the scheduler takes
-    /// it back; `None` tells a write thread to stop.
-    writes: mpsc::Sender<Option<(u32, SharedL2OpView)>>,
+    /// The plan's write ops; `None` tells a write thread to stop.
+    writes: mpsc::Sender<Option<SharedL2OpView>>,
     /// The plan's notices; `None` tells the notice thread to stop.
     notices: mpsc::Sender<Option<Notice>>,
     /// The ids of the writes the write threads finished.
@@ -146,7 +146,7 @@ pub struct RankClient {
 /// its loads to, and what the rank's shutdown closes.
 pub struct RankThreads {
     loads: Loads,
-    writes: mpsc::Sender<Option<(u32, SharedL2OpView)>>,
+    writes: mpsc::Sender<Option<SharedL2OpView>>,
     notices: mpsc::Sender<Option<Notice>>,
     write_workers: usize,
     /// The write and notice threads; empty once closed.
@@ -175,13 +175,17 @@ pub fn start(
     // A copy divides by its group's packing and indexes its fields' layers
     // without a check of its own.
     let num_layers = settings.geometry.num_layers;
-    for (group, pages) in settings.geometry.groups.iter().enumerate() {
-        if pages.packing == 0 {
+    for (group, page_group) in settings.geometry.groups.iter().enumerate() {
+        if page_group.packing == 0 {
             return Err(PoolError(format!(
                 "shared L2 cache group {group} has no page in an LCM block"
             )));
         }
-        if let Some(field) = pages.fields.iter().find(|field| field.layer >= num_layers) {
+        if let Some(field) = page_group
+            .fields
+            .iter()
+            .find(|field| field.layer >= num_layers)
+        {
             return Err(PoolError(format!(
                 "a field of shared L2 cache group {group} is read by layer {}, and the rank \
                  has {num_layers} layers",
@@ -213,13 +217,13 @@ pub fn start(
         reader.clone(),
         signal_words,
         failure.clone(),
-        settings.load_workers,
+        settings.read_workers,
     )
     .map_err(spawn_failed)?;
 
-    let (writes, queued) = mpsc::channel::<Option<(u32, SharedL2OpView)>>();
+    let (writes, incoming_writes) = mpsc::channel::<Option<SharedL2OpView>>();
     let (finished, finished_writes) = mpsc::channel();
-    let queued = Arc::new(Mutex::new(queued));
+    let incoming_writes = Arc::new(Mutex::new(incoming_writes));
     // A thread that started ends when a later step fails: its queue's
     // sender is dropped with this function's locals.
     let mut threads = Vec::with_capacity(settings.write_workers.get() + 1);
@@ -229,22 +233,27 @@ pub fn start(
             geometry: geometry.clone(),
             writer: writer.clone(),
         };
-        let (queued, finished, failure) = (queued.clone(), finished.clone(), failure.clone());
+        let (incoming_writes, finished, failure) =
+            (incoming_writes.clone(), finished.clone(), failure.clone());
         threads.push(
             thread::Builder::new()
-                .name(format!("ts-pool-write-{index}"))
+                .name(format!("ts-shared-l2-write-{index}"))
                 .spawn(move || loop {
                     // Release the queue lock before the write.
-                    let write = queued.lock().recv();
-                    let Ok(Some((id, write))) = write else {
+                    let write = incoming_writes.lock().recv();
+                    let Ok(Some(write)) = write else {
                         return;
                     };
                     match panic_as_failure(|| worker.write(&write)) {
                         Ok(()) => {
-                            let _ = finished.send(id);
+                            let _ = finished.send(write.op_id);
                         }
                         Err(error) => {
-                            tracing::error!(%error, write = id, "shared L2 write failed");
+                            tracing::error!(
+                                %error,
+                                write = write.op_id,
+                                "shared L2 write failed"
+                            );
                             failure.record(error);
                         }
                     }
@@ -253,14 +262,14 @@ pub fn start(
         );
     }
 
-    let (notices, noticed) = mpsc::channel();
+    let (notices, incoming_notices) = mpsc::channel();
     let (mut notice_owner, keepalive) = (connect()?, settings.keepalive);
     let notice_failure = failure.clone();
     threads.push(
         thread::Builder::new()
-            .name("ts-pool-notice".to_owned())
+            .name("ts-shared-l2-notice".to_owned())
             .spawn(move || loop {
-                let notice = match noticed.recv_timeout(keepalive) {
+                let notice = match incoming_notices.recv_timeout(keepalive) {
                     Ok(Some(notice)) => notice,
                     Err(mpsc::RecvTimeoutError::Timeout) => Notice::Ping,
                     Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -310,9 +319,9 @@ struct WriteWorker {
 }
 
 impl WriteWorker {
-    /// Carry out a write command: reserve pool pages for its `keys`, copy
+    /// Carry out a write op: reserve pool pages for its `keys`, copy
     /// its `blocks`, the keys' Device blocks, to them, and commit them with
-    /// its `publications`, the checkpoints among them.
+    /// its `checkpoints`, the State checkpoints among them.
     fn write(&mut self, write: &SharedL2OpView) -> Result<(), PoolError> {
         // No reservation: every block is in the pool, is being written by
         // another rank, or has no room.
@@ -325,14 +334,14 @@ impl WriteWorker {
         let copies: Vec<PageCopy> = (0..write.keys.len())
             .filter(|&index| pages[index] >= 0)
             .map(|index| PageCopy {
-                group: write.keys[index].group_id,
+                group_id: write.keys[index].group_id,
                 bucket: write.buckets[index],
-                page: pages[index],
-                block: write.blocks[index],
+                pool_page: pages[index],
+                device_block: write.device_blocks[index],
             })
             .collect();
-        let providers = self.geometry.write_spans(&copies)?;
-        for (provider, spans) in self.geometry.providers.iter().zip(&providers) {
+        let spans_by_provider = self.geometry.write_spans(&copies)?;
+        for (provider, spans) in self.geometry.providers.iter().zip(&spans_by_provider) {
             if spans.is_empty() {
                 continue;
             }
@@ -345,7 +354,7 @@ impl WriteWorker {
                     ))
                 })?;
         }
-        self.owner.commit(ticket, &write.publications)
+        self.owner.commit(ticket, &write.checkpoints)
     }
 }
 
@@ -354,10 +363,14 @@ impl PoolClient for RankClient {
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-        let answers = self.owner.probe_many(lookups)?;
+        let answers = self.owner.lookup(lookups)?;
         // A load reads a hit's pages at their addresses: each has one.
         for answer in &answers {
-            for ((key, bucket), page) in answer.keys.iter().zip(&answer.buckets).zip(&answer.pages)
+            for ((key, bucket), page) in answer
+                .keys
+                .iter()
+                .zip(&answer.buckets)
+                .zip(&answer.pool_pages)
             {
                 self.geometry.page_address(key.group_id, *bucket, *page)?;
             }
@@ -370,36 +383,29 @@ impl PoolClient for RankClient {
         Ok(self.finished_writes.try_iter().collect())
     }
 
-    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
-        self.proxy_pages.record(pages);
-        Ok(())
+    fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]) {
+        self.proxy_pages.record(proxy_blocks);
     }
 
-    fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError> {
+    fn submit(&mut self, ops: &[SharedL2OpView]) -> Result<(), PoolError> {
         let stopped = || PoolError("the shared L2 client's threads have stopped".to_owned());
         // Each kind goes out in plan order.
-        for command in commands {
-            match command.kind {
+        for op in ops {
+            match op.kind {
                 SharedL2OpKind::Write => {
-                    // The id returns to the scheduler as 32 bits.
-                    let id = u32::try_from(command.id).map_err(|_| {
-                        PoolError(format!("pool write id {} is past 32 bits", command.id))
-                    })?;
-                    self.writes
-                        .send(Some((id, command.clone())))
-                        .map_err(|_| stopped())?
+                    self.writes.send(Some(op.clone())).map_err(|_| stopped())?
                 }
                 SharedL2OpKind::Release => self
                     .notices
-                    .send(Some(Notice::Release(command.id)))
+                    .send(Some(Notice::Release(op.ticket)))
                     .map_err(|_| stopped())?,
                 SharedL2OpKind::Touch => self
                     .notices
-                    .send(Some(Notice::Touch(command.keys.clone())))
+                    .send(Some(Notice::Touch(op.keys.clone())))
                     .map_err(|_| stopped())?,
                 kind => {
                     return Err(PoolError(format!(
-                        "no client call for the pool command {kind:?}"
+                        "no client call for the shared L2 op {kind:?}"
                     )))
                 }
             }
@@ -407,7 +413,7 @@ impl PoolClient for RankClient {
         Ok(())
     }
 
-    fn check_failure(&mut self) -> Result<(), PoolError> {
+    fn check_failure(&self) -> Result<(), PoolError> {
         self.failure.check()
     }
 }

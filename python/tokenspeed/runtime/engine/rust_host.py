@@ -1420,17 +1420,17 @@ class HostBootstrap:
             geometry = specs.cache_geometry
             # With --shared-l2-config, the config of the pool the device
             # build joined; else None.
-            pool_config = device.shared_l2_config
+            shared_l2_client_config = device.shared_l2_client_config
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
                 storage_config=storage_config,
                 shared_l2_config=(
                     SharedL2Config(
-                        max_writes=pool_config.max_writes,
-                        max_write_keys=pool_config.max_write_keys,
+                        max_writes_in_flight=shared_l2_client_config.max_writes_in_flight,
+                        max_keys_per_write=shared_l2_client_config.max_keys_per_write,
                     )
-                    if pool_config is not None
+                    if shared_l2_client_config is not None
                     else None
                 ),
                 max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -1443,8 +1443,7 @@ class HostBootstrap:
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
-                    enable_kvstore=server_args.enable_kvstore,
-                    shared_l2_pool=pool_config is not None,
+                    has_host_tier=server_args.has_host_tier,
                     disaggregation_mode=server_args.disaggregation_mode,
                     draft_model_path_use_base=server_args.draft_model_path_use_base,
                     draft_model_config=draft_model_config,

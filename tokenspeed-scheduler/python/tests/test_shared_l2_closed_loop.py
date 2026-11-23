@@ -52,10 +52,12 @@ ROUNDS = 200
 class _Pool:
     """The pool the ranks share, with what must never happen at its pages."""
 
-    def __init__(self, seed: int, blocks: int, max_writes: int, max_write_keys: int):
+    def __init__(
+        self, seed: int, blocks: int, max_writes_in_flight: int, max_keys_per_write: int
+    ):
         self.rng = random.Random(seed)
         self.blocks = blocks
-        self.limits = (max_writes, max_write_keys)
+        self.limits = (max_writes_in_flight, max_keys_per_write)
         self.chunk = self.rng.choice([P, 2 * P, 3 * P])
         self.pool = None
         self.groups = None
@@ -93,7 +95,7 @@ class _Pool:
         cfg.host_group_packing = [1] * len(self.groups)
         cfg.max_scheduled_tokens = self.chunk
         cfg.shared_l2_config = ts.SharedL2Config(
-            max_writes=self.limits[0], max_write_keys=self.limits[1]
+            max_writes_in_flight=self.limits[0], max_keys_per_write=self.limits[1]
         )
 
 
@@ -147,15 +149,15 @@ class _Rank(closed_loop._Loop):
 
     def before_plan(self) -> None:
         # Every lookup is answered before the plan, as the event loop does.
-        for lookup in self.real.take_shared_l2_lookups():
+        for lookup in self.real.start_shared_l2_lookups():
             request_id, hashes, tokens, max_tokens = lookup
-            result = self.pool.probe(self.client, hashes, tokens, max_tokens)
+            result = self.pool.lookup(self.client, hashes, tokens, max_tokens)
             # The prompt must resume at least where the pool pinned.
             self.pinned_for[request_id] = result[1]
-            for group, block, _, page in self.real.apply_shared_l2_lookups(
+            for group, host_block, _, pool_page in self.real.apply_shared_l2_answers(
                 [(request_id, *result)]
             ):
-                self.page_of[(group, block)] = page
+                self.page_of[(group, host_block)] = pool_page
 
     def after_plan(self, plan) -> None:
         for op in plan.forward:
@@ -221,10 +223,10 @@ class _Rank(closed_loop._Loop):
                         f"pool page {(key[1], page)} is rewritten under a load-back"
                     )
                     self.shared.granted += 1
-            assert self.pool.commit(self.client, ticket, op.publications) == (
-                ticket != 0
-            )
-            events.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
+            # Ticket 0 reserves nothing: there is nothing to commit.
+            if ticket != 0:
+                self.pool.commit(self.client, ticket, op.checkpoints)
+            events.add_event(ts.Cache.SharedL2WriteDone(op.op_id))
         if writes:
             self.real.advance(events)
 
@@ -247,8 +249,8 @@ def _run(seed: int, roles) -> dict:
     shared = _Pool(
         seed,
         blocks=random.Random(seed).choice([12, 20, 32]),
-        max_writes=2,
-        max_write_keys=4,
+        max_writes_in_flight=2,
+        max_keys_per_write=4,
     )
     ranks = [
         _Rank(seed * 10 + index, role, shared, client=index + 1)
@@ -307,7 +309,7 @@ def _run(seed: int, roles) -> dict:
         assert rank.real.can_clear_cache()
     assert not shared.reading
     pool = shared.pool.stats()
-    assert (pool["pinned_blocks"], pool["reserved_blocks"], pool["lookups"]) == (
+    assert (pool["pinned_blocks"], pool["reserved_blocks"], pool["open_lookups"]) == (
         0,
         0,
         0,

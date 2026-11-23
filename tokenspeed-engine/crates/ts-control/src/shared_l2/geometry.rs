@@ -29,18 +29,18 @@
 
 use crate::{peer::geometry::Spans, shared_l2::PoolError};
 
-/// One node's share of the pool: `lcm_blocks` LCM blocks at `base` of its
-/// transfer session, the pool's LCM blocks from `start` on.
+/// One node's share of the pool: `num_lcm_blocks` LCM blocks at `base_address` of its
+/// transfer session, the pool's LCM blocks from `first_lcm_block` on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
     /// The provider's transfer session.
     pub session: String,
     /// The address of its first LCM block.
-    pub base: u64,
+    pub base_address: u64,
     /// How many LCM blocks it holds.
-    pub lcm_blocks: u64,
+    pub num_lcm_blocks: u64,
     /// The pool's LCM block its first one is.
-    pub start: u64,
+    pub first_lcm_block: u64,
 }
 
 /// One field of a group's Device CacheBlocks, as a pool page holds it.
@@ -53,7 +53,7 @@ pub struct PageField {
     /// Bytes of the field's payload.
     pub bytes: u64,
     /// The payload's offset inside a pool page.
-    pub page_offset: u64,
+    pub offset_in_page: u64,
     /// The layer that reads the field, among the rank's layers in the order
     /// its ready words follow.
     pub layer: usize,
@@ -75,13 +75,13 @@ pub struct PageGroup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageCopy {
     /// The cache group, by index.
-    pub group: u32,
+    pub group_id: u32,
     /// The page's shard.
     pub bucket: i32,
     /// The pool page, within the group; pages start at 1.
-    pub page: i32,
+    pub pool_page: i32,
     /// The Device block.
-    pub block: i32,
+    pub device_block: i32,
 }
 
 /// The pool a rank joined and the rank's Device cache. A copy divides by a
@@ -91,7 +91,7 @@ pub struct PageCopy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
     /// Bytes of one pool LCM block.
-    pub lcm_bytes: u64,
+    pub lcm_block_bytes: u64,
     /// The providers, in the order of their LCM blocks.
     pub providers: Vec<Provider>,
     /// The cache groups, in the scheduler's order.
@@ -123,7 +123,7 @@ impl PoolGeometry {
         if bucket != 0 {
             return Err(PoolError("a shared L2 pool holds bucket 0 only".to_owned()));
         }
-        let pages = self.group(group)?;
+        let page_group = self.group(group)?;
         let out_of_range = || {
             PoolError(format!(
                 "shared L2 page {page} of group {group} is out of range"
@@ -132,21 +132,21 @@ impl PoolGeometry {
         // Pages start at 1; widened before any product: page numbers reach
         // the pool's size.
         let index = u64::try_from(i64::from(page) - 1).map_err(|_| out_of_range())?;
-        let (lcm, slot) = (index / pages.packing, index % pages.packing);
+        let (lcm_block, slot) = (index / page_group.packing, index % page_group.packing);
         // The providers' LCM blocks follow one another: the last provider
         // that starts at or before the block holds it, if any does.
         let starting_at_or_before = self
             .providers
-            .partition_point(|provider| provider.start <= lcm);
+            .partition_point(|provider| provider.first_lcm_block <= lcm_block);
         let (provider_index, provider) = starting_at_or_before
             .checked_sub(1)
             .map(|index| (index, &self.providers[index]))
-            .filter(|(_, provider)| lcm - provider.start < provider.lcm_blocks)
+            .filter(|(_, provider)| lcm_block - provider.first_lcm_block < provider.num_lcm_blocks)
             .ok_or_else(out_of_range)?;
-        let page_base = (lcm - provider.start)
-            .checked_mul(self.lcm_bytes)
-            .and_then(|offset| offset.checked_add(slot.checked_mul(pages.page_bytes)?))
-            .and_then(|offset| provider.base.checked_add(offset))
+        let page_base = (lcm_block - provider.first_lcm_block)
+            .checked_mul(self.lcm_block_bytes)
+            .and_then(|offset| offset.checked_add(slot.checked_mul(page_group.page_bytes)?))
+            .and_then(|offset| provider.base_address.checked_add(offset))
             .ok_or_else(overflow)?;
         Ok((provider_index, page_base))
     }
@@ -159,15 +159,15 @@ impl PoolGeometry {
         page_base: u64,
         block: i32,
     ) -> Result<(u64, u64), PoolError> {
-        let in_block = u64::try_from(block)
+        let in_device_block = u64::try_from(block)
             .ok()
             .and_then(|block| block.checked_mul(field.device_stride))
             .and_then(|offset| field.device_address.checked_add(offset))
             .ok_or_else(overflow)?;
-        let in_page = page_base
-            .checked_add(field.page_offset)
+        let in_pool_page = page_base
+            .checked_add(field.offset_in_page)
             .ok_or_else(overflow)?;
-        Ok((in_page, in_block))
+        Ok((in_pool_page, in_device_block))
     }
 
     /// The reads of a load, per layer and then per provider (by index): each
@@ -176,12 +176,13 @@ impl PoolGeometry {
         let mut layers = vec![vec![Spans::default(); self.providers.len()]; self.num_layers];
         for copy in copies {
             let (provider_index, page_base) =
-                self.page_address(copy.group, copy.bucket, copy.page)?;
-            for field in &self.group(copy.group)?.fields {
-                let (in_page, in_block) = Self::field_addresses(field, page_base, copy.block)?;
+                self.page_address(copy.group_id, copy.bucket, copy.pool_page)?;
+            for field in &self.group(copy.group_id)?.fields {
+                let (in_pool_page, in_device_block) =
+                    Self::field_addresses(field, page_base, copy.device_block)?;
                 let spans = &mut layers[field.layer][provider_index];
-                spans.sources.push(in_page);
-                spans.destinations.push(in_block);
+                spans.sources.push(in_pool_page);
+                spans.destinations.push(in_device_block);
                 spans.lengths.push(field.bytes);
             }
         }
@@ -191,19 +192,20 @@ impl PoolGeometry {
     /// The writes of Device blocks to their pool pages, per provider (by
     /// index).
     pub fn write_spans(&self, copies: &[PageCopy]) -> Result<Vec<Spans>, PoolError> {
-        let mut providers = vec![Spans::default(); self.providers.len()];
+        let mut spans_by_provider = vec![Spans::default(); self.providers.len()];
         for copy in copies {
             let (provider_index, page_base) =
-                self.page_address(copy.group, copy.bucket, copy.page)?;
-            for field in &self.group(copy.group)?.fields {
-                let (in_page, in_block) = Self::field_addresses(field, page_base, copy.block)?;
-                let spans = &mut providers[provider_index];
-                spans.sources.push(in_block);
-                spans.destinations.push(in_page);
+                self.page_address(copy.group_id, copy.bucket, copy.pool_page)?;
+            for field in &self.group(copy.group_id)?.fields {
+                let (in_pool_page, in_device_block) =
+                    Self::field_addresses(field, page_base, copy.device_block)?;
+                let spans = &mut spans_by_provider[provider_index];
+                spans.sources.push(in_device_block);
+                spans.destinations.push(in_pool_page);
                 spans.lengths.push(field.bytes);
             }
         }
-        Ok(providers)
+        Ok(spans_by_provider)
     }
 }
 
@@ -220,19 +222,19 @@ mod tests {
     /// State pages of 12 bytes (layer 1) fit in one.
     fn geometry() -> PoolGeometry {
         PoolGeometry {
-            lcm_bytes: 28,
+            lcm_block_bytes: 28,
             providers: vec![
                 Provider {
                     session: "p0".to_owned(),
-                    base: 1_000,
-                    lcm_blocks: 3,
-                    start: 0,
+                    base_address: 1_000,
+                    num_lcm_blocks: 3,
+                    first_lcm_block: 0,
                 },
                 Provider {
                     session: "p1".to_owned(),
-                    base: 5_000,
-                    lcm_blocks: 5,
-                    start: 3,
+                    base_address: 5_000,
+                    num_lcm_blocks: 5,
+                    first_lcm_block: 3,
                 },
             ],
             groups: vec![
@@ -244,14 +246,14 @@ mod tests {
                             device_address: 100,
                             device_stride: 32,
                             bytes: 12,
-                            page_offset: 0,
+                            offset_in_page: 0,
                             layer: 0,
                         },
                         PageField {
                             device_address: 116,
                             device_stride: 32,
                             bytes: 16,
-                            page_offset: 12,
+                            offset_in_page: 12,
                             layer: 1,
                         },
                     ],
@@ -263,7 +265,7 @@ mod tests {
                         device_address: 500,
                         device_stride: 16,
                         bytes: 12,
-                        page_offset: 0,
+                        offset_in_page: 0,
                         layer: 1,
                     }],
                 },
@@ -272,12 +274,12 @@ mod tests {
         }
     }
 
-    fn copy(group: u32, page: i32, block: i32) -> PageCopy {
+    fn copy(group_id: u32, pool_page: i32, device_block: i32) -> PageCopy {
         PageCopy {
-            group,
+            group_id,
             bucket: 0,
-            page,
-            block,
+            pool_page,
+            device_block,
         }
     }
 
@@ -380,12 +382,12 @@ mod tests {
         // 10^8 LCM blocks of 2 MiB on one provider: byte offsets pass 2^47,
         // far past what 32-bit page arithmetic holds.
         let geometry = PoolGeometry {
-            lcm_bytes: 2 << 20,
+            lcm_block_bytes: 2 << 20,
             providers: vec![Provider {
                 session: "p0".to_owned(),
-                base: 1 << 40,
-                lcm_blocks: 100_000_000,
-                start: 0,
+                base_address: 1 << 40,
+                num_lcm_blocks: 100_000_000,
+                first_lcm_block: 0,
             }],
             groups: vec![PageGroup {
                 packing: 1,
@@ -394,7 +396,7 @@ mod tests {
                     device_address: 1 << 46,
                     device_stride: 2 << 20,
                     bytes: 2 << 20,
-                    page_offset: 0,
+                    offset_in_page: 0,
                     layer: 0,
                 }],
             }],
@@ -415,10 +417,10 @@ mod tests {
 
         // An address past 64 bits is an error, not a wrapped address.
         let mut far = geometry;
-        far.providers[0].base = u64::MAX - 1;
+        far.providers[0].base_address = u64::MAX - 1;
         let error = far.page_address(0, 0, 2).unwrap_err();
         assert!(error.0.contains("overflows"), "{error}");
-        far.providers[0].base = 0;
+        far.providers[0].base_address = 0;
         far.groups[0].fields[0].device_address = u64::MAX - 1;
         let error = far.load_spans(&[copy(0, 1, 1)]).unwrap_err();
         assert!(error.0.contains("overflows"), "{error}");

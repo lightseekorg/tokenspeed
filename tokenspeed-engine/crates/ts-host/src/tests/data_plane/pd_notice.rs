@@ -84,7 +84,8 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
     let streams = Streams::Prefill(pair.prefill_outbox.clone());
     let (plane, _) = plane();
     // The rank joined no shared L2 pool.
-    let shared_l2_handle = Python::attach(|py| Py::new(py, crate::pool::Handle::new()).unwrap());
+    let shared_l2_handle =
+        Python::attach(|py| Py::new(py, crate::shared_l2::Handle::new()).unwrap());
     let mut data_plane =
         PythonDataPlane::start(plane, Some(streams.clone()), shared_l2_handle).unwrap();
     let mut scheduler = Python::attach(|py| {

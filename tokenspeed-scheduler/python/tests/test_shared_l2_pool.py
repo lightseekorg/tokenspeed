@@ -98,11 +98,11 @@ class Prompt:
             full.append(key(0, self.tail[1]))
         return full + [key(1, self.end)]
 
-    def publication(self, publisher):
-        return (tokens_bytes(self.tokens), self.hashes, self.tail, publisher)
+    def checkpoint(self, access_epoch):
+        return (tokens_bytes(self.tokens), self.hashes, self.tail, access_epoch)
 
-    def probe(self, pool, client):
-        return pool.probe(
+    def lookup(self, pool, client):
+        return pool.lookup(
             client, self.hashes, tokens_bytes(self.tokens), len(self.tokens)
         )
 
@@ -111,7 +111,7 @@ def write(pool, client, prompt):
     keys = prompt.keys()
     ticket, pages = pool.reserve(client, keys, [0] * len(keys))
     assert ticket and min(pages) >= 1
-    assert pool.commit(client, ticket, [prompt.publication(1)])
+    pool.commit(client, ticket, [prompt.checkpoint(1)])
     return dict(zip(keys, pages))
 
 
@@ -122,12 +122,12 @@ def test_a_client_reads_the_pages_another_client_wrote():
     # A group's pages are numbered on their own.
     assert len({(k[1], page) for k, page in pages.items()}) == 4
 
-    ticket, num_tokens, kv_tokens, tail, slots = Prompt(range(14)).probe(pool, 2)
+    ticket, num_tokens, kv_tokens, tail, hit_pages = Prompt(range(14)).lookup(pool, 2)
     assert (num_tokens, kv_tokens, tail) == (10, 10, prompt.tail)
-    assert {k: page for k, _, page in slots} == pages
-    assert all(bucket == 0 for _, bucket, _ in slots)
+    assert {k: page for k, _, page in hit_pages} == pages
+    assert all(bucket == 0 for _, bucket, _ in hit_pages)
     assert pool.stats()["pinned_blocks"] == 4
-    assert pool.stats()["lookups"] == 1
+    assert pool.stats()["open_lookups"] == 1
     pool.release(2, ticket)
     assert pool.stats()["pinned_blocks"] == 0
     keys = prompt.keys()
@@ -140,13 +140,13 @@ def test_keys_and_tails_survive_a_wire_that_turns_tuples_into_lists():
     prompt = Prompt(range(10))
     keys = [list(k) for k in prompt.keys()]
     ticket, pages = pool.reserve(1, keys, [0] * len(keys))
-    tokens, hashes, tail, publisher = prompt.publication(5)
-    assert pool.commit(1, ticket, [[tokens, list(hashes), list(tail), publisher]])
+    tokens, hashes, tail, access_epoch = prompt.checkpoint(5)
+    pool.commit(1, ticket, [[tokens, list(hashes), list(tail), access_epoch]])
     pool.touch(keys)
-    ticket, num_tokens, _, tail, slots = prompt.probe(pool, 2)
+    ticket, num_tokens, _, tail, hit_pages = prompt.lookup(pool, 2)
     assert num_tokens == 10 and tail == prompt.tail
-    assert sorted(k for k, _, _ in slots) == sorted(prompt.keys())
-    assert sorted(page for _, _, page in slots) == sorted(pages)
+    assert sorted(k for k, _, _ in hit_pages) == sorted(prompt.keys())
+    assert sorted(page for _, _, page in hit_pages) == sorted(pages)
 
 
 def test_misuse_is_refused():
@@ -162,5 +162,5 @@ def test_misuse_is_refused():
     pool = ts.SharedL2Pool(config(), 8, 0)
     prompt = Prompt(range(8))
     with pytest.raises(ValueError, match="int32 bytes"):
-        pool.probe(1, prompt.hashes, b"abc", 8)
-    assert pool.stats()["lookups"] == 0
+        pool.lookup(1, prompt.hashes, b"abc", 8)
+    assert pool.stats()["open_lookups"] == 0

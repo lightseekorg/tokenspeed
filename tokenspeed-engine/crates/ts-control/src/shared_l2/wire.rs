@@ -22,9 +22,9 @@
 //!
 //! A request is a msgpack map, `op`, `client` and the operation's fields; a
 //! reply is `{"ok": true, ...}` or `{"ok": false, "error": ...}`. Cache keys
-//! travel as `[namespace, group, content hash, page offset]`, each with its
-//! bucket, and a prompt's tokens as int32 bytes in native byte order
-//! (`cache/shared_l2/wire.py`).
+//! travel as `[namespace_id, group_id, content_hash, page_offset]`, a key the
+//! owner places with its bucket, and a prompt's tokens as int32 bytes in
+//! native byte order (`cache/shared_l2/wire.py`).
 //!
 //! The owner answers on a ROUTER socket and returns every frame before the
 //! payload unchanged. A connection is a DEALER socket of one thread, and
@@ -42,7 +42,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::runtime::Runtime;
 use ts_scheduler::{
-    SharedL2AnswerView, SharedL2LookupView, SharedL2OpView, SharedL2PublicationView, StorageKeyView,
+    SharedL2AnswerView, SharedL2CheckpointView, SharedL2LookupView, SharedL2OpView, StorageKeyView,
 };
 use ts_wire::{
     msgpack::{Decoder, Encoder},
@@ -54,7 +54,7 @@ use crate::shared_l2::PoolError;
 
 /// The namespace of every pool key. The scheduler's keys do not carry it: a
 /// pool holds the default namespace alone.
-const NAMESPACE: u32 = 0;
+const DEFAULT_CACHE_NAMESPACE_ID: u32 = 0;
 
 /// Read an array's header off `decoder` and check that the array, `what`,
 /// has `len` elements.
@@ -81,14 +81,14 @@ fn decode_answer(
     let kv_tokens = i32::decode(decoder)?;
     // The partial last page: its tokens and its hash.
     let (tail_tokens, tail_hash) = Option::<(i32, String)>::decode(decoder)?.unwrap_or_default();
-    let (mut keys, mut buckets, mut pages) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keys, mut buckets, mut pool_pages) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..decoder.array_len()? {
-        expect_array_len(decoder, 3, "a slot")?;
+        expect_array_len(decoder, 3, "a page")?;
         expect_array_len(decoder, 4, "a key")?;
-        let namespace = u32::decode(decoder)?;
-        if namespace != NAMESPACE {
+        let namespace_id = u32::decode(decoder)?;
+        if namespace_id != DEFAULT_CACHE_NAMESPACE_ID {
             return Err(ts_wire::Error::Invalid(format!(
-                "a key of namespace {namespace}, not {NAMESPACE}"
+                "a key of namespace {namespace_id}, not {DEFAULT_CACHE_NAMESPACE_ID}"
             )));
         }
         keys.push(StorageKeyView {
@@ -97,7 +97,7 @@ fn decode_answer(
             page_offset: i32::decode(decoder)?,
         });
         buckets.push(i32::decode(decoder)?);
-        pages.push(i32::decode(decoder)?);
+        pool_pages.push(i32::decode(decoder)?);
     }
     Ok(SharedL2AnswerView {
         request_id: request_id.to_owned(),
@@ -108,7 +108,7 @@ fn decode_answer(
         tail_hash,
         keys,
         buckets,
-        pages,
+        pool_pages,
     })
 }
 
@@ -124,7 +124,7 @@ fn encode_keys(encoder: &mut Encoder, keys: &[StorageKeyView]) {
     encoder.array_len(keys.len());
     for key in keys {
         encoder.array_len(4);
-        NAMESPACE.encode(encoder);
+        DEFAULT_CACHE_NAMESPACE_ID.encode(encoder);
         key.group_id.encode(encoder);
         key.content_hash.encode(encoder);
         key.page_offset.encode(encoder);
@@ -277,11 +277,11 @@ impl OwnerConnection {
     /// Ask for the pool's hit of every prompt, in one request, and return
     /// one answer for each lookup, in order. The owner pins each hit's
     /// pages under the hit's ticket.
-    pub fn probe_many(
+    pub fn lookup(
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-        let reply = self.request("probe_many", 1, |encoder| {
+        let reply = self.request("lookup", 1, |encoder| {
             encoder.str("lookups");
             encoder.array_len(lookups.len());
             for lookup in lookups {
@@ -292,10 +292,10 @@ impl OwnerConnection {
             }
         })?;
         reply.read("hits", |decoder| {
-            let hits = decoder.array_len()?;
-            if hits != lookups.len() {
+            let num_hits = decoder.array_len()?;
+            if num_hits != lookups.len() {
                 return Err(ts_wire::Error::Invalid(format!(
-                    "{hits} hits for {} lookups",
+                    "{num_hits} hits for {} lookups",
                     lookups.len()
                 )));
             }
@@ -329,34 +329,30 @@ impl OwnerConnection {
     }
 
     /// Commit the pages reserved under `ticket`, with the checkpoints among
-    /// them. Fails if the owner no longer holds the reservation.
+    /// them. The owner rejects a ticket under which the rank reserves
+    /// nothing.
     pub fn commit(
         &mut self,
         ticket: u64,
-        publications: &[SharedL2PublicationView],
+        checkpoints: &[SharedL2CheckpointView],
     ) -> Result<(), PoolError> {
-        let reply = self.request("commit", 2, |encoder| {
+        self.request("commit", 2, |encoder| {
             encoder.str("ticket");
             ticket.encode(encoder);
-            encoder.str("publications");
-            encoder.array_len(publications.len());
-            for publication in publications {
+            encoder.str("checkpoints");
+            encoder.array_len(checkpoints.len());
+            for checkpoint in checkpoints {
                 encoder.array_len(4);
-                encoder.bin(&token_bytes(&publication.tokens));
-                publication.prefix_hashes.encode(encoder);
+                encoder.bin(&token_bytes(&checkpoint.tokens));
+                checkpoint.prefix_hashes.encode(encoder);
                 // A checkpoint that ends on a page has no tail.
-                (publication.tail_tokens != 0)
-                    .then(|| (publication.tail_tokens, publication.tail_hash.clone()))
+                (checkpoint.tail_tokens != 0)
+                    .then(|| (checkpoint.tail_tokens, checkpoint.tail_hash.clone()))
                     .encode(encoder);
-                publication.publisher.encode(encoder);
+                checkpoint.access_epoch.encode(encoder);
             }
-        })?;
-        if !reply.read("committed", bool::decode)? {
-            return Err(PoolError(
-                "the owner no longer holds the reservation".to_owned(),
-            ));
-        }
-        Ok(())
+        })
+        .map(drop)
     }
 
     /// Unpin what a lookup hit under `ticket`.
@@ -370,12 +366,9 @@ impl OwnerConnection {
 
     /// Tell the owner that the rank used its own copies of `keys`.
     pub fn touch(&mut self, keys: &[StorageKeyView]) -> Result<(), PoolError> {
-        self.request("touch", 2, |encoder| {
+        self.request("touch", 1, |encoder| {
             encoder.str("keys");
             encode_keys(encoder, keys);
-            // The command carries no bucket: an unsharded group has one.
-            encoder.str("buckets");
-            vec![0_i32; keys.len()].encode(encoder);
         })
         .map(drop)
     }
@@ -407,25 +400,26 @@ mod tests {
         let (tail_tokens, tail_hash) = tail.unwrap();
         SharedL2OpView {
             kind: SharedL2OpKind::Write,
-            id: 31,
+            op_id: 31,
+            ticket: 0,
             keys,
             buckets: vec![0, 0, 0],
-            blocks: vec![1, 2, 1],
-            publications: vec![
-                SharedL2PublicationView {
+            device_blocks: vec![1, 2, 1],
+            checkpoints: vec![
+                SharedL2CheckpointView {
                     tokens: PROMPT.to_vec(),
                     prefix_hashes: prefix_hashes.clone(),
                     tail_tokens,
                     tail_hash,
-                    publisher: 7,
+                    access_epoch: 7,
                 },
                 // A checkpoint that ends on a page.
-                SharedL2PublicationView {
+                SharedL2CheckpointView {
                     tokens: PROMPT[..4].to_vec(),
                     prefix_hashes,
                     tail_tokens: 0,
                     tail_hash: String::new(),
-                    publisher: u64::MAX,
+                    access_epoch: u64::MAX,
                 },
             ],
         }
@@ -442,7 +436,7 @@ mod tests {
         let mut connection = connect(&owner, TIMEOUT);
 
         let answers = connection
-            .probe_many(&[
+            .lookup(&[
                 lookup("hit", &[1, 2, 3, 4, 5, 6, 7]),
                 lookup("cold", &[9, 9]),
             ])
@@ -461,7 +455,7 @@ mod tests {
                     tail_hash: "1-2-3-4-5".to_owned(),
                     keys,
                     buckets: vec![0, 0, 0],
-                    pages: vec![3, 4, 8],
+                    pool_pages: vec![3, 4, 8],
                 },
                 // A prompt the pool holds no prefix of is answered like the
                 // others: a miss.
@@ -474,7 +468,7 @@ mod tests {
                     tail_hash: String::new(),
                     keys: Vec::new(),
                     buckets: Vec::new(),
-                    pages: Vec::new(),
+                    pool_pages: Vec::new(),
                 },
             ]
         );
@@ -483,7 +477,7 @@ mod tests {
         let requests = owner.requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(op(request), "probe_many");
+        assert_eq!(op(request), "lookup");
         assert_eq!(uint(field(request, "client")), 7);
         let prompt = |hashes: &[&str], tokens: &[i32]| {
             Value::Array(vec![
@@ -509,7 +503,6 @@ mod tests {
                     ("ticket", Value::from(12)),
                     ("pages", ints(&[4, -1, 8])),
                 ]),
-                "commit" => ok(vec![("committed", Value::from(true))]),
                 _ => ok(Vec::new()),
             })
         });
@@ -520,7 +513,7 @@ mod tests {
             connection.reserve(&write).unwrap(),
             Some((12, vec![4, -1, 8]))
         );
-        connection.commit(12, &write.publications).unwrap();
+        connection.commit(12, &write.checkpoints).unwrap();
         connection.release(41).unwrap();
         connection.touch(&write.keys[..2]).unwrap();
         connection.ping().unwrap();
@@ -534,13 +527,13 @@ mod tests {
         assert_eq!(*field(&requests[0], "keys"), keys(&write.keys));
         assert_eq!(*field(&requests[0], "buckets"), ints(&[0, 0, 0]));
         assert_eq!(uint(field(&requests[1], "ticket")), 12);
-        let Value::Array(sent) = field(&requests[1], "publications") else {
-            panic!("publications are an array");
+        let Value::Array(sent) = field(&requests[1], "checkpoints") else {
+            panic!("checkpoints are an array");
         };
-        // The tokens as int32 bytes, the hashes, the tail, the publisher. A
+        // The tokens as int32 bytes, the hashes, the tail, the access epoch. A
         // checkpoint that ends on a page has no tail.
         let (Value::Array(tailed), Value::Array(paged)) = (&sent[0], &sent[1]) else {
-            panic!("a publication is an array");
+            panic!("a checkpoint is an array");
         };
         assert_eq!(tailed[0], Value::Bin(Bytes::from(token_bytes(&PROMPT))));
         assert_eq!(
@@ -550,9 +543,7 @@ mod tests {
         assert_eq!(uint(&tailed[3]), 7);
         assert_eq!((&paged[2], uint(&paged[3])), (&Value::Nil, u64::MAX));
         assert_eq!(uint(field(&requests[2], "ticket")), 41);
-        // A touch names bucket 0 for every key.
         assert_eq!(*field(&requests[3], "keys"), keys(&write.keys[..2]));
-        assert_eq!(*field(&requests[3], "buckets"), ints(&[0, 0]));
     }
 
     #[test]
@@ -587,11 +578,11 @@ mod tests {
     fn an_error_of_the_owner_is_the_requests() {
         let owner = TestOwner::serve(|_| Some(refused("client 7 has not joined the pool")));
         let error = connect(&owner, TIMEOUT)
-            .probe_many(&[lookup("request", &PROMPT)])
+            .lookup(&[lookup("request", &PROMPT)])
             .unwrap_err();
         assert_eq!(
             error.0,
-            "the shared L2 owner rejected 'probe_many': client 7 has not joined the pool"
+            "the shared L2 owner rejected 'lookup': client 7 has not joined the pool"
         );
     }
 
@@ -620,12 +611,12 @@ mod tests {
         ] {
             let owner = TestOwner::serve(move |_| Some(reply.clone()));
             let error = connect(&owner, TIMEOUT)
-                .probe_many(&[lookup("request", &PROMPT)])
+                .lookup(&[lookup("request", &PROMPT)])
                 .unwrap_err();
             assert!(
                 error
                     .0
-                    .starts_with("the shared L2 owner's reply to 'probe_many' is not a reply"),
+                    .starts_with("the shared L2 owner's reply to 'lookup' is not a reply"),
                 "{error}"
             );
             assert!(error.0.contains(reason), "{error}");
@@ -643,7 +634,7 @@ mod tests {
             hit[index] = value;
             Value::Array(hit)
         };
-        let slot = |key: Value, page: i64| {
+        let hit_page = |key: Value, page: i64| {
             with(
                 4,
                 Value::Array(vec![Value::Array(vec![
@@ -676,13 +667,13 @@ mod tests {
             ),
             // A key without its page offset, a page past int32, a negative
             // group, another namespace.
-            slot(
+            hit_page(
                 Value::Array(vec![Value::from(0), Value::from(0), Value::from("1-2")]),
                 3,
             ),
-            slot(key_value(&keys[0]), 1 << 31),
-            slot(key(1, Value::from(-1)), 3),
-            slot(key(0, Value::from(1)), 3),
+            hit_page(key_value(&keys[0]), 1 << 31),
+            hit_page(key(1, Value::from(-1)), 3),
+            hit_page(key(0, Value::from(1)), 3),
             Value::Nil,
         ]
     }
@@ -694,12 +685,12 @@ mod tests {
             let hits = Value::Array(vec![hit_value(41, [3, 4, 8]), spoiled.clone()]);
             let owner = TestOwner::serve(move |_| Some(ok(vec![("hits", hits.clone())])));
             let error = connect(&owner, TIMEOUT)
-                .probe_many(&[lookup("hit", &PROMPT), lookup("spoiled", &PROMPT)])
+                .lookup(&[lookup("hit", &PROMPT), lookup("spoiled", &PROMPT)])
                 .unwrap_err();
             assert!(
                 error
                     .0
-                    .starts_with("the shared L2 owner's reply to 'probe_many' is not a reply"),
+                    .starts_with("the shared L2 owner's reply to 'lookup' is not a reply"),
                 "{spoiled:?}: {error}"
             );
         }
@@ -708,7 +699,7 @@ mod tests {
         let owner =
             TestOwner::serve(move |_| Some(ok(vec![("hits", Value::Array(vec![other.clone()]))])));
         let error = connect(&owner, TIMEOUT)
-            .probe_many(&[lookup("request", &PROMPT)])
+            .lookup(&[lookup("request", &PROMPT)])
             .unwrap_err();
         assert!(error.0.contains("a key of namespace 1, not 0"), "{error}");
     }

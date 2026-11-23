@@ -23,7 +23,12 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_engine.scheduler import PeerConfig, SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import (
+    PeerConfig,
+    SchedulerConfig,
+    SharedL2Config,
+    StorageConfig,
+)
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -261,7 +266,7 @@ def scheduler_config_from_args(
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
     peer_config: PeerConfig | None,
-    shared_l2_config,
+    shared_l2_config: SharedL2Config | None,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -308,9 +313,7 @@ def scheduler_config_from_args(
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
         # A shared L2 pool is the Host L2: the scheduler keeps its proxy tier.
-        disable_l2_cache=not (
-            server_args.enable_kvstore or shared_l2_config is not None
-        ),
+        disable_l2_cache=not server_args.has_host_tier,
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,

@@ -48,16 +48,16 @@ public:
     using ClientId = std::uint64_t;
     using Ticket = std::uint64_t;
 
-    // A pool page: `page` is the block id in the pool's Host layout of the
-    // key's group, `bucket` the shard it lies in (always 0 until the pool
+    // A pool page: `pool_page` is the block id in the pool's Host layout of
+    // the key's group, `bucket` the shard it lies in (always 0 until the pool
     // holds sharded groups).
-    struct Slot {
+    struct Page {
         CacheKey key;
         std::int32_t bucket{0};
-        std::int32_t page{0};
+        std::int32_t pool_page{0};
     };
     // The pool's longest reusable prefix of a prompt (num_tokens 0 when it has
-    // none); its slots stay pinned until the client releases the ticket
+    // none); its pages stay pinned until the client releases the ticket
     // (0: nothing is pinned).
     struct Hit {
         Ticket ticket{0};
@@ -65,14 +65,15 @@ public:
         // How far the pool's KV pages reach, checkpoint or not.
         std::int32_t kv_tokens{0};
         std::optional<TailPublication> tail;
-        std::vector<Slot> slots;
+        std::vector<Page> pages;
     };
-    // A page, or why there is none. kHeld does not tell a key the pool holds
-    // from one another client is writing: if that client leaves before it
-    // commits, the key is in neither state, and a client answered kHeld for it
-    // offers it again only when a request that published it finishes.
-    static constexpr std::int32_t kHeld = -1;    // the pool holds it or another client is writing it
-    static constexpr std::int32_t kNoSlot = -2;  // every slot is pinned or reserved
+    // A page, or why there is none, in the words of the local Host store
+    // path's counters (WriteBackStats). A key answered kInFlight whose writer
+    // leaves before its commit is then neither held nor being written: its
+    // rank offers it again only when a request that published it finishes.
+    static constexpr std::int32_t kHostCached = -1;   // the pool holds the key
+    static constexpr std::int32_t kNoPlacement = -2;  // no page of its group and bucket is free
+    static constexpr std::int32_t kInFlight = -3;     // another reservation writes it, or this one names it twice
     // Aligned with the requested keys: the page to write, or why there is
     // none. Ticket 0 reserves nothing.
     struct Reservation {
@@ -80,13 +81,13 @@ public:
         std::vector<std::int32_t> pages;
     };
     struct Stats {
-        std::int32_t total_lcm_blocks{0};
-        std::int32_t free_lcm_blocks{0};
+        std::int32_t num_lcm_blocks{0};
+        std::int32_t empty_lcm_blocks{0};
         std::int32_t cached_blocks{0};
         std::int32_t pinned_blocks{0};
         std::size_t reserved_blocks{0};
         // Lookup tickets not released yet.
-        std::size_t lookups{0};
+        std::size_t open_lookups{0};
         std::uint64_t evicted_blocks{0};
         std::size_t checkpoints{0};
     };
@@ -104,20 +105,21 @@ public:
     SharedL2Pool& operator=(const SharedL2Pool&) = delete;
 
     // The prompt carries its tokens up to max_tokens.
-    Hit Probe(ClientId client, const PromptPrefix& prompt);
+    Hit Lookup(ClientId client, const PromptPrefix& prompt);
+    // Ends a hit's pins. Throws for a ticket no lookup of the client holds.
     void Release(ClientId client, Ticket ticket);
     // A key the pool holds, one another write reserved or a repeated one gets
-    // no page (kHeld). The keys the pool holds are refreshed, as a rank's
+    // no page (kHostCached, kInFlight). The keys the pool holds are refreshed, as a rank's
     // Device publication refreshes its own Host copies, before pages are
     // taken for the others: the reservation does not evict them.
     Reservation Reserve(ClientId client, std::span<const CacheKey> keys, std::span<const std::int32_t> buckets);
-    // Publishes a reservation's blocks, with the lineage of the checkpoints
-    // whose State block is among them (CacheCoordinator::PublishHostBlocks).
-    // A lineage's access epoch names the request that published the
-    // checkpoint on its rank: checkpoints one request published are no step
-    // apart in the retention ranking (CheckpointTree). False, with no change,
-    // for a ticket that reserves nothing (any more).
-    bool Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints);
+    // Publishes a reservation's blocks, with the checkpoints
+    // whose State block is among them (CacheCoordinator::CacheWrittenHostBlocks).
+    // A checkpoint's access epoch names the request that published it
+    // on its rank: checkpoints one request published are no step
+    // apart in the retention ranking (CheckpointTree). Throws, with no
+    // change, for a ticket under which the client reserves nothing.
+    void Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Checkpoint> checkpoints);
     void Touch(std::span<const CacheKey> keys);
     // Ends everything the client holds. The pool keeps no list of clients: a
     // call under this id afterwards starts it anew, so the service in front
@@ -125,9 +127,8 @@ public:
     void Disconnect(ClientId client);
     // Empties the pool between workloads; false while any client holds pins
     // or reservations.
-    bool Clear();
+    bool ClearCache();
 
-    bool Contains(const CacheKey& key) const { return cache_.Host().ContainsHostCachedBlock(key); }
     Stats GetStats() const;
 
 private:
@@ -172,8 +173,8 @@ private:
     void keepHeadroom();
 
     // The coordinator requires a Device pool; the pool's owner never uses it.
-    BlockPool unused_device_;
-    BlockPool pool_;
+    BlockPool unused_device_block_pool_;
+    BlockPool host_block_pool_;
     CacheCoordinator cache_;
     std::int32_t prefix_granularity_;
     std::int32_t headroom_lcm_blocks_;

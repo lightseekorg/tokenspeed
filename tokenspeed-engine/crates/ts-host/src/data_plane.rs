@@ -33,11 +33,12 @@
 //! the GIL) and the cache acknowledgments. Each takes the GIL for its call
 //! only, under a dispatch guard that rejects device work, and none waits
 //! behind the forward thread's queue: the round head never waits for
-//! launches in flight. A rank whose Host tier is a shared L2 pool has only
-//! load-backs to acknowledge, and the host's loader ran them: its cache
-//! acknowledgments are the loader's finished loads, read without the GIL
-//! (`pool.rs`). The L3 tier's storage executor is the host's own (`ts-l3`),
-//! outside the data plane.
+//! launches in flight. The L3 tier's storage executor is the host's own
+//! (`ts-l3`), outside the data plane.
+//!
+//! A rank whose Host tier is a shared L2 pool has only load-backs to
+//! acknowledge, and the host's loader ran them: its cache acknowledgments
+//! are the loader's finished loads, read without the GIL (`shared_l2.rs`).
 
 use std::{
     collections::HashMap,
@@ -61,7 +62,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::{pd::Streams, pool, LAUNCHER_FAILURE};
+use crate::{pd::Streams, shared_l2, LAUNCHER_FAILURE};
 
 mod result_buffers;
 
@@ -290,7 +291,7 @@ pub struct PythonDataPlane {
     plane: Py<PyAny>,
     /// The rank's shared L2 handle: the loads of a rank that joined a pool
     /// are acknowledged from there.
-    shared_l2_handle: Py<pool::Handle>,
+    shared_l2_handle: Py<shared_l2::Handle>,
     /// The control thread's dispatch guard, entered while the plane serves.
     guard: Option<Py<PyAny>>,
     ops: Option<mpsc::Sender<Op>>,
@@ -308,7 +309,7 @@ impl PythonDataPlane {
     pub fn start(
         plane: Py<PyAny>,
         streams: Option<Streams>,
-        shared_l2_handle: Py<pool::Handle>,
+        shared_l2_handle: Py<shared_l2::Handle>,
     ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane

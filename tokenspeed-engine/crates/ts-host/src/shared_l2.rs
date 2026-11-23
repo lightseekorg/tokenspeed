@@ -49,7 +49,7 @@ use ts_control::{
     shared_l2::{
         client::{self, ClientSettings, EngineWriter, PageWriter, RankClient, RankThreads},
         geometry::{PageField, PageGroup, PoolGeometry, Provider},
-        load::{Loads, SignalWords},
+        load::{LoadRow, Loads, SignalWords},
         PoolClient,
     },
 };
@@ -62,23 +62,23 @@ const KEEPALIVE: Duration = Duration::from_secs(5);
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
 /// The rank's signal words, the start and ready words of its loads:
-/// `count` 32-bit words at `address`, host memory the device maps (the
+/// `num_words` 32-bit words at `address`, host memory the device maps (the
 /// region of `HostSignals` in `cache/shared_l2/executor.py`). The rank
 /// keeps them allocated until the client's threads have ended.
 pub(crate) struct HostSignals {
     address: usize,
-    count: usize,
+    num_words: usize,
 }
 
 impl HostSignals {
     #[allow(unsafe_code)]
     fn word(&self, word: usize) -> &AtomicU32 {
         assert!(
-            word < self.count,
+            word < self.num_words,
             "signal word {word} of {} words",
-            self.count
+            self.num_words
         );
-        // SAFETY: the word lies within the `count` words at `address`, which
+        // SAFETY: the word lies within the `num_words` words at `address`, which
         // outlive the threads that reach it, and is read and written as a
         // whole by them, by the forward thread's streams and by the device.
         unsafe { AtomicU32::from_ptr((self.address as *mut u32).add(word)) }
@@ -87,7 +87,7 @@ impl HostSignals {
 
 impl SignalWords for HostSignals {
     fn num_words(&self) -> usize {
-        self.count
+        self.num_words
     }
 
     fn get(&self, word: usize) -> u32 {
@@ -101,7 +101,7 @@ impl SignalWords for HostSignals {
 
 /// Start the rank's transfer engine and register `regions`, the Device
 /// cache's buffers, as a peer's engine starts (`peer::start`).
-fn start_engine(
+fn start_transfer_engine(
     library: &Path,
     hostname: &str,
     protocol: &str,
@@ -128,7 +128,7 @@ fn start_engine(
 
 /// What the rank's client starts from, and where its signal words are
 /// (`SharedL2ClientSettings`).
-pub(crate) fn client_settings(
+pub(crate) fn settings_from_python(
     settings: &Bound<'_, PyAny>,
 ) -> PyResult<(ClientSettings, HostSignals)> {
     let invalid = |message: String| PyRuntimeError::new_err(message);
@@ -143,9 +143,9 @@ pub(crate) fn client_settings(
             let provider = provider?;
             Ok(Provider {
                 session: provider.getattr("session")?.extract()?,
-                base: provider.getattr("base")?.extract()?,
-                lcm_blocks: provider.getattr("lcm_blocks")?.extract()?,
-                start: provider.getattr("start")?.extract()?,
+                base_address: provider.getattr("base_address")?.extract()?,
+                num_lcm_blocks: provider.getattr("num_lcm_blocks")?.extract()?,
+                first_lcm_block: provider.getattr("first_lcm_block")?.extract()?,
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
@@ -163,7 +163,7 @@ pub(crate) fn client_settings(
                         device_address: field.getattr("device_address")?.extract()?,
                         device_stride: field.getattr("device_stride")?.extract()?,
                         bytes: field.getattr("bytes")?.extract()?,
-                        page_offset: field.getattr("page_offset")?.extract()?,
+                        offset_in_page: field.getattr("offset_in_page")?.extract()?,
                         layer: field.getattr("layer")?.extract()?,
                     })
                 })
@@ -176,7 +176,7 @@ pub(crate) fn client_settings(
         })
         .collect::<PyResult<Vec<_>>>()?;
     let geometry = PoolGeometry {
-        lcm_bytes: settings.getattr("lcm_bytes")?.extract()?,
+        lcm_block_bytes: settings.getattr("lcm_block_bytes")?.extract()?,
         providers,
         groups,
         num_layers: settings.getattr("num_layers")?.extract()?,
@@ -189,13 +189,13 @@ pub(crate) fn client_settings(
                 settings.getattr("request_timeout_ms")?.extract()?,
             ),
             keepalive: KEEPALIVE,
-            load_workers: workers("load_workers")?,
+            read_workers: workers("read_workers")?,
             write_workers: workers("write_workers")?,
             geometry,
         },
         HostSignals {
             address: settings.getattr("signal_words_address")?.extract()?,
-            count: settings.getattr("num_signal_words")?.extract()?,
+            num_words: settings.getattr("num_signal_words")?.extract()?,
         },
     ))
 }
@@ -205,7 +205,7 @@ pub(crate) fn client_settings(
 /// starts it.
 #[pyclass(frozen, name = "SharedL2Handle")]
 pub struct Handle {
-    /// The transfer engine, from `start_engine` until the client takes it.
+    /// The transfer engine, from `start_transfer_engine` until the client takes it.
     engine: Mutex<Option<Arc<ts_mooncake::Engine>>>,
     /// The client for the loop, from `start_client` until the loop takes it.
     client: Mutex<Option<RankClient>>,
@@ -274,7 +274,7 @@ impl Handle {
     ///         points, the engine did not start, a registration failed, or
     ///         the engine was started before.
     #[pyo3(signature = (*, library, hostname, protocol, device_filter, regions))]
-    fn start_engine(
+    fn start_transfer_engine(
         &self,
         py: Python<'_>,
         library: PathBuf,
@@ -284,7 +284,7 @@ impl Handle {
         regions: Vec<(usize, usize)>,
     ) -> PyResult<()> {
         let engine = py
-            .detach(|| start_engine(&library, hostname, protocol, device_filter, &regions))
+            .detach(|| start_transfer_engine(&library, hostname, protocol, device_filter, &regions))
             .map_err(PyRuntimeError::new_err)?;
         if self.engine.lock().replace(engine).is_some() {
             return Err(PyRuntimeError::new_err(
@@ -299,7 +299,7 @@ impl Handle {
     /// connections, its write and notice threads, its keepalive and its
     /// loads. Blocks without the GIL.
     fn start_client(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
-        let (settings, signal_words) = client_settings(settings)?;
+        let (settings, signal_words) = settings_from_python(settings)?;
         let engine = self.engine.lock().take().ok_or_else(|| {
             PyRuntimeError::new_err("the rank's shared L2 transfer engine has not started")
         })?;
@@ -329,6 +329,14 @@ impl Handle {
         start_word: usize,
         seq: u32,
     ) -> PyResult<()> {
+        let rows: Vec<LoadRow> = rows
+            .into_iter()
+            .map(|(group_id, host_block, device_block)| LoadRow {
+                group_id,
+                host_block,
+                device_block,
+            })
+            .collect();
         self.loads()
             .ok_or_else(|| PyRuntimeError::new_err("the rank's shared L2 client has not started"))?
             .submit(op_ids, &rows, start_word, seq)

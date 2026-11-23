@@ -50,7 +50,7 @@ class SharedL2PageField:
         device_address: The address of the field in Device block zero.
         device_stride: Bytes from one Device block to the next.
         bytes: Bytes of the field's payload.
-        page_offset: The payload's offset inside a pool page.
+        offset_in_page: The payload's offset inside a pool page.
         layer: The layer that reads the field, counted over the layout's
             consumers, the target's and then the draft's.
     """
@@ -58,7 +58,7 @@ class SharedL2PageField:
     device_address: int
     device_stride: int
     bytes: int
-    page_offset: int
+    offset_in_page: int
     layer: int
 
 
@@ -67,39 +67,39 @@ class SharedL2Layout:
     """Startup-only facts, in the scheduler's group order.
 
     Attributes:
-        transfer: The rank's Device cache fields and buffers.
-        view_layers: The layers of each cache pool view, the target's and
-            then the draft's when it has its own: together the flat layers of
-            ``transfer.consumers``.
+        transfer_layout: The rank's Device cache fields and buffers.
+        view_num_layers: The number of layers of each cache pool view, the
+            target's and then the draft's when it has its own: together the
+            flat layers of ``transfer_layout.consumers``.
         block_bytes: Bytes of one pool page per group.
         field_offsets: Per group, each field's offset inside a pool page.
-        host_packing: Pool pages per LCM block, per group.
+        host_group_packing: Pool pages per LCM block, per group.
         geometry: What the owner builds its pool from and checks every rank
             against (``owner``'s module docstring).
     """
 
-    transfer: CacheTransferLayout
-    view_layers: tuple[int, ...]
+    transfer_layout: CacheTransferLayout
+    view_num_layers: tuple[int, ...]
     block_bytes: tuple[int, ...]
     field_offsets: tuple[tuple[int, ...], ...]
-    host_packing: tuple[int, ...]
+    host_group_packing: tuple[int, ...]
     geometry: dict[str, Any]
 
     @classmethod
     def build(
         cls,
-        transfer: CacheTransferLayout,
+        transfer_layout: CacheTransferLayout,
         *,
-        view_layers: tuple[int, ...],
+        view_num_layers: tuple[int, ...],
         group_specs: Sequence[Any],
         cache_groups: Sequence[Any],
         prefix_granularity: int,
     ) -> SharedL2Layout:
         """
         Args:
-            transfer: The rank's transfer layout, target and draft fields,
+            transfer_layout: The rank's transfer layout, target and draft fields,
                 groups in the scheduler's order.
-            view_layers: The layers of each cache pool view.
+            view_num_layers: The number of layers of each cache pool view.
             group_specs: The arena's ``CacheGroupSpec`` of each group.
             cache_groups: The scheduler's ``CacheGroupConfig`` of each group
                 (``pool_to_cache_groups``).
@@ -107,34 +107,36 @@ class SharedL2Layout:
         """
         if any(spec.shard_count != 1 for spec in group_specs):
             raise ValueError("a shared L2 pool holds replicated cache groups only")
-        block_bytes, field_offsets, lcm_bytes, host_packing = _compute_host_layout(
-            transfer, group_specs=group_specs
+        block_bytes, field_offsets, lcm_block_bytes, host_group_packing = (
+            _compute_host_layout(transfer_layout, group_specs=group_specs)
         )
         geometry = {
             "prefix_granularity": int(prefix_granularity),
-            "lcm_bytes": lcm_bytes,
+            "lcm_block_bytes": lcm_block_bytes,
             "groups": [
                 {
                     "group_id": config.group_id,
                     "attn_kind": config.attn_kind.name,
                     "block_granularity": config.block_granularity,
                     "cache_blocks_per_lcm_block": config.cache_blocks_per_lcm_block,
-                    "host_packing": packing,
+                    "host_group_packing": packing,
                     "shard_count": config.shard_count,
                     "sliding_window_tokens": config.sliding_window_tokens,
                     "sink_tokens": config.sink_tokens,
                     "replayable": config.replayable,
                     "checkpoint_granularity": config.checkpoint_granularity,
                 }
-                for config, packing in zip(cache_groups, host_packing, strict=True)
+                for config, packing in zip(
+                    cache_groups, host_group_packing, strict=True
+                )
             ],
         }
         return cls(
-            transfer=transfer,
-            view_layers=view_layers,
+            transfer_layout=transfer_layout,
+            view_num_layers=view_num_layers,
             block_bytes=block_bytes,
             field_offsets=field_offsets,
-            host_packing=host_packing,
+            host_group_packing=host_group_packing,
             geometry=geometry,
         )
 
@@ -142,7 +144,7 @@ class SharedL2Layout:
         """``(address, bytes)`` of every Device buffer a transfer touches."""
         return tuple(
             (int(buffer.data_ptr()), int(buffer.nbytes))
-            for buffer in self.transfer.buffers
+            for buffer in self.transfer_layout.buffers
         )
 
     def page_fields(self, group: int) -> tuple[SharedL2PageField, ...]:
@@ -150,22 +152,22 @@ class SharedL2Layout:
         page holds them."""
         layer_of = {
             field_id: layer
-            for layer, consumer in enumerate(self.transfer.consumers)
+            for layer, consumer in enumerate(self.transfer_layout.consumers)
             for field_id in consumer
         }
         return tuple(
             SharedL2PageField(
                 device_address=int(
-                    self.transfer.buffers[field.device_buffer_index].data_ptr()
+                    self.transfer_layout.buffers[field.device_buffer_index].data_ptr()
                 )
                 + field.device_block_zero_offset_bytes,
                 device_stride=field.block_stride_bytes,
                 bytes=field.payload_bytes,
-                page_offset=offset,
+                offset_in_page=offset,
                 layer=layer_of[field.field_id],
             )
             for field, offset in zip(
-                self.transfer.groups[group].fields,
+                self.transfer_layout.groups[group].fields,
                 self.field_offsets[group],
                 strict=True,
             )
@@ -201,7 +203,7 @@ def build_shared_l2_layout(
     return SharedL2Layout.build(
         combined,
         # A draft whose view is the target's has no layers of its own.
-        view_layers=(
+        view_num_layers=(
             (len(target.consumers),)
             if combined is target
             else (len(target.consumers), len(draft.consumers))

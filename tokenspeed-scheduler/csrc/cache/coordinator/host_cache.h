@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <optional>
 #include <span>
@@ -191,7 +192,7 @@ public:
     // Refreshes the Host entries of `keys` as a Device hit on them does; a
     // key the Host does not hold is skipped. For the owner of a shared L2
     // pool (SharedL2Pool), whose ranks' Device hits reach it as keys.
-    void TouchHostBlocks(std::span<const CacheKey> keys);
+    void TouchHostKeys(std::span<const CacheKey> keys);
     // A rank whose Host tier is a proxy of a shared L2 pool (SharedL2Proxy)
     // mirrors the pool's pinned pages as Host entries and gives each up once
     // nothing on the rank holds it.
@@ -199,14 +200,13 @@ public:
     // Evicts key's Host entry, as Host eviction does (a State checkpoint's
     // unpinned State siblings leave with it), unless something holds its
     // block: false then. A key the Host no longer holds is dropped already.
-    bool DropHostEntry(const CacheKey& key);
+    bool TryEvictHostEntry(const CacheKey& key);
     // Queues a newly published Device entry for D2H Store (write-through).
     void QueueStore(CacheKey key) { pending_stores_.push_back(StoreCandidate{.key = std::move(key)}); }
     // Drops the queued stores no drain took (ClearDeviceCache), counting them.
     void DropPendingStores() {
-        store_candidates_dropped_by_flush_ += pending_stores_.size() - taken_pending_stores_;
+        store_candidates_dropped_by_flush_ += pending_stores_.size();
         pending_stores_.clear();
-        taken_pending_stores_ = 0;
     }
     // Whether there is a Host tier at all.
     bool HasPool() const { return store_.HostPool() != nullptr; }
@@ -269,10 +269,7 @@ private:
     CacheEvictor& evictor_;
     AdmissionHistory& history_;
     bool write_back_evictions_{false};
-    std::vector<StoreCandidate> pending_stores_;
-    // How many candidates at its front bounded takes have taken already;
-    // fewer than its size unless both are zero.
-    std::size_t taken_pending_stores_{0};
+    std::deque<StoreCandidate> pending_stores_;
     // Accounting only.
     std::uint64_t store_candidates_dropped_by_flush_{0};
 };

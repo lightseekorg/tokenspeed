@@ -129,22 +129,11 @@ private:
 }  // namespace
 
 std::vector<HostCache::StoreCandidate> HostCache::TakePendingStores(std::size_t max_candidates) {
-    std::vector<StoreCandidate> pending;
-    if (taken_pending_stores_ == 0 && max_candidates >= pending_stores_.size()) {
-        pending = std::exchange(pending_stores_, {});
-    } else {
-        const auto first = pending_stores_.begin() + static_cast<std::ptrdiff_t>(taken_pending_stores_);
-        const auto past_end = first + static_cast<std::ptrdiff_t>(
-                                          std::min(max_candidates, pending_stores_.size() - taken_pending_stores_));
-        pending.assign(std::make_move_iterator(first), std::make_move_iterator(past_end));
-        taken_pending_stores_ += pending.size();
-        // The taken front leaves the queue once it is at least half of it:
-        // a take costs what it takes, however long the queue is.
-        if (taken_pending_stores_ * 2 >= pending_stores_.size()) {
-            pending_stores_.erase(pending_stores_.begin(), past_end);
-            taken_pending_stores_ = 0;
-        }
-    }
+    const auto past_end =
+        pending_stores_.begin() + static_cast<std::ptrdiff_t>(std::min(max_candidates, pending_stores_.size()));
+    std::vector<StoreCandidate> pending(std::make_move_iterator(pending_stores_.begin()),
+                                        std::make_move_iterator(past_end));
+    pending_stores_.erase(pending_stores_.begin(), past_end);
     std::erase_if(pending, [this](const StoreCandidate& candidate) {
         const auto& index = store_.Groups()[candidate.key.group_id].Index();
         auto location = store_.LocationOf(store_.DevicePool(), candidate.key.group_id, candidate.key);
@@ -395,8 +384,8 @@ void HostCache::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
     }
 }
 
-void HostCache::TouchHostBlocks(std::span<const CacheKey> keys) {
-    _assert(store_.HostPool() != nullptr, "TouchHostBlocks requires a host pool");
+void HostCache::TouchHostKeys(std::span<const CacheKey> keys) {
+    _assert(store_.HostPool() != nullptr, "TouchHostKeys requires a host pool");
     const std::uint64_t access_epoch = history_.IssueAccessEpoch();
     for (const CacheKey& key : keys) {
         _assert(key.group_id < store_.Groups().size(), "Host touch key group id out of range");
@@ -414,8 +403,8 @@ void HostCache::TouchHostBlocks(std::span<const CacheKey> keys) {
     }
 }
 
-bool HostCache::DropHostEntry(const CacheKey& key) {
-    _assert(store_.HostPool() != nullptr, "DropHostEntry requires a host pool");
+bool HostCache::TryEvictHostEntry(const CacheKey& key) {
+    _assert(store_.HostPool() != nullptr, "TryEvictHostEntry requires a host pool");
     _assert(key.group_id < store_.Groups().size(), "Host entry key group id out of range");
     const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.HostPool(), key.group_id, key);
     return !location ||

@@ -21,7 +21,6 @@
 #pragma once
 
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
@@ -31,7 +30,7 @@
 namespace tokenspeed {
 
 // A rank's proxy of a shared L2 pool: the Host entries that stand for the
-// pool pages its lookups pinned, and the commands that tell the owner what
+// pool pages its lookups pinned, and the operations that tell the owner what
 // the rank no longer needs. All methods run on the scheduler thread. Writes
 // to the pool are Device-to-Host stores and belong to TierTransferManager.
 class SharedL2Proxy {
@@ -43,28 +42,27 @@ public:
     // references that pin the hit's entries: dropping them lets the entries
     // go. Returns the entries created -- a key another lookup's proxy already
     // stands for is shared, and stays under that lookup's ticket.
-    std::vector<SharedL2ProxyPage> ApplyAnswer(const SharedL2LookupResult& result, const ContentHash& tail_prior,
-                                               std::vector<CacheBlockRef>& hit_blocks);
-    // The keys Device hits used since the last call go to the owner.
-    void Touch(std::vector<CacheKey> keys);
-    // Drops proxy entries nothing holds any more -- no waiting prompt, no
-    // load-back -- and releases each ticket left without one. A ticket's
-    // entries go from the answer's last one back, up to the first one still
-    // held.
-    void ReleaseUnheld();
-    std::vector<SharedL2Operation> TakeCommands() { return std::exchange(commands_, {}); }
+    std::vector<SharedL2ProxyBlock> MirrorAnswer(const SharedL2Answer& answer, const ContentHash& tail_prior,
+                                                 std::vector<CacheBlockRef>& hit_blocks);
+    // This plan's operations for the owner: one touch for the keys Device
+    // hits used since the last plan (none without any), and, after evicting
+    // the proxy entries nothing holds any more -- no waiting prompt, no
+    // load-back --, one release for each ticket left without an entry. A
+    // ticket's entries go from the answer's last one back, up to the first
+    // one still held.
+    std::vector<SharedL2Operation> NextOperations(std::vector<CacheKey> device_hits);
 
 private:
     // The proxy entries created under one owner ticket, in the answer's
-    // order; the ticket is released once the last one is dropped.
+    // order; the ticket is released once the last one is dropped. A ticket
+    // whose every page stands under earlier tickets has none.
     struct TicketEntries {
-        std::uint64_t id{0};
+        std::uint64_t ticket{0};
         std::vector<CacheKey> keys;
     };
 
     CacheCoordinator& coordinator_;
     std::vector<TicketEntries> tickets_;
-    std::vector<SharedL2Operation> commands_;
 };
 
 }  // namespace tokenspeed

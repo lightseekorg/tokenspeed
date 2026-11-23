@@ -30,7 +30,7 @@ mod host_spans;
 mod logging;
 mod pd;
 mod peer;
-mod pool;
+mod shared_l2;
 
 use std::{
     collections::HashSet,
@@ -658,7 +658,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         let built = (|| {
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let peer_outbox = Bound::new(py, peer::Outbox::new())?;
-            let shared_l2_handle = Bound::new(py, pool::Handle::new())?;
+            let shared_l2_handle = Bound::new(py, shared_l2::Handle::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
@@ -796,7 +796,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     // With a shared L2 pool as the Host tier, the client the rank started
     // when it joined the pool at device build is the loop's; the data plane
     // keeps the handle, for the acknowledgments of the rank's loads.
-    let pool_client = shared_l2_handle.get().take_client();
+    let shared_l2_client = shared_l2_handle.get().take_client();
     let data_plane = PythonDataPlane::start(data_plane, peers.streams, shared_l2_handle)
         .map_err(HostError::DataPlane)?;
     let metrics = exporter
@@ -924,7 +924,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
-            pool: pool_client,
+            shared_l2: shared_l2_client,
             peer,
         },
     );

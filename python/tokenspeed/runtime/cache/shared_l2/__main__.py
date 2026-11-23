@@ -36,7 +36,7 @@ def main() -> None:
     services = parser.add_subparsers(dest="service", required=True)
     owner = services.add_parser("owner", help="serve the pool's cache index")
     owner.add_argument("--address", required=True, help="ZMQ bind address")
-    owner.add_argument("--providers", type=int, required=True)
+    owner.add_argument("--num-providers", type=int, required=True)
     owner.add_argument("--headroom-lcm-blocks", type=int, required=True)
     owner.add_argument("--client-timeout-s", type=float, required=True)
     owner.add_argument(
@@ -45,9 +45,17 @@ def main() -> None:
         required=True,
         help="as the server's option, counted over every rank's lookups, hit or miss",
     )
-    owner.add_argument("--checkpoint-retention-leaf-distance", type=int, required=True)
+    owner.add_argument(
+        "--checkpoint-retention-leaf-distance",
+        type=int,
+        required=True,
+        help="as the server's option: State checkpoints within this many later "
+        "requests of the newest on their branch rank as the newest does",
+    )
     provider = services.add_parser("provider", help="host one node's pool memory")
-    provider.add_argument("--owner", required=True, help="the owner's ZMQ address")
+    provider.add_argument(
+        "--owner-address", required=True, help="the owner's ZMQ address"
+    )
     provider.add_argument("--hostname", required=True)
     provider.add_argument("--device-name", required=True)
     provider.add_argument("--bytes", type=int, required=True)
@@ -59,14 +67,17 @@ def main() -> None:
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
     if args.service == "owner":
-        from tokenspeed.runtime.cache.shared_l2.owner import SharedL2Owner, make_pool
+        from tokenspeed.runtime.cache.shared_l2.owner import (
+            SharedL2Owner,
+            make_shared_l2_pool,
+        )
 
         service = SharedL2Owner(
             address=args.address,
-            num_providers=args.providers,
+            num_providers=args.num_providers,
             client_timeout_s=args.client_timeout_s,
-            make_pool=functools.partial(
-                make_pool,
+            make_shared_l2_pool=functools.partial(
+                make_shared_l2_pool,
                 headroom_lcm_blocks=args.headroom_lcm_blocks,
                 checkpoint_retention_requests=args.checkpoint_retention_requests,
                 checkpoint_retention_leaf_distance=(
@@ -82,7 +93,7 @@ def main() -> None:
         from tokenspeed.runtime.cache.shared_l2.provider import run_provider
 
         run_provider(
-            owner=args.owner,
+            owner_address=args.owner_address,
             hostname=args.hostname,
             device_name=args.device_name,
             size_bytes=args.bytes,

@@ -32,12 +32,13 @@ use std::{
 };
 
 use parking_lot::Condvar;
-use ts_scheduler::SharedL2PublicationView;
+use ts_scheduler::SharedL2CheckpointView;
 use ts_wire::Value;
 
 use super::*;
 use crate::shared_l2::{
     geometry::{PageField, PageGroup, Provider},
+    load::LoadRow,
     testing::{
         hit_value, key_value, lookup, miss_value,
         owner::{field, ints, ok, op, refused, uint, TestOwner},
@@ -59,12 +60,12 @@ const NO_KEEPALIVE: Duration = Duration::from_secs(600);
 /// block 64 (layer 1).
 fn geometry() -> PoolGeometry {
     PoolGeometry {
-        lcm_bytes: 64,
+        lcm_block_bytes: 64,
         providers: vec![Provider {
             session: "node0".to_owned(),
-            base: PROVIDER,
-            lcm_blocks: 8,
-            start: 0,
+            base_address: PROVIDER,
+            num_lcm_blocks: 8,
+            first_lcm_block: 0,
         }],
         groups: vec![
             PageGroup {
@@ -74,7 +75,7 @@ fn geometry() -> PoolGeometry {
                     device_address: 0,
                     device_stride: 32,
                     bytes: 32,
-                    page_offset: 0,
+                    offset_in_page: 0,
                     layer: 0,
                 }],
             },
@@ -85,7 +86,7 @@ fn geometry() -> PoolGeometry {
                     device_address: STATE_DEVICE,
                     device_stride: 64,
                     bytes: 64,
-                    page_offset: 0,
+                    offset_in_page: 0,
                     layer: 1,
                 }],
             },
@@ -179,7 +180,7 @@ impl Rank {
                 client_id,
                 request_timeout,
                 keepalive,
-                load_workers: NonZeroUsize::new(2).unwrap(),
+                read_workers: NonZeroUsize::new(2).unwrap(),
                 write_workers: NonZeroUsize::new(2).unwrap(),
                 geometry: geometry(),
             },
@@ -235,35 +236,37 @@ impl Rank {
 
 /// The write that stores `prompt` from Device blocks 1, 2, ... of each
 /// group, with the checkpoint at its end.
-fn write(id: u64, prompt: &[i32]) -> SharedL2OpView {
+fn write(op_id: u32, prompt: &[i32]) -> SharedL2OpView {
     let (prefix_hashes, tail, keys) = prompt_keys(prompt);
     let (tail_tokens, tail_hash) = tail.unwrap_or_default();
     let pages = keys.len() as i32 - 1;
     SharedL2OpView {
         kind: SharedL2OpKind::Write,
-        id,
+        op_id,
+        ticket: 0,
         buckets: vec![0; keys.len()],
         // KV blocks 1.. and State block 1.
-        blocks: (1..=pages).chain([1]).collect(),
+        device_blocks: (1..=pages).chain([1]).collect(),
         keys,
-        publications: vec![SharedL2PublicationView {
+        checkpoints: vec![SharedL2CheckpointView {
             tokens: prompt.to_vec(),
             prefix_hashes,
             tail_tokens,
             tail_hash,
-            publisher: 7,
+            access_epoch: 7,
         }],
     }
 }
 
-fn notice(kind: SharedL2OpKind, id: u64, keys: Vec<StorageKeyView>) -> SharedL2OpView {
+fn notice(kind: SharedL2OpKind, ticket: u64, keys: Vec<StorageKeyView>) -> SharedL2OpView {
     SharedL2OpView {
         kind,
-        id,
+        op_id: 0,
+        ticket,
         keys,
         buckets: Vec::new(),
-        blocks: Vec::new(),
-        publications: Vec::new(),
+        device_blocks: Vec::new(),
+        checkpoints: Vec::new(),
     }
 }
 
@@ -303,7 +306,7 @@ fn one_request_looks_up_every_prompt_and_answers_them_in_order() {
             tail_hash: "1-2-3-4-5".to_owned(),
             keys,
             buckets: vec![0, 0, 0],
-            pages: vec![3, 4, 8],
+            pool_pages: vec![3, 4, 8],
         }
     );
     // A prompt the pool holds no prefix of is answered like the others: a
@@ -319,7 +322,7 @@ fn one_request_looks_up_every_prompt_and_answers_them_in_order() {
             tail_hash: String::new(),
             keys: Vec::new(),
             buckets: Vec::new(),
-            pages: Vec::new(),
+            pool_pages: Vec::new(),
         }
     );
     assert_eq!(
@@ -327,7 +330,7 @@ fn one_request_looks_up_every_prompt_and_answers_them_in_order() {
         ("same", 42)
     );
     // One request asked for all of them.
-    assert_eq!(owner.ops(), ["probe_many"]);
+    assert_eq!(owner.ops(), ["lookup"]);
     assert_eq!(rank.client.poll_writes().unwrap(), Vec::<u32>::new());
 }
 
@@ -341,17 +344,17 @@ fn a_lookup_the_owner_does_not_answer_in_time_fails() {
         .client
         .lookup(&[lookup("request", &PROMPT)])
         .unwrap_err();
-    assert!(error.0.contains("did not answer 'probe_many'"), "{error}");
+    assert!(error.0.contains("did not answer 'lookup'"), "{error}");
     assert!(started.elapsed() >= Duration::from_millis(100));
     // It was asked once.
-    assert_eq!(owner.ops(), ["probe_many"]);
+    assert_eq!(owner.ops(), ["lookup"]);
 }
 
 #[test]
 fn a_lookup_the_owner_answers_with_an_error_fails() {
     // The pool failed; the owner does not know the rank.
     for reason in [
-        "RuntimeError: probe failed",
+        "RuntimeError: lookup failed",
         "client 7 has not joined the pool",
     ] {
         let owner = TestOwner::serve(move |_| Some(refused(reason)));
@@ -359,7 +362,7 @@ fn a_lookup_the_owner_answers_with_an_error_fails() {
             .client
             .lookup(&[lookup("request", &PROMPT)])
             .unwrap_err();
-        assert!(error.0.contains("rejected 'probe_many'"), "{error}");
+        assert!(error.0.contains("rejected 'lookup'"), "{error}");
         assert!(error.0.contains(reason), "{error}");
     }
 }
@@ -372,7 +375,7 @@ fn a_hit_names_pages_the_pool_has() {
         .client
         .lookup(&[lookup("request", &PROMPT)])
         .unwrap();
-    assert_eq!(answers[0].pages, [16, 16, 8]);
+    assert_eq!(answers[0].pool_pages, [16, 16, 8]);
 
     for pages in [[0, 4, 8], [-3, 4, 8], [17, 4, 8], [3, 4, 9], [3, 4, 0]] {
         let owner =
@@ -431,7 +434,6 @@ fn a_write_copies_only_the_blocks_the_owner_placed() {
                     ])
                 }
             }
-            "commit" => ok(vec![("committed", Value::from(true))]),
             _ => ok(Vec::new()),
         })
     });
@@ -459,10 +461,10 @@ fn a_write_copies_only_the_blocks_the_owner_placed() {
         Value::Array(keys.iter().map(key_value).collect())
     );
     assert_eq!(uint(field(&requests[1], "ticket")), 12);
-    let Value::Array(publications) = field(&requests[1], "publications") else {
-        panic!("publications are an array");
+    let Value::Array(checkpoints) = field(&requests[1], "checkpoints") else {
+        panic!("checkpoints are an array");
     };
-    assert_eq!(publications.len(), 1);
+    assert_eq!(checkpoints.len(), 1);
 
     // The pool holds every block of the same prompt: no copy, no commit.
     rank.client.submit(&[write(2, &PROMPT)]).unwrap();
@@ -479,7 +481,6 @@ fn a_write_that_fails_at_any_step_fails_the_polls_from_then_on() {
             ("pages", ints(&[3, 4, 8])),
         ])
     };
-    let committed = |committed: bool| ok(vec![("committed", Value::from(committed))]);
     let cases: Vec<(Option<Value>, Option<Value>, bool, &str)> = vec![
         (
             Some(refused("RuntimeError: reserve failed")),
@@ -493,13 +494,6 @@ fn a_write_that_fails_at_any_step_fails_the_polls_from_then_on() {
             Some(refused("RuntimeError: commit failed")),
             false,
             "commit failed",
-        ),
-        // The owner no longer holds the reservation when the copy is done.
-        (
-            None,
-            Some(committed(false)),
-            false,
-            "no longer holds the reservation",
         ),
         // Not a page for every key.
         (
@@ -526,7 +520,7 @@ fn a_write_that_fails_at_any_step_fails_the_polls_from_then_on() {
         let owner = TestOwner::serve(move |request| {
             Some(match op(request) {
                 "reserve" => reserve.clone().unwrap_or_else(placed),
-                "commit" => commit.clone().unwrap_or_else(|| committed(true)),
+                "commit" => commit.clone().unwrap_or_else(|| ok(Vec::new())),
                 _ => ok(Vec::new()),
             })
         });
@@ -583,7 +577,7 @@ fn an_idle_rank_pings_the_owner() {
 }
 
 #[test]
-fn a_plans_commands_reach_the_owner_each_kind_in_plan_order() {
+fn a_plans_ops_reach_the_owner_each_kind_in_plan_order() {
     let owner = TestOwner::serve(|request| {
         Some(match op(request) {
             // Nothing to copy: no key gets a page.
@@ -615,7 +609,7 @@ fn a_plans_commands_reach_the_owner_each_kind_in_plan_order() {
 
     // Each write is queued as a write of its own.
     assert_eq!(rank.finished(2), [31, 32]);
-    // The commands of one kind reach the owner in plan order.
+    // The ops of one kind reach the owner in plan order.
     wait_until(|| owner.ops().len() == 6);
     let of = |kind: &str| -> Vec<Value> {
         owner
@@ -634,36 +628,20 @@ fn a_plans_commands_reach_the_owner_each_kind_in_plan_order() {
         *field(&touches[0], "keys"),
         Value::Array(keys[..2].iter().map(key_value).collect())
     );
-    assert_eq!(*field(&touches[0], "buckets"), ints(&[0, 0]));
     assert_eq!(
         *field(&touches[1], "keys"),
         Value::Array(keys[2..].iter().map(key_value).collect())
     );
 
-    // A command of no known kind is refused.
+    // An op of no known kind is refused.
     let error = rank
         .client
         .submit(&[notice(SharedL2OpKind { repr: 9 }, 0, Vec::new())])
         .unwrap_err();
     assert!(
-        error.0.contains("no client call for the pool command"),
+        error.0.contains("no client call for the shared L2 op"),
         "{error}"
     );
-    // A write whose id the scheduler could not take back is refused where
-    // the plan has it: neither it nor a command after it is queued.
-    let error = rank
-        .client
-        .submit(&[
-            notice(SharedL2OpKind::Release, 43, Vec::new()),
-            write(1 << 32, &PROMPT),
-            notice(SharedL2OpKind::Release, 44, Vec::new()),
-        ])
-        .unwrap_err();
-    assert!(error.0.contains("is past 32 bits"), "{error}");
-    wait_until(|| owner.ops().len() == 7);
-    thread::sleep(Duration::from_millis(50));
-    assert_eq!(owner.ops()[6..], ["release"]);
-    assert_eq!(uint(field(&owner.requests()[6], "ticket")), 43);
 }
 
 #[test]
@@ -692,7 +670,7 @@ fn a_client_does_not_start_from_settings_its_copies_cannot_use() {
                 client_id: 7,
                 request_timeout: TIMEOUT,
                 keepalive: NO_KEEPALIVE,
-                load_workers: NonZeroUsize::new(2).unwrap(),
+                read_workers: NonZeroUsize::new(2).unwrap(),
                 write_workers: NonZeroUsize::new(2).unwrap(),
                 geometry,
             },
@@ -714,7 +692,6 @@ fn closing_ends_the_threads_once_what_was_queued_ran() {
                 ("ticket", Value::from(12)),
                 ("pages", ints(&[3, 4, 8])),
             ]),
-            "commit" => ok(vec![("committed", Value::from(true))]),
             _ => ok(Vec::new()),
         })
     });
@@ -733,7 +710,7 @@ fn closing_ends_the_threads_once_what_was_queued_ran() {
     let mut ops = owner.ops();
     ops.sort();
     assert_eq!(ops, ["commit", "release", "reserve"]);
-    // Nothing runs any more: a command and a load are refused.
+    // Nothing runs any more: an op and a load are refused.
     let error = rank.client.submit(&[write(6, &PROMPT)]).unwrap_err();
     assert!(error.0.contains("threads have stopped"), "{error}");
     let error = rank.threads.loads().submit(vec![9], &[], 0, 1).unwrap_err();
@@ -750,7 +727,6 @@ fn closing_leaves_what_a_thread_that_still_runs_uses() {
                 ("ticket", Value::from(12)),
                 ("pages", ints(&[3, 4, 8])),
             ]),
-            "commit" => ok(vec![("committed", Value::from(true))]),
             _ => ok(Vec::new()),
         })
     });
@@ -820,7 +796,6 @@ fn closing_releases_the_transfer_last_and_on_the_closing_thread() {
                 ("ticket", Value::from(12)),
                 ("pages", ints(&[3, 4, 8])),
             ]),
-            "commit" => ok(vec![("committed", Value::from(true))]),
             _ => ok(Vec::new()),
         })
     });
@@ -838,7 +813,7 @@ fn closing_releases_the_transfer_last_and_on_the_closing_thread() {
             client_id: 7,
             request_timeout: TIMEOUT,
             keepalive: NO_KEEPALIVE,
-            load_workers: NonZeroUsize::new(2).unwrap(),
+            read_workers: NonZeroUsize::new(2).unwrap(),
             write_workers: NonZeroUsize::new(2).unwrap(),
             geometry: geometry(),
         },
@@ -876,21 +851,28 @@ fn closing_releases_the_transfer_last_and_on_the_closing_thread() {
 fn a_failed_load_fails_the_clients_check_at_a_forwards_commit() {
     let owner = TestOwner::serve(|_| Some(ok(Vec::new())));
     let mut rank = Rank::of(&owner);
-    rank.client
-        .map_proxy_pages(&[SharedL2PageView {
-            group_id: KV,
-            block: 100,
-            bucket: 0,
-            page: 3,
-        }])
-        .unwrap();
+    rank.client.map_proxy_blocks(&[SharedL2ProxyBlockView {
+        group_id: KV,
+        host_block: 100,
+        bucket: 0,
+        pool_page: 3,
+    }]);
     rank.client.check_failure().unwrap();
     rank.transfer.failing.store(true, Ordering::Relaxed);
 
     rank.signal_words.words[0].store(1, Ordering::Relaxed);
     rank.threads
         .loads()
-        .submit(vec![9], &[(KV, 100, 5)], 0, 1)
+        .submit(
+            vec![9],
+            &[LoadRow {
+                group_id: KV,
+                host_block: 100,
+                device_block: 5,
+            }],
+            0,
+            1,
+        )
         .unwrap();
 
     // The forward is let go with the failure already there for the loop.
@@ -1051,20 +1033,26 @@ fn the_client_speaks_the_python_owners_wire() {
     // The hit's pages hold the bytes the write copied: a load reads them
     // back into other Device blocks.
     let pages: Vec<_> = (0..3)
-        .map(|index| SharedL2PageView {
+        .map(|index| SharedL2ProxyBlockView {
             group_id: keys[index].group_id,
-            block: 100 + index as i32,
+            host_block: 100 + index as i32,
             bucket: hit.buckets[index],
-            page: hit.pages[index],
+            pool_page: hit.pool_pages[index],
         })
         .collect();
-    rank.client.map_proxy_pages(&pages).unwrap();
+    rank.client.map_proxy_blocks(&pages);
     rank.signal_words.words[0].store(1, Ordering::Relaxed);
     rank.threads
         .loads()
         .submit(
             vec![9],
-            &[(KV, 100, 11), (KV, 101, 12), (STATE, 102, 5)],
+            &[(KV, 100, 11), (KV, 101, 12), (STATE, 102, 5)].map(
+                |(group_id, host_block, device_block)| LoadRow {
+                    group_id,
+                    host_block,
+                    device_block,
+                },
+            ),
             0,
             1,
         )
@@ -1102,14 +1090,14 @@ fn the_client_speaks_the_python_owners_wire() {
     rank.client.check_failure().unwrap();
 
     // An error of the pool is the lookup's.
-    owner.run(serde_json::json!({"do": "fail", "method": "probe"}));
+    owner.run(serde_json::json!({"do": "fail", "method": "lookup"}));
     let error = rank
         .client
         .lookup(&[lookup("request", &PROMPT)])
         .unwrap_err();
-    assert!(error.0.contains("rejected 'probe_many'"), "{error}");
-    assert!(error.0.contains("probe failed"), "{error}");
-    owner.run(serde_json::json!({"do": "heal", "method": "probe"}));
+    assert!(error.0.contains("rejected 'lookup'"), "{error}");
+    assert!(error.0.contains("lookup failed"), "{error}");
+    owner.run(serde_json::json!({"do": "heal", "method": "lookup"}));
 
     // A rank the owner does not know is told so.
     let mut stranger = Rank::join(&address, 8, Duration::from_secs(2), NO_KEEPALIVE);
@@ -1129,6 +1117,6 @@ fn the_client_speaks_the_python_owners_wire() {
         .client
         .lookup(&[lookup("request", &PROMPT)])
         .unwrap_err();
-    assert!(error.0.contains("did not answer 'probe_many'"), "{error}");
+    assert!(error.0.contains("did not answer 'lookup'"), "{error}");
     owner.run(serde_json::json!({"do": "resume"}));
 }

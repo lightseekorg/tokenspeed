@@ -65,7 +65,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         }
     }
     auto [keys, device_block_refs, group_ids, buckets] =
-        takeStoreSources(stats, storing_keys, std::numeric_limits<std::size_t>::max());
+        acquireStoreSources(stats, storing_keys, std::numeric_limits<std::size_t>::max());
     if (keys.empty()) {
         return std::nullopt;
     }
@@ -122,7 +122,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     };
 }
 
-TierTransferManager::StoreSources TierTransferManager::takeStoreSources(
+TierTransferManager::StoreSources TierTransferManager::acquireStoreSources(
     WriteBackStats& stats, std::unordered_set<CacheKey, CacheKeyHash>& storing_keys, std::size_t max_sources) {
     StoreSources sources;
     while (sources.keys.size() < max_sources && coordinator_.Host().HasPendingStores()) {
@@ -153,62 +153,60 @@ TierTransferManager::StoreSources TierTransferManager::takeStoreSources(
     return sources;
 }
 
-std::vector<SharedL2WriteOperation> TierTransferManager::StartPoolWrites(const SharedL2Config& limits) {
-    ProfileSpan profile_span{"TierTransferManager::StartPoolWrites"};
+std::vector<SharedL2WriteOperation> TierTransferManager::StartSharedL2Writes(const SharedL2Config& limits) {
+    ProfileSpan profile_span{"TierTransferManager::StartSharedL2Writes"};
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kPublication)];
     std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
-    for (const auto& [write_id, write] : pool_writes_) {
+    for (const auto& [op_id, write] : shared_l2_writes_) {
         storing_keys.insert(write.keys.begin(), write.keys.end());
     }
     std::vector<SharedL2WriteOperation> writes;
-    while (pool_writes_.size() < static_cast<std::size_t>(limits.max_writes)) {
-        StoreSources sources = takeStoreSources(stats, storing_keys, static_cast<std::size_t>(limits.max_write_keys));
+    while (shared_l2_writes_.size() < static_cast<std::size_t>(limits.max_writes_in_flight)) {
+        StoreSources sources =
+            acquireStoreSources(stats, storing_keys, static_cast<std::size_t>(limits.max_keys_per_write));
         if (sources.keys.empty()) {
             break;
         }
-        SharedL2WriteOperation write{
-            .write_id = ++next_pool_write_id_, .keys = sources.keys, .buckets = std::move(sources.buckets)};
-        write.blocks.reserve(sources.keys.size());
+        SharedL2WriteOperation write{.op_id = nextOpId(), .keys = sources.keys, .buckets = std::move(sources.buckets)};
+        write.device_blocks.reserve(sources.keys.size());
+        const auto write_carries_checkpoint = [&write](const ContentHash& hash) {
+            return std::ranges::any_of(write.checkpoints, [&](const CheckpointTree::Checkpoint& checkpoint) {
+                return (checkpoint.tail ? checkpoint.tail->hash : ContentHash{checkpoint.prefix_hashes.back()}) == hash;
+            });
+        };
         for (std::size_t i = 0; i < sources.keys.size(); ++i) {
             const CacheKey& key = sources.keys[i];
-            write.blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(key.group_id))
-                                       .ResolveCacheBlockId(*sources.device_block_refs[i]));
+            write.device_blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(key.group_id))
+                                              .ResolveCacheBlockId(*sources.device_block_refs[i]));
             ++stats.blocks[key.group_id];
-            // A checkpoint's lineage rides with its State block, once per
+            // A checkpoint rides with its State block, once per
             // write: the owner records it when the block is registered.
-            if (!coordinator_.GroupIsState(key.group_id) ||
-                std::ranges::any_of(write.publications, [&](const SharedL2Publication& publication) {
-                    return (publication.tail ? publication.tail->hash
-                                             : ContentHash{publication.prefix_hashes.back()}) == key.content_hash;
-                })) {
+            if (!coordinator_.GroupIsState(key.group_id) || write_carries_checkpoint(key.content_hash)) {
                 continue;
             }
-            if (std::optional<CheckpointTree::Lineage> lineage =
-                    coordinator_.Checkpoints().LineageOf(key.content_hash)) {
-                write.publications.push_back(SharedL2Publication{.tokens = std::move(lineage->tokens),
-                                                                 .prefix_hashes = std::move(lineage->prefix_hashes),
-                                                                 .tail = std::move(lineage->tail),
-                                                                 .publisher = lineage->access_epoch});
+            if (std::optional<CheckpointTree::Checkpoint> checkpoint =
+                    coordinator_.Checkpoints().CheckpointOf(key.content_hash)) {
+                write.checkpoints.push_back(std::move(*checkpoint));
             }
         }
-        pool_writes_.emplace(write.write_id,
-                             InFlightPoolWrite{.keys = std::move(sources.keys),
-                                               .device_block_refs = std::move(sources.device_block_refs)});
+        shared_l2_writes_.emplace(write.op_id,
+                                  InFlightSharedL2Write{.keys = std::move(sources.keys),
+                                                        .device_block_refs = std::move(sources.device_block_refs)});
         ++stats.ops;
         writes.push_back(std::move(write));
     }
     return writes;
 }
 
-void TierTransferManager::CompletePoolWrite(const cache::SharedL2WriteDone& event) {
+void TierTransferManager::CompleteSharedL2Write(const cache::SharedL2WriteDone& event) {
     // The record goes with its pins: the sources are evictable again.
-    if (pool_writes_.erase(event.write_id) != 1) {
+    if (shared_l2_writes_.erase(event.op_id) != 1) {
         throw std::invalid_argument("completion of an unknown shared L2 write");
     }
 }
 
 bool TierTransferManager::HasPinnedStoresInFlight() const {
-    return !pool_writes_.empty() || std::ranges::any_of(write_backs_, [](const auto& entry) {
+    return !shared_l2_writes_.empty() || std::ranges::any_of(write_backs_, [](const auto& entry) {
         return entry.second.guard == StoreSourceGuard::kPinnedUntilAck;
     });
 }

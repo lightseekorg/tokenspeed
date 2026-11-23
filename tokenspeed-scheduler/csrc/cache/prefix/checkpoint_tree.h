@@ -177,13 +177,15 @@ public:
     // (a shared L2 pool's owner, which is sent it with the checkpoint's State
     // block): its tokens, the chain hashes of its full pages, its tail and
     // its publishing request's access epoch.
-    struct Lineage {
+    struct Checkpoint {
         std::vector<std::int32_t> tokens;
         std::vector<std::string> prefix_hashes;
         std::optional<TailPublication> tail;
         std::uint64_t access_epoch{0};
+
+        bool operator==(const Checkpoint&) const = default;
     };
-    std::optional<Lineage> LineageOf(const ContentHash& hash) const {
+    std::optional<Checkpoint> CheckpointOf(const ContentHash& hash) const {
         const auto it = nodes_.find(hash);
         if (it == nodes_.end()) {
             return std::nullopt;
@@ -191,19 +193,19 @@ public:
         const Node& node = it->second;
         const auto page = static_cast<std::size_t>(prefix_granularity_);
         const std::size_t pages = node.full_prefix == nullptr ? 0 : static_cast<std::size_t>(node.full_prefix->depth);
-        Lineage lineage{.access_epoch = node.access_epoch};
-        lineage.tokens.resize(static_cast<std::size_t>(node.num_tokens));
-        lineage.prefix_hashes.resize(pages);
+        Checkpoint checkpoint{.access_epoch = node.access_epoch};
+        checkpoint.tokens.resize(static_cast<std::size_t>(node.num_tokens));
+        checkpoint.prefix_hashes.resize(pages);
         for (const PrefixSegment* segment = node.full_prefix; segment != nullptr; segment = segment->parent) {
             const auto index = static_cast<std::size_t>(segment->depth - 1);
-            lineage.prefix_hashes[index] = segment->hash.ToString();
-            std::ranges::copy(segment->tokens, lineage.tokens.begin() + static_cast<std::ptrdiff_t>(index * page));
+            checkpoint.prefix_hashes[index] = segment->hash.ToString();
+            std::ranges::copy(segment->tokens, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(index * page));
         }
-        std::ranges::copy(node.tail, lineage.tokens.begin() + static_cast<std::ptrdiff_t>(pages * page));
+        std::ranges::copy(node.tail, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(pages * page));
         if (!node.tail.empty()) {
-            lineage.tail = TailPublication{.tail_tokens = static_cast<std::int32_t>(node.tail.size()), .hash = hash};
+            checkpoint.tail = TailPublication{.tail_tokens = static_cast<std::int32_t>(node.tail.size()), .hash = hash};
         }
-        return lineage;
+        return checkpoint;
     }
 
     void Clear() {

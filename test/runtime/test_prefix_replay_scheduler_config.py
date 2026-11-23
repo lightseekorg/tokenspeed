@@ -62,8 +62,7 @@ def _resolve_replay(**overrides) -> int:
     kwargs = {
         "speculative_algorithm": "DSPARK",
         "enable_prefix_caching": True,
-        "enable_kvstore": False,
-        "shared_l2_pool": False,
+        "has_host_tier": False,
         "disaggregation_mode": "null",
         "draft_model_path_use_base": True,
         "draft_model_config": SimpleNamespace(dspark_prefix_replay_tokens=128),
@@ -104,8 +103,7 @@ def test_resolve_dspark_prefix_replay_rejects_invalid_capability(value: int) -> 
     "overrides",
     [
         {},
-        {"enable_kvstore": True},
-        {"shared_l2_pool": True},
+        {"has_host_tier": True},
         {"disaggregation_mode": "prefill"},
     ],
 )
@@ -134,9 +132,8 @@ def test_resolve_dspark_prefix_replay_keeps_same_checkpoint_fail_closed() -> Non
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"enable_kvstore": True}, "does not support KVStore"),
-        # The pool is the Host tier in the local Host L2's place.
-        ({"shared_l2_pool": True}, "does not support KVStore or a shared L2 pool"),
+        # The local Host L2, or a shared L2 pool in its place.
+        ({"has_host_tier": True}, "does not support KVStore or a shared L2 pool"),
         ({"disaggregation_mode": "prefill"}, "disaggregated serving"),
         ({"disaggregation_mode": "decode"}, "disaggregated serving"),
     ],
@@ -188,4 +185,4 @@ def test_private_context_rejects_kvstore_even_without_prefix_caching() -> None:
     # The host tier cannot restore a drafter-private context, so KVStore is
     # refused whether or not prefix reuse is on.
     with pytest.raises(ValueError, match="does not support KVStore"):
-        _resolve_replay(enable_prefix_caching=False, enable_kvstore=True)
+        _resolve_replay(enable_prefix_caching=False, has_host_tier=True)

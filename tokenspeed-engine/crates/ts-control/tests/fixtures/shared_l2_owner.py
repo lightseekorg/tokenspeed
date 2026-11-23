@@ -53,9 +53,9 @@ def main() -> None:
         joined_providers=0, client_timeout_s=settings["client_timeout_s"]
     )
     owner.admin.request(
-        "provider",
+        "add_provider",
         session="node0",
-        base=settings["base"],
+        base_address=settings["base"],
         bytes=settings["blocks"] * LCM_BYTES,
     )
     for client in settings["clients"]:

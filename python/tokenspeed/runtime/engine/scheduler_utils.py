@@ -32,6 +32,7 @@ from tokenspeed_engine.scheduler import (
     Cache,
     CacheGroupConfig,
     SchedulerConfig,
+    SharedL2Config,
     StorageConfig,
 )
 
@@ -143,7 +144,7 @@ def make_config(
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
     prefill_chunk_yield_tokens: int = 0,
-    shared_l2_config: Any = None,
+    shared_l2_config: SharedL2Config | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -425,8 +426,7 @@ def resolve_dspark_prefix_replay_tokens(
     *,
     speculative_algorithm: str | None,
     enable_prefix_caching: bool,
-    enable_kvstore: bool,
-    shared_l2_pool: bool,
+    has_host_tier: bool,
     disaggregation_mode: str,
     draft_model_path_use_base: bool,
     draft_model_config: Any | None,
@@ -438,9 +438,9 @@ def resolve_dspark_prefix_replay_tokens(
     are cache resident. Same-checkpoint DSpark configurations without that
     capability remain fail-closed. External generic DSpark configurations
     keep their existing scheduler behavior until they advertise an
-    equivalent contract. The scheduler has a Host tier with the local Host L2
-    (``enable_kvstore``) or with a shared L2 pool in its place
-    (``shared_l2_pool``, ``--shared-l2-config``).
+    equivalent contract. ``has_host_tier`` says whether the scheduler has a
+    Host tier: the local Host L2, or a shared L2 pool in its place
+    (``ServerArgs.has_host_tier``).
     """
 
     if speculative_algorithm != "DSPARK":
@@ -468,7 +468,7 @@ def resolve_dspark_prefix_replay_tokens(
         return 0
     # A drafter-private context cannot be restored from the host tier, with or
     # without prefix reuse.
-    if enable_kvstore or shared_l2_pool:
+    if has_host_tier:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore or a "
             "shared L2 pool; use --disable-kvstore without --shared-l2-config."
@@ -644,7 +644,7 @@ def cache_ops_from_plan(
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
     tuple: the engine host's L3 executor runs them. A shared L2 pool's write,
-    release and touch commands are left out: the engine host's loop reads
+    release and touch ops are left out: the engine host's loop reads
     them from the plan and hands them to the pool's client. Unknown
     kinds fail the whole conversion without partial submission.
 
@@ -675,7 +675,7 @@ def cache_ops_from_plan(
             ),
         ):
             storage.append(op)
-        elif not isinstance(
+        elif isinstance(
             op,
             (
                 Cache.SharedL2ReleaseOp,
@@ -683,7 +683,10 @@ def cache_ops_from_plan(
                 Cache.SharedL2TouchOp,
             ),
         ):
-            # A pool's commands are skipped here; any other kind is unknown.
+            # The engine host's loop hands a plan's shared L2 ops to the
+            # pool's client.
+            continue
+        else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
     return CacheOperations(tuple(device), tuple(storage))
 

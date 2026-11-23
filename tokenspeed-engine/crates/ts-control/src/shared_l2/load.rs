@@ -50,7 +50,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use ts_scheduler::SharedL2PageView;
+use ts_scheduler::SharedL2ProxyBlockView;
 
 use crate::{
     peer::{geometry::Spans, read::PageReader},
@@ -61,7 +61,7 @@ use crate::{
 };
 
 /// How often the loader looks at a load's start word.
-const START_POLL: Duration = Duration::from_micros(20);
+const START_WORD_POLL: Duration = Duration::from_micros(20);
 
 /// The signal words of a rank's loads, a start word and a ready word per
 /// layer for each load in flight: 32-bit words in host memory the device
@@ -78,30 +78,65 @@ pub trait SignalWords: Send + Sync {
 }
 
 /// Whether a word holds load `seq`'s value or a later load's.
-fn reached(word: u32, seq: u32) -> bool {
-    word.wrapping_sub(seq) < 0x8000_0000
+fn reached(value: u32, seq: u32) -> bool {
+    value.wrapping_sub(seq) < 0x8000_0000
+}
+
+/// A proxy Host block of a cache group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProxyBlock {
+    group_id: u32,
+    host_block: i32,
+}
+
+/// The pool page a proxy Host block stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolPage {
+    bucket: i32,
+    pool_page: i32,
 }
 
 /// The pool page behind each proxy Host block. The control thread records
 /// the pages of an answer before the plan that may load from them; the
 /// forward thread reads them when it hands that plan's load over.
 #[derive(Default)]
-pub struct ProxyPages(Mutex<HashMap<(u32, i32), (i32, i32)>>);
+pub struct ProxyPages(Mutex<HashMap<ProxyBlock, PoolPage>>);
 
 impl ProxyPages {
     /// Record the pool page each proxy block of an answer stands for. A
     /// proxy block the scheduler uses again stands for its new page.
-    pub fn record(&self, pages: &[SharedL2PageView]) {
+    pub fn record(&self, proxy_blocks: &[SharedL2ProxyBlockView]) {
         let mut proxy_pages = self.0.lock();
-        for page in pages {
-            proxy_pages.insert((page.group_id, page.block), (page.bucket, page.page));
+        for proxy_block in proxy_blocks {
+            proxy_pages.insert(
+                ProxyBlock {
+                    group_id: proxy_block.group_id,
+                    host_block: proxy_block.host_block,
+                },
+                PoolPage {
+                    bucket: proxy_block.bucket,
+                    pool_page: proxy_block.pool_page,
+                },
+            );
         }
     }
 
-    /// The `(bucket, page)` a group's proxy Host block stands for.
-    fn page(&self, group: u32, proxy_block: i32) -> Option<(i32, i32)> {
-        self.0.lock().get(&(group, proxy_block)).copied()
+    /// The pool page a proxy Host block stands for.
+    fn page(&self, proxy_block: ProxyBlock) -> Option<PoolPage> {
+        self.0.lock().get(&proxy_block).copied()
     }
+}
+
+/// One block of a plan's load: the proxy Host block whose pool page is
+/// read, and the Device block it fills.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadRow {
+    /// The cache group, by index.
+    pub group_id: u32,
+    /// The proxy Host block.
+    pub host_block: i32,
+    /// The Device block.
+    pub device_block: i32,
 }
 
 /// One plan's load, its proxy blocks resolved to pool pages.
@@ -120,7 +155,7 @@ struct Job {
 struct Read {
     session: String,
     spans: Spans,
-    outcome: mpsc::Sender<Result<(), String>>,
+    done: mpsc::Sender<Result<(), String>>,
 }
 
 /// The rank's loads: plans' loads in, the finished operations out.
@@ -137,7 +172,7 @@ pub struct Loads {
 }
 
 impl Loads {
-    /// Start the loader and `load_workers` readers, which read one layer's
+    /// Start the loader and `read_workers` readers, which read one layer's
     /// providers in parallel over `reader`. A failed load is recorded in
     /// `failure`.
     pub fn start(
@@ -146,24 +181,24 @@ impl Loads {
         reader: Arc<dyn PageReader>,
         signal_words: Arc<dyn SignalWords>,
         failure: Arc<FailureLatch>,
-        load_workers: NonZeroUsize,
+        read_workers: NonZeroUsize,
     ) -> std::io::Result<Self> {
         let (jobs, incoming) = mpsc::channel::<Job>();
-        let (reads, queued) = mpsc::channel::<Read>();
+        let (reads, incoming_reads) = mpsc::channel::<Read>();
         let (finished, finished_loads) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
-        let queued = Arc::new(Mutex::new(queued));
+        let incoming_reads = Arc::new(Mutex::new(incoming_reads));
         // Own each thread as soon as it starts: a later spawn failure drops
         // the senders, which ends the ones that already started.
-        let mut threads = Vec::with_capacity(1 + load_workers.get());
-        for index in 0..load_workers.get() {
-            let (reader, queued) = (reader.clone(), queued.clone());
+        let mut threads = Vec::with_capacity(1 + read_workers.get());
+        for index in 0..read_workers.get() {
+            let (reader, incoming_reads) = (reader.clone(), incoming_reads.clone());
             threads.push(
                 thread::Builder::new()
-                    .name(format!("ts-pool-read-{index}"))
+                    .name(format!("ts-shared-l2-read-{index}"))
                     .spawn(move || loop {
                         // Release the queue lock before the blocking read.
-                        let read = queued.lock().recv();
+                        let read = incoming_reads.lock().recv();
                         let Ok(read) = read else {
                             return;
                         };
@@ -171,7 +206,7 @@ impl Loads {
                             format!("shared L2 read from {} failed: {error}", read.session)
                         });
                         // The loader waits for every read it queued.
-                        let _ = read.outcome.send(outcome);
+                        let _ = read.done.send(outcome);
                     })?,
             );
         }
@@ -185,7 +220,7 @@ impl Loads {
         };
         threads.push(
             thread::Builder::new()
-                .name("ts-pool-load".to_owned())
+                .name("ts-shared-l2-load".to_owned())
                 .spawn(move || {
                     for job in incoming {
                         loader.run(job);
@@ -204,16 +239,15 @@ impl Loads {
         })
     }
 
-    /// Queue a plan's load; never waits. `rows` are `(group, proxy Host
-    /// block, Device block)` of every block to load, `start_word` is the
-    /// load's start word, which its layers' ready words follow, and `seq`
-    /// the value that marks the load in them. The proxy blocks are resolved
-    /// now: one may stand for another page once its lookup's pin is
-    /// released.
+    /// Queue a plan's load; never waits. `rows` are the blocks to load,
+    /// `start_word` is the load's start word, which its layers' ready words
+    /// follow, and `seq` the value that marks the load in them. The proxy
+    /// blocks are resolved now: one may stand for another page once its
+    /// lookup's pin is released.
     pub fn submit(
         &self,
         op_ids: Vec<u32>,
-        rows: &[(u32, i32, i32)],
+        rows: &[LoadRow],
         start_word: usize,
         seq: u32,
     ) -> Result<(), PoolError> {
@@ -229,19 +263,23 @@ impl Loads {
         }
         let copies = rows
             .iter()
-            .map(|&(group, proxy_block, block)| {
-                let (bucket, page) =
-                    self.proxy_pages.page(group, proxy_block).ok_or_else(|| {
-                        PoolError(format!(
-                            "a shared L2 load reads proxy Host block {proxy_block} of group \
-                         {group}, which stands for no pool page"
-                        ))
-                    })?;
+            .map(|row| {
+                let proxy_block = ProxyBlock {
+                    group_id: row.group_id,
+                    host_block: row.host_block,
+                };
+                let pool_page = self.proxy_pages.page(proxy_block).ok_or_else(|| {
+                    PoolError(format!(
+                        "a shared L2 load reads proxy Host block {} of group {}, which stands \
+                         for no pool page",
+                        row.host_block, row.group_id
+                    ))
+                })?;
                 Ok(PageCopy {
-                    group,
-                    bucket,
-                    page,
-                    block,
+                    group_id: row.group_id,
+                    bucket: pool_page.bucket,
+                    pool_page: pool_page.pool_page,
+                    device_block: row.device_block,
                 })
             })
             .collect::<Result<Vec<_>, PoolError>>()?;
@@ -321,27 +359,27 @@ impl Loader {
             if self.stopped.load(Ordering::Relaxed) {
                 return Err(PoolError("the rank shut down before the load".to_owned()));
             }
-            thread::sleep(START_POLL);
+            thread::sleep(START_WORD_POLL);
         }
         let layers = self.geometry.load_spans(&job.copies)?;
-        for (layer, providers) in layers.into_iter().enumerate() {
-            let (outcome, outcomes) = mpsc::channel();
+        for (layer, spans_by_provider) in layers.into_iter().enumerate() {
+            let (done, outcomes) = mpsc::channel();
             let mut queued = 0;
-            for (provider, spans) in self.geometry.providers.iter().zip(providers) {
+            for (provider, spans) in self.geometry.providers.iter().zip(spans_by_provider) {
                 if spans.is_empty() {
                     continue;
                 }
                 let read = Read {
                     session: provider.session.clone(),
                     spans,
-                    outcome: outcome.clone(),
+                    done: done.clone(),
                 };
                 if self.reads.send(read).is_err() {
                     return Err(PoolError("the shared L2 readers have stopped".to_owned()));
                 }
                 queued += 1;
             }
-            drop(outcome);
+            drop(done);
             // Every read of the layer retires before the layer is let go or
             // the load fails: none still writes a block afterwards.
             let mut failed = None;
@@ -388,19 +426,19 @@ mod tests {
     /// bytes, layer 1) fit in one.
     fn geometry() -> Arc<PoolGeometry> {
         Arc::new(PoolGeometry {
-            lcm_bytes: 28,
+            lcm_block_bytes: 28,
             providers: vec![
                 Provider {
                     session: "p0".to_owned(),
-                    base: 10_000,
-                    lcm_blocks: 3,
-                    start: 0,
+                    base_address: 10_000,
+                    num_lcm_blocks: 3,
+                    first_lcm_block: 0,
                 },
                 Provider {
                     session: "p1".to_owned(),
-                    base: 20_000,
-                    lcm_blocks: 5,
-                    start: 3,
+                    base_address: 20_000,
+                    num_lcm_blocks: 5,
+                    first_lcm_block: 3,
                 },
             ],
             groups: vec![
@@ -412,14 +450,14 @@ mod tests {
                             device_address: 0,
                             device_stride: 32,
                             bytes: 12,
-                            page_offset: 0,
+                            offset_in_page: 0,
                             layer: 0,
                         },
                         PageField {
                             device_address: 16,
                             device_stride: 32,
                             bytes: 16,
-                            page_offset: 12,
+                            offset_in_page: 12,
                             layer: 1,
                         },
                     ],
@@ -431,7 +469,7 @@ mod tests {
                         device_address: STATE_DEVICE,
                         device_stride: 16,
                         bytes: 12,
-                        page_offset: 0,
+                        offset_in_page: 0,
                         layer: 1,
                     }],
                 },
@@ -473,10 +511,10 @@ mod tests {
                 arena.write(address, &payload);
             }
             copies.push(PageCopy {
-                group,
+                group_id: group,
                 bucket: 0,
-                page,
-                block,
+                pool_page: page,
+                device_block: block,
             });
         }
         let writes = geometry.write_spans(&copies).unwrap();
@@ -488,20 +526,24 @@ mod tests {
 
     /// A reader loads the stored pages into other Device blocks: every
     /// page behind a proxy Host block of its own.
-    fn loaded() -> (Vec<SharedL2PageView>, Vec<(u32, i32, i32)>) {
+    fn loaded() -> (Vec<SharedL2ProxyBlockView>, Vec<LoadRow>) {
         STORED
             .iter()
             .enumerate()
             .map(|(index, &(group_id, page, block))| {
                 let proxy = 100 + index as i32;
                 (
-                    SharedL2PageView {
+                    SharedL2ProxyBlockView {
                         group_id,
-                        block: proxy,
+                        host_block: proxy,
                         bucket: 0,
-                        page,
+                        pool_page: page,
                     },
-                    (group_id, proxy, BLOCKS - block),
+                    LoadRow {
+                        group_id,
+                        host_block: proxy,
+                        device_block: BLOCKS - block,
+                    },
                 )
             })
             .unzip()
@@ -556,7 +598,7 @@ mod tests {
         failed_at_set: Arc<Mutex<Vec<bool>>>,
         reader: Arc<Reader>,
         failure: Arc<FailureLatch>,
-        rows: Vec<(u32, i32, i32)>,
+        rows: Vec<LoadRow>,
     }
 
     impl Rank {
@@ -798,16 +840,20 @@ mod tests {
         let error = rank.loads.poll().unwrap_err();
         assert_eq!(
             error.0,
-            "the shared L2 thread ts-pool-load panicked: the start word is unreadable"
+            "the shared L2 thread ts-shared-l2-load panicked: the start word is unreadable"
         );
     }
 
     #[test]
     fn a_load_of_a_block_or_of_words_the_rank_does_not_have_is_refused() {
         let rank = Rank::new();
-        let submit =
-            |rows: &[(u32, i32, i32)], start_word| rank.loads.submit(vec![7], rows, start_word, 1);
-        let error = submit(&[(KV, 99, 1)], 0).unwrap_err();
+        let submit = |rows: &[LoadRow], start_word| rank.loads.submit(vec![7], rows, start_word, 1);
+        let unmapped = LoadRow {
+            group_id: KV,
+            host_block: 99,
+            device_block: 1,
+        };
+        let error = submit(&[unmapped], 0).unwrap_err();
         assert!(error.0.contains("stands for no pool page"), "{error}");
         // The second word set ends at word 5.
         let error = submit(&[], 4).unwrap_err();
@@ -820,18 +866,26 @@ mod tests {
     #[test]
     fn a_proxy_block_used_again_stands_for_its_new_page() {
         let proxy_pages = ProxyPages::default();
-        let page = |group_id, block, page| SharedL2PageView {
+        let page = |group_id, block, page| SharedL2ProxyBlockView {
             group_id,
-            block,
+            host_block: block,
             bucket: 0,
-            page,
+            pool_page: page,
         };
         proxy_pages.record(&[page(0, 11, 3), page(1, 12, 9)]);
-        assert_eq!(proxy_pages.page(0, 11), Some((0, 3)));
-        assert_eq!(proxy_pages.page(1, 12), Some((0, 9)));
+        let stands_for = |group_id, host_block| {
+            proxy_pages
+                .page(ProxyBlock {
+                    group_id,
+                    host_block,
+                })
+                .map(|pool_page| pool_page.pool_page)
+        };
+        assert_eq!(stands_for(0, 11), Some(3));
+        assert_eq!(stands_for(1, 12), Some(9));
         proxy_pages.record(&[page(0, 11, 4)]);
-        assert_eq!(proxy_pages.page(0, 11), Some((0, 4)));
-        assert_eq!(proxy_pages.page(0, 99), None);
+        assert_eq!(stands_for(0, 11), Some(4));
+        assert_eq!(stands_for(0, 99), None);
     }
 
     #[test]

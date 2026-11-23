@@ -69,7 +69,7 @@ use ts_pd::{
 };
 use ts_scheduler::{
     profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
-    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2ProxyBlockView,
     StorageKeyView,
 };
 use ts_wire::{
@@ -196,7 +196,7 @@ fn new_scheduler(
             "cfg.disable_l2_cache = False\n\
              cfg.num_host_pages = 1025\n\
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
-             cfg.shared_l2_config = ts.SharedL2Config(max_writes=2, max_write_keys=64)"
+             cfg.shared_l2_config = ts.SharedL2Config(max_writes_in_flight=2, max_keys_per_write=64)"
         }
     };
     let code = format!(
@@ -1626,7 +1626,7 @@ fn run_rank<F: Frontend>(
             }),
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
-            pool,
+            shared_l2: pool,
             peer: None,
         },
     );
@@ -6621,16 +6621,18 @@ enum PoolEvent {
         rids: Vec<String>,
         plans: usize,
     },
-    /// A write of this many blocks was started, after the device's
-    /// `commits`-th forward was committed.
+    /// The write `op_id`, of this many blocks, was started, after the
+    /// device's `commits`-th forward was committed.
     Wrote {
+        op_id: u32,
         blocks: usize,
         commits: usize,
     },
     /// A write was reported finished.
     WriteDone,
     Released(u64),
-    /// An answer's proxy blocks were mapped to pool pages, this many.
+    /// The proxy blocks of a round's answers were mapped to pool pages, this
+    /// many.
     Mapped(usize),
 }
 
@@ -6654,7 +6656,7 @@ struct FakePool {
     /// The polls a write stays in flight before it is reported finished.
     write_polls: usize,
     /// Writes started and not reported, each with the polls it still waits.
-    writes: Vec<(usize, u64)>,
+    writes: Vec<(usize, u32)>,
     tickets: u64,
     pages: i32,
     log: Vec<PoolEvent>,
@@ -6712,7 +6714,7 @@ impl PoolClient for FakePoolClient {
                     })
                     .collect(),
                 buckets: vec![0; hit],
-                pages: (1..=hit as i32).map(|page| first_page + page).collect(),
+                pool_pages: (1..=hit as i32).map(|page| first_page + page).collect(),
             });
         }
         Ok(answers)
@@ -6734,43 +6736,40 @@ impl PoolClient for FakePoolClient {
             .into_iter()
             .partition(|(polls, _)| *polls == 0);
         pool.writes = open;
-        let finished: Vec<u32> = finished
-            .into_iter()
-            .map(|(_, write)| u32::try_from(write).unwrap())
-            .collect();
+        let finished: Vec<u32> = finished.into_iter().map(|(_, write)| write).collect();
         for _ in &finished {
             pool.log.push(PoolEvent::WriteDone);
         }
         Ok(finished)
     }
 
-    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+    fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]) {
         let mut pool = self.pool.lock().unwrap();
-        pool.log.push(PoolEvent::Mapped(pages.len()));
-        Ok(())
+        pool.log.push(PoolEvent::Mapped(proxy_blocks.len()));
     }
 
-    fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError> {
+    fn submit(&mut self, ops: &[SharedL2OpView]) -> Result<(), PoolError> {
         let commits = *self.commits.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
-        for command in commands {
-            match command.kind {
+        for op in ops {
+            match op.kind {
                 SharedL2OpKind::Write => {
                     let polls = pool.write_polls;
-                    pool.writes.push((polls, command.id));
+                    pool.writes.push((polls, op.op_id));
                     pool.log.push(PoolEvent::Wrote {
-                        blocks: command.keys.len(),
+                        op_id: op.op_id,
+                        blocks: op.keys.len(),
                         commits,
                     });
                 }
-                SharedL2OpKind::Release => pool.log.push(PoolEvent::Released(command.id)),
+                SharedL2OpKind::Release => pool.log.push(PoolEvent::Released(op.ticket)),
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn check_failure(&mut self) -> Result<(), PoolError> {
+    fn check_failure(&self) -> Result<(), PoolError> {
         let loaded = self
             .plans
             .lock()
@@ -6920,10 +6919,15 @@ fn a_failed_pool_write_stops_the_engine() {
     // The write of the pages the prompt published failed: the poll that
     // reports it ends serving, and the write is not dropped.
     let error = rank.outcome.unwrap_err();
-    assert!(error.contains("pool write 1 failed"), "{error}");
+    let [.., PoolEvent::Wrote {
+        op_id, blocks: 4, ..
+    }] = &log[..]
+    else {
+        panic!("{log:?}");
+    };
     assert!(
-        matches!(log[..], [.., PoolEvent::Wrote { blocks: 4, .. }]),
-        "{log:?}"
+        error.contains(&format!("pool write {op_id} failed")),
+        "{error}"
     );
 }
 
@@ -7033,7 +7037,7 @@ fn a_pool_miss_computes_its_prompt_as_without_a_pool() {
     );
     assert!(
         !log.iter()
-            .any(|event| matches!(event, PoolEvent::Mapped(..) | PoolEvent::Released(_))),
+            .any(|event| matches!(event, PoolEvent::Mapped(1..) | PoolEvent::Released(_))),
         "{log:?}"
     );
     assert_eq!(with_pool.prefixes, [(0, "miss".to_owned(), 0)]);
@@ -7177,7 +7181,9 @@ fn a_pool_write_starts_only_once_the_forward_that_fills_its_blocks_landed() {
     let started: Vec<(usize, usize)> = log
         .iter()
         .filter_map(|event| match event {
-            PoolEvent::Wrote { blocks, commits } => Some((*blocks, *commits)),
+            PoolEvent::Wrote {
+                blocks, commits, ..
+            } => Some((*blocks, *commits)),
             _ => None,
         })
         .collect();
