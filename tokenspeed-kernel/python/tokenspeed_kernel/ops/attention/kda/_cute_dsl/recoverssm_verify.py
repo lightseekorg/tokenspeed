@@ -470,12 +470,18 @@ class RecoverSsmVerify:
         # batch-1 layer with records on GB300: the pass's every chunk waited on
         # its loads).
         self.merge_history_pass = self.preload_history_us
-        # Those tiles also store the window's records after the solve, which
+        # Those tiles also store the window's records after phase 2, which
         # then neither waits for their decays' exps nor for the key scales'
         # extra barrier (2% of a T 4 batch-1 round on GB300); larger tiles
         # store them on the way, as holding the gate steps to the end slowed
-        # T 8 rounds at batch 4-64 by 2-7%.
+        # T 8 rounds at batch 4-64 by 2-7%. The threads past the value tile
+        # store them while the others solve, from the gate steps the tile's
+        # threads leave in M's place once the product has read it.
         self.defer_window_records = self.preload_history_us
+        assert not self.defer_window_records or (
+            value_tile_rows < THREADS
+            and key_dim * self.padded_columns >= value_tile_rows * window
+        )
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
@@ -780,8 +786,9 @@ class RecoverSsmVerify:
                         False,
                     )
             if const_expr(self.defer_window_records):
-                if value_tile == 0:
-                    self._store_window_records(
+                # The threads past the tile store them while the others solve.
+                if (value_tile == 0) & (tidx >= VT):
+                    self._store_surplus_records(
                         shared,
                         retained,
                         slot,
@@ -823,8 +830,8 @@ class RecoverSsmVerify:
         give part of it and the history rows the rest (``_store_history_rows``).
         A CTA stores the window's normalized keys and decays after the records
         when ``records_keys`` is set, or with ``defer_window_records`` returns
-        each key channel's gate steps for ``_store_window_records`` after the
-        solve. ``early_keys``, ``early_decays`` and
+        each key channel's gate steps, and leaves the value tile's in M's
+        place, for ``_store_surplus_records``. ``early_keys``, ``early_decays`` and
         ``early_us`` hold this thread's channels of the records when the CTA
         started loading them (``_start_early_history``), and with
         ``channel_loaded`` the keys and decays its caller started loading;
@@ -935,6 +942,13 @@ class RecoverSsmVerify:
             self._tile_times_columns(shared, warp, lane, products, False)
         cute.arch.barrier()
         self._store_partials(shared, products, warp, lane)
+        if const_expr(self.defer_window_records):
+            # M is spent: the value tile's threads leave their key channels'
+            # gate steps there for the warps past the tile
+            # (``_store_surplus_records``).
+            if tidx < self.value_tile_rows:
+                for t in cutlass.range_constexpr(W):
+                    shared.columns[t * self.value_tile_rows + tidx] = decay_steps[t]
         cute.arch.barrier()
         if const_expr(has_history):
             if record_start > 0:
@@ -979,16 +993,14 @@ class RecoverSsmVerify:
         record_head: Int32,
         record_start: Int32,
         valid_tokens: Int32,
-        tidx: Int32,
-        decay_steps,
+        key: Int32,
+        steps,
     ):
-        """Store the window tokens' decays and normalized keys after the records.
+        """Store key channel ``key``'s window-token decays and normalized keys.
 
-        With ``defer_window_records`` the one CTA per (request, head) that keeps
-        the records runs it after its outputs; ``decay_steps`` holds each key
-        channel's gate steps from ``_project_window``.
+        ``steps`` holds the channel's gate steps of the window tokens.
         """
-        if tidx < self.key_dim:
+        if key < self.key_dim:
             self._store_decay_records(
                 retained,
                 record_slot,
@@ -996,8 +1008,8 @@ class RecoverSsmVerify:
                 record_start,
                 Int32(1),
                 valid_tokens,
-                tidx,
-                [decay_steps[t] for t in range(self.window)],
+                key,
+                steps,
             )
         self._store_key_records(
             shared,
@@ -1007,7 +1019,53 @@ class RecoverSsmVerify:
             record_start,
             Int32(1),
             valid_tokens,
+            key,
+        )
+
+    @cute.jit
+    def _store_surplus_records(
+        self,
+        shared: _Shared,
+        retained: tuple,
+        record_slot: Int64,
+        record_head: Int32,
+        record_start: Int32,
+        valid_tokens: Int32,
+        tidx: Int32,
+        decay_steps,
+    ):
+        """Store the window's records from a thread past the value tile.
+
+        With ``defer_window_records`` the one CTA per (request, head) that keeps
+        the records stores them from the threads that own no value channel,
+        while the others solve: thread t >= VT stores key channel t from its
+        own gate steps (``decay_steps``, from ``_project_window``) and channel
+        t - VT, when that is a value tile thread's, from the steps that thread
+        left in M's place.
+        """
+        VT = self.value_tile_rows
+        W = self.window
+        owned = tidx - VT
+        if owned < VT:
+            self._store_window_records(
+                shared,
+                retained,
+                record_slot,
+                record_head,
+                record_start,
+                valid_tokens,
+                owned,
+                [shared.columns[t * VT + owned] for t in range(W)],
+            )
+        self._store_window_records(
+            shared,
+            retained,
+            record_slot,
+            record_head,
+            record_start,
+            valid_tokens,
             tidx,
+            [decay_steps[t] for t in range(W)],
         )
 
     @cute.jit

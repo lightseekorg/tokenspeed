@@ -635,51 +635,52 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     self.preload_history_channel,
                 )
 
-                # Phase 3, one thread per value channel; the surplus warps repeat
-                # the last channel so the norm's warp sums see full warps.
-                corrections, outputs = self._solve_window(shared, channel)
-                owner = Int32(tidx < VT)
-                if const_expr(self.gated_norm):
-                    outputs = self._normalize(
-                        shared,
-                        outputs,
-                        logits,
-                        value_tile,
-                        warp,
-                        lane,
-                        owner,
-                        norm_scale,
-                        norm_eps,
+                # Phase 3, one thread per value channel. A tile smaller than the
+                # CTA leaves whole warps without one (VT is a multiple of 32, so
+                # the norm's warp sums see full warps); they skip it, and with
+                # deferred records store them meanwhile.
+                if tidx < VT:
+                    corrections, outputs = self._solve_window(shared, tidx)
+                    if const_expr(self.gated_norm):
+                        outputs = self._normalize(
+                            shared,
+                            outputs,
+                            logits,
+                            value_tile,
+                            warp,
+                            lane,
+                            norm_scale,
+                            norm_eps,
+                        )
+                    out_row = out + (
+                        token_start * out_token_stride + head * V + value_start + tidx
                     )
-                out_row = out + (
-                    token_start * out_token_stride + head * V + value_start + channel
-                )
-                correction_row = correction + (
-                    slot * correction_slot_stride
-                    + head * correction_head_stride
-                    + value_start
-                    + channel
-                )
-                for t in cutlass.range_constexpr(W):
-                    stored = owner & Int32(t < valid_tokens)
-                    position = count + t
-                    _store_if(
-                        stored,
-                        (out_row + t * out_token_stride).toint(),
-                        outputs[t],
-                        True,
+                    correction_row = correction + (
+                        slot * correction_slot_stride
+                        + head * correction_head_stride
+                        + value_start
+                        + tidx
                     )
-                    _store_if(
-                        stored,
-                        (
-                            correction_row + position * correction_position_stride
-                        ).toint(),
-                        corrections[t],
-                        False,
-                    )
+                    for t in cutlass.range_constexpr(W):
+                        stored = Int32(t < valid_tokens)
+                        position = count + t
+                        _store_if(
+                            stored,
+                            (out_row + t * out_token_stride).toint(),
+                            outputs[t],
+                            True,
+                        )
+                        _store_if(
+                            stored,
+                            (
+                                correction_row + position * correction_position_stride
+                            ).toint(),
+                            corrections[t],
+                            False,
+                        )
                 if const_expr(self.defer_window_records):
-                    if value_tile == 0:
-                        self._store_window_records(
+                    if (value_tile == 0) & (tidx >= VT):
+                        self._store_surplus_records(
                             shared,
                             retained,
                             slot,
@@ -901,7 +902,6 @@ class FusedVerifyWindow(RecoverSsmVerify):
         value_tile: Int32,
         warp: Int32,
         lane: Int32,
-        owner: Int32,
         norm_scale: Float32,
         norm_eps: Float32,
     ):
@@ -920,12 +920,12 @@ class FusedVerifyWindow(RecoverSsmVerify):
             rounded.append(output)
             squares.append(cute.arch.warp_reduction_sum(output * output))
         if const_expr(self.cluster == 1):
-            if (lane == 0) & (owner != 0):
+            if lane == 0:
                 for t in cutlass.range_constexpr(W):
                     _store_shared_f32(norm_addr + (group * W + t) * 4, squares[t])
             cute.arch.barrier()
         else:
-            if (lane == 0) & (owner != 0):
+            if lane == 0:
                 barrier_addr = Int32(shared.norm_barrier.toint())
                 for peer in cutlass.range_constexpr(self.cluster):
                     for t in cutlass.range_constexpr(W):
