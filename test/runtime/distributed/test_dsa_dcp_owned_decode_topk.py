@@ -36,8 +36,10 @@ score gather (as a records decode's query rides it) must leave the selection as 
 all-gather of every rank's rider lands. A forward's captured metadata build
 and owned selection with its rider, replayed after the lengths, the table
 and the rider change in place, must select what the eager merge selects
-for the new batch and gather the new riders. All of it holds again on CDNA4
-with the score gather pulling its input from an Iris pull exchange.
+for the new batch and gather the new riders. All of it holds again with the
+SM100 or SM103 one-hop exchange prepared, whose float gather releases the
+selection under PDL, and on CDNA4 with the score gather pulling its input
+from an Iris pull exchange.
 """
 
 import sys
@@ -203,7 +205,7 @@ def _assert_same_rows(slots: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
-def _worker(rank, degree, rendezvous, pull_exchange):
+def _worker(rank, degree, rendezvous, exchange_kind):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     # Runtime imports may initialize CUDA, so select the rank's device first.
@@ -211,6 +213,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import prepare_small_exchange
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager,
     )
@@ -244,7 +247,14 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         backend.configure(use_pynccl=False)
         set_global_backend(backend)
         exchange = None
-        if pull_exchange:
+        if exchange_kind == "ll":
+            from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+            gather_fabric_map()
+            # Room for bs 16's scores and rider in one float gather.
+            cap = 16 * _Q_LEN * (_TOPK * 4 + _RIDER)
+            assert prepare_small_exchange(group, 1 << 16, cap, 60_000_000_000)
+        if exchange_kind == "pull":
             # The score gather then pulls its input where the scorer wrote it.
             from tokenspeed_kernel.ops.communication._iris import (
                 IrisGroup,
@@ -474,20 +484,27 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         dist.destroy_process_group()
 
 
-# NCCL at two and four ranks, the pull exchange at two and at K3.1's eight.
+# NCCL and the one-hop exchange at two and four ranks, the pull exchange at
+# two and at K3.1's eight.
 @pytest.mark.parametrize(
-    "degree,pull_exchange", [(2, False), (4, False), (2, True), (8, True)]
+    "degree,exchange_kind",
+    [(2, "nccl"), (4, "nccl"), (2, "ll"), (4, "ll"), (2, "pull"), (8, "pull")],
 )
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
-    tmp_path, degree, pull_exchange
+    tmp_path, degree, exchange_kind
 ):
     from tokenspeed_kernel.platform import ArchVersion, current_platform
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
     platform = current_platform()
-    if pull_exchange and not platform.is_cdna4:
+    if exchange_kind == "pull" and not platform.is_cdna4:
         pytest.skip("Iris pull exchanges run on CDNA4")
+    if exchange_kind == "ll" and not (
+        platform.is_nvidia
+        and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    ):
+        pytest.skip("the one-hop exchange runs on SM100 and SM103")
     if not platform.is_cdna4 and not (
         platform.is_nvidia
         and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
@@ -495,7 +512,7 @@ def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
         pytest.skip("the owned selection runs on CDNA4, SM100, and SM103")
     mp.spawn(
         _worker,
-        args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),
+        args=(degree, f"file://{tmp_path / 'rendezvous'}", exchange_kind),
         nprocs=degree,
         join=True,
     )

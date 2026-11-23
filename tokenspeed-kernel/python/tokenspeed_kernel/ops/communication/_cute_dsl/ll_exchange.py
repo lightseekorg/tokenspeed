@@ -40,6 +40,9 @@ element matches only where the slot's last write came a multiple of
 count lives in device memory: the last CTA of a call publishes it, so graph
 replays need no host state. Every wait is bounded by ``%globaltimer``; a
 timeout traps, as a hung NCCL kernel would end the group.
+
+A float gather releases its PDL dependents at entry: they wait on its grid
+before reading what it lands.
 """
 
 from __future__ import annotations
@@ -224,6 +227,9 @@ class LLExchange:
     @cute.kernel
     def kernel(self, src: Int64, out: Int64, peers: cute.Tensor, ctrl: Int64, units: Int32, cap: Int32, rank: Int32, grid: Int32, multicast: Int64, timeout: Int64):  # fmt: skip
         """Push this rank's units for the call's parity, then poll every rank's."""
+        if cutlass.const_expr(self.floats):
+            # Its reader (the owned top-k select) waits on this whole grid.
+            cute.arch.griddepcontrol_launch_dependents()
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         deadline = _globaltimer() + timeout

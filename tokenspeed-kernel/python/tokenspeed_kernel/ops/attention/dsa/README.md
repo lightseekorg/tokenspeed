@@ -168,7 +168,9 @@ offsets. `cute_dsl_dsa_select_owned_candidates` runs one 1024-thread CTA per
 row: the row's scores stay in registers, three radix digits of 11, 11, and 10
 bits over a shared-memory histogram find the k-th largest score, and two block
 scans keep the rank's candidates in candidate order. It accepts two or more
-power-of-two ranks and at most 32768 gathered scores per row.
+power-of-two ranks and at most 32768 gathered scores per row. Under PDL it
+looks up its candidates' local slots before it waits for the gathered
+scores, so the lookups overlap the gather that releases it.
 `dsa_select_owned_candidates_supported` refuses other sizes and platforms; a
 KVP decode whose sizes it refuses merges the candidates instead.
 

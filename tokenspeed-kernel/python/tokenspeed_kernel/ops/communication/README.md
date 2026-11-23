@@ -268,6 +268,8 @@ words is armed, then re-arms it. Its own call count and parity slots order its
 calls as described earlier, and its workspace holds
 `2 * ranks * float_cap_bytes`; a `float_cap_bytes` of 0 allocates none. A
 gather of 256 KiB per rank or more runs on every SM, a smaller one on 64 CTAs.
+It releases its PDL dependents at entry; they wait on its whole grid before
+reading what it lands.
 `AutoBackend.all_gather_float_words_single` takes it where it serves the size;
 the owned decode top-k gathers its scores and query rider through it, so the
 KVP decode prepares it only for DSA models. On 8 GB300s over two nodes a

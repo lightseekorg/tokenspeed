@@ -28,7 +28,8 @@ order and within a rank in candidate order, ``topk`` in all: this rank's share
 of the merge's selection. Kept candidates map to local slots through the local
 page table in candidate order, ``-1`` after. A row with at most ``topk`` live
 keys in all (a history no longer than the top-k) keeps every one without the
-digits.
+digits. Under PDL, the local slots of this rank's candidates are looked up
+before the wait for the gathered scores.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32, Uint32
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
     float_bits,
 )
@@ -83,8 +85,8 @@ class OwnedSelect:
     writes rank ``rank``'s local slots ``[rows, width]`` and counts ``[rows]``.
     """
 
-    def __init__(self, degree: int, width: int, page: int):
-        self.degree, self.width, self.page = degree, width, page
+    def __init__(self, degree: int, width: int, page: int, pdl: bool):
+        self.degree, self.width, self.page, self.pdl = degree, width, page, pdl
         self.keys = degree * width // THREADS
         self.own = max(1, width // THREADS)
 
@@ -101,7 +103,10 @@ class OwnedSelect:
         stream,
     ):
         self.kernel(scores, positions, table, requests, out, lens, rank).launch(
-            grid=(out.shape[0], 1, 1), block=(THREADS, 1, 1), stream=stream
+            grid=(out.shape[0], 1, 1),
+            block=(THREADS, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.jit
@@ -190,11 +195,36 @@ class OwnedSelect:
         scan = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
         info = smem.allocate_tensor(Int32, cute.make_layout(8), 16)
 
+        # This rank's candidates [tid * own, tid * own + own) in candidate
+        # order and their local slots: positions are this rank's own, written
+        # before the gather began, so the lookups run before the PDL wait.
+        first = tid * self.own
+        request = requests[row]
+        columns = table.shape[1]
+        slots = []
+        for e in cutlass.range_constexpr(self.own):
+            slot = Int32(-1)
+            if first + e < W:
+                position = positions[row, first + e]
+                if position >= Int32(0) and position // Int32(self.page) < columns:
+                    page = table_entry(table, request, position // Int32(self.page))
+                    if page >= Int32(0):
+                        slot = page * Int32(self.page) + position % Int32(self.page)
+            slots.append(slot)
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
+
         # Column c = tid + THREADS * i of the row: rank c // W, candidate c % W.
         raw = []
         for i in cutlass.range_constexpr(self.keys):
             column = tid + THREADS * i
             raw.append(scores[column // W, row, column % W])
+        own_keys = []
+        for e in cutlass.range_constexpr(self.own):
+            key = Uint32(0)
+            if first + e < W:
+                key = _live_key(Uint32(float_bits(scores[rank, row, first + e])))
+            own_keys.append(key)
         keys = []
         live = Uint32(0)
         for i in cutlass.range_constexpr(self.keys):
@@ -202,25 +232,6 @@ class OwnedSelect:
             if key != Uint32(0):
                 live += Uint32(1)
             keys.append(key)
-        # This rank's candidates [tid * own, tid * own + own) in candidate
-        # order, with their local slots: loads that overlap the radix digits.
-        first = tid * self.own
-        request = requests[row]
-        own_keys = []
-        slots = []
-        for e in cutlass.range_constexpr(self.own):
-            key = Uint32(0)
-            slot = Int32(-1)
-            if first + e < W:
-                key = _live_key(Uint32(float_bits(scores[rank, row, first + e])))
-            if key != Uint32(0):
-                position = positions[row, first + e]
-                if position >= Int32(0):
-                    page = table_entry(table, request, position // Int32(self.page))
-                    if page >= Int32(0):
-                        slot = page * Int32(self.page) + position % Int32(self.page)
-            own_keys.append(key)
-            slots.append(slot)
         live = warp_sum(live)
         if tid == 0:
             info[4] = Int32(0)
@@ -274,12 +285,13 @@ def _fake(dtype, shape, stride, align):
 
 
 @functools.cache
-def compile_owned_select(degree: int, width: int, page: int):
-    """Compile the owned selection for a rank count, width, and page size.
+def compile_owned_select(degree: int, width: int, page: int, pdl: bool):
+    """Compile the owned selection for these sizes and launch mode.
 
     Selects among ``degree`` ranks' ``width`` candidates per row over
-    ``page``-token pages. Rows, the rank stride, the table, and the rank are
-    runtime values: one compile serves every batch.
+    ``page``-token pages, launched under PDL when ``pdl``. Rows, the rank
+    stride, the table, and the rank are runtime values: one compile serves
+    every batch.
     """
     sym = cute.sym_int
     scores = _fake(
@@ -292,7 +304,7 @@ def compile_owned_select(degree: int, width: int, page: int):
     lens = _fake(Int32, (sym(),), (1,), 4)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
-        OwnedSelect(degree, width, page),
+        OwnedSelect(degree, width, page, pdl),
         scores,
         positions,
         table,
@@ -348,7 +360,7 @@ def cute_dsl_select_owned_from_gathered(
     """
     degree, rows, width = scores.shape
     if rows:
-        compile_owned_select(degree, width, page_size)(
+        compile_owned_select(degree, width, page_size, pdl_enabled())(
             scores,
             positions,
             local_page_table,
