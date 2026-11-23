@@ -3321,13 +3321,15 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             f"'swiglu', or 'situ', got {activation!r}"
         )
     if decode:
+        fp8_activation = activation_dtype == "fp8"
         gate_up_k = int(hidden_states.shape[-1])
-        gate_up_tiles = decode_tile_config(gate_up_k)
+        gate_up_tiles = decode_tile_config(gate_up_k, fp8_activation)
         rows = int(topk_ids.numel())
         if block_m is None and _resolve_block_m(True, rows, num_experts) == 16:
             # The wide step's ring is sized around decode's 16-row tile.
             gate_up_tiles = decode_gate_up_tile_config(
                 gate_up_k,
+                fp8_activation,
                 RaggedTensorMetadata.n_blocks(num_experts, rows, 16)
                 * triton.cdiv(int(w13_raw.shape[-1]), gate_up_tiles["block_n"]),
                 torch.cuda.get_device_properties(
@@ -3335,7 +3337,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                 ).multi_processor_count,
             )
         # The down projection reduces over the activation's half of W13's N.
-        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
+        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2, fp8_activation)
         if activation_dtype == "fp8":
             # Pairing is tuned on FP8 activations; MXFP4 keeps one tile.
             w2_raw = (

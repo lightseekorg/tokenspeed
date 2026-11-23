@@ -1390,7 +1390,7 @@ def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
         decode=decode,
         partial_tdm=False,
         **(
-            decode_tile_config(hidden_size)
+            decode_tile_config(hidden_size, False)
             if decode
             else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
         ),
@@ -1617,20 +1617,32 @@ def test_gfx1250_epilogue_fp8_matches_fp32_result(
 
 
 def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
-    long_k = decode_tile_config(3584)
-    short_k = decode_tile_config(384)
+    long_k = decode_tile_config(3584, False)
+    short_k = decode_tile_config(384, False)
     assert long_k["block_k"] == 512 and short_k["block_k"] == 128
     assert long_k["block_n"] == short_k["block_n"] == 128
+    assert decode_tile_config(3584, True) == long_k
+
+
+def test_gfx1250_decode_tile_config_widens_short_k_with_fp8_activations() -> None:
+    fp8 = decode_tile_config(384, True)
+    mxfp4 = decode_tile_config(384, False)
+    assert (fp8["block_n"], fp8["num_buffers"]) == (256, 2)
+    assert (mxfp4["block_n"], mxfp4["num_buffers"]) == (128, 3)
+    assert fp8["block_k"] == mxfp4["block_k"] == 128
 
 
 def test_gfx1250_decode_gate_up_reads_wide_k_steps_with_a_cu_per_program() -> None:
-    static = decode_tile_config(3584)
+    static = decode_tile_config(3584, False)
     # At most one program per CU: the long K is read in 1024-wide steps.
-    assert decode_gate_up_tile_config(3584, 96, 256) == {**static, "block_k": 1024}
-    assert decode_gate_up_tile_config(3584, 256, 256)["block_k"] == 1024
+    wide = decode_gate_up_tile_config(3584, False, 96, 256)
+    assert wide == {**static, "block_k": 1024}
+    assert decode_gate_up_tile_config(3584, True, 256, 256)["block_k"] == 1024
     # Programs sharing CUs, and a short K, keep the static tile.
-    assert decode_gate_up_tile_config(3584, 257, 256) == static
-    assert decode_gate_up_tile_config(384, 96, 256) == decode_tile_config(384)
+    assert decode_gate_up_tile_config(3584, False, 257, 256) == static
+    for fp8 in (False, True):
+        short_k = decode_gate_up_tile_config(384, fp8, 96, 256)
+        assert short_k == decode_tile_config(384, fp8)
 
 
 def _sparse_decode_moe_case(num_tokens: int):

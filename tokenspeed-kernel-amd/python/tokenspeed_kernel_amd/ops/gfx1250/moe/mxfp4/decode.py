@@ -45,23 +45,25 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
 _DECODE_LONG_K = 2048
 
 
-def decode_tile_config(k: int) -> dict[str, int]:
+def decode_tile_config(k: int, fp8_activation: bool) -> dict[str, int]:
     """Return the decode tile for a projection with reduction length ``k``.
 
     Decode streams each touched expert's weights once, so the tile is chosen
-    for HBM streaming rather than reuse. 128-column tiles give a single-token
-    step enough programs to occupy the device. A long K reads 256-byte MXFP4
-    row segments (``block_k=512``), which keeps more bytes in flight per TDM
-    operation. A short K uses ``block_k=128`` so the three buffers hold the
+    for HBM streaming rather than reuse. A long K reads 256-byte MXFP4 row
+    segments (``block_k=512``) in 128-column tiles, which keeps more bytes in
+    flight per TDM operation and gives a single-token step enough programs to
+    occupy the device. A short K uses ``block_k=128`` so the ring holds the
     whole reduction in a small LDS footprint, letting more programs stay
-    resident to hide each program's fixed latency.
+    resident to hide each program's fixed latency. With FP8 activations its
+    tiles are 256 columns through a two-buffer ring, so half as many programs
+    read the same weights; with MXFP4 activations that tile measured slower,
+    and they keep 128 columns through three buffers.
     """
-    return {
-        "block_n": 128,
-        "block_k": 512 if k >= _DECODE_LONG_K else 128,
-        "num_buffers": 3,
-        "num_warps": 4,
-    }
+    if k >= _DECODE_LONG_K:
+        return {"block_n": 128, "block_k": 512, "num_buffers": 3, "num_warps": 4}
+    if fp8_activation:
+        return {"block_n": 256, "block_k": 128, "num_buffers": 2, "num_warps": 4}
+    return {"block_n": 128, "block_k": 128, "num_buffers": 3, "num_warps": 4}
 
 
 # K step of a long-K gate/up launch whose programs each have a CU to
@@ -69,7 +71,9 @@ def decode_tile_config(k: int) -> dict[str, int]:
 _DECODE_LONE_PROGRAM_BLOCK_K = 1024
 
 
-def decode_gate_up_tile_config(k: int, programs: int, cus: int) -> dict[str, int]:
+def decode_gate_up_tile_config(
+    k: int, fp8_activation: bool, programs: int, cus: int
+) -> dict[str, int]:
     """Return the decode gate/up tile for a launch of ``programs`` on ``cus`` CUs.
 
     The ring of :func:`decode_tile_config` is sized so that two programs fit
@@ -79,7 +83,7 @@ def decode_gate_up_tile_config(k: int, programs: int, cus: int) -> dict[str, int
     first step. One such ring fills a CU, so a launch with more programs than
     CUs keeps the 512-wide step; it measured slower with the wide one.
     """
-    tiles = decode_tile_config(k)
+    tiles = decode_tile_config(k, fp8_activation)
     if k >= _DECODE_LONG_K and programs <= cus:
         tiles["block_k"] = _DECODE_LONE_PROGRAM_BLOCK_K
     return tiles

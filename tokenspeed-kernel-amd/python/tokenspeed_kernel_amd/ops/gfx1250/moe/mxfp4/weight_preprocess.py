@@ -266,7 +266,7 @@ def preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(
     w2 = w.w2_weight_triton_tensor
     k = int(w2.shape[1]) * 2
     n = int(w2.shape[2])
-    decode = decode_tile_config(k)
+    decode = decode_tile_config(k, True)
     block_k = decode["block_k"]
     if (
         block_k == _PREFILL_DOWN_TILES["block_k"]
