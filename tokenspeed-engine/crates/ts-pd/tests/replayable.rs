@@ -35,6 +35,7 @@ fn sliding_group(replayable: bool) -> GroupSpec {
         rows_per_page: Some(64),
         entry_stride_tokens: Some(1),
         sliding_window_tokens: Some(128),
+        sink_tokens: 0,
         replayable,
         transfer_policy: Some("full_suffix".to_owned()),
         shard_count: 1,
@@ -65,6 +66,28 @@ fn cached_windows_still_skip_the_shared_prefix() {
         assert_eq!(
             logical_slots(&sliding_group(false), prefix, 320, false).unwrap(),
             vec![4],
+        );
+    }
+}
+
+#[test]
+fn sink_windows_transfer_the_unmatched_union_without_duplicates() {
+    let mut group = sliding_group(false);
+    group.sink_tokens = 65;
+    for (prefix, prompt, expected) in [
+        (0, 64, vec![0]),
+        (0, 128, vec![0, 1]),
+        (0, 320, vec![0, 1, 3, 4]),
+        (64, 320, vec![1, 3, 4]),
+        (65, 320, vec![1, 3, 4]),
+        (128, 320, vec![3, 4]),
+        (257, 320, vec![4]),
+        (0, 1024, vec![0, 1, 14, 15]),
+    ] {
+        assert_eq!(
+            logical_slots(&group, prefix, prompt, false).unwrap(),
+            expected,
+            "prefix={prefix}, prompt={prompt}",
         );
     }
 }
@@ -142,4 +165,55 @@ fn a_hole_in_the_retained_window_before_the_hit_is_rejected() {
     assert!(error
         .to_string()
         .contains("logical slot 3 has invalid block ID 0"));
+}
+
+#[test]
+fn sink_manifests_and_layerwise_selection_keep_absolute_slot_positions() {
+    let mut contract = replayable_contract();
+    let swa = contract
+        .group_specs
+        .iter()
+        .position(|group| group.group_id == "v41.swa")
+        .unwrap();
+    contract.group_specs[swa].replayable = false;
+    contract.group_specs[swa].sink_tokens = 65;
+    let mut tables = tables(&contract);
+    tables.insert(
+        "v41.swa".to_owned(),
+        BlockTable::from_rows(&[vec![4, 5, 0, 2, 3]], 5),
+    );
+    for (prefix, expected) in [(0, vec![4, 5, 2, 3]), (64, vec![5, 2, 3])] {
+        let mut manifest = build_manifest(&tables, &contract, 0, prefix, 320, false).unwrap();
+        assert_eq!(manifest.groups[swa].block_ids, expected);
+        validate_manifest(&manifest, &contract, "destination").unwrap();
+        let first =
+            build_selection(&tables, &contract, 0, prefix, 320, prefix, 128, false).unwrap();
+        assert_eq!(
+            first.groups[swa].source_block_ids,
+            if prefix == 0 { vec![4, 5] } else { vec![5] }
+        );
+        let middle = build_selection(&tables, &contract, 0, prefix, 320, 128, 256, false).unwrap();
+        assert_eq!(middle.groups[swa].source_block_ids, vec![2]);
+        assert_eq!(
+            middle.groups[swa].destination_positions,
+            if prefix == 0 { vec![2] } else { vec![1] }
+        );
+        let final_chunk =
+            build_selection(&tables, &contract, 0, prefix, 320, 256, 320, false).unwrap();
+        assert_eq!(final_chunk.groups[swa].source_block_ids, vec![3]);
+        assert_eq!(
+            final_chunk.groups[swa].destination_positions,
+            if prefix == 0 { vec![3] } else { vec![2] }
+        );
+        manifest.groups[swa].block_ids.remove(0);
+        assert!(validate_manifest(&manifest, &contract, "destination").is_err());
+    }
+    // Shared sink pages may be absent from this request's transfer view.
+    tables.insert(
+        "v41.swa".to_owned(),
+        BlockTable::from_rows(&[vec![0, 0, 0, 2, 3]], 5),
+    );
+    let manifest = build_manifest(&tables, &contract, 0, 128, 320, false).unwrap();
+    assert_eq!(manifest.groups[swa].block_ids, vec![2, 3]);
+    assert!(build_manifest(&tables, &contract, 0, 0, 320, false).is_err());
 }

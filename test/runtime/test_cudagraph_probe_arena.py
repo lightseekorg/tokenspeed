@@ -294,6 +294,7 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         context_len=context,
         capture_batch_sizes=capture_batch_sizes,
         decoder_requests=0,
+        drafter_requests=0,
     )
     assert floor == expected
     widest = max(
@@ -310,19 +311,35 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
 
 
 @pytest.mark.parametrize(
-    "ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected",
+    "ceiling, capture_batch_sizes, context, rows_per_request, "
+    "max_num_seqs, algorithm, expected",
     [
-        (None, None, 4096, None, 80, 2),
+        # Unset capture batch sizes fabricate the default 4 requests, up to max_num_seqs.
+        (None, None, 4096, None, 80, None, 4),
+        (None, None, 40960, None, 3, None, 3),
         # A graph ladder wider than the per-forward token budget.
-        (65536, None, 4096, None, 80, 16),
-        (None, [1, 8, 32], 40960, None, 80, 32),
+        (65536, None, 4096, None, 80, None, 16),
+        (None, [1, 8, 32], 40960, None, 80, None, 32),
+        (None, [1], 4096, None, 80, None, 2),
         # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
-        (None, None, 40960, 128, 80, 64),
-        (None, None, 40960, 128, 16, 16),
+        (None, None, 40960, 128, 80, None, 64),
+        (None, None, 40960, 128, 16, None, 16),
+        # A chain drafter's decode steps and a block drafter's block draft
+        # fabricate min(16, max_num_seqs) requests.
+        (None, None, 4096, None, 80, "MTP", 16),
+        (None, None, 4096, None, 8, "EAGLE3", 8),
+        (None, None, 4096, None, 80, "DFLASH", 16),
+        (None, None, 4096, None, 8, "DSPARK", 8),
     ],
 )
 def test_the_boot_floor_reads_both_knobs(
-    ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
+    ceiling,
+    capture_batch_sizes,
+    context,
+    rows_per_request,
+    max_num_seqs,
+    algorithm,
+    expected,
 ) -> None:
     server_args = SimpleNamespace(
         disaggregation_mode="null",
@@ -332,6 +349,7 @@ def test_the_boot_floor_reads_both_knobs(
         max_total_tokens=None,
         prefill_graph_capture_batch_sizes=capture_batch_sizes,
         max_num_seqs=max_num_seqs,
+        speculative_algorithm=algorithm,
     )
     floor = device.probe_arena_floor(
         server_args,
@@ -365,10 +383,17 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             free[0] -= init_keeps
 
         def autotune(self, *, keep_loaded_tactics):
-            assert not keep_loaded_tactics
+            # Only the probe boot tunes; the final pools are warmed by warm_kernels.
+            assert not keep_loaded_tactics and not charged
             # Tried tactics also raise the stack limit, which reserves local memory.
             free[0] -= tune_keeps + (1 << 30)
             stack[0] += 1 << 30
+
+        def warm_kernels(self):
+            # After the rebind: its transient memory comes from the utilization
+            # headroom, not the reserve the rebind was charged for.
+            assert charged
+            free[0] -= 1 << 20
 
         def capture_graphs(self, *, entries, observer):
             raise _ServingCapture
@@ -426,6 +451,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         lambda: SimpleNamespace(
             restore_stack_limit=restore_stack_limit,
             is_nvidia=is_nvidia,
+            is_amd=not is_nvidia,
             is_cdna4=False,
         ),
     )
@@ -468,6 +494,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             server_args=server_args,
             # Kimi-K3.1-like: the aggregated role agrees on its prefill plan.
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=True,
@@ -480,7 +507,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     return charged, set(reads), stack[0]
 
@@ -533,6 +562,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "_cudagraph_probe_refusal",
         "build_components",
         "autotune",
+        "warm_kernels",
         "_rebind_under_reserve",
         "HostCacheExecutor",
         "_capture_serving_graphs",
@@ -548,10 +578,11 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "warm_kernels",
         "HostCacheExecutor",
         "_capture_serving_graphs",
     ]
-    refusal, probe_build, _, _, _, _ = calls
+    refusal, probe_build, _, _, _, _, _ = calls
     # The serving capture, which a forward reload repeats, then reseeds the generator.
     capture = _function("execution/device.py", "_capture_serving_graphs")
     serving, seed = sorted(

@@ -432,6 +432,7 @@ def _select_candidates(scores, positions, lengths, causal, topk):
         topk=topk,
         initial_tokens=INITIAL_TOKENS,
         local_tokens=LOCAL_TOKENS,
+        scores_out=None,
     )
 
 
@@ -601,6 +602,85 @@ def test_deep_gemm_facade_selects_with_original_empty_lengths(monkeypatch, deep_
     )
     assert (logical[1:] == -1).all()
     assert torch.isneginf(values[1:]).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or not platform.is_hopper_plus
+    or not deep_gemm._HAS_DEEP_GEMM,
+    reason="requires DeepGEMM on an NVIDIA Hopper or newer GPU",
+)
+def test_deep_gemm_leaf_fills_a_send_buffer_from_strided_queries(monkeypatch):
+    """Check the DeepGEMM leaf's send-buffer scores and strided queries.
+
+    It writes the scores straight into a send buffer's rows, as the facade's
+    masking of its records would, and scores index queries read from a
+    projection's columns as it scores contiguous ones.
+    """
+    gather = index_candidates.gather_index_candidates
+    filled = []
+
+    def recorded(*args, **kwargs):
+        filled.append(kwargs.get("scores_out") is not None)
+        return gather(*args, **kwargs)
+
+    monkeypatch.setattr(index_candidates, "gather_index_candidates", recorded)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    rows, heads, topk, local_pages = 6, 32, 512, 24
+    cache = torch.randint(
+        0, 0x7E, (local_pages * PAGE_SIZE, 132), dtype=torch.uint8, device="cuda",
+        generator=generator,
+    )  # fmt: skip
+    # UE8M0 scale bytes of 2**0 for every key of every page.
+    cache.view(local_pages, -1)[:, PAGE_SIZE * 128 :] = 127
+    table = torch.randperm(local_pages - 1, device="cuda", generator=generator) + 1
+    table = table[:20].view(2, 10).int()
+    table[1, 6:] = -1
+    requests = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device="cuda")
+    causal = torch.tensor(
+        [600, 601, 602, 300, 0, 380], dtype=torch.int32, device="cuda"
+    )
+    projected = torch.randn(
+        (rows, 2304 + heads * 128), device="cuda", generator=generator
+    ).to(torch.bfloat16)
+    strided = projected[:, 2304:].view(rows, heads, 128)
+    assert not strided.is_contiguous()
+    weights = torch.randn((rows, heads), device="cuda", generator=generator)
+    kwargs = dict(
+        page_size=PAGE_SIZE,
+        topk=topk,
+        softmax_scale=0.1,
+        initial_tokens=INITIAL_TOKENS,
+        local_tokens=LOCAL_TOKENS,
+        solution="deep_gemm",
+    )
+
+    def by_position(logical, values):
+        order = logical.argsort(dim=1)
+        return logical.gather(1, order), values.gather(1, order)
+
+    args = (weights.to(torch.bfloat16), cache, table, requests, causal)
+    logical, values = by_position(
+        *dsa_index_candidates(strided.contiguous(), *args, **kwargs)
+    )
+    assert (logical >= 0).any() and (logical < 0).any()
+    from_columns = by_position(*dsa_index_candidates(strided, *args, **kwargs))
+    assert torch.equal(from_columns[0], logical)
+    assert torch.equal(from_columns[1].view(torch.int32), values.view(torch.int32))
+    buffer = torch.full((rows, topk + 2), 11.0, device="cuda")
+    positions, sent = dsa_index_candidates(
+        strided, *args, scores_out=buffer[:, 1:-1], **kwargs
+    )
+    assert sent.data_ptr() == buffer[:, 1:-1].data_ptr()
+    assert positions.is_contiguous()
+    # The leaf filled the buffer itself, so the facade masked nothing.
+    assert filled == [False, False, True]
+    positions, sent = by_position(positions, sent)
+    assert torch.equal(positions, logical)
+    masked = torch.where(logical >= 0, values, -float("inf"))
+    assert torch.equal(sent.view(torch.int32), masked.view(torch.int32))
+    assert (buffer[:, [0, -1]] == 11.0).all()
 
 
 def _record_ragged_calls(monkeypatch):
@@ -985,16 +1065,16 @@ def test_bounded_compact_compiles_once_across_widths():
 
 def _owned_width_index_plane(pages, generator):
     """FP8 index keys for every local page, in the block-split plane."""
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
 
     slots = pages * PAGE_SIZE
     keys = torch.randn((slots, 128), generator=generator).to(
         device="cuda", dtype=torch.bfloat16
     )
-    values, scales = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    values, scales = quantize_index_k_rows(keys, group_size=128)
     plane = torch.zeros((slots, 132), dtype=torch.uint8, device="cuda")
     index_k_block_split_scatter(
         plane,

@@ -188,6 +188,8 @@ def run(degree):
             extend_seq_lens=torch.tensor(extend, dtype=torch.int32).npu(),
             extend_seq_lens_cpu=torch.tensor(extend, dtype=torch.int32),
             page_table=table.npu(),
+            extend_with_prefix=bool(max(prefix)),
+            page_table_cpu=table,
         )
         output = torch.empty(rows, H * 128, dtype=torch.bfloat16, device="npu")
         if max(prefix):

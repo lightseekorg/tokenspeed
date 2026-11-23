@@ -187,6 +187,7 @@ def _attn_config(layer_types, window) -> AttnConfig:
         kernel_page_size=64,
         context_len=262144,
         max_bs=64,
+        max_resident_requests=64,
     )
 
 
@@ -481,6 +482,17 @@ def _setup(environ, caplog, path, caller, **overrides):
     return args, warnings
 
 
+@pytest.mark.parametrize("connections", [None, "1", "4", "8", "32"])
+def test_launcher_preserves_cuda_max_connections(
+    checkpoints, environ, caplog, connections
+):
+    key = "CUDA_DEVICE_MAX_CONNECTIONS"
+    environ.pop(key, None)
+    caller = {} if connections is None else {key: connections}
+    _setup(environ, caplog, checkpoints["other"], caller)
+    assert environ[key] == ("4" if connections is None else connections)
+
+
 @pytest.mark.parametrize(
     "caller",
     [{}, dict.fromkeys(TF32_KEYS, "1"), dict.fromkeys(TF32_KEYS, "0")],
@@ -670,6 +682,7 @@ def _drafter_config(max_position_embeddings):
         use_sliding_window=True,
         sliding_window=4096,
         layer_types=["sliding_attention"],
+        decode_monokernel=False,
         dflash_config={
             "block_size": 16,
             "conv_group_size": 16,

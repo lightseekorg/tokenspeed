@@ -33,6 +33,8 @@ struct AcquirePlan {
     // Dense append when < 0. Otherwise the logical slot the sparse suffix
     // starts at; slots below it stay null holes.
     std::int32_t suffix_start{-1};
+    // Sparse only: fresh leading slots appended immediately after the existing table.
+    std::int32_t head_blocks{0};
     // Sparse only: the table's logical block count after placement.
     std::int32_t table_blocks_after{0};
     // Unconsumed tail capacity after placement, in tokens. The allocator

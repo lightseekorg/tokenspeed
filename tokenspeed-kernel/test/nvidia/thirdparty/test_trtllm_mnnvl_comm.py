@@ -917,6 +917,7 @@ def test_lamport_all_gather_refuses_by_shape_and_copies_odd_layouts():
     rank-local refusal would strand the peers in the exchange."""
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         MNNVL_ALLGATHER_MAX_BYTES,
+        mnnvl_allgather_serves,
         trtllm_mnnvl_allgather,
     )
 
@@ -928,6 +929,7 @@ def test_lamport_all_gather_refuses_by_shape_and_copies_odd_layouts():
     misaligned = flat[1 : 1 + 4 * 640].view(4, 640)
     assert misaligned.data_ptr() % 16 != 0
     for rows in (strided, misaligned):
+        assert mnnvl_allgather_serves(rows, mnnvl)
         keep = rows.clone()
         want = torch.empty(world, 4, 640, dtype=torch.bfloat16, device=dev)
         dist.all_gather_into_tensor(want, rows.contiguous())
@@ -945,6 +947,7 @@ def test_lamport_all_gather_refuses_by_shape_and_copies_odd_layouts():
         ((0, 640), torch.bfloat16),
     ):
         refused = torch.zeros(shape, dtype=dtype, device=dev)
+        assert not mnnvl_allgather_serves(refused, mnnvl)
         assert trtllm_mnnvl_allgather(refused, mnnvl, launch_with_pdl=True) is None
     dist.barrier()
 

@@ -1,6 +1,34 @@
 name: Release TokenSpeed Engine
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      release_type:
+        required: true
+        type: string
+      version_date:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      release_candidate:
+        required: false
+        type: string
+      replace_nightly:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      LIGHTSEEK_BOT_TOKEN:
+        required: true
+    outputs:
+      version:
+        description: The version built and tested by this run
+        value: ${{ jobs.metadata.outputs.version }}
   workflow_dispatch:
     inputs:
       mode:
@@ -38,7 +66,7 @@ concurrency:
 
 jobs:
   metadata:
-    if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main')
+    if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot')))
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -47,7 +75,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -56,17 +85,29 @@ jobs:
         id: version
         env:
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION_DATE: ${{ inputs.version_date }}
           PUBLISH_POST_TO_PYPI: ${{ inputs.publish_post_to_pypi }}
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
+          if [ "$REPLACE_NIGHTLY" = true ] && [ "$RELEASE_TYPE" != nightly ]; then
+            echo "Replacement is only supported for coordinated nightly releases." >&2
+            exit 1
+          fi
           if [ "$PUBLISH_POST_TO_PYPI" = true ] && [ "$RELEASE_TYPE" != post ]; then
             echo "publish_post_to_pypi is only valid for post releases." >&2
             exit 1
           fi
           if [ "$RELEASE_TYPE" != release ]; then
             VERSION_DATE=${VERSION_DATE:-$(date -u +%Y%m%d)}
+          fi
+          if [[ "$GITHUB_REF" == refs/heads/release/engine-* ]]; then
+            version=$(python .github/scripts/prepare-engine-release.py . --target version --kind release --date '')
+            test "$GITHUB_REF_NAME" = "release/engine-$version"
+            git fetch origin main
+            git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD
           fi
           version_args=()
           if [ "$RELEASE_TYPE" = post ]; then
@@ -75,7 +116,7 @@ jobs:
             version_args+=(--release-tags release-tags.txt)
           fi
           version=$(python .github/scripts/prepare-engine-release.py . \
-            --target version --kind "$RELEASE_TYPE" --date "$VERSION_DATE" "${version_args[@]}")
+            --target version --kind "$RELEASE_TYPE" --date "$VERSION_DATE" --release-candidate "$RELEASE_CANDIDATE" "${version_args[@]}")
           if [ "$RELEASE_TYPE" = post ]; then
             VERSION_DATE=${version##*.post}
           fi
@@ -101,7 +142,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12"]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
@@ -112,7 +153,7 @@ jobs:
       - name: Checkout release commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v5
@@ -122,11 +163,12 @@ jobs:
       - name: Apply wheel version to the build checkout
         env:
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION_DATE: ${{ needs.metadata.outputs.date }}
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           version=$(python .github/scripts/prepare-engine-release.py . \
-            --target engine --kind "$RELEASE_TYPE" --date "$VERSION_DATE")
+            --target engine --kind "$RELEASE_TYPE" --date "$VERSION_DATE" --release-candidate "$RELEASE_CANDIDATE")
           test "$version" = "$EXPECTED_VERSION"
 
       - name: Build and repair wheel
@@ -146,12 +188,19 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python }}
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          docker run --rm \
-            -v "$PWD/dist:/wheels:ro" \
-            -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
-            -e EXPECTED_VERSION \
-            "python:${PYTHON_VERSION}-slim" \
-            sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install --no-index /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py "$EXPECTED_VERSION"'
+          versions="$PYTHON_VERSION"
+          if [ "$PYTHON_VERSION" = 3.12 ]; then
+            versions="3.12 3.13 3.14 3.15"
+          fi
+          for runtime in $versions; do
+            docker run --rm \
+              -v "$PWD/dist:/wheels:ro" \
+              -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
+              -v "$PWD/tokenspeed-scheduler/python:/scheduler:ro" \
+              -e EXPECTED_VERSION \
+              "python:${runtime}-slim" \
+              sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py "$EXPECTED_VERSION" /scheduler'
+          done
 
       - name: Upload tested wheel
         uses: actions/upload-artifact@v4
@@ -162,14 +211,17 @@ jobs:
 
   publish-whl:
     needs: [metadata, build]
-    if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: wheelhouse-publication
+      cancel-in-progress: false
     steps:
       - name: Checkout release scripts
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v5
@@ -187,9 +239,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION: ${{ needs.metadata.outputs.version }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           gh auth status
           test "$(gh api user --jq .login)" = lightseek-bot
@@ -202,9 +256,13 @@ jobs:
           cat release-notes.txt
           if gh release view "$TAG_NAME" --repo lightseekorg/whl >/dev/null 2>&1; then
             existing_notes=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json body --jq .body)
-            if [ "$existing_notes" != "$notes" ]; then
+            if [ "$REPLACE_NIGHTLY" != true ] && [ "$existing_notes" != "$notes" ]; then
               echo "This version belongs to a different source commit; start a new post run or choose a new version." >&2
               exit 1
+            fi
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              gh release upload "$TAG_NAME" dist/*.whl --repo lightseekorg/whl --clobber
+              gh release edit "$TAG_NAME" --repo lightseekorg/whl --notes-file release-notes.txt
             fi
             existing_assets=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json assets --jq '.assets[].name')
             for asset in dist/*.whl; do
@@ -214,7 +272,7 @@ jobs:
             done
           else
             flags=()
-            if [ "$RELEASE_TYPE" = rc ]; then
+            if [ "$RELEASE_TYPE" = rc ] || [ "$RELEASE_TYPE" = nightly ]; then
               flags+=(--prerelease --latest=false)
             fi
             gh release create "$TAG_NAME" dist/*.whl --repo lightseekorg/whl \
@@ -235,13 +293,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           variant=engine-nightly
+          replace_args=()
+          if [ "${{ inputs.replace_nightly }}" = true ]; then
+            replace_args+=(--replace)
+          fi
           if [ "$RELEASE_TYPE" = release ]; then
             variant=engine-release
           fi
-          python .github/scripts/update-nightly-index.py \
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed-engine --variant "$variant" \
             wheelhouse engine-release.json dist > engine-index-paths.txt
           mapfile -t index_paths < engine-index-paths.txt
@@ -282,7 +345,7 @@ jobs:
 
   publish:
     needs: publish-whl
-    if: inputs.mode == 'publish' && (inputs.release_type == 'release' || (inputs.release_type == 'post' && inputs.publish_post_to_pypi)) && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: inputs.source_sha == '' && inputs.mode == 'publish' && (inputs.release_type == 'release' || (inputs.release_type == 'post' && inputs.publish_post_to_pypi)) && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi

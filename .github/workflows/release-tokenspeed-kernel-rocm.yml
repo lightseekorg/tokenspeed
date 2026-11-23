@@ -1,15 +1,8 @@
 name: Build and Release tokenspeed-kernel for ROCm
 
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      nightly:
-        description: "Build ROCm 7.2 wheels with a .postYYYYMMDD version; enable publish_github on main to publish."
-        required: false
-        default: false
-        type: boolean
       tag_name:
         description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>."
         required: false
@@ -28,12 +21,36 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      nightly:
+        type: boolean
+        required: true
+      replace_nightly:
+        type: boolean
+        required: true
+      publish_github:
+        type: boolean
+        required: true
+      version_date:
+        type: string
+        required: true
+      tag_name:
+        type: string
+        required: false
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      LIGHTSEEK_BOT_TOKEN:
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: release-tokenspeed-kernel-rocm-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -64,13 +81,22 @@ jobs:
       - name: Resolve release metadata
         id: metadata
         env:
-          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
-          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          NIGHTLY: ${{ inputs.nightly }}
+          PUBLISH_GITHUB: ${{ inputs.publish_github }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           VERSION_DATE: ${{ inputs.version_date }}
           REQUESTED_TAG: ${{ inputs.tag_name }}
         run: |
           if [ "$NIGHTLY" = "true" ] && [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "Nightly publication requires main." >&2
+            exit 1
+          fi
+          if [ "$REPLACE_NIGHTLY" = true ] && { [ "$PUBLISH_GITHUB" != true ] || [ "$GITHUB_REF" != refs/heads/main ]; }; then
+            echo "Replacement requires nightly publication from main." >&2
+            exit 1
+          fi
+          if [ "$REPLACE_NIGHTLY" = true ] && [ "$NIGHTLY" != true ]; then
+            echo "Replacement requires nightly mode." >&2
             exit 1
           fi
           version_date="$VERSION_DATE"
@@ -294,7 +320,7 @@ jobs:
 
   release:
     name: Create ROCm 7.2 wheelhouse release
-    if: github.event_name == 'schedule' || inputs.publish_github
+    if: inputs.publish_github && github.repository == 'lightseekorg/tokenspeed' && (!inputs.nightly || github.ref == 'refs/heads/main')
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false
@@ -320,6 +346,7 @@ jobs:
           NIGHTLY: ${{ needs.metadata.outputs.nightly }}
           PRERELEASE: ${{ inputs.prerelease }}
           SOURCE_SHA: ${{ github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           release_tag="${TAG_NAME}-${ROCM_VARIANT}"
           test "$(gh api user --jq .login)" = lightseek-bot
@@ -345,21 +372,27 @@ jobs:
           fi
 
           if gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$NIGHTLY" = true ]; then
+              replace_args=()
+              if [ "$REPLACE_NIGHTLY" = true ]; then
+                replace_args+=(--replace)
+              fi
+              python .github/scripts/nightly-release.py --source-sha "$SOURCE_SHA" "${replace_args[@]}" check "$release_tag"
+            fi
             if [ "${#prerelease_args[@]}" -gt 0 ]; then
               gh release edit "$release_tag" \
                 --repo "$RELEASE_REPOSITORY" \
                 --prerelease
             fi
-            if [ "$NIGHTLY" = "true" ]; then
-              # Never replace an indexed wheel: its published SHA256 must stay valid.
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              gh release upload "$release_tag" "${assets[@]}" --repo "$RELEASE_REPOSITORY" --clobber
+              gh release edit "$release_tag" --repo "$RELEASE_REPOSITORY" \
+                --notes "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA"
+            elif [ "$NIGHTLY" = "true" ]; then
+              # A normal rerun preserves the published wheel bytes.
               existing_assets=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json assets --jq '.assets[].name')
               for asset in "${assets[@]}"; do
                 if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
-                  release_notes=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json body --jq .body)
-                  if [ "$release_notes" != "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA" ]; then
-                    echo "Cannot complete a nightly release from a different source commit." >&2
-                    exit 1
-                  fi
                   gh release upload "$release_tag" "$asset" --repo "$RELEASE_REPOSITORY"
                 fi
               done
@@ -390,11 +423,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
           test "$(gh repo view lightseekorg/whl --json visibility --jq .visibility)" = PUBLIC
           gh api "repos/lightseekorg/whl/releases/tags/${TAG_NAME}-rocm72" > nightly-release.json
-          python .github/scripts/update-nightly-index.py \
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = true ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed-kernel --variant rocm72 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot

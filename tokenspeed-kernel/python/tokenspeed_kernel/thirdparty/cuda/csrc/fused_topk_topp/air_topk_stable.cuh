@@ -490,6 +490,9 @@ __global__ void last_filter_kernel(const T* in,
                                    IdxT k,
                                    Counter<T, IdxT>* counters,
                                    const bool select_min) {
+    // No-op unless launched with PDL; then the counters and survivor buffers
+    // of the preceding pass must be visible first.
+    cudaGridDependencySynchronize();
     const size_t batch_id = blockIdx.y;
 
     Counter<T, IdxT>* counter = counters + batch_id;
@@ -587,6 +590,11 @@ __global__ void radix_kernel(const T* in,
                              const IdxT k,
                              const bool select_min,
                              const int pass) {
+    // No-op unless launched with PDL; then the input and the preceding
+    // kernel's counters, histogram and survivor buffers must be visible first.
+    // Every pass must see the same input, or the bucket counts no longer bound
+    // the survivor buffers and the K-element output.
+    cudaGridDependencySynchronize();
     const size_t batch_id = blockIdx.y;
     auto counter = counters + batch_id;
     if (counter->skip) {
@@ -648,6 +656,9 @@ __global__ void radix_kernel(const T* in,
                                                pass,
                                                early_stop);
     __threadfence();
+    // Wait for every writer's fence before thread 0 publishes block completion.
+    // A threadfence alone does not wait for the other warps' histogram updates.
+    __syncthreads();
 
     bool isLastBlock = false;
     if (threadIdx.x == 0) {

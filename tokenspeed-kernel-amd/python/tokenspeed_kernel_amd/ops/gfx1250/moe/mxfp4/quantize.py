@@ -56,7 +56,9 @@ def _mxfp4_quantize_blocks(x):
     amax = amax.to(tl.float32, bitcast=True)
     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+    # Add the bias before narrowing: the unbiased exponent is negative for
+    # small blocks, and converting a negative float to uint8 is undefined.
+    scale_byte = (scale_e8m0_unbiased + 127).to(tl.uint8)
     qx = x * tl.expand_dims(tl.exp2(-scale_e8m0_unbiased), 2)
     qx = qx.to(tl.uint32, bitcast=True)
 
@@ -231,7 +233,9 @@ def store_mxfp4_tile_gfx1250(
     amax = amax.to(gl.float32, bitcast=True)
     scale_e8m0_unbiased = gl.floor(gl.log2(amax)) - 2
     scale_e8m0_unbiased = gl.clamp(scale_e8m0_unbiased, -127, 127)
-    scale_byte = scale_e8m0_unbiased.to(gl.uint8) + 127
+    # Add the bias before narrowing: the unbiased exponent is negative for
+    # small blocks, and converting a negative float to uint8 is undefined.
+    scale_byte = (scale_e8m0_unbiased + 127).to(gl.uint8)
     qx = x * gl.expand_dims(gl.exp2(-scale_e8m0_unbiased), 2)
     qx = qx.to(gl.uint32, bitcast=True)
 
@@ -336,6 +340,37 @@ def quantize_mxfp4_rows_tile_gfx1250(
         col_start,
         K,
         NUM_WARPS,
+    )
+
+
+@gluon.jit
+def quantize_fp8_rows_tile_gfx1250(
+    x_ptr,
+    stride_x,
+    q_ptr,
+    stride_q,
+    inv_scale,
+    M,
+    tile,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Cast tile ``tile`` of ``[M, K]`` rows to FP8 E4M3 after scaling by
+    ``inv_scale``, ``BLOCK_M x BLOCK_K`` each."""
+    COL_TILES: gl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
+    row_start = (tile // COL_TILES) * BLOCK_M
+    col_start = (tile % COL_TILES) * BLOCK_K
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [NUM_WARPS, 1], [1, 0])
+    rows = row_start + gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    cols = col_start + gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
+    mask = (rows < M)[:, None] & (cols < K)[None, :]
+    x = gl.load(x_ptr + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0)
+    gl.store(
+        q_ptr + rows[:, None] * stride_q + cols[None, :],
+        (x.to(gl.float32) * inv_scale).to(gl.float8e4nv),
+        mask=mask,
     )
 
 

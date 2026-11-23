@@ -21,7 +21,8 @@
 """Real CUDA sampling acceptance tests; missing CUDA/dependencies fail.
 
 Constructed logits isolate sampling from model numerics. No numerical kernel
-or communication is mocked. Run these explicitly on a CUDA host.
+or communication is mocked. Multi-token FlashInfer verification requires NVIDIA
+CUDA.
 """
 
 import sys
@@ -42,10 +43,16 @@ from tokenspeed.runtime.sampling.sampling_batch_info import (
 
 VOCAB = 512
 POOL = 8
+CHAIN_WIDTH = 4
+
+requires_flashinfer_chain = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FlashInfer chain verification requires an NVIDIA CUDA GPU",
+)
 
 
 @pytest.fixture(params=["flashinfer", "flashinfer_full"])
-def backend(request):
+def make_backend(request):
     assert torch.cuda.is_available(), "This acceptance suite requires a real CUDA GPU"
     from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
     from tokenspeed.runtime.sampling.backends.flashinfer import (
@@ -63,26 +70,35 @@ def backend(request):
         if request.param == "flashinfer"
         else FlashInferFullSamplingBackend
     )
-    try:
-        yield cls(
+
+    def create(*, width, recorded_proposals):
+        return cls(
             SamplingBackendConfig(
                 synthetic_acceptance_length=None,
-                enable_speculative_sampling=False,
+                enable_speculative_sampling=recorded_proposals,
                 sampling_stream="per-request",
                 logprob_order="torch",
                 enable_output_logprobs=True,
                 max_bs=4,
-                max_draft_tokens_per_req=1,
+                max_draft_tokens_per_req=width,
                 max_req_pool_size=POOL,
                 vocab_size=VOCAB,
                 device="cuda",
             )
         )
+
+    try:
+        yield create
     finally:
         if previous is None:
             global_server_args_dict.pop("numerics", None)
         else:
             global_server_args_dict["numerics"] = previous
+
+
+@pytest.fixture
+def backend(make_backend):
+    return make_backend(width=1, recorded_proposals=False)
 
 
 def prepare(backend, slots, *, seed, top_k):
@@ -95,7 +111,12 @@ def prepare(backend, slots, *, seed, top_k):
         sp.resolve_seed(rid)
         sp.normalize(None)
         params.append(sp)
-    backend.prepare_step(rids, slots, params, num_tokens_per_req=1)
+    backend.prepare_step(
+        [(seed * (VOCAB + 2) + top_k + 1) * POOL + slot + 1 for slot in slots],
+        slots,
+        params,
+        num_tokens_per_req=1,
+    )
 
 
 def draw(backend, logits, info, *, decode):
@@ -270,7 +291,7 @@ def test_single_verify_publishes_one_token_and_updates_counts_once(backend):
         sp.resolve_seed(rid)
         sp.normalize(None)
         params.append(sp)
-    backend.prepare_step(["pack-a", "pack-b"], [1, 3], params, num_tokens_per_req=1)
+    backend.prepare_step([26, 27], [1, 3], params, num_tokens_per_req=1)
     info = SamplingBatchInfo(
         req_pool_indices=slots,
         valid_cache_lengths=torch.full(
@@ -366,3 +387,193 @@ def test_prefill_graph_reads_current_frontier_and_lengths(backend):
         graph.replay()
         assert_exact(actual, expected)
         assert frontier[3].item() == prefix
+
+
+def _chain_inputs(recorded_proposals):
+    logits = torch.full((CHAIN_WIDTH, VOCAB), -torch.inf, device="cuda")
+    logits[:, 1:4] = torch.tensor([0.25, 0.50, 0.25], device="cuda").log()
+    # Column zero is the previous verified token; the first proposal has
+    # p=0.25 and, for recorded proposals, q=0.50.
+    candidates = torch.tensor([[4, 1, 1, 1]], device="cuda", dtype=torch.int32)
+    recorded = None
+    if recorded_proposals:
+        recorded = torch.zeros(POOL + 1, CHAIN_WIDTH, VOCAB, device="cuda")
+        recorded[:, :-1, 1:4] = torch.tensor([0.50, 0.375, 0.125], device="cuda")
+    return logits, candidates, recorded
+
+
+def _chain_params(seed):
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    params = SamplingParams(temperature=1.0, top_k=-1, top_p=1.0, seed=seed)
+    params.resolve_seed(f"chain-{seed}")
+    params.normalize(None)
+    return params
+
+
+def _verify_chain(backend, logits, info, candidates):
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+
+    output = LogitsProcessorOutput(next_token_logits=logits)
+    tokens, lengths = backend.verify(output, info, candidates, tree=None)
+    bs, width = candidates.shape
+    return (
+        tokens.view(bs, width).clone(),
+        lengths.clone(),
+        output.next_token_logprobs.view(bs, width).clone(),
+        backend.accepted_path(bs, width).clone(),
+    )
+
+
+def _emitted_chain_row(result, row):
+    tokens, lengths, logprobs, paths = result
+    length = lengths[row : row + 1]
+    kept = slice(None, length.item())
+    return (
+        tokens[row, kept],
+        length,
+        logprobs[row, kept],
+        paths[row, kept] - row * tokens.shape[1],
+    )
+
+
+@requires_flashinfer_chain
+@pytest.mark.parametrize("recorded_proposals", [False, True], ids=["target_only", "q"])
+def test_chain_verify_ignores_extra_prefill_prepare(make_backend, recorded_proposals):
+    backend = make_backend(width=CHAIN_WIDTH, recorded_proposals=recorded_proposals)
+    logits, candidates, recorded = _chain_inputs(recorded_proposals)
+    params = _chain_params(seed=45)
+    # Non-emitting prefill still passes the deployment's chain width to
+    # prepare_step. With generator refills, seed 45 moves the first accept
+    # coin across both the target-only and recorded-q thresholds.
+    backend.prepare_step([1], [1], [params], num_tokens_per_req=CHAIN_WIDTH)
+    backend.prepare_step(
+        [3, 1, 2],
+        [3, 1, 2],
+        [_chain_params(seed=46), params, params],
+        num_tokens_per_req=CHAIN_WIDTH,
+    )
+    mixed_info = SamplingBatchInfo(
+        req_pool_indices=torch.tensor([3, 1, 2], device="cuda"),
+        valid_cache_lengths=torch.full(
+            (POOL + 1,), 2048, dtype=torch.int32, device="cuda"
+        ),
+        extend_lengths=torch.tensor([37], device="cuda", dtype=torch.int32),
+        draft_probs=recorded,
+    )
+    actual = _verify_chain(
+        backend, logits.repeat(2, 1), mixed_info[1:], candidates.repeat(2, 1)
+    )
+    assert_exact(_emitted_chain_row(actual, 0), _emitted_chain_row(actual, 1))
+
+
+@requires_flashinfer_chain
+def test_chain_verify_resumes_from_sampler_snapshot(make_backend):
+    backend = make_backend(width=CHAIN_WIDTH, recorded_proposals=True)
+    logits, candidates, recorded = _chain_inputs(recorded_proposals=True)
+    params = _chain_params(seed=45)
+    backend.prepare_step(
+        [1, 2], [1, 2], [params, _chain_params(seed=79)], num_tokens_per_req=CHAIN_WIDTH
+    )
+    image = torch.empty(backend.slot_state_bytes(), dtype=torch.uint8, pin_memory=True)
+    stream = torch.cuda.current_stream()
+    backend.export_slot_state(1, image, stream, admission_id=1)
+    stream.synchronize()
+    backend.import_slot_state(2, image, stream, admission_id=1)
+    backend.prepare_step([1], [2], [params], num_tokens_per_req=CHAIN_WIDTH)
+
+    # RuntimeStates supplies the restored frontier and recorded proposals.
+    frontier = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    info = SamplingBatchInfo(
+        req_pool_indices=torch.tensor([1, 2], device="cuda"),
+        valid_cache_lengths=frontier,
+        draft_probs=recorded,
+    )
+    logits = logits.repeat(2, 1)
+    candidates = candidates.repeat(2, 1)
+    for position in range(2048, 2064):
+        frontier[1:3].fill_(position)
+        actual = _verify_chain(backend, logits, info, candidates)
+        assert_exact(_emitted_chain_row(actual, 0), _emitted_chain_row(actual, 1))
+
+
+@requires_flashinfer_chain
+@pytest.mark.parametrize("recorded_proposals", [False, True], ids=["target_only", "q"])
+def test_chain_verify_replay_reads_current_seed_and_position(
+    make_backend, recorded_proposals
+):
+    backend = make_backend(width=CHAIN_WIDTH, recorded_proposals=recorded_proposals)
+    logits, candidates, recorded = _chain_inputs(recorded_proposals)
+    frontier = torch.arange(POOL + 1, dtype=torch.int32, device="cuda")
+    solo = SamplingBatchInfo(
+        req_pool_indices=torch.tensor([7], device="cuda"),
+        valid_cache_lengths=frontier,
+        draft_probs=recorded,
+    )
+    slots = torch.tensor([3, 4, 0, 0], device="cuda")
+    packed = SamplingBatchInfo(
+        req_pool_indices=slots, valid_cache_lengths=frontier, draft_probs=recorded
+    )
+    packed_logits = logits.repeat(4, 1).view(4, CHAIN_WIDTH, VOCAB)
+    packed_candidates = candidates.repeat(4, 1)
+    other_logits = logits.roll(1, dims=-1)
+    other_q = torch.tensor([0.875, 0.0625, 0.0625], device="cuda")
+    other_params = _chain_params(seed=79)
+    backend.prepare_step(
+        [3, 4], [3, 4], [other_params, other_params], num_tokens_per_req=CHAIN_WIDTH
+    )
+
+    def forward():
+        return _verify_chain(
+            backend, packed_logits.flatten(0, 1), packed, packed_candidates
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            forward()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward()
+
+    seed_results = []
+    for seed in (45, 46):
+        params = _chain_params(seed)
+        results = []
+        for step, position in enumerate(range(2049, 2081)):
+            backend.prepare_step([seed], [7], [params], num_tokens_per_req=CHAIN_WIDTH)
+            frontier[7] = position - 1
+            expected = _emitted_chain_row(
+                _verify_chain(backend, logits, solo, candidates), 0
+            )
+            row = step % 2
+            probe_slot = 3 + row
+            order = [3, 4] if step % 4 < 2 else [4, 3]
+            probe_row = order.index(probe_slot)
+            other_slot = order[1 - probe_row]
+            packed_logits[probe_row].copy_(logits)
+            packed_logits[1 - probe_row].copy_(other_logits)
+            slots[:2].copy_(torch.tensor(order, device="cuda"))
+            frontier[probe_slot] = position - 1
+            frontier[other_slot] = position + 123
+            if recorded is not None:
+                recorded[probe_slot].copy_(recorded[7])
+                recorded[other_slot, :-1, 1:4] = other_q
+            packed_params = [other_params, other_params]
+            packed_params[probe_row] = params
+            admission_ids = order.copy()
+            admission_ids[probe_row] = seed
+            backend.prepare_step(
+                admission_ids, order, packed_params, num_tokens_per_req=CHAIN_WIDTH
+            )
+            graph.replay()
+            assert_exact(_emitted_chain_row(captured, probe_row), expected)
+            results.append(tuple(expected[0].tolist()))
+        assert len(set(results)) > 1, "Changing positions must change sampled results"
+        assert any(len(tokens) > 1 for tokens in results), "Must accept a proposal"
+        seed_results.append(results)
+    assert (
+        seed_results[0] != seed_results[1]
+    ), "Changing seeds must change sampled results"

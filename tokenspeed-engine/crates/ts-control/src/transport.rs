@@ -393,6 +393,8 @@ pub fn output_batch(
         kv_active_pages: load.kv_active_pages,
         kv_total_pages: load.kv_total_pages,
         kv_used_pages: load.kv_used_pages,
+        num_resident_tokens: Some(load.num_resident_tokens),
+        num_waiting_uncached_tokens: Some(load.num_waiting_uncached_tokens),
         finish_reason_details: Vec::with_capacity(n),
         spec_verify_ct: Vec::new(),
         accept_draft_tokens: Vec::new(),
@@ -502,6 +504,9 @@ impl Frontend for EngineTransport {
     fn reply(&mut self, mut output: ControlOutput) {
         if let ControlOutput::GetAdmission(snapshot) = &mut output {
             snapshot.dp_rank = i64::from(self.engine_index);
+        }
+        if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
+            publication.dp_rank = i64::from(self.engine_index);
         }
         let asker = self
             .askers
@@ -821,6 +826,8 @@ mod tests {
             kv_active_pages: 5,
             kv_total_pages: 64,
             kv_used_pages: 9,
+            num_resident_tokens: 5_000_000_000,
+            num_waiting_uncached_tokens: 3_000_000_000,
         };
         transport.send(vec![output.clone()], load);
         let [EngineOutput::Batch(batch)] = <[_; 1]>::try_from(sent(&mut outputs)).unwrap() else {
@@ -828,6 +835,8 @@ mod tests {
         };
         assert_eq!(*batch, output_batch(vec![output], 2, load));
         assert_eq!(batch.reasoning_tokens, [1]);
+        assert_eq!(batch.num_resident_tokens, Some(5_000_000_000));
+        assert_eq!(batch.num_waiting_uncached_tokens, Some(3_000_000_000));
         assert_eq!(
             (batch.engine_index, batch.num_waiting, batch.kv_used_pages),
             (2, 3, 9)

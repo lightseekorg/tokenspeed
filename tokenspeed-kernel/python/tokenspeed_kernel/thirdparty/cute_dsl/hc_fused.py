@@ -3928,7 +3928,10 @@ class FusedGatedResidualKernel:
                                 reduce_ready,
                                 owner,
                             )
-                        cute.arch.mbarrier_wait(reduce_ready, projection_phase)
+                        # The peers' st.async packets complete reduce_ready at
+                        # cluster scope; acquire at cluster scope before summing
+                        # the mailbox.
+                        _cluster_wait(reduce_ready, projection_phase)
                         for part in cutlass.range_constexpr(
                             (self.down_n * self.owner_cols + self.epilogue_threads - 1)
                             // self.epilogue_threads

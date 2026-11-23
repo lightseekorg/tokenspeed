@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel.ops.moe._triton.routed_norm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.moe import _bf16_routes_moe_apply, _bf16_routes_moe_warmup
 from tokenspeed_kernel.ops.moe._triton.bf16 import (
     _check_route_tensors as _check_bf16_route_tensors,
 )
@@ -635,6 +636,53 @@ def triton_bf16_precomputed_moe_apply(
     )
 
 
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_bf16_routes_moe_apply",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"unquant"}),
+        "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_finalize": frozenset({False}),
+        "supports_deferred_finalize": frozenset({True}),
+        "deferred_output_is_token_order": frozenset({True}),
+        "supports_deferred_out": frozenset({True}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_bf16_routes_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor | None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+    deferred_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, None, None]:
+    """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
+
+    Selected only by layers that defer the finalize; see
+    ``_bf16_routes_moe_apply`` for the arguments and the returned routes.
+    """
+    del plan, router_logits, topk_weights, num_tokens_global
+    del max_num_tokens_per_gpu, enable_pdl
+    return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
+
+
+triton_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
+
+
 # ===-----------------------------------------------------------------------===#
 # FP8 block-scaled experts (NVIDIA SM89+, AMD gfx950+)
 # ===-----------------------------------------------------------------------===#
@@ -979,6 +1027,10 @@ register_kernel(
     "latent_input",
     name="triton_latent_input_packed",
     solution="triton",
+    # AMD only: on NVIDIA the separate vendor GEMM projections are faster than
+    # this generic packed kernel, so no fused kernel is registered there below
+    # the specialized front's row bound and callers keep the separate path.
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=frozenset(
         {
             format_signature(

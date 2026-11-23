@@ -69,6 +69,7 @@ def _blockscaled_signature_and_scales(
     """Pick dense vs MXFP8 signature and build the scale kwargs splat.
 
     q_scale selects the block-scaled path; k_scale/v_scale must accompany it.
+    k_scale/v_scale alone describe an MXFP8 K/V cache read with a dense query.
     Returns (signature, scale_kwargs) for the paged-KV-cache entry points.
     """
     if q_scale is not None:
@@ -78,12 +79,33 @@ def _blockscaled_signature_and_scales(
         signature = _mxfp8_attention_format_signature(
             q=q, k_cache=k_cache, v_cache=v_cache
         )
+    elif k_scale is not None or v_scale is not None:
+        assert (
+            k_scale is not None and v_scale is not None
+        ), "an MXFP8 K/V cache requires k_scale and v_scale together"
+        signature = format_signature(
+            q=dense_tensor_format(q.dtype),
+            **{
+                role: tensor_format(
+                    "mxfp8", cache.dtype, scale=MXFP8_ATTENTION_BLOCK_SCALE
+                )
+                for role, cache in (("k_cache", k_cache), ("v_cache", v_cache))
+            },
+        )
     else:
         signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     return signature, dict(q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
 
 
 LSE_LN = math.log2(math.e)
+
+
+def _fp32_output_trait(output_dtype: torch.dtype | None) -> bool:
+    if output_dtype not in (None, torch.float32):
+        raise ValueError(
+            "Relative attention output_dtype must be None or torch.float32"
+        )
+    return output_dtype == torch.float32
 
 
 # rel_mha: relative-distance-bias MHA; own family keeps model-specific args out of plain mha.
@@ -95,11 +117,15 @@ def rel_mha_plan(
     window_left: int = -1,
     return_lse: bool = False,
     solution: str | None = None,
+    *,
+    output_dtype: torch.dtype | None,
 ) -> dict:
     """Build a relative-attention MHA execution plan.
 
     Args:
         dtype: Query/K/V dtype for prefill planning.
+        output_dtype: None preserves the selected kernel's output dtype.
+            torch.float32 requires an FP32 result before any output rounding.
         head_dim: Attention head dimension.
         window_left: Exclusive left sliding-window size, or -1 for full-context
             attention.
@@ -110,10 +136,12 @@ def rel_mha_plan(
         Same "extend_mode" dict as mha_plan, planned over the rel_mha_prefill
         operator.
     """
+    fp32_output = _fp32_output_trait(output_dtype)
     if dtype == torch.float8_e4m3fn:
         return {"extend_mode": "prewrite"}
 
     traits = {
+        "fp32_output": fp32_output,
         "head_dim": head_dim,
         "return_lse": return_lse,
         "sliding_window": window_left >= 0,
@@ -156,6 +184,8 @@ def rel_mha_prefill(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    output_dtype: torch.dtype | None,
 ) -> AttentionResult:
     """Relative-attention MHA prefill from uncached KV.
 
@@ -176,6 +206,8 @@ def rel_mha_prefill(
         window_left: Exclusive left sliding-window size. -1 means full attention.
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads].
+        output_dtype: None preserves legacy output precision. torch.float32
+            stores the FP32 accumulation result without a BF16 rounding step.
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
         tau: Optional fp32 per-query-row multiplier on the total pre-softmax
@@ -189,6 +221,7 @@ def rel_mha_prefill(
     batch_size = cu_seqlens.shape[0] - 1
 
     traits = {
+        "fp32_output": _fp32_output_trait(output_dtype),
         "head_dim": q.shape[-1],
         "return_lse": return_lse,
         "sliding_window": window_left >= 0,
@@ -221,6 +254,7 @@ def rel_mha_prefill(
         shape_params,
     )
 
+    precision_kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
     with kernel_scope(
         "attention",
         "rel_mha_prefill",
@@ -241,6 +275,7 @@ def rel_mha_prefill(
             softmax_scale=softmax_scale,
             tau=tau,
             enable_pdl=pdl_enabled(),
+            **precision_kwargs,
         )
 
 
@@ -267,6 +302,8 @@ def rel_mha_extend_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    output_dtype: torch.dtype | None,
 ) -> AttentionResult:
     """Relative-attention MHA extend with paged KV cache.
 
@@ -289,6 +326,8 @@ def rel_mha_extend_with_kvcache(
         window_left: Exclusive left sliding-window size. -1 means full attention.
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads].
+        output_dtype: None preserves legacy output precision. torch.float32
+            stores the FP32 accumulation result without a BF16 rounding step.
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
         tau: Optional fp32 per-query-row multiplier on the total pre-softmax
@@ -309,6 +348,7 @@ def rel_mha_extend_with_kvcache(
         q, k_cache, v_cache, q_scale, k_scale, v_scale
     )
     traits = {
+        "fp32_output": _fp32_output_trait(output_dtype),
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "return_lse": return_lse,
@@ -344,6 +384,7 @@ def rel_mha_extend_with_kvcache(
         shape_params,
     )
 
+    precision_kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
     with kernel_scope(
         "attention",
         "rel_mha_extend_with_kvcache",
@@ -368,6 +409,7 @@ def rel_mha_extend_with_kvcache(
             tau=tau,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
+            **precision_kwargs,
         )
 
 
@@ -392,6 +434,11 @@ def rel_mha_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    output_dtype: torch.dtype | None,
+    return_lse: bool,
+    gate: torch.Tensor | None,
+    sink: torch.Tensor | None,
 ) -> AttentionResult:
     """Relative-attention MHA decode with paged KV cache.
 
@@ -413,6 +460,10 @@ def rel_mha_decode_with_kvcache(
         max_seqlen_q: Number of uniformly packed query tokens per request. This
             is 1 for normal decode and `spec_num_tokens` for compact
             speculative decode.
+        return_lse: Return natural-log LSE with shape [total_q, num_q_heads].
+            Empty contexts produce zero output and negative-infinity LSE.
+        output_dtype: None preserves legacy output precision. torch.float32
+            stores the FP32 accumulation result without a BF16 rounding step.
         window_left: Exclusive left sliding-window size. -1 means full attention.
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
@@ -421,25 +472,43 @@ def rel_mha_decode_with_kvcache(
             q's row count and values must be positive.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        gate: Output gate logits ``[total_q, num_q_heads * head_dim]``, with
+            ``sink`` (``[total_q, num_q_heads]``), or None. The output is then
+            ``(out * sigmoid(gate)) * sigmoid(lse - sink)`` from the unrounded
+            FP32 attention output, stored once in ``output_dtype``: the
+            ``rel_mha_gate_sink`` epilogue, fused into the kernel when its
+            solution declares the ``gate_sink`` trait and applied after it
+            otherwise, with the same bits either way.
+        sink: Attention-sink logits, with ``gate``.
 
     ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
     q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
     UE8M0 [batch, num_q_heads, head_dim // 32], k_scale/v_scale use the
     paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
-    32, 4, 4].
+    32, 4, 4]. ``k_scale``/``v_scale`` without ``q_scale`` describe an MXFP8
+    k_cache/v_cache read with a dense (BF16) query: the attention equals that
+    of the dequantized cache.
 
     Uniform ``max_seqlen_q > 1`` (spec verify) rides v2's native prediction
     dimension — unexpanded ``[batch]`` seqlens and ``[batch, W]`` table, one
     KV load per request. Non-uniform multi-query takes the fork varlen path.
     """
     blockscaled = q_scale is not None
+    gated = gate is not None
+    if gated != (sink is not None):
+        raise ValueError("gate and sink go together")
+    if gated and output_dtype is None:
+        raise ValueError("a gated decode names its output dtype")
     signature, scale_kwargs = _blockscaled_signature_and_scales(
         q, k_cache, v_cache, q_scale, k_scale, v_scale
     )
+    # A gated decode gates the FP32 output by its LSE, fused or after the kernel.
     traits = {
+        "fp32_output": True if gated else _fp32_output_trait(output_dtype),
+        "gate_sink": gated,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "return_lse": False,
+        "return_lse": return_lse or gated,
         "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
@@ -472,6 +541,23 @@ def rel_mha_decode_with_kvcache(
         shape_params,
     )
 
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    fused_gate = True in spec.traits.get("gate_sink", frozenset())
+    if fused_gate:
+        precision_kwargs = {
+            "output_dtype": output_dtype,
+            "return_lse": return_lse,
+            "gate": gate,
+            "sink": sink,
+        }
+    elif gated:
+        precision_kwargs = {"output_dtype": torch.float32, "return_lse": True}
+    else:
+        precision_kwargs = (
+            {} if output_dtype is None else {"output_dtype": output_dtype}
+        )
+        if return_lse:
+            precision_kwargs["return_lse"] = True
     with kernel_scope(
         "attention",
         "rel_mha_decode_with_kvcache",
@@ -479,7 +565,7 @@ def rel_mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        result = kernel(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -494,7 +580,20 @@ def rel_mha_decode_with_kvcache(
             tau=tau,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
+            **precision_kwargs,
         )
+    if not gated or fused_gate:
+        return result
+    output, lse = result
+    gated_output = rel_mha_gate_sink(
+        output.reshape(q.shape[0], -1),
+        gate,
+        lse,
+        sink,
+        head_dim=q.shape[-1],
+        out_dtype=output_dtype,
+    ).view(q.shape)
+    return (gated_output, lse) if return_lse else gated_output
 
 
 # Backend registration (side-effect imports)
@@ -506,7 +605,16 @@ import tokenspeed_kernel.ops.attention.rmha.gluon  # noqa: E402,F401
 
 # isort: on
 
+from tokenspeed_kernel.ops.attention.rmha._triton.gate_sink import (  # noqa: E402
+    rel_mha_gate_sink,
+)
+from tokenspeed_kernel.ops.attention.rmha._triton.head_norms import (  # noqa: E402
+    rel_mha_head_norms,
+)
+
 __all__ = [
+    "rel_mha_gate_sink",
+    "rel_mha_head_norms",
     "rel_mha_plan",
     "rel_mha_prefill",
     "rel_mha_extend_with_kvcache",

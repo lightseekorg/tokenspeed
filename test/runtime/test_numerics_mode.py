@@ -34,6 +34,33 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class TestNumericsMode:
+    @pytest.mark.parametrize(
+        "numerics,backend", [("rl-bitwise", "ascend_full"), ("auto", "ascend_full")]
+    )
+    def test_ascend_default_sampling_backend(self, monkeypatch, numerics, backend):
+        from dataclasses import replace
+
+        from tokenspeed_kernel.platform import current_platform
+
+        from tokenspeed.runtime.utils import server_args
+
+        args = ServerArgs(model="x")
+        platform = replace(current_platform(), vendor="ascend")
+        monkeypatch.setattr(server_args, "current_platform", lambda: platform)
+        args.sampling_backend = None
+        args.numerics = numerics
+        args.resolve_kernel_backends()
+        assert args.sampling_backend == backend
+        if numerics == "rl-bitwise":
+            args.device = "npu"
+            stream = args.sampling_stream
+            args._resolve_rl_bitwise()
+            assert (args.sampling_backend, args.sampling_stream) == (backend, stream)
+            args.sampling_backend = "greedy"
+            args.resolve_kernel_backends()
+            args._resolve_rl_bitwise()
+            assert args.sampling_backend == "greedy"
+
     def test_moe_cutlass_fused_finalize_defaults_on(self):
         from tokenspeed.runtime.utils.server_args import prepare_server_args
 
@@ -151,6 +178,46 @@ class TestNumericsMode:
         )
         assert not (args.enable_allreduce_fusion)
         assert (args.comm_fusion_max_num_tokens) == (-1)
+
+    def test_dense_fp8_small_m_is_refused_under_a_bitwise_envelope(self):
+        assert ServerArgs(model="x").dense_fp8_small_m == "none"
+        assert ServerArgs(model="x", dense_fp8_small_m="qkv").dense_fp8_small_m == (
+            "qkv"
+        )
+        with pytest.raises(ValueError, match="--dense-fp8-small-m qkv.*rl-bitwise"):
+            ServerArgs(model="x", numerics="rl-bitwise", dense_fp8_small_m="qkv")
+        with pytest.raises(ValueError, match="--dense-fp8-small-m"):
+            ServerArgs(model="x", dense_fp8_small_m="all")
+        with pytest.raises(ValueError, match="batch-invariant-collectives"):
+            ServerArgs(
+                model="x",
+                batch_invariant_collectives=True,
+                dense_fp8_small_m="qkv",
+            )
+        # Run-to-run determinism alone keeps the flag.
+        assert (
+            ServerArgs(
+                model="x", force_deterministic_rsag=True, dense_fp8_small_m="qkv"
+            ).dense_fp8_small_m
+            == "qkv"
+        )
+
+    def test_dense_fp8_small_m_refuses_a_checkpoint_without_fp8_projections(
+        self, tmp_path
+    ):
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"architectures": ["Qwen3ForCausalLM"]})
+        )
+        with pytest.raises(
+            ValueError, match="no FP8 projections for .*Qwen3ForCausalLM"
+        ):
+            ServerArgs(model=str(tmp_path), dense_fp8_small_m="qkv")
+        (tmp_path / "config.json").write_text(
+            json.dumps({"architectures": ["MuseSparkForConditionalGeneration"]})
+        )
+        ServerArgs(model=str(tmp_path), dense_fp8_small_m="qkv")
 
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):

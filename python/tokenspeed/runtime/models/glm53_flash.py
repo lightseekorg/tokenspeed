@@ -30,7 +30,7 @@ indexer projections and consumes the resulting generic DSA metadata.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -105,6 +105,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -887,6 +888,8 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         # Every rank selects every prefill row (validated configuration).
         self.prefill_topk_tp_split = False
         self.skip_indexer_topk = config.indexer_types[layer_id] == "shared"
+        # The mixin's host contract; GLM-5.3-Flash selects on the main stream.
+        self.decode_topk_fork = StreamFork(None)
         self.indexer = (
             None
             if self.skip_indexer_topk
@@ -1123,8 +1126,12 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         num_tokens: int,
         num_decode_tokens: int,
         topk: int,
+        query_rider: torch.Tensor | None = None,
+        rider_ready: Callable[[], None] | None = None,
     ) -> GlmDsaDecodeTopK:
         del topk
+        if query_rider is not None or rider_ready is not None:
+            raise ValueError("GLM-5.3-Flash selects no owned decode top-k")
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             num_tokens,

@@ -133,13 +133,9 @@ BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
 
 
 def beam_kernels() -> bool:
-    """Whether Beam's Triton kernels serve its calls: NVIDIA SM90 to SM103, where
-    each was checked byte for byte against the Torch statements it replaces.
-    Elsewhere Beam runs the statements. Beam's vendor defaults
-    (``beam_default_platform``) keep their own SM100 to SM103 range."""
+    """Whether Beam's generic Triton kernels support this platform."""
     platform = current_platform()
-    in_range = ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 3)
-    return platform.is_nvidia and in_range
+    return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
 # The hidden size the residual boundary's one-launch kernel was checked at.
@@ -852,7 +848,7 @@ class BeamRouter(ReplicatedLinear):
         # Keep the exact parameter already referenced by TopK and MoELayer.
         self.e_score_correction_bias = correction_bias
         # BF16 pieces of the FP32 weight, made once after loading where a
-        # registered mv kernel takes them (SM90 to SM103).
+        # registered mv kernel takes them (SM90 and newer).
         self.register_buffer("weight_split", None, persistent=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -862,7 +858,7 @@ class BeamRouter(ReplicatedLinear):
         # BF16 rows times the FP32 weight, FP32 logits (gemm.mv): the
         # FP32 row-CTA kernel up to 16 rows, the BF16x3 tensor-core kernel on
         # the weight split from 17 rows, the FP32 CUDA-core kernel from 17 to
-        # 96 rows where no split is made (past SM103), Torch's FP32 matmul
+        # 96 rows where no split is made, Torch's FP32 matmul
         # where no kernel takes the call.
         return kernel_mv(hidden_states, self.weight, weight_split=self.weight_split)
 

@@ -8,7 +8,12 @@ from pathlib import Path
 
 
 def prepare_release(
-    root: Path, kind: str, date: str, target: str, release_tags: set[str]
+    root: Path,
+    kind: str,
+    date: str,
+    target: str,
+    release_tags: set[str],
+    release_candidate: str = "",
 ) -> str:
     pyproject = root / "tokenspeed-engine/pyproject.toml"
     original = pyproject.read_text()
@@ -19,11 +24,15 @@ def prepare_release(
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", base):
         raise ValueError("Release requires a stable engine base version")
 
+    candidate = release_candidate.removeprefix("rc")
+    if candidate and (kind != "nightly" or not re.fullmatch(r"[1-9][0-9]*", candidate)):
+        raise ValueError("A candidate number requires coordinated nightly mode")
+
     if kind == "release":
         if date:
             raise ValueError("A stable release does not accept a date")
         version = base
-    elif kind in ("post", "rc"):
+    elif kind in ("post", "rc", "nightly"):
         if not re.fullmatch(r"[0-9]{8}", date):
             raise ValueError("Release date must be YYYYMMDD")
         release_date = datetime.strptime(date, "%Y%m%d")
@@ -35,8 +44,9 @@ def prepare_release(
             ):
                 release_date += timedelta(days=1)
                 date = release_date.strftime("%Y%m%d")
-        suffix = ".post" if kind == "post" else "rc"
-        version = f"{base}{suffix}{date}"
+        suffix = ".post" if kind in ("post", "nightly") else "rc"
+        candidate_suffix = f"rc{candidate}" if candidate else ""
+        version = f"{base}{candidate_suffix}{suffix}{date}"
     else:
         raise ValueError(f"Unsupported release kind: {kind}")
 
@@ -55,13 +65,20 @@ def prepare_release(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", choices=("version", "engine"), required=True)
-    parser.add_argument("--kind", choices=("release", "post", "rc"), required=True)
+    parser.add_argument(
+        "--kind", choices=("release", "post", "rc", "nightly"), required=True
+    )
     parser.add_argument("--date", required=True)
     parser.add_argument("--release-tags", type=Path)
+    parser.add_argument("--release-candidate", default="")
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
     resolve_post = args.target == "version" and args.kind == "post"
     if resolve_post != (args.release_tags is not None):
         parser.error("--release-tags is required only when resolving a post version")
     tags = set(args.release_tags.read_text().splitlines()) if resolve_post else set()
-    print(prepare_release(args.root, args.kind, args.date, args.target, tags))
+    print(
+        prepare_release(
+            args.root, args.kind, args.date, args.target, tags, args.release_candidate
+        )
+    )

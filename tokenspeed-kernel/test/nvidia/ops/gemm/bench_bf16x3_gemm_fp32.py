@@ -97,7 +97,9 @@ def main() -> None:
             args.repeats,
         )
         split_ulp = _ulp_row(out, exact)
-        selected = _select(m, args.n, args.k, True, x.dtype, weight.dtype, True)
+        selected = _select(
+            m, args.n, args.k, True, x.dtype, weight.dtype, True, True, True
+        )
         routed = {"mv": selected.__name__}
         if selected is not triton_bf16x3_gemm_fp32:
             routed["mv_us"] = round(

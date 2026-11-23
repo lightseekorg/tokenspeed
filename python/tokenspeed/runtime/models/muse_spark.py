@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.gemm import (
-    _use_mv,
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
     fp32_router_gemv_execute_with_mm,
@@ -39,9 +38,11 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_process_weight,
     fp32_router_gemv_with_mm_supported,
     mm,
+    mm_has_kernel_with_features,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
     mv_weightless_rmsnorm_gated_sigmoid_supported,
+    prepare_fp8_channel_weight,
 )
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
@@ -51,8 +52,6 @@ from tokenspeed_kernel.ops.layernorm import (
 from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
-    bf16_moe_routes,
-    bf16_moe_routes_warmup,
     gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_sorted_gate_up,
@@ -67,21 +66,30 @@ from tokenspeed_kernel.ops.moe import (
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     AllReduceMailbox,
     KimiK3LatentDownOp,
-    MailboxPublish,
 )
-from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant, rmsnorm_nvfp4_quant
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    rmsnorm_mxfp4_quant,
+    rmsnorm_nvfp4_quant,
+)
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
+    post_norm_residual_pre_norm_bf16_fp8,
     residual_gate_coefficients,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
 
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    ProjectionSpec,
+    ProjectionWorkspace,
+)
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -89,10 +97,16 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_reduce,
     can_acquire_all_reduce_outputs,
+    prepare_projection_collectives,
+    projection_gather_mm,
+    projection_mm_reduce_scatter,
+    projection_mm_to_owners,
+    reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
@@ -101,6 +115,7 @@ from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
@@ -121,6 +136,15 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
+from tokenspeed.runtime.models.muse_spark_monokernel import (
+    MAX_ROWS as MONOKERNEL_MAX_ROWS,
+)
+from tokenspeed.runtime.models.muse_spark_monokernel import (
+    MuseSparkMonokernelLayer,
+    MuseSparkMonokernelState,
+    enable_decode_monokernels,
+    prepare_monokernel_state,
+)
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -132,7 +156,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalForwardContext,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.common import make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -142,19 +166,167 @@ if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
+logger = get_colorful_logger(__name__)
 
-# Row limit of the generic column gather and the NVLS mailbox.
+
+# Row limit of the generic column gather.
 _GATHER_WORKSPACE_ROWS = 64
-# Past this the consumer's own stores cost more than the copy launch (TP4: -1.4% at 16 rows, +1.3% at 64).
-_CONSUMER_PUBLISH_MAX_ROWS = 32
-# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
-# TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
-# 1024-wide shard), and TP8 uses the same limit. In measurements the fused
-# path was faster than the column gather plus a separate quantize at every
-# row count tested above 64, up to 191 rows at TP8 and 172 at TP4. Pre-expert
-# workspace rows past 64 serve only as the fused path's placeholder for the
-# gathered BF16 rows, which it returns but does not fill.
-_GATHER_MXFP4_MAX_ROWS = 172
+# A gather mailbox moves only each rank's own block, so it beats the NCCL gather well past 64 rows.
+_GATHER_MAILBOX_ROWS = 512
+# Past this, multicasting a full partial per rank costs more than the two-shot all-reduce (128 rows: 73 us vs 29).
+_REDUCE_MAILBOX_ROWS = 64
+# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path: the TP4
+# Lamport mailbox capacity (ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS, 320
+# rows of a 1024-wide shard); TP8 uses the same limit. In TP4 graph replay the
+# fused path beat the column gather plus a separate quantize at every row
+# count tested, 64 to 320, with the same bits. Pre-expert workspace rows past
+# 64 serve only as the fused path's placeholder for the gathered BF16 rows,
+# which it returns but does not fill.
+_GATHER_MXFP4_MAX_ROWS = 320
+# Row limit of the fused gather + RMSNorm (BF16 output) path, the one-shot
+# Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
+# within one BF16 ulp, not bit for bit, so it keeps its bound.
+_GATHER_RMSNORM_MAX_ROWS = 172
+# The QKV projection's FP8 row window (--dense-fp8-small-m): up to 32 rows its
+# decode stays on the BF16 projection.
+_DENSE_FP8_QKV_MIN_ROWS = 33
+_DENSE_FP8_MAX_ROWS = 128
+# The GEMM family the flag runs: a weight-streaming FP8 kernel with row and
+# channel scales. Loading refuses a projection no such kernel serves at either
+# end of its window; the serving call selects among the FP8 kernels by the
+# same traits, so with its own aligned, contiguous copies it takes that kernel.
+_DENSE_FP8_FEATURES = frozenset({"weight_streaming"})
+
+
+def _dense_fp8_qkv() -> bool:
+    """Whether --dense-fp8-small-m runs the QKV projection in FP8. Off gfx950
+    no small-M FP8 GEMM serves it, so loading refuses it
+    (_DenseFp8Weight.prepare)."""
+    return global_server_args_dict["dense_fp8_small_m"] == "qkv"
+
+
+def _fp8_projections(forward_mode: ForwardMode) -> bool:
+    """Whether this forward's rows may take the dense FP8 projections
+    (--dense-fp8-small-m): decode and verify forwards only. Prompt rows write
+    the K / V every later token and every prefix-cache reuse reads, so they
+    stay BF16; mixed rounds never run (MuseSparkDecoderLayer.forward raises).
+    Each FP8 projection also needs its row window (_DenseFp8Weight.applies).
+    """
+    return forward_mode.is_decode()
+
+
+def _row_fp8_probe(
+    rows: int, k: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Placeholders with ``_quantize_rows_fp8``'s output layout (FP8 codes,
+    [rows, 1] FP32 scales), made without running it: the quantizer exists only
+    where the FP8 GEMM does, so a probe elsewhere reaches the GEMM's refusal
+    instead of a registry error."""
+    codes = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device)
+    return codes, torch.ones(rows, 1, dtype=torch.float32, device=device)
+
+
+def _quantize_rows_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row FP8 codes and scales of ``x``, with the recipe the boundary's
+    FP8 copy uses (``token_fp8_amax_div``), so both give the same bits."""
+    return quantize_fp8(
+        x.contiguous(),
+        granularity="token",
+        scale_encoding="float32",
+        enable_pdl=False,
+        required_features=frozenset({"token_fp8_amax_div"}),
+    )
+
+
+class _DenseFp8Weight:
+    """A projection's FP8 copy for small-M decode GEMMs (--dense-fp8-small-m).
+
+    Holds an FP8 E4M3 copy of the projected weight with one FP32 scale per
+    output channel, made after loading, and projects decode rows in
+    ``[min_rows, max_rows]`` through it with per-row FP8 activations. The
+    copy is made while the weights load, inside the memory saver's
+    ``weights`` region, so releasing ``weights`` releases it too.
+    """
+
+    def __init__(self, name: str, enabled: bool, min_rows: int, max_rows: int) -> None:
+        self.name = name
+        self.enabled = enabled
+        self.min_rows = min_rows
+        self.max_rows = max_rows
+        self.weight: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+
+    def check(self, weight: torch.Tensor) -> None:
+        """Refuse, when enabled, a BF16 ``[N, K]`` weight no small-M FP8
+        kernel serves at either end of the window. Makes no copy."""
+        if not self.enabled:
+            return
+        n, k = weight.shape
+        # Probe on placeholders of the copy's shape and layout, so a refusal
+        # comes before any conversion.
+        probe_weight = torch.empty(
+            (n, k), dtype=torch.float8_e4m3fn, device=weight.device
+        )
+        probe_scale = torch.ones(n, dtype=torch.float32, device=weight.device)
+        for rows in (self.min_rows, self.max_rows):
+            codes, scales = _row_fp8_probe(rows, k, weight.device)
+            if not mm_has_kernel_with_features(
+                codes,
+                probe_weight.t(),
+                A_scales=scales,
+                B_scales=probe_scale,
+                out_dtype=torch.bfloat16,
+                quant="fp8",
+                features=_DENSE_FP8_FEATURES,
+            ):
+                raise ValueError(
+                    f"--dense-fp8-small-m: no weight-streaming FP8 GEMM serves "
+                    f"the {self.name} projection [{n}, {k}] at {rows} rows"
+                )
+
+    def prepare(self, weight: torch.Tensor) -> None:
+        """Convert the loaded BF16 ``[N, K]`` weight when enabled, after
+        ``check``, then compile the GEMM."""
+        if not self.enabled:
+            return
+        self.check(weight)
+        self.weight, self.scale = prepare_fp8_channel_weight(weight)
+        # Compile the GEMM's binaries now (its warm-up compiles every row
+        # tile), whatever row counts the startup warm-up forwards run.
+        with kernel_warmup(enabled=True):
+            self.project(weight.new_zeros(self.min_rows, weight.shape[1]), None, None)
+
+    def applies(self, rows: int) -> bool:
+        """Whether ``rows`` rows of a forward that takes the FP8 projections
+        (``_fp8_projections``) project through this copy: the copy exists
+        and the rows are inside its window. Every producer and consumer of
+        the FP8 copy asks this with the same rows."""
+        return self.weight is not None and self.min_rows <= rows <= self.max_rows
+
+    def project(
+        self,
+        x: torch.Tensor,
+        x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``x @ weight^T`` in BF16, into ``out`` when given.
+
+        ``x_fp8`` is the per-row FP8 copy of ``x`` (codes, FP32 scales) its
+        producer wrote, or None to quantize ``x`` here. Callers check
+        ``applies`` first.
+        """
+        rows, scales = x_fp8 if x_fp8 is not None else _quantize_rows_fp8(x)
+        return mm(
+            rows,
+            self.weight.t(),
+            A_scales=scales,
+            B_scales=self.scale,
+            out=out,
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+        )
+
+
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
@@ -190,6 +362,100 @@ def _muse_all_reduce(
         else:
             results.append(all_reduce(tensor, group))
     return tuple(results)
+
+
+class _OwnedRowProjections:
+    """Owned-row projections through prepared projection workspaces.
+
+    Rank ``r`` owns rows ``[r * L, (r + 1) * L)`` of the batch padded to
+    ``world_size * L`` rows, ``L = ceil(rows / world_size)``.
+    """
+
+    def __init__(self, group: Group) -> None:
+        self.group = group
+        self.world_size = len(group)
+        # Bound by prepare_communication_runtime; owned forwards require them.
+        self.qkv: ProjectionWorkspace | None = None
+        self.output: ProjectionWorkspace | None = None
+        self.pre_expert: ProjectionWorkspace | None = None
+        self.post_expert: ProjectionWorkspace | None = None
+
+    def local_rows(self, rows: int) -> int:
+        return (rows + self.world_size - 1) // self.world_size
+
+    def gather_mm(
+        self,
+        x: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        """All ``rows`` owned rows through this rank's ``[N, K]`` weight shard."""
+        local_rows = self.local_rows(rows)
+        out = x.new_empty((self.world_size * local_rows, weight.shape[0]))
+        projection_gather_mm(x, local_rows, weight, out, workspace, None)
+        return out[:rows]
+
+    def matmul_reduce_scatter(
+        self, x: torch.Tensor, rows: int, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Sum every rank's ``x @ weight.T`` partial into this rank's ``[L, N]`` rows."""
+        return projection_mm_reduce_scatter(
+            x, self.local_rows(rows), weight, self.output, None
+        )
+
+    def matmul_to_owners(
+        self, x: torch.Tensor, rows: int, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows.
+
+        The rows are borrowed until the next owned-row projection.
+        """
+        return projection_mm_to_owners(
+            x, self.local_rows(rows), weight, self.post_expert, None
+        )
+
+    def gather_rows(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
+        """Gather every rank's ``[L, width]`` rows into ``[rows, width]``."""
+        gathered = all_gather(
+            tensor, self.group, dim=0, backend=get_global_backend().nccl
+        )
+        return gathered[:rows]
+
+
+def _prepare_owned_projections(
+    owned: _OwnedRowProjections, layer: nn.Module, group: Group, rows: int
+) -> None:
+    """Collectively prepare the four owned-row projections of every decoder layer."""
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
+
+    size = owned.world_size
+    projections = (
+        ("gather", layer.self_attn.qkv_proj.weight),
+        ("scatter", layer.self_attn.o_proj.weight),
+        ("gather", layer.mlp.pre_expert_proj.weight),
+        ("transpose", layer.mlp.post_expert_proj.weight),
+    )
+    specs = [
+        ProjectionSpec(
+            group=group,
+            kind=kind,
+            input_size=weight.shape[1] * (size if kind == "scatter" else 1),
+            output_size=weight.shape[0] * (1 if kind == "scatter" else size),
+            max_tokens=rows,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
+        for kind, weight in projections
+    ]
+    # The projections run one after another, so they share one scratch block.
+    pool = WorkspacePool(specs[0].device, initial_nbytes=0)
+    for spec in specs:
+        pool.allocate(*spec.scratch_specs)
+    pool.freeze()
+    owned.qkv, owned.output, owned.pre_expert, owned.post_expert = (
+        prepare_projection_collectives(spec, None, pool) for spec in specs
+    )
 
 
 def _gemm_dispatch_required() -> bool:
@@ -272,9 +538,10 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 block_index=layer_id,
                 layer_count=layer_count,
                 model_scope=f"{prefix.split('.layers.')[0]}.{prefix.rsplit('.', 1)[-1]}",
-                max_m=_GATHER_WORKSPACE_ROWS,
+                max_m=_GATHER_MAILBOX_ROWS,
                 # Takes this call's weight view; the mailbox publishes wider blocks.
                 publish_gemm=partial(_block_gemm, self),
+                rank_major=True,
             )
         self.iris_state: MuseIrisState | None = None
 
@@ -309,6 +576,18 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         if result.data_ptr() != out.data_ptr():
             out.copy_(result)
         return out
+
+    def warm_local_gemm(self) -> None:
+        """Run one two-row local-columns GEMM inside the warm-up scope.
+
+        Two rows is the fewest that take the GEMM rather than the one-row
+        GEMV; kernels that compile their binaries when a warm-up GEMM meets
+        their weight (the skinny GEMM, the decode GEMM) compile them for this
+        weight.
+        """
+        weight = self._local_weight()
+        with kernel_warmup(enabled=True):
+            self._project(weight.new_zeros((2, weight.shape[1])), weight, None)
 
     def _local_weight(self) -> torch.Tensor:
         if not self.gather_column_view:
@@ -408,20 +687,20 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         self,
         x: torch.Tensor,
         consumer_handles_mailbox: bool,
-    ) -> tuple[torch.Tensor, int | None, MailboxPublish | None]:
+    ) -> tuple[torch.Tensor, int | None]:
         """Project into the mailbox when the consumer polls it, else into full rows.
 
-        Returns the rows, the mailbox sentinel, and the block the consumer
-        stores before polling (None when the projection stored it).
+        Returns the rows, or the mailbox's ``[ranks, rows, shard]`` view, and
+        the mailbox sentinel.
         """
         if (
             consumer_handles_mailbox
             and self.multicast is not None
             and self.multicast.handles(x.shape[0])
         ):
-            rows, publish = _publish(self.multicast, x, self._local_weight())
-            return rows, self.multicast.sentinel, publish
-        return self(x), None, None
+            rows = self.multicast.publish(x, self._local_weight())
+            return rows, self.multicast.sentinel
+        return self(x), None
 
     def forward_rmsnorm(self, x: torch.Tensor, norm: MuseSparkRMSNorm) -> torch.Tensor:
         """Project, gather and apply ``norm``: full-width normalized BF16 rows.
@@ -434,7 +713,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             iris is not None
             and norm.weight is not None
             and self.workspace is not None
-            and x.shape[0] <= min(_GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0])
+            and x.shape[0] <= min(_GATHER_RMSNORM_MAX_ROWS, self.workspace.shape[0])
         ):
             local_weight = self._local_weight()
             local = x.new_empty((x.shape[0], local_weight.shape[0]))
@@ -583,6 +862,36 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
                 device=self.weight.device,
             )
         self.iris_state: MuseIrisState | None = None
+        # The local weight's FP8 copy (--dense-fp8-small-m qkv).
+        if _dense_fp8_qkv() and not isinstance(
+            self.quant_method, UnquantizedLinearMethod
+        ):
+            raise ValueError(
+                f"--dense-fp8-small-m converts a BF16 QKV weight; {prefix} is "
+                f"quantized by {type(self.quant_method).__name__}"
+            )
+        self.dense_fp8 = _DenseFp8Weight(
+            "qkv_proj",
+            _dense_fp8_qkv(),
+            _DENSE_FP8_QKV_MIN_ROWS,
+            _DENSE_FP8_MAX_ROWS,
+        )
+
+    def prepare_fp8_weight(self) -> None:
+        """Make the local weight's FP8 copy from the loaded weight."""
+        self.dense_fp8.prepare(self._local_weight().data)
+
+    def forward_rows(
+        self,
+        input_: torch.Tensor,
+        input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Project normalized rows of a forward that takes the FP8 projections
+        (``_fp8_projections``), given their per-row FP8 copy or None: through
+        the FP8 copy where ``_DenseFp8Weight.applies``, else in BF16."""
+        if self.dense_fp8.applies(input_.shape[0]):
+            return self.dense_fp8.project(input_, input_fp8, None)
+        return self(input_)[0]
 
     def _local_weight(self) -> torch.Tensor:
         if not self.replicate_for_owned_rows:
@@ -663,37 +972,21 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
             )
 
 
-def _publish(
-    multicast: KimiK3LatentDownOp, x: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, MailboxPublish | None]:
-    """Publish ``x``'s projection; a small batch leaves the store to the consumer.
-
-    Returns this rank's mailbox rows and the block the consumer stores before
-    polling, or None when the copy already stored it.
-    """
-    if x.shape[0] <= _CONSUMER_PUBLISH_MAX_ROWS:
-        return multicast.publish_by_consumer(x, weight)
-    return multicast.publish(x, weight), None
-
-
 def _block_gemm(
     linear: LinearBase,
     x: torch.Tensor,
     weight: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """``x`` through this rank's ``weight`` block; one row is written into ``out``.
+    """``x`` through this rank's ``weight`` block, written into ``out``.
 
-    The kernels are the ones the projection's own forward would pick, so the
+    ``mm`` picks the kernel the projection's own forward would, so the
     published rows carry the bits an unpublished projection would have.
     """
-    if (
-        x.shape[0] == 1
-        and resolve_kernel_override("gemm", "mm", None) is None
-        and _use_mv(x, weight)
-    ):
-        return mv(x, weight, out=out)
-    return linear.quant_method.apply(SimpleNamespace(weight=weight), x, None)
+    method = linear.quant_method
+    return mm(
+        x, weight, out=out, plan=method.kernel_plan if method.batch_invariant else None
+    )
 
 
 def _bind_mailbox(
@@ -728,9 +1021,10 @@ def _bind_mailbox(
         block_index=layer_id,
         layer_count=config.num_hidden_layers,
         model_scope=model_scope,
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         # Pooled across layers: the weight must come from the call, never the closure.
         publish_gemm=lambda x, weight, out: _block_gemm(linear, x, weight, out),
+        rank_major=True,
     )
 
 
@@ -753,8 +1047,9 @@ def _bind_ep_all_reduce(
         layer_count=config.num_hidden_layers,
         # Mailboxes pool across layers, so the scope excludes the layer index.
         model_scope=f"{prefix.split('.layers.')[0]}.ep_all_reduce",
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         publish_gemm=_no_route_sum_gemm,
+        rank_major=False,
     )
 
 
@@ -894,7 +1189,19 @@ class MuseSparkAttention(nn.Module):
             rotary_emb=self.rotary_emb,
             qk_norm=(self.q_norm, self.k_norm),
         )
+        # --owned-attention-output all-to-all: owned-row rounds send each token
+        # owner its rows of every rank's heads and project them through the
+        # whole output projection there, instead of reduce-scattering per-rank
+        # partials. The whole weight is gathered after loading into a
+        # projection of its own (prepare_owned_output_weight).
+        self.owned_heads_to_owners = _owned_heads_to_owners(self.o_proj)
+        self.owned_output_proj: ReplicatedLinear | None = None
         self.iris_state: MuseIrisState | None = None
+        self.owned_projections: _OwnedRowProjections | None = (
+            _OwnedRowProjections(mapping.attn.tp_group)
+            if self.tp_size > 1 and current_platform().is_nvidia
+            else None
+        )
 
     def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
         """Borrow the all-reduce producer buffer for the projection, if compatible."""
@@ -932,16 +1239,31 @@ class MuseSparkAttention(nn.Module):
         self,
         positions: torch.Tensor,
         normalized: torch.Tensor,
+        normalized_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         owned_global_rows: int | None,
-    ) -> tuple[torch.Tensor, int | None, int, MailboxPublish | None]:
-        """Attend over rows already passed through ``normalize``."""
-        if owned_global_rows is not None:
+        project: bool,
+    ) -> tuple[torch.Tensor, int | None, int]:
+        """Attend over rows already passed through ``normalize``.
+
+        Without ``project`` the gated heads [rows, heads * head_dim] come back
+        unprojected, for the owner-side output projection
+        (``project_owned_heads``).
+        ``normalized_fp8`` is the rows' per-row FP8 copy from their producer,
+        or None.
+        """
+        # NVIDIA gathers owned rows into the projection; Iris projects them in place.
+        # Without ``project`` the forward runs on Iris owned rows
+        # (_heads_to_owners_applies needs an Iris state, which only gfx950
+        # prepares), never on the NVIDIA gathered rows.
+        gathered = owned_global_rows is not None and self.owned_projections is not None
+        if owned_global_rows is not None and not gathered:
             projected = self.qkv_proj.project_owned_rows(normalized, owned_global_rows)
             iris = self.iris_state
             assert iris is not None
         if (
             owned_global_rows is not None
+            and not gathered
             and owned_global_rows >= MUSE_OWNED_QKVG_MIN_TOKENS
             and ctx.forward_mode.is_extend()
             and ctx.token_to_kv_pool.dtype == torch.bfloat16
@@ -961,54 +1283,146 @@ class MuseSparkAttention(nn.Module):
                 cos_sin_cache,
                 self.rms_norm_eps,
                 self.q_scale,
+                payload=_collective_payload(ctx.forward_mode),
             )
             prepared = self.attn.store_prepared(q, k, v, ctx)
             output = self.attn.attend(prepared.q, prepared.k, prepared.v, ctx)
+            gated = False
         else:
-            if owned_global_rows is not None:
-                qkv_gate = iris.all_to_all_transpose_qkvg(projected, owned_global_rows)
+            if gathered:
+                owned = self.owned_projections
+                qkv_gate = owned.gather_mm(
+                    normalized, owned_global_rows, self.qkv_proj.weight, owned.qkv
+                )
+            elif owned_global_rows is not None:
+                qkv_gate = iris.all_to_all_transpose_qkvg(
+                    projected,
+                    owned_global_rows,
+                    payload=_collective_payload(ctx.forward_mode),
+                )
             elif normalized.shape[0] == 0:
-                return normalized.new_empty((0, self.hidden_size)), None, 1, None
+                return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
-                qkv_gate, _ = self.qkv_proj(normalized)
+                qkv_gate = (
+                    self.qkv_proj.forward_rows(normalized, normalized_fp8)
+                    if _fp8_projections(ctx.forward_mode)
+                    else self.qkv_proj(normalized)[0]
+                )
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
-            output = self.attn(q, k, v, positions, ctx)
-        output = output.contiguous()
-        # One row normalizes and gates inside the output projection's GEMV.
-        projection_out = (
-            self._acquire_projection_output(output)
-            if output.shape[0] == 1
-            and mv_weightless_rmsnorm_gated_sigmoid_supported(
-                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            # Attention gates its own output (in the decode kernel's store
+            # where it can); a single row keeps it for the output GEMV below.
+            gated = q.shape[0] > 1
+            output = self.attn(
+                q,
+                k,
+                v,
+                positions,
+                ctx,
+                rmsnorm_output_gate=(
+                    (output_gate, self.rms_norm_eps) if gated else None
+                ),
             )
-            else None
-        )
-        if projection_out is not None:
-            projected = mv_weightless_rmsnorm_gated_sigmoid(
+        if not gated:
+            output = output.contiguous()
+            # One row normalizes and gates inside the output projection's GEMV.
+            projection_out = (
+                self._acquire_projection_output(output)
+                if project
+                and output.shape[0] == 1
+                and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                else None
+            )
+            if projection_out is not None:
+                projected = mv_weightless_rmsnorm_gated_sigmoid(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.rms_norm_eps,
+                    projection_out,
+                )
+                return projected, None, 1
+            output = weightless_rmsnorm_gated_sigmoid(
                 output,
                 output_gate,
-                self.o_proj.weight,
                 self.num_heads,
+                self.head_dim,
                 self.rms_norm_eps,
-                projection_out,
+                pdl_enabled(),
             )
-            return projected, None, 1, None
-        output = weightless_rmsnorm_gated_sigmoid(
-            output,
-            output_gate,
-            self.num_heads,
-            self.head_dim,
-            self.rms_norm_eps,
-            pdl_enabled(),
+        if gathered:
+            # NVIDIA returns its owned rows already reduced.
+            return (
+                self.owned_projections.matmul_reduce_scatter(
+                    output, owned_global_rows, self.o_proj.weight
+                ),
+                None,
+                1,
+            )
+        return self._project(output) if project else (output, None, 1)
+
+    def project_owned_heads(self, heads: torch.Tensor, rows: int) -> torch.Tensor:
+        """Project this rank's gated heads of all rows on the token owners.
+
+        The heads [rows, heads * head_dim] go to the token owners (an
+        all-to-all), and each owner projects its rows through the whole output
+        projection. Replaces the per-rank partial projection plus owned-row
+        reduce-scatter (``--owned-attention-output all-to-all``); a
+        summation-order change. Returns this rank's owned rows [ceil(rows /
+        tp_size), hidden_size].
+        """
+        # The decoder calls this only where _heads_to_owners_applies found the
+        # gathered weight and the layer's Iris state, which is this module's.
+        gathered = self.iris_state.all_to_all_heads_to_owners(
+            heads.reshape(rows, -1), rows
         )
-        return self._project(output)
+        return self.owned_output_proj(gathered)[0]
+
+    def prepare_owned_output_weight(self) -> None:
+        """Gather the whole output projection for ``project_owned_heads``.
+
+        Runs once the shards are loaded; a no-op unless
+        ``--owned-attention-output all-to-all``.
+        """
+        if not self.owned_heads_to_owners:
+            return
+        linear = self.o_proj
+        group = process_group_manager.get_device_process_group(linear.tp_group)
+        shards = [torch.empty_like(linear.weight) for _ in range(linear.tp_size)]
+        dist.all_gather(shards, linear.weight.data, group=group)
+        # The whole [hidden, hidden] projection, unquantized BF16 as
+        # _owned_heads_to_owners requires, with its own linear method (its
+        # GEMM is planned for this weight's K, not the shard's). A module
+        # parameter, so dummy loading, which fills the parameters only after
+        # this runs, fills it too.
+        with torch.device(linear.weight.device):
+            projection = ReplicatedLinear(
+                input_size=linear.input_size,
+                output_size=linear.output_size,
+                bias=False,
+                params_dtype=linear.weight.dtype,
+                quant_config=None,
+                prefix=f"{linear.prefix}.owned",
+            )
+        # Rank r's input columns are its heads, the order the all-to-all lays
+        # the gathered heads in.
+        projection.weight.data.copy_(torch.cat(shards, dim=1))
+        projection.quant_method.process_weights_after_loading(projection)
+        self.owned_output_proj = projection
 
     def forward_sliding_tail(
         self,
         positions: torch.Tensor,
         normalized: torch.Tensor,
+        normalized_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         cache: DecodeKVView,
         stream: torch.Tensor,
@@ -1024,9 +1438,14 @@ class MuseSparkAttention(nn.Module):
         applies the gated norm and o_proj, all-reduces and runs the boundary
         (MuseIrisState.sliding_attention_boundary). Returns the FP32 residual,
         router input and pre-expert input. The caller checked
-        can_sliding_attention_boundary.
+        can_sliding_attention_boundary. ``normalized_fp8`` is the rows' per-row
+        FP8 copy from their producer, or None.
         """
-        qkv_gate, _ = self.qkv_proj(normalized)
+        qkv_gate = (
+            self.qkv_proj.forward_rows(normalized, normalized_fp8)
+            if _fp8_projections(ctx.forward_mode)
+            else self.qkv_proj(normalized)[0]
+        )
         q, k, v, output_gate = qkv_gate.split(
             (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
         )
@@ -1054,12 +1473,10 @@ class MuseSparkAttention(nn.Module):
             pre_norm.weight_offset,
         )
 
-    def _project(
-        self, output: torch.Tensor
-    ) -> tuple[torch.Tensor, int | None, int, MailboxPublish | None]:
+    def _project(self, output: torch.Tensor) -> tuple[torch.Tensor, int | None, int]:
         """Project attended rows; a batch the mailbox serves publishes its partial for the boundary to reduce."""
         if current_platform().is_cdna4:
-            return self._project_output(output), None, 1, None
+            return self._project_output(output), None, 1
         multicast = self.o_proj_multicast
         tokens = output.shape[0]
         if (
@@ -1067,20 +1484,108 @@ class MuseSparkAttention(nn.Module):
             and multicast.handles(tokens)
             and boundary_gathers_mailbox(tokens, self.hidden_size, self.tp_size)
         ):
-            rows, publish = _publish(multicast, output, self.o_proj.weight)
-            return rows, multicast.sentinel, self.tp_size, publish
+            rows = multicast.publish(output, self.o_proj.weight)
+            return rows, multicast.sentinel, self.tp_size
         output, _ = self.o_proj(output)
-        return output, None, 1, None
+        return output, None, 1
 
 
 # Every decoder gain is stored as its deviation from unity; the output gain is not.
 ZERO_CENTERED_GAIN_OFFSET = 1.0
 OUTPUT_GAIN_OFFSET = 0.0
-# Norm-preserving residual gate constants, fixed by the architecture.
-RESIDUAL_GATE_TEMPERATURE = 0.3
+# Norm-preserving residual gate epsilon, fixed by the architecture.
 RESIDUAL_GATE_EPS = 1e-3
 MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
+# NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
+MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
+# The owned-row layout serves forwards up to the prefill chunk the server is
+# configured for (--chunked-prefill-size), and at least 8192 rows. Startup
+# sizes three per-rank buffers from min(max forward tokens, that) full
+# 8192-wide BF16 rows: the Iris producer buffer, its pull scratch holding one
+# rank's share of them, and the prepared gather's local output. Larger
+# forwards take the replicated-row path, whose attention-output and expert
+# sums add the ranks in another order.
+MUSE_OWNED_ROWS_MAX_TOKENS = 8192
+# The largest chunk the layout follows: the size its outputs were checked
+# at against the replicated path. It is well inside the producer buffer's
+# 32-bit offset range (131071 rows).
+MUSE_OWNED_ROWS_LIMIT_TOKENS = 24576
+# Expert TP (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
+# limit stays at 8192; larger expert-TP forwards replicate rows.
+MUSE_OWNED_ROUTE_MAX_TOKENS = 8192
+
+
+def _owned_rows_max_tokens() -> int:
+    """The most token rows a forward takes on the owned-row layout.
+
+    Chunks above 8192 tokens stay on owned rows instead of replicated rows,
+    which changes the order their sums are taken in; --numerics rl-bitwise
+    keeps 8192, and the layout follows the chunk size up to 24576 rows.
+    """
+    chunk = global_server_args_dict["chunked_prefill_size"]
+    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES or chunk is None:
+        return MUSE_OWNED_ROWS_MAX_TOKENS
+    return min(max(chunk, MUSE_OWNED_ROWS_MAX_TOKENS), MUSE_OWNED_ROWS_LIMIT_TOKENS)
+
+
+def _owned_heads_to_owners(o_proj: nn.Module) -> bool:
+    """Whether --owned-attention-output all-to-all applies to this output
+    projection; the owner-side projection takes the whole weight in BF16."""
+    if global_server_args_dict["owned_attention_output"] != "all-to-all":
+        return False
+    if not (
+        isinstance(o_proj.quant_method, UnquantizedLinearMethod)
+        and o_proj.weight.dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "--owned-attention-output all-to-all needs a BF16 output projection"
+        )
+    return True
+
+
+def _heads_to_owners_applies(
+    owned_global_rows: int | None,
+    iris: "MuseIrisState | None",
+    forward_mode: ForwardMode,
+    attention: nn.Module,
+) -> bool:
+    """Whether this forward's attention output takes the heads all-to-all: an
+    owned-row prefill (extend) forward on Iris with the gathered output weight;
+    other forward modes keep the reduce-scatter."""
+    return (
+        owned_global_rows is not None
+        and iris is not None
+        and forward_mode.is_extend()
+        and attention.owned_output_proj is not None
+    )
+
+
+def _heads_refusal(cause: str) -> str:
+    return (
+        "--owned-attention-output all-to-all needs Muse Spark's Iris owned-row "
+        f"prefill, which this server does not run ({cause}); serve with "
+        "--owned-attention-output reduce-scatter"
+    )
+
+
+def _payload_refusal(cause: str) -> str:
+    return (
+        "--prefill-collective-payload int8-block16 needs Muse Spark's Iris "
+        f"owned-row prefill, which this server does not run ({cause}); serve with "
+        "--prefill-collective-payload bf16"
+    )
+
+
+def _collective_payload(forward_mode: ForwardMode) -> str:
+    """Return the owned-row collective payload encoding for a forward mode.
+
+    Extend forwards take the --prefill-collective-payload choice; decode (and
+    verify), mixed and idle forwards keep BF16.
+    """
+    if forward_mode.is_extend():
+        return global_server_args_dict["prefill_collective_payload"]
+    return "bf16"
 
 
 class PreparedFP32RouterGEMV(nn.Module):
@@ -1153,6 +1658,30 @@ class PreparedFP32RouterGEMV(nn.Module):
             self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
         )
 
+    def warm_with_mm(self, mm_b: torch.Tensor, max_rows: int) -> None:
+        """Compile every binary :meth:`forward_with_mm` can select with ``mm_b``.
+
+        The shared launch serves only a few rows, which the startup warm
+        forwards may never run (their extend is past that row limit). One
+        launch inside the warm-up scope, at the first of up to ``max_rows``
+        row counts it serves, makes the selected kernel compile its binary for
+        every row count it serves; does nothing when none of them shares the
+        launch. Raises if the weight was not prepared, which would otherwise
+        make every row count skip the launch and leave its compiles to serving.
+        """
+        if self.prepared_weight is None:
+            raise RuntimeError("router weight was not prepared after loading")
+        hidden = self.weight.shape[0]
+        for rows in range(1, max_rows + 1):
+            x = self.weight.new_zeros((rows, hidden))
+            mm_a = mm_b.new_zeros((rows, mm_b.shape[1]))
+            if self.supports_with_mm(x, mm_a, mm_b):
+                with kernel_warmup(enabled=True):
+                    self.forward_with_mm(
+                        x, mm_a, mm_b, mm_b.new_empty((rows, mm_b.shape[0]))
+                    )
+                return
+
 
 class MuseSparkRouter(PreparedFP32RouterGEMV):
     """FP32 routing scores plus the bias that only steers the top-k selection."""
@@ -1178,11 +1707,16 @@ class MuseSparkRouter(PreparedFP32RouterGEMV):
 class MuseSparkMoE(nn.Module):
     """Sharded SwiGLU experts with per-route post normalization.
 
-    The experts run as raw BF16 weights through the portable Triton route
-    kernel, or as FP4 weights through ``MoELayer``'s planned kernel when the
-    checkpoint quantizes this layer. Both arms finish with the same post-expert
-    norm and weighted reduction: the BF16 arm over a materialized per-route
-    tensor, the quantized one straight through the planned kernel's permute map.
+    The experts, BF16 or FP4 as the checkpoint stores this layer, run through
+    ``MoELayer``'s planned kernel with the finalize deferred. The post-expert
+    norm and weighted reduction then read its routes in token order, or
+    through the kernel's permute map when it returns one.
+
+    Under attention TP, the MoE group holds the same rows on every rank. Under
+    attention DP, each rank holds its own rows (``exchanges_rank_local_rows``):
+    Gluon Petit returns every route of this rank's rows from the EP group,
+    and other expert layers gather the group's compressed rows, padded to the
+    largest rank's count, and reduce-scatter their partial sums back.
     """
 
     def __init__(
@@ -1202,9 +1736,19 @@ class MuseSparkMoE(nn.Module):
             raise ValueError(
                 "Muse Spark MoE requires pure tensor or expert parallelism"
             )
-        if mapping.attn.tp_group != mapping.moe.tp_ep_group:
+        # Attention DP across the whole EP group keeps rows rank-local.
+        self.exchanges_rank_local_rows = (
+            mapping.attn.tp_size == 1
+            and mapping.moe.tp_size == 1
+            and mapping.attn.dp_size == mapping.moe.ep_size > 1
+        )
+        if (
+            mapping.attn.tp_group != mapping.moe.tp_ep_group
+            and not self.exchanges_rank_local_rows
+        ):
             raise ValueError(
-                "Muse Spark requires the attention TP and MoE groups to match"
+                "Muse Spark requires the attention TP and MoE groups to "
+                "match, or attention DP across the expert group"
             )
         if config.num_local_experts % mapping.moe.ep_size:
             raise ValueError("the expert count must divide evenly across EP ranks")
@@ -1222,7 +1766,6 @@ class MuseSparkMoE(nn.Module):
         self.tp_size = mapping.moe.tp_size
         self.tp_group = mapping.moe.tp_group
         compressed_size = config.moe_hidden_size
-        intermediate_size = config.moe_intermediate_size // self.tp_size
 
         self.gate = MuseSparkRouter(
             hidden_size=config.hidden_size,
@@ -1256,49 +1799,36 @@ class MuseSparkMoE(nn.Module):
                 quant_config.exclude_modules,
             )
         )
-        if self.quantized_experts:
-            self.experts = MoELayer(
-                top_k=self.topk,
-                num_experts=self.num_experts,
-                hidden_size=compressed_size,
-                intermediate_size=config.moe_intermediate_size,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=experts_prefix,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                ep_rank=self.ep_rank,
-                ep_size=self.ep_size,
-                # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
-                activation="silu",
-                routing_mode="precomputed_topk",
-            )
-            self.expert_quant_kind = self.experts._quant_kind
-            if self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
-                raise ValueError(
-                    "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
-                )
-            if not self.experts.supports_deferred_finalize:
-                raise ValueError(
-                    "Muse Spark normalizes each expert route before the "
-                    "top-k reduction, so its MoE kernel must defer the finalize"
-                )
-        else:
-            self.expert_quant_kind = "unquant"
-            self.experts = nn.Module()
-            self.experts.w13_weight = nn.Parameter(
-                torch.empty(
-                    self.experts_per_rank,
-                    2 * intermediate_size,
-                    compressed_size,
-                )
-            )
-            self.experts.w2_weight = nn.Parameter(
-                torch.empty(
-                    self.experts_per_rank,
-                    compressed_size,
-                    intermediate_size,
-                )
+        self.experts = MoELayer(
+            top_k=self.topk,
+            num_experts=self.num_experts,
+            hidden_size=compressed_size,
+            intermediate_size=config.moe_intermediate_size,
+            # The exclusions above leave some expert layers in BF16.
+            quant_config=quant_config if self.quantized_experts else None,
+            layer_index=layer_id,
+            prefix=experts_prefix,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
+            activation="silu",
+            routing_mode="precomputed_topk",
+            # Each route is normalized before the top-k reduction.
+            requires_deferred_finalize=True,
+            # Gluon Petit runs only MXFP4 experts; under attention DP the BF16
+            # layers exchange gathered rows instead.
+            a2a_backend=(
+                "none"
+                if self.exchanges_rank_local_rows and not self.quantized_experts
+                else None
+            ),
+        )
+        self.expert_quant_kind = self.experts._quant_kind
+        if self.quantized_experts and self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
+            raise ValueError(
+                "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
             )
         self.post_expert_norm = MuseSparkRMSNorm(
             hidden_size=compressed_size,
@@ -1345,9 +1875,18 @@ class MuseSparkMoE(nn.Module):
             replicate_for_owned_rows=False,
             workspace_rows=_GATHER_WORKSPACE_ROWS,
         )
+        # Gluon Petit owns dispatch and returns each local row's routes.
+        self.uses_petit = self.experts.plan["a2a_backend"] == "gluon_petit"
+        if self.uses_petit and not self.exchanges_rank_local_rows:
+            raise ValueError("Muse Spark runs Gluon Petit only under attention DP")
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}
         self.iris_state: MuseIrisState | None = None
+        self.owned_projections: _OwnedRowProjections | None = (
+            _OwnedRowProjections(mapping.attn.tp_group)
+            if mapping.attn.tp_size > 1 and current_platform().is_nvidia
+            else None
+        )
         # On NVIDIA the routed-sum kernel all-reduces decode batches over EP through this mailbox.
         self.ep_all_reduce = (
             _bind_ep_all_reduce(
@@ -1365,8 +1904,12 @@ class MuseSparkMoE(nn.Module):
         route_weights: torch.Tensor,
         *,
         owned_rows: bool,
+        payload: str,
     ) -> torch.Tensor:
-        """Complete TP routes before normalization, or sum normalized EP routes."""
+        """Complete TP routes before normalization, or sum normalized EP routes.
+
+        ``payload`` is the owned-row reduce-scatters' encoding
+        (``_collective_payload``)."""
         norm = self.post_expert_norm
         iris = self.iris_state
         if self.tp_size > 1:
@@ -1462,6 +2005,7 @@ class MuseSparkMoE(nn.Module):
                     norm.weight,
                     norm.eps,
                     norm.weight_offset,
+                    payload=payload,
                 )
                 if reduced is not None:
                     return reduced
@@ -1543,7 +2087,7 @@ class MuseSparkMoE(nn.Module):
                 # The kernel already summed over the EP ranks.
                 return combined
             if owned_rows:
-                return iris.reduce_scatter_owned_rows(combined)
+                return iris.reduce_scatter_owned_rows(combined, payload=payload)
         if not owned_rows and self.ep_size <= 1:
             return combined
         if not current_platform().is_cdna4:
@@ -1556,10 +2100,10 @@ class MuseSparkMoE(nn.Module):
                 output.copy_(combined)
             combined = output
         if owned_rows:
-            return iris.reduce_scatter_owned_rows(combined)
+            return iris.reduce_scatter_owned_rows(combined, payload=payload)
         return _muse_all_reduce(self.iris_state, (combined,), self.ep_group)[0]
 
-    def _quantized_combined(
+    def _experts_combined(
         self,
         compressed: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         compressed_quantized: tuple[torch.Tensor, torch.Tensor] | None,
@@ -1570,8 +2114,13 @@ class MuseSparkMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         prepared: PreparedNvfp4Routing | None,
         owned_rows: bool,
+        *,
+        payload: str,
     ) -> torch.Tensor:
-        """Run FP4 experts and complete sharded routes before normalization."""
+        """Run the experts and complete sharded routes before normalization.
+
+        ``payload`` is the owned-row reduce-scatters' encoding
+        (``_collective_payload``)."""
         norm_weight = self.post_expert_norm.weight
         iris = self.iris_state
         if (
@@ -1608,7 +2157,10 @@ class MuseSparkMoE(nn.Module):
             assert gemm2_out.data_ptr() == deferred_out.data_ptr()
         if prepared is None:
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
-        if (
+        # Map-less routes are in token order with every row defined.
+        if expanded_idx is None:
+            gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
+        elif (
             self.tp_size > 1
             and self.ep_size == 1
             and self.experts.deferred_output_is_token_order
@@ -1629,6 +2181,65 @@ class MuseSparkMoE(nn.Module):
             num_tokens=topk_ids.shape[0],
             route_weights=topk_weights,
             owned_rows=owned_rows,
+            payload=payload,
+        )
+
+    def _forward_owned_projections(
+        self,
+        hidden_states: torch.Tensor,
+        router_input: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        rows: int,
+    ) -> tuple[torch.Tensor, None]:
+        """Route owned rows, run the sharded projections and experts on all rows, return owned rows."""
+        owned = self.owned_projections
+        assert owned is not None
+        topk_weights, topk_ids = self._select_experts(
+            self.gate(router_input, pdl_enabled()), None
+        )
+        routes = owned.gather_rows(
+            torch.cat((topk_ids, topk_weights.view(torch.int32)), dim=1), rows
+        )
+        topk_ids = routes[:, : self.topk].contiguous()
+        topk_weights = routes[:, self.topk :].contiguous().view(torch.float32)
+        projection = self.pre_expert_proj
+        compressed = all_gather(
+            owned.gather_mm(hidden_states, rows, projection.weight, owned.pre_expert),
+            projection.group,
+            dim=-1,
+            backend=get_global_backend().nccl,
+        )
+        norm = self.pre_expert_norm
+        if self.expert_quant_kind == "nvfp4":
+            compressed_quantized = rmsnorm_nvfp4_quant(
+                compressed,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                self.experts.w13_input_scale_quant,
+                None,
+                pdl_enabled(),
+            )
+        else:
+            compressed = norm(compressed, compressed.dtype)
+            compressed_quantized = None
+        combined = self._experts_combined(
+            compressed,
+            compressed_quantized,
+            topk_weights,
+            topk_ids,
+            None,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            None,
+            False,
+            # Rank-local rows: no owned-row collective reads the payload.
+            payload="bf16",
+        )
+        return (
+            owned.matmul_to_owners(combined, rows, self.post_expert_proj.weight),
+            None,
         )
 
     def _column_split_combined(
@@ -1683,13 +2294,14 @@ class MuseSparkMoE(nn.Module):
         ]
         | None
     ):
-        """Route and quantize decode rows in two launches, or None.
+        """Route and quantize decode rows in two or three launches, or None.
 
-        The router shares a launch with this rank's pre-expert columns, and the
-        top-k shares one with the column gather, RMSNorm and MXFP4
-        quantization. Neither launch has a dependency between its halves, so
-        this replaces four launches with two. Returns the BF16 placeholder
-        rows, the MXFP4 rows, the router logits and the top-k weights and ids.
+        The top-k shares a launch with the column gather, RMSNorm and MXFP4
+        quantization, and up to the router's shared-launch row limit the router
+        shares one with this rank's pre-expert columns. Neither launch has a
+        dependency between its halves, so this replaces four launches with two
+        (three past that limit). Returns the BF16 placeholder rows, the MXFP4
+        rows, the router logits and the top-k weights and ids.
         """
         iris = self.iris_state
         projection = self.pre_expert_proj
@@ -1707,16 +2319,19 @@ class MuseSparkMoE(nn.Module):
         weight = projection._local_weight()
         local = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
         bias = self.gate.e_score_correction_bias
-        if not (
-            self.gate.supports_with_mm(router_input, hidden_states, weight)
-            and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
-                local, norm.weight, bias, self.topk
-            )
+        if not iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, norm.weight, bias, self.topk
         ):
             return None
-        router_logits = self.gate.forward_with_mm(
-            router_input, hidden_states, weight, local
-        )
+        if self.gate.supports_with_mm(router_input, hidden_states, weight):
+            router_logits = self.gate.forward_with_mm(
+                router_input, hidden_states, weight, local
+            )
+        else:
+            # Rows past the router's shared-launch limit leave the router and
+            # this rank's pre-expert columns a launch each.
+            router_logits = self.gate(router_input, pdl_enabled())
+            projection._project(hidden_states, weight, local)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
@@ -1821,14 +2436,25 @@ class MuseSparkMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
         project: bool,
-    ) -> tuple[torch.Tensor, int | None, MailboxPublish | None]:
+        *,
+        payload: str,
+    ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
-        The returned projection may defer its gather, and the store of this
-        rank's block, to the residual boundary.
+        The returned projection may defer its gather to the residual boundary.
         Without ``project`` the combined expert rows are returned unprojected
-        for a boundary that applies ``post_expert_proj`` itself.
+        for a boundary that applies ``post_expert_proj`` itself. ``payload``
+        is the owned-row reduce-scatters' encoding (``_collective_payload``).
         """
+        if owned_global_rows is not None and self.iris_state is None:
+            assert project
+            return self._forward_owned_projections(
+                hidden_states,
+                router_input,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                owned_global_rows,
+            )
         routed = (
             self._route_and_quantize_inputs(hidden_states, router_input)
             if owned_global_rows is None
@@ -1882,10 +2508,8 @@ class MuseSparkMoE(nn.Module):
                     )
                 elif self.expert_quant_kind == "nvfp4":
                     width = self.pre_expert_proj.output_size
-                    compressed, sentinel, publish = (
-                        self.pre_expert_proj.forward_with_mailbox(
-                            hidden_states, width & (width - 1) == 0
-                        )
+                    compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
+                        hidden_states, width & (width - 1) == 0
                     )
                     compressed_quantized = rmsnorm_nvfp4_quant(
                         compressed,
@@ -1895,8 +2519,12 @@ class MuseSparkMoE(nn.Module):
                         self.experts.w13_input_scale_quant,
                         sentinel,
                         pdl_enabled(),
-                        publish,
                     )
+                    if sentinel is not None:
+                        # The experts read the quantized rows; their BF16 operand only lends its shape.
+                        compressed = hidden_states.new_empty(
+                            (hidden_states.shape[0], width)
+                        )
                 else:
                     # MXFP4 kernels dynamically quantize this normalized BF16 row
                     # into OCP E2M1 values with group-32 E8M0 scales.
@@ -1935,64 +2563,185 @@ class MuseSparkMoE(nn.Module):
             )
             compressed_quantized = None
             router_logits = None
-        if self.quantized_experts:
-            combined = self._quantized_combined(
-                (
-                    compressed.contiguous()
-                    if isinstance(compressed, torch.Tensor)
-                    else compressed
-                ),
-                compressed_quantized,
-                topk_weights,
-                topk_ids,
-                router_logits,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-                prepared,
-                owned_global_rows is not None,
-            )
-        else:
-            routes = bf16_moe_routes(
-                compressed.contiguous(),
-                self.experts.w13_weight,
-                self.experts.w2_weight,
-                topk_ids.contiguous(),
-                self.expert_start,
-                output=(
-                    self._acquire_route_destination(
-                        compressed.shape[0], owned_global_rows is not None
-                    )
-                    if self.tp_size > 1 and self.iris_state is not None
-                    else None
-                ),
-                batch_invariant=global_server_args_dict["numerics"]
-                in BITWISE_ENVELOPES,
-            )
-            combined = self._reduce_expert_routes(
-                routes=routes,
-                route_map=None,
-                num_tokens=compressed.shape[0],
-                route_weights=topk_weights,
-                owned_rows=owned_global_rows is not None,
-            )
+        combined = self._experts_combined(
+            (
+                compressed.contiguous()
+                if isinstance(compressed, torch.Tensor)
+                else compressed
+            ),
+            compressed_quantized,
+            topk_weights,
+            topk_ids,
+            router_logits,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            prepared,
+            owned_global_rows is not None,
+            payload=payload,
+        )
         if not project:
             assert owned_global_rows is None
-            return combined, None, None
+            return combined, None
         if owned_global_rows is not None:
             output = iris.acquire_owned_post_expert_output(
                 owned_global_rows, self.post_expert_proj.output_size
             )
-            return (
-                self.post_expert_proj.forward_owned_rows(combined, output),
-                None,
-                None,
-            )
+            return self.post_expert_proj.forward_owned_rows(combined, output), None
         return self.post_expert_proj.forward_with_mailbox(
             combined,
             boundary_gathers_mailbox(
                 combined.shape[0], self.post_expert_proj.output_size, 1
             ),
         )
+
+    def _normalized_route_sum(
+        self,
+        routes: torch.Tensor,
+        route_map: torch.Tensor | None,
+        num_tokens: int,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize each route, then sum the weighted routes of each token."""
+        norm = self.post_expert_norm
+        if route_map is None:
+            return routed_input_scale_rmsnorm_sum(
+                routes,
+                route_weights,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                pdl_enabled(),
+                None,
+            )
+        return routed_input_scale_rmsnorm_sum_gathered(
+            routes,
+            route_map,
+            num_tokens,
+            self.topk,
+            route_weights,
+            norm.weight,
+            norm.eps,
+            norm.weight_offset,
+            pdl_enabled(),
+            None,
+        )
+
+    def _gathered_expert_partial(
+        self,
+        compressed: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        max_rows: int,
+    ) -> torch.Tensor:
+        """Sum this rank's experts' normalized routes over every EP rank's padded rows.
+
+        Each rank pads its rows to ``max_rows``; padded rows hold zero inputs
+        and zero route weights, so they reduce to zero. Each padded row still
+        selects ``topk`` distinct experts, as a real row does.
+        """
+        rows = compressed.shape[0]
+        padded_compressed = compressed.new_zeros((max_rows, compressed.shape[1]))
+        # Padded rows select this rank's own experts, so no single rank
+        # computes every rank's padding.
+        padded_ids = (
+            torch.arange(self.topk, dtype=topk_ids.dtype, device=topk_ids.device)
+            % self.experts_per_rank
+            + self.expert_start
+        ).repeat(max_rows, 1)
+        padded_weights = topk_weights.new_zeros((max_rows, self.topk))
+        payloads = []
+        for padded, tensor in (
+            (padded_compressed, compressed),
+            (padded_ids, topk_ids),
+            (padded_weights, topk_weights),
+        ):
+            padded[:rows].copy_(tensor)
+            payloads.append(all_gather(padded, self.ep_group, dim=0))
+        compressed, topk_ids, topk_weights = payloads
+        rows = compressed.shape[0]
+        routes, route_weights, route_map = self.experts(
+            hidden_states=compressed,
+            topk_output=StandardTopKOutput(topk_weights, topk_ids, None),
+            num_global_tokens=rows,
+            max_num_tokens_per_gpu=rows,
+            do_finalize=False,
+        )
+        if route_map is None:
+            # Map-less routes are in token order with every row defined.
+            routes = routes.view(*topk_ids.shape, routes.shape[-1])
+        # Routes of other ranks' experts are zero and normalize to zero.
+        return self._normalized_route_sum(routes, route_map, rows, route_weights)
+
+    def forward_rank_local(
+        self,
+        hidden_states: torch.Tensor,
+        router_input: torch.Tensor,
+        counts: list[int],
+    ) -> torch.Tensor:
+        """Route this rank's attention-DP rows through the EP group's experts.
+
+        Every EP rank calls this with the same ``counts`` (rows per EP rank),
+        including ranks without rows: they still serve their experts to peers.
+
+        Args:
+            hidden_states: This rank's BF16 normalized rows ``[rows, hidden]``.
+            router_input: The same rows in FP32 for the router.
+            counts: Rows held by each EP rank, in EP rank order.
+
+        Returns:
+            The post-expert projection of this rank's rows ``[rows, hidden]``.
+        """
+        assert self.exchanges_rank_local_rows
+        rows = hidden_states.shape[0]
+        if len(counts) != self.ep_size or counts[self.ep_rank] != rows:
+            raise ValueError(
+                f"EP row counts {counts} do not hold {rows} rows at EP rank "
+                f"{self.ep_rank}"
+            )
+        output_size = self.post_expert_proj.output_size
+        if max(counts) == 0:
+            # No rank holds rows, so every rank skips the exchange consistently.
+            return hidden_states.new_empty((0, output_size))
+        if rows:
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
+                compressed = self.pre_expert_norm(
+                    self.pre_expert_proj(hidden_states), hidden_states.dtype
+                )
+                with fork.branch():
+                    router_logits = self.gate(router_input, pdl_enabled())
+                    topk_weights, topk_ids = self._select_experts(router_logits, None)
+        else:
+            compressed = hidden_states.new_empty((0, self.pre_expert_proj.output_size))
+            topk_ids = torch.empty(
+                (0, self.topk), dtype=torch.int32, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.topk), dtype=torch.float32, device=hidden_states.device
+            )
+        if self.uses_petit:
+            routes, _, _ = self.experts(
+                hidden_states=compressed,
+                topk_output=StandardTopKOutput(topk_weights, topk_ids, None),
+                num_global_tokens=sum(counts),
+                max_num_tokens_per_gpu=max(counts),
+                do_finalize=False,
+            )
+            if not rows:
+                return hidden_states.new_empty((0, output_size))
+            combined = self._normalized_route_sum(routes, None, rows, topk_weights)
+        else:
+            # Sum the ranks' BF16 partials in FP32 and round the total once.
+            combined = reduce_scatter(
+                self._gathered_expert_partial(
+                    compressed, topk_ids, topk_weights, max(counts)
+                ).float(),
+                self.ep_group,
+            )[:rows].to(hidden_states.dtype)
+            if not rows:
+                return hidden_states.new_empty((0, output_size))
+        return self.post_expert_proj(combined)
 
 
 class MuseSparkResidualGate(nn.Module):
@@ -2100,6 +2849,7 @@ class MuseSparkDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         attention_input: torch.Tensor,
+        attention_input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -2133,6 +2883,7 @@ class MuseSparkDecoderLayer(nn.Module):
         return attn.forward_sliding_tail(
             positions,
             attention_input,
+            attention_input_fp8,
             ctx,
             cache,
             hidden_states,
@@ -2148,23 +2899,53 @@ class MuseSparkDecoderLayer(nn.Module):
         self.post_attention_residual_gate.refresh_gate()
         self.post_feedforward_residual_gate.refresh_gate()
 
+    def mlp_boundary_writes_fp8(
+        self, rows: int, *, owned_rows: bool, mailbox: bool
+    ) -> bool:
+        """Whether the MLP boundary writes an FP8 copy of the next layer's
+        attention input rows, which that layer's QKV projection reads in FP8.
+        Every layer's QKV takes the same rows, so this layer's predicate
+        answers for the next. An owned-row forward, a mailbox branch (the
+        next QKV then quantizes its rows itself, with the same bits) or the
+        next layer's pre_attn_comm gather replaces those rows, so none is
+        written there."""
+        # The window predicate first: with the flag off it is one check.
+        return (
+            self.self_attn.qkv_proj.dense_fp8.applies(rows)
+            and not owned_rows
+            and not mailbox
+            # Every Muse Spark layer is MoE, so the next layer's gather
+            # follows this layer's layout.
+            and self.comm_manager.use_all_reduce(is_moe=True)
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         attention_input: torch.Tensor | None,
+        attention_input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         next_input_layernorm: MuseSparkRMSNorm | None,
         owned_global_rows: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Advance full or owned FP32 residual rows and prepare the next attention input."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """Advance full or owned FP32 residual rows and prepare the next attention input.
+
+        ``attention_input_fp8`` is the per-row FP8 copy of ``attention_input``
+        from the previous boundary, or None. Returns the residual rows, the next
+        attention input and its FP8 copy (None unless the next QKV takes one).
+        """
         iris = None
         owned_qkvg = False
         if owned_global_rows is not None:
             iris = self.iris_state
-            assert iris is not None
-            # Layer zero receives full input; later large batches project owned rows.
-            owned_qkvg = (
+            assert iris is not None or self.self_attn.owned_projections is not None
+            # NVIDIA projects owned rows from layer zero; Iris past it at large batches.
+            owned_qkvg = iris is None or (
                 self.comm_manager.layer_id > 0
                 and owned_global_rows >= MUSE_OWNED_QKVG_MIN_TOKENS
             )
@@ -2176,7 +2957,16 @@ class MuseSparkDecoderLayer(nn.Module):
                     "serve without --enable-mixed-batch"
                 )
             if hidden_states.shape[0] == 0:
-                return hidden_states, None
+                if self.mlp.exchanges_rank_local_rows:
+                    # Peers' expert exchange needs every EP rank, with or without rows.
+                    self.mlp.forward_rank_local(
+                        hidden_states.new_empty(
+                            (0, hidden_states.shape[1]), dtype=torch.bfloat16
+                        ),
+                        hidden_states,
+                        self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx),
+                    )
+                return hidden_states, None, None
         if not owned_qkvg:
             # The input norm is row-wise, so either side of the comm agrees.
             if attention_input is None and owned_global_rows is None:
@@ -2186,24 +2976,40 @@ class MuseSparkDecoderLayer(nn.Module):
                     norm.weight.dtype,
                 )
             else:
-                attention_input = self.comm_manager.pre_attn_comm(attention_input, ctx)
+                communicated = self.comm_manager.pre_attn_comm(attention_input, ctx)
+                if communicated is not attention_input:
+                    # The FP8 copy describes the rows before the comm.
+                    attention_input_fp8 = None
+                attention_input = communicated
         # Sliding decode rows may run attention through its boundary in one launch.
         fused = (
-            self._sliding_attention_tail(positions, attention_input, ctx, hidden_states)
+            self._sliding_attention_tail(
+                positions, attention_input, attention_input_fp8, ctx, hidden_states
+            )
             if owned_global_rows is None
             else None
         )
         if fused is None:
-            attention_output, attention_sentinel, attention_ranks, attention_publish = (
-                self.self_attn(
-                    positions,
-                    attention_input,
-                    ctx,
-                    owned_global_rows if owned_qkvg else None,
-                )
+            heads_to_owners = _heads_to_owners_applies(
+                owned_global_rows, iris, ctx.forward_mode, self.self_attn
             )
-            if owned_global_rows is not None:
-                attention_output = iris.reduce_scatter_owned_rows(attention_output)
+            attention_output, attention_sentinel, attention_ranks = self.self_attn(
+                positions,
+                attention_input,
+                attention_input_fp8,
+                ctx,
+                owned_global_rows if owned_qkvg else None,
+                not heads_to_owners,
+            )
+            if heads_to_owners:
+                attention_output = self.self_attn.project_owned_heads(
+                    attention_output, owned_global_rows
+                )
+            elif owned_global_rows is not None and iris is not None:
+                attention_output = iris.reduce_scatter_owned_rows(
+                    attention_output,
+                    payload=_collective_payload(ctx.forward_mode),
+                )
             elif (
                 self.self_attn.o_proj.tp_size > 1
                 and not self.self_attn.o_proj.reduce_results
@@ -2266,15 +3072,14 @@ class MuseSparkDecoderLayer(nn.Module):
                 pdl_enabled(),
                 attention_sentinel,
                 attention_ranks,
-                attention_publish,
             )
-        if owned_global_rows is None:
+        # Attention DP keeps rows rank-local: the expert exchange moves only
+        # their compressed projections.
+        rank_local = self.mlp.exchanges_rank_local_rows
+        if owned_global_rows is None and not rank_local:
             mlp_input = self.comm_manager.pre_mlp_comm(mlp_input, ctx)
         else:
             assert router_input is not None and mlp_input is not None
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
         post_norm = self.post_feedforward_layernorm
         alpha, beta = self.post_feedforward_residual_gate._gate_coefficients()
         next_weight, next_eps, next_weight_offset = (
@@ -2291,6 +3096,7 @@ class MuseSparkDecoderLayer(nn.Module):
         # boundary gathers them, which beats streaming the replicated weight.
         project_in_boundary = (
             owned_global_rows is None
+            and not rank_local
             and self.iris_state is not None
             and projection.replicated
             and not projection.gather_column_view
@@ -2307,34 +3113,46 @@ class MuseSparkDecoderLayer(nn.Module):
                 next_weight,
             )
         )
-        mlp_output, sentinel, mlp_publish = self.mlp(
-            mlp_input,
-            router_input,
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-            owned_global_rows,
-            project=not project_in_boundary,
-        )
-        if project_in_boundary:
-            return self.iris_state.gemv_all_gather_boundary(
-                mlp_output,
-                projection.weight,
-                hidden_states,
-                post_norm.weight,
-                alpha,
-                beta,
-                next_weight,
-                post_norm.eps,
-                post_norm.weight_offset,
-                next_eps,
-                next_weight_offset,
+        if rank_local:
+            mlp_output, sentinel = (
+                self.mlp.forward_rank_local(
+                    mlp_input,
+                    router_input,
+                    self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx),
+                ),
+                None,
             )
-        boundary = (
-            post_norm_residual_pre_norm_bf16
-            if current_platform().is_cdna4
-            else post_norm_residual_pre_norm
-        )
-        boundary_outputs = boundary(
+        else:
+            num_global_tokens, max_num_tokens_per_gpu = (
+                self.comm_manager.get_num_tokens(ctx)
+            )
+            mlp_output, sentinel = self.mlp(
+                mlp_input,
+                router_input,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                owned_global_rows,
+                project=not project_in_boundary,
+                payload=_collective_payload(ctx.forward_mode),
+            )
+        if project_in_boundary:
+            hidden_states, next_attention_input = (
+                self.iris_state.gemv_all_gather_boundary(
+                    mlp_output,
+                    projection.weight,
+                    hidden_states,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    next_weight,
+                    post_norm.eps,
+                    post_norm.weight_offset,
+                    next_eps,
+                    next_weight_offset,
+                )
+            )
+            return hidden_states, next_attention_input, None
+        boundary_args = (
             hidden_states,
             mlp_output,
             post_norm.weight,
@@ -2348,18 +3166,46 @@ class MuseSparkDecoderLayer(nn.Module):
             pdl_enabled(),
             None if owned_global_rows is not None else sentinel,
             1,
-            None if owned_global_rows is not None else mlp_publish,
         )
-        hidden_states, next_attention_input = boundary_outputs[0], boundary_outputs[-1]
+        boundary = (
+            post_norm_residual_pre_norm_bf16
+            if current_platform().is_cdna4
+            else post_norm_residual_pre_norm
+        )
+        # The next layer's QKV, when it runs in FP8, reads the per-row FP8
+        # copy the boundary writes alongside the BF16 rows. Every layer's QKV
+        # takes the same rows, so this layer's answers for the next.
+        if (
+            next_weight is not None
+            and _fp8_projections(ctx.forward_mode)
+            and self.mlp_boundary_writes_fp8(
+                # The residual rows give the row count: a mailbox branch is a
+                # [ranks, rows, shard] view.
+                hidden_states.shape[0],
+                owned_rows=owned_global_rows is not None,
+                mailbox=sentinel is not None,
+            )
+        ):
+            hidden_states, next_attention_input, next_attention_input_fp8 = (
+                post_norm_residual_pre_norm_bf16_fp8(*boundary_args)
+            )
+        else:
+            next_attention_input_fp8 = None
+            boundary_outputs = boundary(*boundary_args)
+            hidden_states, next_attention_input = (
+                boundary_outputs[0],
+                boundary_outputs[-1],
+            )
         if (
             owned_global_rows is not None
             and next_attention_input is not None
+            and iris is not None
             and owned_global_rows < MUSE_OWNED_QKVG_MIN_TOKENS
         ):
             next_attention_input = iris.all_gather_owned_rows(
                 next_attention_input, owned_global_rows, False
             )
-        return hidden_states, next_attention_input
+        return hidden_states, next_attention_input, next_attention_input_fp8
 
 
 def _widen_modelopt_exclusions(quant_config: QuantizationConfig | None) -> None:
@@ -2372,10 +3218,16 @@ def _widen_modelopt_exclusions(quant_config: QuantizationConfig | None) -> None:
     ]
 
 
+class MuseSparkMonokernelDecoderLayer(MuseSparkMonokernelLayer, MuseSparkDecoderLayer):
+    """Muse Spark layer whose decode steps run as one monokernel launch."""
+
+
 class MuseSparkModel(BaseTransformerModel):
     """Text decoder using TokenSpeed's ordinary MHA cache route."""
 
     layer_cls = MuseSparkDecoderLayer
+    # The layer class with --decode-monokernel.
+    monokernel_layer_cls = MuseSparkMonokernelDecoderLayer
 
     def __init__(
         self,
@@ -2404,6 +3256,15 @@ class MuseSparkModel(BaseTransformerModel):
             weight_offset=OUTPUT_GAIN_OFFSET,
         )
         self.iris_state: MuseIrisState | None = None
+        self.owned_projections: _OwnedRowProjections | None = (
+            _OwnedRowProjections(mapping.attn.tp_group)
+            if mapping.attn.tp_size > 1 and current_platform().is_nvidia
+            else None
+        )
+        # The state that the monokernel layers share (--decode-monokernel),
+        # set by prepare_monokernel_state once the Iris collectives exist.
+        # None with the regular layers.
+        self.monokernel_state: MuseSparkMonokernelState | None = None
 
     def resolve_layers(
         self,
@@ -2419,9 +3280,12 @@ class MuseSparkModel(BaseTransformerModel):
             if torch.cuda.is_available() and not current_platform().is_cdna4
             else None
         )
+        layer_cls = (
+            self.monokernel_layer_cls if config.decode_monokernel else self.layer_cls
+        )
         return make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: self.layer_cls(
+            lambda idx, prefix: layer_cls(
                 config=config,
                 layer_id=idx,
                 mapping=self.mapping,
@@ -2453,6 +3317,28 @@ class MuseSparkModel(BaseTransformerModel):
         if rows < MUSE_OWNED_ROWS_MIN_TOKENS:
             return False
         mapping = self.mapping
+        if self.owned_projections is not None:
+            return (
+                rows >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS
+                and not ctx.forward_mode.is_idle()
+                and not ctx.forward_mode.is_mixed()
+                and mapping.pp_size == 1
+                and mapping.moe.tp_size == 1
+                and not mapping.attn.has_qcp
+                and not _gemm_dispatch_required()
+                and not global_server_args_dict.get(
+                    "batch_invariant_collectives", False
+                )
+                # The owned path gathers draft taps in BF16, as the Iris one does.
+                and self.embed_tokens.weight.dtype == torch.bfloat16
+                and self.owned_projections.qkv is not None
+                # Owned rows feed the Q/K/V and output projections as BF16 GEMMs.
+                and all(
+                    isinstance(linear.quant_method, UnquantizedLinearMethod)
+                    for layer in self.layers
+                    for linear in (layer.self_attn.qkv_proj, layer.self_attn.o_proj)
+                )
+            )
         if not (
             current_platform().is_cdna4
             and not ctx.forward_mode.is_idle()
@@ -2510,27 +3396,41 @@ class MuseSparkModel(BaseTransformerModel):
         )
         rows, width = hidden_states.shape
         owned_global_rows = rows if self._can_use_owned_rows(rows, ctx) else None
+        state = self.monokernel_state
+        if state is not None:
+            state.start_step()
         attention_input = None
+        attention_input_fp8 = None
         if owned_global_rows is not None:
             local_rows = (
                 rows + self.mapping.attn.tp_size - 1
             ) // self.mapping.attn.tp_size
             first_row = self.mapping.attn.tp_rank * local_rows
             valid_rows = min(local_rows, max(0, rows - first_row))
-            norm = self.layers[0].input_layernorm
-            attention_input = norm(hidden_states, norm.weight.dtype)
             stream = torch.zeros(
                 (local_rows, width),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
             stream[:valid_rows].copy_(hidden_states[first_row : first_row + valid_rows])
+            norm = self.layers[0].input_layernorm
+            # Iris layer zero projects full rows; NVIDIA projects gathered owned rows.
+            attention_input = norm(
+                hidden_states if self.iris_state is not None else stream,
+                norm.weight.dtype,
+            )
             hidden_states = stream
         aux_hidden_states: list[torch.Tensor] = []
         # An idle forward captures no hidden states, as in the base model's loop.
         taps_live = owned_global_rows is not None or not ctx.forward_mode.is_idle()
+        # The launches may store the draft's taps themselves.
+        launch_taps = (
+            state is not None
+            and owned_global_rows is None
+            and state.claim_taps(rows, ctx)
+        )
         for layer_index, layer in enumerate(self.layers):
-            if taps_live and layer_index in self.layers_to_capture:
+            if taps_live and not launch_taps and layer_index in self.layers_to_capture:
                 self._capture(
                     layer_index,
                     hidden_states,
@@ -2546,14 +3446,21 @@ class MuseSparkModel(BaseTransformerModel):
             )
             # Preserve the owned path's direct call without Module hooks.
             layer_forward = layer.forward if owned_global_rows is not None else layer
-            hidden_states, attention_input = layer_forward(
-                positions,
-                hidden_states,
-                ctx,
-                attention_input,
-                next_input_layernorm,
-                owned_global_rows,
+            # A launch before a layer that a draft taps hands over the whole
+            # rows, so the capture above read the current residual.
+            hidden_states, attention_input, attention_input_fp8 = layer_forward(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                attention_input=attention_input,
+                attention_input_fp8=attention_input_fp8,
+                next_input_layernorm=next_input_layernorm,
+                owned_global_rows=owned_global_rows,
             )
+        if state is not None:
+            state.finish_step()
+        if launch_taps:
+            aux_hidden_states = [state.tap_rows(rows)]
         if taps_live:
             final_layer_index = len(self.layers) + 1
             if final_layer_index in self.layers_to_capture:
@@ -2567,8 +3474,11 @@ class MuseSparkModel(BaseTransformerModel):
             hidden_states = self.norm(hidden_states, self.embed_tokens.weight.dtype)
         if owned_global_rows is not None:
             iris = self.iris_state
-            assert iris is not None
-            hidden_states = iris.all_gather_owned_rows(hidden_states, rows, False)
+            hidden_states = (
+                iris.all_gather_owned_rows(hidden_states, rows, False)
+                if iris is not None
+                else self.owned_projections.gather_rows(hidden_states, rows)
+            )
         return hidden_states, aux_hidden_states or None
 
     def _capture(
@@ -2602,9 +3512,12 @@ class MuseSparkModel(BaseTransformerModel):
             ):
                 tap = tap.to(self.embed_tokens.weight.dtype)
             tap = layer.comm_manager.gather_residual(tap, ctx)
+        elif self.iris_state is None:
+            tap = self.owned_projections.gather_rows(
+                hidden_states.to(self.embed_tokens.weight.dtype), owned_global_rows
+            )
         else:
             iris = self.iris_state
-            assert iris is not None
             # Round FP32 to BF16 directly into the gather's pull scratch,
             # saving the copy a separate BF16 tensor would need.
             tap = iris.all_gather_owned_stream_bf16(hidden_states, owned_global_rows)
@@ -2862,29 +3775,83 @@ def shard_expert_projection(
     return loaded_weight.narrow(dim, tp_rank * width, width)
 
 
+def _iris_unprepared(mapping: Mapping, backend, group) -> str | None:
+    """Why Muse's Iris collectives cannot be prepared for ``group`` on
+    ``backend``, or None when they can."""
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+    if not current_platform().is_cdna4:
+        return "not gfx950 (CDNA4)"
+    if mapping.attn.tp_size not in (4, 8):
+        return f"attention TP {mapping.attn.tp_size}, not 4 or 8"
+    if group != mapping.moe.tp_ep_group:
+        return "the attention TP group is not the MoE TP x EP group"
+    if not isinstance(backend, AutoBackend):
+        return "the communication backend is not AutoBackend"
+    if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
+        return "the backend cannot prepare all-reduce buffers"
+    return None
+
+
 class MuseSparkForConditionalGeneration(BaseCausalLM):
     """Muse Spark conditional generation model with shared vision and audio towers."""
 
     model_cls = MuseSparkModel
     supports_aux_capture = True
 
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether this step's decode monokernels store the draft's taps (the
+        forward then hands them over in one block, see ``MuseSparkModel``)."""
+        state = self.model.monokernel_state
+        rows = ctx.input_num_tokens
+        return (
+            state is not None
+            and not self.model._can_use_owned_rows(rows, ctx)
+            and state.stores_taps(rows, ctx)
+        )
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-
         mapping = self.mapping
         backend = get_global_backend()
         group = mapping.attn.tp_group
+        owned = self.model.owned_projections
+        if owned is not None and max_num_tokens >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS:
+            rows = owned.local_rows(max_num_tokens)
+            if owned.qkv is None:
+                _prepare_owned_projections(owned, self.model.layers[0], group, rows)
+            elif owned.qkv.spec.max_tokens < rows:
+                raise RuntimeError("Cannot grow prepared owned-row projections")
+            for layer in self.model.layers:
+                layer.self_attn.owned_projections = owned
+                layer.mlp.owned_projections = owned
         down_columns = any(
             layer.mlp.down_columns is not None for layer in self.model.layers
         )
+        unprepared = _iris_unprepared(mapping, backend, group)
+        heads_to_owners = any(
+            layer.self_attn.owned_heads_to_owners for layer in self.model.layers
+        )
+        if heads_to_owners and unprepared is not None:
+            # The flag would gather every output projection and refuse weight
+            # updates while never running: refuse it instead.
+            raise RuntimeError(_heads_refusal(f"Iris is not prepared: {unprepared}"))
         if (
-            not current_platform().is_cdna4
-            or mapping.attn.tp_size not in (4, 8)
-            or group != mapping.moe.tp_ep_group
-            or not isinstance(backend, AutoBackend)
-            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
+            global_server_args_dict["prefill_collective_payload"] != "bf16"
+            and unprepared is not None
         ):
+            # The payload encodes only Iris owned-row collectives; refuse a
+            # flag that would never apply.
+            raise RuntimeError(_payload_refusal(f"Iris is not prepared: {unprepared}"))
+        if unprepared is not None:
+            if self.model.config.decode_monokernel:
+                # The launches' mailbox scratch lives on the Iris heap that
+                # this prepares: without it no layer could launch.
+                raise RuntimeError(
+                    f"--decode-monokernel: Muse Spark's Iris collectives are "
+                    f"not prepared ({unprepared}), and the decode monokernels "
+                    "need their heap. Serve without --decode-monokernel."
+                )
             # Only the Iris intermediate exchange uses the column-split down
             # copy; free it before the KV cache is sized.
             for layer in self.model.layers:
@@ -2894,9 +3861,11 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             prepare_muse_communication,
         )
 
-        capacity = min(max_num_tokens, 8192) * self.config.hidden_size
+        capacity = (
+            min(max_num_tokens, _owned_rows_max_tokens()) * self.config.hidden_size
+        )
         owned_route_max_rows = (
-            min(max_num_tokens, 8192)
+            min(max_num_tokens, MUSE_OWNED_ROUTE_MAX_TOKENS)
             if mapping.moe.tp_size > 1
             and mapping.moe.ep_size == 1
             and self.config.moe_hidden_size == 4096
@@ -2914,6 +3883,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 enable_lamport=True,
                 owned_route_max_rows=owned_route_max_rows,
                 intermediate_gather_max_rows=intermediate_gather_max_rows,
+                int8_payloads=global_server_args_dict["prefill_collective_payload"]
+                == "int8-block16",
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
@@ -2925,6 +3896,22 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             # MLP and projection reductions when it runs at attention TP, and
             # a draft model's (DFlash2) per-layer reductions.
             backend.iris.install_ordinary_all_reduce(group, state.reduction)
+            producer = state.all_reduce.producer.data
+            scratch = state.all_reduce.producer_pull.scratch
+            gather_output = state.gather.output
+            payload_bytes = sum(
+                buffer.numel() * buffer.element_size()
+                for buffer in (state.payload_codes, state.payload_scales)
+                if buffer is not None
+            )
+            logger.info(
+                f"Muse Iris owned-row limit "
+                f"{producer.numel() // self.config.hidden_size} token rows; per-rank "
+                f"bytes: producer buffer {producer.numel() * producer.element_size()}, "
+                f"pull scratch {scratch.numel() * scratch.element_size()}, gather "
+                f"output {gather_output.numel() * gather_output.element_size()}, "
+                f"int8-block16 payload {payload_bytes}"
+            )
         elif (
             state.all_reduce.producer_direct_max_numel < capacity
             or state.owned_route_max_rows < owned_route_max_rows
@@ -2933,9 +3920,95 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             raise RuntimeError(
                 "Muse communication was prepared below the requested capacity"
             )
+        if (
+            global_server_args_dict["prefill_collective_payload"] != "bf16"
+            and state.payload_codes is None
+        ):
+            # Prepared Iris without the payload buffers: the owned-row layout
+            # cannot serve these forwards (too few rows for its row boundary),
+            # so the flag would never apply.
+            raise RuntimeError(
+                _payload_refusal(
+                    f"no owned-row layout for forwards of up to {max_num_tokens} tokens"
+                )
+            )
+        if heads_to_owners and not state.can_use_owned_rows(MUSE_OWNED_ROWS_MIN_TOKENS):
+            # Prepared Iris whose owned-row layout serves no forward here (too
+            # few rows for its row boundary): the all-to-all would never run.
+            raise RuntimeError(
+                _heads_refusal(
+                    f"no owned-row layout for forwards of up to {max_num_tokens} tokens"
+                )
+            )
         self.model.iris_state = state
         # Startup might not reduce any payload in the two-shot pull's window.
         state.warmup_reduce_outputs()
+        # The attention boundary's Lamport push changes peer order with the
+        # row count, and capture may reach only one order; every layer shares
+        # the boundary's norms' eps and center.
+        post_norm = self.model.layers[0].post_attention_layernorm
+        pre_norm = self.model.layers[0].pre_feedforward_layernorm
+        state.warmup_symmetric_boundary(
+            post_norm.weight,
+            pre_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+        )
+        # A gathered projection takes the column gather only past what its
+        # fused paths serve (rows past _GATHER_MXFP4_MAX_ROWS when the
+        # owned-row layout is not taken, such as a mixed round), which startup
+        # warm forwards and capture may never reach.
+        widths = set()
+        for layer in self.model.layers:
+            for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
+                if (
+                    isinstance(projection, _MuseGatheredLinear)
+                    and projection.workspace is not None
+                ):
+                    widths.add(projection._local_weight().shape[0])
+        for width in sorted(widths):
+            state.gather.warmup(width)
+        # The local-columns GEMM of a gathered projection (_project) selects
+        # its kernel by row count, and some of those kernels compile their
+        # row tiles only when a GEMM inside the warm-up scope meets the
+        # weight; the startup warm forwards may never run one (an extend
+        # past the fused paths' rows takes another layout). Two rows is the
+        # fewest that take the GEMM rather than the one-row GEMV, so one
+        # two-row GEMM a weight shape, inside the scope, compiles the tiles
+        # those kernels warm for that weight.
+        projection_shapes = set()
+        for layer in self.model.layers:
+            for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
+                if (
+                    not isinstance(projection, _MuseGatheredLinear)
+                    or projection.workspace is None
+                ):
+                    continue
+                weight = projection._local_weight()
+                if tuple(weight.shape) in projection_shapes:
+                    continue
+                projection_shapes.add(tuple(weight.shape))
+                projection.warm_local_gemm()
+        # Each layer's router shares a launch with its pre-expert columns at
+        # few rows (MuseSparkMoE's gather, RMSNorm and top-k path); compile
+        # that launch for every row count it serves, once a weight shape.
+        router_mm_shapes = set()
+        for layer in self.model.layers:
+            mlp = layer.mlp
+            projection = mlp.pre_expert_proj
+            if (
+                not isinstance(mlp, MuseSparkMoE)
+                or not isinstance(projection, _MuseGatheredLinear)
+                or projection.workspace is None
+            ):
+                continue
+            weight = projection._local_weight()
+            shape = (tuple(mlp.gate.weight.shape), tuple(weight.shape))
+            if shape not in router_mm_shapes:
+                router_mm_shapes.add(shape)
+                mlp.gate.warm_with_mm(weight, projection.workspace.shape[0])
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state
@@ -2969,6 +4042,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 mlps[0].down_columns.prepared,
                 state.intermediate_gather_min_rows,
                 intermediate_gather_max_rows,
+            )
+        if self.model.config.decode_monokernel:
+            # The mailbox scratch lives on the same Iris heap.
+            prepare_monokernel_state(
+                self.model,
+                process_group_manager.get_device_process_group(group),
+                process_group_manager.get_process_group("gloo", group),
+                group.index(dist.get_rank()),
             )
         return True
 
@@ -3135,6 +4216,62 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             dp_lm_head_tp=False,
         )
 
+    def _log_dense_fp8_memory(self) -> None:
+        """Log, once a rank, the QKV projection's FP8 window, how many layers
+        hold its FP8 copy, and the persistent memory those copies take."""
+        copies = [
+            layer.self_attn.qkv_proj.dense_fp8
+            for layer in self.model.layers
+            if layer.self_attn.qkv_proj.dense_fp8.weight is not None
+        ]
+        total = sum(
+            fp8.weight.numel() * fp8.weight.element_size()
+            + fp8.scale.numel() * fp8.scale.element_size()
+            for fp8 in copies
+        )
+        shape = list(copies[0].weight.shape) if copies else []
+        logger.info(
+            f"--dense-fp8-small-m qkv: FP8 GEMMs for qkv_proj {shape} at "
+            f"{_DENSE_FP8_QKV_MIN_ROWS}-{_DENSE_FP8_MAX_ROWS} rows in {len(copies)} "
+            f"of {len(self.model.layers)} layers; FP8 weight copies take "
+            f"{total / 2**30:.2f} GiB on this rank"
+        )
+
+    def _warm_dense_fp8_boundaries(self) -> None:
+        """Compile the MLP boundary's FP8-copy variant, which the next layer's
+        QKV projection reads, before serving.
+
+        Its compile key holds only the fixed norms and flags, so one call
+        covers every row count. A mailbox branch never writes a copy, so its
+        variants have none to warm.
+        """
+        layers = self.model.layers
+        if not layers:
+            return
+        layer = layers[0]
+        pre = layer.pre_feedforward_layernorm
+        rows, width = _DENSE_FP8_QKV_MIN_ROWS, self.config.hidden_size
+        # The post-attention norm is weightless; the pre-MLP one has a weight.
+        device = pre.weight.device
+        stream = torch.zeros((rows, width), dtype=torch.float32, device=device)
+        branch = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
+        if len(layers) > 1:
+            post, nxt = layer.post_feedforward_layernorm, layers[1].input_layernorm
+            post_norm_residual_pre_norm_bf16_fp8(
+                stream,
+                branch,
+                post.weight,
+                post.eps,
+                post.weight_offset,
+                *layer.post_feedforward_residual_gate._gate_coefficients(),
+                nxt.weight,
+                nxt.eps,
+                nxt.weight_offset,
+                pdl_enabled(),
+                None,
+                1,
+            )
+
     def begin_weight_update(self) -> None:
         # The column-split down copy is laid out for its kernel once and keeps
         # no checkpoint layout, so it cannot take new weights. Refuse before the
@@ -3145,6 +4282,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 "while the expert down projections keep a column-split copy "
                 "(MXFP4 experts at MoE TP8, EP1 on gfx950)"
             )
+        if any(
+            layer.self_attn.owned_output_proj is not None for layer in self.model.layers
+        ):
+            raise RuntimeError(
+                f"{type(self).__name__}: live weight updates are not supported "
+                "with --owned-attention-output all-to-all's gathered output "
+                "projections"
+            )
+        if global_server_args_dict["dense_fp8_small_m"] != "none":
+            # Its FP8 weight copies are made once, after loading.
+            raise RuntimeError("live weight updates do not support --dense-fp8-small-m")
         super().begin_weight_update()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -3247,20 +4395,44 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
-        bf16_mlps = [
-            layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
+        for layer in self.model.layers:
+            layer.self_attn.prepare_owned_output_weight()
+        fp8_value = global_server_args_dict["dense_fp8_small_m"]
+        if self.model.config.decode_monokernel and fp8_value != "none":
+            # A launch projects in BF16, so it must not take rows the regular
+            # path projects in FP8: refused before any copy is made.
+            if MONOKERNEL_MAX_ROWS >= _DENSE_FP8_QKV_MIN_ROWS:
+                raise ValueError(
+                    f"decode monokernels take up to {MONOKERNEL_MAX_ROWS} "
+                    f"rows, inside --dense-fp8-small-m {fp8_value}'s FP8 "
+                    f"window, which starts at {_DENSE_FP8_QKV_MIN_ROWS} rows"
+                )
+        if fp8_value != "none":
+            for layer in self.model.layers:
+                layer.self_attn.qkv_proj.prepare_fp8_weight()
+            self._warm_dense_fp8_boundaries()
+            self._log_dense_fp8_memory()
+        if self.model.config.decode_monokernel:
+            if fp8_value != "none":
+                logger.info(
+                    f"--dense-fp8-small-m "
+                    f"{global_server_args_dict['dense_fp8_small_m']} with decode "
+                    f"monokernels: decode steps of 1-{MONOKERNEL_MAX_ROWS} rows "
+                    "the monokernels take stay BF16; regular decode steps "
+                    "take the FP8 QKV projection inside its row window"
+                )
+            enable_decode_monokernels(self.model)
+        # The BF16 route kernels' warmup only compiles, so disable_autotune keeps it.
+        mlps_to_warm = [
+            layer.mlp
+            for layer in self.model.layers
+            if layer.mlp.experts.plan.get("warmup") is not None
+            and not (
+                global_server_args_dict["disable_autotune"]
+                and layer.mlp.quantized_experts
+            )
         ]
-        experts_to_warm = (
-            []
-            if global_server_args_dict["disable_autotune"]
-            else [
-                layer.mlp.experts
-                for layer in self.model.layers
-                if layer.mlp.quantized_experts
-                and layer.mlp.experts.plan.get("warmup") is not None
-            ]
-        )
-        if not bf16_mlps and not experts_to_warm:
+        if not mlps_to_warm:
             return
         # Match the global routing span reserved by execution/device.py.
         chunk = int(global_server_args_dict["chunked_prefill_size"])
@@ -3277,22 +4449,18 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])
         max_tokens = max(max_tokens, decode_rows)
-        # BF16 expert layers compile their route kernels before graph capture.
-        # This is JIT warmup, not tuning, so disable_autotune does not skip it.
-        for mlp in bf16_mlps:
-            bf16_moe_routes_warmup(
-                mlp.experts.w13_weight,
-                mlp.experts.w2_weight,
-                mlp.topk,
-                mlp.expert_start,
-                max_num_tokens=max_tokens,
-                batch_invariant=global_server_args_dict["numerics"]
-                in BITWISE_ENVELOPES,
-            )
-        for experts in experts_to_warm:
+        for mlp in mlps_to_warm:
+            experts = mlp.experts
             if not experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
-            moe_warmup(experts.plan, experts, max_num_tokens=max_tokens)
+            # Under attention DP, non-Petit layers gather every EP rank's rows,
+            # padded to the largest count; Petit routes each rank's own rows.
+            gathered = mlp.exchanges_rank_local_rows and not mlp.uses_petit
+            moe_warmup(
+                experts.plan,
+                experts,
+                max_num_tokens=max_tokens * (mlp.ep_size if gathered else 1),
+            )
 
 
 EntryClass = MuseSparkForConditionalGeneration

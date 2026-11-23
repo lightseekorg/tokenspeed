@@ -211,6 +211,22 @@ def get_drafter_impl(
     Returns:
         The ``BaseDrafter`` subclass to instantiate (not an instance).
     """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if (
+        global_server_args_dict.get("enable_dsv41_adaptive_dspark", False)
+        or global_server_args_dict["enable_dp_local_cuda_graph"]
+    ):
+        from tokenspeed.runtime.models.deepseek_v41_dspark import (
+            DeepseekV41ForCausalLMDSpark,
+        )
+
+        if spec_algo != "DSPARK" or not isinstance(model, DeepseekV41ForCausalLMDSpark):
+            raise ValueError(
+                "adaptive or local DP verification requires "
+                "the native V4.1 DSpark model"
+            )
+
     plugin = _PLUGIN_DRAFTERS.get(spec_algo)
     if plugin is not None:
         for model_cls, drafter_cls in plugin.scoped:
@@ -252,6 +268,14 @@ def get_drafter_impl(
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "DSPARK":
+        from tokenspeed.runtime.execution.drafter.inkling2 import Inkling2DSpark
+        from tokenspeed.runtime.models.inkling2_mtp import (
+            Inkling2ForConditionalGenerationMTP,
+        )
+
+        if isinstance(model, Inkling2ForConditionalGenerationMTP):
+            return Inkling2DSpark
+
         from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
             DeepseekV41DSpark,
         )

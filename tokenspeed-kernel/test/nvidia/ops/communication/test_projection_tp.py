@@ -37,7 +37,11 @@ from tokenspeed_kernel.ops.communication.triton import (
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherQuantState,
+    TrtllmAllGatherState,
+    TrtllmReduceScatterState,
+    trtllm_allgather,
     trtllm_allgather_fp8_quantize,
+    trtllm_reduce_scatter,
 )
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
@@ -223,6 +227,38 @@ def _check_allgather_quant(rank, device):
     state.close()
 
 
+def _check_shared_collectives(rank, device, size):
+    rows = 256
+    group = dist.group.WORLD
+    gather = TrtllmAllGatherState(group, rows, HIDDEN, device, True)
+    reduction = TrtllmReduceScatterState(group, rows, HIDDEN, device)
+    try:
+        inputs = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+        partial = torch.zeros(size * rows, HIDDEN, dtype=inputs.dtype, device=device)
+        trtllm_allgather(gather, inputs)
+        trtllm_reduce_scatter(reduction, partial, rows)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gathered = trtllm_allgather(gather, inputs)
+            reduced = trtllm_reduce_scatter(reduction, partial, rows)
+        for value in (rank + 1, rank + 2):
+            inputs.fill_(value)
+            partial.fill_(value)
+            expected_gather = torch.empty_like(partial)
+            expected_reduced = torch.empty_like(inputs)
+            dist.all_gather_single(expected_gather, inputs)
+            dist.reduce_scatter_single(expected_reduced, partial)
+            graph.replay()
+            torch.testing.assert_close(gathered, expected_gather, rtol=0, atol=0)
+            torch.testing.assert_close(reduced, expected_reduced, rtol=0, atol=0)
+        del graph
+    finally:
+        gather.close()
+        reduction.close()
+
+
 def _worker(rank, size, rendezvous):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -238,6 +274,7 @@ def _worker(rank, size, rendezvous):
     _check_pack(device, size)
     _check_a2a(rank, device, size)
     _check_allgather_quant(rank, device)
+    _check_shared_collectives(rank, device, size)
     dist.destroy_process_group()
 
 

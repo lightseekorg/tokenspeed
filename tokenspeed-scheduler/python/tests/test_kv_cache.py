@@ -40,6 +40,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = True
@@ -205,6 +206,9 @@ def test_k3_four_groups_share_one_global_id_namespace() -> None:
 
     _abort(scheduler, "r1")
     scheduler.next_execution_plan()
+    assert scheduler.available_lcm_blocks() < before
+    _advance_tokens(scheduler, "r1", [])
+    scheduler.next_execution_plan()
     assert scheduler.available_lcm_blocks() == before
 
 
@@ -233,6 +237,7 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = 8_192
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     for group in cfg.cache_groups:
         if group.group_id == K3_GROUP_IDS[0]:
             group.block_granularity = cfg.prefix_granularity
@@ -306,6 +311,7 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
         cfg.num_snapshot_pages = 1  # never retracts
         cfg.max_scheduled_tokens = chunk_tokens
         cfg.max_batch_size = 1
+        cfg.max_resident_requests = cfg.max_batch_size
         cfg.disable_l2_cache = True
         cfg.disable_prefix_cache = not prefix_cache_enabled
         cfg.decode_input_tokens = decode_width
@@ -370,6 +376,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 2
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False
     cfg.decode_input_tokens = decode_width
@@ -683,6 +690,7 @@ def _make_replay_config() -> ts.SchedulerConfig:
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False

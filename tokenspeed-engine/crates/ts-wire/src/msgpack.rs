@@ -90,6 +90,7 @@ impl Encoder {
     }
 
     /// Write `nil`.
+    #[inline]
     pub fn nil(&mut self) {
         self.buf.push(0xc0);
     }
@@ -100,6 +101,7 @@ impl Encoder {
     }
 
     /// Write a signed integer: non-negative values use the unsigned formats.
+    #[inline]
     pub fn int(&mut self, value: i64) {
         if value >= 0 {
             self.uint(value as u64);
@@ -121,6 +123,7 @@ impl Encoder {
     }
 
     /// Write an unsigned integer.
+    #[inline]
     pub fn uint(&mut self, value: u64) {
         if value < 0x80 {
             self.buf.push(value as u8);
@@ -140,6 +143,7 @@ impl Encoder {
     }
 
     /// Write a float, always as float64.
+    #[inline]
     pub fn float(&mut self, value: f64) {
         self.buf.push(0xcb);
         self.buf.extend_from_slice(&value.to_be_bytes());
@@ -163,6 +167,7 @@ impl Encoder {
     }
 
     /// Write an array header for `len` elements.
+    #[inline]
     pub fn array_len(&mut self, len: usize) {
         if len < 16 {
             self.buf.push(0x90 | len as u8);
@@ -331,6 +336,11 @@ impl<'f> Decoder<'f> {
         &self.frames[0]
     }
 
+    /// Bytes still available in the msgpack frame, excluding out-of-band data.
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.buf().len() - self.pos
+    }
+
     /// Fail unless the whole msgpack buffer was consumed.
     pub fn finish(&self) -> Result<()> {
         let left = self.buf().len() - self.pos;
@@ -371,6 +381,7 @@ impl<'f> Decoder<'f> {
     }
 
     /// Consume a `nil` if the next value is one.
+    #[inline]
     pub fn take_nil(&mut self) -> Result<bool> {
         if self.peek_marker()? == 0xc0 {
             self.pos += 1;
@@ -395,7 +406,32 @@ impl<'f> Decoder<'f> {
         }
     }
 
+    /// Read a token-sized integer without widening the common encodings.
+    /// Wider integers retain the same checked narrowing as the generic path.
+    #[inline]
+    pub fn int32(&mut self) -> Result<i32> {
+        let start = self.pos;
+        match self.peek_marker()? {
+            marker @ 0x00..=0x7f => {
+                self.pos += 1;
+                Ok(i32::from(marker))
+            }
+            marker @ 0xe0..=0xff => {
+                self.pos += 1;
+                Ok(i32::from(marker as i8))
+            }
+            0xcc => Ok(i32::from(self.be::<1>(start)?[0])),
+            0xcd => Ok(i32::from(u16::from_be_bytes(self.be(start)?))),
+            0xce => Integer::Unsigned(u64::from(u32::from_be_bytes(self.be(start)?))).narrow("i32"),
+            0xd0 => Ok(i32::from(self.be::<1>(start)?[0] as i8)),
+            0xd1 => Ok(i32::from(i16::from_be_bytes(self.be(start)?))),
+            0xd2 => Ok(i32::from_be_bytes(self.be(start)?)),
+            _ => self.integer()?.narrow("i32"),
+        }
+    }
+
     /// Read an integer in any format.
+    #[inline]
     pub fn integer(&mut self) -> Result<Integer> {
         let marker = self.peek_marker()?;
         let start = self.pos;
@@ -422,6 +458,7 @@ impl<'f> Decoder<'f> {
     }
 
     /// Read a float. Integers are accepted, as msgspec does for float fields.
+    #[inline]
     pub fn float(&mut self) -> Result<f64> {
         let start = self.pos;
         match self.peek_marker()? {
@@ -464,6 +501,7 @@ impl<'f> Decoder<'f> {
     }
 
     /// Read an array header and return its length.
+    #[inline]
     pub fn array_len(&mut self) -> Result<usize> {
         let marker = self.peek_marker()?;
         let start = self.pos;
@@ -627,6 +665,62 @@ mod tests {
             let decoded: i64 = decoder.integer().unwrap().narrow("i64").unwrap();
             assert_eq!(decoded, *value);
             decoder.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn int32_accepts_all_integer_encodings_and_checks_truncation() {
+        let cases: &[(&[u8], i32)] = &[
+            (&[0x7f], 127),
+            (&[0xff], -1),
+            (&[0xcc, 0xff], 255),
+            (&[0xcd, 0xff, 0xff], 65535),
+            (&[0xce, 0, 1, 0, 0], 65536),
+            (&[0xce, 0x7f, 0xff, 0xff, 0xff], i32::MAX),
+            (&[0xd0, 0x80], -128),
+            (&[0xd1, 0x80, 0], -32768),
+            (&[0xd2, 0x80, 0, 0, 0], i32::MIN),
+            (&[0xd2, 0, 0, 0, 1], 1),
+            (&[0xcf, 0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff], i32::MAX),
+            (&[0xd3, 0xff, 0xff, 0xff, 0xff, 0x80, 0, 0, 0], i32::MIN),
+        ];
+        for &(bytes, expected) in cases {
+            let frames = [Bytes::copy_from_slice(bytes)];
+            let mut decoder = Decoder::new(&frames);
+            assert_eq!(decoder.int32().unwrap(), expected);
+            decoder.finish().unwrap();
+            for prefix in 0..bytes.len() {
+                let frames = [Bytes::copy_from_slice(&bytes[..prefix])];
+                assert!(matches!(
+                    Decoder::new(&frames).int32(),
+                    Err(Error::Truncated { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn int32_rejects_out_of_range_and_non_integer_values() {
+        for bytes in [
+            &[0xce, 0x80, 0, 0, 0][..],
+            &[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            &[0xd3, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff],
+        ] {
+            let frames = [Bytes::copy_from_slice(bytes)];
+            assert!(matches!(
+                Decoder::new(&frames).int32(),
+                Err(Error::IntRange { .. })
+            ));
+        }
+        for marker in [0xc0, 0xc1, 0xc2, 0xca, 0xcb, 0xa0, 0x90] {
+            let frames = [Bytes::copy_from_slice(&[marker])];
+            assert!(matches!(
+                Decoder::new(&frames).int32(),
+                Err(Error::Type {
+                    expected: "int",
+                    ..
+                })
+            ));
         }
     }
 

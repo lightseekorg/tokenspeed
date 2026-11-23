@@ -126,6 +126,7 @@ mod tests {
                 write_workers: 1,
                 failure_threshold: 1,
                 recovery_interval: Duration::from_secs(1),
+                clear_cache_drain_timeout: Duration::from_millis(500),
             },
             monotonic_clock(),
         )
@@ -316,8 +317,8 @@ impl L3Executor {
 
     /// Per operation kind ``(kind, events, success_keys, failed_keys,
     /// success_bytes, queue_seconds, backend_seconds, operations, bytes)``,
-    /// the backend's health state and epoch, and whether new I/O is off
-    /// (unproven retirement).
+    /// the backend's health state and epoch, whether historical native I/O
+    /// lacks retirement proof, and whether the active namespace is blocked.
     #[allow(clippy::type_complexity)]
     fn snapshot(
         &self,
@@ -335,6 +336,7 @@ impl L3Executor {
         )>,
         String,
         f64,
+        bool,
         bool,
     )> {
         self.with(|executor| {
@@ -360,6 +362,7 @@ impl L3Executor {
                 snapshot.health_state,
                 snapshot.health_epoch,
                 snapshot.unsafe_io,
+                snapshot.io_blocked,
             ))
         })
     }

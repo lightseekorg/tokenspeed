@@ -38,6 +38,161 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
 )
 
 
+@dataclasses.dataclass
+class _TupleContext:
+    rows: int
+    scale: float
+    structure: str
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestTupleBreakOutputs:
+    def setup_method(self):
+        self.input = torch.zeros(8, 16, device="cuda")
+        self.destinations = []
+
+    def _capture(self, bucket, storage, pool, explicit):
+        dummy = _TupleContext(bucket, 2.0, "original")
+
+        def pair(x, ctx):
+            rows = current_valid_rows()
+            count = ctx.rows if rows is None else min(rows, ctx.rows)
+            x = x[:count]
+            first, second = x * ctx.scale, x - ctx.scale
+            if ctx.structure == "tensor":
+                return first
+            if ctx.structure == "arity":
+                return (first, second)
+            if ctx.structure == "optional":
+                return ((first, second), x.sum(-1), first)
+            if ctx.structure == "dtype":
+                return ((first.double(), second), x.sum(-1), None)
+            return ((first, second), x.sum(-1), None)
+
+        decorated_pair = break_point(pair)
+
+        @break_point
+        def single(x):
+            return x * 2
+
+        destination = (
+            (
+                torch.empty_like(self.input[:bucket]),
+                torch.empty_like(self.input[:bucket]),
+            ),
+            torch.empty(bucket, device="cuda"),
+            None,
+        )
+        # Explicit handoffs borrow caller-owned storage, not the graph pool.
+        if explicit:
+            self.destinations.append(destination)
+
+        def forward():
+            h = single(self.input[:bucket] + 1)
+            leaves = (
+                break_here(pair, destination, h, dummy)
+                if explicit
+                else decorated_pair(h, dummy)
+            )
+            (first, second), summary, absent = leaves
+            assert absent is None
+            return first + 3 * second + summary[:, None], leaves
+
+        for _ in range(2):
+            with active_forward(dummy):
+                forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture(pool=pool, handoff_storage=storage)
+        with active_forward(dummy), cap:
+            output, leaves = forward()
+        return cap, output, leaves
+
+    def _check(self, captured, live, scale):
+        cap, output, leaves = captured
+        data = torch.arange(live * 16, device="cuda", dtype=torch.float32).reshape(
+            live, 16
+        )
+        data = data / 32 + scale
+        self.input.fill_(float("nan"))
+        self.input[:live].copy_(data)
+        addresses = [leaf.data_ptr() for leaf in (*leaves[0], leaves[1])]
+        with active_forward(_TupleContext(live, scale, "original")):
+            cap.replay(valid_rows=live)
+        torch.cuda.synchronize()
+        h = (data + 1) * 2
+        first, second = h * scale, h - scale
+        summary = h.sum(-1)
+        torch.testing.assert_close(
+            output[:live], first + 3 * second + summary[:, None], rtol=0, atol=0
+        )
+        for actual, expected in zip(
+            (*leaves[0], leaves[1]), (first, second, summary), strict=True
+        ):
+            torch.testing.assert_close(actual[:live], expected, rtol=0, atol=0)
+            assert torch.count_nonzero(actual[live:]) == 0
+        assert torch.count_nonzero(output[live:]) == 0
+        assert addresses == [leaf.data_ptr() for leaf in (*leaves[0], leaves[1])]
+        assert addresses[0] != addresses[1]
+
+    @pytest.mark.parametrize("explicit", (False, True))
+    def test_tuple_leaves_survive_changed_inputs_context_and_padded_replay(
+        self, explicit
+    ):
+        captured = self._capture(8, {}, None, explicit)
+        for live, scale in ((8, 3.0), (3, 5.0), (1, 7.0), (6, 2.0), (8, 4.0)):
+            self._check(captured, live, scale)
+
+    def test_tuple_handoffs_reuse_storage_across_buckets(self):
+        storage = {}
+        large = self._capture(8, storage, None, False)
+        small = self._capture(4, storage, large[0].pool, False)
+        large_leaves, small_leaves = large[2], small[2]
+        assert [t.data_ptr() for t in (*large_leaves[0], large_leaves[1])] == [
+            t.data_ptr() for t in (*small_leaves[0], small_leaves[1])
+        ]
+        for captured, live, scale in (
+            (large, 8, 2.0),
+            (small, 3, 3.0),
+            (large, 5, 4.0),
+            (small, 4, 5.0),
+        ):
+            self._check(captured, live, scale)
+
+    def test_tuple_result_view_survives_reuse_of_its_input_handoff(self):
+        @break_point
+        def single(x):
+            return x * 2
+
+        @break_point
+        def pair(x):
+            return x * 3, x.view_as(x)
+
+        def forward():
+            first, second = pair(single(self.input + 1))
+            return first + second
+
+        for _ in range(2):
+            forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            output = forward()
+        self.input.fill_(5)
+        cap.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, (self.input + 1) * 8, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("structure", ("tensor", "arity", "optional", "dtype"))
+    def test_changed_tuple_output_contract_is_rejected(self, structure):
+        cap, _, _ = self._capture(8, {}, None, False)
+        with active_forward(_TupleContext(8, 3.0, structure)):
+            with pytest.raises(
+                ValueError, match="Break output .*changed after capture"
+            ):
+                cap.replay(valid_rows=8)
+        torch.cuda.synchronize()
+
+
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
 class TestBreakableCudaGraph:
     def setup_method(self):
@@ -974,14 +1129,28 @@ class TestPoolReuseAcrossCaptures:
             cap.replay()
         torch.cuda.synchronize()
 
-    def test_tensor_bundle_break_args_reuse_pool(self):
+    @pytest.mark.parametrize("bundle", ["tensors", "tensors_and_scalar"])
+    def test_tensor_bundle_break_args_reuse_pool(self, bundle):
         """A frozen dataclass of segment outputs passed to a break (MLA's
-        prologue output) must not pin its tensors, exactly like a bare tensor
-        arg: otherwise every capture keeps its own copy of each layer's
-        bundle and pool memory grows with the sum of the buckets."""
+        prologue output, or KDA's output norm with its float epsilon) must not
+        pin its tensors, exactly like a bare tensor arg: otherwise every capture
+        keeps its own copy of each layer's bundle and pool memory grows with the
+        sum of the buckets."""
         from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 
         from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
+
+        @dataclasses.dataclass(frozen=True)
+        class ScaledKey:
+            query: torch.Tensor
+            key: torch.Tensor
+            scale: float
+
+        def make(q):
+            if bundle == "tensors":
+                return MLAPrologueOutput(query=q, key=q * 2.0, value=None)
+            # The scalar is frozen at capture, like a loose scalar arg.
+            return ScaledKey(query=q, key=q * 2.0, scale=1.0)
 
         probe = torch.empty(1, device="cuda")
         if weak_ref_tensor(probe) is probe:
@@ -997,7 +1166,10 @@ class TestPoolReuseAcrossCaptures:
         class Attention:
             @break_point
             def forward(self, x, ctx, *, expanded):
-                return torch.relu(expanded.query) + expanded.key
+                key = expanded.key
+                if bundle == "tensors_and_scalar":
+                    key = key * expanded.scale
+                return torch.relu(expanded.query) + key
 
         attn = Attention()
 
@@ -1005,8 +1177,7 @@ class TestPoolReuseAcrossCaptures:
             x = xbuf[:n]
             for _ in range(depth):
                 q = x @ w1
-                expanded = MLAPrologueOutput(query=q, key=q * 2.0, value=None)
-                x = attn.forward(x, None, expanded=expanded) @ w2
+                x = attn.forward(x, None, expanded=make(q)) @ w2
             return outbuf[:n].copy_(x)
 
         def eager(x):

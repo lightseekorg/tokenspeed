@@ -1452,9 +1452,11 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         """Core absorbed attention over this rank's KV through the backend's
         dispatch (``attn_mqa``: the decode kernels, or a backend's own
-        extend), then :meth:`project_attended_heads`. A sparse-attention
-        model's extend rows take :meth:`sparse_prefill_attn_v_proj` instead,
-        since the DSA backend has no ``forward_extend``.
+        extend), then :meth:`project_attended_heads`. A decode whose backend
+        projects values hands it the projection when it carries a gate or
+        merges a KVP-placed cache. A sparse-attention model's extend rows
+        take :meth:`sparse_prefill_attn_v_proj` instead, since the DSA
+        backend has no ``forward_extend``.
 
         The core runs on every rank that holds rows or a query shard: an
         empty shard's sparse core still joins its group's history gathers.
@@ -1468,9 +1470,14 @@ class DeepseekV3AttentionMLA(nn.Module):
                 "attention head TP does not support an output gate"
             )
         use_projected_value_decode = (
-            output_gate is not None
+            not exchanges
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
+            # A gate fuses into the core; a KVP merge projects as it combines.
+            and (
+                output_gate is not None
+                or ctx.attn_backend.cache_placement(self.attn_mqa) is not None
+            )
         )
         if Q.shape[0] == 0 and ctx.query_shard is None:
             attn_output = Q.new_empty(0, Q.shape[1] * self.kv_lora_rank)
@@ -1985,6 +1992,8 @@ class DeepseekV3Model(nn.Module):
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
     supports_aux_capture = True
+    # Whether the checkpoint carries routed experts for this model's MoE layers.
+    has_routed_experts = True
 
     def post_init(self) -> None:
         self._routed_experts_weights_of_layer = LazyValue(
@@ -2079,10 +2088,14 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         # by the checkpoint loader.
         moe_loader = build_moe_checkpoint_loader(
             params_dict=moe_params_dict,
-            expert_schema=ExpertCheckpointSchema(
-                gate_proj_name="gate_proj",
-                down_proj_name="down_proj",
-                up_proj_name="up_proj",
+            expert_schema=(
+                ExpertCheckpointSchema(
+                    gate_proj_name="gate_proj",
+                    down_proj_name="down_proj",
+                    up_proj_name="up_proj",
+                )
+                if self.has_routed_experts
+                else None
             ),
             num_experts=self.config.n_routed_experts,
             ep_rank=self.mapping.moe.ep_rank,
@@ -2543,6 +2556,9 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
     Eagle3MlaModel internally with a single MLA decoder layer that accepts
     concatenated [embeds || hidden_states] as input.
     """
+
+    # One dense decoder layer; the config's MoE fields describe the target model.
+    has_routed_experts = False
 
     def __init__(
         self,

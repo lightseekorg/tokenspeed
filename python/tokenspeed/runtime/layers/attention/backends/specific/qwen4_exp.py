@@ -136,6 +136,12 @@ class Qwen4ExpBackend(AttentionBackend):
         )
         return cls(config, attention_backend, ple, indexer)
 
+    def model_binding(self, layer_id, binding_type):
+        return self.attention_backend.model_binding(layer_id, binding_type)
+
+    def prefill_request_layout(self):
+        return self.attention_backend.prefill_request_layout()
+
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.attention_backend,) + tuple(
             backend

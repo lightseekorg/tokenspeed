@@ -312,6 +312,7 @@ if is_decode_available():
             "state_dtype": frozenset({torch.float32}),
             "padding_safe": frozenset({False}),
             "strided_qkv": frozenset({False}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_decode_step(
@@ -338,7 +339,8 @@ if is_decode_available():
         read row. ``-1`` marks CUDA-graph padding rows and is handled
         internally by flashinfer (skipped on the float32 path, redirected to a
         sacrificial pool row 0 on the bf16 fast path) -- no caller-side clamp
-        needed. The post-step state is written to output_state_indices
+        needed. Page-strided pools use the upstream 4D pool-indexing path.
+        The post-step state is written to output_state_indices
         (defaults to initial_state_indices when None; pass distinct output-page
         ids when the grouped cache writes the next state to another page).
 
@@ -387,6 +389,7 @@ if is_decode_available():
             "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_decode_mtp(
@@ -540,6 +543,7 @@ if is_rubin_decode_available():
             "value_head_dim": frozenset({128}),
             "state_dtype": frozenset({torch.bfloat16}),
             "strided_qkv": frozenset({False, True}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def flashinfer_rubin_gdn_decode_step(

@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -154,6 +155,21 @@ inline void FatalCheck(bool condition, const char* message = "Fatal check failed
     if (!condition) [[unlikely]] {
         detail::FatalCheckFailed(message, loc);
     }
+}
+
+// (value + divisor - 1) / divisor, which is ceil(value / divisor) for
+// value >= 0 and divisor > 0, summed in int64: in int32 the sum overflows
+// once value is within divisor - 1 of INT32_MAX. The quotient fits in int32.
+constexpr std::int32_t CeilDiv(std::int32_t value, std::int32_t divisor) noexcept {
+    return static_cast<std::int32_t>((std::int64_t{value} + divisor - 1) / divisor);
+}
+
+// A value computed in int64 narrowed back to int32, where the caller's
+// invariant keeps it in range; _assert()s that it is.
+inline std::int32_t CheckedInt32(std::int64_t value, const char* message = "value exceeds the int32 range",
+                                 SourceLocation loc = SourceLocation::current()) {
+    _assert(std::in_range<std::int32_t>(value), message, loc);
+    return static_cast<std::int32_t>(value);
 }
 
 template <typename T, typename Variant>
