@@ -1819,7 +1819,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     monkeypatch.setattr(gemm_module, "torch_decode_gemv", fallback)
     x = _CudaTensorDouble((m, k))
     weight = _CudaTensorDouble((7168, k))
-    assert gemm_module._use_mv(x, weight) is expected
+    assert gemm_module._use_mv(x, weight, None) is expected
     if fi and m <= 32:
         assert select_calls == []
 
@@ -1863,9 +1863,10 @@ def test_decode_gemv_selection_obeys_shape_traits(
     )
     monkeypatch.setattr(gemm_module, "KernelRegistry", _GetAccess(registry))
     gemm_module._select_mv.cache_clear()
+    gemm_module._mv_declares_alignment.cache_clear()
     fallback = gemm_module.torch_decode_gemv
     selected = gemm_module._select_mv(
-        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False
+        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False, True, True
     )
     # A full trait match selects the registered kernel. Anything less keeps
     # the portable fallback -- including the non-CUDA caller, whose early
@@ -1873,10 +1874,13 @@ def test_decode_gemv_selection_obeys_shape_traits(
     assert selected is (specialized_gemv if expected else fallback)
     # A dtype pair with no registry signature keeps the fallback as well.
     assert (
-        gemm_module._select_mv(m, n, k, on_cuda, torch.float16, torch.float16, False)
+        gemm_module._select_mv(
+            m, n, k, on_cuda, torch.float16, torch.float16, False, True, True
+        )
         is fallback
     )
     gemm_module._select_mv.cache_clear()
+    gemm_module._mv_declares_alignment.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -1923,7 +1927,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(
     )
     x = torch.ones(1, 128, dtype=torch.bfloat16)
     w = torch.ones(32, 128, dtype=torch.bfloat16)
-    assert gemm_module._use_mv(x, w) is not serving
+    assert gemm_module._use_mv(x, w, None) is not serving
     result = gemm_module.mv(x, w)
     torch.testing.assert_close(result, x @ w.T)
     used, idle = (
