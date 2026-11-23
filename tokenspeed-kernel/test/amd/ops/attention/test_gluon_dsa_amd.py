@@ -1263,6 +1263,59 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
+def test_dsa_decode_topk_multi_cta_selects_the_exact_set_of_verify_rows() -> None:
+    # 8 verify rows of 131072 keys in 1M-wide logits: 17 to 64 tiles a row, each
+    # listing at most 64 threshold-prefix keys, so the last CTA loads them at once.
+    page_size = 64
+    topk = 2048
+    rows = q_len_per_req = 8
+    cols = 1 << 20
+    max_pages = cols // page_size
+    seq_len = 131072
+    gen = _generator("cuda", seq_len + rows)
+    # Distinct normal quantiles, so each row's top-k set is unique.
+    order = torch.stack(
+        [torch.randperm(cols, device="cuda", generator=gen) for _ in range(rows)]
+    )
+    logits = torch.special.ndtri((order.double() + 0.5) / cols).float()
+    row_lens = [seq_len - (q_len_per_req - 1) + offset for offset in range(rows)]
+    for row, row_len in enumerate(row_lens):
+        logits[row, row_len:] = float("inf")
+    block_table = torch.randperm(max_pages, device="cuda", generator=gen).int()[None]
+    seq_lens = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
+    out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    plan = dsa_topk_backend._dsa_topk_plan(
+        rows, cols, topk, torch.device("cuda"), is_decode=True
+    )
+    assert plan.kind == "multi-cta"
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+    selections = _check_decode_topk_selection(
+        logits,
+        row_lens,
+        out,
+        lens_out,
+        torch.argsort(block_table.long(), dim=1),
+        q_len_per_req,
+        page_size,
+        topk,
+    )
+    for row, row_len in enumerate(row_lens):
+        expected = torch.topk(logits[row, :row_len], topk).indices
+        assert torch.equal(selections[row], torch.sort(expected).values)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
 def test_dsa_decode_topk_multi_cta_reuses_its_kernels_across_batches() -> None:
     # Rows and lengths are runtime values; the workspace re-zeroes after every call.
     page_size = 64
