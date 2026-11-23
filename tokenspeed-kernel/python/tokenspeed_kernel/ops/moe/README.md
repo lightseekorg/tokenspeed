@@ -617,8 +617,9 @@ byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 ## Routing weight storage and deferred finalize
 
 `moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
-routing stores its weights in that dtype after FP32 scoring, normalization, and
-scaling.
+and Kimi K3 routing store their weights in that dtype after FP32 scoring,
+normalization, and scaling. Kimi K3 uses BF16 for TRT-LLM SiTU and FP32 for
+MegaMoE and Gluon Petit.
 
 On NVIDIA, the DeepSeek V4 MoE defers finalization for BF16 activations
 whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
@@ -685,6 +686,39 @@ The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
 router and do not depend on the FlashInfer package shipping its experimental
 kernel sources (release wheels omit them). Prepare/warm up before graph capture;
 no persistent activation tensors are cached per layer by this adapter.
+
+## Kimi-K3 MXFP4 MegaMoE (`flashinfer_cutedsl.py`)
+
+`flashinfer_mxfp4_situ_mega_moe_apply` (`solution="mega_moe"`) runs FlashInfer's
+Kimi K3 MegaMoE: the expert kernel dispatches routed rows to their owners and
+runs both MXFP4 expert GEMMs with SiTU on MXFP8 activations. A final top-k
+reduction combines the returned expert outputs.
+
+The preprocessor rewrites the checkpoint's packed experts in place into the
+kernel's layout (gate/up rows interleaved in 16-row groups, block scales
+swizzled), so the layer keeps one copy of its weights. Weights are launch
+arguments: MoE layers with matching dimensions and activation in an EP group
+share one set of workspaces (`thirdparty/flashinfer/kimi_mega_moe.py`).
+
+A workspace's token capacity is a compile-time parameter; the live row count
+is not. Both MegaMoE runners use the runtime's startup tuning capacity.
+`MoELayer.input_buffers` prepares shared storage in the CPU-backed workspace
+region during warmup. MXFP4 prepares power-of-two capacities from 128 to that
+bound and warms each before capture. The router writes IDs and scores directly
+into the selected capacity's buffers, and the quantizer writes MXFP8 values
+and scales there. Only unused route rows need masking; there is no routing-copy
+kernel on this path. All EP ranks use the same per-step capacity.
+
+The kernel is sized for every SM of the device. Above 128 rows per rank its
+router spans several CTAs and deadlocks across ranks when another kernel holds
+SMs during the launch, so the caller must not overlap it with work on another
+stream. Both MXFP4 and NVFP4 MegaMoE join shared-expert work immediately before
+launch. Routing and latent projection may overlap shared computation beforehand;
+shared-expert TP reduction may overlap routed normalization and projection
+afterward.
+
+The kernel takes BF16 rows, int32 expert ids and FP32 route weights, and
+returns a view of the workspace that is valid until its next launch.
 
 ## NVFP4 MegaMoE for Qwen3.5
 
