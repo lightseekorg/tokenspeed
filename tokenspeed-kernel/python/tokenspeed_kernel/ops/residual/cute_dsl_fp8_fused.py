@@ -26,7 +26,12 @@ import threading
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
@@ -43,7 +48,6 @@ try:
     _AVAILABLE = True
 except (ImportError, NotImplementedError):
     _AVAILABLE = False
-from tokenspeed_kernel.platform import pdl_enabled
 
 
 @dataclass
@@ -78,6 +82,46 @@ def _view(value):
     return from_dlpack(
         value.detach(), assumed_align=4 if value.ndim == 1 else 16
     ).mark_layout_dynamic(leading_dim=value.ndim - 1)
+
+
+def _supports_sm103(device: torch.device) -> bool:
+    return (
+        _AVAILABLE
+        and device.type == "cuda"
+        and current_platform().is_nvidia
+        and torch.cuda.get_device_capability(device) == (10, 3)
+    )
+
+
+def supports_packed_fp8_up_weight(device: torch.device, g: int, h: int, r: int) -> bool:
+    """Check whether the device can use the wide FP8 Up weight layout."""
+    return (g, h, r) == (4, 8192, 1024) and _supports_sm103(device)
+
+
+def prepare_fp8_up_weight(
+    weight: torch.Tensor, g: int, h: int, r: int
+) -> torch.Tensor | None:
+    """Build contiguous K128 by 64-hidden weight tiles for the wide FP8 mixer.
+
+    The caller owns the returned tensor and refreshes its contents in place
+    whenever the canonical weight changes.
+    """
+    if not supports_packed_fp8_up_weight(weight.device, g, h, r):
+        return None
+    if (
+        weight.shape != (g * h, r)
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("Packed Up tiles require contiguous wide E4M3 weights")
+    return (
+        weight.view(torch.uint8)
+        .view(g, h // 64, 64, r // 128, 128)
+        .permute(3, 1, 0, 2, 4)
+        .contiguous()
+        .view_as(weight)
+        .view(weight.dtype)
+    )
 
 
 def _execute(
@@ -241,6 +285,7 @@ def _execute(
 
 
 def _warmup(
+    execute,
     x,
     xs,
     down,
@@ -255,9 +300,10 @@ def _warmup(
     output_dtype,
     projection_scale,
     weights_independent,
+    **options,
 ):
     for bucket in (16, 32, 64, 128, 256):
-        _execute(
+        execute(
             x[:1],
             xs.reshape(-1)[:1],
             down,
@@ -272,6 +318,7 @@ def _warmup(
             projection_scale=projection_scale,
             weights_independent=weights_independent,
             token_bucket=bucket,
+            **options,
         )
 
 
@@ -343,12 +390,11 @@ if _AVAILABLE:
         their input scale, without a separate 16-bit residual. Returns mixed
         values and optional injection logits. Workspace initializes once during
         warmup and is reused on its execution stream; calls require ordering
-        when they share that workspace.
+        when they share that workspace. Wide SM103 injection mixers with a
+        prepared Up weight use it in the 16-, 32-, 64-, and 128-token buckets.
         """
-        if activation_quantization != "fp8" or packed_up_weight is not None:
-            raise ValueError(
-                "prequantized FP8 fusion requires fp8 arithmetic and unpacked weights"
-            )
+        if activation_quantization != "fp8":
+            raise ValueError("prequantized FP8 fusion requires fp8 arithmetic")
         if output_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(
                 "prequantized FP8 fusion requires BF16 or FP16 output_dtype"
@@ -372,8 +418,27 @@ if _AVAILABLE:
         )
         from tokenspeed_kernel.ops.tuning import is_warming_up
 
+        execute = _execute
+        model = (hc_count, hidden_size, lowrank)
+        sm103 = _supports_sm103(normalized.device)
+        if sm103 and model == (4, 8192, 1024):
+            from tokenspeed_kernel.ops.residual._cute_dsl.hc_fp8_wide import (
+                _execute as execute_wide,
+            )
+
+            execute = execute_wide
+            kwargs["packed_up_weight"] = packed_up_weight
+        elif packed_up_weight is not None:
+            raise ValueError("Packed E4M3 Up weights require the wide SM103 mixer")
+        elif sm103 and model == (4, 2560, 320):
+            from tokenspeed_kernel.ops.residual._cute_dsl.hc_fp8_narrow import (
+                _execute as execute_narrow,
+            )
+
+            execute = execute_narrow
+
         if is_warming_up():
-            _warmup(*values, **kwargs)
+            _warmup(execute, *values, **kwargs)
         rows = normalized.shape[0]
         bucket = min(256, max(16, 1 << max(0, rows - 1).bit_length()))
-        return _execute(*values, **kwargs, token_bucket=bucket)
+        return execute(*values, **kwargs, token_bucket=bucket)

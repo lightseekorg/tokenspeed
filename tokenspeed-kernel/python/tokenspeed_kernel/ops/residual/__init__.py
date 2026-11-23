@@ -348,16 +348,23 @@ def prepare_gated_residual_up_weight(
         lowrank: Mix gate bottleneck rank.
 
     Returns:
-        A packed tensor for supported prefill kernels, or None. Its owner must
+        A packed tensor for a supported Up kernel, or None. Its owner must
         refresh it whenever ``weight`` changes, preserving storage during graph
         replay. Other kernels continue to consume the canonical weight.
     """
-    from tokenspeed_kernel.ops.residual.cute_dsl import prepare_up_mix_weight
-
     if weight.shape != (hc_count * hidden_size, lowrank):
         raise ValueError(
             "up weight shape must match hc_count * hidden_size and lowrank"
         )
+    if weight.dtype == _torch.float8_e4m3fn:
+        from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
+            prepare_fp8_up_weight,
+        )
+
+        return prepare_fp8_up_weight(weight, hc_count, hidden_size, lowrank)
+
+    from tokenspeed_kernel.ops.residual.cute_dsl import prepare_up_mix_weight
+
     return prepare_up_mix_weight(weight, hc_count, hidden_size, lowrank)
 
 
@@ -384,7 +391,7 @@ def select_gated_residual_mix_kernel(
         flat: Normalized residual streams shaped ``[rows, hc_count * hidden_size]``.
         projection_weight: Fused down/inject weight (see ``gated_residual_mix``).
         up_weight: Mix-up weight shaped ``[hc_count * hidden_size, lowrank]``.
-        packed_up_weight: Optional load-time layout of up_weight for prefill.
+        packed_up_weight: Optional load-time layout of up_weight for this mixer.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
@@ -418,6 +425,7 @@ def select_gated_residual_mix_kernel(
     traits = {
         "prefill_up_mix": (
             rows >= 4096
+            and projection_weight.dtype in (_torch.bfloat16, _torch.float16)
             and packed_up_weight is not None
             and packed_up_weight.data_ptr() % 16 == 0
         ),
@@ -639,8 +647,8 @@ def gated_residual_mix(
     if fp8_weights:
         if flat.dtype not in (_torch.bfloat16, _torch.float16, _torch.float8_e4m3fn):
             raise ValueError("FP8 mixer requires BF16, FP16 or E4M3 normalized input")
-        if packed_up_weight is not None:
-            raise ValueError("FP8 mixer consumes canonical, unpacked FP8 weights")
+        if packed_up_weight is not None and not prequantized_input:
+            raise ValueError("Packed E4M3 Up weights require prequantized FP8 input")
         for name, weight, scale in (
             ("projection_weight", projection_weight, projection_weight_scale),
             ("up_weight", up_weight, up_weight_scale),
@@ -678,6 +686,20 @@ def gated_residual_mix(
             raise ValueError(
                 "packed_up_weight must have the up weight shape and contiguous storage"
             )
+        if fp8_weights:
+            from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
+                supports_packed_fp8_up_weight,
+            )
+
+            if (
+                not supports_packed_fp8_up_weight(
+                    flat.device, hc_count, hidden_size, lowrank
+                )
+                or packed_up_weight.data_ptr() % 16
+            ):
+                raise ValueError(
+                    "Packed E4M3 Up weights require 16-byte alignment and the wide SM103 mixer"
+                )
     if not flat.is_cuda:
         raise ValueError("gated_residual_mix requires GPU tensors")
 

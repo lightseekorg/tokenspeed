@@ -42,6 +42,28 @@ from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import (
 
 
 @cute.experimental.jit
+def _decode_residual(codes):
+    # Every E4M3 value is exactly representable in BF16 and FP32.
+    words = cute.recast_tensor(codes, cutlass.Uint16)
+    decoded = cute.make_rmem_tensor(cute.size(codes), cutlass.Float32)
+    for i in cutlass.range_constexpr(cute.size(codes) // 2):
+        result = llvm.inline_asm(
+            llvm.StructType.get_literal([T.f32(), T.f32()]),
+            [words[i].ir_value()],
+            "{ .reg .b32 pair; .reg .b16 lo, hi;\n"
+            "cvt.rn.bf16x2.e4m3x2 pair, $2;\n"
+            "mov.b32 {lo, hi}, pair;\n"
+            "cvt.f32.bf16 $0, lo; cvt.f32.bf16 $1, hi; }",
+            "=f,=f,h",
+            has_side_effects=False,
+            asm_dialect=0,
+        )
+        decoded[2 * i] = cutlass.Float32(llvm.extractvalue(T.f32(), result, [0]))
+        decoded[2 * i + 1] = cutlass.Float32(llvm.extractvalue(T.f32(), result, [1]))
+    return decoded
+
+
+@cute.experimental.jit
 def _copy_residual_16(destination, source, size):
     llvm.inline_asm(
         None,
@@ -265,29 +287,18 @@ class _DownPhase(Fp8GatedResidualGemm):
         map_x = cute_ext.get_cta_v_map_ab(x_view, tiler, mma, "B")
         stage_bytes = (self.m + self.n) * self.k
         if warp == self.producer_warp:
+            # The enclosing kernel already waited for input and weight producers.
+            # Pair each stage's operands so its MMA can start before later loads.
             for stage in cutlass.range_constexpr(self.stages):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(full + stage, stage_bytes)
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, split * self.tiles + stage],
-                        sw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, split * self.tiles + stage],
-                        sw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
+                cute_ext.tma_load(
+                    gw[None, None, split * self.tiles + stage],
+                    sw[None, None, None, stage],
+                    (full + stage).value,
+                    cta_v_map=map_w,
+                    update_expect_tx=False,
+                )
                 cute_ext.tma_load(
                     gx[None, None, split * self.tiles + stage],
                     sx[None, None, None, stage],
@@ -431,7 +442,9 @@ class Fp8FusedGatedResidualKernel:
         self.up_parts = 2 if token_bucket == 256 else 1
         # Small narrow tiles avoid padding tokens to the native M128 reader.
         self.token_major_up = r == 1024 or token_bucket == 256
-        self.up_rows = 128 if self.token_major_up else token_bucket
+        self.up_rows = (
+            min(128, max(64, token_bucket)) if self.token_major_up else token_bucket
+        )
         self.up_mn = (
             (self.up_rows, self.up_channels)
             if self.token_major_up
@@ -849,28 +862,33 @@ class Fp8FusedGatedResidualKernel:
         part: cutlass.Constexpr,
         branch: cutlass.Constexpr,
     ):
-        # M128's reader owns a contiguous hidden vector within one token.
-        row, col = coords[0]
-        global_row = global_base + cutlass.Int64(part * self.up_rows + row)
-        if global_row < x.shape[0]:
-            copy_bits = min(128, cute.size(target) * 8)
-            pointer = cute.make_ptr(
-                cutlass.Float8E4M3FN,
-                (
-                    x.iterator
-                    + global_row * (self.g * self.h)
-                    + branch * self.h
-                    + hidden_tile * self.up_hidden
-                    + col
-                ).toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=copy_bits // 8,
-            )
-            source = cute.make_tensor(pointer, cute.make_layout(cute.size(target)))
-            atom = cute.make_copy_atom(
-                CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=copy_bits
-            )
-            cute.copy(atom, source, target)
+        # M64 readers interleave token rows; only channel pairs are contiguous.
+        packet_size = 2 if self.up_rows == 64 else cute.size(target)
+        for packet in cutlass.range_constexpr(cute.size(target) // packet_size):
+            row, col = coords[packet * packet_size]
+            global_row = global_base + cutlass.Int64(part * self.up_rows + row)
+            if global_row < x.shape[0]:
+                copy_bits = min(128, packet_size * 8)
+                pointer = cute.make_ptr(
+                    cutlass.Float8E4M3FN,
+                    (
+                        x.iterator
+                        + global_row * (self.g * self.h)
+                        + branch * self.h
+                        + hidden_tile * self.up_hidden
+                        + col
+                    ).toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=copy_bits // 8,
+                )
+                source = cute.make_tensor(pointer, cute.make_layout(packet_size))
+                values = cute.make_rmem_tensor(packet_size, cutlass.Float8E4M3FN)
+                atom = cute.make_copy_atom(
+                    CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=copy_bits
+                )
+                cute.copy(atom, source, values)
+                for i in cutlass.range_constexpr(packet_size):
+                    target[packet * packet_size + i] = values[i]
 
     @cute.experimental.jit
     def _up(
@@ -1139,6 +1157,7 @@ class Fp8FusedGatedResidualKernel:
                                 part,
                                 branch + 1,
                             )
+                        decoded_x = _decode_residual(x_ring[None, branch % 2])
                         cute.arch.mbarrier_wait(done + part, 0)
                         acc, reader, values, _ = self._reader(
                             mma, base, x, tid, branch, part
@@ -1154,40 +1173,50 @@ class Fp8FusedGatedResidualKernel:
                                     cached[local_row]
                                     * cached[2 * self.n + branch * self.up_hidden + col]
                                 )
-                                xv = (
-                                    x_ring[i, branch % 2].to(cutlass.Float32)
-                                    * cached[self.n + local_row]
-                                )
+                                xv = decoded_x[i] * cached[self.n + local_row]
                                 sums[i] = sums[i] + xv * _up_sigmoid_tanh(
                                     values[i] * factor
                                 )
                     packed = cute.make_rmem_tensor(cute.size(sums), out.element_type)
                     for i in cutlass.range_constexpr(cute.size(sums)):
                         packed[i] = (sums[i] / self.g).to(out.element_type)
-                    row, col = coords[0]
-                    global_row = global_base + cutlass.Int64(part * self.up_rows + row)
-                    if global_row < x.shape[0]:
-                        copy_bits = min(128, cute.size(sums) * 16)
-                        pointer = cute.make_ptr(
-                            out.element_type,
-                            (
-                                out.iterator
-                                + global_row * self.h
-                                + hidden_tile * self.up_hidden
-                                + col
-                            ).toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=copy_bits // 8,
+                    packet_size = 2 if self.up_rows == 64 else cute.size(sums)
+                    for packet in cutlass.range_constexpr(
+                        cute.size(sums) // packet_size
+                    ):
+                        row, col = coords[packet * packet_size]
+                        global_row = global_base + cutlass.Int64(
+                            part * self.up_rows + row
                         )
-                        target = cute.make_tensor(
-                            pointer, cute.make_layout(cute.size(sums))
-                        )
-                        atom = cute.make_copy_atom(
-                            CopyUniversalOp(),
-                            out.element_type,
-                            num_bits_per_copy=copy_bits,
-                        )
-                        cute.copy(atom, packed, target)
+                        if global_row < x.shape[0]:
+                            pointer = cute.make_ptr(
+                                out.element_type,
+                                (
+                                    out.iterator
+                                    + global_row * self.h
+                                    + hidden_tile * self.up_hidden
+                                    + col
+                                ).toint(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=min(16, packet_size * 2),
+                            )
+                            target = cute.make_tensor(
+                                pointer, cute.make_layout(packet_size)
+                            )
+                            output_packet = cute.make_rmem_tensor(
+                                packet_size, out.element_type
+                            )
+                            for i in cutlass.range_constexpr(packet_size):
+                                output_packet[i] = packed[packet * packet_size + i]
+                            cute.copy(
+                                cute.make_copy_atom(
+                                    CopyUniversalOp(),
+                                    out.element_type,
+                                    num_bits_per_copy=min(128, packet_size * 16),
+                                ),
+                                output_packet,
+                                target,
+                            )
                 tcgen05_fence("before_thread_sync")
                 cute.arch.mbarrier_arrive(read_done)
             else:

@@ -607,20 +607,48 @@ graph replay needs no reset kernel. Startup warms finite token buckets
 16/32/64/128/256, with runtime row masks and additional rounds for larger
 batches. PDL waits precede producer-owned input, weight and scale reads.
 
-Prequantized Up reuses the BF16 token-major tile for the wide model and the
-largest narrow-model bucket: 128 tokens by four branches of contiguous hidden
-channels (64 per branch for the wide model, 32 for the narrow model). The
+In the SM103 narrow mixer's 32-token plan, a separate warp issues the
+residual copies on quantizing CTAs. The Up output warp reads its own gate
+values after the shared inputs and MMA results are ready.
+
+The SM103 narrow mixer's 16-token plan keeps the low-rank Down partials in
+aligned projection tiles and the injection columns in a separate region of
+the same scratch allocation. The quantization reader still adds the FP32
+partials in split order.
+
+The SM103 narrow mixer with injection hands off the 16-token bucket's FP8
+activation in aligned records that carry the current epoch. Up checks each
+record before use. Three warps copy contiguous groups of the first K64 plane.
+Once it and the weights are ready, Up can issue its first MMA instructions
+while three other warps copy the remaining planes. The last record of each
+row's first plane supplies both FP32 row scales to the Up epilogue. The
+quantizer also writes the canonical activation scale with the full epoch.
+Each round refreshes the records for both valid and padded rows.
+
+Prequantized Up uses token-major tiles for the wide model and the largest
+narrow-model bucket, with four branches of contiguous hidden channels (64 per
+branch for the wide model, 32 for the narrow model). Wide-model buckets up to
+64 tokens use M64; larger buckets and the narrow model use M128. The
 256-token bucket retains two TMEM accumulators and shares each weight stage
 across their independent activation tiles. The last operand stages stay owned
 until both token parts finish; publishing the first accumulator before the
 second part's MMA tail lets its residual epilogue overlap that tail.
 
-The token-major reader owns a contiguous hidden vector within one token.
-Packed register loads prefetch the next branch's FP8 residual while the
-current branch consumes TMEM; the output is written directly in 16-byte
-vectors. Input, activation and weight scales are cached per tile. Small narrow
-buckets retain the hidden-major layout and shared residual/gate staging to
-avoid padding token MMA work. Both layouts use the same resident phases and
+An SM103 wide mixer with injection can prepare its Up weight at load time
+through the ordinary weight preparation helper. Each K128 tile stores all
+four 64-channel branch segments contiguously. The prepared weight is optional
+for the 16-, 32-, 64-, and 128-token buckets and the 256-token bucket reads the
+canonical weight. The owner refreshes the derived tensor in place whenever it
+updates the canonical weight so captured graphs retain a valid address.
+
+M128 readers own contiguous hidden vectors within one token. M64 readers
+interleave token rows and read and write adjacent channel pairs. Packed register
+loads prefetch the next branch's FP8 residual while the current branch consumes
+TMEM. Residual codes decode in pairs through exact BF16 values. Scaling and
+residual arithmetic use FP32. Output stores use the reader's contiguous vectors.
+Input, activation and weight scales are cached per tile. Small narrow buckets
+retain the hidden-major layout and shared residual/gate staging to avoid padding
+token MMA work. Both layouts use the same resident phases and
 producer/MMA stage pipeline. Another token round waits before scratch reuse;
 the final round publishes its arrivals without polling, with stream and PDL
 completion ordering protecting the next invocation.
@@ -637,7 +665,9 @@ choices through the ordinary operator.
 
 The native FP8 Down projection pairs its initial weight and activation
 transfers when PDL is disabled. Full/empty barriers protect stage reuse;
-PDL retains its readiness dependency ordering.
+PDL retains its readiness dependency ordering. The prequantized fused kernel
+pairs these transfers after its enclosing PDL wait, including when its weights
+depend on the preceding kernel.
 
 The wider model's larger W8A8 Up buckets reuse each resident FP8 weight tile
 across two independent 128-token MMA tiles. Separate activation tiles and
