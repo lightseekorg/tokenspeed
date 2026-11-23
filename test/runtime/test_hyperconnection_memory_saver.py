@@ -45,6 +45,7 @@ def _check_mix_workspaces_survive_release() -> None:
     """Release and resume warmed and later-grown fused mix workspaces on CUDA."""
     from tokenspeed_kernel.ops.residual import cute_fused
     from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
 
     from tokenspeed.runtime.layers.hyperconnection import (
         GatedResidualSimple,
@@ -84,11 +85,21 @@ def _check_mix_workspaces_survive_release() -> None:
         return mixed.cpu(), residuals[2].cpu()
 
     expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    # Eager calls reach new layouts lazily; a later kernel warmup walks the rest.
-    for rows, warm in ((1, False), (200, False), (1, True)):
+    streaming = cute_fused._SM107_HC_STREAM_GROUPS
+    # Eager calls grow layouts, SM107 streaming plans included; warmup walks the rest.
+    # 256 rows reuse the 128-row streaming layout; the other phases add new ones.
+    for rows, warm, grows in (
+        (1, False, True),
+        (128, False, True),
+        (256, False, False),
+        (1, True, True),
+    ):
+        sm107 = current_platform().arch_version == ArchVersion(10, 7)
+        if sm107 and not warm and rows > 64:
+            assert cute_fused._model_tactic(rows, 4, 2560, 320, 324)[-1] == streaming
         layouts = len(cute_fused._WORKSPACES)
         expected[rows] = forward(rows, warm)
-        assert len(cute_fused._WORKSPACES) > layouts
+        assert (len(cute_fused._WORKSPACES) > layouts) == grows
         for _ in range(3):
             torch.cuda.synchronize()
             retained = [
