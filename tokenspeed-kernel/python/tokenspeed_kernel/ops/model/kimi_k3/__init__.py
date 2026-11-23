@@ -133,7 +133,8 @@ class KimiK3MoeTailLayer:
     Attributes:
         tail: The tail the layer runs on.
         weights: The layer's weights as the kernel reads them (opaque).
-        options: The layer's fixed launch options (opaque).
+        options: The layer's fixed launch options (opaque but for
+            ``applies_attn_norm``, whether the decode takes ``attn_norm``).
     """
 
     tail: KimiK3MoeTail
@@ -341,14 +342,7 @@ def kimi_k3_moe_tail(
 def kimi_k3_moe_tail_applies_attn_norm(layer: KimiK3MoeTailLayer) -> bool:
     """Whether :func:`kimi_k3_moe_tail` can apply a KDA layer's gated output
     norm to ``layer``'s attention output."""
-    build = getattr(layer.options, "build", None)
-    if build is None or not hasattr(build, "gated_norm"):
-        return False
-    from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail.contract import (
-        gated_norm_rows,
-    )
-
-    return gated_norm_rows(build.tokens)
+    return layer.options.applies_attn_norm
 
 
 # Registers the tail kernels with the registry.

@@ -142,6 +142,7 @@ if _moe_tail is not None:
         build: Any
         slot: int
         starts_step: bool
+        applies_attn_norm: bool
 
     @register_kernel(
         "kimi_k3",
@@ -256,7 +257,12 @@ if _moe_tail is not None:
         slot = _SLOT_BASE + layer_index
         if not _SLOT_BASE <= slot < 2 * _SLOT_BASE:
             raise ValueError(f"layer {layer_index} has no tail slot")
-        return weights, _LayerOptions(build=build, slot=slot, starts_step=starts_step)
+        return weights, _LayerOptions(
+            build=build,
+            slot=slot,
+            starts_step=starts_step,
+            applies_attn_norm=_moe_tail.gated_norm_rows(shape.rows),
+        )
 
     def _check_rows(tensor: torch.Tensor, rows: int, width: int, what: str) -> None:
         if (
