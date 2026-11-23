@@ -752,6 +752,7 @@ def launch_gluon_gated_rowcta_bf16_gemv_gfx950(
 # any single row.
 _PREFERRED_SHAPES: frozenset[tuple[int, int]] = frozenset(
     {
+        (128, 5120),  # EAGLE-4 candidate head down_proj (Qwen3.8-27B draft)
         (160, 4096),
         (288, 4096),
         (512, 5120),

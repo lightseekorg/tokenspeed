@@ -144,13 +144,10 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
     return drafter
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Candidates are the top rank-r scores; their logits are the exact LM head's;
-    the draft top-k is the best of their softmax."""
-    num_candidates, vocab = 128, 256
+def _candidate_head_model(
+    monkeypatch: pytest.MonkeyPatch, num_candidates: int, vocab: int
+) -> tuple[LlamaForCausalLMEagle4, CandidateHeads]:
+    """A one-layer EAGLE-4 draft with a rank-8 candidate head of random weights."""
     config = LlamaConfig(
         vocab_size=vocab,
         hidden_size=_HIDDEN,
@@ -182,6 +179,17 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
         down_proj=model.efficient_lm_head_down_proj,
         num_candidates=num_candidates,
     )
+    return model, heads
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidates are the top rank-r scores; their logits are the exact LM head's;
+    the draft top-k is the best of their softmax."""
+    num_candidates, vocab = 128, 256
+    model, heads = _candidate_head_model(monkeypatch, num_candidates, vocab)
     processor = model.logits_processor
     processor.draft_top_k = 4
     hidden = torch.randn(3, _HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -212,6 +220,35 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
     scores, tree_tokens = _static_tree_drafter(model, 4)._score_candidates(output)
     assert torch.equal(tree_tokens.long(), tokens)
     torch.testing.assert_close(scores.exp(), probs, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_eagle4_greedy_draft_token_is_the_first_best_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chain draft (no draft top-k) emits each row's argmax candidate, ties to
+    the first, as torch.argmax over the candidate logits, and no draft top-k."""
+    num_candidates, vocab = 128, 256
+    model, heads = _candidate_head_model(monkeypatch, num_candidates, vocab)
+    # Every LM head row four times over: each row's candidates hold tied logits.
+    weight = heads.lm_head.weight.data
+    weight.copy_(weight[: vocab // 4].repeat(4, 1))
+    processor = model.logits_processor
+    assert processor.draft_top_k == 0 and processor.do_argmax
+    hidden = torch.randn(5, _HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    output = processor(
+        None,
+        hidden,
+        heads,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
+    )
+    logits, ids = output.next_token_logits, output.candidate_ids
+
+    best = logits.argmax(-1, keepdim=True)
+    assert (logits == logits.gather(-1, best)).sum(-1).gt(1).any()
+    assert torch.equal(output.next_token_ids, ids.gather(-1, best).view(-1))
+    assert output.draft_topk is None
 
 
 # Toy sizes; the MoE's are the smallest the BF16 squared-ReLU expert kernels plan for.

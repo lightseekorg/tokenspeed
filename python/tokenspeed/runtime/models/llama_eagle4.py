@@ -506,6 +506,13 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
     output also carries each row's best ``draft_top_k`` softmax probabilities
     over its candidates and their tokens (``draft_topk``).
 
+    A greedy draft's next token (``do_argmax``) is the tail's best softmax
+    probability: softmax keeps the logits' order and the tail breaks ties to
+    the lower slot, as ``torch.argmax`` does, so it is the logits' argmax
+    without an argmax and a gather launch. (Distinct bf16 logits only round to
+    one probability when the best is within 2^-25 of another, i.e. below
+    about 1e-5 in magnitude.)
+
     The fused kernels (one shard top-k launch, the gather-dot, one packed
     all-gather of logits and ids, one launch for the rest) reproduce those
     torch ops bit for bit; the model refuses a head they do not cover.
@@ -525,6 +532,8 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         )
         self._candidate_ids: torch.Tensor | None = None
         self._draft_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Each row's best candidate token when do_argmax.
+        self._best_tokens: torch.Tensor | None = None
         # Best probabilities per row each forward also returns (draft_topk; 0: none).
         self.draft_top_k = 0
 
@@ -566,7 +575,8 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
             ids.storage_offset() + nc // 4,
         )
 
-        top_k = self.draft_top_k
+        # do_argmax reads the best token off the tail's top-1.
+        top_k = max(self.draft_top_k, int(self.do_argmax))
         logits = torch.empty((rows, nc), dtype=torch.float32, device=hidden.device)
         tokens = (
             torch.empty((rows, nc), dtype=torch.int64, device=hidden.device)
@@ -585,7 +595,8 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
             cand_logits, cand_ids, top_k, logits, tokens, *(draft_topk or (None, None))
         )
         self._candidate_ids = tokens
-        self._draft_topk = draft_topk
+        self._draft_topk = draft_topk if self.draft_top_k else None
+        self._best_tokens = draft_topk[1][:, 0] if self.do_argmax else None
         return logits
 
     def _dist_argmax_eligible(self) -> bool:
@@ -593,8 +604,8 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         return False
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        best = super()._argmax(logits)
-        return self._candidate_ids.gather(-1, best.view(-1, 1).long()).view(-1)
+        # The candidate tail's top-1 of these logits (see the class docstring).
+        return self._best_tokens
 
     def forward(self, *args, **kwargs) -> Eagle4LogitsOutput:
         output = super().forward(*args, **kwargs)

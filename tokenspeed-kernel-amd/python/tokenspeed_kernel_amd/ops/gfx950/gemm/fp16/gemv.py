@@ -983,6 +983,8 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (5120, 15360): frozenset({1, 4, 16}),  # draft fc
     (5120, 16384): frozenset({4, 16}),  # draft MLP down
     (5120, 17408): frozenset({1, 4, 16}),  # MLP down
+    # EAGLE-4 candidate head down_proj (hidden -> rank 128) of that draft.
+    (128, 5120): frozenset({4, 16}),
 }
 
 
