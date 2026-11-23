@@ -141,6 +141,8 @@ class AttnComponentSpec:
 class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
+    # Optional model-specific implementation of this paged attention family.
+    paged_backend_cls: type | None = None
     is_dsa: ClassVar[bool] = False
     # Whether this family stores a latent KV page (MLA and its DSA variant) as
     # opposed to K/V head rows (MHA, MSA). A draft of the latter kind plans an

@@ -22,8 +22,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
+#include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
@@ -43,6 +45,12 @@ struct SchedulerConfig {
     };
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;
+    // The local SSD tier below Host (docs/rfcs/0006-disk-tier.md), packed like
+    // the Host (host_group_packing). total_pages <= 1 means no Disk tier;
+    // anything above it requires disk_config, a Host cache and the
+    // write-back policy.
+    AllocatorConfig disk_allocator;
+    std::optional<DiskConfig> disk_config;
     // The request-private pool a retracted request's image tail lives in
     // (the unaligned tail pages, groups that never publish, and -- with no
     // Host cache -- the whole image). Never prefix-indexed, never evicted.
@@ -60,6 +68,10 @@ struct SchedulerConfig {
     // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
+    // Optional bound on successful debug-forced retractions per Request.
+    // Omission preserves unlimited forcing. A supplied value must be positive
+    // and requires a nonzero interval; ordinary capacity recovery ignores it.
+    std::optional<std::int32_t> debug_force_retraction_max_per_request;
 
     std::vector<CacheGroupConfig> cache_groups{};
     // Virtual children per compact Host parent, shared by L2 and snapshots.
@@ -67,7 +79,18 @@ struct SchedulerConfig {
     std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+    bool HasDiskCache() const { return disk_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
+    // The Host pool's blocks in its densest group: its usable parents times
+    // the largest host_group_packing. The bound on the Host credits of L3,
+    // the Disk tier and peer Host landings, which count blocks in any group:
+    // a hybrid model's read holds every KV page under the State checkpoint it
+    // reaches.
+    std::int64_t HostBlockCapacity() const {
+        const std::int64_t densest_packing =
+            host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
+        return std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing;
+    }
 
     // What feeds Host L2 from ordinary Device prefix entries; required with a
     // Host tier (Validate says where kWriteBack may run).
@@ -123,6 +146,13 @@ struct SchedulerConfig {
     // Fused role only: decode rounds every local prefill round owes even
     // while an overdue prompt suspends the interval (§3.3). 0 is off.
     std::int32_t prefill_decode_min_interval{0};
+    // With prefill_decode_interval: the most prefill rounds that may run back
+    // to back while an overdue prompt suspends the interval; the round that
+    // reaches it owes the decodes the whole interval again, overdue prompts
+    // or not, and every prompt's held-back count restarts when one of its
+    // chunks runs (docs/design/scheduler.md §3.3). 0 keeps the unbounded
+    // suspension.
+    std::int32_t max_consecutive_prefill_rounds{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after
@@ -135,6 +165,18 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
+    // What the Decode destination gates on the P role; refused elsewhere
+    // (Validate), and absent there it is kEarly. Under either policy a prompt
+    // is admitted once pd::BootstrappedEvent arrived.
+    //   kEarly     that event also says every Decode rank allocated the
+    //              destination, so a prompt computes with its destination
+    //              allocated.
+    //   kDeferred  the destination has its own event,
+    //              pd::DestinationReadyEvent. A prompt computed before it
+    //              waits in PrefillAwaitingDestination, and its KV is sent
+    //              once it arrived.
+    enum class DecodeAllocationPolicy : std::uint8_t { kEarly, kDeferred };
+    std::optional<DecodeAllocationPolicy> decode_allocation_policy;
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.
@@ -200,10 +242,18 @@ struct SchedulerConfig {
     // that fit whole, so they run complete in the same forward: the chunk
     // ends on an earlier page and gives up fewer than this plus one page
     // (docs/design/scheduler.md §1.1). A chunk yields only while such prompts
-    // wait, and only what they take. 0 (the default) is off; at most half of
-    // max_scheduled_tokens, so a long prompt keeps about half of every round
-    // or more.
+    // wait, and only what they take. 0 (the default) is off: no chunk gives
+    // way; at most half of max_scheduled_tokens, so a long prompt keeps about
+    // half of every round or more. The budget a P-role chunk leaves on its
+    // own goes to bootstrapped prompts that fit whole in it whatever this
+    // value (§1.1).
     std::int32_t prefill_chunk_yield_tokens{0};
+    // P role: the most rounds in which one prompt's chunk gives way
+    // (prefill_chunk_yield_tokens); afterwards its chunks are cut only as
+    // they would be without the yield (docs/design/scheduler.md §1.1).
+    // Positive when prefill_chunk_yield_tokens is; the default leaves it
+    // unbounded.
+    std::int32_t prefill_chunk_yield_max_rounds{std::numeric_limits<std::int32_t>::max()};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

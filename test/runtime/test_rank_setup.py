@@ -52,6 +52,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
 )
 
 import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
+import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -73,6 +74,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        cache_storage={},
         host_group_packing=(),
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
@@ -98,6 +100,8 @@ def _config(args: ServerArgs, specs):
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
 
 
@@ -177,8 +181,11 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -221,10 +228,40 @@ def test_the_prefill_decode_min_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_min_interval == 2
 
 
+def test_the_prefill_round_cap_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "64",
+            "--max-consecutive-prefill-rounds",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 64
+    assert cfg.max_consecutive_prefill_rounds == 2
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
         (["--prefill-decode-interval", "-1"], "must be non-negative"),
+        (["--max-consecutive-prefill-rounds", "2"], "needs --prefill-decode-interval"),
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--max-consecutive-prefill-rounds",
+                "-1",
+            ],
+            "--max-consecutive-prefill-rounds must be non-negative",
+        ),
         (
             ["--prefill-decode-interval", "64", "--disaggregation-mode", "prefill"],
             "needs --disaggregation-mode null",
@@ -372,8 +409,8 @@ def test_an_engine_with_l3_passes_its_prefetch_threshold():
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_roles_configure_their_pools_as_resolved(role):
-    # The prefill role resolves to no pool and no forced retraction; the
-    # decode role keeps both.
+    # The prefill role resolves to no pool, no forced retraction and early
+    # admission; the decode role keeps both and has no admission policy.
     args = ServerArgs(
         model="x",
         max_num_seqs=8,
@@ -388,6 +425,23 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+    assert cfg.decode_allocation_policy == (
+        ts.SchedulerConfig.DecodeAllocationPolicy.Early if role == "prefill" else None
+    )
+
+
+def test_deferred_allocation_reaches_the_prefill_scheduler():
+    args = ServerArgs(
+        model="x",
+        disaggregation_mode="prefill",
+        disaggregation_decode_allocation_policy="deferred",
+        disaggregation_layerwise_interval=0,
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    assert (
+        cfg.decode_allocation_policy
+        == ts.SchedulerConfig.DecodeAllocationPolicy.Deferred
+    )
 
 
 @pytest.mark.parametrize(
@@ -1058,9 +1112,12 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
@@ -1195,3 +1252,36 @@ def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
             speculative_draft_model_revision="v2",
             **draft,
         )
+
+
+@pytest.mark.parametrize(
+    "explicit,workspace,expected",
+    [(None, 512, 32), (1024, 512, 32), (256, 512, 16), (None, 0, 0)],
+)
+def test_prefill_page_budget_respects_reserved_workspace(explicit, workspace, expected):
+    args = ServerArgs(model="x", max_num_seqs=8, chunk_prefill_kv_size=explicit)
+    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
+    specs.cache_storage["prefill_kv_capacity"] = workspace
+    cfg = _config(args, specs)
+    assert cfg.max_kv_page_num == expected
+    assert cfg.num_device_pages == specs.cache_geometry.num_device_pages
+
+
+@pytest.mark.parametrize("cap", [None, 1, 64, 2**31 - 1])
+def test_rank_setup_preserves_optional_forced_retraction_cap(cap):
+    args = ServerArgs(
+        model="fixture",
+        debug_force_retraction_interval=3,
+        debug_force_retraction_max_per_request=cap,
+    )
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == cap
+    # Preserve raw optional semantics at the translation boundary too; the
+    # native validator rejects this invalid value, rather than seeing None.
+    args.debug_force_retraction_max_per_request = 0
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == 0

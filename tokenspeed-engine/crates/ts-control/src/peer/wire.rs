@@ -26,6 +26,7 @@
 
 use ts_scheduler::{
     PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView,
+    PeerTier,
 };
 
 use crate::{
@@ -134,12 +135,30 @@ fn read_lease(reader: &mut Reader<'_>) -> Option<PeerLeaseView> {
     })
 }
 
+fn write_tier(out: &mut Writer, tier: PeerTier) {
+    out.u8(match tier {
+        PeerTier::Device => 0,
+        PeerTier::Host => 1,
+        PeerTier::Disk => 2,
+        _ => unreachable!("a peer page tier"),
+    });
+}
+
+fn read_tier(reader: &mut Reader<'_>) -> Option<PeerTier> {
+    Some(match reader.u8()? {
+        0 => PeerTier::Device,
+        1 => PeerTier::Host,
+        2 => PeerTier::Disk,
+        _ => return None,
+    })
+}
+
 fn write_pages(out: &mut Writer, pages: &[PeerPageView]) {
     out.count(pages.len());
     for page in pages {
         out.u32(page.group_id);
         out.i64(i64::from(page.slot));
-        out.flag(page.host);
+        write_tier(out, page.tier);
         out.i64(i64::from(page.block_id));
     }
 }
@@ -155,7 +174,7 @@ fn read_pages(reader: &mut Reader<'_>) -> Option<Vec<PeerPageView>> {
         pages.push(PeerPageView {
             group_id: reader.u32()?,
             slot: read_i32(reader)?,
-            host: reader.flag()?,
+            tier: read_tier(reader)?,
             block_id: read_i32(reader)?,
         });
     }
@@ -202,6 +221,9 @@ fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
         out.u64(field.page_stride);
         out.u64(field.bytes);
     }
+    out.option(geometry.push.as_ref(), |out, endpoint| {
+        out.bytes(endpoint.as_bytes())
+    });
     out.option(geometry.host.as_ref(), |out, pool| {
         out.u64(pool.address);
         out.count(pool.groups.len());
@@ -231,6 +253,7 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
             bytes: reader.u64()?,
         });
     }
+    let push = reader.option(read_str)?;
     let host = reader.option(|reader| {
         let address = reader.u64()?;
         let count = reader.count()?;
@@ -257,6 +280,7 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
         session,
         device,
         host,
+        push,
     })
 }
 
@@ -532,6 +556,7 @@ mod tests {
                     field_offsets: vec![("layer.3.k".into(), 0)],
                 }],
             }),
+            push: Some("10.0.0.2:7300".into()),
         };
         for reply in [
             Reply::Layout {
@@ -540,6 +565,7 @@ mod tests {
                     geometry.clone(),
                     RankGeometry {
                         host: None,
+                        push: None,
                         ..geometry.clone()
                     },
                 ],
@@ -550,12 +576,20 @@ mod tests {
                     lease: lease(),
                     kind: PeerAnswerKind::Lookup,
                     num_tokens: 128,
-                    pages: vec![PeerPageView {
-                        group_id: 0,
-                        slot: 3,
-                        host: true,
-                        block_id: 99,
-                    }],
+                    pages: vec![
+                        PeerPageView {
+                            group_id: 0,
+                            slot: 3,
+                            tier: PeerTier::Host,
+                            block_id: 99,
+                        },
+                        PeerPageView {
+                            group_id: 1,
+                            slot: 1,
+                            tier: PeerTier::Disk,
+                            block_id: 7,
+                        },
+                    ],
                     held: false,
                 },
             },

@@ -33,7 +33,10 @@
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
 
+pub mod cache_events;
 pub mod profile;
+
+pub use cache_events::{CacheEventObserver, CacheObservationLosses};
 
 use std::ptr::NonNull;
 
@@ -43,11 +46,57 @@ use crate::profile::record_scheduler_span;
 
 #[cxx::bridge(namespace = "ts_scheduler")]
 mod ffi {
+    /// Native scheduler observations, separate from scheduler feedback events.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CacheObservationKind {
+        /// A slot acquired a request admission owner.
+        SlotAssigned,
+        /// The owning request-slot handle released its row.
+        SlotReleased,
+        /// A request's image was scheduled for restoration.
+        RestoreScheduled,
+        /// A request's acquired Host prefix was scheduled for copying.
+        PrefixLoadScheduled,
+    }
+
+    /// Fixed-size metadata. Fields outside the selected kind are unused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CacheObservation {
+        /// The owner transition or scheduled operation represented.
+        kind: CacheObservationKind,
+        /// Destination or owned request-pool row index.
+        slot: i32,
+        /// Allocation generation of the owned row.
+        slot_generation: u64,
+        /// The immutable admission identity allocated by the output processor.
+        admission_id: u64,
+        /// Prior owner of this row, zero before its first owner.
+        slot_previous_admission_id: u64,
+        /// Wire operation index, scoped by operation kind and wrap generation.
+        op_id: u32,
+        /// Generation across 32-bit operation-index wraparound.
+        op_generation: u64,
+        /// The request's row before its image was captured.
+        previous_slot: i32,
+        /// Allocation generation of that previous row.
+        previous_slot_generation: u64,
+        /// One-based restore sequence within the admission.
+        restore_sequence: u64,
+        /// Submitted prompt plus accepted generated tokens at the snapshot.
+        committed_tokens: i32,
+        /// Exclusive cache frontier at the same snapshot.
+        computed_tokens: i32,
+        /// Submitted prompt token count.
+        prompt_tokens: i32,
+    }
+
     /// A request to admit (`tokenspeed::RequestSpec`).
     #[derive(Debug, Clone, PartialEq)]
     struct RequestSpec {
         /// Request id.
         request_id: String,
+        /// The output processor's immutable identity for this admission.
+        admission_id: u64,
         /// Router-only cache retention identity, empty when untracked.
         session_id: String,
         /// Shared cache owner, empty to retain session ownership.
@@ -79,6 +128,10 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
+        /// PD, P role under deferred decode allocation: every decode rank
+        /// allocated the request's destination
+        /// (`pd::DestinationReadyEvent`).
+        PdDestinationReady,
         /// PD: the request's transfer failed; it may still be stopping
         /// (`pd::FailedEvent`).
         PdFailed,
@@ -317,6 +370,14 @@ mod ffi {
         operations: u64,
         /// Host blocks storage operations hold.
         held_blocks: u64,
+        /// Old-generation tickets still charged to the operation limit.
+        retained_operations: u64,
+        /// Host references retained by old-generation tickets.
+        retained_host_blocks: u64,
+        /// A global operation or Host-reference limit is full with retained work.
+        retained_capacity_exhausted: bool,
+        /// Capacity warnings emitted on transitions into exhaustion, cumulative.
+        retained_capacity_warnings: u64,
         /// Host blocks quarantined after unproven retirement.
         quarantined: u64,
         /// Keys known to be absent from the store.
@@ -345,6 +406,75 @@ mod ffi {
         disabled_dropped_backup_keys: u64,
         /// Backup candidates dropped on cleanup, cumulative.
         cleanup_dropped_backup_keys: u64,
+    }
+
+    /// The kind of a plan's Disk operation (`DiskOpKind`).
+    #[derive(Debug)]
+    enum DiskOpKind {
+        /// Disk to Host: a prefetch.
+        Read,
+        /// Host to Disk: a cleaning write.
+        Write,
+    }
+
+    /// A Disk operation a plan starts on every cache owner's disk executor
+    /// (`DiskOperation`, `docs/rfcs/0006-disk-tier.md`): row i moves group
+    /// `group_ids[i]`'s block between Host block `host_blocks[i]` and Disk
+    /// block `disk_blocks[i]`.
+    #[derive(Debug, Clone, PartialEq)]
+    struct DiskOpView {
+        /// Which way.
+        kind: DiskOpKind,
+        /// Its id.
+        op_id: u64,
+        /// Each row's cache group, by index.
+        group_ids: Vec<u32>,
+        /// Each row's Host block.
+        host_blocks: Vec<i32>,
+        /// Each row's Disk block.
+        disk_blocks: Vec<i32>,
+    }
+
+    /// A Disk operation every cache owner finished (`cache::DiskDone`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DiskDoneView {
+        /// The operation.
+        op_id: u64,
+        /// Every owner moved every row.
+        success: bool,
+    }
+
+    /// The scheduler's Disk tier observations (`DiskStats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct DiskStatsView {
+        /// Disk operations in flight or holding a request's Host blocks.
+        operations: u64,
+        /// Host blocks Disk operations hold.
+        held_host_blocks: u64,
+        /// Host entries waiting to be cleaned.
+        queued_cleanings: u64,
+        /// Requests waiting for their prefetch.
+        waiting_requests: u64,
+        /// Requests holding a finished prefetch for their admission.
+        ready_requests: u64,
+        /// Disk entries.
+        disk_blocks: u64,
+        /// Empty Disk parents.
+        free_disk_parents: u64,
+        /// Blocks cleaned to Disk, cumulative.
+        written_blocks: u64,
+        /// Blocks prefetched from Disk, cumulative.
+        read_blocks: u64,
+        /// Failed prefetches, cumulative.
+        failed_reads: u64,
+        /// Failed cleaning writes, cumulative.
+        failed_writes: u64,
+        /// Cleaning candidates dropped, cumulative.
+        dropped_cleanings: u64,
+        /// Prefetches that timed out waiting, cumulative.
+        wait_timeouts: u64,
+        /// Ready prefetches that expired, cumulative.
+        ready_expirations: u64,
     }
 
     /// Prefix-cache hits by tier, cumulative since start (`HostCacheStats`).
@@ -445,8 +575,9 @@ mod ffi {
         token_ids: Vec<i32>,
         /// Stored: tokens per block.
         block_size: i32,
-        /// The event concerns the Host cache; else the Device.
-        host: bool,
+        /// The memory the event concerns, as a `KvEventMedium` value: 0 the
+        /// Device, 1 the Host cache, 2 the Disk tier.
+        medium: u8,
     }
 
     /// A peer lease's name: its reader and the reader's own counter
@@ -467,15 +598,32 @@ mod ffi {
         group_id: u32,
         /// The block's slot in the group's request table.
         slot: i32,
-        /// Whether the block is in the Host pool rather than the Device's.
-        host: bool,
+        /// Where the block is.
+        tier: PeerTier,
         /// The scheduler block id on its tier.
         block_id: i32,
+    }
+
+    /// Where a peer page is (`tokenspeed::CacheTier`): a holder lists a page
+    /// from its Device, its Host pool or its Disk tier; a reader lands into
+    /// its Device or its Host pool.
+    #[derive(Debug)]
+    enum PeerTier {
+        /// The Device cache arena.
+        Device,
+        /// The Host pool.
+        Host,
+        /// The Disk tier's file (`docs/rfcs/0006-disk-tier.md`).
+        Disk,
     }
 
     /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerLookupView {
+        /// Request owning this lookup.
+        request_id: String,
+        /// Deadline on the agreed scheduler clock.
+        deadline_us: i64,
         /// The lease the lookup opens.
         lease: PeerLeaseView,
         /// The holder's name.
@@ -571,7 +719,18 @@ mod ffi {
         request_id: String,
     }
 
-    /// The scheduler's peer sharing observations (`Scheduler::PeerStats`).
+    /// Duration and deadline headroom of a completed hard pin.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct PinSampleView {
+        /// Time between applying and releasing the hard pin, in microseconds.
+        held_us: i64,
+        /// Signed microseconds left until the deadline at release.
+        remaining_us: i64,
+        /// Whether the holder reclaimed the pin on expiry.
+        expired: bool,
+    }
+
+    /// The scheduler's peer sharing observations.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct PeerStatsView {
         /// Holder: leases held.
@@ -605,6 +764,13 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type ExecutionPlan;
 
+        fn cache_event_protocol_version() -> u32;
+
+        fn install_cache_event_observer(
+            scheduler: Pin<&mut Scheduler>,
+            observer: Box<CacheEventObserver>,
+        ) -> Result<()>;
+
         fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
         fn next_execution_plan(
             scheduler: Pin<&mut Scheduler>,
@@ -617,6 +783,7 @@ mod ffi {
             ticks: &[StorageTickView],
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
+            disk_done: &[DiskDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
         fn advance_peer(
@@ -634,6 +801,7 @@ mod ffi {
         ) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
+        fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
         fn peer_stats(scheduler: &Scheduler) -> PeerStatsView;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
@@ -676,14 +844,26 @@ mod ffi {
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn defers_decode_state(scheduler: &Scheduler) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
+        fn storage_current_pending(scheduler: &Scheduler) -> bool;
+        fn storage_progress_pending(scheduler: &Scheduler) -> bool;
+        fn storage_blocking_quarantined(scheduler: &Scheduler) -> usize;
+        fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
+        fn can_prepare_storage_clear(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
+        fn disk_stats(scheduler: &Scheduler) -> DiskStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
+        fn cancel_storage_for_clear(scheduler: Pin<&mut Scheduler>);
+        fn can_clear_cache_retaining_storage(scheduler: &Scheduler) -> bool;
+        fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
+        fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -693,6 +873,7 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+        fn plan_disk_ops(plan: &ExecutionPlan) -> Vec<DiskOpView>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         /// Install the scheduler's profile span sink, which forwards to
@@ -701,31 +882,54 @@ mod ffi {
     }
 
     extern "Rust" {
+        type CacheEventObserver;
+        fn record_cache_observation(
+            observer: &CacheEventObserver,
+            value: CacheObservation,
+            request_id: &[u8],
+        );
         /// The C++ scheduler's finished spans, while the sink is installed.
         fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64);
     }
 }
 
 pub use ffi::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
-    PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheObservation,
+    CacheObservationKind, CacheOpKind, CacheOpView, DiskDoneView, DiskOpKind, DiskOpView,
+    DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind,
+    PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
+    PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe, PrefixHitView,
+    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
+    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
 
-/// What advances the scheduler at the head of a round: with L3, the agreed
-/// storage clock, the cancellations and the storage completions; then the
-/// Host copies' acknowledgments.
+fn record_cache_observation(
+    observer: &CacheEventObserver,
+    value: CacheObservation,
+    request_id: &[u8],
+) {
+    observer.record(value, request_id);
+}
+
+/// Version implemented by the linked native ownership producer.
+pub fn cache_event_protocol_version() -> u32 {
+    ffi::cache_event_protocol_version()
+}
+
+/// What advances the scheduler at the head of a round: with L3 or the Disk
+/// tier, the agreed storage clock, the cancellations and the storage and
+/// Disk completions; then the Host copies' acknowledgments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageRound {
-    /// The agreed clock and permissions; `None` without L3.
+    /// The agreed clock and permissions; `None` without L3 or a Disk tier.
     pub tick: Option<StorageTickView>,
     /// Requests cancelled since the last round, in order.
     pub cancellations: Vec<StorageCancellationView>,
     /// Storage operations every owner completed, by op id.
     pub done: Vec<StorageDoneView>,
+    /// Disk operations every owner finished, by op id.
+    pub disk_done: Vec<DiskDoneView>,
 }
 
 extern "C" {
@@ -831,6 +1035,14 @@ impl Scheduler {
         unsafe { self.raw.as_ref() }
     }
 
+    /// Install diagnostics before any admission; native ownership retains the observer.
+    pub fn install_cache_event_observer(
+        &mut self,
+        observer: CacheEventObserver,
+    ) -> Result<(), cxx::Exception> {
+        ffi::install_cache_event_observer(self.pinned(), Box::new(observer))
+    }
+
     /// Queue requests for admission. Validation errors reject the entire
     /// batch without inserting any request.
     pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
@@ -876,6 +1088,7 @@ impl Scheduler {
             ticks,
             &storage.cancellations,
             &storage.done,
+            &storage.disk_done,
             cache_events,
         )
     }
@@ -924,7 +1137,12 @@ impl Scheduler {
         ffi::plan_calls(self.get())
     }
 
-    /// The scheduler's peer sharing observations.
+    /// Drain hard pins released or expired since the last sample.
+    pub fn take_peer_pin_samples(&mut self) -> Vec<PinSampleView> {
+        ffi::take_peer_pin_samples(self.pinned())
+    }
+
+    /// Current holder and reader state.
     pub fn peer_stats(&self) -> PeerStatsView {
         ffi::peer_stats(self.get())
     }
@@ -1013,9 +1231,41 @@ impl Scheduler {
         ffi::storage_pending(self.get())
     }
 
+    /// Current-generation tickets remain, including unknown retirement.
+    pub fn storage_current_pending(&self) -> bool {
+        ffi::storage_current_pending(self.get())
+    }
+
+    /// Current storage work can still advance through completion or deadlines.
+    /// Retained and terminal-unknown tickets keep their resources but do not count.
+    pub fn storage_progress_pending(&self) -> bool {
+        ffi::storage_progress_pending(self.get())
+    }
+
+    /// Current-generation quarantined tickets blocking new storage work.
+    pub fn storage_blocking_quarantined(&self) -> usize {
+        ffi::storage_blocking_quarantined(self.get())
+    }
+
+    /// Ordinary indexed-pin preflight after storage references drain.
+    pub fn storage_non_storage_clearable(&self) -> bool {
+        ffi::storage_non_storage_clearable(self.get())
+    }
+
+    /// Ordinary clear preparation, discounting only real storage pins on
+    /// indexed Host entries. Recovery requires its separate exact preflight.
+    pub fn can_prepare_storage_clear(&self) -> bool {
+        ffi::can_prepare_storage_clear(self.get())
+    }
+
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
+    }
+
+    /// The Disk tier's observations; all zero without one.
+    pub fn disk_stats(&self) -> DiskStatsView {
+        ffi::disk_stats(self.get())
     }
 
     /// Cumulative prefix-cache hits by tier.
@@ -1037,12 +1287,42 @@ impl Scheduler {
         ffi::clear_cache(self.pinned())
     }
 
+    /// Abandon best-effort PUTs before a flush. The next plan carries any
+    /// runtime cancellations; dispatched sources stay pinned until retired.
+    pub fn cancel_storage_backups(&mut self) {
+        ffi::cancel_storage_backups(self.pinned());
+    }
+
+    /// After replica-agreed non-storage preflight, detach request storage
+    /// leases and backups so healthy work can drain without attached holds.
+    pub fn cancel_storage_for_clear(&mut self) {
+        ffi::cancel_storage_for_clear(self.pinned());
+    }
+
+    /// Whether a full clear may retain only the storage tickets' Host blocks.
+    /// Other cache pins, Device transfers and suspended requests still refuse.
+    pub fn can_clear_cache_retaining_storage(&self) -> bool {
+        ffi::can_clear_cache_retaining_storage(self.get())
+    }
+
+    /// Clear cache indexes while preserving detached old storage references.
+    /// The runtime must move subsequent work to a fresh cache generation.
+    pub fn clear_cache_retaining_storage(&mut self) -> bool {
+        ffi::clear_cache_retaining_storage(self.pinned())
+    }
+
+    /// Old storage references survived a clear and still consume capacity.
+    pub fn storage_has_retained_operations(&self) -> bool {
+        ffi::storage_has_retained_operations(self.get())
+    }
+
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
     }
 
-    /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.
+    /// Whether current references permit a full clear, without cancelling
+    /// backups or changing any state.
     pub fn can_clear_cache(&self) -> bool {
         ffi::can_clear_cache(self.get())
     }
@@ -1095,6 +1375,8 @@ pub enum KvEventMedium {
     Device,
     /// The pinned Host cache (Host L2).
     Host,
+    /// The Disk tier (`docs/rfcs/0006-disk-tier.md`).
+    Disk,
 }
 impl KvEventBatch {
     /// Copy independent event rows into an owned batch, preserving wire fields.
@@ -1147,10 +1429,10 @@ impl KvEventBatch {
             parent_block_hash: parents[i],
             token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
             block_size: block_sizes[i],
-            medium: if media[i] == 0 {
-                KvEventMedium::Device
-            } else {
-                KvEventMedium::Host
+            medium: match media[i] {
+                0 => KvEventMedium::Device,
+                1 => KvEventMedium::Host,
+                _ => KvEventMedium::Disk,
             },
         })
     }
@@ -1172,6 +1454,12 @@ impl ExecutionPlan {
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
         let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
+    }
+
+    /// The requests whose prompt's last chunk the plan's batches carry
+    /// (`ForwardBatch::CompletesPrompt`).
+    pub fn completed_prompts(&self) -> Vec<String> {
+        ffi::plan_completed_prompts(&self.0)
     }
 
     /// Whether the data plane has anything to do for this plan: a batch,
@@ -1227,6 +1515,12 @@ impl ExecutionPlan {
     /// runs them on the cache owners' storage executors.
     pub fn storage_ops(&self) -> Vec<StorageOpView> {
         ffi::plan_storage_ops(&self.0)
+    }
+
+    /// The Disk operations the plan starts, in plan order; the control plane
+    /// runs them on the cache owners' disk executors.
+    pub fn disk_ops(&self) -> Vec<DiskOpView> {
+        ffi::plan_disk_ops(&self.0)
     }
 
     /// The peer prefix landings the plan admitted, in plan order.

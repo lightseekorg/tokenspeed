@@ -258,6 +258,9 @@ class TestDeferredDecodeState:
                 hard_pin_us=1000,
                 lookup_timeout_us=100,
                 min_fetch_tokens=cfg.prefix_granularity,
+                landing_tier=ts.PeerLandingTier.Device,
+                max_host_landing_blocks=0,
+                host_ready_timeout_us=0,
             )
         groups = cfg.cache_groups
         for group in groups:

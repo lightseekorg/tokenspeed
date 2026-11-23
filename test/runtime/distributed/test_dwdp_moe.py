@@ -29,9 +29,14 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
+    ExpertWeightShard,
+    PreparedExpertWeights,
     create_peer_weight_store,
 )
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+)
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import (
     ExpertCheckpointSchema,
@@ -47,7 +52,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 @pytest.fixture(scope="module")
 def device():
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-        pytest.skip("Launch with torchrun on fabric-connected GPUs")
+        pytest.skip("Launch with torchrun on at least two CUDA devices")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     torch.set_num_threads(2)
@@ -154,8 +159,88 @@ def _load_input_scales(layer, *, experts, rank, size):
         )
 
 
+def _run_layers(layers, inputs, routing, manager):
+    manager.prefetch_first()
+    for layer in layers:
+        inputs = layer(inputs, routing, inputs.shape[0], inputs.shape[0])
+    return inputs
+
+
+@pytest.mark.parametrize("num_layers", [3, 4])
+def test_peer_manager_breakable_graph_replay(device, num_layers):
+    partition = ExpertPartition(
+        2 * dist.get_world_size(), dist.get_rank(), dist.get_world_size()
+    )
+    store = create_peer_weight_store(
+        partition=partition,
+        group=dist.group.WORLD,
+        device=device,
+        model_identity="peer-manager-graph-test",
+        pool_page_bytes=16 * 1024**2,
+        copy_implementation="simple",
+        handle_type="posix_fd",
+        solution="cuda",
+    )
+    manager = MoEPeerWeights(partition=partition, store=store)
+    layers = []
+    references = []
+    # A whole VMM page per expert forces replay to refresh remote staging,
+    # rather than reading only the immutable edge bytes populated at setup.
+    width = store.granularity // 4
+    try:
+        for index in range(num_layers):
+            full = (
+                torch.arange(partition.num_experts, device=device, dtype=torch.float32)
+                + index
+                + 1
+            )[:, None].expand(-1, width).contiguous() / 16
+            layer = torch.nn.Linear(width, partition.count, bias=False, device=device)
+            layer.weight.data.copy_(
+                full[partition.first : partition.first + partition.count]
+            )
+            manager.publish(
+                index,
+                layer,
+                PreparedExpertWeights(
+                    "linear-test", (ExpertWeightShard("weight", layer.weight, False),)
+                ),
+            )
+            layers.append(layer)
+            references.append(full)
+        manager.finalize()
+        assert store.staging_bytes > 0
+        inputs = torch.randn(2, width, device=device)
+
+        def forward(value):
+            manager.prefetch_first()
+            outputs = []
+            for index, layer in enumerate(layers):
+                with manager.read(index):
+                    outputs.append(layer(value))
+            return torch.stack(outputs).sum(dim=0)
+
+        with torch.no_grad():
+            forward(inputs)
+            capture = BreakableCapture()
+            with capture:
+                output = forward(inputs)
+            for _ in range(8):
+                inputs.normal_()
+                expected = torch.stack(
+                    [
+                        torch.nn.functional.linear(inputs, weight)
+                        for weight in references
+                    ]
+                ).sum(dim=0)
+                capture.replay()
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    finally:
+        manager.close()
+
+
 @pytest.mark.parametrize("quant", ["nvfp4", "mxfp4"])
-def test_owned_loading_and_full_expert_compute(device, quant):
+@pytest.mark.parametrize("num_layers", [3, 4])
+def test_owned_loading_and_full_expert_compute(device, quant, num_layers):
     world, rank = dist.get_world_size(), dist.get_rank()
     partition = ExpertPartition(world * 2, rank, world)
     store = create_peer_weight_store(
@@ -165,6 +250,7 @@ def test_owned_loading_and_full_expert_compute(device, quant):
         model_identity=f"runtime-moe-test-{quant}",
         pool_page_bytes=16 * 1024**2,
         copy_implementation="simple",
+        handle_type="posix_fd",
         solution="cuda",
     )
     manager = MoEPeerWeights(partition=partition, store=store)
@@ -177,7 +263,7 @@ def test_owned_loading_and_full_expert_compute(device, quant):
     try:
         resident, shared = [], []
         with torch.device(device):
-            for index in range(3):
+            for index in range(num_layers):
                 full = _layer(quant, partition.num_experts, index, None)
                 own = _layer(quant, partition.num_experts, index, manager)
                 assert own.w13_weight.shape[0] == partition.count
@@ -197,25 +283,65 @@ def test_owned_loading_and_full_expert_compute(device, quant):
                 shared.append(own)
         manager.finalize()
         hidden_size = resident[0].hidden_size
-        inputs = (
-            torch.randn(128, hidden_size, device=device, dtype=torch.bfloat16) * 0.2
+        static_inputs = torch.empty(
+            128, hidden_size, device=device, dtype=torch.bfloat16
         )
-        ids = (
+        static_weights = torch.empty(128, 4, device=device, dtype=torch.bfloat16)
+        static_ids = torch.empty(128, 4, device=device, dtype=torch.int32)
+
+        def routing():
+            return StandardTopKOutput(static_weights, static_ids, None)
+
+        def expected_output(inputs, route):
+            for layer in resident:
+                inputs = layer(inputs, route, inputs.shape[0], inputs.shape[0])
+            return inputs
+
+        # Warm up the real peer-reader path before capturing its eager breaks.
+        static_inputs.normal_(std=0.2)
+        static_weights.fill_(0.25)
+        static_ids.copy_(
             (
                 torch.arange(128, device=device)[:, None]
                 + torch.arange(4, device=device)[None, :]
             )
             % partition.num_experts
-        ).int()
-        routing = StandardTopKOutput(
-            torch.full((128, 4), 0.25, device=device, dtype=torch.bfloat16), ids, None
         )
-        expected = [layer(inputs, routing, 128, 128) for layer in resident]
-        for iteration in range(24):
-            manager.prefetch_first()
-            for index, layer in enumerate(shared):
-                actual = layer(inputs, routing, 128, 128)
-                torch.testing.assert_close(actual, expected[index], rtol=0, atol=0)
+        warmup_route = routing()
+        _run_layers(shared, static_inputs, warmup_route, manager)
+
+        capture = BreakableCapture()
+        with torch.no_grad():
+            with capture:
+                graph_output = _run_layers(shared, static_inputs, warmup_route, manager)
+
+            # A direct replay is a smoke pass before serving changes static inputs.
+            capture.replay()
+            torch.testing.assert_close(
+                graph_output,
+                expected_output(static_inputs.clone(), warmup_route),
+                rtol=0,
+                atol=0,
+            )
+
+            # Exercise same-slot layer reuse and cross-slot prefetch over repeated
+            # serving replays with live values copied into stable graph inputs.
+            for iteration in range(8):
+                inputs = torch.randn(
+                    128, hidden_size, device=device, dtype=torch.bfloat16
+                ) * (0.1 + iteration * 0.01)
+                weights = torch.rand(128, 4, device=device, dtype=torch.bfloat16)
+                ids = (
+                    torch.arange(128, device=device)[:, None]
+                    + torch.arange(4, device=device)[None, :]
+                    + iteration
+                ) % partition.num_experts
+                static_inputs.copy_(inputs)
+                static_weights.copy_(weights)
+                static_ids.copy_(ids)
+                expected = expected_output(inputs.clone(), routing())
+                capture.replay()
+                torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
     finally:
         manager.close()
         global_server_args_dict.clear()

@@ -428,8 +428,8 @@ def _pool_spec(recipe):
 
 def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> None:
     """A GQA block draft whose every layer slides keeps its K/V pages in a
-    window group of its own, in the bytes it took inside the MLA group, and
-    KVP shards the MLA group but not that window."""
+    window group of its own, inside the target's MLA planes, and KVP shards
+    the MLA group but not that window."""
     from tokenspeed.runtime.layers.attention import registry
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         DRAFT_SLIDING_ATTENTION,
@@ -437,7 +437,7 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
 
     num_target_layers = KimiLinearConfig().num_hidden_layers
     num_draft_layers = 5
-    _, _, shared = kimi_tp8_layout(draft_layers=num_draft_layers, draft_attn="mha")
+    _, _, target = kimi_tp8_layout()
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=num_draft_layers, draft_attn="mha", draft_window=2048
     )
@@ -458,13 +458,24 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
     }
     assert field_ids[DRAFT_SLIDING_ATTENTION] == draft_field_ids
     assert not field_ids[FULL_ATTENTION] & draft_field_ids
+    # The draft adds no bytes: the planes and every target group's packing are
+    # the draft-less target's, and each draft layer takes two MLA planes.
+    assert layout.plane_bytes == target.plane_bytes
+    assert layout.lcm_block_bytes == target.lcm_block_bytes
     packing = dict(layout.group_packing)
-    assert packing[DRAFT_SLIDING_ATTENTION] == packing[FULL_ATTENTION]
-    # Plane ids number each group's own layers; the bytes are the same.
-    assert sorted(size for _, size in layout.plane_bytes) == sorted(
-        size for _, size in shared.plane_bytes
+    draft_packing = packing.pop(DRAFT_SLIDING_ATTENTION)
+    assert packing == dict(target.group_packing)
+    draft_fields = next(
+        fields for spec, fields in groups if spec.group_id == DRAFT_SLIDING_ATTENTION
     )
-    assert layout.lcm_block_bytes == shared.lcm_block_bytes
+    assert [field.plane_id for field in draft_fields] == [
+        f"slot.{index}" for index in range(2 * num_draft_layers)
+    ]
+    plane_bytes = dict(layout.plane_bytes)
+    assert all(
+        draft_packing * field.payload_bytes <= plane_bytes[field.plane_id]
+        for field in draft_fields
+    )
 
     spec = _pool_spec(_kvp8(recipe))
     shard_counts = {
@@ -487,6 +498,58 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
         registry._validate_unsharded_draft_storage(
             shared_spec, num_target_layers=num_target_layers
         )
+
+
+def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> None:
+    """At attention TP 1 a draft K page is narrower than its share of an MLA
+    plane: K and V are strided 4-D views of two planes with one page stride,
+    and the parent is the draft-less Kimi-K3.1 target's."""
+    from test.runtime.conftest import kimi_layout
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        DRAFT_SLIDING_ATTENTION,
+    )
+
+    num_draft_layers = 5
+    target_recipe = kimi_recipe(
+        tp_size=1, dsa_index_k_format="fp8_scaled", mamba_ssm_dtype="bfloat16"
+    )
+    _, target = kimi_layout(target_recipe)
+    recipe = kimi_recipe(
+        tp_size=1,
+        dsa_index_k_format="fp8_scaled",
+        mamba_ssm_dtype="bfloat16",
+        draft_layers=num_draft_layers,
+        draft_attn="mha",
+        draft_window=2048,
+    )
+    _, layout = kimi_layout(recipe)
+    assert layout.plane_bytes == target.plane_bytes
+    assert layout.lcm_block_bytes == target.lcm_block_bytes
+
+    assert len(layout.plane_bytes) == 48
+    assert layout.lcm_block_bytes == 100_048_896
+
+    plan = layout.bind(3)
+    draft_packing = dict(layout.group_packing)[DRAFT_SLIDING_ATTENTION]
+    assert draft_packing == 12
+    draft_fields = [
+        field for field in plan.fields if field.group_id == DRAFT_SLIDING_ATTENTION
+    ]
+    assert len(draft_fields) == 2 * num_draft_layers
+    plane_bytes = dict(layout.plane_bytes)
+    for index, field in enumerate(draft_fields):
+        assert field.plane_id == f"slot.{index}"
+        assert field.page_stride_bytes == plane_bytes[field.plane_id] // draft_packing
+        assert field.payload_bytes == 262_144
+        assert field.page_stride_bytes == 282_624
+
+    arena = make_arena(plan)
+    for field in draft_fields:
+        view = arena.field(field.field_id)
+        assert view.shape[0] >= 3 * draft_packing
+        assert view.shape[1:] == field.shape
+        assert view.stride(0) * view.element_size() == field.page_stride_bytes
 
 
 def test_drafter_keeps_fused_kv_writes_for_an_unsharded_draft_group() -> None:

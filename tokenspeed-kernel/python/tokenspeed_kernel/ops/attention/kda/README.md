@@ -8,6 +8,25 @@ dense base of the request's page. The logical endpoint is the base followed by
 `--mamba-ssm-dtype` (FP32 or BF16). Accumulation and history remain FP32.
 Materialization casts the result to the dense base dtype.
 
+## CuTe prefill (`cutedsl_kda`)
+
+The backend selects FlashInfer's ordinary or persistent CuTe KDA scan, reading
+token-strided Q/K/V directly from convolution output. Persistent prefill admits
+BF16 gates, head counts divisible by eight and gate bounds in `[-5, 0)`, and is
+selected when `2 * requests * heads > SM count`; smaller workloads retain the
+ordinary decomposed scan. FP32 initial and final states are
+separate; the runtime retains its LCM gather/writeback and checkpoint policy.
+Live device boundaries build the scan plan for both eager execution and
+capacity-based CUDA graphs. Inputs beyond the live total follow the runtime's
+zero-padding contract: native scans may load a full tile at the tail.
+Persistent planning distributes 32-token chunks
+over resident workers, with at most one exact FP32 handoff per request/head
+chain. Its metadata launch also resets the handoff flags on every replay.
+Scratch belongs to each invocation or its graph
+pool; only compiled code is cached. The FlashInfer adapter owns the pinned
+native launch ABI, avoiding the public wrapper's in-place state updates and
+persistent GPU scratch.
+
 ## Verify and publication
 
 `KdaRetainedRecords` supplies original pre-convolution QKV, the retained history,

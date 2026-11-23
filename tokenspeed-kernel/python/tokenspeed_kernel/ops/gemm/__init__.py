@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
 from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     Platform,
     current_platform,
@@ -85,6 +86,7 @@ __all__ = [
     # GEMM
     "bmm",
     "mm",
+    "mm_activation_scale_layout",
     "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
@@ -167,6 +169,9 @@ _fp8_dtype = torch.float8_e4m3fn
 #   <dim>_min            spec only: set of accepted minimums for <dim>
 #   mnk_problem_filter   spec only: ``(m, n, k) -> bool`` predicates for rules
 #                        the above cannot express
+#   problem_filter       spec only: predicates over named request traits
+#                        (``selection.traits_problem_filter``), for rules that
+#                        also read traits other than m, n and k
 #
 # ``selection.spec_matches_shape_traits`` evaluates these; a spec that
 # constrains a dimension rejects a request that does not supply it. Every
@@ -365,6 +370,24 @@ def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
     return spec is not None and spec.solution == "torch"
 
 
+def _scales_major(scales: torch.Tensor | None) -> str | frozenset[str]:
+    """Which axis of 2-D scales is contiguous; empty when both orders fit."""
+    if scales is None or scales.dim() != 2:
+        return frozenset()
+    k_major = scales.shape[1] == 1 or scales.stride(1) == 1
+    mn_major = scales.shape[0] == 1 or scales.stride(0) == 1
+    if k_major and mn_major:
+        return frozenset()
+    return "k_major" if k_major else "mn_major" if mn_major else "strided"
+
+
+def _reads_mn_major_scales(kernel_name: str) -> bool:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    return spec is not None and spec.traits.get("a_scales_layout") == frozenset(
+        {"mn_major"}
+    )
+
+
 def _validate_gemm_out(
     out: torch.Tensor,
     *,
@@ -520,6 +543,7 @@ def plan_dense_gemm(
     dtype: torch.dtype,
     batch_size: int | None,
     batch_invariant: bool,
+    solution: str | None = None,
 ) -> KernelPlan:
     """Plan dense MM/BMM from model geometry, without allocating example tokens.
 
@@ -538,10 +562,143 @@ def plan_dense_gemm(
         features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         static_traits=traits,
         variable_traits=frozenset({"m"}),
-        solution=None,
+        solution=solution,
         declared_traits=frozenset(),
         ignore_layout=False,
     )
+
+
+def _mm_traits(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    *,
+    M: int,
+    N: int,
+    K: int,
+    b_layout: str,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None,
+    quant: str | None,
+    block_size: list[int] | None,
+    enable_pdl: bool,
+) -> dict[str, object]:
+    """The traits mm selects its kernel with."""
+    block_scale_layout = (
+        "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+    )
+    # Online FP32/UE8M0 quantizers write contiguous FP8; describe what GEMM sees.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
+    traits: dict[str, object] = {
+        "m": M,
+        "n": N,
+        "k": K,
+        "b_layout": b_layout,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
+        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "a_scales_layout": _scales_major(A_scales),
+        "b_contiguous": B.is_contiguous(),
+        "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
+        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
+        "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
+        "out_dtype": out_dtype,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
+        "pdl_enabled": enable_pdl,
+    }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Offset views can break alignment; online quantization allocates aligned ones.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
+
+    if A.dtype == B.dtype == torch.bfloat16:
+        traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
+        traits["out_aligned_32"] = out is None or out.data_ptr() % 32 == 0
+    return traits
+
+
+def mm_activation_scale_layout(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    B_scales: torch.Tensor,
+    block_size: list[int],
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> str:
+    """The activation-scale layout mm's block-FP8 kernel reads for 16-bit A.
+
+    Quantize ``A`` into this layout before ``mm(quant="mxfp8")`` so neither
+    the quantizer nor the kernel copies the scales into another layout.
+
+    Args:
+        A: BF16 or FP16 activations ``[M, K]`` that will be quantized.
+        B: E4M3 weights.
+        B_scales: Weight block scales, as passed to ``mm``.
+        block_size: Block size, as passed to ``mm``.
+        out: Output buffer, as passed to ``mm``.
+        out_dtype: Output dtype, as passed to ``mm``; defaults to ``A``'s.
+        solution: Implementation family, as passed to ``mm``.
+        override: Kernel name, as passed to ``mm``.
+
+    Returns:
+        ``"mn_major"`` when the kernel ``mm`` selects reads MN-major
+        activation scales, otherwise ``"k_major"``.
+    """
+    override = resolve_kernel_override("gemm", "mm", override)
+    out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    K = A.shape[-1]
+    b_layout = "KN" if B.shape[0] == K else "NK"
+    N = B.shape[-1] if b_layout == "KN" else B.shape[0]
+    traits = _mm_traits(
+        A,
+        B,
+        None,
+        B_scales,
+        M=A.shape[0],
+        N=N,
+        K=K,
+        b_layout=b_layout,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=None,
+        quant="mxfp8",
+        block_size=block_size,
+        enable_pdl=pdl_enabled(),
+    )
+    signature = _gemm_format_signature(
+        A, B, None, B_scales, out_dtype, "mxfp8", block_size
+    )
+    kernel = select_kernel(
+        "gemm", "mm", signature, traits=traits, solution=solution, override=override
+    )
+    return "mn_major" if _reads_mn_major_scales(kernel.name) else "k_major"
 
 
 def mm(
@@ -706,7 +863,10 @@ def mm(
         # the same bias-free tuning branch for FI's timing collectives, even
         # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
-        warm_tgv_decode_gemm(A, B)
+        if is_warming_up():
+            warm_tgv_decode_gemm(A, B)
+            warm_gluon_mm_a16w16_skinny(A, B)
+            warm_gluon_mm_a16w16_decode(A, B)
         # Let the registry check the small-N policy's layout/alignment traits.
         small_n = prefer_bf16_small_n_splitk(M, N, K, enable_pdl=enable_pdl)
         if (
@@ -759,62 +919,25 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
-        if bias is None and not small_n and _use_mv(A, B):
+        if bias is None and not small_n and _use_mv(A, B, out):
             return mv(A, B, out)
 
-    block_scale_layout = (
-        "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+    traits = _mm_traits(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        M=M,
+        N=N,
+        K=K,
+        b_layout=b_layout,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=alpha,
+        quant=quant,
+        block_size=block_size,
+        enable_pdl=enable_pdl,
     )
-    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
-    # Describe the layout seen by GEMM, not the original dense activation view.
-    online_contiguous_a = (
-        quant == "mxfp8"
-        and A_scales is None
-        and A.dtype in (torch.bfloat16, torch.float16)
-        and B_scales is not None
-        and block_size is not None
-        and (
-            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
-            or (
-                B_scales.dtype == torch.uint8
-                and block_size[1] == 32
-                and A.stride(-1) == 1
-            )
-        )
-    )
-    traits: dict[str, object] = {
-        "m": M,
-        "n": N,
-        "k": K,
-        "b_layout": b_layout,
-        "a_contiguous": online_contiguous_a or A.is_contiguous(),
-        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
-        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
-        "b_contiguous": B.is_contiguous(),
-        "b_inner_stride_one": B.stride(-1) == 1,
-        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
-        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
-        "block_scale_layout": block_scale_layout,
-        "has_alpha": alpha is not None,
-        "out_contiguous": out is None or out.is_contiguous(),
-        "out_dtype": out_dtype,
-        "out_inner_stride_one": out is None or out.stride(-1) == 1,
-        "pdl_enabled": enable_pdl,
-    }
-    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
-        # Contiguous offset views can still violate a backend's pointer alignment.
-        # Online quantization allocates aligned activation values and scales.
-        traits["operands_aligned_16"] = (
-            online_contiguous_a or A.data_ptr() % 16 == 0
-        ) and B.data_ptr() % 16 == 0
-        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
-        traits["scales_aligned_16"] = (
-            A_scales is None or A_scales.data_ptr() % 16 == 0
-        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
-
-    if A.dtype == B.dtype == torch.bfloat16:
-        traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
-        traits["out_aligned_32"] = out is None or out.data_ptr() % 32 == 0
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
@@ -861,6 +984,9 @@ def mm(
             enable_pdl=enable_pdl,
             kernel_name=kernel.name,
         )
+        if _reads_mn_major_scales(kernel.name) and _scales_major(A_scales) == "k_major":
+            # This kernel reads MN-major scales; the online quantizer writes K-major.
+            A_scales = A_scales.t().contiguous().t()
 
     # Online per-token FP8 quantization of 16-bit activations.
     if (
@@ -1830,6 +1956,38 @@ _MV_SIGNATURES = {
 }
 
 
+@lru_cache(maxsize=16)
+def _mv_declares_alignment(x_dtype: torch.dtype, weight_dtype: torch.dtype) -> bool:
+    """Whether a registered mv kernel for the dtypes declares 16-byte alignment.
+
+    Registered in this process, whatever architecture it takes: a vendor's
+    other architectures then read addresses they need not."""
+    signature = _MV_SIGNATURES.get((x_dtype, weight_dtype))
+    return signature is not None and any(
+        "operands_aligned_16" in spec.traits or "out_aligned_16" in spec.traits
+        for spec in KernelRegistry.get().get_for_operator(
+            "gemm", "mv", format_signature=signature
+        )
+    )
+
+
+def _mv_alignment(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> tuple[bool, bool]:
+    """The ``(operands_aligned_16, out_aligned_16)`` traits of an mv call.
+
+    Addresses are read only for CUDA tensors on a platform where a registered
+    kernel can decline on them; elsewhere the call reads none and selects as
+    it did before the traits. ``out`` is None for a call with no destination.
+    """
+    if not x.is_cuda or not _mv_declares_alignment(x.dtype, weight.dtype):
+        return True, True
+    return (
+        x.data_ptr() % 16 == 0 and weight.data_ptr() % 16 == 0,
+        out is None or out.data_ptr() % 16 == 0,
+    )
+
+
 @lru_cache(maxsize=64)
 def _select_mv(
     m: int,
@@ -1839,6 +1997,8 @@ def _select_mv(
     x_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     weight_split: bool,
+    operands_aligned_16: bool,
+    out_aligned_16: bool,
 ):
     signature = _MV_SIGNATURES.get((x_dtype, weight_dtype))
     if not on_cuda or signature is None:
@@ -1848,7 +2008,17 @@ def _select_mv(
     # Honor each registered implementation's architecture gate and dtype
     # signature before its shape traits, including the specialized CDNA5
     # kernels. Kernels that take a split weight declare the weight_split trait.
-    traits = {"m": m, "n": n, "k": k, "weight_split": weight_split}
+    # A kernel that needs 16-byte aligned operands or output declares the
+    # alignment traits, as mm's kernels do, and an offset view selects the
+    # next match.
+    traits = {
+        "m": m,
+        "n": n,
+        "k": k,
+        "operands_aligned_16": operands_aligned_16,
+        "out_aligned_16": out_aligned_16,
+        "weight_split": weight_split,
+    }
     for spec in reg.get_for_operator(
         "gemm",
         "mv",
@@ -1862,7 +2032,13 @@ def _select_mv(
     return torch_decode_gemv
 
 
-def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _use_mv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    # Required, so that a caller cannot omit the out it hands to mv; None for
+    # a call with no destination.
+    out: torch.Tensor | None,
+) -> bool:
     if (
         flashinfer_joint_bf16_supported(x, weight, None)
         and x.shape[0] <= BF16_GEMM_MAX_M
@@ -1882,8 +2058,21 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     m, k = x.shape
     platform = current_platform()
     n = weight.shape[0]
+    # Addresses are read only for CUDA tensors when a registered mv kernel
+    # declares an alignment trait (_mv_alignment).
+    operands_aligned, out_aligned = _mv_alignment(x, weight, out)
     if platform.is_cdna4:
-        impl = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+        impl = _select_mv(
+            m,
+            n,
+            k,
+            True,
+            x.dtype,
+            weight.dtype,
+            False,
+            operands_aligned,
+            out_aligned,
+        )
         if impl is torch_decode_gemv:
             return False
         # Single rows keep mm's own path (Torch's skinny GEMM or hipBLASLt)
@@ -1897,7 +2086,18 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     if not platform.is_cdna5 or k < 256:
         return False
     return (
-        _select_mv(m, n, k, True, x.dtype, weight.dtype, False) is not torch_decode_gemv
+        _select_mv(
+            m,
+            n,
+            k,
+            True,
+            x.dtype,
+            weight.dtype,
+            False,
+            operands_aligned,
+            out_aligned,
+        )
+        is not torch_decode_gemv
     )
 
 
@@ -1913,7 +2113,9 @@ def mv(
     FlashInfer owns runner/tactic selection on the supported BF16 range.
     The registry retains other architectures, unsupported input layouts and
     FP32 weights, which also take BF16 activations and return FP32.
-    Noncontiguous inputs and other dtypes take Torch.
+    Noncontiguous inputs and other dtypes take Torch. A kernel that declares
+    the 16-byte alignment traits is not selected for an operand or an ``out``
+    that starts off such a boundary.
 
     Args:
         x: ``[M, K]`` activations.
@@ -1957,6 +2159,7 @@ def mv(
         x.dtype,
         weight.dtype,
         weight_split is not None,
+        *_mv_alignment(x, weight, out),
     )
     if impl is triton_bf16x3_gemm_fp32:
         return impl(x, weight_split, out)
@@ -2099,7 +2302,17 @@ def _select_mv_weightless_rmsnorm_gated_sigmoid(
         "weightless_rmsnorm_gated_sigmoid",
         dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
     )
-    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    # No destination here: the selection is only compared.
+    gemv = _select_mv(
+        m,
+        n,
+        k,
+        True,
+        x.dtype,
+        weight.dtype,
+        False,
+        *_mv_alignment(x, weight, None),
+    )
     if (
         norm.name != "triton_weightless_rmsnorm_gated_sigmoid"
         or gemv is not KernelRegistry.get().get_impl("gluon_rowcta_bf16_gemv_gfx950")
@@ -2211,7 +2424,17 @@ def _select_mv_rmsnorm_gated_sigmoid(
         return None
     # The launch reproduces rmsnorm_gated_sigmoid and the GEMV that mm runs on
     # its rows bit for bit, so it only stands in where mm selects that GEMV.
-    gemv = _select_mv(m, n, k, True, gate.dtype, weight.dtype, False)
+    # No destination here: the selection is only compared.
+    gemv = _select_mv(
+        m,
+        n,
+        k,
+        True,
+        gate.dtype,
+        weight.dtype,
+        False,
+        *_mv_alignment(gate, weight, None),
+    )
     if gemv is not KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950"):
         return None
     return kernel
@@ -2329,7 +2552,17 @@ def _select_mv_rmsnorm(
         return None
     # The launch reproduces rmsnorm_fused_parallel and the GEMV that mm runs on
     # its rows bit for bit, so it only stands in where mm selects that GEMV.
-    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    # No destination here: the selection is only compared.
+    gemv = _select_mv(
+        m,
+        n,
+        k,
+        True,
+        x.dtype,
+        weight.dtype,
+        False,
+        *_mv_alignment(x, weight, None),
+    )
     if gemv is not registry.get_impl("gluon_gemv_a16w16_gfx950"):
         return None
     return kernel
@@ -3069,7 +3302,7 @@ def kimi3_latent_projection(
             weight,
             out=out,
         )
-    if routed and _use_mv(hidden_states, weight):
+    if routed and _use_mv(hidden_states, weight, out):
         return mv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
@@ -3145,7 +3378,11 @@ def kimi3_mla_qkv_gate_projection(
             else (
                 "gluon_largem_gfx1250"
                 if gfx1250_largem
-                else ("fused" if m <= 32 or _use_mv(hidden_states, weight) else "split")
+                else (
+                    "fused"
+                    if m <= 32 or _use_mv(hidden_states, weight, None)
+                    else "split"
+                )
             )
         )
 
@@ -3657,7 +3894,7 @@ def kimi3_shared_situ_projection(
             hidden_states, gate_up_weight, out, beta, linear_beta
         )
 
-    if routed and _use_mv(hidden_states, gate_up_weight):
+    if routed and _use_mv(hidden_states, gate_up_weight, None):
         gate_up = mv(hidden_states, gate_up_weight)
     else:
         gate_up = None
@@ -3790,7 +4027,7 @@ def kimi3_shared_down_projection(
             solution = "gluon_largem_gfx1250"
         else:
             solution = "torch"
-    if routed and _use_mv(hidden_states, weight):
+    if routed and _use_mv(hidden_states, weight, out):
         return mv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
@@ -3955,7 +4192,7 @@ def kimi3_qkvfab_projection(
             and supports_gluon_mm_a16w16_prefill_gfx950(m, output_width, input_width)
         ):
             solution = "gluon_largem"
-        elif specialized or _use_mv(hidden_states, weight):
+        elif specialized or _use_mv(hidden_states, weight, None):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "mv"
         else:
@@ -4268,6 +4505,8 @@ if has_flashinfer_mxfp8():
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
+    warm_gluon_mm_a16w16_decode,
+    warm_gluon_mm_a16w16_skinny,
 )
 from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402
     mv_fp8_weight_signature,
@@ -4430,7 +4669,7 @@ def fp32_router_gemv_execute(
         or not x.is_contiguous()
     ):
         raise ValueError(
-            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+            f"router input must be contiguous FP32 [rows, {typed_plan.hidden_size}]"
         )
     return typed_plan.kernel(
         x,
@@ -4491,8 +4730,18 @@ def _select_fp32_router_gemv_with_mm(
     if (
         spec is None
         or spec.weight_preprocessor is not plan.weight_preprocessor
-        or not _use_mv(mm_a, mm_b)
-        or _select_mv(rows, mm_n, mm_k, True, mm_a.dtype, mm_b.dtype, False)
+        or not _use_mv(mm_a, mm_b, None)
+        or _select_mv(
+            rows,
+            mm_n,
+            mm_k,
+            True,
+            mm_a.dtype,
+            mm_b.dtype,
+            False,
+            # No destination here: the selection is only compared.
+            *_mv_alignment(mm_a, mm_b, None),
+        )
         is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
     ):
         return None

@@ -327,7 +327,8 @@ def kda_paged_prefill(
             host planning, without a synchronizing D2H per layer. Backends
             with device planning consume cu_seqlens directly.
         capacity: Explicit graph planning bounds, or None for exact
-            live-length planning. Live boundaries retain their normal meaning.
+            live-length planning. Live boundaries retain their normal meaning;
+            input rows past the final live boundary must be zero.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.

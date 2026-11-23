@@ -26,7 +26,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use ts_pd::{PdEvent, TransferPeer};
+use ts_pd::{BootstrapInfo, PdEvent, TransferPeer};
 
 #[path = "../src/tests_support.rs"]
 mod native;
@@ -235,6 +235,150 @@ fn blocked_write_retirement(cancel_decode: bool) {
     assert!(landed(&destination, &source));
 }
 
+#[test]
+fn a_cancellation_unacknowledged_past_the_receive_budget_is_retired_by_revoking_the_transport() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let mut destination = vec![0u8; BYTES];
+    let budget = Duration::from_secs(3);
+    let mut pair = pair_with_waiting_timeout(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        budget,
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "writing";
+    prepare(&mut pair, rid, &mut mesh, &group);
+    library.block_writes();
+    pair.send(rid, 7, Vec::new()).unwrap();
+    assert!(library.wait_write_entered(Duration::from_secs(5)));
+    // The write is executing, so Prefill withholds its acknowledgment, as
+    // a dead Prefill rank would.
+    pair.decode.cancel(rid);
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+    let failed = Instant::now();
+    // Another request is connected, within its own budget, but not admitted
+    // yet when the transport is replaced.
+    thread::sleep(budget / 2);
+    let queued = BootstrapInfo {
+        room: 4343,
+        ..pair.bootstrap.clone()
+    };
+    pair.decode.register("queued", &queued).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped("queued".to_owned())
+    );
+    let cache_id = pair.decode.cache_id();
+    thread::sleep((failed + budget).saturating_duration_since(Instant::now()));
+    // Past the budget, a poll starts replacing the transfer engine.
+    assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pair.decode.cache_id() == cache_id {
+        assert!(Instant::now() < deadline, "the transport was not replaced");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let fresh = pair.decode.cache_id();
+    // The queued request failed with the replaced transport; admitting it
+    // now must not publish a manifest no Prefill rank could acknowledge
+    // (which would take another revocation to retire).
+    pair.admit("queued");
+    let expected = [
+        PdEvent::Stopped(rid.to_owned()),
+        PdEvent::Failed("queued".to_owned()),
+        PdEvent::Stopped("queued".to_owned()),
+    ];
+    let mut events = Vec::new();
+    while !expected.iter().all(|event| events.contains(event)) {
+        events.extend(pair.decode.poll(&mut mesh, &group).unwrap());
+        assert!(Instant::now() < deadline, "not retired: {events:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events.len(), expected.len(), "{events:?}");
+    assert_eq!(
+        pair.decode.cache_id(),
+        fresh,
+        "the transport was replaced again"
+    );
+    assert!(!pair.decode.has_in_flight());
+    // A sleep and wake replace the engine again while the revoked write is
+    // still blocked: its old session must not resolve to the new engine.
+    pair.decode_outbox.release_registration().unwrap();
+    pair.decode_outbox.restore_registration().unwrap();
+    // The pages hold other data now; the writer, released, cannot reach them.
+    destination.fill(0xa5);
+    library.release_writes();
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        destination.iter().all(|&byte| byte == 0xa5),
+        "a revoked write reached recycled pages"
+    );
+    // The same Prefill rank serves the next request through the fresh engine.
+    destination.fill(0);
+    transfer_one(&mut pair, "next", 4444, &mut mesh, &group);
+    assert!(landed(&destination, &source));
+}
+
+#[test]
+fn a_revocation_whose_deregistration_fails_keeps_waiting_for_acknowledgments() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let budget = Duration::from_secs(2);
+    let mut pair = pair_with_waiting_timeout(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        budget,
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "writing";
+    prepare(&mut pair, rid, &mut mesh, &group);
+    library.block_writes();
+    pair.send(rid, 7, Vec::new()).unwrap();
+    assert!(library.wait_write_entered(Duration::from_secs(5)));
+    pair.decode.cancel(rid);
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+    let cache_id = pair.decode.cache_id();
+    library.fail_unregistrations();
+    thread::sleep(budget);
+    assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pair.decode.cache_id() == cache_id {
+        assert!(Instant::now() < deadline, "the transport was not replaced");
+        thread::sleep(Duration::from_millis(1));
+    }
+    // The replaced engine kept the cache registered, so its writer is not
+    // fenced: the receive keeps waiting, and starts no other revocation.
+    let fresh = pair.decode.cache_id();
+    let waited = Instant::now() + 2 * budget;
+    while Instant::now() < waited {
+        assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(pair.decode.cache_id(), fresh);
+    assert!(pair.decode.has_in_flight());
+    // The write lands in still-pinned pages, then Prefill acknowledges.
+    library.release_writes();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Stopped(rid.to_owned())
+    );
+    // The cache stays registered with the replaced engine: never released.
+    let refused = pair.decode_outbox.release_registration().unwrap_err();
+    assert!(refused.contains("kept it registered"), "{refused}");
+}
+
 fn transfer_counter(directory: &std::path::Path, name: &str) -> f64 {
     let result = std::process::Command::new("python3")
         .env("PROMETHEUS_MULTIPROC_DIR", directory)
@@ -274,6 +418,7 @@ fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
         Duration::from_secs(120),
         None,
         0,
+        "early",
         Some(metrics),
     );
     let (mut mesh, group) = single_rank();
@@ -352,6 +497,7 @@ fn replica_end_metrics(cause: &str) {
                         timeout,
                         None,
                         0,
+                        "early",
                         Some(metrics),
                     );
                     pair.prefill.register("r", &pair.bootstrap).unwrap();

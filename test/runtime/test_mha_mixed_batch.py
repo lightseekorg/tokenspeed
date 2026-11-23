@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -404,6 +405,7 @@ def _block_runtime():
     # wire_target's choice for a one-rank layout: the lookup is the input.
     drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     runner.dp_local_graph = False
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
@@ -816,9 +818,11 @@ def test_cached_extend_bounds_keys_by_the_longest_request(monkeypatch, mode):
     torch.testing.assert_close(output, torch.cat(expected).flatten(1), rtol=0, atol=0)
 
 
-def _cached_decode_cpu(*, q, **kwargs):
+def _cached_decode_cpu(*, q, uniform_row_groups, **kwargs):
     # Block drafting expands each request to sixteen one-query metadata rows,
-    # all seeing the same complete block (non-causal within the block).
+    # all seeing the same complete block (non-causal within the block), and
+    # tells the decode op that each request's sixteen rows share their row.
+    assert uniform_row_groups == 16
     return _cached_attention_cpu(
         q=q, cu_seqlens_q=torch.arange(q.shape[0] + 1), **kwargs
     )

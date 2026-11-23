@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CausalConv1dPrefillMetadata,
 )
+from tokenspeed_kernel.ops.conv.triton import PREFILL_QKV_CHANNEL_MULTIPLE
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -71,6 +72,7 @@ def _prepare_causal_conv1d_prefill(
     config: PrefillConfig,
     silu: bool,
     enable_pdl: bool,
+    split_out: tuple[torch.Tensor, torch.Tensor] | None,
 ):
     """Compile or look up the executor without launching it."""
     import cuda.bindings.driver as cuda
@@ -83,13 +85,29 @@ def _prepare_causal_conv1d_prefill(
     channels = x.shape[0]
     if x.ndim != 2 or x.stride(0) != 1:
         raise ValueError("convolution input must have contiguous channels")
-    if out.shape != x.shape or out.stride() != (1, channels):
-        raise ValueError("convolution output must use packed token rows")
+    if split_out is None:
+        key_dim = None
+        outputs = (out, out, out)
+        if out.shape != x.shape or out.stride() != (1, channels):
+            raise ValueError("convolution output must use packed token rows")
+    else:
+        key_dim = out.shape[1]
+        outputs = (out, *split_out)
+        widths = (key_dim, key_dim, channels - 2 * key_dim)
+        if any(
+            t.shape != (x.shape[1], width) or not t.is_contiguous()
+            for t, width in zip(outputs, widths, strict=True)
+        ):
+            raise ValueError("q, k and v outputs must be contiguous token rows")
+        if any(width % (config.block_n // config.threads) for width in widths):
+            raise ValueError(
+                "q, k and v widths must be multiples of the channels per thread"
+            )
     if weight.shape != (channels, 4):
         raise ValueError("convolution requires four taps per channel")
     if state.ndim != 3 or state.shape[1] != channels or state.shape[2] < 3:
         raise ValueError("convolution requires three history values per channel")
-    if any(t.dtype != torch.bfloat16 for t in (x, weight, state, out)):
+    if any(t.dtype != torch.bfloat16 for t in (x, weight, state, *outputs)):
         raise ValueError("convolution requires BF16 input, weight, state and output")
     if bias is not None and (
         bias.shape != (channels,) or bias.dtype != x.dtype or not bias.is_contiguous()
@@ -105,7 +123,7 @@ def _prepare_causal_conv1d_prefill(
         boundaries,
         metadata.batch_indices,
         metadata.chunk_offsets,
-        out,
+        *outputs,
     )
     if any(t.device != x.device for t in tensors[7:9]):
         raise ValueError("convolution metadata must be on the input device")
@@ -130,7 +148,7 @@ def _prepare_causal_conv1d_prefill(
         torch.int64: cutlass.Int64,
         torch.bool: cutlass.Uint8,
     }
-    alignment = math.gcd(16, x.data_ptr(), out.data_ptr())
+    alignment = math.gcd(16, x.data_ptr(), *(t.data_ptr() for t in outputs))
     weight_alignment = math.gcd(16, weight.data_ptr())
     args = tuple(
         make_ptr(
@@ -139,7 +157,7 @@ def _prepare_causal_conv1d_prefill(
             cute.AddressSpace.gmem,
             assumed_align=(
                 alignment
-                if i in (0, 9)
+                if i in (0, 9, 10, 11)
                 else weight_alignment if i == 1 else t.element_size()
             ),
         )
@@ -162,6 +180,7 @@ def _prepare_causal_conv1d_prefill(
         bias is not None,
         silu,
         enable_pdl,
+        key_dim,
     )
     with torch.cuda.device(x.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -190,6 +209,7 @@ def _prepare_causal_conv1d_prefill(
                         has_bias=bias is not None,
                         silu=silu,
                         use_pdl=enable_pdl,
+                        key_dim=key_dim,
                     )
                     compiled = cute.compile(kernel, *args, stream)
                     _COMPILED[key] = compiled
@@ -210,6 +230,7 @@ def launch_causal_conv1d_prefill(
     config: PrefillConfig,
     silu: bool,
     enable_pdl: bool,
+    split_out: tuple[torch.Tensor, torch.Tensor] | None,
 ):
     """Run four-tap BF16 convolution and update each non-padding request's state.
 
@@ -219,6 +240,8 @@ def launch_causal_conv1d_prefill(
     use config.block_m. Output must not alias input. Output and state are
     caller-owned and updated in place. Returns the compiled executor, or None
     for an empty map. Token and request counts do not specialize the executor.
+    With split_out=(k, v), out is q and the packed [q | k | v] channels leave
+    as contiguous [tokens, key_dim], [tokens, key_dim] and [tokens, rest] rows.
     """
     with torch.cuda.device(x.device):
         compiled, args, stream = _prepare_causal_conv1d_prefill(
@@ -234,6 +257,7 @@ def launch_causal_conv1d_prefill(
             config=config,
             silu=silu,
             enable_pdl=enable_pdl,
+            split_out=split_out,
         )
         if compiled is not None:
             compiled(*args, stream)
@@ -331,5 +355,103 @@ if _AVAILABLE:
             config=_PARALLEL,
             silu=silu,
             enable_pdl=enable_pdl,
+            split_out=None,
         )
         return out
+
+    @register_kernel(
+        "conv",
+        "causal_conv1d_prefill_qkv",
+        name="cute_dsl_causal_conv1d_prefill_qkv",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "width": frozenset({4}),
+            "state_layout": frozenset({"channel_major"}),
+            "channel_contiguous": frozenset({True}),
+            "weight_dtype": frozenset({torch.bfloat16}),
+            "bias_dtype": frozenset({None, torch.bfloat16}),
+            "state_dtype": frozenset({torch.bfloat16}),
+            "indexed_state": frozenset({True}),
+            "pad_slot_id": frozenset({-1}),
+            "block_m": frozenset({8}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_causal_conv1d_prefill_qkv(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        conv_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        activation: str | bool | None,
+        pad_slot_id: int,
+        *,
+        prefill_metadata: CausalConv1dPrefillMetadata,
+        key_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``cute_dsl_causal_conv1d_prefill`` written to contiguous q, k, v rows.
+
+        The packed ``[q | k | v]`` channels of ``x`` leave as ``[tokens, key_dim]``,
+        ``[tokens, key_dim]`` and ``[tokens, channels - 2 * key_dim]`` tensors with
+        the values the packed output followed by a q/k/v split would hold. Both
+        widths must be multiples of ``PREFILL_QKV_CHANNEL_MULTIPLE``.
+
+        Args:
+            x: BF16 [channels, tokens] with contiguous channels and any token
+                stride, including fused projection views.
+            weight: BF16 [channels, 4] taps in oldest-to-newest order.
+            bias: Optional contiguous BF16 channel vector.
+            conv_states: BF16 [slots, channels, history], updated in place.
+            query_start_loc: Packed request boundaries [requests + 1].
+            cache_indices: Integer state slots [requests]; -1 marks padding.
+            has_initial_state: Boolean history-valid flags [requests].
+            activation: True, "silu", or "swish" applies SiLU; None/False omit it.
+            pad_slot_id: Padding sentinel; this solution requires -1.
+            prefill_metadata: Eight-token maps shared by all layers this forward.
+            key_dim: Width of the q and k channel blocks.
+
+        Returns:
+            Contiguous BF16 q, k and v rows. Padding rows are untouched.
+        """
+        channels, tokens = x.shape
+        value_dim = channels - 2 * key_dim
+        if (
+            key_dim <= 0
+            or value_dim <= 0
+            or key_dim % PREFILL_QKV_CHANNEL_MULTIPLE
+            or value_dim % PREFILL_QKV_CHANNEL_MULTIPLE
+        ):
+            raise ValueError(
+                f"q/k/v widths {key_dim}, {key_dim}, {value_dim} must be positive "
+                f"multiples of {PREFILL_QKV_CHANNEL_MULTIPLE}"
+            )
+        if pad_slot_id != -1:
+            raise ValueError("CuTe convolution requires padding slot -1")
+        if activation not in (None, False, True, "silu", "swish"):
+            raise ValueError("convolution activation must be SiLU or disabled")
+        q = x.new_empty((tokens, key_dim))
+        k = x.new_empty((tokens, key_dim))
+        v = x.new_empty((tokens, value_dim))
+        launch_causal_conv1d_prefill(
+            x,
+            weight,
+            bias,
+            conv_states,
+            cache_indices,
+            has_initial_state,
+            query_start_loc,
+            q,
+            metadata=prefill_metadata,
+            config=_PARALLEL,
+            silu=activation is True or activation in ("silu", "swish"),
+            enable_pdl=pdl_enabled(),
+            split_out=(k, v),
+        )
+        return q, k, v

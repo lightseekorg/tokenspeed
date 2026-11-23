@@ -891,6 +891,7 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode(
         kvp_rank=0,
         nprocs_per_node=1,
         world_cpu_group=None,
+        block_alignment=1,
     )
     config = ts.SchedulerConfig()
     config.prefix_granularity = _P

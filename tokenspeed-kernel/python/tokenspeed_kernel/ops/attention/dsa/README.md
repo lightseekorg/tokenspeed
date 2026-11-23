@@ -76,9 +76,13 @@ and CUDA Graph replay.
 
 ## DCP local candidate selection
 
-`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. Its
-local top-k uses a length-aware selector with the original compact lengths,
-so selection excludes the unused logits tail. Empty shards keep length zero
+`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. It reads
+index queries with any row stride (a projection's column view) and declares
+`INDEX_CANDIDATE_SCORES_OUT_FEATURE`: its gather writes the scores straight
+into a caller's `scores_out` rows, -inf for invalid candidates, and the
+positions into their own contiguous matrix. Its local top-k uses a
+length-aware selector with the original compact lengths, so selection
+excludes the unused logits tail. Empty shards keep length zero
 for selection even though DeepGEMM's scoring scheduler needs a nonzero dummy
 length. Selectors are tried in this order:
 
@@ -358,8 +362,45 @@ its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
 `index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
 same order) and of `quantize_index_query_weights`, so the plane's bytes and
 the query and weights are bit-identical to the two separate launches. Mixed
-rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
-of the K3 decode chain run the fused decode front below instead.
+rounds and prefill keep the separate write; decode rounds of the K3 decode
+chain, KV-parallel or not, run the fused decode front below instead.
+
+## KVP decode candidates (`cute_dsl_dsa_decode_index_candidates`)
+
+`dsa_decode_index_candidates` scores and selects a KVP decode's local index
+candidates: each row's exact local top-k over this rank's compact owned pages
+(`DSAIndexCandidatePages`), as logical positions and FP32 logits, `-1` and
+`-inf` for invalid candidates, the scores written straight into a send
+buffer's rows (`scores_out`). It serves decode rows without mandatory windows,
+each request's `query_group_size` rows consecutive;
+`dsa_decode_index_candidates_supported` decides from host sizes, the request
+count among them, and the owned decode top-k (`select_owned_dsa_topk`) falls
+back to `dsa_index_candidates` where it refuses.
+
+On SM100-SM103 the `cute_dsl` leaf runs the fused decode top-k's kernels in a
+KVP mode after the shared query quantization (`compile_candidates`):
+
+- The scorer scores every request whose last row sees more than `topk` keys
+  over every rank (`row_lengths`), as a rank's share of the merged top-k is
+  unknown before the merge, over the request's compact pages: its last row's,
+  of which every earlier row sees a prefix. Each row stops at its own local
+  length, as rows of one verify window can end on different ranks' pages.
+  Logits are bit-identical to `deep_gemm_dsa_index_candidates`' (the same FP8
+  MMA and FP32 head sum).
+- The select keeps each row's exact top-k (ties at the threshold to the lowest
+  keys) and writes each key's logical position through the request's logical
+  page columns and its logit, recovered from its order key. A row of at most
+  `topk` keys takes all of them with their logits. A row whose `row_lengths`
+  fit `topk` takes all its keys in key order, scored 0, without logits: the
+  merged selection keeps every one of them anyway.
+- Rows, requests, columns and strides are runtime values: one compile per
+  `query_group_size`. At most 4096 requests per call; `topk` 1024-4096 in
+  steps of 1024.
+
+On GB300, a KVP8 rank's decode candidates of eight rows over 1.5K-token
+contexts take 8.2 us against 32.9 us for the DeepGEMM leaf (quantization,
+paged logits, scrub, selection and gather), 11.5 against 19.4 us for 128 rows
+over 16K tokens, and 27.8 against 31.8 us for 128 rows over 64K tokens.
 
 ## Fused decode front (`cute_dsl_dsa_decode_front`)
 
@@ -403,9 +444,11 @@ compile per 16-row tile and slot / LayerNorm dtype.
 
 Kimi-K3.1 selects the front at construction only with the fused decode top-k
 (`index_k_write_quantizes_query`) and takes it for decode rounds of the decode
-chain without KV placement or a breakable capture; the front runs inside the
-layer's eager break, and `forward_dsa_core` takes its outputs as
-`written_index_query`. Prefill, mixed and KV-parallel rounds, the non-chain
+chain without a breakable capture; the front runs inside the layer's eager
+break, and `forward_dsa_core` takes its outputs as `written_index_query`. Under
+a KVP placement the round's slots are virtual: `slot_owner` hands the front
+`virtual_slots_to_local`'s geometry, and the front writes only this rank's
+index keys, at their local slots. Prefill and mixed rounds, the non-chain
 forward and bitwise numerics keep the separate launches.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)

@@ -47,6 +47,7 @@ namespace tokenspeed {
 // build does.
 struct SchedulerTestAccess {
     static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
+    static StorageTransferManager& Storage(Scheduler& scheduler) { return *scheduler.storage_transfers_; }
     static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
     static BlockPool& Pool(Scheduler& scheduler) { return scheduler.block_pool_; }
     // A metadata-only fill still needs the same token descriptors as a real

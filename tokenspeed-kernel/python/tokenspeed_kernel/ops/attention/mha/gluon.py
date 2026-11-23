@@ -63,6 +63,7 @@ if current_platform().is_amd:
         "mha_decode_with_kvcache",
         name="gluon_mha_decode_gfx950",
         solution="gluon",
+        features={"rmsnorm_output_gate", "uniform_row_groups"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
             max_arch_version=ArchVersion(9, 5),
@@ -82,7 +83,7 @@ if current_platform().is_amd:
         # schedule select.
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "page_size": frozenset({64}),
             # A plain sliding mask cannot keep leading tokens visible outside the
             # window; an undeclared trait would serve every value and hand this
@@ -119,7 +120,7 @@ if current_platform().is_amd:
             },
         ),
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "page_size": frozenset({64}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -132,7 +133,7 @@ if current_platform().is_amd:
         "attention",
         "mha_decode_with_kvcache",
         name="gluon_mha_decode_balanced_gfx950",
-        features={"split_schedule"},
+        features={"split_schedule", "rmsnorm_output_gate"},
         priority=Priority.SPECIALIZED,
         **_BALANCED_GFX950,
     )

@@ -53,6 +53,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import HistoryPrefillPlan
+from tokenspeed.runtime.layers.attention.dcp.comm import ValueProjection
 from tokenspeed.runtime.layers.attention.dcp.indexer import (
     DCPIndexMetadata,
     build_dcp_index_metadata,
@@ -1408,10 +1409,11 @@ class GlmDsaSparseAttentionMixin:
                 ``[T, index_heads]`` (``quantize_index_query_weights``' outputs)
                 from a launch that also wrote the round's index keys
                 (``index_k_layernorm_fp8_scatter``'s bytes); the core then skips
-                its index-K write. Every row must decode, without KV
-                placement, under ``index_k_write_quantizes_query``, and the
-                keys must be the caller's ``index_key_weights``. None writes
-                the keys here.
+                its index-K write. Every row must decode, under
+                ``index_k_write_quantizes_query``, and the keys must be the
+                caller's ``index_key_weights``. Under KV placement the launch
+                wrote only this rank's keys and the KV-parallel top-k
+                quantizes its own index queries. None writes the keys here.
 
         Returns:
             ``[T, num_local_heads * v_head_dim]`` attention output before
@@ -1558,18 +1560,14 @@ class GlmDsaSparseAttentionMixin:
                     indexer_output, query=index_query, query_proj=None
                 )
             placement = backend.cache_placement(self.attn_mqa)
-            index_slots, index_mask = resolve_write_slots(
-                out_cache_loc, placement, shared_topk
-            )
             if written_index_query is not None:
-                if num_prefill_tokens > 0 or placement is not None:
-                    raise RuntimeError(
-                        "a written index query needs a decode round without KV "
-                        "placement"
+                if num_prefill_tokens > 0:
+                    raise RuntimeError("a written index query needs a decode round")
+                # The KV-parallel top-k quantizes its own index queries.
+                if placement is None:
+                    indexer_output = replace(
+                        indexer_output, quantized_query=written_index_query
                     )
-                indexer_output = replace(
-                    indexer_output, quantized_query=written_index_query
-                )
             # Decode rounds only (every row decodes); the KV-parallel top-k
             # quantizes its own index queries.
             elif (
@@ -1577,6 +1575,9 @@ class GlmDsaSparseAttentionMixin:
                 and num_prefill_tokens == 0
                 and placement is None
             ):
+                index_slots, index_mask = resolve_write_slots(
+                    out_cache_loc, placement, shared_topk
+                )
                 quantized = ctx.token_to_kv_pool.set_index_k_buffer_and_quantize_query(
                     self.attn_mqa.layer_id,
                     index_slots,
@@ -1589,6 +1590,9 @@ class GlmDsaSparseAttentionMixin:
                 )
                 indexer_output = replace(indexer_output, quantized_query=quantized)
             else:
+                index_slots, index_mask = resolve_write_slots(
+                    out_cache_loc, placement, shared_topk
+                )
                 ctx.token_to_kv_pool.set_index_k_buffer(
                     self.attn_mqa.layer_id,
                     index_slots,
@@ -1765,6 +1769,11 @@ class GlmDsaSparseAttentionMixin:
         owned = {"topk_owned": True} if topk_owned else {}
         if gathered_query is not None:
             owned["gathered_query"] = gathered_query
+        value_weight = self.owned_decode_value_weight() if topk_owned else None
+        if value_weight is not None:
+            owned["value_projection"] = ValueProjection(
+                weight=value_weight, gate=output_gate, out=output
+            )
         attn_output = self.attn_mqa(
             Q,
             k=None,
@@ -1775,9 +1784,19 @@ class GlmDsaSparseAttentionMixin:
             topk_lens=topk_lens,
             **owned,
         )
+        if value_weight is not None:
+            return output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         self.project_latent_values(attn_output, output, output_gate)
         return output
+
+    def owned_decode_value_weight(self) -> torch.Tensor | None:
+        """The ``w_vc`` an owned decode top-k's KVP combine projects with, or None.
+
+        With a weight the combine projects as it merges (``ValueProjection``);
+        without one the values project after it.
+        """
+        return None
 
     def project_latent_values(
         self,

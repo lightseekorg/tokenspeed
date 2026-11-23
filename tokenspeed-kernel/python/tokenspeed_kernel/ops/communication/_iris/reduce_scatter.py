@@ -26,11 +26,13 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.ops.communication._iris.payload import load_int8_block16
 
 
 @gluon.jit(do_not_specialize=["ROWS"])
 def iris_pull_reduce_scatter(
     input_ptr,
+    scales_ptr,
     output_ptr,
     ready_flags,
     heaps,
@@ -42,6 +44,7 @@ def iris_pull_reduce_scatter(
     NUM_WARPS: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
     PRODUCER_WRITES_THROUGH: gl.constexpr,
+    INT8_BLOCK16: gl.constexpr,
     WAIT_VMEM: gl.constexpr,
 ):
     """Reduce BF16 contributions into consecutive, possibly uneven rows.
@@ -51,11 +54,16 @@ def iris_pull_reduce_scatter(
     ready_flags publish the inputs; EXIT_BARRIER waits for peer reads to finish.
     PRODUCER_WRITES_THROUGH requires WIDTH=4096 and EXIT_BARRIER; ordinary
     producers publish with release ordering and support the caller's width.
+    INT8_BLOCK16: input_ptr holds the contributions' INT8 codes and
+    scales_ptr their block-16 scales (payload.py); each element is decoded to
+    BF16 before the same FP32 sum. Otherwise scales_ptr is unused.
     """
     WORLD_SIZE: gl.constexpr = len(heaps)
     if PRODUCER_WRITES_THROUGH:
         gl.static_assert(EXIT_BARRIER and WIDTH == 4096)
     inputs = _iris_peer_pointers(input_ptr, heaps, RANK)
+    if INT8_BLOCK16:
+        scales = _iris_peer_pointers(scales_ptr, heaps, RANK)
     flags = ready_flags.to(gl.pointer_type(gl.uint32))
     pid = gl.program_id(0)
     epoch = (
@@ -75,11 +83,18 @@ def iris_pull_reduce_scatter(
         mask = (offsets < elements) & (source < ROWS * WIDTH)
         values = ()
         for step in gl.static_range(WORLD_SIZE):
-            values += (
-                gl.amd.cdna4.buffer_load(
+            if INT8_BLOCK16:
+                value = load_int8_block16(
+                    inputs[(RANK + step) % WORLD_SIZE],
+                    scales[(RANK + step) % WORLD_SIZE],
+                    source,
+                    mask,
+                )
+            else:
+                value = gl.amd.cdna4.buffer_load(
                     inputs[(RANK + step) % WORLD_SIZE], source, mask, 0, cache=".cg"
-                ).to(gl.float32),
-            )
+                )
+            values += (value.to(gl.float32),)
         # All owners use the same sum order and round the result to BF16.
         reduced = values[(0 - RANK) % WORLD_SIZE]
         for peer in gl.static_range(1, WORLD_SIZE):

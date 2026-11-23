@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -579,7 +580,13 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
+        hidden,
+        router_input,
+        hidden.shape[0],
+        hidden.shape[0],
+        None,
+        project=True,
+        payload="bf16",
     )
     assert sentinel is None
 
@@ -1112,7 +1119,7 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
     )
     monkeypatch.setattr(module, "pdl_enabled", lambda: False)
     positions, ctx = torch.arange(3), SimpleNamespace()
-    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None)
+    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None, True)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1122,13 +1129,16 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 
 
 @requires_gpu
+@pytest.mark.parametrize("project", [False, True])
 @pytest.mark.parametrize("with_rope", [False, True])
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_owned_attention_stores_prepared_rows_once(
-    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
+    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int, project: bool
 ) -> None:
     """Prepared receiver outputs pass through the real prologue's cache store,
-    preserving prefix slots and reaching attention without another head norm."""
+    preserving prefix slots and reaching attention without another head norm.
+    Without ``project`` the gated heads come back for the token owners'
+    output projection."""
     from tokenspeed_kernel.ops.attention.prologue import HeadKVCache
 
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -1182,10 +1192,15 @@ def test_owned_attention_stores_prepared_rows_once(
         project_owned_rows=lambda value, global_rows: value,
         tp_group=tuple(range(world_size)),
     )
-    attention._project = lambda value: (value, None, 1)
+    attention._project = (
+        (lambda value: (value, None, 1))
+        if project
+        else (lambda value: pytest.fail("heads for the owners were projected"))
+    )
+    attention.owned_projections = None
 
     attention.iris_state = SimpleNamespace(
-        all_to_all_transpose_qkvg_norm_rope=lambda *args: (
+        all_to_all_transpose_qkvg_norm_rope=lambda *args, payload: (
             prepared_q,
             prepared_k,
             prepared_v,
@@ -1226,7 +1241,7 @@ def test_owned_attention_stores_prepared_rows_once(
             dtype=torch.bfloat16, kv_write_target=write_target
         ),
     )
-    output, sentinel, ranks = attention(positions, local, ctx, rows)
+    output, sentinel, ranks = attention(positions, local, ctx, rows, project)
     assert sentinel is None and ranks == 1
     assert torch.equal(output, prepared_q)
     assert len(write_targets) == 1
@@ -1460,6 +1475,7 @@ def test_experts_combined_prepares_routing_once_per_token_count(
             tokens,
             prepared,
             False,
+            payload="bf16",
         )
 
     combine(2, None)
@@ -1484,8 +1500,14 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
         model=SimpleNamespace(
-            layers=[SimpleNamespace(mlp=mlp)],
+            layers=[
+                SimpleNamespace(
+                    mlp=mlp,
+                    self_attn=SimpleNamespace(owned_heads_to_owners=False),
+                )
+            ],
             config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
         ),
     )
 
@@ -1504,11 +1526,80 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
     owner = SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
         model=SimpleNamespace(
-            layers=[], config=SimpleNamespace(decode_monokernel=True)
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=True),
+            owned_projections=None,
         ),
     )
 
     with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("prefill_collective_payload", "int8-block16"),
+        ("owned_attention_output", "all-to-all"),
+    ],
+)
+def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
+    tmp_path, flag: str, value
+) -> None:
+    """The owned-row prefill flags apply to Muse Spark only: off their
+    defaults, another architecture's checkpoint is refused."""
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"]})
+    )
+    args = ServerArgs(model="x")
+    args.model = str(tmp_path)
+    setattr(args, flag, value)
+    with pytest.raises(ValueError, match="apply to Muse Spark"):
+        args.resolve_model_defaults()
+    setattr(args, flag, ServerArgs.__dataclass_fields__[flag].default)
+    args.resolve_model_defaults()
+
+
+def test_heads_all_to_all_without_iris_fails_startup_with_the_cause() -> None:
+    """--owned-attention-output all-to-all runs only on Iris owned rows: a
+    server whose Iris cannot be prepared refuses it at startup instead of
+    gathering output weights it would never use."""
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(owned_heads_to_owners=True),
+        mlp=SimpleNamespace(down_columns=None),
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[layer],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+def test_int8_payload_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prefill-collective-payload int8-block16 encodes only Iris owned-row
+    collectives: a server whose Iris cannot be prepared refuses it at startup
+    instead of serving with the flag inert."""
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", "int8-block16"
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
         MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
@@ -1769,6 +1860,7 @@ def _gathered_mxfp4_workspace_worker(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
+            int8_payloads=False,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -2008,6 +2100,282 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
+
+
+@pytest.mark.parametrize("flag", ["bf16", "int8-block16"])
+def test_prefill_collective_payload_applies_to_extend_forwards_only(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """--prefill-collective-payload selects the owned-row collectives'
+    encoding of extend forwards; every other forward mode stays BF16."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", flag
+    )
+    for mode in ForwardMode:
+        expected = flag if mode == ForwardMode.EXTEND else "bf16"
+        assert module._collective_payload(mode) == expected, mode
+
+
+@pytest.mark.parametrize("flag", ["reduce-scatter", "all-to-all"])
+def test_owned_heads_to_owners_needs_a_bf16_output_projection(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """all-to-all applies only to a BF16, unquantized output projection (the
+    owner projects through the whole gathered weight); reduce-scatter never
+    takes it, whatever the projection."""
+    monkeypatch.setitem(module.global_server_args_dict, "owned_attention_output", flag)
+    projections = {
+        dtype: RowParallelLinear(
+            input_size=64,
+            output_size=64,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=dtype,
+            reduce_results=False,
+            quant_config=None,
+            prefix="model.layers.0.self_attn.o_proj",
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+            use_presharded_weights=False,
+            override_kernel_name=None,
+        )
+        for dtype in (torch.bfloat16, torch.float16)
+    }
+    assert module._owned_heads_to_owners(projections[torch.bfloat16]) == (
+        flag == "all-to-all"
+    )
+    if flag == "all-to-all":
+        with pytest.raises(ValueError, match="BF16 output projection"):
+            module._owned_heads_to_owners(projections[torch.float16])
+    else:
+        assert module._owned_heads_to_owners(projections[torch.float16]) is False
+
+
+def test_owned_output_proj_stays_unset_without_the_flag() -> None:
+    attention = _stub(MuseSparkAttention)
+    attention.owned_heads_to_owners = False
+    attention.owned_output_proj = None
+    attention.prepare_owned_output_weight()
+    assert attention.owned_output_proj is None
+
+
+def test_heads_go_to_owners_only_in_owned_prefill_with_the_gathered_weight() -> None:
+    """The decoder layer sends heads to the owners only for an owned-row extend
+    forward on Iris with the gathered weight; decode, mixed and idle forwards,
+    replicated rows and a missing weight keep the reduce-scatter."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    with_weight = SimpleNamespace(owned_output_proj=torch.empty(1))
+    without_weight = SimpleNamespace(owned_output_proj=None)
+    iris = object()
+    for mode in ForwardMode:
+        assert module._heads_to_owners_applies(2048, iris, mode, with_weight) == (
+            mode == ForwardMode.EXTEND
+        )
+    extend = ForwardMode.EXTEND
+    assert not module._heads_to_owners_applies(None, iris, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, None, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, iris, extend, without_weight)
+
+
+def test_weight_update_is_refused_while_output_projections_are_gathered() -> None:
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(down_columns=None),
+        self_attn=SimpleNamespace(owned_output_proj=torch.empty(1)),
+    )
+    owner = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    with pytest.raises(RuntimeError, match="owned-attention-output all-to-all"):
+        MuseSparkForConditionalGeneration.begin_weight_update(owner)
+
+
+def test_owned_row_flags_are_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--owned-attention-output"):
+        ServerArgs(model="x", owned_attention_output="all-gather")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
+        )
+
+
+@pytest.mark.parametrize(
+    "chunk,numerics,expected",
+    [
+        (None, "auto", 8192),
+        (-1, "auto", 8192),
+        (4096, "auto", 8192),
+        (8192, "auto", 8192),
+        (24576, "auto", 24576),
+        (24576, "rl-bitwise", 8192),
+        (24577, "auto", 24576),
+        (32768, "auto", 24576),
+    ],
+)
+def test_owned_rows_follow_the_prefill_chunk_size(
+    monkeypatch: pytest.MonkeyPatch, chunk, numerics: str, expected: int
+) -> None:
+    """The owned-row layout serves the configured prefill chunk, at least
+    8192 and at most 24576 rows; --numerics rl-bitwise keeps 8192."""
+    monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", numerics)
+    assert module._owned_rows_max_tokens() == expected
+
+
+def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
+    """ServerArgs validates the flag; the Iris state takes the same names."""
+    if not current_platform().is_cdna4:
+        pytest.skip("the Iris state is importable on AMD CDNA4 only")
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
+
+    from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
+
+    assert tuple(PREFILL_COLLECTIVE_PAYLOADS) == tuple(MUSE_PAYLOADS)
+
+
+def test_prefill_collective_payload_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--prefill-collective-payload"):
+        ServerArgs(model="x", prefill_collective_payload="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny BF16 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_gathered_projection_warmup_covers_its_gemms(
+    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
+) -> None:
+    """A gathered projection's warm-up leaves none of its GEMMs to compile.
+
+    After its local-GEMM warm-up, its GEMM at any row count compiles no decode
+    or skinny GEMM binary: the pre-expert projection's [1024, 8192] columns at
+    TP4 (the decode GEMM at 9-32 rows, with another config from 17 rows, and
+    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM
+    only)."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm, skinny
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: group
+    )
+    monkeypatch.setattr(module.KimiK3LatentDownOp, "initialize", lambda **kwargs: None)
+    hidden, latent = 8192, 4096
+    with torch.device("cuda"):
+        linear = module._MuseGatheredLinear(
+            input_size=hidden,
+            output_size=latent,
+            prefix="model.layers.0.mlp.pre_expert_proj",
+            tp_rank=1,
+            tp_size=ranks,
+            tp_group=tuple(range(ranks)),
+            layer_id=0,
+            layer_count=2,
+            replicate_for_owned_rows=True,
+            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
+        )
+    with torch.no_grad():
+        linear.weight.normal_(std=hidden**-0.5)
+    weight = linear._local_weight()
+    assert tuple(weight.shape) == (latent // ranks, hidden)
+
+    def project(rows: int) -> None:
+        linear._project(torch.randn(rows, hidden, device="cuda"), weight, None)
+
+    helpers.assert_warmup_covers(
+        (
+            mm.gluon_mm_a16w16_medium_gfx950,
+            skinny.gluon_mm_a16w16_skinny_gfx950,
+            skinny.gluon_mm_a16w16_skinny_reduce_gfx950,
+        ),
+        linear.warm_local_gemm,
+        project,
+        range(2, 129),
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the router + decode GEMM launch is gfx950-only",
+)
+@pytest.mark.parametrize("width", [512, 1024])
+def test_router_with_mm_warmup_covers_every_shared_row_count(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """The router's warm-up covers every row count of the shared launch.
+
+    After it, with this rank's pre-expert columns, the shared launch at any
+    row count it serves compiles nothing, including rows past 16, which a
+    large warm-up extend does not run through it."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32 import router_gemv
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", "auto")
+    hidden, experts = 8192, 256
+    with torch.device("cuda"):
+        router = module.MuseSparkRouter(
+            hidden_size=hidden, num_experts=experts, multiplier=1.0, solution=None
+        )
+    router.weight.data.normal_(0.0, hidden**-0.5)
+    router.process_weights_after_loading(router)
+    columns = torch.randn(width, hidden, dtype=torch.bfloat16, device="cuda")
+    served = []
+
+    def launch(rows: int) -> None:
+        x = torch.randn(rows, hidden, dtype=torch.float32, device="cuda")
+        a = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        if router.supports_with_mm(x, a, columns):
+            served.append(rows)
+            router.forward_with_mm(x, a, columns, a.new_empty((rows, width)))
+
+    helpers.assert_warmup_covers(
+        (router_gemv.gluon_fp32_router_gemv_mm_a16w16_gfx950,),
+        lambda: router.warm_with_mm(columns, 128),
+        launch,
+        range(1, 129),
+    )
+    # The sweep reached the launch past its first 16-row bucket.
+    assert max(served) > 16
+
+
+def test_router_with_mm_warmup_refuses_an_unprepared_weight() -> None:
+    """The router's warm-up raises before its weight is prepared.
+
+    Its forward raises too. Skipping instead would skip the shared launch at
+    every row count and leave those compiles to serving."""
+    router = module.MuseSparkRouter(
+        hidden_size=256, num_experts=16, multiplier=1.0, solution=None
+    )
+    columns = torch.zeros(64, 256, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        router.warm_with_mm(columns, 128)
 
 
 if __name__ == "__main__":

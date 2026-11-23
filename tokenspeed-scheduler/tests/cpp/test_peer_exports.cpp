@@ -48,7 +48,10 @@ PeerConfig Config() {
                       .soft_pin_us = 100,
                       .hard_pin_us = 1000,
                       .lookup_timeout_us = 100,
-                      .min_fetch_tokens = kP};
+                      .min_fetch_tokens = kP,
+                      .landing_tier = PeerLandingTier::kDevice,
+                      .max_host_landing_blocks = 0,
+                      .host_ready_timeout_us = 0};
 }
 
 std::vector<std::string> PageHashes(const std::vector<std::int32_t>& tokens) {
@@ -126,7 +129,7 @@ protected:
         const PeerAnswer answer = LookUp(Lookup(id, tokens, static_cast<std::int32_t>(tokens.size())));
         PinAnswer(answer);
         const bool held = exports_.Held(answer.lease);
-        exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = demote});
+        exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = demote}, /*now_us=*/0);
         return held;
     }
 
@@ -138,10 +141,10 @@ protected:
 
     BlockPool device_{32, {4, 1}};
     BlockPool host_{32, {4, 1}};
-    CacheCoordinator coordinator_ =
-        MakeCoordinator(kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
-                        /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator_ = MakeCoordinator(
+        kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+        /*checkpoint_retention_requests=*/0);
     // Declared after the coordinator, so its pins go first.
     PeerExports exports_{Config()};
 };
@@ -178,7 +181,7 @@ TEST_F(PeerExportsTest, APinHoldsExactlyTheAnsweredPagesUntilTheRelease) {
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u);
     EXPECT_FALSE(coordinator_.ClearCache()) << "the pin holds the blocks";
 
-    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease});
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease}, /*now_us=*/0);
     EXPECT_EQ(exports_.NumLeases(), 0u);
     EXPECT_TRUE(coordinator_.ClearCache());
 }
@@ -207,7 +210,7 @@ TEST_F(PeerExportsTest, PagesMatchUpToTheAnsweredBoundaryEvenAfterALongerPublica
     EXPECT_TRUE(exports_.Held(answer.lease));
     EXPECT_EQ(exports_.NumPinnedBlocks(), 2u) << "one KV page and its checkpoint";
 
-    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease});
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease}, /*now_us=*/0);
     ASSERT_TRUE(coordinator_.ClearCache());
     EXPECT_FALSE(PeerExports::Matches(coordinator_, lookup, answer.num_tokens, answer.pages)) << "the pages left";
 }
@@ -218,11 +221,17 @@ TEST_F(PeerExportsTest, AnExpiredPinLetsItsBlocksGoAndIsNoLongerHeld) {
     const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
     PinAnswer(answer);
 
+    EXPECT_TRUE(exports_.TakePinSamples().empty());
     exports_.Expire(/*now_us=*/999);
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u) << "before its deadline";
     exports_.Expire(/*now_us=*/1000);
     EXPECT_EQ(exports_.NumPinnedBlocks(), 0u);
     EXPECT_FALSE(exports_.Held(answer.lease));
+    const auto samples = exports_.TakePinSamples();
+    ASSERT_EQ(samples.size(), 1u);
+    EXPECT_TRUE(samples[0].expired);
+    EXPECT_EQ(samples[0].held_us, 1000);
+    EXPECT_EQ(samples[0].remaining_us, 0);
     EXPECT_TRUE(coordinator_.ClearCache());
     EXPECT_EQ(exports_.NumLeases(), 1u) << "the tombstone";
     exports_.Expire(/*now_us=*/2000);
@@ -324,7 +333,7 @@ TEST_F(PeerExportsTest, NothingIsDemotedThatWasAccessedSinceThePin) {
     PinAnswer(answer);
     // Another reader's lookup refreshes the same entries.
     LookUp(Lookup(2, tokens, 2 * kP));
-    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true});
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true}, /*now_us=*/0);
     EXPECT_FALSE(Demoted(kFull, hashes[1]));
     EXPECT_FALSE(Demoted(kState, hashes[1]));
 }
@@ -339,7 +348,7 @@ TEST_F(PeerExportsTest, NoDemotionUnlessAskedOrAfterAPinThatExpired) {
     const PeerAnswer answer = LookUp(Lookup(2, tokens, 2 * kP));
     PinAnswer(answer);
     exports_.Expire(/*now_us=*/1000);
-    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true});
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true}, /*now_us=*/0);
     EXPECT_FALSE(Demoted(kFull, hashes[1]));
 }
 
@@ -351,10 +360,10 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
     };
     BlockPool device{8, {4}};
     BlockPool host{8, {4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(kSpecs, kP, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
-                        /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(kSpecs, kP, device, /*enable_l3_storage=*/false, &host,
+                                                   /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                                                   /*checkpoint_retention_requests=*/0);
     PeerExports exports{Config()};
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     const std::vector<std::string> hashes = PageHashes(tokens);
@@ -392,7 +401,7 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
                 cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
                 /*now_us=*/0);
     EXPECT_TRUE(exports.Held(answer.lease));
-    exports.Release(coordinator, cache::PeerRelease{.lease = answer.lease});
+    exports.Release(coordinator, cache::PeerRelease{.lease = answer.lease}, /*now_us=*/0);
 }
 
 TEST(PeerConfigTest, EveryLimitMustBePositiveAndTheNameSet) {

@@ -1914,8 +1914,15 @@ class ProducerAllReduce:
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
+    # Elements per rank slot of the Lamport mailbox region, the stride every
+    # kernel on it addresses with. Larger than the one-shot window
+    # (LAMPORT_MAX_ELEMENTS, which still selects the all-reduce protocols) so
+    # a fused gather fits 320 rows of a 1024-wide shard.
+    LAMPORT_CAPACITY_ELEMENTS = 80 * 4096
     # The one-shot sends every peer the whole payload; from this size the
-    # two-shot was faster in 8-rank MI355X graph replay. TP4 keeps push.
+    # two-shot was faster in 8-rank MI355X graph replay. At TP4 the one-shot
+    # stays faster up to its whole window (LAMPORT_MAX_ELEMENTS), so the
+    # two-shot starts above it there (see lamport_two_shot_min_numel).
     LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
     # Covers 172 rows of 8192, the most rows a speculative verify step
     # reduces; from 129 to 172 rows the two-shot was faster than the producer
@@ -1931,9 +1938,10 @@ class ProducerAllReduce:
     # applied to any width: the producer pull beat RCCL up to these sizes
     # (1024 rows at TP8, 256 at TP4); past them RCCL was as fast or faster.
     ORDINARY_MAX_BYTES = {4: 4 << 20, 8: 16 << 20}
-    # Smallest payload for which reduce_ordinary uses the push at TP4: it
-    # beat the producer pull from 64 to 128 rows of 8192 and lost from 22 to
-    # 48 rows. TP8 never selects it.
+    # Smallest payload of reduce_ordinary's push window at TP4: the push beat
+    # the producer pull from 64 to 128 rows of 8192 and lost from 22 to 48
+    # rows. Payloads in the window that the Lamport two-shot serves take it
+    # (the push's sum order); the push keeps the others. TP8 has no window.
     ORDINARY_PUSH_MIN_BYTES = {4: 1 << 20}
     # BF16 elements in 16 packed 8-byte words.
     _ORDINARY_GRANULE = 64
@@ -1942,7 +1950,7 @@ class ProducerAllReduce:
     def lamport_two_shot_capacity(
         max_numel: int, *, world_size: int, enable_lamport: bool
     ) -> int:
-        """Return the TP8 Lamport two-shot capacity in elements, or 0."""
+        """Return the TP4 / TP8 Lamport two-shot capacity in elements, or 0."""
         alignment = world_size * ProducerAllReduce.LAMPORT_TWO_SHOT_TILE
         capacity = min(
             max_numel // alignment * alignment,
@@ -1951,7 +1959,7 @@ class ProducerAllReduce:
         return (
             capacity
             if enable_lamport
-            and world_size == 8
+            and world_size in (4, 8)
             and capacity >= ProducerAllReduce.LAMPORT_TWO_SHOT_MIN_ELEMENTS
             else 0
         )
@@ -1959,7 +1967,7 @@ class ProducerAllReduce:
     @staticmethod
     def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
         lamport = (
-            min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
+            min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS)
             if enable_lamport
             else 0
         )
@@ -1999,11 +2007,14 @@ class ProducerAllReduce:
         self.pull = pull
         self.world_size = peers.world_size
         max_numel = producer.data.numel()
-        self.lamport_max_numel = (
-            min(max_numel // 512 * 512, self.LAMPORT_MAX_ELEMENTS)
+        # The mailbox region's slot size, and the one-shot window inside it
+        # that the protocol choices read.
+        self.lamport_capacity = (
+            min(max_numel // 512 * 512, self.LAMPORT_CAPACITY_ELEMENTS)
             if enable_lamport
             else 0
         )
+        self.lamport_max_numel = min(self.lamport_capacity, self.LAMPORT_MAX_ELEMENTS)
         alignment = self.world_size * 8
         self.push_max_numel = min(
             max_numel // alignment * alignment, self.PUSH_MAX_ELEMENTS
@@ -2021,16 +2032,16 @@ class ProducerAllReduce:
         self.push_output = peers.ctx.empty((self.push_max_numel,), dtype=torch.bfloat16)
         self.lamport_region = (
             peers.ctx.empty(
-                (3, self.world_size, self.lamport_max_numel), dtype=torch.bfloat16
+                (3, self.world_size, self.lamport_capacity), dtype=torch.bfloat16
             )
-            if self.lamport_max_numel
+            if self.lamport_capacity
             else None
         )
         self.lamport_epochs = (
             torch.zeros(
-                self.lamport_max_numel // 512, dtype=torch.int32, device=peers.device
+                self.lamport_capacity // 512, dtype=torch.int32, device=peers.device
             )
-            if self.lamport_max_numel
+            if self.lamport_capacity
             else None
         )
         self.lamport_peer_addresses = None
@@ -2042,6 +2053,14 @@ class ProducerAllReduce:
             )
         self.lamport_two_shot_max_numel = self.lamport_two_shot_capacity(
             max_numel, world_size=self.world_size, enable_lamport=enable_lamport
+        )
+        # At TP4 the two-shot starts where the one-shot window ends: the
+        # one-shot was faster at every row count it covers (MI355X graph
+        # replay, [rows, 8192] BF16), the two-shot faster than the push above.
+        self.lamport_two_shot_min_numel = (
+            self.lamport_max_numel + 1
+            if self.world_size == 4
+            else self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
         )
         two_shot_shard = self.lamport_two_shot_max_numel // self.world_size
         # [stage][reduce-scatter, all-gather][source rank][shard] mailboxes and
@@ -2088,9 +2107,7 @@ class ProducerAllReduce:
 
     def _lamport_two_shot_serves(self, numel: int) -> bool:
         return (
-            self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
-            <= numel
-            <= self.lamport_two_shot_max_numel
+            self.lamport_two_shot_min_numel <= numel <= self.lamport_two_shot_max_numel
             and numel % (self.world_size * self.LAMPORT_TWO_SHOT_TILE) == 0
         )
 
@@ -2146,27 +2163,34 @@ class ProducerAllReduce:
         The result lives in the caller's storage, never in this state's, so
         later collectives cannot overwrite it and another stream may read it
         once ordered after this call. Payloads within a Lamport window are
-        pushed through its mailboxes and summed in place; at TP4, payloads in
-        the push window are pushed and copied back. Other payloads are copied
-        into the producer buffer and reduced by the generic producer pull,
-        which beat run's two-shot pull at every size measured (129 to 1024
-        rows of 8192 at TP8). Callers must
-        not hold borrowed producer-buffer or pull-scratch views across this
-        call. Every rank must make the same call, on the stream that orders
-        this state's other uses.
+        pushed through its mailboxes and summed in place; at TP4 the two-shot
+        takes only the push window's payloads, and the window's others are
+        pushed and copied back. Other payloads are copied into the producer
+        buffer and reduced by the generic producer pull, which beat run's
+        two-shot pull at every size measured (129 to 1024 rows of 8192 at
+        TP8). Callers must not hold borrowed producer-buffer or pull-scratch
+        views across this call. Every rank must make the same call, on the
+        stream that orders this state's other uses.
         """
         # Uniform across ranks, so a violation fails on every rank alike.
         assert self.can_reduce_ordinary(tensor, rccl_fallback=False)
         flat = tensor.view(-1)
         numel = flat.numel()
         push_min_bytes = self.ORDINARY_PUSH_MIN_BYTES.get(self.world_size)
-        if self._lamport_two_shot_serves(numel) or self._lamport_one_shot_serves(numel):
-            self.run(flat, flat, numel)
-        elif (
+        in_push_window = (
             push_min_bytes is not None
             and push_min_bytes <= numel * flat.element_size()
             and numel <= self.push_max_numel
-        ):
+        )
+        # At TP4 the Lamport two-shot adds in the push's order, not the
+        # producer pull's (local first), so an ordinary payload takes it only
+        # inside the push window, where the bits are the push's.
+        two_shot = self._lamport_two_shot_serves(numel) and (
+            self.world_size != 4 or in_push_window
+        )
+        if two_shot or self._lamport_one_shot_serves(numel):
+            self.run(flat, flat, numel)
+        elif in_push_window:
             # Outside the Lamport windows run selects the push, whose result
             # is borrowed push storage.
             flat.copy_(self.run(flat, flat, numel)[:numel])
@@ -2211,7 +2235,7 @@ class ProducerAllReduce:
                 RANK=self.pull.producer.peers.rank,
                 WORLD_SIZE=self.world_size,
                 total_elements=numel,
-                MAX_ELEMENTS=self.lamport_max_numel,
+                MAX_ELEMENTS=self.lamport_capacity,
                 NUM_STAGES=3,
                 PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
@@ -2498,8 +2522,9 @@ def iris_lamport_twoshot_rs_wait_reduce(
 ):
     """Wait for every peer's part of this rank's shard at offsets and reduce.
 
-    own is this rank's part. Returns the FP32 sum in rank order rounded once
-    to BF16 (the one-shot result), with negative zero sent as zero.
+    own is this rank's part. Returns the FP32 sum rounded once to BF16, with
+    negative zero sent as zero: at TP4 in the push two-shot's pairwise order
+    (r0 + r1) + (r2 + r3), at TP8 in rank order (the one-shot result).
     """
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
     scattered = _iris_wait_lamport_slots(
@@ -2511,16 +2536,23 @@ def iris_lamport_twoshot_rs_wait_reduce(
         MAX_SHARD_ELEMENTS,
         LAYOUT,
     )
-    # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
+    terms = ()
     for source in gl.static_range(0, WORLD_SIZE):
         if source == RANK:
-            term = own
+            terms += (own.to(gl.float32),)
         else:
-            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
-        if source == 0:
-            accumulator = term.to(gl.float32)
-        else:
-            accumulator += term.to(gl.float32)
+            terms += (
+                scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1].to(gl.float32),
+            )
+    if WORLD_SIZE == 4:
+        # TP4 replaces the push two-shot on these payloads, so it adds as the
+        # push does: FP32 (r0 + r1) + (r2 + r3), one BF16 rounding.
+        accumulator = (terms[0] + terms[1]) + (terms[2] + terms[3])
+    else:
+        # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
+        accumulator = terms[0]
+        for source in gl.static_range(1, WORLD_SIZE):
+            accumulator += terms[source]
     return _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
 
 
@@ -2717,14 +2749,16 @@ def iris_lamport_twoshot_bf16_allreduce(
 
     Each rank owns one contiguous 1/WORLD_SIZE shard of input_ptr. Program t
     pushes tile t of every peer's shard to that peer, sums its own shard tile in
-    FP32 rank order, rounds once to BF16, and pushes the result to every peer.
+    FP32 (at TP4 as (r0 + r1) + (r2 + r3), the push and pull two-shots' order it
+    replaces; at TP8 in rank order), rounds once to BF16, and pushes the result
+    to every peer.
     regions are the peers' region_sym_ptr addresses. A region holds
     [stage][reduce-scatter, all-gather][source rank][MAX_SHARD_ELEMENTS]
     mailboxes, indexed by program, so epochs[t] belongs to program t for every
     payload size. Negative zero becomes zero in inputs and in reduced values,
     which every rank receives from the shard owner.
     """
-    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
     # One subgroup of 4-byte packs per program spreads pushes over more CUs.
     VECTOR: gl.constexpr = 2
     TILE: gl.constexpr = 64 * VECTOR

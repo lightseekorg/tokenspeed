@@ -135,6 +135,19 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
+    def preallocate_prefill_workspace(self, pool_options: object | None = None) -> int:
+        """Allocate recipe-budgeted Prefill storage; options belong to its owner."""
+        return sum(
+            child.preallocate_prefill_workspace(pool_options)
+            for child in self.child_backends()
+        )
+
+    @property
+    def prefill_kv_capacity(self) -> int:
+        """Maximum summed prefill KV rows supported by fixed workspace; 0 if unbounded."""
+        capacities = [child.prefill_kv_capacity for child in self.child_backends()]
+        return min((capacity for capacity in capacities if capacity), default=0)
+
     #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
     #: none by default; a node that keeps some names them.
     token_derived_slot_state: tuple[str, ...] = ()
@@ -203,6 +216,13 @@ class CachePoolBinding:
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
         was written at (``PagedAttention.fp8_kv_scales``)."""
+        return False
+
+    def gates_decode_output(self, layer: PagedAttention) -> bool:
+        """Whether ``forward_decode`` for ``layer`` takes
+        ``rmsnorm_output_gate`` and returns the gated output: from the store
+        of a kernel that can gate, else by running the separate op itself
+        (:meth:`PagedAttention.attend`)."""
         return False
 
     def query_dtype(

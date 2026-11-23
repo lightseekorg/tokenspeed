@@ -3,7 +3,7 @@
 # HELP tokenspeed:decode_prefix_cache_hit_ratio Decode-local admission cache hits divided by prompt tokens, weighted by prompt tokens.
 # HELP tokenspeed:decode_prefix_hit_tokens_total Prompt tokens served by the decode-local prefix cache at admission.
 # HELP tokenspeed:decode_prefix_prompt_tokens_total Prompt tokens admitted by the decode-local scheduler.
-# HELP tokenspeed:decode_time_seconds Wall time from the first token to the request's end.
+# HELP tokenspeed:decode_time_seconds Wall time from this role's first output token to the request's end. On a decode role this starts at the first local decode output.
 # HELP tokenspeed:e2e_time_per_output_token_seconds Time from first emitted chunk to request end divided by tokens after the first chunk.
 # HELP tokenspeed:generation_tokens_total Generated tokens committed by decode forwards.
 # HELP tokenspeed:grammar_queue_reqs Admissions waiting for their grammar to compile.
@@ -43,13 +43,14 @@
 # HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that ended, including aborted requests.
 # HELP tokenspeed:request_completion_tokens Output tokens per ended request, including a prefill bootstrap token.
 # HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are frontend and IPC wait.
+# HELP tokenspeed:request_spec_decode_accept_length Mean output tokens per verify round, including bonus, per ended speculative request.
 # HELP tokenspeed:request_time_seconds Wall time from request creation to its end on this role (prefill: KV transfer done; decode: generation done).
 # HELP tokenspeed:spec_decode_accept_length Accepted tokens including bonus per verify request-slot.
 # HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).
 # HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
 # HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).
 # HELP tokenspeed:time_per_output_token_seconds Time between nonempty emitted chunks divided by tokens in the later chunk.
-# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to its first output token, on this role.
+# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to this role's first output token. On a decode role this is the first local decode output; a remote prefill's bootstrap token alone does not end it, except when that token ends the request, so the wait for a decode execution permit is included.
 # TYPE tokenspeed:cache_hit_tokens_total counter
 # TYPE tokenspeed:completion_tokens_total counter
 # TYPE tokenspeed:decode_prefix_cache_hit_ratio histogram
@@ -95,6 +96,7 @@
 # TYPE tokenspeed:prompt_tokens_total counter
 # TYPE tokenspeed:request_completion_tokens histogram
 # TYPE tokenspeed:request_queue_time_seconds histogram
+# TYPE tokenspeed:request_spec_decode_accept_length histogram
 # TYPE tokenspeed:request_time_seconds histogram
 # TYPE tokenspeed:spec_decode_accept_length histogram
 # TYPE tokenspeed:spec_decode_num_accepted_tokens_total counter
@@ -280,6 +282,16 @@ tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="7680.0",
 tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="960.0",model_name="m"} 1.0
 tokenspeed:request_queue_time_seconds_count{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:request_queue_time_seconds_sum{app_key="",dp_rank="0",model_name="m"} 9000.4
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 0.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="16.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 1.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="32.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="4.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="64.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="8.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_count{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_sum{app_key="",dp_rank="0",model_name="m"} 5.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="0.01",model_name="m"} 0.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="0.02",model_name="m"} 0.0

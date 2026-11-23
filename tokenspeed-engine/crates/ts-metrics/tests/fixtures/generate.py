@@ -99,6 +99,8 @@ def _run_scenario() -> None:
     engine.record_spec_decode_step(
         num_decode_slots=4, accepted_draft_tokens=5, draft_width=3
     )
+    engine.observe_request_spec_decode_accept_length(2.0)
+    engine.observe_request_spec_decode_accept_length(3.0)
     engine.record_jit_compiles(
         CompileStats(
             startup_compiles=9,

@@ -210,6 +210,7 @@ pub(crate) fn pair_with(
         bootstrap_timeout,
         step_address,
         0,
+        "early",
     )
 }
 
@@ -220,6 +221,7 @@ pub(crate) fn pair_on_port(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
     port: u16,
+    decode_allocation_policy: &str,
 ) -> Pair {
     pair_on_port_with_metrics(
         library,
@@ -228,10 +230,12 @@ pub(crate) fn pair_on_port(
         bootstrap_timeout,
         step_address,
         port,
+        decode_allocation_policy,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pair_on_port_with_metrics(
     library: PathBuf,
     source: &[u8],
@@ -239,7 +243,55 @@ pub(crate) fn pair_on_port_with_metrics(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
     port: u16,
+    decode_allocation_policy: &str,
     metrics: Option<std::sync::Arc<ts_metrics::KvTransferMetrics>>,
+) -> Pair {
+    pair_configured(
+        library,
+        source,
+        destination,
+        bootstrap_timeout,
+        step_address,
+        port,
+        decode_allocation_policy,
+        metrics,
+        Duration::from_secs(60),
+    )
+}
+
+/// A pair whose Decode rank gives each receive phase `waiting_timeout`.
+#[allow(dead_code)] // Used by the cancellation tests only.
+pub(crate) fn pair_with_waiting_timeout(
+    library: PathBuf,
+    source: &[u8],
+    destination: &[u8],
+    bootstrap_timeout: Duration,
+    waiting_timeout: Duration,
+) -> Pair {
+    pair_configured(
+        library,
+        source,
+        destination,
+        bootstrap_timeout,
+        None,
+        0,
+        "early",
+        None,
+        waiting_timeout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pair_configured(
+    library: PathBuf,
+    source: &[u8],
+    destination: &[u8],
+    bootstrap_timeout: Duration,
+    step_address: Option<usize>,
+    port: u16,
+    decode_allocation_policy: &str,
+    metrics: Option<std::sync::Arc<ts_metrics::KvTransferMetrics>>,
+    waiting_timeout: Duration,
 ) -> Pair {
     let server = BootstrapServer::start(port, Registry::CacheLayouts).unwrap();
     let port = server.port();
@@ -270,6 +322,7 @@ pub(crate) fn pair_on_port_with_metrics(
             "engine_rank": 0,
             "cache_layout": layout(None),
             "cache_fields_by_stage": [FIELDS],
+            "decode_allocation_policy": decode_allocation_policy,
         }),
         bootstrap_timeout,
         failed_session_ttl: Duration::from_secs(30),
@@ -288,7 +341,7 @@ pub(crate) fn pair_on_port_with_metrics(
         layout: layout(Some(destination_base)).into_bytes(),
         tp_size: 1,
         tp_rank: 0,
-        waiting_timeout: Duration::from_secs(60),
+        waiting_timeout,
         heartbeat_interval: Duration::from_secs(2),
         heartbeat_max_failures: 2,
     })

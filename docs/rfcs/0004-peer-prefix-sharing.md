@@ -62,9 +62,10 @@ engines.
 
 Holder and reader must share the cache namespace: the same deployment
 identity (checkpoint, layout, attention TP, KV parallelism, backends,
-quantization, compatibility epoch) and weight version, as the L3 key prefix
-already defines it. Same namespace implies the same per-rank layout, so rank
-*i* of the reader reads only from rank *i* of the holder. Replicas in
+quantization, compatibility epoch) and weight version. Under `numerics=auto`,
+the live peer identity allows different MoE expert-parallel sizes. Other
+numerical policies and persistent L3 keys retain the expert-parallel size.
+Same namespace implies the same per-rank layout, so rank *i* of the reader reads only from rank *i* of the holder. Replicas in
 different namespaces never share: the two compare identities when they first
 connect and before every read (Faults, below).
 
@@ -239,9 +240,8 @@ or a lease the holder kept for the old one.
 **Different models or weights:** every answer carries the holder's namespace
 identity; a reader reads only from a holder whose identity equals its own.
 Equal token hashes under different weights would otherwise land wrong KV. The
-identity is the L3 deployment id (checkpoints, cache layout, numerics,
-parallel layout) and the weight version. A weight update must flush and name
-its `weight_version`, as with L3; once every rank holds the new weights the
+identity includes the deployment facts described above and the weight version. A weight update
+must flush and name its `weight_version`, as with L3; once every rank holds the new weights the
 replica serves and reads under the new identity and forgets the layouts it
 knew, so replicas mid-rollout never read each other.
 
@@ -426,3 +426,30 @@ leases held by tier, demoted and dropped blocks and their returns.
 1. Soft-pin and hard-pin deadlines.
 2. Whether a landing should keep a shorter confirmed prefix for groups whose
    tables do not depend on the boundary (full history only).
+
+### Observing peer reuse
+
+With engine metrics enabled, the attention-DP owner records one
+`tokenspeed:peer_consumed_tokens` sample per finished hinted request. Consumption
+is the intersection of the confirmed remote interval with the prefix skipped by
+the first committed prefill. Local prefix tokens and replayed tokens are excluded.
+If the router supplied `peer_expected_tokens`, the same request also contributes
+`expected - consumed` to `tokenspeed:peer_estimation_error_tokens`, labeled by
+outcome. An older hint with no estimate still contributes consumption.
+
+`tokenspeed:peer_stage_seconds_count` counts visits by stage and outcome.
+Inspect lookup, admission, layout, pin, read_agreement, release and quarantine separately.
+The lookup_to_ready and landing timers span multiple stages. hard_pin uses the
+holder's clock, from PIN application until actual release or expiry.
+`tokenspeed:peer_hard_pin_remaining_seconds` measures deadline minus that time.
+`tokenspeed:peer_shard_seconds` measures device-fence wait, read queue delay and
+transport service on each rank. Sum `tokenspeed:peer_outstanding_read_bytes`
+over reader ranks for bytes queued or executing against a holder; count distinct
+reader replicas with a positive sum to obtain concurrency at scrape time.
+Use `tokenspeed:peer_read_bytes_total` for successful physical payload;
+`tokenspeed:peer_read_source_bytes_total` splits it, and the Disk pages a holder
+pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
+`device`, `host` or `disk`.
+Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
+A reader process that dies before terminal observation cannot report a completed
+sample; frontend failures and holder expiry remain independently observable.

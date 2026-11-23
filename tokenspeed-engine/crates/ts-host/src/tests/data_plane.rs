@@ -30,13 +30,15 @@ use super::*;
 
 #[path = "data_plane/cpu_benchmark.rs"]
 mod cpu_benchmark;
+#[path = "data_plane/pd_notice.rs"]
+mod pd_notice;
 #[path = "data_plane/result_buffers.rs"]
 mod result_buffers;
 
 /// Start the interpreter once per test process, with the scheduler
 /// module loaded and the repository's `tokenspeed_scheduler` package
 /// importable.
-fn interpreter() {
+pub(crate) fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         // The test binary is not in a Python prefix; point at the one the
@@ -62,6 +64,102 @@ fn interpreter() {
                 .call_method1("insert", (0, package_dir))
                 .unwrap();
         });
+    });
+}
+
+#[test]
+fn python_clear_cache_drain_budgets_reach_the_started_executor() {
+    interpreter();
+    let mut host = vec![0_u8; 64];
+    Python::attach(|py| {
+        // Use this test binary's real host/scheduler module. Loading another
+        // _host shared library would register a second set of nanobind types.
+        let host_module = pyo3::wrap_pymodule!(crate::_host)(py);
+        let globals = PyDict::new(py);
+        globals
+            .set_item(
+                "scheduler_module",
+                host_module.bind(py).getattr("scheduler").unwrap(),
+            )
+            .unwrap();
+        globals
+            .set_item(
+                "config_path",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../../python/tokenspeed/runtime/cache/l3/config.py"
+                ),
+            )
+            .unwrap();
+        globals
+            .set_item("host_buffer", host.as_mut_ptr() as usize)
+            .unwrap();
+        let code = CString::new(
+            r#"
+import importlib.util
+import sys
+
+# Rust CI runs before the engine wheel is installed. Load the real, stdlib-only
+# config directly, without importing the runtime package or another extension.
+spec = importlib.util.spec_from_file_location('_ts_host_test_l3_config', config_path)
+config = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = config
+try:
+    spec.loader.exec_module(config)
+finally:
+    del sys.modules[spec.name]
+
+def settings(extra):
+    # The config's factory imports the scheduler's public wheel namespace.
+    # Bind that name to this process's real scheduler only for the factory call.
+    name = 'tokenspeed_engine.scheduler'
+    previous = sys.modules.get(name)
+    sys.modules[name] = scheduler_module
+    try:
+        return config.L3Settings(
+            runtime=config.StorageRuntimeConfig.from_extra_config(
+                extra, host_blocks=8, prefix_granularity=1),
+            deployment_id='clear-budget-bridge', has_draft=False, weight_version='v1',
+            host_buffer=host_buffer, host_buffer_bytes=64,
+            groups=((1, 8, 1),), lcm_block_bytes=8, num_lcm_blocks=8,
+            owner_rank=0, tp_rank=0, backend='memory', mooncake=None)
+    finally:
+        if previous is None:
+            del sys.modules[name]
+        else:
+            sys.modules[name] = previous
+"#,
+        )
+        .unwrap();
+        py.run(&code, Some(&globals), None)
+            .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+        let settings = globals.get_item("settings").unwrap().unwrap();
+        let mut namespace = None;
+        for (extra, milliseconds) in [
+            (None, 500),
+            (
+                Some(r#"{"async":{"clear_cache_drain_timeout_ms":123}}"#),
+                123,
+            ),
+            (Some(r#"{"async":{"clear_cache_drain_timeout_ms":0}}"#), 0),
+        ] {
+            let python_settings = settings.call1((extra,)).unwrap();
+            let settings = ts_l3::Settings::from_python(&python_settings).unwrap();
+            let expected = Duration::from_millis(milliseconds);
+            assert_eq!(settings.config.clear_cache_drain_timeout, expected);
+            let mut executor = settings.start().unwrap();
+            assert_eq!(executor.config().clear_cache_drain_timeout, expected);
+            let prefix = executor.key_prefix();
+            if let Some(namespace) = &namespace {
+                assert_eq!(
+                    &prefix, namespace,
+                    "a drain budget does not change stored bytes"
+                );
+            } else {
+                namespace = Some(prefix);
+            }
+            executor.close(Duration::from_secs(1)).unwrap();
+        }
     });
 }
 
@@ -202,7 +300,7 @@ fn plane() -> (Py<PyAny>, Scheduler) {
 }
 
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, None).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -254,6 +352,7 @@ fn admission_identity_and_stop_criteria_reach_python_together() {
     let request = Admission {
         rid: "reused".to_owned(),
         spec: ts_scheduler::RequestSpec {
+            admission_id: 42,
             request_id: "reused".to_owned(),
             session_id: String::new(),
             cache_group_id: String::new(),
@@ -475,7 +574,7 @@ fn a_failed_completion_notifies_the_launcher_before_logging() {
                 ..Dispatch::default()
             };
             LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
-            let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+            let mut data_plane = PythonDataPlane::start(plane, None, None).unwrap();
             let forward = data_plane
                 .execute(scheduler.next_execution_plan(true, false), &dispatch)
                 .unwrap()
