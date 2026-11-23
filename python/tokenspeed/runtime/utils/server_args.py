@@ -33,6 +33,7 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
     BLOCKWISE_LOGPROB_ORDERS,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
@@ -220,6 +221,8 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
+# Checkpoint architectures that run --dense-fp8-small-m's FP8 projections.
+DENSE_FP8_SMALL_M_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
 # Draft architectures with decode monokernels, and the target architectures
 # whose drafts they serve. Under --decode-monokernel such a draft of such a
 # target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
@@ -256,6 +259,17 @@ def decode_monokernel_refusal(architectures: list[str]) -> str | None:
     return (
         f"--decode-monokernel: no decode monokernel for {architectures or 'this model'} "
         f"(models with one: {', '.join(DECODE_MONOKERNEL_ARCHITECTURES)})"
+    )
+
+
+def dense_fp8_small_m_refusal(architectures: list[str]) -> str | None:
+    """Why ``--dense-fp8-small-m`` cannot serve a checkpoint of
+    ``architectures``, or None when one of them runs its FP8 projections."""
+    if any(a in DENSE_FP8_SMALL_M_ARCHITECTURES for a in architectures):
+        return None
+    return (
+        f"no FP8 projections for {architectures or 'this model'} (models with "
+        f"them: {', '.join(DENSE_FP8_SMALL_M_ARCHITECTURES)})"
     )
 
 
@@ -641,7 +655,7 @@ class ServerArgs:
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
     # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
-    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # the node's replica leaders share for external control messages;
     # None turns it off.
     peer_prefix_port: int | None = None
     # The host other replicas and the router reach this replica's endpoint at;
@@ -863,6 +877,8 @@ class ServerArgs:
     # layers); fewer bytes, a different summation order. Refused where Iris
     # owned rows do not run.
     owned_attention_output: str = "reduce-scatter"
+    # Muse Spark's dense FP8 projections on gfx950 (docs/configuration/server.md).
+    dense_fp8_small_m: str = "none"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1200,6 +1216,12 @@ class ServerArgs:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
                 raise ValueError(refusal)
+        if self.dense_fp8_small_m != "none" and architectures is not None:
+            refusal = dense_fp8_small_m_refusal(architectures)
+            if refusal is not None:
+                raise ValueError(
+                    f"--dense-fp8-small-m {self.dense_fp8_small_m}: {refusal}"
+                )
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
         )
@@ -2437,6 +2459,23 @@ class ServerArgs:
                 "numerics; --numerics rl-bitwise needs bf16"
             )
         resolve_numerics_envelope(self)
+        _require_choice(
+            "--dense-fp8-small-m",
+            self.dense_fp8_small_m,
+            ("none", "qkv"),
+        )
+        if self.dense_fp8_small_m != "none" and (
+            self.numerics in BITWISE_ENVELOPES or self.batch_invariant_collectives
+        ):
+            # Only batches inside the FP8 row windows project in FP8; other
+            # batches stay BF16, so a row's bits depend on the batch's row count.
+            # Run-to-run determinism (--force-deterministic-rsag) still holds
+            # and is not refused.
+            raise ValueError(
+                f"--dense-fp8-small-m {self.dense_fp8_small_m} is not "
+                f"batch-invariant: it cannot run under --numerics {self.numerics} "
+                f"or --batch-invariant-collectives"
+            )
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
@@ -2753,11 +2792,9 @@ class ServerArgs:
             raise ValueError(
                 "--peer-prefix-port is not supported with " + ", ".join(unsupported)
             )
-        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
-        if self.peer_prefix_port < 1 or last_port > 65535:
+        if not 1 <= self.peer_prefix_port <= 65535:
             raise ValueError(
-                "--peer-prefix-port and one port per attention-DP rank after "
-                f"it must be valid ports; got {self.peer_prefix_port}"
+                f"--peer-prefix-port must be in 1..65535; got {self.peer_prefix_port}"
             )
         if self.peer_prefix_answer_timeout_ms <= 0:
             raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
@@ -2935,6 +2972,16 @@ class ServerArgs:
                 raise ValueError(
                     "Weight discard currently requires running without EPLB"
                 )
+            if self.dense_fp8_small_m != "none":
+                # The FP8 weight copies are made once, after loading, and a
+                # weight update refuses to start with them; discarding them
+                # would leave nothing that rebuilds them.
+                raise ValueError(
+                    f"--dense-fp8-small-m {self.dense_fp8_small_m} cannot run "
+                    "with --weight-memory-policy discard: its FP8 weight copies "
+                    "are made once after loading, and no weight update rebuilds "
+                    "them after a discard"
+                )
 
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
@@ -2965,6 +3012,14 @@ class ServerArgs:
         if self.model_update_draft_weights not in ("retain", "refresh"):
             raise ValueError(
                 "--model-update-draft-weights must be 'retain' or 'refresh'"
+            )
+        if self.dense_fp8_small_m != "none":
+            # Every weight update refuses to start while the FP8 copies exist
+            # (MuseSparkForConditionalGeneration.begin_weight_update).
+            raise ValueError(
+                f"--dense-fp8-small-m {self.dense_fp8_small_m} cannot run with "
+                "--model-update-config: its FP8 weight copies are made once "
+                "after loading, and no weight update rebuilds them"
             )
 
     def validate_petit_moe_options(self):
@@ -3828,7 +3883,7 @@ class ServerArgs:
             "sends with a peer holder reads the prefix that replica caches, in "
             "its Device or Host cache, over RDMA, instead of computing it, and "
             "this replica serves its own cache the same way. Its endpoint binds "
-            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "one port shared by the node's attention-DP replicas. Needs the Host "
             "tier (--enable-kvstore) and prefix caching; refused with "
             "--kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
@@ -3844,7 +3899,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.peer_prefix_host,
             help="The host other replicas and the router reach this replica's peer "
-            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "endpoint at; nonzero DP ranks append /rank to host:port. A holder hint "
             "must name it exactly so. Defaults to this host's detected address.",
         )
         parser.add_argument(
@@ -5509,6 +5564,17 @@ class ServerArgs:
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "
             "BF16, and so do the heads of --owned-attention-output all-to-all.",
+        )
+        parser.add_argument(
+            "--dense-fp8-small-m",
+            type=str,
+            default=ServerArgs.dense_fp8_small_m,
+            choices=["none", "qkv"],
+            help="Muse Spark on gfx950: run decode and verify forwards' QKV "
+            "projection at 33-128 rows as an FP8 GEMM (qkv); prompt K / V "
+            "stays BF16. Startup refuses what it cannot serve. A numerics "
+            "change, refused under --numerics rl-bitwise and "
+            "--batch-invariant-collectives. none keeps BF16.",
         )
         parser.add_argument(
             "--numerics",
