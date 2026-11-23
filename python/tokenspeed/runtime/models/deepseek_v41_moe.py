@@ -48,7 +48,7 @@ from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = logging.getLogger(__name__)
@@ -192,6 +192,22 @@ def _deepseek_v4_routed_expert_quant_config(
     )
 
 
+def shared_expert_stream(
+    aux_stream: object | None, *, use_gluon_petit: bool
+) -> object | None:
+    """Return the stream a MoE layer's shared expert forks onto under capture.
+
+    Petit's VMM-backed collective and auxiliary-stream shared experts were
+    kept apart on the assumption that they do not replay safely together, so
+    under Gluon Petit both branches stay on the main stream (None) unless
+    TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in to the overlap every
+    other backend gets. Every other backend uses ``aux_stream``.
+    """
+    if use_gluon_petit and not envs.TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM.get():
+        return None
+    return aux_stream
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -217,9 +233,9 @@ class DeepseekV4MoE(nn.Module):
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
         self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
-        # Petit's VMM-backed collective and auxiliary-stream shared experts do
-        # not replay safely together. Keep both branches on the main stream.
-        self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
+        self.stream_fork = StreamFork(
+            shared_expert_stream(aux_stream, use_gluon_petit=self.use_gluon_petit)
+        )
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
