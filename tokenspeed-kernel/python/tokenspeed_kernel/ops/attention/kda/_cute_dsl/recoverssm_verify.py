@@ -261,6 +261,23 @@ def _prefetch_l2_line(byte_addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ldg_f32_if(present: Int32, byte_addr: Int64, *, loc=None, ip=None) -> Float32:
+    """An FP32 global load when present, else zero; a predicate keeps it branch-free."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int32(present), Int64(byte_addr)],
+            "{ .reg .pred p; setp.ne.b32 p, $1, 0; mov.b32 $0, 0; "
+            "@p ld.global.f32 $0, [$2]; }",
+            "=f,r,l",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
 def _store_if(
     live: Int32, byte_addr: Int64, value: Float32, bf16: bool, *, loc=None, ip=None
 ):
@@ -1284,9 +1301,9 @@ class RecoverSsmVerify:
     ):
         """Load this key channel's key and decay of every history row into registers.
 
-        The loads are all in flight at once. Rows past the count reload the
-        last accepted record, an L1 hit no one uses, so stale records cost no
-        memory traffic.
+        The loads are all in flight at once. Rows past the count are not
+        loaded (their registers hold zeros no one reads), and a row's offset
+        within the records is 32-bit.
         """
         key_field, decay_field = retained[2], retained[3]
         key_row = key_field.iterator + (
@@ -1299,10 +1316,14 @@ class RecoverSsmVerify:
             + Int64(head) * decay_field.stride[1]
             + Int64(key) * decay_field.stride[3]
         )
+        key_addr = key_row.toint()
+        decay_addr = decay_row.toint()
+        key_step = Int32(key_field.stride[2]) * 4
+        decay_step = Int32(decay_field.stride[2]) * 4
         for p in cutlass.range_constexpr(self.history_rows):
-            at = Int64(cutlass.min(Int32(p), count - 1))
-            keys[p] = _load(key_row, at * key_field.stride[2])
-            decays[p] = _load(decay_row, at * decay_field.stride[2])
+            present = Int32(p < count)
+            keys[p] = _ldg_f32_if(present, key_addr + Int64(p * key_step))
+            decays[p] = _ldg_f32_if(present, decay_addr + Int64(p * decay_step))
 
     @cute.jit
     def _store_history_rows(
