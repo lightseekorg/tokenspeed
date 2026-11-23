@@ -36,7 +36,9 @@ def test_chunk_kkt_shared_tile_reuse(lengths: tuple[int, ...], beta_value: float
     key = torch.randint(
         -3, 4, (1, tokens, heads, head_dim), device=device, generator=rng
     ).to(torch.bfloat16)
-    beta = torch.full((1, tokens, heads), beta_value, device=device, dtype=torch.bfloat16)
+    beta = torch.full(
+        (1, tokens, heads), beta_value, device=device, dtype=torch.bfloat16
+    )
     gate = torch.zeros((1, tokens, heads), device=device, dtype=torch.float32)
     ends = [0]
     for length in lengths:
