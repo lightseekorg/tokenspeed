@@ -392,6 +392,72 @@ pub struct EngineLabels {
 
 const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 
+/// A request-local PD phase, observed once when its ending milestone is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum PdPhase {
+    /// Scheduler submission to bootstrap agreement, on either PD role.
+    BootstrapWait,
+    /// P bootstrap agreement to its first forward plan.
+    PrefillScheduleWait,
+    /// P first forward plan to its first dispatch.
+    PrefillDispatchWait,
+    /// P first dispatch to the final prompt chunk's commit.
+    Prefill,
+    /// P prompt completion to observing transfer completion.
+    PrefillKvTransferTail,
+    /// D bootstrap agreement to reserving remote-prefill landing pages.
+    DecodeKvReserveWait,
+    /// D landing admission to observing complete KV and bootstrap-token arrival.
+    DecodeKvArrivalWait,
+}
+
+impl PdPhase {
+    /// Every phase, in the order used by the metric collector.
+    pub const ALL: [Self; 7] = [
+        Self::BootstrapWait,
+        Self::PrefillScheduleWait,
+        Self::PrefillDispatchWait,
+        Self::Prefill,
+        Self::PrefillKvTransferTail,
+        Self::DecodeKvReserveWait,
+        Self::DecodeKvArrivalWait,
+    ];
+
+    fn definition(self) -> (&'static str, &'static str) {
+        match self {
+            Self::BootstrapWait => (
+                "tokenspeed:pd_bootstrap_wait_seconds",
+                "PD scheduler submission to bootstrap agreement, once per request.",
+            ),
+            Self::PrefillScheduleWait => (
+                "tokenspeed:prefill_schedule_wait_seconds",
+                "P bootstrap agreement to its first forward plan, once per request.",
+            ),
+            Self::PrefillDispatchWait => (
+                "tokenspeed:prefill_dispatch_wait_seconds",
+                "P first forward plan to first dispatch, including DP agreement, once per request.",
+            ),
+            Self::Prefill => (
+                "tokenspeed:prefill_time_seconds",
+                "P first dispatch to final prompt commit, including all chunks and host waits, once per request.",
+            ),
+            Self::PrefillKvTransferTail => (
+                "tokenspeed:prefill_kv_transfer_tail_seconds",
+                "P prompt completion to observing transfer completion, excluding earlier overlapping transfer, once per request.",
+            ),
+            Self::DecodeKvReserveWait => (
+                "tokenspeed:decode_kv_reserve_wait_seconds",
+                "D bootstrap agreement to reserving KV landing pages, once per request.",
+            ),
+            Self::DecodeKvArrivalWait => (
+                "tokenspeed:decode_kv_arrival_wait_seconds",
+                "D landing admission to complete KV and bootstrap-token arrival, including preparation and P execution, once per request.",
+            ),
+        }
+    }
+}
+
 /// The scheduler loop's metrics (`EngineMetrics`), on the attention-TP
 /// group's first rank.
 #[derive(Debug)]
@@ -429,6 +495,7 @@ pub struct EngineMetrics {
     num_preemptions: Metric,
     request_queue_time: Metric,
     decode_ready_wait: Metric,
+    pd_phases: [Metric; 7],
     /// Active (non-reclaimable) KV occupancy.
     kv_token_usage: Metric,
     num_used_tokens: Metric,
@@ -686,6 +753,19 @@ impl EngineMetrics {
                     10.0, 30.0, 60.0, 120.0,
                 ],
             ),
+            pd_phases: PdPhase::ALL.map(|phase| {
+                let (name, help) = phase.definition();
+                Metric::histogram(
+                    exporter,
+                    name,
+                    help,
+                    names,
+                    &[
+                        0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+                        2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+                    ],
+                )
+            }),
             kv_token_usage: Metric::gauge(
                 exporter,
                 "tokenspeed:kv_token_usage_perc",
@@ -961,6 +1041,11 @@ impl EngineMetrics {
     /// The decode role's KV-ready wait before its first decode dispatch.
     pub fn observe_decode_ready_wait(&self, seconds: f64) {
         self.decode_ready_wait.observe(&self.labels(), seconds);
+    }
+
+    /// A completed PD phase's duration in seconds, once per request and phase.
+    pub fn observe_pd_phase(&self, phase: PdPhase, seconds: f64) {
+        self.pd_phases[phase as usize].observe(&self.labels(), seconds);
     }
 
     /// Active and resident KV occupancy. `used_pages` counts active and reclaimable

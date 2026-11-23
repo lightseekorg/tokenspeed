@@ -74,18 +74,20 @@ def test_prefill_kv_limit_reaches_model_initialization_and_can_be_disabled():
         global_server_args_dict.update(original)
 
 
-@pytest.mark.parametrize("rate", ["0", "1", "100"])
-def test_pd_ttft_sampling_percentage(rate):
-    args = prepare_server_args(
-        ["--model", "x", "--ttft-trace-sampling-percentage", rate]
-    )
-    assert args.ttft_trace_sampling_percentage == int(rate)
-
-
-@pytest.mark.parametrize("rate", ["-1", "101"])
-def test_invalid_pd_ttft_sampling_percentage(rate):
-    with pytest.raises(ValueError, match="ttft-trace-sampling-percentage"):
-        prepare_server_args(["--model", "x", "--ttft-trace-sampling-percentage", rate])
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--ttft-trace-sampling-percentage", "1"],
+        ["--ttft-trace-sampling-percentage=1"],
+    ],
+)
+def test_removed_pd_ttft_sampling_argument_is_rejected(capsys, options):
+    with pytest.raises(SystemExit) as error:
+        prepare_server_args(["--model", "x", *options])
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "unrecognized arguments:" in stderr
+    assert "--ttft-trace-sampling-percentage" in stderr
 
 
 def test_request_time_stats_compatibility_flag():

@@ -1152,7 +1152,6 @@ which a dead prefill process never does, as under `early`.
 | --- | --- |
 | `--log-level` | Engine logging threshold for Python, the Rust host and the C++ scheduler. Python `critical`/`fatal` maps to Rust `error`, its highest severity. Explicit `TS_HOST_LOG` and `SPDLOG_LEVEL` settings override their native writers. |
 | `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
-| `--ttft-trace-sampling-percentage` | Percentage of PD rooms to trace through their first engine output (0–100, default 0). |
 | `--enable-log-request-stats`, `--enable-request-time-stats-logging` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
@@ -1374,8 +1373,7 @@ carry `bootstrap_room` to correlate peers that use different request IDs.
 | `ts_request_finished` | The engine releases the request or refuses it at admission. | Role, prompt, cached and completion token counts, finish and abort reasons, `e2e_latency_s` when the frontend supplied a creation time, and optional `request_stats` |
 
 These events are enabled for every request at the default INFO log level, with
-WARN for a failed transfer. They are independent of the request-stats flag and
-TTFT sampling percentage.
+WARN for a failed transfer. They are independent of the request-stats flag.
 Request admission and completion use the same logging ranks as the per-request
 stats. Each PD role records its own completion time. Ingress refusals have a
 finish event only. A duplicate-ID refusal logs a finish event for the rejected
@@ -1395,58 +1393,35 @@ At DEBUG, the native client logs the chosen engine and routing policy by request
 ID. Scheduler diagnostics (`SPDLOG_LEVEL=debug`) report restore and decode
 preallocation waits, and link L3 prefetch queries, reads and timeouts to the request ID.
 
-### Sampled PD first-output logs
+### PD phase metrics
 
-Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
-1% of rooms. The selection uses the CRC32 of the decimal bootstrap room,
-modulo 1000, with a threshold of ten times the percentage. A frontend owner
-records a selected request once, even when several token batches stream out.
-Pair the JSON records using `endpoint` and `room` within the same time window.
-The sampling percentage defaults to 0 (disabled); 100 selects all PD rooms.
-These INFO summaries do not require `--enable-log-request-stats`, which
-independently adds RequestStats to the request's finish log.
-When sampled summaries and event-loop DEBUG logging are disabled, these records
-add no remote-prefill batch reads. When both are enabled, they share one read.
+Every PD request records its first local lifecycle timestamps on a monotonic
+clock, independently of metrics and logging. The timestamps remain with the
+request until release. Replanning, resubmission and subsequent streamed outputs
+do not overwrite them. Plain-role requests keep no PD timing state.
 
-| INFO record | Boundary | Measurements |
+With `--enable-metrics`, the engine exports the following per-request
+phase histograms independently of log level. Each completed phase contributes one observation in seconds when its ending
+milestone is reached. Unreached boundaries contribute no observation; a
+measured zero duration remains a zero observation. Repeated plans, dispatches
+and chunks do not create duplicate phase samples.
+
+| Metric | Role | Boundaries |
 | --- | --- | --- |
-| `TTFTBootstrap` | The prefill replica agrees the room is bootstrapped | Engine registration to bootstrap agreement |
-| `TTFTBreakdown` on Prefill | First engine output or terminal release | Bootstrap, admission to first dispatch after bootstrap, prompt execution, transfer observation and output preparation |
-| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output (including a wait for a decode execution permit) |
+| `tokenspeed:pd_bootstrap_wait_seconds` | P/D | `submitted` to `bootstrapped` |
+| `tokenspeed:prefill_schedule_wait_seconds` | P | `bootstrapped` to `first_planned` |
+| `tokenspeed:prefill_dispatch_wait_seconds` | P | `first_planned` to `first_dispatched` |
+| `tokenspeed:prefill_time_seconds` | P | `first_dispatched` to `prompt_done`, including all chunks and host waits |
+| `tokenspeed:prefill_kv_transfer_tail_seconds` | P | `prompt_done` to P `transfer_done`; earlier overlapping transfer is excluded |
+| `tokenspeed:decode_kv_reserve_wait_seconds` | D | `bootstrapped` to `remote_admitted`, when KV landing pages are reserved |
+| `tokenspeed:decode_kv_arrival_wait_seconds` | D | `remote_admitted` to D `transfer_done`; includes preparation, P execution and transfer |
 
-Prefill holds its first output until the KV transfer completes. Its normal
-breakdown therefore includes `transfer_observe` and `output_pack`; producing
-the bootstrap token alone does not emit the breakdown.
-
-Schema `ts-engine-v1` measures local `phases_ms` and `engine_elapsed_ms` on a
-monotonic clock. `first_dispatch_ms` is relative to engine registration.
-`milestones_ms` records registration, scheduler submission, bootstrap agreement,
-decode landing admission, the first forward plan, first dispatch, prompt
-completion, transfer observation and output preparation on that same clock.
-Unreached milestones are null. The first plan precedes attention-DP agreement;
-dispatch is the enqueue boundary, not the forward thread starting execution.
-Registration follows transport receipt, replica relay and basic ingress
-validation. `output_prepared` is the timestamp taken at the start of summary
-construction, before the streamed output is built. Thus `output_pack` and
-`output_after_landing` do not measure complete output encoding or delivery.
-For a terminal release without an output, this endpoint is the release summary.
-
-On P, all prefill chunks contribute to `prefill`; only the last chunk records
-`prompt_done`. On a streaming D request, KV and the bootstrap token record
-`transfer_done`; the summary normally waits for the next local decode commit.
-A request ended by the bootstrap token completes without that decode, and a
-non-streaming request waits until completion to prepare its output.
-`output_prepared` is this sampled summary's boundary. The role metrics'
-`first_token` is the first local decode output, stamped at the first decode
-commit, so it does not wait for a non-streaming flush.
-
-On P, `admission` splits into `ready_to_plan` and `plan_to_dispatch`. On D,
-`transfer_observe` splits into `remote_admission` and `admission_to_landing`.
-The latter includes forward-thread waiting, page preparation, manifest delivery,
-P execution and transfer; it is not a pure network duration. `landing_to_plan`
-and `plan_to_dispatch` further split the wait before the first decode.
-`registration_to_submit` and `submit_to_bootstrap` split `bootstrap` on both
-roles. These detail fields overlap their parent phases; do not add both levels.
+The first three P phases split the scheduler-submission-to-dispatch interval
+of `tokenspeed:request_queue_time_seconds`. `RequestStats.queue_ms` additionally
+includes the interval before scheduler submission. On D, the reserve and
+arrival phases precede `tokenspeed:decode_ready_wait_seconds`, which measures
+complete KV arrival to first local decode dispatch. Do not add parent phases
+and their subdivisions, or add independently computed phase quantiles.
 
 For short diagnostic runs, `TS_HOST_LOG=info,ts_pd::decode=debug,ts_pd::prefill=debug,_host::data_plane=debug`
 also reports D route lookup, manifest queueing, P manifest receipt and validation,
@@ -1457,12 +1432,6 @@ The D route and connection durations are cumulative from connection setup;
 route resolution may use a cached route. P accepts a complete bootstrap only
 after all expected manifests arrive. Execute queue time ends when the forward
 thread dequeues the plan, before dependency waits, metadata work or GPU execution.
-
-`total_ms` starts at the caller-supplied `created_time` when available and ends
-at the same summary boundary. It may include time before Rust registration;
-`created_time` is not necessarily the gateway's HTTP arrival time. Unreached
-phases and an unavailable creation time are JSON null. Gateway output processing
-and delivery to the HTTP client occur after this measurement.
 
 ### Per-request stats
 

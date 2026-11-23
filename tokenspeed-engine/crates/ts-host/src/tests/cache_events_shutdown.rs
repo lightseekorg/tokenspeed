@@ -165,7 +165,6 @@ class CpuConfig:
     log_spec_accept_lengths: bool = False
     finish_log: bool = False
     log_request_stats: bool = False
-    ttft_trace_sampling_percentage: int = 0
     otlp_traces_endpoint: object = None
     kv_events: bool = False
     kv_events_publisher: object = None

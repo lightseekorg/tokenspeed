@@ -1801,9 +1801,8 @@ fn run_rank<F: Frontend>(
         FinishLog {
             enabled: true,
             request_stats: true,
-            ttft_percentage: 0,
         },
-        false,
+        metrics_dir.is_some(),
         None,
     );
     let transfer = pd.map(|pd| {
@@ -8953,6 +8952,23 @@ fn exported_gauges(directory: &Path) -> HashMap<String, f64> {
     })
 }
 
+/// Histogram sample counts after the metrics adapter's real multiprocess export.
+fn exported_histogram_counts(directory: &Path) -> HashMap<String, f64> {
+    Python::attach(|py| {
+        let globals = PyDict::new(py);
+        globals
+            .set_item("directory", directory.to_str().unwrap())
+            .unwrap();
+        py.run(c"from prometheus_client import CollectorRegistry, multiprocess\nregistry = CollectorRegistry()\nmultiprocess.MultiProcessCollector(registry, path=directory)\nvalues = {sample.name: sample.value for metric in registry.collect() for sample in metric.samples if sample.name.endswith('_count')}", Some(&globals), None).unwrap();
+        globals
+            .get_item("values")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap()
+    })
+}
+
 #[test]
 fn scheduler_metrics_follow_dispatched_forwards_and_return_to_zero() {
     interpreter();
@@ -9018,6 +9034,26 @@ fn scheduler_metrics_follow_dispatched_forwards_and_return_to_zero() {
                 assert_eq!(
                     gauges[&format!("tokenspeed:{name}")],
                     0.0,
+                    "{role:?}/{depth}/{name}"
+                );
+            }
+            let counts = exported_histogram_counts(&directory.join("0"));
+            for (name, expected) in [
+                ("pd_bootstrap_wait_seconds", role != Role::Plain),
+                ("prefill_schedule_wait_seconds", role == Role::Prefill),
+                ("prefill_dispatch_wait_seconds", role == Role::Prefill),
+                ("prefill_time_seconds", role == Role::Prefill),
+                ("prefill_kv_transfer_tail_seconds", role == Role::Prefill),
+                ("decode_kv_reserve_wait_seconds", role == Role::Decode),
+                ("decode_kv_arrival_wait_seconds", role == Role::Decode),
+                ("decode_ready_wait_seconds", role == Role::Decode),
+            ] {
+                assert_eq!(
+                    counts
+                        .get(&format!("tokenspeed:{name}_count"))
+                        .copied()
+                        .unwrap_or(0.0),
+                    if expected { 12.0 } else { 0.0 },
                     "{role:?}/{depth}/{name}"
                 );
             }

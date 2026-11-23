@@ -18,142 +18,98 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The per-request finish line: with
-//! `--enable-log-request-stats` a timing summary, otherwise the average
-//! accepted tokens per verify.
+//! Request lifecycle clocks and the per-request performance summary.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use ts_metrics::PdPhase;
 
 use crate::request::{FinishReason, RequestState};
 
-/// Local milestones until the first engine output of a sampled PD request.
-#[derive(Debug, Clone)]
-pub(crate) struct TtftTrace {
-    bootstrap: ts_pd::BootstrapInfo,
-    role: crate::output::Role,
-    start: std::time::Instant,
-    received_wall: f64,
-    percentage: u8,
-    pub(crate) prefill_chunks: usize,
-    pub(crate) submitted_ms: Option<f64>,
-    bootstrap_ms: Option<f64>,
-    pub(crate) remote_admitted_ms: Option<f64>,
-    pub(crate) planned_ms: Option<f64>,
-    pub(crate) scheduled_ms: Option<f64>,
-    pub(crate) prompt_done_ms: Option<f64>,
-    pub(crate) transfer_done_ms: Option<f64>,
+/// First occurrences of the local PD lifecycle boundaries.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PdMilestone {
+    Submitted,
+    Bootstrapped,
+    RemoteAdmitted,
+    Planned,
+    Scheduled,
+    PromptDone,
+    TransferDone,
+    OutputPrepared,
 }
 
-impl TtftTrace {
-    pub(crate) fn sample(
-        percentage: u8,
-        role: crate::output::Role,
-        bootstrap: &ts_pd::BootstrapInfo,
-    ) -> Option<Box<Self>> {
-        if percentage == 0
-            || role == crate::output::Role::Plain
-            || crc32fast::hash(bootstrap.room.to_string().as_bytes()) % 1000
-                >= u32::from(percentage) * 10
-        {
+/// Request-owned monotonic timestamps, collected independently of exporters.
+#[derive(Debug, Clone)]
+pub(crate) struct PdTimings {
+    role: crate::output::Role,
+    registered: Instant,
+    pub(crate) submitted: Option<Instant>,
+    pub(crate) bootstrapped: Option<Instant>,
+    pub(crate) remote_admitted: Option<Instant>,
+    pub(crate) planned: Option<Instant>,
+    pub(crate) scheduled: Option<Instant>,
+    pub(crate) prompt_done: Option<Instant>,
+    pub(crate) transfer_done: Option<Instant>,
+    pub(crate) output_prepared: Option<Instant>,
+}
+
+impl PdTimings {
+    pub(crate) fn new(role: crate::output::Role, registered: Instant) -> Option<Box<Self>> {
+        if role == crate::output::Role::Plain {
             return None;
         }
         Some(Box::new(Self {
-            bootstrap: bootstrap.clone(),
             role,
-            start: std::time::Instant::now(),
-            received_wall: wall_seconds(),
-            percentage,
-            prefill_chunks: 0,
-            submitted_ms: None,
-            bootstrap_ms: None,
-            remote_admitted_ms: None,
-            planned_ms: None,
-            scheduled_ms: None,
-            prompt_done_ms: None,
-            transfer_done_ms: None,
+            registered,
+            submitted: None,
+            bootstrapped: None,
+            remote_admitted: None,
+            planned: None,
+            scheduled: None,
+            prompt_done: None,
+            transfer_done: None,
+            output_prepared: None,
         }))
     }
 
-    pub(crate) fn ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
-    }
-
-    pub(crate) fn bootstrapped(&mut self, rid: &str) {
-        if self.bootstrap_ms.is_some() {
-            return;
+    /// Stamp a boundary once and return only the phase it completes.
+    pub(crate) fn mark(&mut self, milestone: PdMilestone, now: Instant) -> Option<(PdPhase, f64)> {
+        assert!(now >= self.registered, "PD milestone precedes registration");
+        let at = match milestone {
+            PdMilestone::Submitted => &mut self.submitted,
+            PdMilestone::Bootstrapped => &mut self.bootstrapped,
+            PdMilestone::RemoteAdmitted => &mut self.remote_admitted,
+            PdMilestone::Planned => &mut self.planned,
+            PdMilestone::Scheduled => &mut self.scheduled,
+            PdMilestone::PromptDone => &mut self.prompt_done,
+            PdMilestone::TransferDone => &mut self.transfer_done,
+            PdMilestone::OutputPrepared => &mut self.output_prepared,
+        };
+        if at.is_some() {
+            return None;
         }
-        self.bootstrap_ms = Some(self.ms());
-        if self.role == crate::output::Role::Prefill {
-            tracing::info!(
-                "TTFTBootstrap {}",
-                serde_json::json!({
-                    "schema": "ts-engine-v1", "rid": rid, "role": "prefill", "room": self.bootstrap.room,
-                    "endpoint": format!("{}:{}", self.bootstrap.host, self.bootstrap.port),
-                    "sampling_percentage": self.percentage, "bootstrap_ms": self.bootstrap_ms,
-                    "registered_wall_s": self.received_wall,
-                })
-            );
-        }
-    }
-
-    pub(crate) fn phases(&self, end: f64) -> serde_json::Value {
+        *at = Some(now);
         use crate::output::Role;
-        let delta = |end: Option<f64>, begin: Option<f64>| end.zip(begin).map(|(b, a)| b - a);
-        match self.role {
-            Role::Prefill => serde_json::json!({
-                "bootstrap": self.bootstrap_ms,
-                "registration_to_submit": self.submitted_ms,
-                "submit_to_bootstrap": delta(self.bootstrap_ms, self.submitted_ms),
-                "admission": delta(self.scheduled_ms, self.bootstrap_ms),
-                "ready_to_plan": delta(self.planned_ms, self.bootstrap_ms),
-                "plan_to_dispatch": delta(self.scheduled_ms, self.planned_ms),
-                "prefill": delta(self.prompt_done_ms, self.scheduled_ms),
-                "transfer_observe": delta(self.transfer_done_ms, self.prompt_done_ms),
-                "output_pack": delta(Some(end), self.transfer_done_ms),
-            }),
-            Role::Decode => serde_json::json!({
-                "bootstrap": self.bootstrap_ms,
-                "registration_to_submit": self.submitted_ms,
-                "submit_to_bootstrap": delta(self.bootstrap_ms, self.submitted_ms),
-                "transfer_observe": delta(self.transfer_done_ms, self.bootstrap_ms),
-                "remote_admission": delta(self.remote_admitted_ms, self.bootstrap_ms),
-                "admission_to_landing": delta(self.transfer_done_ms, self.remote_admitted_ms),
-                "landing_to_plan": delta(self.planned_ms, self.transfer_done_ms),
-                "plan_to_dispatch": delta(self.scheduled_ms, self.planned_ms),
-                "output_after_landing": delta(Some(end), self.transfer_done_ms),
-            }),
-            Role::Plain => serde_json::Value::Null,
-        }
-    }
-
-    pub(crate) fn finish(&self, rid: &str, state: &RequestState) {
-        use crate::output::Role;
-        if self.role == Role::Plain {
-            return;
-        }
-        let end = self.ms();
-        let aborted = matches!(state.finished_reason, Some(FinishReason::Abort { .. }));
-        tracing::info!(
-            "TTFTBreakdown {}",
-            serde_json::json!({
-                "schema": "ts-engine-v1", "rid": rid, "room": self.bootstrap.room,
-                "role": if self.role == Role::Prefill { "prefill" } else { "decode" },
-                "endpoint": format!("{}:{}", self.bootstrap.host, self.bootstrap.port),
-                "sampling_percentage": self.percentage, "status": if aborted { "abort" } else { "first_output" },
-                "prompt_tokens": state.prompt_len, "cached_tokens": state.cached_tokens,
-                "engine_elapsed_ms": end, "phases_ms": self.phases(end), "prefill_chunks": self.prefill_chunks,
-                "milestones_ms": {
-                    "registered": 0.0, "submitted": self.submitted_ms,
-                    "bootstrapped": self.bootstrap_ms, "remote_admitted": self.remote_admitted_ms,
-                    "first_planned": self.planned_ms, "first_dispatched": self.scheduled_ms,
-                    "prompt_done": self.prompt_done_ms, "transfer_done": self.transfer_done_ms,
-                    "output_prepared": end,
-                },
-                "registered_wall_s": self.received_wall,
-                "first_dispatch_ms": self.scheduled_ms,
-                "total_ms": (state.created_time > 0.0).then(|| (wall_seconds() - state.created_time).max(0.0)*1000.0),
-            })
-        );
+        let (phase, begin) = match (self.role, milestone) {
+            (_, PdMilestone::Bootstrapped) => (PdPhase::BootstrapWait, self.submitted),
+            (Role::Prefill, PdMilestone::Planned) => {
+                (PdPhase::PrefillScheduleWait, self.bootstrapped)
+            }
+            (Role::Prefill, PdMilestone::Scheduled) => (PdPhase::PrefillDispatchWait, self.planned),
+            (Role::Prefill, PdMilestone::PromptDone) => (PdPhase::Prefill, self.scheduled),
+            (Role::Prefill, PdMilestone::TransferDone) => {
+                (PdPhase::PrefillKvTransferTail, self.prompt_done)
+            }
+            (Role::Decode, PdMilestone::RemoteAdmitted) => {
+                (PdPhase::DecodeKvReserveWait, self.bootstrapped)
+            }
+            (Role::Decode, PdMilestone::TransferDone) => {
+                (PdPhase::DecodeKvArrivalWait, self.remote_admitted)
+            }
+            _ => return None,
+        };
+        begin.map(|begin| (phase, now.duration_since(begin).as_secs_f64()))
     }
 }
 
@@ -354,70 +310,105 @@ mod tests {
 
     use super::*;
 
-    fn sampled_trace(role: crate::output::Role) -> Box<TtftTrace> {
-        TtftTrace::sample(
-            100,
-            role,
-            &ts_pd::BootstrapInfo {
-                room: 4,
-                host: "prefill".into(),
-                port: 8998,
-            },
-        )
-        .unwrap()
-    }
-
     #[test]
-    fn prefill_queue_splits_bootstrap_ready_wait_and_dispatch_preparation() {
-        let mut trace = sampled_trace(crate::output::Role::Prefill);
-        trace.submitted_ms = Some(3.0);
-        trace.bootstrap_ms = Some(200.0);
-        trace.planned_ms = Some(211.0);
-        trace.scheduled_ms = Some(224.0);
-        trace.prompt_done_ms = Some(309.0);
-        trace.transfer_done_ms = Some(334.0);
-        let phases = trace.phases(340.0);
-        assert_eq!(phases["registration_to_submit"], 3.0);
-        assert_eq!(phases["submit_to_bootstrap"], 197.0);
-        assert_eq!(phases["ready_to_plan"], 11.0);
-        assert_eq!(phases["plan_to_dispatch"], 13.0);
-        assert_eq!(phases["admission"], 24.0);
-        assert_eq!(phases["prefill"], 85.0);
-        assert_eq!(phases["transfer_observe"], 25.0);
-        assert_eq!(phases["output_pack"], 6.0);
-    }
+    fn metric_phases_use_monotonic_first_milestones() {
+        use crate::output::Role;
+        use std::time::Duration;
 
-    #[test]
-    fn decode_separates_landing_admission_from_waiting_for_prefill() {
-        let mut trace = sampled_trace(crate::output::Role::Decode);
-        trace.bootstrap_ms = Some(20.0);
-        trace.remote_admitted_ms = Some(30.0);
-        trace.transfer_done_ms = Some(250.0);
-        trace.planned_ms = Some(252.0);
-        trace.scheduled_ms = Some(255.0);
-        let phases = trace.phases(260.0);
-        assert_eq!(phases["remote_admission"], 10.0);
-        assert_eq!(phases["admission_to_landing"], 220.0);
-        assert_eq!(phases["transfer_observe"], 230.0);
-        assert_eq!(phases["landing_to_plan"], 2.0);
-        assert_eq!(phases["plan_to_dispatch"], 3.0);
-        assert_eq!(phases["output_after_landing"], 10.0);
-    }
-
-    #[test]
-    fn unreached_queue_boundaries_stay_null_after_abort_or_early_output() {
-        let mut trace = sampled_trace(crate::output::Role::Decode);
-        trace.bootstrap_ms = Some(20.0);
-        let phases = trace.phases(30.0);
-        for name in [
-            "remote_admission",
-            "admission_to_landing",
-            "landing_to_plan",
-            "plan_to_dispatch",
-            "output_after_landing",
+        for (role, steps) in [
+            (
+                Role::Prefill,
+                vec![
+                    (PdMilestone::Submitted, 3, None),
+                    (
+                        PdMilestone::Bootstrapped,
+                        200,
+                        Some((PdPhase::BootstrapWait, 0.197)),
+                    ),
+                    (
+                        PdMilestone::Planned,
+                        211,
+                        Some((PdPhase::PrefillScheduleWait, 0.011)),
+                    ),
+                    (
+                        PdMilestone::Scheduled,
+                        224,
+                        Some((PdPhase::PrefillDispatchWait, 0.013)),
+                    ),
+                    (
+                        PdMilestone::PromptDone,
+                        309,
+                        Some((PdPhase::Prefill, 0.085)),
+                    ),
+                    (
+                        PdMilestone::TransferDone,
+                        334,
+                        Some((PdPhase::PrefillKvTransferTail, 0.025)),
+                    ),
+                    (PdMilestone::OutputPrepared, 340, None),
+                ],
+            ),
+            (
+                Role::Decode,
+                vec![
+                    (PdMilestone::Submitted, 3, None),
+                    (
+                        PdMilestone::Bootstrapped,
+                        20,
+                        Some((PdPhase::BootstrapWait, 0.017)),
+                    ),
+                    (
+                        PdMilestone::RemoteAdmitted,
+                        30,
+                        Some((PdPhase::DecodeKvReserveWait, 0.01)),
+                    ),
+                    (
+                        PdMilestone::TransferDone,
+                        250,
+                        Some((PdPhase::DecodeKvArrivalWait, 0.22)),
+                    ),
+                    (PdMilestone::Planned, 252, None),
+                    (PdMilestone::Scheduled, 255, None),
+                    (PdMilestone::OutputPrepared, 260, None),
+                ],
+            ),
         ] {
-            assert!(phases[name].is_null(), "{phases}");
+            let start = Instant::now();
+            let mut timings = PdTimings::new(role, start).unwrap();
+            for (milestone, ms, expected) in steps {
+                let now = start + Duration::from_millis(ms);
+                let actual = timings.mark(milestone, now);
+                match (actual, expected) {
+                    (Some((phase, seconds)), Some((expected_phase, expected_seconds))) => {
+                        assert_eq!(phase, expected_phase);
+                        assert!((seconds - expected_seconds).abs() < 1e-12);
+                    }
+                    (None, None) => {}
+                    other => panic!("unexpected phase sample: {other:?}"),
+                }
+                assert_eq!(
+                    timings.mark(milestone, now + Duration::from_millis(1)),
+                    None
+                );
+            }
         }
+    }
+
+    #[test]
+    fn absent_phase_starts_are_not_zero_samples_and_real_zero_is_preserved() {
+        let start = Instant::now();
+        let mut missing = PdTimings::new(crate::output::Role::Prefill, start).unwrap();
+        assert_eq!(missing.mark(PdMilestone::TransferDone, start), None);
+        assert_eq!(missing.transfer_done, Some(start));
+        assert_eq!(missing.prompt_done, None);
+        let mut zero = PdTimings::new(crate::output::Role::Prefill, start).unwrap();
+        assert_eq!(zero.mark(PdMilestone::Submitted, start), None);
+        assert_eq!(
+            zero.mark(PdMilestone::Bootstrapped, start),
+            Some((PdPhase::BootstrapWait, 0.0))
+        );
+        assert_eq!(zero.mark(PdMilestone::Bootstrapped, start), None);
+        assert!(PdTimings::new(crate::output::Role::Plain, start).is_none());
     }
 
     #[test]
