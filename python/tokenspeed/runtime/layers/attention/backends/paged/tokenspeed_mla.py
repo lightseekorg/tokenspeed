@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import math
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -38,17 +37,18 @@ import torch
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
+    tokenspeed_mla_decode_split_kvs,
+    tokenspeed_mla_decode_task_capacity,
+    tokenspeed_mla_decode_workspace_size,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
+from tokenspeed_kernel.ops.metadata import broadcast_block_lengths
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.workspace import workspace_pool
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
-    PagedAttentionBackend,
+    PagedMLABackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeCascadeRows,
@@ -66,7 +66,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.dcp.comm import (
+    ValueProjection,
     combine_attention_partials,
+    combine_project_attention_partials,
     gather_query_heads,
 )
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
@@ -86,11 +88,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = logging.getLogger(__name__)
-
-# Fallback q_len capacity for warming the decode workspace when the backend
-# runs without speculative decoding (q_len is then 1, but keep the historical
-# floor so draft experiments do not immediately hit the frozen-pool error).
-_CUTEDSL_WARMUP_Q_LEN_FLOOR = 8
 
 
 @dataclass
@@ -193,7 +190,7 @@ class _DCPDecodeState:
         return visible
 
 
-class CuteDSLMLABackend(PagedAttentionBackend):
+class CuteDSLMLABackend(PagedMLABackend):
     """CuteDSL MLA leaf for Blackwell SM100 GPUs.
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
@@ -201,8 +198,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
 
     DCP decode gathers TP query heads, reads compact local KV with per-query
-    visibility, then merges partials back to the original TP heads. CuTe's
-    base-2 LSE is converted to natural logs at the shared merge boundary.
+    visibility, then merges partials back to the original TP heads, projecting
+    their values as it merges when given ``value_weight``. CuTe's base-2 LSE
+    is converted to natural logs at the shared merge boundary.
 
     A block drafter's proposal rides the query axis with one page table row and
     one cache length per request, non-causal and bounded by the layer's window.
@@ -245,21 +243,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         if not 1 <= self.min_kv_split <= 256:
             raise ValueError("min_kv_split must be in [1, 256]")
         self._decode_row_capacity = config.max_bs * self.block_decode_expansion
+        self._decode_split_kvs_buf: torch.Tensor | None = None
+        self._decode_split_offsets_buf: torch.Tensor | None = None
+        self._decode_split_tasks_buf: torch.Tensor | None = None
+        self._decode_split_tasks_storage: torch.Tensor | None = None
 
-        # Decode scratch comes from the shared WorkspacePool: the kernel's own
-        # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
-        # automatic B*split_kv <= num_SMs, plus any explicit split minimum in
-        # _cutedsl_workspace. The content is partial decode accumulators,
-        # consumed within each op and never zero-initialized, so sharing the
-        # block is safe. Warm to the verify-path peak now: graph capture runs
-        # the decode forward with the pool frozen.
+        # Layers reuse the partial-accumulator workspace. Reserve its peak
+        # capacity before capture freezes the pool.
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
-        self.cutedsl_workspace = self._cutedsl_workspace(
-            max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)
-        )
+        self.cutedsl_workspace = self._cutedsl_workspace(self.spec_num_tokens or 1)
 
         # Pre-compile prefill kernel variants so JIT doesn't run during serving.
         # The backend may be constructed once per attention layer (60x for
@@ -293,6 +288,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._decode_split_kvs_buf = None
+        self._decode_split_offsets_buf = None
+        self._decode_split_tasks_buf = None
+        self._decode_split_tasks_storage = None
         self._dcp = None
 
     def configure_runtime(
@@ -329,12 +328,24 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             * (self.kv_lora_rank + 1)
             * 4
         )
+        required = max(
+            required,
+            tokenspeed_mla_decode_workspace_size(
+                self._decode_row_capacity // self.block_decode_expansion,
+                self._num_heads_per_tp * len(self.kvp_group),
+                q_len_capacity,
+                self.kv_lora_rank,
+                self.min_kv_split,
+                get_num_sm(self.device),
+            ),
+        )
         if self.min_kv_split > 1:
             head_rows = self._num_heads_per_tp * len(self.kvp_group) * q_len_capacity
-            # Packed FP8 queries pad the combined query/head axis to 128 rows.
+            # Packed queries pad the combined query/head axis to 128 rows.
             head_rows = ((head_rows + 127) // 128) * 128
             required = max(
                 required,
+                # The uniform fallback can flatten a block into separate rows.
                 self._decode_row_capacity
                 * head_rows
                 * self.min_kv_split
@@ -357,59 +368,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     # ---- Metadata initialization ----
 
-    def init_forward_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        forward_mode: ForwardMode,
-        *,
-        extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
-        **kwargs,
-    ):
-        reject_query_shard(query_shard, "CuteDSLMLABackend")
-        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
-            raise RuntimeError(
-                "tokenspeed_mla decode metadata goes through "
-                "refresh_decode_metadata; init_forward_metadata only serves "
-                f"extend/mixed ({forward_mode})"
-            )
-        if forward_mode.is_extend_or_mixed():
-            self._init_prefill_metadata(
-                seq_lens[:num_extends],
-                page_table=page_table[:num_extends],
-                page_table_cpu=page_table_cpu,
-                extend_prefix_lens=extend_prefix_lens[:num_extends],
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
-                extend_seq_lens=extend_seq_lens[:num_extends],
-                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
-            )
-        # Target mixed/idle batches carry decode requests whose metadata this
-        # init must cover; the same in-place refresh serves them. A draft's
-        # decode metadata instead comes from the wrapper's refresh after this
-        # init (the unified draft contract).
-        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
-            self.refresh_decode_metadata(
-                bs, bs, seq_lens, page_table, num_extends=num_extends
-            )
-
-    @contextmanager
-    def override_num_extends(self, num_extends: int):
-        assert self.forward_decode_metadata is not None
-        prev = self.forward_decode_metadata.num_extends
-        self.forward_decode_metadata.num_extends = num_extends
-        try:
-            yield
-        finally:
-            self.forward_decode_metadata.num_extends = prev
-
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
@@ -419,8 +377,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         *,
+        extend_with_prefix: bool,
         page_table_cpu: torch.Tensor | None,
     ):
+        del extend_with_prefix  # Unused: the prefix lengths drive the chunk loops.
         # Worst-case bound to avoid GPU->CPU sync from seq_lens.max().item().
         # TODO: track a loose CPU upper bound (advance by chunked_prefill_size /
         # accept_lengths.max(); correct when accurate values land) for tighter
@@ -486,6 +446,24 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # capture's allocation pool. Reinitialization must replace them too.
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._decode_split_kvs_buf = torch.ones(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        self._decode_split_offsets_buf = torch.arange(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self._decode_split_tasks_buf = torch.empty(
+            tokenspeed_mla_decode_task_capacity(
+                max_bs,
+                self._num_heads_per_tp * len(self.kvp_group),
+                1,
+                self.min_kv_split,
+                get_num_sm(self.device),
+            ),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._decode_split_tasks_storage = self._decode_split_tasks_buf
         if self._dcp is None:
             return
         if self.block_decode_active:
@@ -504,11 +482,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        self._update_draft_lengths(seq_lens, 1)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        self._update_draft_lengths(frontier, self.spec_num_tokens)
+
+    def _update_draft_lengths(self, seq_lens: torch.Tensor, q_len: int) -> None:
         super().advance_draft_forward_metadata(seq_lens)
         if self._dcp is not None:
             self._dcp.refresh_lengths(
                 self._decode_views(seq_lens.shape[0]).dcp, seq_lens
             )
+        self._refresh_split_kvs(self.seq_lens_buf[: seq_lens.shape[0]], q_len)
 
     def _ensure_block_row_buffers(self) -> None:
         """Resident per-request rows behind the block entries, sized once.
@@ -532,25 +517,60 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         """Broadcast, keeping the per-request row the query-axis fold reads.
 
         The drafter calls this inside the captured graph, so the row has to be
-        written there too rather than derived from the expanded view per layer.
+        written there too rather than derived from the expanded view per layer;
+        one launch writes both.
         """
         self._copy_block_decode_seq_lens(bs, block_seq_lens)
         if self._dcp is not None:
             self._dcp.refresh_lengths(
                 self._decode_views(bs).dcp, self._block_seq_lens_buf[:bs]
             )
+        self._refresh_split_kvs(self._block_seq_lens_buf[:bs], self.spec_num_tokens)
 
     def _copy_block_decode_seq_lens(
         self, bs: int, block_seq_lens: torch.Tensor
     ) -> None:
         self._ensure_block_row_buffers()
-        rows = self._block_seq_lens_buf[:bs]
-        torch.clamp(
-            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
-        )
         expansion = self.block_decode_expansion
-        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
-            rows.unsqueeze(1)
+        broadcast_block_lengths(
+            block_seq_lens[:bs],
+            self.spec_num_tokens,
+            self.max_context_len,
+            causal=False,
+            rows_out=self._block_seq_lens_buf[:bs],
+            entries_out=self.decode_seq_lens_buffer[: bs * expansion].view(
+                bs, expansion
+            ),
+        )
+
+    def _refresh_split_kvs(self, seq_lens: torch.Tensor, q_len: int) -> None:
+        """Recompute the batch's per-request split-KV plan in place.
+
+        Counts, offsets and the chunk map land in the resident decode buffers,
+        so CUDA graph replays reuse the same storage.
+        """
+        if self._decode_split_kvs_buf is None:
+            return
+        if self._dcp is not None:
+            seq_lens = self._decode_views(seq_lens.shape[0]).dcp.local_seq_lens
+        capacity = tokenspeed_mla_decode_task_capacity(
+            seq_lens.shape[0],
+            self._num_heads_per_tp * len(self.kvp_group),
+            q_len,
+            self.min_kv_split,
+            get_num_sm(self.device),
+        )
+        self._decode_split_tasks_buf = self._decode_split_tasks_storage[:capacity]
+        tokenspeed_mla_decode_split_kvs(
+            seq_lens,
+            self._decode_split_kvs_buf[: seq_lens.shape[0]],
+            self._decode_split_offsets_buf[: seq_lens.shape[0] + 1],
+            self._decode_split_tasks_buf,
+            num_heads=self._num_heads_per_tp * len(self.kvp_group),
+            q_len=q_len,
+            max_seq_len=self.max_context_len,
+            min_split_kv=self.min_kv_split,
+            dtype=self.data_type,
         )
 
     def _log_block_layout(
@@ -641,14 +661,19 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 rows[:, num_pages:].zero_()
             replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
             replicated.copy_(rows[:, None, :])
-            if not for_graph_replay or actual_bs == 0:
+            write_lengths = not for_graph_replay or actual_bs == 0
+            if write_lengths:
                 self._copy_block_decode_seq_lens(bs, seq_lens)
             if self._dcp is not None:
                 self._dcp.refresh(metadata.dcp, metadata.block_seq_lens)
+            if write_lengths:
+                self._refresh_split_kvs(metadata.block_seq_lens, self.spec_num_tokens)
             self.forward_decode_metadata = metadata
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        torch.clamp_min(
+            seq_lens[:bs], metadata.q_len_per_req, out=self.seq_lens_buf[:bs]
+        )
         self._refresh_tree_prefix(bs, self.seq_lens_buf)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
@@ -662,12 +687,22 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self.page_table_buf[:bs, num_pages:].zero_()
         if self._dcp is not None:
             self._dcp.refresh(metadata.dcp, metadata.seq_lens_k)
+        # Local lengths must be current; mixed-round drafts consume every row.
+        self._refresh_split_kvs(self.seq_lens_buf[:bs], metadata.q_len_per_req)
         self.forward_decode_metadata = metadata
 
     # ---- Forward: Decode ----
 
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         return self._dcp.placement if self._dcp is not None else None
+
+    @property
+    def supports_mla_projected_value_decode(self) -> bool:
+        """Whether decode projects values, which only a KVP merge does.
+
+        The merge projects as it combines the partials.
+        """
+        return self._dcp is not None
 
     def forward_decode(
         self,
@@ -681,9 +716,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
+        value_weight = kwargs.get("value_weight")
+        if value_weight is not None and self._dcp is None:
+            raise ValueError("CuTe MLA projects values only in a KVP merge")
         lanes = self._tree_lane_rows(bs)
         if lanes is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, lanes)
+            return self._tree_cascade(q, layer, token_to_kv_pool, lanes, value_weight)
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
         tree = self._tree_verify_rows(
@@ -693,7 +731,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             metadata.seq_lens_k[num_extends:],
         )
         if tree is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, tree)
+            return self._tree_cascade(q, layer, token_to_kv_pool, tree, value_weight)
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
         causal_mask = True
         if self.block_decode_active:
@@ -730,6 +768,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
             page_table = metadata.page_table[num_extends:]
             cache_seqlens = metadata.seq_lens_k[num_extends:]
+        request_start = 0 if self.block_decode_active else num_extends
+        block_split_kvs = (
+            self._decode_split_kvs_buf[request_start : request_start + bs]
+            if self._decode_split_kvs_buf is not None
+            and (not self.block_decode_active or q_len_per_req == self.spec_num_tokens)
+            and window_left < 0
+            else None
+        )
 
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:
@@ -737,8 +783,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
         local_visible_lens = None
         if metadata.dcp is not None:
-            start = 0 if self.block_decode_active else num_extends
-            local = metadata.dcp.slice_requests(start, start + bs)
+            local = metadata.dcp.slice_requests(request_start, request_start + bs)
             page_table = local.local_page_table
             cache_seqlens = local.local_seq_lens
             # One-query draft steps consume the final endpoint of the reserved
@@ -782,13 +827,36 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             local_visible_lens=local_visible_lens,
             return_lse=metadata.dcp is not None,
             min_split_kv=self.min_kv_split,
+            block_split_kvs=block_split_kvs,
+            block_split_offsets=(
+                self._decode_split_offsets_buf[request_start : request_start + bs + 1]
+                if block_split_kvs is not None
+                else None
+            ),
+            block_split_tasks=(
+                self._decode_split_tasks_buf if block_split_kvs is not None else None
+            ),
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out
+            partial = partial.flatten(0, 1)
             # CuTe exports base-2 LSE; the shared DCP merge uses natural logs.
+            lse = lse_log2.flatten(0, 1) * math.log(2)
+            if value_weight is not None:
+                return combine_project_attention_partials(
+                    partial,
+                    lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    projection=ValueProjection(
+                        weight=value_weight,
+                        gate=kwargs.get("output_gate"),
+                        out=kwargs["projected_output"],
+                    ),
+                )
             raw_out = combine_attention_partials(
-                partial.flatten(0, 1),
-                lse_log2.flatten(0, 1) * math.log(2),
+                partial,
+                lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
                 sink=None,
@@ -812,10 +880,15 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         layer: PagedAttention,
         token_to_kv_pool,
         tree: TreeCascadeRows,
+        value_weight: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): the CuTe
         causal ``rows``-token MLA decode over the committed prefix, with its
-        base-2 log-sum-exp, then the tree window merged in (``finish_mla_tree``)."""
+        base-2 log-sum-exp, then the tree window merged in
+        (``finish_mla_tree``). It projects no values, so it refuses a
+        ``value_weight``."""
+        if value_weight is not None:
+            raise ValueError("a draft tree's attention projects no values")
         if layer.sliding_window_size >= 0:
             raise NotImplementedError("draft trees have no sliding-window path yet")
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)

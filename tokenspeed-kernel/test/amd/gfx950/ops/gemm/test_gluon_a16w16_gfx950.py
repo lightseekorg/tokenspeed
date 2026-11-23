@@ -21,11 +21,17 @@
 from __future__ import annotations
 
 import contextlib
+import re
 
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm
-from utils import assert_no_triton_compile, is_cdna4
+from utils import (
+    assert_no_triton_compile,
+    assert_warmup_covers,
+    compiled_kernels,
+    is_cdna4,
+)
 
 if not is_cdna4():
     pytest.skip(
@@ -34,7 +40,18 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm import bmm, kimi3_router_projection, mm  # noqa: E402
+from tokenspeed_kernel.ops.gemm import (  # noqa: E402
+    _select_mv,
+    _use_mv,
+    bmm,
+    kimi3_router_projection,
+    mm,
+    mv,
+)
+from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
+    warm_gluon_mm_a16w16_skinny,
+)
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -59,6 +76,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (  # noqa: E402
+    gluon_mm_a16w16_skinny_gfx950,
+    gluon_mm_a16w16_skinny_reduce_gfx950,
+    launch_gluon_mm_a16w16_skinny_gfx950,
+    supports_gluon_mm_a16w16_skinny_gfx950,
 )
 
 # Kernels and references accumulate in FP32 and round once to BF16, so outputs
@@ -490,30 +513,103 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
-    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    # Past 64 rows only the listed buckets serve: the Muse TP8 pre-expert
+    # projection and the K3.1 TP8 verify shapes.
     assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
+    # The Muse TP4 pre-expert projection: 9-32 rows.
+    assert not supports_gluon_mm_a16w16_decode_gfx950(8, 1024, 8192)
+    assert supports_gluon_mm_a16w16_decode_gfx950(9, 1024, 8192)
+    assert supports_gluon_mm_a16w16_decode_gfx950(32, 1024, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(33, 1024, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
 
 
-# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
-# 64-row bucket splits K.
-@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
-def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
+# The K3.1 TP8 speculative-verify buckets at ragged and full row counts, twice
+# each so split-K counters reset between calls.
+_K31_VERIFY_BUCKETS = [
+    ((6288, 7168), (36, 100)),
+    ((1536, 7168), (68, 128)),
+    ((7168, 768), (100, 132, 192)),
+    ((8448, 7168), (36, 64)),
+    ((7168, 4224), (44, 64)),
+    ((160, 7168), (100, 132, 192)),
+    ((6400, 1536), (36, 60)),
+    ((1536, 128), (36, 100, 192)),
+    ((2112, 7168), (60, 100, 188)),
+    ((1536, 1536), (44, 100)),
+]
+
+# The K3.1 DSpark drafters' TP8 buckets: the preview drafter's q_a with kv_a
+# at draft-block rows and its stacked context kv_a, and the released GQA
+# drafter's q|k|v, stacked context k|v and MLP gate/up; both share the MLP
+# down projection's and the context projection's rows.
+_K31_DSPARK_BUCKETS = [
+    ((2112, 7168), (7, 14, 28)),
+    ((7168, 1792), (6, 7, 16, 28)),
+    ((2880, 7168), (14, 32, 56)),
+    ((896, 35840), (6, 7, 16, 28)),
+    ((1024, 7168), (6, 16, 28, 48)),
+    ((1280, 7168), (6, 16, 28, 48)),
+    ((3584, 7168), (6, 8)),
+]
+
+
+@pytest.mark.parametrize(
+    "n,k,rows",
+    [
+        pytest.param(n, k, rows, id=f"{n}x{k}-{rows[0]}")
+        for (n, k), rows in _K31_VERIFY_BUCKETS + _K31_DSPARK_BUCKETS
+    ],
+)
+def test_decode_gemm_k31_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
+    torch.manual_seed(0)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for m in rows:
+        assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+        for _ in range(2):
+            a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+            torch.testing.assert_close(
+                _decode(a, b, torch.bfloat16),
+                _decode_reference(a, b, torch.bfloat16),
+                atol=1e-4,
+                rtol=_RTOL,
+            )
+
+
+# Kimi K3 shared gate/up, the Muse TP8 pre-expert projection, whose 64-row
+# bucket splits K, and the indexer wq_b, which has only a 32-row and a 64-row
+# tile.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192), (4096, 1536)])
+def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
     torch.manual_seed(0)
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    counters = zeroed_state(
+        gluon_mm_a16w16_decode_num_counters_gfx950(64, n, k),
+        dtype=torch.int32,
+        device=a.device,
+    )
 
     def run(rows):
-        out = _decode(a[:rows], b, torch.bfloat16)
-        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+        if supports_gluon_mm_a16w16_decode_gfx950(rows, n, k):
+            out = _decode(a[:rows], b, torch.bfloat16)
+            torch.testing.assert_close(
+                out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL
+            )
 
-    # Warm both integer classes (divisible by 16 or not) of each bucket.
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
-        run(rows)
-    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
-            run(rows)
+    # The row count itself does not specialize, so one launch per bucket
+    # covers every count in it, multiples of 16 included.
+    assert_warmup_covers(
+        (gluon_mm_a16w16_medium_gfx950,),
+        lambda: launch_gluon_mm_a16w16_decode_gfx950(
+            a, b, torch.bfloat16, counters=counters, warm_variants=True
+        ),
+        run,
+        (2, 6, 7, 12, 14, 16, 20, 27, 32, 40, 48, 61, 64),
+    )
 
 
 @pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
@@ -556,10 +652,11 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
             a[:rows], b, addend[:rows], addend[:rows]
         )
 
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32):
+    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
+    for rows in (3, 4, 5, 8, 9, 17):
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 31):
+        for rows in (2, 6, 7, 12, 14, 16, 20, 27, 31, 32):
             run(rows)
 
 
@@ -883,6 +980,65 @@ def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
             run(rows)
 
 
+def test_decode_gemm_serves_muse_tp4_pre_expert_rows() -> None:
+    # The Muse TP4 pre-expert projection takes the decode GEMM at 9-32 rows;
+    # fewer rows and 33 rows and up do not take it.
+    torch.manual_seed(0)
+    n, k = 1024, 8192
+    for rows in (1, 2, 8, 33, 64, 128, 256):
+        assert not supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    reference = a.double() @ b.double().T
+
+    def run(rows):
+        assert supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
+        out = _decode(a[:rows], b, torch.bfloat16)
+        # One BF16 rounding of an FP32 accumulation over K = 8192.
+        error = (out.double() - reference[:rows]).norm() / reference[:rows].norm()
+        assert error < 4e-3, (rows, error.item())
+        assert torch.equal(mm(a[:rows], b), out)
+        return out
+
+    # A row's bits do not depend on the batch's row count inside a bucket:
+    # the bucket's tile and split are fixed and rows do not mix.
+    for rows in ((9, 12, 16), (17, 24, 32)):
+        outs = [run(m) for m in rows]
+        for out in outs[1:]:
+            assert torch.equal(out[: rows[0]], outs[0])
+    # Each bucket compiles once per integer class (divisible by 16 or not).
+    for rows in (9, 16, 17, 32):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (10, 15, 20, 31):
+            run(rows)
+
+
+def test_mm_warmup_compiles_the_decode_gemm_for_every_row_count() -> None:
+    """A warm-up mm on a weight compiles every decode GEMM config it has.
+
+    The Muse TP4 pre-expert projection takes the decode GEMM only at 9-32
+    rows, with another config from 17 rows. A warm-up GEMM at 2 rows, which
+    the decode GEMM does not take, still compiles both, so a startup that never
+    runs 17 rows compiles nothing of it while serving."""
+    torch.manual_seed(0)
+    n, k = 1024, 8192
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert not supports_gluon_mm_a16w16_decode_gfx950(2, n, k)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(a[:2], b)
+
+    assert_warmup_covers(
+        (gluon_mm_a16w16_medium_gfx950,),
+        warm,
+        lambda rows: mm(a[:rows], b),
+        range(2, 33),
+    )
+
+
 def test_medium_coalesced_store_masks_strided_out() -> None:
     # 128x128 medium tiles store through the coalesced row layout; a padded
     # row stride must stay inside the output view.
@@ -930,3 +1086,345 @@ def test_column_shard_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for m in range(9, 17):
             launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])
+
+
+# A shape the skinny GEMM takes, its measured row range, and rows on both
+# sides of the row-tile boundary and at the ends of each tile.
+_SKINNY_N, _SKINNY_K = 1024, 8192
+_SKINNY_FIRST_M, _SKINNY_LAST_M = 33, 128
+_SKINNY_ROWS = [33, 48, 63, 64, 65, 96, 127, 128]
+
+
+def _skinny_problem(rows: int = _SKINNY_LAST_M):
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(
+        (rows, _SKINNY_K), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    weight = 0.02 * torch.randn(
+        (_SKINNY_N, _SKINNY_K), device="cuda", generator=generator
+    )
+    return a, weight.to(torch.bfloat16)
+
+
+def _skinny(a, weight, out=None):
+    return launch_gluon_mm_a16w16_skinny_gfx950(a, weight, out=out)
+
+
+def _off_by_one(rows: int, columns: int) -> torch.Tensor:
+    """A contiguous BF16 ``[rows, columns]`` view one element into a buffer.
+
+    Legal GEMM input that is not 16-byte aligned."""
+    flat = torch.zeros(rows * columns + 8, dtype=torch.bfloat16, device="cuda")
+    view = flat[1 : 1 + rows * columns].view(rows, columns)
+    assert view.is_contiguous() and view.data_ptr() % 16
+    return view
+
+
+@pytest.mark.parametrize("m", _SKINNY_ROWS)
+def test_skinny_gemm_rounds_the_exact_product_once(m: int):
+    """With small integer inputs the result is the BF16-rounded FP64 product.
+
+    Every FP32 partial sum is exact (at most 8192 * 64 < 2**24), so the only
+    rounding is the final one to BF16, and the bits match exactly."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randint(-8, 9, (m, _SKINNY_K), device="cuda", generator=generator)
+    weight = torch.randint(
+        -8, 9, (_SKINNY_N, _SKINNY_K), device="cuda", generator=generator
+    )
+    actual = _skinny(a.to(torch.bfloat16), weight.to(torch.bfloat16))
+    exact = a.double() @ weight.double().T
+    expected = exact.to(torch.bfloat16)
+    # Most outputs need the rounding: the check is not of representable sums.
+    assert int((expected.double() != exact).sum()) > exact.numel() // 2
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("m", _SKINNY_ROWS)
+def test_skinny_gemm_matches_fp64_reference(m: int):
+    a, weight = _skinny_problem()
+    a = a[:m].contiguous()
+    actual = _skinny(a, weight)
+    expected = a.double() @ weight.double().T
+    # One rounding to BF16, 8 significant bits: at most half a step, 2**-8
+    # relative. _ATOL only covers FP32 accumulation noise on near-zero
+    # outputs.
+    torch.testing.assert_close(actual.double(), expected, atol=_ATOL, rtol=2**-8)
+
+
+def test_skinny_gemm_rows_do_not_depend_on_the_batch():
+    """A row has the same bits with any other rows and in either row tile.
+
+    The K split and summation order never depend on M."""
+    a, weight = _skinny_problem()
+
+    def run(rows: torch.Tensor) -> torch.Tensor:
+        return _skinny(rows.contiguous(), weight).view(torch.int16)
+
+    full = run(a)
+    for m in _SKINNY_ROWS:
+        assert torch.equal(run(a[:m]), full[:m]), f"rows differ at M={m}"
+    # The first 33 rows at another position of a launch in the other tile.
+    shifted = run(torch.cat((a[60:100], a[:33])))
+    assert torch.equal(shifted[40:], full[:33])
+    assert torch.equal(run(a), full), "repeat launch differs"
+
+
+@pytest.mark.parametrize("m", [33, 63, 127])
+def test_skinny_gemm_writes_only_its_rows(m: int):
+    """Rows of the destination's buffer below row M keep their bits.
+
+    The row tile and the reduce programs are taller than M."""
+    a, weight = _skinny_problem(rows=m)
+    guard = 0x7FC1  # a NaN no product yields
+    buffer = torch.full(
+        (_SKINNY_LAST_M + 16, _SKINNY_N), guard, dtype=torch.int16, device="cuda"
+    ).view(torch.bfloat16)
+    result = _skinny(a, weight, out=buffer[:m])
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(
+        buffer[:m].view(torch.int16), _skinny(a, weight).view(torch.int16)
+    )
+    assert bool((buffer[m:].view(torch.int16) == guard).all())
+
+
+def test_skinny_gemm_refuses_strided_and_unaligned_tensors():
+    a, weight = _skinny_problem(rows=96)
+    wide = torch.empty((48, _SKINNY_N + 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="contiguous inputs"):
+        _skinny(a[::2], weight)
+    with pytest.raises(ValueError, match="contiguous"):
+        _skinny(a[:48].contiguous(), weight, out=wide[:, :_SKINNY_N])
+
+    # The direct-to-LDS loads and the kernels' stated alignment need 16
+    # bytes: a direct launch on an offset view is refused.
+    with pytest.raises(ValueError, match="aligned activation"):
+        _skinny(_off_by_one(48, _SKINNY_K), weight)
+    with pytest.raises(ValueError, match="aligned output"):
+        _skinny(a[:48].contiguous(), weight, out=_off_by_one(48, _SKINNY_N))
+
+
+@pytest.mark.parametrize("m", [33, 48, 128])
+def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
+    """An activation or output that is not 16-byte aligned is legal mm input.
+
+    Selection declines the skinny GEMM through its alignment traits, and mm
+    takes the path it takes without that kernel, here Torch's GEMM."""
+    a, weight = _skinny_problem(rows=m)
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    shifted = _off_by_one(m, _SKINNY_K)
+    shifted.copy_(a)
+    shifted_out = _off_by_one(m, _SKINNY_N)
+    dtypes = (torch.bfloat16, torch.bfloat16)
+
+    def select(operands_aligned: bool, out_aligned: bool) -> str:
+        return _select_mv(
+            m,
+            _SKINNY_N,
+            _SKINNY_K,
+            True,
+            *dtypes,
+            False,
+            operands_aligned,
+            out_aligned,
+        ).__name__
+
+    assert select(True, True) == "gluon_mm_a16w16_skinny_gfx950"
+    assert _use_mv(a, weight, None)
+    for operands_aligned, out_aligned in ((False, True), (True, False)):
+        assert select(operands_aligned, out_aligned) == "torch_decode_gemv"
+    assert not _use_mv(shifted, weight, None)
+    assert not _use_mv(a, weight, shifted_out)
+
+    expected = torch.mm(a, weight.T).view(torch.int16)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    assert torch.equal(mm(shifted, weight).view(torch.int16), expected)
+    mm(a, weight, out=shifted_out)
+    assert torch.equal(shifted_out.view(torch.int16), expected)
+    # A direct mv selects with the same traits.
+    assert torch.equal(mv(shifted, weight).view(torch.int16), expected)
+    shifted_out.zero_()
+    mv(a, weight, out=shifted_out)
+    assert torch.equal(shifted_out.view(torch.int16), expected)
+    # No call launched the skinny GEMM: it has no binary.
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+
+def test_skinny_reduce_loads_every_split_sixteen_bytes_wide():
+    """Each reduce buffer load is 16 bytes a lane (four FP32 partials).
+
+    The reduce states the alignment of the first split's base; the other
+    splits sit at constant offsets from it, so no load of the binary is split
+    into narrower loads."""
+    a, weight = _skinny_problem(rows=_SKINNY_FIRST_M)
+    gluon_mm_a16w16_skinny_reduce_gfx950.device_caches.clear()
+    _skinny(a, weight)
+    (binary,) = compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)
+    loads = re.findall(r"^\s*(buffer_load_\w+)", binary.asm["amdgcn"], re.M)
+    assert loads and set(loads) == {"buffer_load_dwordx4"}
+
+
+def test_skinny_gemm_warmup_compiles_every_binary_from_any_row_count():
+    """A GEMM on the weight inside kernel_warmup compiles every skinny binary.
+
+    Startup warmup need not run a row count the skinny GEMM takes: that GEMM
+    compiles both row tiles and the reduce, and then no row count of the
+    measured range compiles either kernel."""
+    a, weight = _skinny_problem()
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    below = a[: _SKINNY_FIRST_M - 1].contiguous()
+    assert not supports_gluon_mm_a16w16_skinny_gfx950(
+        below.shape[0], _SKINNY_N, _SKINNY_K
+    )
+
+    # Outside warmup the same GEMM compiles nothing of the skinny GEMM.
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    mm(below, weight)
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(below, weight)
+
+    # Nor does the hook inside warmup while the stream is capturing a graph.
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            warm_gluon_mm_a16w16_skinny(below, weight)
+    stream.synchronize()
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+    assert_warmup_covers(
+        kernels,
+        warm,
+        lambda m: _skinny(a[:m].contiguous(), weight),
+        range(_SKINNY_FIRST_M, _SKINNY_LAST_M + 1),
+    )
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_gfx950)) == 2
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)) == 1
+
+
+def test_skinny_gemm_binaries_do_not_depend_on_where_the_tensors_live():
+    """Startup's binaries serve views deep into storages over 2 GB.
+
+    Triton keys a binary on a tensor's 16-byte alignment and, on AMD, on
+    whether its storage fits in 2 GB. The skinny GEMM specializes no pointer,
+    so the binaries startup compiled from small fresh tensors serve an
+    activation and an output that are views deep into such storages."""
+    a, weight = _skinny_problem()
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    below = a[: _SKINNY_FIRST_M - 1].contiguous()
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(below, weight)
+
+    over_2gb = 2**31 + 2**20
+    a_rows = over_2gb // (2 * _SKINNY_K) + _SKINNY_LAST_M
+    out_rows = over_2gb // (2 * _SKINNY_N) + _SKINNY_LAST_M
+    a_arena = torch.empty((a_rows, _SKINNY_K), dtype=torch.bfloat16, device="cuda")
+    out_arena = torch.empty((out_rows, _SKINNY_N), dtype=torch.bfloat16, device="cuda")
+    assert a_arena.untyped_storage().size() > 2**31
+    assert out_arena.untyped_storage().size() > 2**31
+
+    def run(m: int) -> None:
+        # The last rows of each arena: past 2 GB from its base.
+        x = a_arena[a_rows - m :]
+        x.copy_(a[:m])
+        out = out_arena[out_rows - m :]
+        _skinny(x, weight, out=out)
+        expected = _skinny(a[:m].contiguous(), weight)
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+    assert_warmup_covers(kernels, warm, run, _SKINNY_ROWS)
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_gfx950)) == 2
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)) == 1
+
+
+@pytest.mark.parametrize("m", [33, 128])
+def test_skinny_gemm_replays_in_a_captured_graph(m: int):
+    """A captured launch pair reads its inputs and scratch at replay."""
+    a, weight = _skinny_problem(rows=m)
+    out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        _skinny(a, weight, out=out)
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            _skinny(a, weight, out=out)
+    stream.synchronize()
+    for _ in range(3):
+        a.copy_(torch.randn_like(a))
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _skinny(a, weight)
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    ("m", "selected"),
+    [
+        (_SKINNY_FIRST_M - 1, False),
+        (_SKINNY_FIRST_M, True),
+        (_SKINNY_LAST_M, True),
+        (_SKINNY_LAST_M + 1, False),
+    ],
+)
+def test_mm_selects_the_skinny_gemm_in_its_measured_row_range(m: int, selected: bool):
+    """Selection reads only the row count, whatever the forward."""
+    assert supports_gluon_mm_a16w16_skinny_gfx950(m, _SKINNY_N, _SKINNY_K) == selected
+    name = _select_mv(
+        m,
+        _SKINNY_N,
+        _SKINNY_K,
+        True,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        True,
+        True,
+    ).__name__
+    assert (name == "gluon_mm_a16w16_skinny_gfx950") == selected
+    if selected:
+        a, weight = _skinny_problem(rows=m)
+        out = torch.empty((m, _SKINNY_N), dtype=torch.bfloat16, device="cuda")
+        mm(a, weight, out=out)
+        assert torch.equal(out.view(torch.int16), _skinny(a, weight).view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    ("m", "kernel"),
+    [
+        (8, None),
+        (9, "gluon_mm_a16w16_decode_gfx950"),
+        (32, "gluon_mm_a16w16_decode_gfx950"),
+        (_SKINNY_FIRST_M, "gluon_mm_a16w16_skinny_gfx950"),
+        (_SKINNY_LAST_M, "gluon_mm_a16w16_skinny_gfx950"),
+        (_SKINNY_LAST_M + 1, None),
+    ],
+)
+def test_tp4_pre_expert_projection_selects_by_row_count(m: int, kernel: str | None):
+    """The Muse TP4 pre-expert projection's kernels by row count.
+
+    In any mm call it takes the decode GEMM at 9-32 rows and the skinny GEMM
+    at 33-128 rows; outside those rows mm selects neither."""
+    name = _select_mv(
+        m, _SKINNY_N, _SKINNY_K, True, torch.bfloat16, torch.bfloat16, False, True, True
+    ).__name__
+    if kernel is None:
+        assert name not in (
+            "gluon_mm_a16w16_decode_gfx950",
+            "gluon_mm_a16w16_skinny_gfx950",
+        )
+        return
+    assert name == kernel
+    a, weight = _skinny_problem(rows=m)
+    expected = (
+        _skinny(a, weight)
+        if kernel == "gluon_mm_a16w16_skinny_gfx950"
+        else _decode(a, weight, torch.bfloat16)
+    )
+    assert torch.equal(mm(a, weight).view(torch.int16), expected.view(torch.int16))

@@ -38,12 +38,18 @@ import msgspec
 
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DemoteCacheGroupsReqInput,
+    DemoteCacheGroupsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetAdmissionReqInput,
+    GetAdmissionReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetSharedPrefixPublicationReqInput,
+    GetSharedPrefixPublicationReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
@@ -90,6 +96,9 @@ REQ_TYPE_CONTROL = b"\x02"
 # tag tells them apart). An engine answers each kind of operation in the
 # order it received them; the replies carry no request id.
 CONTROL_REQUESTS = (
+    GetSharedPrefixPublicationReqInput,
+    DemoteCacheGroupsReqInput,
+    GetAdmissionReqInput,
     FlushCacheReqInput,
     PauseSchedulerReqInput,
     ResumeSchedulerReqInput,
@@ -110,6 +119,9 @@ CONTROL_REQUESTS = (
     ReloadForwardReqInput,
 )
 CONTROL_OUTPUTS = (
+    GetSharedPrefixPublicationReqOutput,
+    DemoteCacheGroupsReqOutput,
+    GetAdmissionReqOutput,
     FlushCacheReqOutput,
     PauseSchedulerReqOutput,
     ResumeSchedulerReqOutput,

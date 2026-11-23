@@ -2,14 +2,14 @@
 
 Each rank checks its Host L2 and retraction snapshot pool against an equal
 share of its node's available memory when it starts
-([sizing](./server.md#host-l2-and-mooncake-store-l3)). That check sees one
-process at one moment. It reserves nothing for other jobs, replicas or
+([Host L2 and Mooncake Store L3 sizing](./server.md#host-l2-and-mooncake-store-l3)). That check sees one
+process at one moment. It reserves nothing for other jobs, replicas, or
 prefill/decode worlds on the same node, and it does not count Mooncake client
-segments, staging buffers or storage providers.
+segments, staging buffers, or storage providers.
 
 `tokenspeed cache-budget` checks a whole deployment offline. It sums the Host
 memory an explicit JSON manifest declares, per node and per container, and
-reports any limit those declarations exceed. It needs no GPU, model or
+reports any limit those declarations exceed. It needs no GPU, model, or
 running server:
 
 ```bash
@@ -18,7 +18,7 @@ tokenspeed cache-budget deployment.json --format json   # machine-readable
 ```
 
 The command exits with 0 when every node and container fits, 1 when any is
-overcommitted and 2 when the manifest is unreadable or invalid. Invalid
+overcommitted, and 2 when the manifest is unreadable or invalid. Invalid
 manifests are not evaluated: the report lists every error with its JSON
 path. The JSON report has sorted keys and lists, so identical manifests
 produce identical output.
@@ -63,15 +63,15 @@ The shape, abridged to one of a rank's six required allocations:
 
 Every field is required. The only exception is the `note` string an
 allocation may carry. Unknown fields, duplicate JSON keys, duplicate ids,
-and references to unknown nodes, containers or allocations are errors.
+and references to unknown nodes, containers, or allocations are errors.
 Sizes and counts must be JSON integers. Floats, booleans, strings, negative
 values, and zero limits or counts are refused.
 
 - **Nodes.** `memory_bytes` is the node's Host memory. `system_reserved_bytes`
   is memory the manifest's processes cannot use: the OS, page tables,
-  daemons and other tenants.
+  daemons, and other tenants.
 - **Containers.** `memory_limit_bytes` is the memory cgroup limit of the
-  container, pod or Slurm step. This manifest represents one level of
+  container, pod, or Slurm step. This manifest represents one level of
   container limits. With nested cgroups, also check the combined allocations
   of all siblings against each ancestor's limit separately; choosing each
   process's tightest limit alone does not check those combined totals.
@@ -94,7 +94,7 @@ role may also add `other` allocations.
 | --- | --- |
 | `inference_rank` | `l2`, `snapshot_pool`, `slot_state`, `l3_client_segment`, `l3_client_staging`, `process_headroom` |
 | `storage_provider` | `provider_segment`, `process_headroom` |
-| `auxiliary` (store master, gateway, ...) | `process_headroom` |
+| `auxiliary` (such as a store master or gateway) | `process_headroom` |
 
 Where each value comes from:
 
@@ -111,7 +111,7 @@ Where each value comes from:
   currently 16 MiB per rank with L3 enabled and zero without it.
 - `provider_segment` is the segment a storage provider mounts.
 - `process_headroom` is the rest of the process's memory: Python, the
-  device runtime, model staging and allocator caches. The rank startup check
+  device runtime, model staging, and allocator caches. The rank startup check
   leaves 10 GiB per rank; measure peak RSS beyond the declared buffers to
   refine it.
 
@@ -129,7 +129,7 @@ one of these ways:
   `T = 1073741824`. Use `null` for an allocator without a threshold, which
   rounds every request.
 - `{"basis": "included_in", "allocation": "<id>"}`: these bytes are already
-  counted in another private, measured or declared allocation of the same
+  counted in another private, measured, or declared allocation of the same
   process.
 
 Other kinds take `measured` or `declared` bytes, or `included_in`.
@@ -140,11 +140,11 @@ Other kinds take `measured` or `declared` bytes, or `included_in`.
 each of its entry's `count` processes. A shared allocation counts once
 however many processes declare it, for example a shared-memory segment
 that every rank of a container maps. Its id is global, and every
-declaration of it must agree on kind, reservation and memory domain. The
+declaration of it must agree on kind, reservation, and memory domain. The
 memory domain is the same container, or the same node outside any
 container. An id that is shared in one place and private in another is an
 error. `l2`, `snapshot_pool`, `slot_state`, `process_headroom`,
-`l3_client_segment` and `l3_client_staging` belong to one process and cannot
+`l3_client_segment`, and `l3_client_staging` belong to one process and cannot
 be shared. Sharing the remote store's objects does not make the clients'
 local segment or staging buffers shared allocations.
 

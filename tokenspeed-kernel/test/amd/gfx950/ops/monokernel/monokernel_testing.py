@@ -61,29 +61,80 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x > 20, x, torch.log1p(torch.exp(x)))
 
 
+def _start(plan: Plan, region: str, copy: int) -> int:
+    """Pair offset of row 0 of ``region``, copy ``copy`` of a peer region."""
+    return plan.offset(region) + (copy * plan.peer_copy(region) if copy else 0)
+
+
 def fill(
-    scratch: torch.Tensor, plan: Plan, region: str, payload: torch.Tensor, tag: int
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    payload: torch.Tensor,
+    tag: int,
+    *,
+    row: int = 0,
+    copy: int = 0,
 ) -> None:
-    """Publish ``payload`` (32-bit words) in row 0 of ``region`` with ``tag``,
-    as the stage that writes the region would."""
-    start = plan.offset(region)
-    words = payload.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    """Publish ``payload`` (32-bit words) in row ``row`` of ``region`` with
+    ``tag``, as the stage that writes the region would (``copy``: the launch
+    parity's copy of a peer region)."""
+    start = _start(plan, region, copy) + row * plan.row_pairs
+    words = payload.reshape(-1).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     scratch[start : start + words.numel()] = (tag << 32) | words
 
 
 def payloads(
-    scratch: torch.Tensor, plan: Plan, region: str, count: int, tag: int, row: int = 0
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    count: int,
+    tag: int,
+    row: int = 0,
+    copy: int = 0,
 ) -> torch.Tensor:
-    """The first ``count`` int32 payloads of row ``row`` of ``region``,
-    after checking that every one carries ``tag``."""
-    start = plan.offset(region) + row * plan.row_pairs
+    """The first ``count`` int32 payloads of row ``row`` of ``region`` (copy
+    ``copy`` of a peer region), after checking that every one carries ``tag``."""
+    start = _start(plan, region, copy) + row * plan.row_pairs
     pairs = scratch[start : start + count]
     assert torch.all((pairs >> 32) == tag), region
     return (pairs & 0xFFFFFFFF).to(torch.int32)
 
 
+def fill_words(
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    payload: torch.Tensor,
+    *,
+    row: int = 0,
+    copy: int = 0,
+) -> None:
+    """Store ``payload`` (32-bit words) as plain words in row ``row`` of
+    ``region``, as a producer's ``store_words`` would (2 words a pair)."""
+    start = 2 * (_start(plan, region, copy) + row * plan.row_pairs)
+    words = payload.reshape(-1).view(torch.int32)
+    scratch.view(torch.int32)[start : start + words.numel()] = words
+
+
+def words(
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    count: int,
+    *,
+    row: int = 0,
+    copy: int = 0,
+) -> torch.Tensor:
+    """The first ``count`` plain words of row ``row`` of ``region``."""
+    start = 2 * (_start(plan, region, copy) + row * plan.row_pairs)
+    return scratch.view(torch.int32)[start : start + count].clone()
+
+
 __all__ = [
     "fill",
+    "fill_words",
+    "words",
     "mxfp4",
     "payloads",
     "random_mxfp4",

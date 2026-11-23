@@ -26,9 +26,12 @@
 import torch
 from tokenspeed_kernel.ops.gemm import (
     mm,
+    mm_activation_scale_layout,
     prepare_mxfp8_weight_scales,
 )
+from tokenspeed_kernel.ops.gemm.deepgemm import prepare_deepgemm_fp8_weight
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -48,6 +51,7 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.block_solution: str | None = None
         # 1x32 weight scales in the native GEMM's layout, or None for the
         # original path. see prepare_weight_scales.
         self.prepared_weight_scales: torch.Tensor | None = None
@@ -55,6 +59,16 @@ class Fp8LinearMethod(LinearMethodBase):
         # and the prepacked scales above are exclusive: a subclass that prepares
         # both lets the activation's scale layout pick the GEMM.
         self.projection_weight_scales: torch.Tensor | None = None
+
+    def _get_block_solution(self) -> str | None:
+        if self.block_solution is not None:
+            return self.block_solution
+        backend = global_server_args_dict["dense_gemm_backend"]
+        if backend in ("trtllm_cutedsl", "deepgemm") and tuple(
+            self.quant_config.weight_block_size
+        ) == (128, 128):
+            return backend
+        return None
 
     def create_weights(
         self,
@@ -187,6 +201,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
+            if self._get_block_solution() == "deepgemm":
+                weight, scales = prepare_deepgemm_fp8_weight(
+                    layer.weight, layer.weight_scale_inv
+                )
+                if weight is not layer.weight or scales is not layer.weight_scale_inv:
+                    layer.weight = Parameter(weight, requires_grad=False)
+                    layer.weight_scale_inv = Parameter(scales, requires_grad=False)
+                    self.block_solution = "deepgemm"
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -288,6 +310,7 @@ class Fp8LinearMethod(LinearMethodBase):
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], layer.weight.shape[0]]
         output_dtype = output_dtype or x.dtype
+        out_2d = out.view(-1, layer.weight.shape[0]) if out is not None else None
         if self.prepared_weight_scales is not None and (
             block_scale is not None or x.dtype in (torch.bfloat16, torch.float16)
         ):
@@ -306,25 +329,40 @@ class Fp8LinearMethod(LinearMethodBase):
                 out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
             )
             return out if out is not None else output.view(*output_shape)
+        # Prequantized scales must match the layout mm_activation_scale_layout reports.
         if block_scale is None:
             scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+                "packed_ue8m0"
+                if layer.weight_scale_inv.dtype == torch.int32
+                else (
+                    "ue8m0"
+                    if layer.weight_scale_inv.dtype == torch.uint8
+                    else "float32"
+                )
             )
+            mn_major = (
+                scale_encoding == "float32"
+                and input_2d.dtype == torch.bfloat16
+                and mm_activation_scale_layout(
+                    input_2d,
+                    layer.weight,
+                    B_scales=layer.weight_scale_inv,
+                    block_size=self.quant_config.weight_block_size,
+                    out=out_2d,
+                    out_dtype=output_dtype,
+                    solution=self._get_block_solution(),
+                )
+                == "mn_major"
+            )
+            # The GEMM reads MN-major scales, which this quantizer writes natively.
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
+                enable_pdl=pdl_enabled() and not mn_major,
+                override="trtllm_quantize_fp8_mn_major" if mn_major else None,
             )
-        solution = None
-        if global_server_args_dict["dense_gemm_backend"] in (
-            "trtllm_cutedsl",
-            "deepgemm",
-        ) and tuple(self.quant_config.weight_block_size) == (
-            128,
-            128,
-        ):
-            solution = global_server_args_dict["dense_gemm_backend"]
         output = mm(
             input_2d,
             layer.weight,
@@ -334,8 +372,8 @@ class Fp8LinearMethod(LinearMethodBase):
             out_dtype=output_dtype,
             quant="mxfp8",
             block_size=self.quant_config.weight_block_size,
-            solution=solution,
-            out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
+            solution=self._get_block_solution(),
+            out=out_2d,
         )
         return (
             out

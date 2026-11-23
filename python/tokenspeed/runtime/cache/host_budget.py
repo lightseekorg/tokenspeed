@@ -127,7 +127,7 @@ class ManifestIssue:
     message: str
 
 
-class ManifestInvalid(Exception):
+class ManifestInvalidError(Exception):
     """The manifest is malformed, incomplete or contradictory."""
 
     def __init__(self, issues: list[ManifestIssue]) -> None:
@@ -139,7 +139,7 @@ def parse_manifest_json(text: str) -> Any:
     """Decode manifest text, refusing duplicate keys and non-finite numbers.
 
     Raises:
-        ManifestInvalid: The text is not one strict JSON document.
+        ManifestInvalidError: The text is not one strict JSON document.
     """
 
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -157,7 +157,7 @@ def parse_manifest_json(text: str) -> Any:
             text, object_pairs_hook=unique_object, parse_constant=refuse_constant
         )
     except (ValueError, RecursionError) as error:
-        raise ManifestInvalid([ManifestIssue(path="$", message=str(error))])
+        raise ManifestInvalidError([ManifestIssue(path="$", message=str(error))])
 
 
 class _Issues:
@@ -706,7 +706,7 @@ def _parse_manifest(document: Any) -> _Manifest:
         issues=issues,
     )
     if top is None:
-        raise ManifestInvalid(issues.items)
+        raise ManifestInvalidError(issues.items)
     version = _integer(top, "schema_version", "$", minimum=0, issues=issues)
     if version is not None and version != SCHEMA_VERSION:
         issues.add("$.schema_version", f"must be {SCHEMA_VERSION}, got {version}")
@@ -780,7 +780,7 @@ def _parse_manifest(document: Any) -> _Manifest:
     _check_sharing(declarations, issues)
 
     if issues.items:
-        raise ManifestInvalid(issues.items)
+        raise ManifestInvalidError(issues.items)
     return _Manifest(nodes, containers, processes, declarations)
 
 
@@ -805,8 +805,13 @@ def _check_sharing(declarations: list[_Declaration], issues: _Issues) -> None:
             ("kind", declaration.kind, original.kind),
             (
                 "reservation",
-                (declaration.basis, declaration.spec),
-                (original.basis, original.spec),
+                json.dumps(
+                    {"basis": declaration.basis, **dict(declaration.spec)},
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {"basis": original.basis, **dict(original.spec)}, sort_keys=True
+                ),
             ),
             (
                 "memory domain",
@@ -976,7 +981,7 @@ def evaluate_manifest(document: Any) -> dict[str, Any]:
         ``"overcommitted"``; lists are in a deterministic order.
 
     Raises:
-        ManifestInvalid: The manifest is malformed, incomplete or
+        ManifestInvalidError: The manifest is malformed, incomplete or
             contradictory; nothing is evaluated.
     """
     manifest = _parse_manifest(document)

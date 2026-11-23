@@ -22,12 +22,20 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    decode_index_k_scale,
+    encode_index_k_scale,
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     _copy_page_fields_kernel,
     _copy_state_rows_kernel,
     _index_k_layernorm_fp8_scatter_kernel,
     _index_k_layernorm_scatter_kernel,
     _state_verify_commit_rows_kernel,
+    _store_kv_cache_kernel,
     _store_state_rows_kernel,
     _zero_page_fields_kernel,
     copy_page_fields,
@@ -37,6 +45,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_layernorm_fp8_scatter,
     index_k_layernorm_scatter,
     state_verify_commit_rows,
+    store_kv_cache,
     store_state_rows,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
@@ -47,13 +56,27 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _count_slots_by_owner,
+    _decode_visible_lengths,
     _local_visible_lengths,
     _split_slots_by_owner,
+    kvp_decode_visible_lengths,
     kvp_local_visible_lengths,
     split_slots_by_owner,
 )
 from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from utils import (
+    ARENA_DIM,
+    ARENA_HKV,
+    ARENA_HQ,
+    ARENA_LARGE_SLOTS,
+    ARENA_SMALL_SLOTS,
+    ARENA_TOKENS,
+    arena_caches,
+    arena_slots,
+    assert_no_triton_compile,
+    needs_amd_arena_key,
+    skip_without_arena_memory,
+)
 
 
 def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
@@ -91,6 +114,57 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(3, 63, 4, 0)
         run(2, 129, 3, 13)
         run(5, 1024, 4, 16)
+
+
+@pytest.mark.parametrize(
+    "queries,offset,len_dtype", [(1, 0, torch.int32), (4, -3, torch.int64)]
+)
+def test_kvp_decode_visible_lengths_matches_the_separate_launches(
+    device: str, queries: int, offset: int, len_dtype: torch.dtype
+) -> None:
+    page, groups = 64, 6
+
+    def run(batch, cols, padding, start):
+        owned = (torch.arange(cols) % 3 == 1) | (torch.arange(cols) == 0)
+        prefix = torch.zeros((start + batch, cols + 1 + padding), dtype=torch.int32)
+        prefix[:, 1 : cols + 1] = owned.int().cumsum(0)
+        # Endpoints from below zero (clamped) through the table's last token.
+        seq_lens = torch.randint(0, cols * page + 1, (start + batch,), dtype=len_dtype)
+        seq_lens[start] = 1
+        seq_lens[-1] = cols * page
+        # Rows after ``start`` others, as a mixed round's decode rows follow its extends.
+        prefix = prefix.to(device)[start:, : cols + 1]
+        seq_lens = seq_lens.to(device)[start:]
+        endpoints = (
+            (seq_lens[:, None] + torch.arange(offset, offset + queries, device=device))
+            .clamp_min_(0)
+            .to(torch.int32)
+        )
+        local = torch.empty_like(endpoints)
+        kvp_local_visible_lengths(prefix, endpoints, page_size=page, out=local)
+        local = local.reshape(-1)
+        cache = local.clamp_min(1).repeat_interleave(groups)
+        got_local = torch.full_like(local, -7)
+        got_cache = torch.full_like(cache, -7)
+        kvp_decode_visible_lengths(
+            prefix,
+            seq_lens,
+            offset=offset,
+            queries=queries,
+            groups=groups,
+            page_size=page,
+            local_lengths=got_local,
+            cache_lengths=got_cache,
+        )
+        torch.testing.assert_close(got_local, local, rtol=0, atol=0)
+        torch.testing.assert_close(got_cache, cache, rtol=0, atol=0)
+
+    run(1, 17, 0, 0)
+    # Batch, table width, row stride and the rows' start are runtime values.
+    with assert_no_triton_compile(_decode_visible_lengths):
+        run(16, 63, 0, 0)
+        run(5, 129, 13, 3)
+        run(64, 1024, 16, 1)
 
 
 @pytest.mark.parametrize("degree", [1, 3, 4, 16])
@@ -385,11 +459,14 @@ def test_copy_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+@pytest.mark.parametrize("shape", [(4, 8, 16), (3, 7, 9)])
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_store_state_rows_skips_negative_blocks_without_recompiling(
-    device: str,
+    device: str, shape: tuple[int, int, int], transposed: bool, dtype: torch.dtype
 ) -> None:
-    heads, key, value = 4, 8, 16
-    slab = torch.zeros((12, heads, key, value), dtype=torch.bfloat16, device=device)
+    heads, key, value = shape
+    slab = torch.full((12, heads, key, value), -7, dtype=dtype, device=device)
     # Page-interleaved slab view, as the arena hands out.
     strided = slab.as_strided(
         (6, heads, key, value), (2 * heads * key * value, key * value, value, 1)
@@ -397,23 +474,29 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
 
     def run(blocks: list[int]) -> None:
         strided.zero_()
-        states = torch.randn(
-            (len(blocks), heads, value, key), dtype=torch.float32, device=device
-        ).transpose(-1, -2)
-        expected = strided.clone()
+        if transposed:
+            states = torch.randn(
+                (len(blocks), heads, value, key), dtype=torch.float32, device=device
+            ).transpose(-1, -2)
+        else:
+            states = torch.randn(
+                (len(blocks), heads, key, value), dtype=torch.float32, device=device
+            )
+        expected = slab.clone()
         for row, block in enumerate(blocks):
             if block >= 0:
-                expected[block] = states[row].to(torch.bfloat16)
+                expected[2 * block] = states[row].to(dtype)
         store_state_rows(
             states, strided, torch.tensor(blocks, dtype=torch.int32, device=device)
         )
-        torch.testing.assert_close(strided, expected, rtol=0, atol=0)
+        torch.testing.assert_close(slab, expected, rtol=0, atol=0)
 
     run([1, -1, 3])
     with assert_no_triton_compile(_store_state_rows_kernel):
         run([5])
         run([2, 4, -1, -1, 1, 0])
         run([-1, -1])
+        run(list(range(6)) + [-1] * 10)
 
     with pytest.raises(ValueError, match="one destination"):
         store_state_rows(
@@ -421,6 +504,24 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
             strided,
             torch.zeros(3, dtype=torch.int32, device=device),
         )
+
+
+def test_store_state_rows_large_offsets(device: str) -> None:
+    if torch.cuda.mem_get_info()[0] < 9 * 1024**3:
+        pytest.skip("large-offset test requires 9 GiB free")
+    shape = (2, 7, 9)
+    width = 2 * 7 * 9
+    row_stride = 2**31 + 128
+    backing = torch.empty(row_stride + 2 * width, dtype=torch.float32, device=device)
+    states = backing.as_strided((2, *shape), (row_stride, 63, 9, 1))
+    slab = backing[width:].as_strided((2, *shape), (row_stride, 63, 9, 1))
+    states[1].copy_(torch.arange(width, device=device).reshape(shape))
+    slab.fill_(-7)
+    store_state_rows(
+        states, slab, torch.tensor([-1, 1], dtype=torch.int32, device=device)
+    )
+    torch.testing.assert_close(slab[1], states[1], rtol=0, atol=0)
+    torch.testing.assert_close(slab[0], torch.full_like(slab[0], -7), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 32])
@@ -1244,7 +1345,7 @@ def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
         (page_bytes, head_dim, 1),
     )
     scale_view = torch.as_strided(
-        flat.view(torch.float32),
+        flat.view(index_k_scale_dtype()),
         (num_pages, page_size, num_groups),
         (page_bytes // 4, num_groups, 1),
         (page_size * head_dim) // 4,
@@ -1274,7 +1375,11 @@ def test_index_k_block_split_scatter_matches_index_put(
     row = head_dim + ng * 4
 
     k_fp8 = torch.randn(tokens, head_dim, device=device).to(torch.float8_e4m3fn)
-    k_scale = torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
+    k_scale = encode_index_k_scale(
+        round_index_k_scale(
+            torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
+        )
+    )
     loc = torch.randperm(num_slots, device=device)[:tokens].to(loc_dtype)
     page, slot = loc.long() // page_size, loc.long() % page_size
 
@@ -1342,7 +1447,7 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     expected = before.clone()
     data, scale = _index_k_block_views(expected, 2, page_size, dim, 1)
     data[1, [1, 3]] = values.view(torch.uint8)[[1, 3]].view(torch.float8_e4m3fn)
-    scale[1, [1, 3]] = scales[[1, 3]]
+    scale[1, [1, 3]] = scales[[1, 3]].view(scale.dtype)
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
 
@@ -1470,7 +1575,7 @@ def _read_fp8_rows(buf, slots, page_size, head_dim, ng):
     take = torch.arange(slots.numel(), device=slots.device)
     codes = picked[:, : page_size * head_dim].reshape(-1, page_size, head_dim)
     codes = codes[take, row]
-    scales = picked[:, page_size * head_dim :].contiguous().view(torch.float32)
+    scales = decode_index_k_scale(picked[:, page_size * head_dim :].contiguous())
     scales = scales.view(-1, page_size, ng)[take, row]
     values = codes.view(torch.float8_e4m3fn).float().view(-1, ng, head_dim // ng)
     return codes, scales, (values * scales[..., None]).view(-1, head_dim)
@@ -1508,7 +1613,7 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
         keys.float(), (head_dim,), weight, bias, eps
     ).to(torch.bfloat16)
     groups = normed.float().view(tokens, ng, group_size)
-    ref_scales = groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0
+    ref_scales = round_index_k_scale(groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0)
     ref_codes = (
         (groups / ref_scales[..., None])
         .clamp(-448.0, 448.0)
@@ -1520,9 +1625,11 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
     # A boundary LayerNorm value may round either way, moving its scale one bf16 step.
     torch.testing.assert_close(scales, ref_scales, rtol=2**-7, atol=0)
     assert (codes == ref_codes).float().mean() > 0.99
-    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off.
+    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off, twice
+    # that when the scale is rounded up to a power of two.
     amax = groups.abs().amax(dim=-1, keepdim=True)
-    assert ((values.view_as(groups) - groups).abs() <= amax / 24).all()
+    step = amax / (12 if index_k_scale_ue8m0() else 24)
+    assert ((values.view_as(groups) - groups).abs() <= step).all()
     # Every byte outside the written rows and scales is untouched.
     pages = _plane_pages(buf, page_size, head_dim, ng)
     written = torch.zeros(pages.shape, dtype=torch.bool, device=device)
@@ -1590,3 +1697,61 @@ def test_index_k_layernorm_fp8_scatter_reuses_compile_across_token_counts(
     with assert_no_triton_compile(_index_k_layernorm_fp8_scatter_kernel):
         for tokens in (4, 7, 64, 300, 2048):
             run(tokens)
+
+
+# A small KV arena and one past 2 GiB: serving sizes the arena after startup's
+# warm-up (a small probe arena, then the full one), and on AMD Triton keys a
+# binary on whether a tensor's storage fits in 2 GiB, so the kernels that write
+# the arena do not specialize its pointers.
+@needs_amd_arena_key
+def test_store_kv_cache_serves_a_large_arena_with_the_small_arenas_binary():
+    skip_without_arena_memory()
+    _, k, v = (
+        torch.randn(ARENA_TOKENS, (ARENA_HQ + 2 * ARENA_HKV) * ARENA_DIM, device="cuda")
+        .bfloat16()
+        .split(
+            [ARENA_HQ * ARENA_DIM, ARENA_HKV * ARENA_DIM, ARENA_HKV * ARENA_DIM],
+            dim=-1,
+        )
+    )
+
+    def write(slots: int, first: int):
+        k_cache, v_cache = arena_caches(slots)
+        loc = arena_slots(first)
+        store_kv_cache(
+            k.view(ARENA_TOKENS, ARENA_HKV, ARENA_DIM),
+            v.view(ARENA_TOKENS, ARENA_HKV, ARENA_DIM),
+            k_cache,
+            v_cache,
+            loc,
+        )
+        return k_cache[loc].clone(), v_cache[loc].clone()
+
+    small = write(ARENA_SMALL_SLOTS, 0)
+    with assert_no_triton_compile(_store_kv_cache_kernel):
+        large = write(ARENA_LARGE_SLOTS, ARENA_LARGE_SLOTS - ARENA_SMALL_SLOTS)
+    torch.cuda.synchronize()
+    assert torch.equal(small[0], large[0]) and torch.equal(small[1], large[1])
+
+
+def test_store_kv_cache_writes_an_unaligned_cache():
+    """A cache whose base is not 16-byte aligned (here one element in) takes
+    the unaligned stores and holds the same rows."""
+    k = torch.randn(ARENA_TOKENS, ARENA_HKV, ARENA_DIM, device="cuda").bfloat16()
+    v = torch.randn_like(k)
+    loc = arena_slots(0)
+    rows = []
+    for offset in (0, 1):
+        width = ARENA_HKV * ARENA_DIM
+        k_cache, v_cache = (
+            torch.zeros(
+                ARENA_SMALL_SLOTS * width + 1, dtype=torch.bfloat16, device="cuda"
+            )[offset : offset + ARENA_SMALL_SLOTS * width].view(
+                ARENA_SMALL_SLOTS, ARENA_HKV, ARENA_DIM
+            )
+            for _ in range(2)
+        )
+        store_kv_cache(k, v, k_cache, v_cache, loc)
+        rows.append((k_cache[loc].clone(), v_cache[loc].clone()))
+    assert torch.equal(rows[0][0], k) and torch.equal(rows[0][1], v)
+    assert torch.equal(rows[0][0], rows[1][0]) and torch.equal(rows[0][1], rows[1][1])

@@ -69,14 +69,14 @@ def tuned(tmp_path_factory):
     with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
         # Discovery on prefill must expose small decode profiles too.
         result = mm(x, w)
-        assert torch.equal(result, x @ w.T)
+        check_result(result, x, w)
     path = str(tmp_path_factory.mktemp("out-projection") / "tactics.json")
     assert save_autotune_cache(path, None, 0)
     tuner.clear_cache()
     assert load_autotune_cache(path, None, 0)
 
 
-@pytest.mark.parametrize("m", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 17, 32])
 @pytest.mark.parametrize("seed", [7, 23, 41])
 def test_tuned_projection_and_changed_input_graph(m, seed):
     x, w = inputs(m, seed)
@@ -85,6 +85,8 @@ def test_tuned_projection_and_changed_input_graph(m, seed):
     assert fi.flashinfer_joint_bf16_supported(x, w, out)
     assert mm(x, w, out=out) is out
     check_result(out, x, w)
+    # mm() took the CuTe DSL path, not cuBLASLt.
+    assert torch.equal(fi.flashinfer_bf16_gemm(x, w, None), out)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -104,7 +106,7 @@ def test_tuned_projection_and_changed_input_graph(m, seed):
         assert torch.all(storage[m * N :] == 42)
 
 
-@pytest.mark.parametrize("m", [1, 3, 4])
+@pytest.mark.parametrize("m", [1, 3, 4, 32])
 def test_pdl_and_cancellation(m):
     x, w = inputs(m, 91)
     x[:, K // 2 :] = -x[:, : K // 2]
@@ -121,20 +123,36 @@ def test_pdl_and_cancellation(m):
         pdl_enabled(previous)
 
 
-@pytest.mark.parametrize("m", [5, 17, 32, 48, 128, 192])
-def test_larger_rows_keep_original_gemm(m):
+@pytest.mark.parametrize("m", [33, 48, 128, 192])
+def test_larger_rows_leave_the_joint_gemm(m):
     x, w = inputs(m, 99)
     out = torch.empty(m, N, dtype=x.dtype, device=x.device)
     with pytest.raises(ValueError, match="Unsupported input"):
         fi.flashinfer_bf16_gemm(x, w, out)
-    assert torch.equal(mm(x, w, out=out), x @ w.T)
+    # Rows the TGV policy admits under PDL take its tile.
+    tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
+    tile = fi.select_tgv_decode_tile(
+        m=m,
+        n=N,
+        k=K,
+        weight_bytes=w.numel() * w.element_size(),
+        arch=fi.platform.arch_version,
+        sm_count=fi.platform.sm_count,
+        pdl=pdl_enabled(),
+    )
+    assert (tactic is None) == (tile is None)
+    expected = (
+        x @ w.T if tactic is None else fi.flashinfer_tgv_decode_gemm(x, w, None, tactic)
+    )
+    assert torch.equal(mm(x, w, out=out), expected)
+    check_result(out, x, w)
 
 
 def test_other_projections_and_invalid_layouts_keep_original_gemm():
     x, w = inputs(4, 10)
     for a, b in [
-        (x[:, :2560].contiguous(), w[:, :2560].contiguous()),
-        (x, w[:512]),
+        # K % 128 != 0
+        (x[:, :2112].contiguous(), w[:, :2112].contiguous()),
         (x[:, ::2], w[:, ::2]),
     ]:
         assert not fi.flashinfer_joint_bf16_supported(a, b, None)

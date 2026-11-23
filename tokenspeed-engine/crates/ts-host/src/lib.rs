@@ -1,0 +1,1169 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+//! One TokenSpeed engine rank with its control plane in Rust.
+//!
+//! The launching Python interpreter imports this extension and enters the
+//! scheduling loop on its main thread with the GIL released. The forward
+//! thread runs the Python data plane; completion queries acquire the GIL.
+
+mod cache_events;
+mod data_plane;
+mod encode;
+mod host_spans;
+mod logging;
+mod pd;
+mod peer;
+
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::Duration,
+};
+
+use pyo3::{prelude::*, types::PyBytes};
+use ts_collective::{Group, Listener, Mesh};
+use ts_control::{
+    batch_log::BatchLogConfig,
+    control::ControlConfig,
+    eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
+    event_loop::{EventLoop, LoopConfig, LoopError, PrefillDelay, Ranks, Subsystems},
+    grammar::{GrammarConfig, Grammars, ReasoningGrammar},
+    ingress::{IngressLimits, LogprobServability},
+    json_framing::{JsonFraming, MessageBoundary},
+    kv_events::{KvEventPublisher, KvEventsConfig},
+    output::{FinishLog, OutputProcessor, Role},
+    startup,
+    transport::{EngineTransport, TransportError},
+};
+use ts_metrics::{
+    DiskMetrics, EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics,
+    MetricsConfig,
+};
+use ts_scheduler::Scheduler;
+use ts_wire::EngineCoreReadyResponse;
+
+use crate::data_plane::PythonDataPlane;
+
+/// Rust's allocations go to mimalloc. The control thread allocates for every
+/// row of every round (scheduler events, outputs, the batches' columns); with
+/// glibc's allocator those allocations also contend with the forward thread's
+/// frees of the C++ plans the control thread built, as glibc returns a chunk
+/// to the arena that allocated it under that arena's lock. mimalloc frees
+/// across threads without one, and allocates small objects faster. Python,
+/// the C++ scheduler and the kernels keep the system allocator; nothing
+/// allocated on one side is freed on the other, as every boundary copies.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// How long the host waits for the frontend's INIT and for the other ranks
+/// to connect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Collective group ids. Replicas are disjoint, and so are pipelines, so each
+/// kind shares one id.
+const DP_GROUP: u32 = 0;
+const REPLICA_GROUP: u32 = 1;
+const PP_GROUP: u32 = 2;
+const EP_GROUP: u32 = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum HostError {
+    #[error("{0}")]
+    Interpreter(String),
+    #[error("python:\n{0}")]
+    Python(String),
+    #[error("data plane: {0}")]
+    DataPlane(String),
+    #[error("the ready response does not decode: {0}")]
+    Ready(#[from] ts_wire::Error),
+    #[error("frontend: {0}")]
+    Transport(#[from] TransportError),
+    #[error("rank mesh: {0}")]
+    Collective(#[from] ts_collective::Error),
+    #[error(transparent)]
+    Metrics(#[from] ts_metrics::MetricsError),
+    #[error(transparent)]
+    KvEvents(#[from] ts_control::kv_events::KvEventsError),
+    #[error("the L3 store: {0}")]
+    Storage(#[from] ts_mooncake::Error),
+    #[error("the Disk tier: {0}")]
+    Disk(#[from] ts_control::disk::DiskError),
+    #[error(transparent)]
+    Loop(#[from] LoopError),
+    #[error("the EPD embedding sender: {0}")]
+    Sender(#[from] ts_pd::StartError),
+    #[error("the encode loop: {0}")]
+    Encode(#[from] ts_control::encode::EncodeError),
+    #[error("peer prefix sharing: {0}")]
+    Peer(String),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// The data plane's `DiskSettings` (`cache/disk.py`), or None without the
+/// Disk tier.
+fn disk_settings(settings: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::disk::DiskSettings>> {
+    if settings.is_none() {
+        return Ok(None);
+    }
+    let backend: String = settings.getattr("backend")?.extract()?;
+    let backend = match backend.as_str() {
+        "io_uring" => ts_disk::Backend::IoUring,
+        "psync" => ts_disk::Backend::Psync,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported Disk tier I/O backend {other:?}"
+            )))
+        }
+    };
+    let groups: Vec<(usize, usize, usize)> = settings.getattr("groups")?.extract()?;
+    let layout = |num_lcm_blocks: usize| -> PyResult<ts_l3::HostLayout> {
+        Ok(ts_l3::HostLayout {
+            groups: groups
+                .iter()
+                .map(|&(packing, block_bytes, shard_count)| ts_l3::GroupLayout {
+                    packing,
+                    block_bytes,
+                    shard_count,
+                })
+                .collect(),
+            lcm_block_bytes: settings.getattr("lcm_block_bytes")?.extract()?,
+            num_lcm_blocks,
+            owner_rank: settings.getattr("owner_rank")?.extract()?,
+            tp_rank: settings.getattr("tp_rank")?.extract()?,
+        })
+    };
+    Ok(Some(ts_control::disk::DiskSettings {
+        file: std::path::PathBuf::from(settings.getattr("file")?.extract::<String>()?),
+        file_bytes: settings.getattr("file_bytes")?.extract()?,
+        executor: ts_disk::ExecutorConfig {
+            backend,
+            queue_depth: settings.getattr("queue_depth")?.extract()?,
+            write_queue_depth: settings.getattr("write_queue_depth")?.extract()?,
+            max_io_bytes: settings.getattr("max_io_bytes")?.extract()?,
+            write_bytes_per_second: settings.getattr("write_bytes_per_second")?.extract()?,
+        },
+        host: ts_l3::HostBuffer {
+            base: settings.getattr("host_buffer")?.extract()?,
+            len: settings.getattr("host_buffer_bytes")?.extract()?,
+        },
+        host_layout: layout(settings.getattr("num_host_lcm_blocks")?.extract()?)?,
+        disk_layout: layout(settings.getattr("num_disk_lcm_blocks")?.extract()?)?,
+        max_operations: settings.getattr("max_operations")?.extract()?,
+        push_ring_bytes: settings.getattr("push_ring_bytes")?.extract()?,
+    }))
+}
+
+fn python_error(py: Python<'_>, error: PyErr) -> HostError {
+    HostError::Python(data_plane::describe(py, &error))
+}
+
+struct Args {
+    control_fd: i32,
+    enable_async_logging: bool,
+    cache_events: Option<cache_events::Settings>,
+}
+
+/// The control and forward threads report to the same launcher.
+static LAUNCHER_FAILURE: OnceLock<LauncherFailure> = OnceLock::new();
+
+struct LauncherFailure {
+    notification: OnceLock<()>,
+    logged: Mutex<HashSet<String>>,
+    parent: Option<libc::pid_t>,
+}
+
+impl LauncherFailure {
+    #[allow(unsafe_code)]
+    fn for_parent() -> Self {
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        Self {
+            notification: OnceLock::new(),
+            logged: Mutex::new(HashSet::new()),
+            parent: (parent > 0).then_some(parent),
+        }
+    }
+
+    /// Wait for the first signal attempt. Only its caller receives the error,
+    /// so it can report it after publishing any failure state.
+    #[allow(unsafe_code)]
+    fn notify(&self) -> std::io::Result<bool> {
+        let mut result = Ok(false);
+        self.notification.get_or_init(|| {
+            // Keep logging and Python outside this initialization: concurrent
+            // reporters wait here until the signal attempt has completed.
+            let failed = self.parent.is_some_and(|parent| {
+                // SAFETY: parent is positive. A parent in an outer PID
+                // namespace is 0 and must not become a process-group signal.
+                // Only notify the launcher that originally owned this rank.
+                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 }
+            });
+            result = if failed {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(true)
+            };
+        });
+        result
+    }
+
+    fn log_signal_error(error: std::io::Error) {
+        tracing::error!(%error, "could not notify the launcher");
+    }
+
+    fn report(&self, error: impl std::fmt::Display) {
+        if let Err(error) = self.notify() {
+            Self::log_signal_error(error);
+        }
+        let error = error.to_string();
+        let distinct = self
+            .logged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(error.clone());
+        if distinct {
+            // Synchronous logging can stall on a blocked output stream.
+            // Release the diagnostic lock before calling the writer.
+            tracing::error!("{error}");
+        }
+    }
+}
+
+/// Load once at startup; Python is called only by the background exporter.
+fn trace_provider(config: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::trace::TraceProvider>> {
+    let callback = config.getattr("trace_provider")?;
+    if callback.is_none() {
+        return Ok(None);
+    }
+    if !callback.is_callable() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "trace provider must be callable",
+        ));
+    }
+    let callback = callback.unbind();
+    Ok(Some(Arc::new(move |rid| {
+        Python::attach(|py| {
+            match callback
+                .call1(py, (rid,))
+                .and_then(|value| value.extract::<Option<(String, Option<String>)>>(py))
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "trace provider failed; retaining native context");
+                    None
+                }
+            }
+        })
+    })))
+}
+
+/// OTLP tracing as the Python server args carry it.
+struct TraceConfig {
+    endpoint: String,
+    sample_ratio: f64,
+    provider: Option<ts_control::trace::TraceProvider>,
+}
+
+/// What `rust_host.HostConfig` carries.
+struct HostConfig {
+    handshake_address: String,
+    engine_index: u16,
+    ready_response: Vec<u8>,
+    in_flight_depth: usize,
+    limits: IngressLimits,
+    stream_interval: i64,
+    spec_num_tokens: Option<usize>,
+    ngram_context_len: usize,
+    request_token_history: bool,
+    request_token_history_lookback: Option<usize>,
+    physical_context_len: i64,
+    kv_total_pages: i64,
+    /// Effective token capacity of the usable KV pool.
+    kv_token_capacity: i64,
+    /// With `--enable-startup-requests`, what sizes the requests the engine
+    /// serves itself before it registers.
+    startup: Option<startup::Limits>,
+    rank: usize,
+    replica_ranks: Vec<usize>,
+    pp_ranks: Option<Vec<usize>>,
+    dp_ranks: Option<Vec<usize>>,
+    collective_bind_host: String,
+    controls: ControlConfig,
+    metrics: Metrics,
+    batch_log: BatchLogConfig,
+    finish_log: FinishLog,
+    /// OTLP tracing: the endpoint and sample ratio, when tracing is on.
+    trace: Option<TraceConfig>,
+    /// The scheduler records KV cache events.
+    kv_events: bool,
+    /// Where this rank publishes them, if it does.
+    kv_events_publisher: Option<KvEventsConfig>,
+    /// With the L3 storage tier, the executor's settings.
+    l3: Option<ts_l3::Settings>,
+    /// With the Disk tier, its file and executor's settings.
+    disk: Option<ts_control::disk::DiskSettings>,
+    /// `--enable-eplb`: the rebalance's settings.
+    eplb: Option<Eplb>,
+    /// An EPD prefill node: it receives image embeddings from encode
+    /// workers.
+    epd_receive_enabled: bool,
+    /// Grammar-constrained decoding's settings, if it is on.
+    grammar: Option<GrammarConfig>,
+    /// The data plane fills bitmasks from the matchers' committed state.
+    eager_grammar: bool,
+    /// The fused role's prefill-delay gate, `(attempt_interval,
+    /// any_interval)` in rounds plus `--prefill-single-round`, when
+    /// `--prefill-attempt-interval` is set.
+    prefill_delay: Option<PrefillDelay>,
+}
+
+/// `rust_host.HostConfig.eplb`.
+struct Eplb {
+    config: EplbConfig,
+    /// The EP group in EP-rank order, when it has more than one rank.
+    ep_ranks: Option<Vec<usize>>,
+}
+
+impl Eplb {
+    fn from_python(eplb: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        if eplb.is_none() {
+            return Ok(None);
+        }
+        let specs = eplb.getattr("specs")?;
+        let specs = EplbSpecs {
+            num_layers: specs.getattr("num_layers")?.extract()?,
+            num_logical_experts: specs.getattr("num_logical_experts")?.extract()?,
+            num_physical_experts: specs.getattr("num_physical_experts")?.extract()?,
+            ep_size: specs.getattr("ep_size")?.extract()?,
+            ep_rank: specs.getattr("ep_rank")?.extract()?,
+            ep_rank_nodes: specs.getattr("ep_rank_nodes")?.extract()?,
+            all_to_all_ep: specs.getattr("all_to_all_ep")?.extract()?,
+            num_groups: specs.getattr("num_groups")?.extract()?,
+            num_nodes: specs.getattr("num_nodes")?.extract()?,
+        };
+        let algorithm: String = eplb.getattr("algorithm")?.extract()?;
+        let algorithm = Algorithm::resolve(
+            &algorithm,
+            specs.num_groups.map(|groups| groups as i64),
+            specs.num_nodes as i64,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let ep_ranks: Vec<usize> = eplb.getattr("ep_ranks")?.extract()?;
+        Ok(Some(Self {
+            config: EplbConfig {
+                specs,
+                rebalance_num_iterations: eplb.getattr("rebalance_num_iterations")?.extract()?,
+                layers_per_chunk: eplb.getattr("layers_per_chunk")?.extract()?,
+                algorithm,
+                commit_delay_forwards: COMMIT_DELAY_FORWARDS,
+            },
+            ep_ranks: (ep_ranks.len() > 1).then_some(ep_ranks),
+        }))
+    }
+}
+
+/// The host's reasoning parser settings (`rust_host.ReasoningGrammar`).
+fn reasoning_grammar(reasoning: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
+    if reasoning.is_none() {
+        return Ok(None);
+    }
+    let boundary = reasoning.getattr("boundary")?;
+    Ok(Some(ReasoningGrammar {
+        continues: reasoning.getattr("continues")?.extract()?,
+        may_open: reasoning.getattr("may_open")?.extract()?,
+        schema_slot: reasoning.getattr("schema_slot")?.extract()?,
+        markers: reasoning.getattr("markers")?.extract()?,
+        implicit_closer: reasoning.getattr("implicit_closer")?.extract()?,
+        boundary: if boundary.is_none() {
+            None
+        } else {
+            Some(MessageBoundary {
+                open_answer: boundary.getattr("open_answer")?.extract()?,
+                closed: boundary.getattr("closed")?.extract()?,
+            })
+        },
+    }))
+}
+
+/// The grammar settings' `json_framing` (`inkling2_json.JsonFraming`), if
+/// set.
+fn json_framing(grammar: &Bound<'_, PyAny>) -> PyResult<Option<JsonFraming>> {
+    let framing = grammar.getattr("json_framing")?;
+    if framing.is_none() {
+        return Ok(None);
+    }
+    let reserved: Vec<i32> = framing.getattr("reserved_tokens")?.extract()?;
+    JsonFraming::new(
+        framing.getattr("answer_begin")?.extract()?,
+        framing.getattr("answer_end")?.extract()?,
+        framing.getattr("delimiters")?.extract()?,
+        framing.getattr("text_token")?.extract()?,
+        framing.getattr("end_token")?.extract()?,
+        &reserved,
+        framing.getattr("string_steps")?.extract()?,
+    )
+    .map(Some)
+    .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Which metrics this rank exports, and where (`rust_host.HostConfig`'s
+/// `metrics_*` fields).
+struct Metrics {
+    outputs: MetricsConfig,
+    /// The scheduler loop's metrics, on the attention-TP group's first rank.
+    engine: bool,
+    /// The PD transfer metrics, on every rank of a disaggregated engine.
+    transfer: bool,
+    /// The L3 tier's metrics, on every rank with the tier.
+    l3: bool,
+    /// The Disk tier's metrics, on every rank with the tier.
+    disk: bool,
+    labels: EngineLabels,
+    /// The L3 metrics' extra labels: the attention-TP rank and the role.
+    tp_rank: i64,
+    engine_role: String,
+}
+
+impl Metrics {
+    fn from_python(config: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            outputs: MetricsConfig {
+                prometheus_dir: config
+                    .getattr("metrics_prometheus_dir")?
+                    .extract::<Option<String>>()?
+                    .map(Into::into),
+                relay_endpoint: config.getattr("metrics_relay_endpoint")?.extract()?,
+            },
+            engine: config.getattr("engine_metrics")?.extract()?,
+            transfer: config.getattr("transfer_metrics")?.extract()?,
+            l3: config.getattr("l3_metrics")?.extract()?,
+            disk: config.getattr("disk_metrics")?.extract()?,
+            labels: EngineLabels {
+                model_name: config.getattr("metrics_model_name")?.extract()?,
+                app_key: config.getattr("metrics_app_key")?.extract()?,
+                dp_rank: config.getattr("dp_rank")?.extract()?,
+            },
+            tp_rank: config.getattr("attn_tp_rank")?.extract()?,
+            engine_role: config.getattr("engine_role")?.extract()?,
+        })
+    }
+
+    /// The storage metrics' labels.
+    fn storage_labels(&self) -> L3Labels {
+        L3Labels {
+            model_name: self.labels.model_name.clone(),
+            app_key: self.labels.app_key.clone(),
+            dp_rank: self.labels.dp_rank,
+            tp_rank: self.tp_rank,
+            engine_role: self.engine_role.clone(),
+        }
+    }
+
+    /// The L3 tier's metrics, on a rank that reports them.
+    fn l3_metrics(&self, exporter: Option<&Arc<Exporter>>) -> Option<L3Metrics> {
+        exporter
+            .filter(|_| self.l3)
+            .map(|exporter| L3Metrics::new(exporter, &self.storage_labels()))
+    }
+
+    /// The Disk tier's metrics, on a rank that reports them.
+    fn disk_metrics(&self, exporter: Option<&Arc<Exporter>>) -> Option<DiskMetrics> {
+        exporter
+            .filter(|_| self.disk)
+            .map(|exporter| DiskMetrics::new(exporter, &self.storage_labels()))
+    }
+
+    /// The exporter, when any metric of this rank is on.
+    fn exporter(&self) -> Result<Option<Arc<Exporter>>, ts_metrics::MetricsError> {
+        let any_output =
+            self.outputs.prometheus_dir.is_some() || self.outputs.relay_endpoint.is_some();
+        if !any_output || !(self.engine || self.transfer || self.l3 || self.disk) {
+            return Ok(None);
+        }
+        Exporter::new(&self.outputs).map(Some)
+    }
+}
+
+impl HostConfig {
+    /// `requires_bootstrap`: the engine is disaggregated, so it serves only
+    /// requests that name their peer; `role` is its PD role.
+    fn from_python(
+        config: &Bound<'_, PyAny>,
+        requires_bootstrap: bool,
+        role: Role,
+    ) -> PyResult<Self> {
+        let l3 = {
+            let l3 = config.getattr("l3")?;
+            if l3.is_none() {
+                None
+            } else {
+                Some(ts_l3::Settings::from_python(&l3)?)
+            }
+        };
+        let reasoning = reasoning_grammar(&config.getattr("reasoning")?)?;
+        let grammar_enabled = !config.getattr("grammar")?.is_none();
+        Ok(Self {
+            handshake_address: config.getattr("handshake_address")?.extract()?,
+            engine_index: config.getattr("engine_index")?.extract()?,
+            ready_response: config
+                .getattr("ready_response")?
+                .cast_into::<PyBytes>()?
+                .as_bytes()
+                .to_vec(),
+            in_flight_depth: config.getattr("in_flight_depth")?.extract()?,
+            limits: IngressLimits {
+                vocab_size: config.getattr("vocab_size")?.extract()?,
+                eos_token_ids: config.getattr("eos_token_ids")?.extract()?,
+                top_k_exclusive_max: config.getattr("top_k_exclusive_max")?.extract()?,
+                max_model_len: config.getattr("max_model_len")?.extract()?,
+                max_req_input_len: config.getattr("max_req_input_len")?.extract()?,
+                enable_output_logprobs: config
+                    .getattr("logprob_servability")?
+                    .getattr("enable_output_logprobs")?
+                    .extract()?,
+                requires_bootstrap,
+                multimodal: config.getattr("multimodal")?.extract()?,
+                grammar: grammar_enabled,
+                reasoning: if grammar_enabled {
+                    reasoning.clone()
+                } else {
+                    None
+                },
+                reasoning_usage: reasoning,
+                logprobs: {
+                    let servability = config.getattr("logprob_servability")?;
+                    LogprobServability {
+                        supports_prompt_logprobs: servability
+                            .getattr("supports_prompt_logprobs")?
+                            .extract()?,
+                        logprob_order: servability.getattr("logprob_order")?.extract()?,
+                        pipeline_parallel: servability.getattr("pipeline_parallel")?.extract()?,
+                        disaggregated: servability.getattr("disaggregated")?.extract()?,
+                        lm_head_tp_under_dp: config.getattr("lm_head_tp_under_dp")?.extract()?,
+                        // The PD decode role's prefill node returns them.
+                        computes_prompt_logprobs: role != Role::Decode,
+                    }
+                },
+            },
+            stream_interval: config.getattr("stream_interval")?.extract()?,
+            spec_num_tokens: config.getattr("spec_num_tokens")?.extract()?,
+            ngram_context_len: config.getattr("ngram_context_len")?.extract()?,
+            request_token_history: config.getattr("request_token_history")?.extract()?,
+            request_token_history_lookback: config
+                .getattr("request_token_history_lookback")?
+                .extract()?,
+            physical_context_len: config.getattr("physical_context_len")?.extract()?,
+            kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
+            kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+            startup: if config.getattr("startup_requests")?.extract()? {
+                Some(startup::Limits {
+                    max_batch_size: config.getattr("max_batch_size")?.extract()?,
+                    chunk_tokens: config.getattr("chunked_prefill_size")?.extract()?,
+                    max_prompt_len: config.getattr("max_req_input_len")?.extract()?,
+                    max_model_len: config.getattr("max_model_len")?.extract()?,
+                    token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+                    page_tokens: config.getattr("prefix_granularity")?.extract()?,
+                    decode_width: config
+                        .getattr("spec_num_tokens")?
+                        .extract::<Option<usize>>()?
+                        .unwrap_or(1),
+                })
+            } else {
+                None
+            },
+            rank: config.getattr("rank")?.extract()?,
+            replica_ranks: config.getattr("replica_ranks")?.extract()?,
+            pp_ranks: config.getattr("pp_ranks")?.extract()?,
+            dp_ranks: config.getattr("dp_ranks")?.extract()?,
+            collective_bind_host: config.getattr("collective_bind_host")?.extract()?,
+            controls: ControlConfig {
+                memory_saver: config.getattr("memory_saver")?.extract()?,
+                memory_regions: config.getattr("memory_regions")?.extract()?,
+                // With L3, its namespace's weight version; peer sharing,
+                // which excludes L3, sets its own in `serve`.
+                shared_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
+                allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
+            },
+            l3,
+            disk: disk_settings(&config.getattr("disk")?)?,
+            eplb: Eplb::from_python(&config.getattr("eplb")?)?,
+            epd_receive_enabled: config.getattr("epd_receive_enabled")?.extract()?,
+            grammar: {
+                let grammar = config.getattr("grammar")?;
+                if grammar.is_none() {
+                    None
+                } else {
+                    Some(GrammarConfig {
+                        tokenizer_info: grammar.getattr("tokenizer_info")?.extract()?,
+                        any_whitespace: grammar.getattr("any_whitespace")?.extract()?,
+                        compile_timeout: Duration::from_secs_f64(
+                            grammar.getattr("compile_timeout_s")?.extract()?,
+                        ),
+                        max_retries: grammar.getattr("max_retries")?.extract()?,
+                        json_framing: json_framing(&grammar)?,
+                    })
+                }
+            },
+            eager_grammar: config.getattr("eager_grammar")?.extract()?,
+            prefill_delay: match config
+                .getattr("prefill_delay")?
+                .extract::<Option<(u64, u64, bool)>>()?
+            {
+                None => None,
+                Some((attempt_interval, any_interval, single_round)) => {
+                    if attempt_interval < 1 || any_interval < attempt_interval {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "prefill delay needs 1 <= attempt_interval <= any_interval, got \
+                             {attempt_interval} and {any_interval}"
+                        )));
+                    }
+                    Some(PrefillDelay {
+                        attempt_interval,
+                        any_interval,
+                        single_round,
+                    })
+                }
+            },
+            metrics: Metrics::from_python(config)?,
+            batch_log: BatchLogConfig {
+                enabled: config.getattr("batch_log")?.extract()?,
+                decode_log_interval: config.getattr("decode_log_interval")?.extract()?,
+                num_total_pages: config.getattr("kv_total_pages")?.extract()?,
+                spec_num_steps: config.getattr("spec_num_steps")?.extract()?,
+                dp_rank: config.getattr("dp_rank")?.extract()?,
+                disaggregated: requires_bootstrap,
+                cache_state_group_ids: config.getattr("cache_state_group_ids")?.extract()?,
+                log_spec_accept_lengths: config.getattr("log_spec_accept_lengths")?.extract()?,
+            },
+            finish_log: FinishLog {
+                enabled: config.getattr("finish_log")?.extract()?,
+                request_stats: config.getattr("log_request_stats")?.extract()?,
+                ttft_percentage: config
+                    .getattr("ttft_trace_sampling_percentage")?
+                    .extract()?,
+            },
+            trace: match config
+                .getattr("otlp_traces_endpoint")?
+                .extract::<Option<String>>()?
+            {
+                Some(endpoint) => Some(TraceConfig {
+                    endpoint,
+                    sample_ratio: config.getattr("trace_sample_ratio")?.extract()?,
+                    provider: trace_provider(config)?,
+                }),
+                None => None,
+            },
+            kv_events: config.getattr("kv_events")?.extract()?,
+            kv_events_publisher: {
+                let publisher = config.getattr("kv_events_publisher")?;
+                if publisher.is_none() {
+                    None
+                } else {
+                    Some(KvEventsConfig {
+                        endpoint: publisher.getattr("endpoint")?.extract()?,
+                        replay_endpoint: publisher.getattr("replay_endpoint")?.extract()?,
+                        buffer_steps: publisher.getattr("buffer_steps")?.extract()?,
+                        max_queue_size: publisher.getattr("max_queue_size")?.extract()?,
+                        topic: publisher.getattr("topic")?.extract()?,
+                    })
+                }
+            },
+        })
+    }
+}
+
+/// Set `stop` on SIGTERM or SIGINT, so the loop finishes its round and the
+/// host shuts down in order.
+fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    let (mut terminate, mut interrupt) = {
+        let _entered = runtime.enter();
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
+    thread::Builder::new()
+        .name("ts-signals".to_owned())
+        .spawn(move || {
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = terminate.recv() => tracing::info!("SIGTERM: stopping"),
+                    _ = interrupt.recv() => tracing::info!("SIGINT: stopping"),
+                }
+            });
+            stop.store(true, Ordering::Relaxed);
+        })?;
+    Ok(())
+}
+
+fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
+    let cache_writer = args
+        .cache_events
+        .as_ref()
+        .map(|_| {
+            logging::cache_event_writer().ok_or_else(|| {
+                HostError::Interpreter(
+                    "cache observations require the host nonblocking logger".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    watch_signals(stop.clone())?;
+
+    let (bootstrap, outbox, peer_outbox, mode) = Python::attach(|py| {
+        let built = (|| {
+            let outbox = Bound::new(py, pd::Outbox::new())?;
+            let peer_outbox = Bound::new(py, peer::Outbox::new())?;
+            let host_spans = Bound::new(py, host_spans::HostSpans)?;
+            let bootstrap = py
+                .import("tokenspeed.runtime.engine.rust_host")?
+                .call_method1(
+                    "bootstrap",
+                    (
+                        args.control_fd,
+                        outbox.clone(),
+                        2_u32,
+                        host_spans,
+                        peer_outbox.clone(),
+                    ),
+                )?;
+            let mode: String = bootstrap.getattr("mode")?.extract()?;
+            Ok((
+                bootstrap.unbind(),
+                outbox.unbind(),
+                peer_outbox.unbind(),
+                mode,
+            ))
+        })();
+        built.map_err(|error| python_error(py, error))
+    })?;
+    if mode == "encode" {
+        return encode::serve(bootstrap, &stop);
+    }
+
+    let (bootstrap, mut scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
+        Python::attach(|py| {
+            let built = (|| {
+                let bootstrap = bootstrap.into_bound(py);
+                let outbox = outbox.into_bound(py);
+                let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
+                let peer_sharing =
+                    peer::Settings::from_python(&bootstrap.getattr("peer_sharing")?)?;
+                let python_config = bootstrap.getattr("config")?;
+                let metrics = Metrics::from_python(&python_config)?;
+                let exporter = metrics.exporter().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+                })?;
+                let transfer_metrics =
+                    exporter
+                        .as_ref()
+                        .filter(|_| metrics.transfer)
+                        .map(|exporter| {
+                            Arc::new(KvTransferMetrics::new(
+                                exporter,
+                                &metrics.labels.model_name,
+                                &metrics.labels.app_key,
+                            ))
+                        });
+                let peers = pd::start(
+                    py,
+                    bootstrap.getattr("transfer_peer")?,
+                    bootstrap.getattr("epd_receive")?,
+                    outbox.get(),
+                    transfer_metrics,
+                )?;
+                let role = peers.role;
+                let mut config =
+                    HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
+                if let Some(peer) = &peer_sharing {
+                    config.controls.shared_weight_version = Some(peer.weight_version().to_owned());
+                }
+                let data_plane = bootstrap.getattr("data_plane")?.unbind();
+                Ok((
+                    bootstrap.unbind(),
+                    scheduler,
+                    config,
+                    data_plane,
+                    role,
+                    peers,
+                    peer_sharing,
+                    exporter,
+                ))
+            })();
+            built.map_err(|error| python_error(py, error))
+        })?;
+
+    // Install before startup requests or client admissions. Scheduler RAII
+    // retains this context through the last slot release, including teardown.
+    let cache_events = args
+        .cache_events
+        .clone()
+        .zip(cache_writer)
+        .map(|(settings, writer)| {
+            cache_events::CacheEvents::install(
+                settings,
+                &config.metrics.engine_role,
+                config.metrics.labels.dp_rank,
+                config.rank,
+                writer,
+                &mut scheduler,
+            )
+            .map_err(HostError::Interpreter)
+        })
+        .transpose()?;
+
+    // The ranks find each other through the data plane's rendezvous, then
+    // connect: every rank is past startup once the mesh is up.
+    let listener = Listener::bind(&config.collective_bind_host)?;
+    let port = listener.port()?;
+    let addresses: Vec<String> = Python::attach(|py| {
+        bootstrap
+            .call_method1(py, "collective_addresses", (port,))
+            .and_then(|addresses| addresses.extract(py))
+            .map_err(|error| python_error(py, error))
+    })?;
+    let mesh = Mesh::connect(config.rank, listener, &addresses, HANDSHAKE_TIMEOUT)?;
+    let mut ranks = Ranks {
+        mesh,
+        replica: Group::new(REPLICA_GROUP, config.replica_ranks.clone(), config.rank)?,
+        pp: config
+            .pp_ranks
+            .clone()
+            .map(|ranks| Group::new(PP_GROUP, ranks, config.rank))
+            .transpose()?,
+        dp: config
+            .dp_ranks
+            .clone()
+            .map(|ranks| Group::new(DP_GROUP, ranks, config.rank))
+            .transpose()?,
+        ep: config
+            .eplb
+            .as_ref()
+            .and_then(|eplb| eplb.ep_ranks.clone())
+            .map(|ranks| Group::new(EP_GROUP, ranks, config.rank))
+            .transpose()?,
+    };
+
+    // The replica's first member speaks for it.
+    let speaks = ranks.replica.index() == 0;
+    let call = |method: &str| {
+        Python::attach(|py| {
+            bootstrap
+                .call_method0(py, method)
+                .map(drop)
+                .map_err(|error| python_error(py, error))
+        })
+    };
+
+    if config.grammar.is_some() {
+        // The data plane drives the matchers through these.
+        Python::attach(|py| {
+            let entries: Vec<(&str, usize)> = ts_grammar::table::entries();
+            data_plane
+                .call_method1(py, "set_grammar_entries", (entries,))
+                .map(drop)
+                .map_err(|error| python_error(py, error))
+        })?;
+    }
+    let data_plane = PythonDataPlane::start(data_plane, peers.streams, cache_events)
+        .map_err(HostError::DataPlane)?;
+    let metrics = exporter
+        .as_ref()
+        .filter(|_| config.metrics.engine)
+        .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
+    let trace = config
+        .trace
+        .as_ref()
+        .filter(|trace| {
+            if trace.sample_ratio <= 0.0 {
+                tracing::warn!(
+                    endpoint = %trace.endpoint,
+                    "--otlp-traces-endpoint without --trace-sample-ratio traces nothing"
+                );
+            }
+            trace.sample_ratio > 0.0
+        })
+        .and_then(|trace| {
+            // The reporting rank alone traces: the finish line's rank, so a
+            // replicated engine exports one span per request, not one per rank.
+            (config.finish_log.enabled).then(|| {
+                ts_control::trace::TracePublisher::new(
+                    trace.endpoint.clone(),
+                    trace.sample_ratio,
+                    config.metrics.labels.model_name.clone(),
+                    trace.provider.clone(),
+                )
+            })
+        });
+    let outputs = OutputProcessor::new(
+        config.spec_num_tokens,
+        config.stream_interval,
+        Some(config.physical_context_len),
+        role,
+        config.finish_log,
+        metrics.is_some(),
+        trace,
+    );
+    let loop_config = LoopConfig {
+        in_flight_depth: config.in_flight_depth,
+        limits: config.limits,
+        kv_total_pages: config.kv_total_pages,
+        kv_token_capacity: config.kv_token_capacity,
+        ngram_context_len: config.ngram_context_len,
+        request_token_history: config.request_token_history,
+        request_token_history_lookback: config.request_token_history_lookback,
+        controls: config.controls.clone(),
+        batch_log: config.batch_log.clone(),
+        kv_events: config.kv_events,
+        epd_receive_enabled: config.epd_receive_enabled,
+        eager_grammar: config.eager_grammar,
+        prefill_delay: config.prefill_delay,
+    };
+    tracing::info!(
+        rank = config.rank,
+        engine_index = config.engine_index,
+        replica_ranks = ?config.replica_ranks,
+        pp_ranks = ?config.pp_ranks,
+        dp_ranks = ?config.dp_ranks,
+        in_flight_depth = config.in_flight_depth,
+        "serving"
+    );
+    // The L3 tier's executor connects its store before serving starts.
+    let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
+    // The Disk tier's file is allocated before serving starts.
+    let disk_metrics = config.metrics.disk_metrics(exporter.as_ref());
+    let disk = config
+        .disk
+        .as_ref()
+        .map(|settings| {
+            ts_control::disk::DiskTier::start(
+                settings,
+                disk_metrics.as_ref().map(DiskMetrics::jobs),
+            )
+        })
+        .transpose()?;
+    let grammars = config
+        .grammar
+        .clone()
+        .map(Grammars::new)
+        .transpose()
+        .map_err(HostError::Interpreter)?;
+    let eplb = config
+        .eplb
+        .as_ref()
+        .map(|eplb| Controller::new(eplb.config.clone()))
+        .transpose()
+        .map_err(HostError::Interpreter)?;
+    let kv_events = config
+        .kv_events_publisher
+        .as_ref()
+        .map(|publisher| KvEventPublisher::start(publisher, config.metrics.labels.dp_rank))
+        .transpose()?;
+    // Its endpoint serves the scheduler between the loop's rounds.
+    let scheduler = Arc::new(parking_lot::Mutex::new(scheduler));
+    let mut peer = peer_sharing
+        .map(|settings| {
+            peer::start(
+                settings,
+                &mut ranks.mesh,
+                &ranks.replica,
+                scheduler.clone(),
+                peer_outbox.get(),
+                disk.as_ref(),
+            )
+        })
+        .transpose()
+        .map_err(HostError::Peer)?;
+    if let Some(peer) = &mut peer {
+        let logical = metrics.as_ref().map(|m| Arc::clone(&m.peer));
+        let physical = exporter
+            .as_ref()
+            .filter(|_| config.metrics.transfer)
+            .map(|exporter| {
+                logical.clone().unwrap_or_else(|| {
+                    Arc::new(ts_metrics::PeerMetrics::new(
+                        exporter,
+                        &config.metrics.labels,
+                    ))
+                })
+            });
+        peer.set_metrics(logical, physical);
+    }
+    let mut event_loop = EventLoop::new(
+        scheduler,
+        data_plane,
+        None::<EngineTransport>,
+        outputs,
+        loop_config,
+        ranks,
+        Subsystems {
+            transfer: peers.transfer,
+            embeddings: peers.embeddings,
+            metrics,
+            kv_events,
+            eplb,
+            grammars,
+            l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
+            l3,
+            disk_metrics,
+            disk,
+            peer,
+        },
+    );
+    // The engine registers only once its own requests ran: no client
+    // request can reach it before then.
+    let registered = (|| -> Result<bool, HostError> {
+        if let Some(limits) = config.startup {
+            let phases = limits.phases();
+            let started = std::time::Instant::now();
+            let requests = startup::requests(&phases, limits.output_tokens());
+            if event_loop.warm_up(requests, &stop)? {
+                return Ok(false);
+            }
+            tracing::info!(
+                ?phases,
+                elapsed_ms = started.elapsed().as_millis(),
+                "served the startup requests"
+            );
+        }
+        if speaks {
+            let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+            ready.declare_scheduler();
+            *event_loop.frontend_mut() = Some(EngineTransport::connect(
+                &config.handshake_address,
+                config.engine_index,
+                ready,
+                HANDSHAKE_TIMEOUT,
+            )?);
+        }
+        call("report_ready")?;
+        call("enter_serving")?;
+        Ok(true)
+    })();
+    let served = match registered {
+        Ok(true) => event_loop.run(&stop),
+        // Stopped while serving the startup requests.
+        Ok(false) => Ok(()),
+        Err(error) => {
+            // Startup is not generation serving: its failure reaches the
+            // final error handler after cleanup.
+            drop(event_loop);
+            if let Err(close_error) = call("close") {
+                tracing::error!(%close_error, "rank cleanup also failed");
+            }
+            return Err(error);
+        }
+    };
+    finish_serving(served, launcher, || {
+        // Stops the forward thread and tells the frontend the engine is gone.
+        drop(event_loop);
+        call("close")
+    })
+}
+
+fn finish_serving(
+    served: Result<(), LoopError>,
+    launcher: &LauncherFailure,
+    close: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let served = served.map_err(HostError::from);
+    if let Err(error) = &served {
+        // Joining the forward thread and closing Python can wait on device
+        // work. Let the launcher start failure handling before either.
+        launcher.report(error);
+    }
+    let closed = close();
+    if served.is_err() {
+        if let Err(error) = &closed {
+            tracing::error!(%error, "rank cleanup also failed");
+        }
+    }
+    served.and(closed)
+}
+
+/// Run one rank on the calling (main) thread and exit without Python finalization.
+#[pyfunction]
+fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    // Reject explicit incompatible settings before any Python model bootstrap.
+    let cache_events = cache_events::Settings::from_env(enable_async_logging)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    py.detach(|| {
+        let args = Args {
+            control_fd,
+            enable_async_logging,
+            cache_events,
+        };
+        let log_guard = logging::init(args.enable_async_logging);
+        let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Outside serve: reacquiring the GIL here drains its deferred
+            // bootstrap/scheduler decrefs, so their last ownership callbacks
+            // can finish the cache trace before the native log guard flushes.
+            let _python_logs = logging::PythonLogGuard;
+            serve(&args, launcher)
+        }));
+        let code = match served {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                launcher.report(error);
+                1
+            }
+            Err(_) => {
+                launcher.report("host panicked");
+                1
+            }
+        };
+        // process::exit skips Rust drops and Python finalization. Drain native
+        // logging explicitly; stuck Python threads must not keep a rank alive.
+        drop(log_guard);
+        std::process::exit(code)
+    })
+}
+
+/// Cache observation protocol implemented by the linked native scheduler.
+/// This probe does not bootstrap a model or initialize a device.
+#[pyfunction]
+fn cache_event_protocol() -> String {
+    cache_events::protocol()
+}
+
+/// The rank's native control loop and its single scheduler implementation.
+#[pymodule]
+fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
+    module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    module.add_function(wrap_pyfunction!(cache_event_protocol, module)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "tests/main.rs"]
+mod tests;

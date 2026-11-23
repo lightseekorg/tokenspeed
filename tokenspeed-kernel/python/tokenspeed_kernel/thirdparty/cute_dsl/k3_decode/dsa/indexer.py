@@ -20,6 +20,10 @@
 #   runtime values, and the block table and the slot rows are runtime-strided.
 # - The select never releases its dependents early: the sparse core reads the
 #   counts before its PDL wait.
+# - A KVP mode (compile_candidates): the scorer scores every request over a
+#   rank's compact local pages, each row to its own end (row_ends), and
+#   IndexerCandidates writes each row's local top-k as logical positions and
+#   FP32 logits (from the order keys) instead of slots.
 
 """Fused decode indexer of a DSA layer: FP32 logits and an exact top-k.
 
@@ -67,7 +71,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
 
 PAGE = 64  # keys per index-K page
 DIM = 128
-ROW_BYTES = DIM + 4  # a key's FP8 bytes, then (in the page tail) its FP32 scale
+ROW_BYTES = DIM + 4  # a key's FP8 bytes, then (in the page tail) its UE8M0 scale word
 HEADS = 32
 TILE = 128  # keys per MMA tile (two pages)
 ITEM_TILES = 16  # tiles per work item (the producer caches 32 page ids)
@@ -89,6 +93,7 @@ TOPS = 16384
 CANDIDATES = 6144  # keys at or above the bound (more: the exact select over the row)
 HOT = 4096  # vectors holding a candidate (more: the exact select over the row)
 NEG_INF_BITS = 0xFF800000
+NEG_INF_KEY = 0x007FFFFF  # order_key(NEG_INF_BITS)
 POS_INF_BITS = 0x7F800000
 
 
@@ -186,6 +191,19 @@ def request_tiles(seq_lens: cute.Tensor, r: Int32, cap: Int32, topk) -> Int32:
     tiles = Int32(0)
     if end > topk:
         tiles = (end + Int32(TILE - 1)) // Int32(TILE)
+    return tiles
+
+
+@cute.jit
+def kvp_request_tiles(
+    seq_lens: cute.Tensor, global_ends: cute.Tensor, r: Int32, cap: Int32, q, topk
+) -> Int32:
+    """128-key tiles of request ``r`` on a KVP rank; 0 when its last row's keys
+    over every rank (``global_ends``) fit the top-k: every row keeps all its keys
+    and reads no logits."""
+    tiles = request_tiles(seq_lens, r, cap, 0)
+    if global_ends[r * Int32(q) + Int32(q - 1)] <= Int32(topk):
+        tiles = Int32(0)
     return tiles
 
 
@@ -343,11 +361,15 @@ class IndexerScore:
     in); ``cache`` the packed index-K plane bytes [slots, 132] (per 64-slot page
     the FP8 keys, then one FP32 scale per key); ``table`` the int32 block table
     [requests, pages]; ``seq_lens`` the int32 request lengths [requests];
-    ``logits`` / ``tops`` the FP32 / int32 scratch."""
+    ``global_ends`` (KVP only) every row's keys over every rank [rows], no tiles
+    for a request whose last row's fit the top-k; ``logits`` / ``tops`` the
+    FP32 / int32 scratch."""
 
-    def __init__(self, q: int, topk: int, ctas: int, pdl: bool):
+    def __init__(self, q: int, topk: int, ctas: int, pdl: bool, dcp: bool):
         assert 1 <= q <= 8
-        self.q, self.topk, self.ctas, self.pdl = q, topk, ctas, pdl
+        self.q, self.topk, self.ctas, self.pdl, self.dcp = q, topk, ctas, pdl, dcp
+        # A KVP rank scores every request: its share of the top-k is unknown.
+        self.tile_topk = 0 if dcp else topk
         self.stages = STAGES
         self.n = q * HEADS
         self.tiler = (TILE, self.n, DIM)
@@ -361,6 +383,8 @@ class IndexerScore:
         cache: cute.Tensor,
         table: cute.Tensor,
         seq_lens: cute.Tensor,
+        row_ends: cute.Tensor,
+        global_ends: cute.Tensor,
         logits: cute.Tensor,
         tops: cute.Tensor,
         stream,
@@ -423,6 +447,8 @@ class IndexerScore:
             weights,
             table,
             seq_lens,
+            row_ends,
+            global_ends,
             logits,
             tops,
         ).launch(
@@ -491,6 +517,20 @@ class IndexerScore:
             if cutlass.const_expr(tok + 1 < Q):
                 cute.arch.fence_view_async_tmem_load()
 
+    @cute.jit
+    def row_end(self, seq_lens, row_ends, request, lane, cap):
+        """Row ``min(lane, q - 1)`` of ``request``'s visible keys: a decode
+        window's from the request length, or under KVP each row's own count
+        of this rank's keys (``row_ends``)."""
+        Q = self.q
+        j = cutlass.min(lane, Int32(Q - 1))
+        end = Int32(0)
+        if cutlass.const_expr(self.dcp):
+            end = clamp_end(row_ends[request * Int32(Q) + j], cap)
+        else:
+            end = clamp_end(seq_lens[request] - (Q - 1) + j, cap)
+        return end
+
     @cute.kernel
     def kernel(
         self,
@@ -506,6 +546,8 @@ class IndexerScore:
         weights: cute.Tensor,
         table: cute.Tensor,
         seq_lens: cute.Tensor,
+        row_ends: cute.Tensor,
+        global_ends: cute.Tensor,
         logits: cute.Tensor,
         tops: cute.Tensor,
     ):
@@ -563,7 +605,12 @@ class IndexerScore:
         requests = seq_lens.shape[0]
         cap = table.shape[1] * Int32(PAGE)
         for r in cutlass.range(tidx, requests, SCORE_THREADS, unroll=1):
-            sStart[r + 1] = request_tiles(seq_lens, r, cap, self.topk)
+            if cutlass.const_expr(self.dcp):
+                sStart[r + 1] = kvp_request_tiles(
+                    seq_lens, global_ends, r, cap, Q, self.topk
+                )
+            else:
+                sStart[r + 1] = request_tiles(seq_lens, r, cap, self.tile_topk)
         cute.arch.sync_threads()
         if warp == 0:
             carry = Int32(0)
@@ -631,9 +678,7 @@ class IndexerScore:
                 n_page = table_entry(
                     table, n_req, cutlass.min(n_k0 // PAGE + lane, max_page)
                 )
-                n_end = clamp_end(
-                    seq_lens[n_req] - (Q - 1) + cutlass.min(lane, Int32(Q - 1)), cap
-                )
+                n_end = self.row_end(seq_lens, row_ends, n_req, lane, cap)
             has_item = n_nt > 0
             while has_item:
                 req = n_req
@@ -646,10 +691,7 @@ class IndexerScore:
                     n_page = table_entry(
                         table, n_req, cutlass.min(n_k0 // PAGE + lane, max_page)
                     )
-                    n_end = clamp_end(
-                        seq_lens[n_req] - (Q - 1) + cutlass.min(lane, Int32(Q - 1)),
-                        cap,
-                    )
+                    n_end = self.row_end(seq_lens, row_ends, n_req, lane, cap)
                 qs = j % 2
                 cute.arch.mbarrier_wait(q_empty + qs, ((j // 2) & 1) ^ 1)
                 if lane < Q:
@@ -776,7 +818,9 @@ class IndexerScore:
                         key = k0 + t * TILE + lt
                         phase = (it // self.stages) & 1
                         cute.arch.mbarrier_wait(kv_full + stage, phase)
-                        kscale = bits_float(Uint32(sSc[lt, stage]))
+                        # Blackwell planes store the key scale as four UE8M0 bytes
+                        # (kvcache/index_k_scale.py): a power of two from its exponent.
+                        kscale = bits_float((Uint32(sSc[lt, stage]) & 0xFF) << 23)
                         cute.arch.mbarrier_arrive(sc_empty + stage)
                         cute.arch.mbarrier_wait(acc_full + acc, (it // ACCS) & 1)
                         # tcgen05.ld is .sync.aligned: reconverge the warp after
@@ -819,6 +863,8 @@ class IndexerSelect:
     def __init__(self, q: int, topk: int, pdl: bool):
         assert 1 <= q <= 8 and topk % SELECT_THREADS == 0 and 0 < topk <= 4096
         self.q, self.topk, self.pdl = q, topk, pdl
+        # The scorer's tile accounting: requests no longer than this are unscored.
+        self.tile_topk = topk
 
     @cute.jit
     def __call__(
@@ -839,10 +885,27 @@ class IndexerSelect:
         )
 
     @cute.jit
-    def emit(self, out, table, request, row, pos, key):
-        """Key ``key``'s global slot at position ``pos`` of the row."""
-        page = table_entry(table, request, key >> 6)
-        out[row, pos] = page * Int32(PAGE) + (key & Int32(PAGE - 1))
+    def emit(self, emit_args, pos, index, key):
+        """Key ``index``'s global slot at position ``pos`` of the row (its
+        order key ``key`` unused)."""
+        out, table, request, row = emit_args
+        page = table_entry(table, request, index >> 6)
+        out[row, pos] = page * Int32(PAGE) + (index & Int32(PAGE - 1))
+
+    @cute.jit
+    def shared(self):
+        """The select's shared memory: (histogram, scan words, warp counts,
+        info, candidate indices, candidate keys, hot vectors, vector maxima)."""
+        smem = utils.SmemAllocator()
+        hist = smem.allocate_tensor(Uint32, cute.make_layout(BINS), 16)
+        scan = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
+        counts = smem.allocate_tensor(Uint32, cute.make_layout((2, SELECT_WARPS)), 16)
+        info = smem.allocate_tensor(Int32, cute.make_layout(8), 16)
+        cand_index = smem.allocate_tensor(Int32, cute.make_layout(CANDIDATES), 16)
+        cand_key = smem.allocate_tensor(Uint32, cute.make_layout(CANDIDATES), 16)
+        hot_list = smem.allocate_tensor(Int32, cute.make_layout(HOT), 16)
+        tops_s = smem.allocate_tensor(Uint32, cute.make_layout(TOPS), 16)
+        return hist, scan, counts, info, cand_index, cand_key, hot_list, tops_s
 
     @cute.jit
     def top_of(self, tops_s, tops_address, v):
@@ -917,7 +980,6 @@ class IndexerSelect:
     ):
         """One warp round of the ordered output: ``n`` (0/1) per lane of key
         ``key`` at ``index``; returns the carries."""
-        out, table, request, row = emit_args
         n_a = Uint32(0)
         n_t = Uint32(0)
         if n != Uint32(0):
@@ -933,10 +995,10 @@ class IndexerSelect:
         pos_t = carry_t + (exclusive & Uint32(0xFFFF))
         if n_a != Uint32(0):
             pos = Int32(pos_a + cutlass.min(pos_t, take))
-            self.emit(out, table, request, row, pos, index)
+            self.emit(emit_args, pos, index, key)
         if n_t != Uint32(0) and pos_t < take:
             pos = Int32(pos_a + pos_t)
-            self.emit(out, table, request, row, pos, index)
+            self.emit(emit_args, pos, index, key)
         return carry_a + (total >> Uint32(16)), carry_t + (total & Uint32(0xFFFF))
 
     @cute.jit
@@ -1008,7 +1070,6 @@ class IndexerSelect:
                     elif keys[e] == threshold:
                         n_t += Uint32(1)
         carry_a, carry_t = self.warp_carries(counts, n_a, n_t, warp, lane)
-        out, table, request, row = emit_args
         for base in cutlass.range(w0, w1, 32, unroll=1):
             v = base + lane
             mine = Int32(0)
@@ -1036,12 +1097,12 @@ class IndexerSelect:
                         key = keys[e]
                         if key > threshold:
                             pos = Int32(pos_a + cutlass.min(pos_t, take))
-                            self.emit(out, table, request, row, pos, v * 8 + e)
+                            self.emit(emit_args, pos, v * 8 + e, key)
                             pos_a += Uint32(1)
                         elif key == threshold:
                             if pos_t < take:
                                 pos = Int32(pos_a + pos_t)
-                                self.emit(out, table, request, row, pos, v * 8 + e)
+                                self.emit(emit_args, pos, v * 8 + e, key)
                             pos_t += Uint32(1)
             carry_a += total >> Uint32(16)
             carry_t += total & Uint32(0xFFFF)
@@ -1146,33 +1207,60 @@ class IndexerSelect:
         return listed
 
     @cute.jit
-    def select_row(self, sm, logits, tops, seq_lens, emit_args, j, length, cap):
-        """The exact top-K of a row longer than K."""
-        hist, scan, _, info = sm[0], sm[1], sm[2], sm[3]
-        Q, K = self.q, self.topk
-        _, _, request, _ = emit_args
+    def tiles(self, seq_lens, global_ends, r, cap):
+        """The scorer's tiles of request ``r``; ``global_ends`` (a KVP rank's
+        rows over every rank, else None) as ``IndexerScore(dcp=True)`` gates them."""
+        tiles = Int32(0)
+        if cutlass.const_expr(global_ends is None):
+            tiles = request_tiles(seq_lens, r, cap, self.tile_topk)
+        else:
+            tiles = kvp_request_tiles(seq_lens, global_ends, r, cap, self.q, self.topk)
+        return tiles
+
+    @cute.jit
+    def row_logits(self, sm, logits, tops, seq_lens, global_ends, request, j, cap):
+        """(address of row ``j`` of ``request``'s logits in the scratch, of its
+        vector maxima)."""
+        info = sm[3]
+        Q = self.q
         tid, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
-        # This row's logits: request ``request``'s row j of the scratch.
         if warp == 0:
             before = Int32(0)
             for base in cutlass.range(0, request, 32, unroll=1):
                 r = base + lane
                 tiles = Int32(0)
                 if r < request:
-                    tiles = request_tiles(seq_lens, r, cap, K)
+                    tiles = self.tiles(seq_lens, global_ends, r, cap)
                 for i in cutlass.range_constexpr(5):
                     tiles += cute.arch.shuffle_sync_bfly(tiles, 1 << i)
                 before += tiles
             if lane == 0:
                 info[0] = before
-                info[1] = request_tiles(seq_lens, request, cap, K)
+                info[1] = self.tiles(seq_lens, global_ends, request, cap)
         cute.arch.sync_threads()
         element = Int64(info[0]) * Int64(TILE * Q)
         element += Int64(j) * Int64(info[1]) * Int64(TILE)
         address = logits.iterator.toint() + element * 4
         tops_address = tops.iterator.toint() + (element >> 3) * 4
+        return address, tops_address
+
+    @cute.jit
+    def select_row(
+        self, sm, logits, tops, seq_lens, global_ends, emit_args, j, length, cap
+    ):
+        """The exact top-K of a row longer than K."""
+        hist, scan, _, info = sm[0], sm[1], sm[2], sm[3]
+        K = self.topk
+        request = emit_args[2]
+        tid, _, _ = cute.arch.thread_idx()
+        warp = cute.arch.make_warp_uniform(tid // 32)
+        lane = tid % 32
+        # This row's logits: request ``request``'s row j of the scratch.
+        address, tops_address = self.row_logits(
+            sm, logits, tops, seq_lens, global_ends, request, j, cap
+        )
         vectors = (length + 7) // 8
         # Under 2K vectors the K-th largest maximum bounds loosely: bound from the
         # keys themselves.
@@ -1222,17 +1310,7 @@ class IndexerSelect:
         row, _, _ = cute.arch.block_idx()
         request = row // Q
         j = row - request * Q
-
-        smem = utils.SmemAllocator()
-        hist = smem.allocate_tensor(Uint32, cute.make_layout(BINS), 16)
-        scan = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
-        counts = smem.allocate_tensor(Uint32, cute.make_layout((2, SELECT_WARPS)), 16)
-        info = smem.allocate_tensor(Int32, cute.make_layout(8), 16)
-        cand_index = smem.allocate_tensor(Int32, cute.make_layout(CANDIDATES), 16)
-        cand_key = smem.allocate_tensor(Uint32, cute.make_layout(CANDIDATES), 16)
-        hot_list = smem.allocate_tensor(Int32, cute.make_layout(HOT), 16)
-        tops_s = smem.allocate_tensor(Uint32, cute.make_layout(TOPS), 16)
-        sm = hist, scan, counts, info, cand_index, cand_key, hot_list, tops_s
+        sm = self.shared()
 
         # No early release: the sparse core reads the counts before its PDL wait.
         if cutlass.const_expr(self.pdl):
@@ -1244,15 +1322,108 @@ class IndexerSelect:
             # Short-context bypass: every key, no logits.
             for e in cutlass.range(tid, K, SELECT_THREADS, unroll=1):
                 if e < length:
-                    self.emit(out, table, request, row, e, e)
+                    self.emit(emit_args, e, e, Uint32(0))
                 else:
                     out[row, e] = Int32(-1)
             if tid == 0:
                 lens[row] = length
         else:
-            self.select_row(sm, logits, tops, seq_lens, emit_args, j, length, cap)
+            self.select_row(sm, logits, tops, seq_lens, None, emit_args, j, length, cap)
             if tid == 0:
                 lens[row] = Int32(K)
+
+
+class IndexerCandidates(IndexerSelect):
+    """A KVP rank's local top-``topk`` candidates of every row (one CTA per row)
+    -> ``positions`` [rows, topk]: each selected key's logical position through
+    its request's logical page columns (``table``), and ``scores`` [rows, topk]:
+    its FP32 logit; ``-1`` / ``-inf`` past the row's count and for a ``-inf``
+    logit. The scorer scored every request (``IndexerScore(dcp=True)``), so a
+    row of at most ``topk`` keys reads its logits for all of them; longer rows
+    take the exact select (ties to the lowest keys). Row ``r`` sees
+    ``row_ends[r]`` keys of this rank and ``global_ends[r]`` over every rank;
+    a row whose ``global_ends`` fit the top-k keeps all its keys, every one
+    scored 0, without reading logits."""
+
+    def __init__(self, q: int, topk: int, pdl: bool):
+        super().__init__(q, topk, pdl)
+        self.tile_topk = 0
+
+    @cute.jit
+    def __call__(
+        self,
+        logits: cute.Tensor,
+        tops: cute.Tensor,
+        seq_lens: cute.Tensor,
+        row_ends: cute.Tensor,
+        global_ends: cute.Tensor,
+        table: cute.Tensor,
+        positions: cute.Tensor,
+        scores: cute.Tensor,
+        stream,
+    ):
+        args = (logits, tops, seq_lens, row_ends, global_ends, table, positions)
+        self.kernel(*args, scores).launch(
+            grid=(positions.shape[0], 1, 1),
+            block=(SELECT_THREADS, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
+        )
+
+    @cute.jit
+    def emit(self, emit_args, pos, index, key):
+        """Key ``index`` (order key ``key``) at position ``pos`` of the row: its
+        logical position and FP32 logit, ``-1`` and ``-inf`` for a ``-inf``
+        logit."""
+        positions, table, request, row, scores = emit_args
+        bits = key ^ Uint32(0xFFFFFFFF)
+        if (key & Uint32(0x80000000)) != Uint32(0):
+            bits = key ^ Uint32(0x80000000)
+        logical = Int32(-1)
+        if key != Uint32(NEG_INF_KEY):
+            column = table_entry(table, request, index >> 6)
+            logical = column * Int32(PAGE) + (index & Int32(PAGE - 1))
+        positions[row, pos] = logical
+        scores[row, pos] = bits_float(bits)
+
+    @cute.kernel
+    def kernel(
+        self, logits, tops, seq_lens, row_ends, global_ends, table, positions, scores
+    ):
+        Q, K = self.q, self.topk
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        request = row // Q
+        j = row - request * Q
+        sm = self.shared()
+
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
+        cap = table.shape[1] * Int32(PAGE)
+        length = clamp_end(row_ends[row], cap)
+        emit_args = positions, table, request, row, scores
+        if global_ends[row] <= K:
+            for e in cutlass.range(tid, K, SELECT_THREADS, unroll=1):
+                if e < length:
+                    self.emit(emit_args, e, e, order_key(Uint32(0)))
+                else:
+                    positions[row, e] = Int32(-1)
+                    scores[row, e] = bits_float(Uint32(NEG_INF_BITS))
+        elif length <= K:
+            address, _ = self.row_logits(
+                sm, logits, tops, seq_lens, global_ends, request, j, cap
+            )
+            for e in cutlass.range(tid, K, SELECT_THREADS, unroll=1):
+                if e < length:
+                    key = order_key(load_u32(address + Int64(e) * 4))
+                    self.emit(emit_args, e, e, key)
+                else:
+                    positions[row, e] = Int32(-1)
+                    scores[row, e] = bits_float(Uint32(NEG_INF_BITS))
+        else:
+            self.select_row(
+                sm, logits, tops, seq_lens, global_ends, emit_args, j, length, cap
+            )
 
 
 def _fake(dtype, shape, stride, align):
@@ -1280,12 +1451,14 @@ def compile_indexer(q: int, topk: int, ctas: int, pdl: bool):
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     options = "--enable-tvm-ffi"
     score = cute.compile(
-        IndexerScore(q, topk, ctas, pdl),
+        IndexerScore(q, topk, ctas, pdl, False),
         query,
         weights,
         cache,
         table,
         seq_lens,
+        seq_lens,  # row ends: the decode window's, from the request length
+        seq_lens,  # global ends: read under KVP only
         logits,
         tops,
         stream,
@@ -1299,6 +1472,57 @@ def compile_indexer(q: int, topk: int, ctas: int, pdl: bool):
         table,
         out,
         lens,
+        stream,
+        options=options,
+    )
+    return score, select
+
+
+@functools.cache
+def compile_candidates(q: int, topk: int, ctas: int, pdl: bool):
+    """The KVP (score, candidates) kernels for ``q`` rows per request and
+    ``topk`` candidates per row: ``IndexerScore(dcp=True)`` and
+    ``IndexerCandidates``. The tables are row-strided views and the request
+    lengths a strided view of the row ends; rows, requests, columns, strides and
+    the scratch sizes are runtime values: one compile serves every batch."""
+    sym = cute.sym_int
+    query = _fake(Uint8, (sym(), DIM), (DIM, 1), 16)
+    weights = _fake(Float32, (sym(),), (1,), 16)
+    cache = _fake(Uint8, (sym(), ROW_BYTES), (ROW_BYTES, 1), 16)
+    table = _fake(Int32, (sym(), sym()), (cute.sym_int64(), 1), 4)
+    seq_lens = _fake(Int32, (sym(),), (sym(),), 4)
+    row_ends = _fake(Int32, (sym(),), (1,), 4)
+    global_ends = _fake(Int32, (sym(),), (1,), 4)
+    logits = _fake(Float32, (sym(),), (1,), 16)
+    tops = _fake(Int32, (sym(),), (1,), 16)
+    positions = _fake(Int32, (sym(), topk), (cute.sym_int64(), 1), 4)
+    scores = _fake(Float32, (sym(), topk), (cute.sym_int64(), 1), 4)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    options = "--enable-tvm-ffi"
+    score = cute.compile(
+        IndexerScore(q, topk, ctas, pdl, True),
+        query,
+        weights,
+        cache,
+        table,
+        seq_lens,
+        row_ends,
+        global_ends,
+        logits,
+        tops,
+        stream,
+        options=options,
+    )
+    select = cute.compile(
+        IndexerCandidates(q, topk, pdl),
+        logits,
+        tops,
+        seq_lens,
+        row_ends,
+        global_ends,
+        table,
+        positions,
+        scores,
         stream,
         options=options,
     )

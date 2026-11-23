@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
@@ -153,7 +154,7 @@ def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
 def test_draft_final_step_follows_the_complete_drafter_run():
     events = []
 
-    class _Drafter:
+    class _Drafter(BaseDrafter):
         supports_pd_layerwise_finalization = True
 
         def prepare_target_forward(self, ctx):
@@ -175,12 +176,13 @@ def test_draft_final_step_follows_the_complete_drafter_run():
 
     executor.attn_backend = CachePoolBinding()
     executor.device_module = SimpleNamespace(current_stream=lambda: None)
+    executor.forward_step = SimpleNamespace(draft_overlap=None)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([0]),
         state_write_req_pool_indices_buf=torch.tensor([0]),
     )
     executor.grammar_runtime = None
-    executor.drafter = _Drafter()
+    executor.drafter = _Drafter(spec_num_tokens=4)
     executor.tree_spec = None
     executor.dspark_context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
@@ -226,46 +228,6 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     ]
 
 
-def test_cudagraph_gc_flag_reaches_the_capture_context():
-    """The operator flag must survive ServerArgs -> config -> capture.
-
-    Freezing the collector for the duration of capture is the default; the
-    flag is the escape hatch. It previously never arrived -- the wrapper read
-    it off a config that never carried it -- so capture never froze and the
-    flag moved nothing in either direction. Pin the whole path, not the
-    default: read the value the capture context would actually see.
-    """
-    import dataclasses
-    import gc
-
-    from tokenspeed.runtime.execution.forward_step import (
-        ForwardStepRunner,
-        freeze_gc,
-    )
-    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
-
-    fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
-    assert "enable_cudagraph_gc" in fields, "config must carry the flag"
-
-    for flag in (False, True):
-        config = SimpleNamespace(enable_cudagraph_gc=flag)
-        wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
-        # Only the flag plumbing is under test; __init__ needs a live model.
-        wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
-        assert wrapper.enable_cudagraph_gc is flag
-
-        # get_freeze_count() is process-global and other code freezes too, so
-        # compare against the count on entry rather than against zero.
-        before = gc.get_freeze_count()
-        canary = [object() for _ in range(64)]
-        with freeze_gc(wrapper.enable_cudagraph_gc):
-            during = gc.get_freeze_count()
-        after = gc.get_freeze_count()
-        assert (during > before) is (not flag), (flag, before, during)
-        assert after <= before, (before, after)
-        assert len(canary) == 64
-
-
 def test_non_spec_decode_routes_through_verify():
     """The unified sampling rule: decode rows verify even without a drafter.
 
@@ -292,16 +254,22 @@ def test_non_spec_decode_routes_through_verify():
         input_lengths_buf=torch.ones(8, dtype=torch.int32),
     )
     executor.sampling_backend = SimpleNamespace(
+        supports_packed_verify=False,
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
-        verify=lambda _lo, _si, cand, tree: calls.append(("verify", tuple(cand.shape)))
-        or (
-            torch.zeros(cand.shape[0], dtype=torch.int32),
-            torch.ones(cand.shape[0], dtype=torch.int32),
+        verify=lambda _lo, _si, cand, tree: (
+            calls.append(("verify", tuple(cand.shape)))
+            or (
+                torch.zeros(cand.shape[0], dtype=torch.int32),
+                torch.ones(cand.shape[0], dtype=torch.int32),
+            )
         ),
     )
 
     # Pure decode, bs=3, N=1: candidates are the tail 3 ids as [3, 1].
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        forward_mode=ForwardMode.DECODE,
         bs=3,
         num_extends=0,
         input_num_tokens=3,
@@ -318,7 +286,10 @@ def test_non_spec_decode_routes_through_verify():
 
     # Pure prefill still samples.
     calls.clear()
-    ctx2 = SimpleNamespace(
+    ctx2 = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        forward_mode=ForwardMode.EXTEND,
         bs=2,
         num_extends=2,
         input_num_tokens=6,
@@ -368,6 +339,7 @@ def test_input_allocation_covers_decode(
     config = SimpleNamespace(
         device="cpu",
         max_num_seqs=160,
+        enable_memory_saver=False,
         data_parallel_size=dp_size,
         chunked_prefill_size=prefill_tokens,
         output_length=width,

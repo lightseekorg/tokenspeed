@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """A real ``Eagle`` drafter over a toy draft model and draft backend, for the
-drafter prefill graph tests (``--enable-drafter-prefill-graph``).
+drafter prefill graph tests.
 
 The toy stands in for what a test host lacks (weights, a real draft backend)
 and keeps the state a real draft backend keeps, read the way a real draft step
@@ -77,8 +77,8 @@ MAX_TOKENS = 256
 # Cache positions per request in the toy cache.
 MAX_LEN = 512
 STEPS = 3
-FIRST_STEP_SERIES = "prefill:drafter-step0"
 DECODE_STEPS_SERIES = "prefill:drafter-decode"
+KV_WRITER_SERIES = "prefill:drafter-kv"
 
 
 class _ToyLayout(NamedTuple):
@@ -95,7 +95,6 @@ class ToyBackend:
     """Unsharded draft attention for the single-rank graph tests."""
 
     def __init__(self, device: str) -> None:
-        self.query_sharded = False
         self.sparse_topk = SparseTopKShare()
         # The toy draft attends whole extend spans; it takes no query shard.
         self.query_sharded = False
@@ -174,6 +173,14 @@ class ToyBackend:
         )
         return self.selected
 
+    def padded_write_locations(
+        self, layer, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """The extend's persistent write slots, the dummy slot past the live rows."""
+        del layer
+        assert forward_mode.is_extend()
+        return self.extend_locs[:rows]
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         bs = seq_lens.shape[0]
         self.seq_lens[:bs].copy_(seq_lens)
@@ -212,9 +219,6 @@ class ToyDraftModel(nn.Module):
     """Embedding + hidden fold (row-wise), an index break, the narrowing, the
     prologue's KV write in the segment, an attention break, and
     request-shaped heads. Seeded: every instance has the same weights."""
-
-    # Its narrowed step keeps both sequence mixers at break points.
-    supports_breakable_draft_extend = True
 
     def __init__(self, device: str) -> None:
         super().__init__()
@@ -303,17 +307,50 @@ class ToyDraftModel(nn.Module):
         return x + summed / lengths[:, None].clamp_min(1)
 
 
+class ToySplitDraftModel(ToyDraftModel):
+    """The toy as a split draft: each row's K/V is what the index break gives it."""
+
+    def begin_split_round(self, ctx, rows):
+        """Each row's K/V slot and logical position, two locations as a QSA draft's."""
+        backend = ctx.attn_backend
+        requests = backend.row_requests
+        logical = (
+            backend.extend_lengths[requests]
+            - backend.query_lengths[requests]
+            + backend.row_offsets
+        )
+        slots = backend.padded_write_locations(None, ctx.forward_mode, rows)
+        return slots, logical[:rows]
+
+    def write_draft_kv(
+        self, ctx, input_ids, positions, captured_hidden_states, locations
+    ):
+        del positions
+        slots, logical = locations
+        x = self.embed(input_ids) + captured_hidden_states[:, :HIDDEN] * self.fold
+        kv = x * 2 + logical.to(x.dtype)[:, None] * 0.01
+        ctx.attn_backend.cache.index_copy_(0, slots, kv)
+
+
 class ToyRunner:
     """The draft model runner surface the drafter uses; counts the eager
     forwards it runs (a replayed step runs none)."""
 
     def __init__(
-        self, model, device: str, *, dp_size: int = 1, world_size: int = 1
+        self,
+        model,
+        device: str,
+        *,
+        dp_size: int = 1,
+        world_size: int = 1,
+        pp_size: int = 1,
     ) -> None:
         self.model = model
         self.device = device
         self.mapping = SimpleNamespace(
-            attn=SimpleNamespace(dp_size=dp_size), world_size=world_size
+            attn=SimpleNamespace(dp_size=dp_size),
+            world_size=world_size,
+            pp_size=pp_size,
         )
         self.model_config = SimpleNamespace(requires_request_token_history=False)
         self.forward_calls = 0
@@ -349,6 +386,8 @@ def make_eagle(
     spec_num_steps: int = STEPS,
     dp_size: int = 1,
     world_size: int = 1,
+    pp_size: int = 1,
+    max_bs: int = MAX_BS,
     model: nn.Module | None = None,
 ) -> tuple[Eagle, ToyBackend]:
     """A real Eagle drafter over the toy draft model and backend."""
@@ -358,6 +397,7 @@ def make_eagle(
         device,
         dp_size=dp_size,
         world_size=world_size,
+        pp_size=pp_size,
     )
     drafter = Eagle(
         spec_num_tokens=spec_num_steps + 1,
@@ -366,16 +406,16 @@ def make_eagle(
         attn_backend=backend,
         token_to_kv_pool=ToyPool(),
         runtime_states=RuntimeStates(
-            req_pool_size=MAX_BS + 1,
+            req_pool_size=max_bs + 1,
             input_vocab_size=VOCAB,
             vocab_size=VOCAB,
             device=device,
             output_length=spec_num_steps + 1,
         ),
         input_buffers=InputBuffers(
-            max_bs=MAX_BS,
+            max_bs=max_bs,
             max_num_tokens=MAX_TOKENS,
-            state_write_padding_pool_index=MAX_BS,
+            state_write_padding_pool_index=max_bs,
             device=device,
         ),
         vocab_size=VOCAB,
@@ -480,7 +520,6 @@ def capture_input(
     drafter: Eagle,
     backend: ToyBackend,
     buckets: list[int],
-    counts,
     *,
     entries: int | None,
     stream=None,
@@ -488,10 +527,10 @@ def capture_input(
     prepared: list | None = None,
 ) -> DrafterExtendCapture:
     """What the executor hands ``capture_extend_graphs``: the drafter's plan
-    over ``buckets`` at ``counts(bucket)`` requests, its ladders sampled at
-    ``entries``, and a ``prepare_batch`` that lays out a balanced dummy extend
-    (recorded in ``prepared``)."""
-    plan = drafter.extend_graph_plan(buckets, counts)
+    over ``buckets``, its ladders sampled at ``entries``, and a
+    ``prepare_batch`` that lays out a balanced dummy extend (recorded in
+    ``prepared``)."""
+    plan = drafter.extend_graph_plan(buckets)
 
     def prepare_batch(num_tokens: int, bs: int) -> None:
         if prepared is not None:

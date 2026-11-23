@@ -152,6 +152,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
             "k_align": frozenset({128}),
             "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
             "a_contiguous": frozenset({True}),
+            "a_scales_layout": frozenset({"k_major"}),
             "b_contiguous": frozenset({True}),
             "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
             "operands_aligned_16": frozenset({True}),
@@ -789,26 +790,7 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
 _mm_bf16 = error_fn
 _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
-BF16_GEMM_MAX_M = 4 if platform.arch_version == ArchVersion(10, 7) else 32
-
-# SM107 admits only the projection shapes with a measured CuTe DSL win over
-# cuBLAS nvjet on vr200 (fi 0.7.2/0.7.3 microbenchmarks; full-N >= 13312
-# projections and the LM head lose and stay on nvjet). (N, K) of the TP4
-# per-rank projections plus the existing TP1 o_proj admission.
-_SM107_BF16_GEMM_SHAPES = frozenset(
-    {
-        (2560, 6144),  # attention o_proj, TP1 (existing admission)
-        (3584, 2560),  # attention qkv gated proj, TP4
-        (4096, 2560),  # GDN in_proj, TP4
-        (4120, 2560),  # GDN in_proj (padded variant), TP4
-        (4160, 2560),  # GDN in_proj (padded variant), TP4
-        (2560, 1536),  # attention o_proj, TP4
-        (1280, 2560),  # MoE shared-expert gate_up, TP4
-        (2560, 640),  # MoE shared-expert down, TP4
-        (320, 2560),  # small-N router-class proj, TP4
-        (512, 2560),  # small-N gate-up proj, TP4
-    }
-)
+BF16_GEMM_MAX_M = 32
 
 if platform.is_nvidia and platform.arch_version in (
     *_CUTE_DSL_SM100_ARCHS,
@@ -848,16 +830,27 @@ def has_flashinfer_cute_dsl_bf16() -> bool:
     return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
 
 
+def _sm107_cute_dsl_bf16_admits(n: int, k: int, weight_bytes: int) -> bool:
+    """Whether SM107 runs an ``[n, k]`` BF16 weight on the CuTe DSL GEMM.
+
+    Microbenchmark on vr200 (FlashInfer 0.7.4, CUDA graphs, weights cold in L2,
+    N 256 to 248320, K 640 to 8192, M 1 to 32): CuTe DSL wins or ties cuBLASLt up
+    to N = 8192. Wider weights lose at 16 to 32 rows when K <= 1792 or when they
+    exceed 96 MiB (32768 x 2048 = 128 MiB and larger, such as an LM head). The
+    benchmark understates the in-situ win (cold L2, no PDL overlap), so the
+    bounds were confirmed by serving A/B.
+    """
+    return n <= 8192 or (k >= 2048 and weight_bytes <= 96 << 20)
+
+
 def _bf16_gemm_runner_names(k: int) -> list[str]:
     """Admit each backend by its own K contract, not their intersection."""
     if k <= 0:
         return []
     if platform.arch_version == ArchVersion(10, 7):
-        # SM107: pin CuTe DSL, the measured winner on every admitted shape
-        # (microbenchmarks; the AutoTuner joint pick chose TGV for
-        # (2560, 1536) in production, so the joint ranking is not trusted
-        # here). Only consulted for shapes in _SM107_BF16_GEMM_SHAPES, so the
-        # pin's effective scope is exactly that set.
+        # SM107: pin CuTe DSL, the measured winner on the weights
+        # _sm107_cute_dsl_bf16_admits admits (the AutoTuner joint pick chose
+        # TGV for (2560, 1536) in production, so its ranking is not trusted).
         return ["cute-dsl"] if k % 128 == 0 else []
     # TGV handles partial K tiles; its TMA rows need 16-byte (8 BF16) strides.
     runners = ["tgv"] if k % 8 == 0 else []
@@ -881,11 +874,13 @@ def flashinfer_joint_bf16_supported(
         and x.is_cuda
         and x.device == weight.device
         and x.ndim == weight.ndim == 2
-        # Limit SM107 dispatch to the measured projection set. Other dense
-        # projections keep their existing implementation.
         and (
             platform.arch_version != ArchVersion(10, 7)
-            or tuple(weight.shape) in _SM107_BF16_GEMM_SHAPES
+            or _sm107_cute_dsl_bf16_admits(
+                weight.shape[0],
+                weight.shape[1],
+                weight.numel() * weight.element_size(),
+            )
         )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.shape[0] > 0
@@ -934,7 +929,7 @@ def flashinfer_bf16_gemm(
         raise ValueError("Unsupported input to joint FlashInfer BF16 GEMM")
     if out is None:
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    workspace = _fi_gemm._get_cache_buf(
+    workspace = _fi_gemm._get_stream_cache_buf(
         "mm_bf16_workspace", _fi_gemm.DEFAULT_WORKSPACE_SIZE, x.device
     )
     # WAR: the public auto heuristic excludes cute-dsl, and its SM100a check
@@ -960,8 +955,7 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 
     FI skips cached profiles. Scratch inputs/output never alias the model output;
     this function does nothing outside the startup autotune window. The scratch
-    row count exposes native profiles up to the dispatch bound: 1/2/4 on
-    SM107, and 1/2/4/8/16/32 on SM100/103.
+    row count exposes native profiles up to the dispatch bound: 1/2/4/8/16/32.
     """
     if is_autotuning() and flashinfer_joint_bf16_supported(x, weight, None):
         with torch.no_grad():
@@ -969,22 +963,119 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
             flashinfer_bf16_gemm(sample, weight, None)
 
 
+# This is an admission policy, not a kernel shape limit. The four-row,
+# small-N projection measured a win with this tile; other shapes retain their
+# existing GEMM ranking until they have comparable performance evidence.
+def _prefer_small_n_splitk(m: int, n: int, k: int) -> bool:
+    return (m, n, k) == (4, 640, 2560)
+
+
+_bf16_splitk = None
+if platform.is_nvidia and platform.arch_version == ArchVersion(10, 7):
+    try:
+        from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as _bf16_splitk
+    except ImportError:
+        # Older optional FlashInfer builds keep the existing registered GEMM.
+        pass
+
+
+def prefer_bf16_small_n_splitk(m: int, n: int, k: int, *, enable_pdl: bool) -> bool:
+    """Give the available small-N policy precedence over startup GEMM shortcuts."""
+    return _bf16_splitk is not None and enable_pdl and _prefer_small_n_splitk(m, n, k)
+
+
+if _bf16_splitk is not None:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_bf16_small_n_splitk",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        traits={
+            "mnk_problem_filter": frozenset({_prefer_small_n_splitk}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "b_layout": frozenset({"NK"}),
+            "has_alpha": frozenset({False}),
+            "operands_aligned_32": frozenset({True}),
+            "out_aligned_32": frozenset({True}),
+            "out_contiguous": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "pdl_enabled": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def flashinfer_mm_bf16_small_n_splitk(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        enable_pdl: bool,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute BF16 ``A[M,K] @ B[N,K].T`` with a pinned Split-K tile.
+
+        Scales, alpha and block_size must be absent. ``out`` is preserved when
+        supplied. The provider validates layouts, alignment and tile bounds;
+        its compiled function uses runtime row counts. Registry admission is
+        narrower than this callable's supported shapes.
+        """
+        if (
+            A.dtype != torch.bfloat16
+            or B.dtype != A.dtype
+            or out_dtype != A.dtype
+            or any(
+                value is not None for value in (A_scales, B_scales, alpha, block_size)
+            )
+        ):
+            raise ValueError("Split-K BF16 GEMM requires unscaled BF16 operands")
+        if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires contiguous 2D operands")
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], B.shape[0]), device=A.device, dtype=out_dtype
+            )
+        if out.ndim != 2 or not out.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires a contiguous 2D output")
+        _bf16_splitk.run_splitk_dense(
+            _canonical_bf16_view(A),
+            B.t(),
+            None,
+            _canonical_bf16_view(out),
+            enable_pdl,
+            _bf16_splitk.SplitKTactic(64, 8, 4, 6),
+        )
+        return out
+
+
 # ===-----------------------------------------------------------------------===#
-# BF16 decode GEMM on small weights: pinned FlashInfer TGV tiles (SM100/103)
+# BF16 decode GEMM on small weights: pinned FlashInfer TGV tiles (SM100/103/107)
 # ===-----------------------------------------------------------------------===#
 #
 # With PDL and before serving, mm() runs a bias-free BF16 GEMM with
 # TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M rows and
 # TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K on a weight of at most
-# TGV_DECODE_MAX_WEIGHT_BYTES with one TGV tile instead of cuBLASLt. Under
+# TGV_DECODE_MAX_WEIGHT_BYTES (SM107: its TGV_DECODE_WINDOWS entry's bounds)
+# with one TGV tile instead of cuBLASLt. Under
 # PDL, TGV's weight-load warp fills its shared-memory stages while the
 # producer kernel still runs; only its activation-load warp waits for the
 # producer. cuBLASLt loads nothing before the producer finishes. FI's tactic
 # profiling times each GEMM alone and cannot see this overlap, so the tile is
 # chosen here rather than by FI's tuner: the deepest-staged tile whose grid
-# fits in one wave. Without PDL there is no overlap, and cuBLASLt stays.
+# fits in one wave (half the SMs on SM107). Without PDL there is no overlap,
+# and cuBLASLt stays.
 #
-# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, these tiles among them,
+# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, SM100's tiles among them,
 # blocklisted (autotune() in ops/tuning.py) after replay failures of FI
 # 0.6.18's C++ TGV kernel. FI 0.7.2.post1 runs TGV as a CuTe DSL rewrite
 # (tgv_gemm_cute_ext), which these tiles call directly, outside the tuner.
@@ -992,9 +1083,8 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # kernels.
 
 # The policy routes rows above TGV_DECODE_MIN_M, the joint FlashInfer path's
-# bound on SM100 and SM103 (BF16_GEMM_MAX_M there; the GPU tests check that
-# they agree). BF16_GEMM_MAX_M itself follows the host GPU, 4 on SM107, so the
-# policy keeps its own bound and depends only on its arguments.
+# bound (BF16_GEMM_MAX_M; the GPU tests check that they agree). The policy
+# keeps its own bound and depends only on its arguments.
 TGV_DECODE_MIN_M = 32
 TGV_DECODE_MAX_M = 512
 TGV_DECODE_MAX_WEIGHT_BYTES = 16 << 20
@@ -1027,6 +1117,43 @@ TGV_DECODE_TILES = (
     TgvTile(cta_m=64, cta_n=32, num_ab_stage=11, use_2cta=True),
     TgvTile(cta_m=64, cta_n=64, num_ab_stage=9, use_2cta=True),
 )
+# The same tile shapes with the most stages SM107's larger shared memory fits.
+TGV_DECODE_SM107_TILES = (
+    TgvTile(cta_m=64, cta_n=16, num_ab_stage=18, use_2cta=True),
+    TgvTile(cta_m=64, cta_n=32, num_ab_stage=16, use_2cta=True),
+    TgvTile(cta_m=64, cta_n=64, num_ab_stage=13, use_2cta=True),
+)
+
+
+class TgvDecodeWindow(NamedTuple):
+    """One architecture's pinned TGV tiles and the GEMMs they take."""
+
+    tiles: tuple[TgvTile, ...]  # in the order the policy tries them
+    min_n: int  # fewest weight rows the window was measured on
+    max_k: int
+    max_weight_bytes: int
+    sms_per_cta: int  # a grid may hold at most sm_count // sms_per_cta CTAs
+
+
+_SM100_TGV_DECODE_WINDOW = TgvDecodeWindow(
+    tiles=TGV_DECODE_TILES,
+    min_n=1,
+    max_k=TGV_DECODE_MAX_K,
+    max_weight_bytes=TGV_DECODE_MAX_WEIGHT_BYTES,
+    sms_per_cta=1,
+)
+# Measured like SM100's window (README "Decode GEMMs on small weights").
+TGV_DECODE_WINDOWS = {
+    ArchVersion(10, 0): _SM100_TGV_DECODE_WINDOW,
+    ArchVersion(10, 3): _SM100_TGV_DECODE_WINDOW,
+    ArchVersion(10, 7): TgvDecodeWindow(
+        tiles=TGV_DECODE_SM107_TILES,
+        min_n=512,
+        max_k=6144,
+        max_weight_bytes=32 << 20,
+        sms_per_cta=2,
+    ),
+}
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -1045,9 +1172,9 @@ def select_tgv_decode_tile(
 ) -> TgvTile | None:
     """Choose the pinned TGV tile for a bias-free BF16 GEMM, or None.
 
-    The choice depends only on the arguments, and it can only be one of
-    :data:`TGV_DECODE_TILES`, so compiling those tiles at startup covers
-    every row count.
+    The choice depends only on the arguments, and it can only be one of the
+    tiles of the architecture's :data:`TGV_DECODE_WINDOWS` entry, so
+    compiling those tiles at startup covers every row count.
 
     Args:
         m: Activation rows.
@@ -1062,34 +1189,38 @@ def select_tgv_decode_tile(
             chosen.
 
     Returns:
-        With PDL on SM100 and SM103, for
-        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``,
-        ``TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K`` and
-        ``weight_bytes <= TGV_DECODE_MAX_WEIGHT_BYTES``, the first tile of
-        :data:`TGV_DECODE_TILES` whose grid has at most ``sm_count`` CTAs. TGV
-        gives each CTA a whole SM's shared memory and has no split-K, so a
-        larger grid runs in more than one wave. None otherwise.
+        With PDL on an architecture of :data:`TGV_DECODE_WINDOWS`, for
+        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``, ``n >= window.min_n``,
+        ``TGV_DECODE_MIN_K <= k <= window.max_k`` and
+        ``weight_bytes <= window.max_weight_bytes``, the first of the
+        window's tiles whose grid has at most
+        ``sm_count // window.sms_per_cta`` CTAs. TGV gives each CTA a whole
+        SM's shared memory and has no split-K, so a grid of more than
+        ``sm_count`` CTAs runs in more than one wave. None otherwise.
     """
+    window = TGV_DECODE_WINDOWS.get(arch)
     if (
         not pdl
-        or arch not in _CUTE_DSL_SM100_ARCHS
+        or window is None
         or not TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M
-        or not TGV_DECODE_MIN_K <= k <= TGV_DECODE_MAX_K
-        or weight_bytes > TGV_DECODE_MAX_WEIGHT_BYTES
+        or n < window.min_n
+        or not TGV_DECODE_MIN_K <= k <= window.max_k
+        or weight_bytes > window.max_weight_bytes
     ):
         return None
-    for tile in TGV_DECODE_TILES:
+    for tile in window.tiles:
         # TGV's grid: weight-row tiles rounded up to whole clusters, times
         # activation-row tiles.
         cluster = 2 if tile.use_2cta else 1
         weight_ctas = _ceil_div(_ceil_div(n, tile.cta_m), cluster) * cluster
-        if weight_ctas * _ceil_div(m, tile.cta_n) <= sm_count:
+        if weight_ctas * _ceil_div(m, tile.cta_n) <= sm_count // window.sms_per_cta:
             return tile
     return None
 
 
 def resolve_tgv_tactics(
     tactic_table: Sequence[tuple[int, int, int, bool]],
+    tiles: Sequence[TgvTile],
 ) -> dict[TgvTile, int] | None:
     """Look up the tactic id of each pinned tile in a FlashInfer TGV table.
 
@@ -1099,13 +1230,15 @@ def resolve_tgv_tactics(
     Args:
         tactic_table: FI's TGV tactic table. Entry ``i`` describes tactic
             ``i`` as ``(cta_m, cta_n, num_ab_stage, use_2cta)``.
+        tiles: The pinned tiles, such as one :data:`TGV_DECODE_WINDOWS`
+            entry's.
 
     Returns:
-        The tactic id of every tile of :data:`TGV_DECODE_TILES`, or None when
-        the table lacks one of them.
+        The tactic id of every tile of ``tiles``, or None when the table lacks
+        one of them.
     """
     tactics = {}
-    for tile in TGV_DECODE_TILES:
+    for tile in tiles:
         tactic = next(
             (i for i, entry in enumerate(tactic_table) if entry == tile), None
         )
@@ -1154,10 +1287,11 @@ def _flashinfer_tgv() -> _FlashInferTgv | None:
             "GEMMs on small weights keep cuBLASLt"
         )
         return None
-    tactics = resolve_tgv_tactics(_TGV_CUTE_EXT_TACTIC_CONFIGS)
+    tiles = TGV_DECODE_WINDOWS[platform.arch_version].tiles
+    tactics = resolve_tgv_tactics(_TGV_CUTE_EXT_TACTIC_CONFIGS, tiles)
     if tactics is None:
         logger.warning(
-            f"FlashInfer's TGV tactic table lacks one of {TGV_DECODE_TILES}; "
+            f"FlashInfer's TGV tactic table lacks one of {tiles}; "
             "decode-sized BF16 GEMMs on small weights keep cuBLASLt"
         )
         return None
@@ -1222,9 +1356,8 @@ def flashinfer_tgv_decode_gemm(
             :func:`flashinfer_joint_bf16_supported` or ``tactic`` is not a
             pinned tile of the installed FlashInfer.
     """
-    tgv = _flashinfer_tgv()
     if not flashinfer_joint_bf16_supported(x, weight, out) or (
-        tgv is None or tactic not in tgv.tactics.values()
+        (tgv := _flashinfer_tgv()) is None or tactic not in tgv.tactics.values()
     ):
         raise ValueError("Unsupported input to the pinned FlashInfer TGV GEMM")
     if out is None:
@@ -1272,7 +1405,7 @@ def warm_tgv_decode_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
             pdl=pdl_enabled(),
         )
         is None
-        # Asked only on SM100/SM103, where CUDA is present.
+        # Asked only on SM100, SM103 and SM107, where CUDA is present.
         or torch.cuda.is_current_stream_capturing()
     ):
         return

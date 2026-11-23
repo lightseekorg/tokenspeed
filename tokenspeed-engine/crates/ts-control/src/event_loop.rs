@@ -50,16 +50,21 @@
 
 use std::{
     collections::{HashSet, VecDeque},
-    sync::atomic::{AtomicBool, Ordering},
+    io::Read,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
+use parking_lot::{lock_api::ArcMutexGuard, Mutex, RawMutex};
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::{EngineMetrics, L3Metrics};
+use ts_metrics::{DiskMetrics, EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
-    CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, SchedulerSizes, StorageRound, StorageTickView,
+    profile, CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent,
+    ForwardEventKind, Scheduler, SchedulerSizes, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -71,6 +76,7 @@ use crate::{
     cache_ops::{CacheOpError, CacheOps},
     codec::{Reader, Writer},
     control::{self, ControlConfig, Controls, Drain, Effect},
+    disk::{DiskError, DiskTier},
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
     ingress::{self, Admission, Admitted, IngressLimits},
@@ -80,6 +86,7 @@ use crate::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
         LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
     },
+    peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
 };
@@ -147,12 +154,11 @@ const IDLE_WAIT: Duration = Duration::from_millis(10);
 const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 
 /// The scheduler's active page count, as the load report, the metrics and
-/// the batch line read it. Taking it walks every live request's block
-/// tables, which at long contexts costs a round more than the rest of its
-/// work, so it is taken at most once per [`ACTIVE_PAGES_REFRESH`] -- the
-/// frontend considers a load report fresh for seconds -- and whenever the
-/// loop runs no request, when the walk costs nothing and an engine that went
-/// idle reports none active at once. A count taken while idle is not kept:
+/// the batch line read it. Reading it is O(1) (the scheduler's block tables
+/// keep the count), and it is taken at most once per
+/// [`ACTIVE_PAGES_REFRESH`] -- the frontend considers a load report fresh
+/// for seconds -- and whenever the loop runs no request, so an engine that
+/// went idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
 /// just took a burst does not report none active for the next 100 ms.
 #[derive(Debug, Default)]
@@ -190,6 +196,13 @@ const RELOAD_GATE_CODE: i64 = 7;
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Without L3, how long a cache clear waits for the Host and Disk writes
+/// still in flight -- the Disk tier's operations, peer landings into Host --
+/// to retire. Each takes milliseconds; one still in flight past this fails
+/// the clear, since none is retained across one
+/// (`Scheduler::CanClearCacheRetainingStorage`).
+const LOCAL_CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -365,6 +378,10 @@ pub struct Load {
     pub kv_total_pages: i64,
     /// Resident cache blocks, including reclaimable prefix-cache entries.
     pub kv_used_pages: i64,
+    /// Prompt plus committed output tokens of every request held by the rank.
+    pub num_resident_tokens: i64,
+    /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+    pub num_waiting_uncached_tokens: i64,
 }
 
 /// The frontend: requests in, outputs out.
@@ -435,6 +452,13 @@ pub enum LoopError {
     /// The L3 executor refused what a plan or a control operation asked.
     #[error(transparent)]
     StorageExecutor(#[from] ts_l3::ExecutorError),
+    /// The Disk tier refused a plan's operation, or its replica could not
+    /// agree on its reports.
+    #[error(transparent)]
+    Disk(#[from] DiskError),
+    /// The replica could not agree on its peer sharing reports.
+    #[error(transparent)]
+    Peer(#[from] PeerError),
     /// The ranks disagree on a control operation.
     #[error("control: {0}")]
     Control(String),
@@ -498,6 +522,24 @@ pub struct PrefillDelay {
     /// `attempt_interval`, otherwise the ALL points could never be reached
     /// consecutively.
     pub any_interval: u64,
+    /// `--prefill-single-round`: one prefill round per window. The round
+    /// after a prefill round is not an ALL point while any rank would
+    /// decode, so a backlog does not drain in consecutive prefill rounds;
+    /// the next ALL point is `attempt_interval` rounds later. An idle engine
+    /// still admits at once.
+    pub single_round: bool,
+}
+
+impl PrefillDelay {
+    /// Whether round `rounds` since the last prefill round is an ANY point
+    /// and whether it is an ALL point; `decoding` says whether any rank
+    /// would decode this round.
+    fn attempt_points(&self, rounds: u64, decoding: bool) -> (bool, bool) {
+        let any_point = rounds != 0 && rounds % self.any_interval == 0;
+        let all_point =
+            rounds % self.attempt_interval == 0 && !(self.single_round && rounds == 0 && decoding);
+        (any_point, all_point)
+    }
 }
 
 /// The optional subsystems a loop coordinates; each is `None` on an engine
@@ -523,11 +565,25 @@ pub struct Subsystems {
     /// on the executors' reports every round, and flushes delete the tier's
     /// namespace. `None` without the tier.
     pub l3: Option<ts_l3::Executor>,
+    /// With the Disk tier (`docs/rfcs/0006-disk-tier.md`), this rank's
+    /// executor and file: the replica agrees on what the executors finished
+    /// every round. `None` without the tier, which excludes L3.
+    pub disk: Option<DiskTier>,
+    /// The Disk tier's metrics, on a rank that reports them.
+    pub disk_metrics: Option<DiskMetrics>,
+    /// With peer prefix sharing, this rank's part of it: started over the
+    /// loop's scheduler, which its endpoint serves between rounds. `None`
+    /// without.
+    pub peer: Option<Peer>,
 }
 
 /// One rank's scheduling loop.
 pub struct EventLoop<D: DataPlane, F: Frontend> {
-    scheduler: Scheduler,
+    /// Held for the whole round. A peer holder's endpoint answers from the
+    /// scheduler between rounds, so the loop lets go of it only where it
+    /// waits on something else: a forward's result, an idle frontend, a
+    /// paused round's sleep.
+    scheduler: ArcMutexGuard<RawMutex, Scheduler>,
     data_plane: D,
     frontend: F,
     outputs: OutputProcessor,
@@ -542,6 +598,12 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The L3 tier: this rank's executor and the replica's agreement.
     l3: Option<Tier>,
     l3_metrics: Option<L3Metrics>,
+    /// The Disk tier: this rank's executor and the replica's agreement.
+    disk: Option<DiskTier>,
+    disk_metrics: Option<DiskMetrics>,
+    peer: Option<Peer>,
+    /// The peer clock the replica agreed on this round.
+    peer_now_us: i64,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     /// The last cumulative prefix-hit counters reported, for deltas.
@@ -553,6 +615,13 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
     cache_ops: CacheOps,
     controls: Controls,
+    /// Accepted cache clear waiting for native completions between rounds.
+    cache_clear_started: Option<Instant>,
+    /// Warm-up drives its clear directly between serving rounds, without a
+    /// queued frontend control request. Keep that demand alive while it waits.
+    startup_cache_clear: bool,
+    /// Standalone flush callers whose replies wait for that clear.
+    deferred_flushes: usize,
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
     /// EPD: admissions waiting for their images' embeddings, in staging
@@ -587,18 +656,22 @@ struct Relayed {
     stop: bool,
     /// Its frontend messages.
     messages: Vec<EngineRequest>,
-    /// With L3, every member's storage report, in member order; empty
-    /// without.
-    l3_reports: Vec<Vec<u8>>,
+    /// With L3 or the Disk tier, every member's storage report, in member
+    /// order; empty without.
+    storage_reports: Vec<Vec<u8>>,
+    /// With peer sharing, every member's peer report, in member order;
+    /// empty without.
+    peer_reports: Vec<Vec<u8>>,
 }
 
 impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// A loop over `scheduler`, with `outputs` configured for the engine's
     /// speculation and streaming. `frontend` is used only on the replica's
     /// first member; with a PD transfer peer in `subsystems`, `outputs`
-    /// follows its role.
+    /// follows its role. A peer in `subsystems` was started over
+    /// `scheduler`.
     pub fn new(
-        scheduler: Scheduler,
+        scheduler: Arc<Mutex<Scheduler>>,
         data_plane: D,
         frontend: F,
         outputs: OutputProcessor,
@@ -617,7 +690,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .then(|| HistoryRows::new(config.request_token_history_lookback)),
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
-            scheduler,
+            disk: subsystems.disk,
+            disk_metrics: subsystems.disk_metrics,
+            peer: subsystems.peer,
+            peer_now_us: 0,
+            scheduler: scheduler.lock_arc(),
             data_plane,
             frontend,
             outputs,
@@ -633,6 +710,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
+            cache_clear_started: None,
+            startup_cache_clear: false,
+            deferred_flushes: 0,
             withheld: Vec::new(),
             staged: Vec::new(),
             dp_idle: true,
@@ -653,6 +733,59 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
+    /// Serve `phases` of the engine's own requests before a frontend is
+    /// attached: each phase on its own, until every rank is idle, then the
+    /// prefix caches it filled are dropped. The requests take the serving
+    /// path -- admission, planning, the data plane and the commits -- so the
+    /// first requests a client sends find that path prepared. Every rank
+    /// calls this with the same phases; the replica's first member submits
+    /// them, as it does a frontend's requests. Their outputs go to the
+    /// frontend, which drops them while none is attached.
+    ///
+    /// Returns whether a stop was agreed meanwhile; the loop must not
+    /// [`Self::run`] then.
+    pub fn warm_up(
+        &mut self,
+        phases: Vec<Vec<EngineRequest>>,
+        stop: &AtomicBool,
+    ) -> Result<bool, LoopError> {
+        for requests in phases {
+            let mut submitted = if self.owns_frontend() {
+                requests
+            } else {
+                Vec::new()
+            };
+            loop {
+                let received = std::mem::take(&mut submitted);
+                if self.round_with(stop.load(Ordering::Relaxed), received)? {
+                    return Ok(true);
+                }
+                // Background backups need not finish before entering clear:
+                // the clear itself owns their bounded drain/isolation policy.
+                if self.converge(self.requests_idle() && self.dp_idle)? {
+                    break;
+                }
+            }
+            self.startup_cache_clear = true;
+            loop {
+                if self.clear_cache()? == Some(true) {
+                    break;
+                }
+                if self.round(stop.load(Ordering::Relaxed))? {
+                    self.startup_cache_clear = false;
+                    return Ok(true);
+                }
+            }
+            self.startup_cache_clear = false;
+        }
+        Ok(false)
+    }
+
+    /// The frontend, for attaching one after [`Self::warm_up`].
+    pub fn frontend_mut(&mut self) -> &mut F {
+        &mut self.frontend
+    }
+
     fn owns_frontend(&self) -> bool {
         self.ranks.replica.index() == 0
     }
@@ -666,6 +799,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn idle(&self) -> bool {
+        self.cache_clear_started.is_none()
+            && self.requests_idle()
+            && !self.scheduler.storage_progress_pending()
+    }
+
+    /// The model requests and Device copies drained. Storage I/O has its own
+    /// lifetime; warm-up must reach clear even if a background PUT is stuck.
+    fn requests_idle(&self) -> bool {
         // The scheduler's counts are a pass over its requests per state: ask
         // for them only once the loop's own state says nothing runs.
         if !self.in_flight.is_empty()
@@ -675,34 +816,69 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return false;
         }
         let sizes = self.scheduler.sizes();
-        sizes.waiting == 0
-            && sizes.prefilling == 0
-            && sizes.decoding == 0
-            && sizes.retracted == 0
-            && !self.scheduler.storage_pending()
+        sizes.waiting == 0 && sizes.prefilling == 0 && sizes.decoding == 0 && sizes.retracted == 0
     }
 
     /// One round, with this rank's stop request. Returns whether the ranks
     /// agreed to stop after it.
     pub fn round(&mut self, stop_requested: bool) -> Result<bool, LoopError> {
+        self.round_with(stop_requested, Vec::new())
+    }
+
+    /// A round whose replica-first member also receives `submitted`, the
+    /// engine's own requests, ahead of the frontend's.
+    fn round_with(
+        &mut self,
+        stop_requested: bool,
+        submitted: Vec<EngineRequest>,
+    ) -> Result<bool, LoopError> {
+        // A peer servicer answers from the scheduler between rounds, and the
+        // loop releases it only while it waits on the device or on an idle
+        // frontend. A loop waiting on a transfer -- a prefill engine on its
+        // PD sends, a landing on its reads -- does neither and spins
+        // through empty rounds, so it hands the scheduler to a waiting
+        // servicer once per round; with none waiting this costs one atomic
+        // read.
+        ArcMutexGuard::bump(&mut self.scheduler);
+        // A profile keeps the spans of a round that did something: a loop
+        // waiting on a transfer spins through empty rounds.
+        let held_spans = profile::hold();
+        let round_span = profile::span("EventLoop::round");
         let mut outputs: Vec<StreamedOutput> = Vec::new();
         let mut released: Vec<String> = Vec::new();
 
         let received = if self.owns_frontend() {
-            let wait = (self.idle() && self.dp_idle).then_some(IDLE_WAIT);
-            self.frontend.receive(wait)
+            let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
+            let _span = profile::span("Frontend::receive");
+            let mut received = submitted;
+            let frontend = &mut self.frontend;
+            received.extend(match wait {
+                Some(_) => ArcMutexGuard::unlocked(&mut self.scheduler, || frontend.receive(wait)),
+                None => frontend.receive(wait),
+            });
+            received
         } else {
             Vec::new()
         };
         // Nothing reaches a rank whose frontend is gone: it stops as on a
         // stop request, so every rank stops after this round.
         let stop_requested = stop_requested || self.frontend.closed();
-        let report = self.l3.as_ref().map(Tier::report);
+        let storage_report = self
+            .l3
+            .as_ref()
+            .map(Tier::report)
+            .or_else(|| self.disk.as_ref().map(DiskTier::report));
+        let peer_report = self.peer.as_mut().map(Peer::report);
         let Relayed {
             mut stop,
             messages,
-            l3_reports,
-        } = self.relay(stop_requested, received, report)?;
+            storage_reports,
+            peer_reports,
+        } = self.relay(stop_requested, received, storage_report, peer_report)?;
+        let mut busy = !messages.is_empty();
+        // First at the head: the holder's changes since the last round, as
+        // its replica agreed on them, then the landings' progress.
+        busy |= self.peer_round(&peer_reports)?;
         self.admit(messages, &mut outputs, &mut released)?;
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
@@ -716,12 +892,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
-        let (memory_resident, release_pending) = self.gate()?;
-        let forward_allowed = memory_resident && !self.controls.forward_blocked();
+        let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
+        let forward_allowed = memory_resident
+            && !self.controls.forward_blocked()
+            && self.cache_clear_started.is_none();
 
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
-        let storage = self.storage_round(&l3_reports, forward_allowed)?;
+        let storage = self.storage_round(&storage_reports, forward_allowed)?;
         let ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
@@ -755,9 +933,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .scheduler
                 .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
-                l3.submit(&plan)?;
+                busy |= l3.submit(&plan)?;
             }
-            self.cache_ops.dispatched(&plan.cache_ops());
+            if let Some(disk) = &self.disk {
+                busy |= disk.submit(&plan)?;
+            }
+            let cache_ops = plan.cache_ops();
+            self.cache_ops.dispatched(&cache_ops);
+            self.dispatch_peer(&plan);
+            // The storage tick disabled forward planning: scheduler aborts arise
+            // only in that build, and frozen rounds reset the no-progress streak.
+            self.record_scheduler_metrics(None, &cache_ops, 0);
+            busy |= plan.needs_device();
             if plan.needs_device() {
                 self.data_plane.execute(plan, &Dispatch::default())?;
             }
@@ -768,11 +955,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     forwarded = true;
                 }
             }
+            busy |= forwarded;
             self.note_forward(forwarded);
-            std::thread::sleep(PAUSED_IDLE_SLEEP);
+            ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                std::thread::sleep(PAUSED_IDLE_SLEEP);
+            });
         } else {
             let allow_prefill = self.prefill_delay_allows_prefill();
-            self.plan_and_dispatch(
+            busy |= self.plan_and_dispatch(
                 &mut stop,
                 &mut events,
                 &mut outputs,
@@ -801,9 +991,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if self.config.kv_events {
             let drained = self.scheduler.drain_kv_events();
             if let Some(publisher) = &self.kv_events {
-                publisher.publish(&drained);
+                publisher.publish(drained);
             }
         }
+        // A storage operation's outcome is an acknowledgment too.
+        busy |= !ready.is_empty()
+            || !storage.done.is_empty()
+            || !storage.disk_done.is_empty()
+            || !events.is_empty()
+            || !outputs.is_empty()
+            || !released.is_empty();
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
@@ -815,6 +1012,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 kv_active_pages: i64::from(self.active_pages()),
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
+                num_resident_tokens: self.outputs.num_resident_tokens(),
+                num_waiting_uncached_tokens: sizes.pending_prefill_tokens,
             };
             // Silent aborts must refresh load immediately; periodic heartbeats
             // also keep an idle engine's load snapshot fresh at its frontend.
@@ -824,21 +1023,29 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     .last_load_report
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
             {
+                let _span = profile::span("Frontend::send");
                 self.frontend.send(outputs, load);
                 self.reported_load = Some(load);
                 self.last_load_report = Some(Instant::now());
             }
         }
         // A deferred pause or release resolves once the scheduler drained.
-        self.finish_drain(release_pending)?;
-        for reply in self.controls.take_replies() {
+        self.finish_drain(release_pending, nccl_release_pending)?;
+        let replies = self.controls.take_replies();
+        busy |= !replies.is_empty();
+        for reply in replies {
             self.frontend.reply(reply);
+        }
+        drop(round_span);
+        if busy {
+            held_spans.keep();
         }
         Ok(stop)
     }
 
     /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed.
+    /// in-flight depth committed. Returns whether the data plane or the L3
+    /// executor got work.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
@@ -846,26 +1053,40 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
         allow_prefill: bool,
-    ) -> Result<(), LoopError> {
+    ) -> Result<bool, LoopError> {
+        let _span = profile::span("EventLoop::plan_and_dispatch");
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        let sample_ttft = self.outputs.ttft_sampling_enabled();
+        let debug = tracing::enabled!(tracing::Level::DEBUG);
+        // Reading the batch crosses FFI and copies its arrays.
+        if sample_ttft || debug {
             if let Some(batch) = plan.remote_prefill() {
-                tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                if sample_ttft {
+                    self.outputs.mark_planned(&batch.request_ids, true);
+                }
+                if debug {
+                    tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                }
             }
+        }
+        if debug {
             if let Some(batch) = plan.remote_decode() {
                 tracing::debug!(rids = ?batch.request_ids, "remote decode planned");
             }
         }
         // The storage operations start on the L3 executor at once, apart
         // from the device work.
-        if let Some(l3) = &self.l3 {
-            l3.submit(&plan)?;
-        }
+        let storage_work = match (&self.l3, &self.disk) {
+            (Some(l3), _) => l3.submit(&plan)?,
+            (None, Some(disk)) => disk.submit(&plan)?,
+            (None, None) => false,
+        };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
+        self.dispatch_peer(&plan);
         let aborted = self.outputs.finish_scheduler_aborts(&plan.aborts());
         outputs.extend(aborted.outputs);
         released.extend(aborted.released);
@@ -874,94 +1095,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
-        // The scheduler's counts as this round planned, for the metrics and
-        // the batch line: nothing between the two mutates the scheduler, so
-        // they are taken once, and only for a reader.
-        let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
-            // A retraction victim's image store is the retraction signal.
-            let retracted = cache_ops
-                .iter()
-                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
-                .count();
-            metrics.record_preemptions(retracted as i64);
-            for _ in 0..aborted.stats.capacity_aborts {
-                metrics.record_capacity_abort();
+        if sample_ttft {
+            if let Some(batch) = &forward {
+                self.outputs.mark_planned(&batch.request_ids, false);
             }
-            // A pre-dispatch snapshot: the running count still holds what
-            // this round's commits end. `sizes.running` is the batch;
-            // `outputs.num_running()` is every request this rank holds,
-            // including the PD transfer and waiting states the batch excludes.
-            let sizes = planned_sizes.insert(self.scheduler.sizes());
-            let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
-                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
-            });
-            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
-            let active_pages = self
-                .active_pages
-                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
-            metrics.record_scheduler_iteration(
-                sizes.running as i64,
-                self.outputs.num_running() as i64,
-                sizes.waiting as i64,
-                i64::from(active_pages),
-                self.config.kv_total_pages,
-                iteration_tokens,
-            );
-            let total_pages = self.config.kv_total_pages;
-            metrics.record_cache_occupancy(
-                total_pages - i64::from(sizes.empty_lcm_blocks),
-                i64::from(active_pages),
-                total_pages,
-                self.config.kv_token_capacity,
-            );
-            match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Decode => metrics.record_decode_queues(
-                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
-                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
-                    sizes.pd_transfer as i64,       // transfer pins pages
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Plain => {}
-            }
-            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
-            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
-            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
-            let request = self.outputs.take_request_metrics();
-            for seconds in request.ttft_seconds {
-                metrics.observe_time_to_first_token(seconds);
-            }
-            for seconds in request.request_seconds {
-                metrics.observe_request_time(seconds);
-            }
-            for seconds in request.decode_seconds {
-                metrics.observe_decode_time(seconds);
-            }
-            for seconds in request.tpot_seconds {
-                metrics.observe_time_per_output_token(seconds);
-            }
-            metrics.record_completion_tokens(request.completion_tokens);
-            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
-            let hits = self.scheduler.prefix_hit_stats();
-            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
-            metrics.record_prefix_hits(
-                delta.prompt_tokens,
-                delta.device_hit_tokens,
-                delta.host_hit_tokens,
-                delta.l3_hit_tokens,
-            );
         }
-
         let dp = self.dp_round(forward.as_ref(), stop)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
-            // The idle forward replaces this rank's batch; what is dispatched
-            // commits first, as nothing would follow it.
+            // Padding for a peer is not a local request batch.
             forward = None;
+        }
+        let planned_sizes = self.record_scheduler_metrics(
+            forward.as_ref(),
+            &cache_ops,
+            aborted.stats.capacity_aborts,
+        );
+
+        if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
+            // What was dispatched commits first, as no local batch follows.
             self.commit_down_to(0, events, outputs, released)?;
         }
         // Gathered before this round's commits: a commit may end requests
@@ -1009,11 +1160,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if let Some(at) = self.outputs.take_submitted_at(rid) {
                     metrics.observe_request_queue_time(at.elapsed().as_secs_f64());
                 }
+                if let Some(at) = self.outputs.take_decode_ready_at(rid) {
+                    metrics.observe_decode_ready_wait(at.elapsed().as_secs_f64());
+                }
             }
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
-        if plan.needs_device() || idle_forward {
+        let device_work = plan.needs_device() || idle_forward;
+        if device_work {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
@@ -1031,7 +1186,138 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             0
         };
-        self.commit_down_to(depth, events, outputs, released)
+        self.commit_down_to(depth, events, outputs, released)?;
+        Ok(device_work || storage_work)
+    }
+
+    /// Export a round's snapshot on both serving and paused paths. The
+    /// returned scheduler sizes can also be reused by the batch log.
+    fn record_scheduler_metrics(
+        &mut self,
+        forward: Option<&ForwardBatchView>,
+        cache_ops: &[ts_scheduler::CacheOpView],
+        capacity_aborts: i64,
+    ) -> Option<SchedulerSizes> {
+        let mut planned_sizes: Option<SchedulerSizes> = None;
+        if let Some(metrics) = &self.metrics {
+            let _span = profile::span("EventLoop::record_metrics");
+            // A retraction victim's image store is the retraction signal.
+            let retracted = cache_ops
+                .iter()
+                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
+                .count();
+            metrics.record_preemptions(retracted as i64);
+            for _ in 0..capacity_aborts {
+                metrics.record_capacity_abort();
+            }
+            // State occupancy is not forward batch size: PrefillDone can
+            // wait for PD retirement or a decode permit, and an overlapped
+            // round can still hold rows from earlier forwards.
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
+            let iteration_tokens: i64 = forward.map_or(0, |batch| {
+                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
+            });
+            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
+            let active_pages = self
+                .active_pages
+                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
+            metrics.record_scheduler_iteration(
+                forward.map_or(0, |batch| batch.request_ids.len() as i64),
+                self.outputs.num_running() as i64,
+                sizes.waiting as i64 + sizes.ready_waiting as i64 + self.withheld.len() as i64,
+                i64::from(active_pages),
+                self.config.kv_total_pages,
+                iteration_tokens,
+            );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
+            );
+            let total_pages = self.config.kv_total_pages;
+            metrics.record_cache_occupancy(
+                total_pages - i64::from(sizes.empty_lcm_blocks),
+                i64::from(active_pages),
+                total_pages,
+                self.config.kv_token_capacity,
+            );
+            match self.outputs.role() {
+                crate::output::Role::Prefill => metrics.record_prefill_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.prefill_inflight as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Decode => metrics.record_decode_queues(
+                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
+                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
+                    sizes.remote_prefilling as i64, // transfer queue: alias of kv_wait
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Plain => {}
+            }
+            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
+            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
+            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
+            let request = self.outputs.take_request_metrics();
+            for (rid, lookup, admission, aborted) in request.peer_stops {
+                let outcome = if aborted { "cancelled" } else { "no_gain" };
+                if let Some(start) = admission {
+                    metrics
+                        .peer
+                        .stage("admission", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(start) = lookup {
+                    metrics
+                        .peer
+                        .stage("lookup_to_ready", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(peer) = &mut self.peer {
+                    peer.end_lookup(&rid, outcome);
+                }
+            }
+            for (expected, actual, outcome) in request.peer_usage {
+                metrics.peer.usage(expected, actual, outcome);
+            }
+            for seconds in request.ttft_seconds {
+                metrics.observe_time_to_first_token(seconds);
+            }
+            for seconds in request.request_seconds {
+                metrics.observe_request_time(seconds);
+            }
+            for seconds in request.decode_seconds {
+                metrics.observe_decode_time(seconds);
+            }
+            for seconds in request.tpot_seconds {
+                metrics.observe_time_per_output_token(seconds);
+            }
+            for seconds in request.e2e_tpot_seconds {
+                metrics.observe_e2e_time_per_output_token(seconds);
+            }
+            metrics.record_completion_tokens(request.completion_tokens);
+            for count in request.completion_token_samples {
+                metrics.observe_request_completion_tokens(count);
+            }
+            for accept_length in request.spec_decode_accept_length_samples {
+                metrics.observe_request_spec_decode_accept_length(accept_length);
+            }
+            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            let hits = self.scheduler.prefix_hit_stats();
+            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
+            if self.outputs.role() == crate::output::Role::Decode {
+                metrics.record_decode_prefix_hits(
+                    delta.prompt_tokens,
+                    delta.device_hit_tokens + delta.host_hit_tokens,
+                );
+            }
+            metrics.record_prefix_hits(
+                delta.prompt_tokens,
+                delta.device_hit_tokens,
+                delta.host_hit_tokens,
+                delta.l3_hit_tokens,
+            );
+        }
+
+        planned_sizes
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
@@ -1045,18 +1331,23 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
-    /// The round's storage input to the scheduler. With L3, the replica's
-    /// agreement on the members' reports, every round. Without, the forward
-    /// permission when a freeze starts or ends: the tick is the scheduler's
-    /// only input that carries it, and its clock, which times only storage
-    /// deadlines, stays 0.
+    /// The round's storage input to the scheduler. With L3 or the Disk
+    /// tier, the replica's agreement on the members' reports, every round.
+    /// Without, the forward permission when a freeze starts or ends: the
+    /// tick is the scheduler's only input that carries it, and its clock,
+    /// which times only storage deadlines, stays 0.
     fn storage_round(
         &mut self,
-        l3_reports: &[Vec<u8>],
+        storage_reports: &[Vec<u8>],
         allowed: bool,
     ) -> Result<StorageRound, LoopError> {
         if let Some(l3) = self.l3.as_mut() {
-            return Ok(l3.agree(l3_reports, allowed, allowed)?);
+            let _span = profile::span("Tier::agree");
+            return Ok(l3.agree(storage_reports, allowed, allowed)?);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            let _span = profile::span("DiskTier::agree");
+            return Ok(disk.agree(storage_reports, allowed, allowed)?);
         }
         if allowed == self.forward_allowed {
             return Ok(StorageRound::default());
@@ -1503,14 +1794,26 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// Sample the L3 tier's metrics: at most once a second, and whenever
-    /// storage turns pending or idle. Observations never feed the agreement
-    /// or the scheduler.
+    /// Sample L3 or Disk metrics once a second while stable, plus each
+    /// transition between progress-pending and idle. Observations never feed
+    /// the agreement or the scheduler.
     fn record_storage_metrics(&mut self) -> Result<(), LoopError> {
+        if let (Some(disk), Some(metrics)) = (self.disk.as_mut(), self.disk_metrics.as_mut()) {
+            if disk.metrics_due(self.scheduler.storage_progress_pending()) {
+                metrics.record(
+                    &crate::disk::scheduler_stats(self.scheduler.disk_stats()),
+                    &disk.executor_stats(),
+                );
+            }
+            return Ok(());
+        }
         let (Some(l3), Some(metrics)) = (self.l3.as_mut(), self.l3_metrics.as_mut()) else {
             return Ok(());
         };
-        if !l3.agreement.metrics_due(self.scheduler.storage_pending()) {
+        if !l3
+            .agreement
+            .metrics_due(self.scheduler.storage_progress_pending())
+        {
             return Ok(());
         }
         let snapshot = l3.executor.snapshot();
@@ -1567,9 +1870,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// flushes, and the weight operation at the queue's head once every
     /// attention-DP rank holds one of the same kind. One blocking weight
     /// operation per round. Returns whether every rank's memory is resident
-    /// and whether any rank has a pending memory release.
-    fn gate(&mut self) -> Result<(bool, bool), LoopError> {
-        let flushes = self.controls.take_flushes();
+    /// and whether any rank has a pending memory release or NCCL release.
+    fn gate(&mut self) -> Result<(bool, bool, bool), LoopError> {
+        let _span = profile::span("EventLoop::gate");
+        let flushes = self
+            .deferred_flushes
+            .checked_add(self.controls.take_flushes())
+            .ok_or_else(|| LoopError::Control("cache flush request count overflow".to_owned()))?;
+        self.deferred_flushes = 0;
         let head = self.controls.weight_head().and_then(control::gate_code);
         let internal = self.controls.internal_head().map(InternalOp::gate_code);
         // A reload heads the queue from its arrival; it runs once drained, with the same id, everywhere.
@@ -1583,6 +1891,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut all_have_internal = internal.is_some();
         let mut memory_resident = !self.controls.memory_released();
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
+        let mut nccl_release_pending = matches!(
+            self.controls.drain(),
+            Some(Drain::Release(tags)) if tags.iter().any(|tag| tag == "nccl")
+        );
         if let Some(world) = &self.ranks.dp {
             let code = head.unwrap_or(0);
             let internal_code = internal.unwrap_or(0);
@@ -1596,7 +1908,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 internal_code,
                 -internal_code,
                 i64::from(!memory_resident),
-                i64::from(release_pending),
+                // MAX propagates NCCL intent even while a peer is already asleep.
+                if nccl_release_pending {
+                    2
+                } else {
+                    i64::from(release_pending)
+                },
                 key,
                 -key,
                 if reload_ready { -1 } else { 0 },
@@ -1606,6 +1923,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
             release_pending = reduced[8] != 0;
+            nccl_release_pending = reduced[8] == 2;
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
             let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
@@ -1652,20 +1970,40 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             },
             ready => ready,
         };
-        // One blocking device operation per round: a frontend one first.
-        let ready_internal = if all_have_internal && ready.is_none() {
-            self.controls.pop_internal()
-        } else {
-            None
-        };
         if let Some(op) = &ready {
             want_flush |= control::wants_flush(op);
         }
+        if !want_flush && !self.startup_cache_clear {
+            // A deferred reload can expire or be cancelled, and a load can
+            // lose admission while storage drains. With no remaining flush
+            // caller, stop withholding forwards for that abandoned clear.
+            self.cache_clear_started = None;
+        }
         let flushed = if want_flush {
-            self.clear_cache()?
+            match self.clear_cache()? {
+                Some(flushed) => flushed,
+                None => {
+                    // No frontend admission runs inside this gate. Restore the
+                    // original head before yielding so weights_busy() and the
+                    // next round still see this operation, without cloning its
+                    // potentially large serialized weight payload each round.
+                    if let Some(op) = ready {
+                        self.controls.defer_weight_op(op);
+                    }
+                    self.deferred_flushes = flushes;
+                    return Ok((memory_resident, release_pending, nccl_release_pending));
+                }
+            }
         } else {
             true
         };
+        // One blocking device operation per round: a frontend one first.
+        let ready_internal =
+            if all_have_internal && ready.is_none() && self.cache_clear_started.is_none() {
+                self.controls.pop_internal()
+            } else {
+                None
+            };
         for _ in 0..flushes {
             self.controls
                 .reply(ControlOutput::FlushCache(FlushCacheReqOutput {
@@ -1679,7 +2017,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
-        Ok((memory_resident, release_pending))
+        Ok((memory_resident, release_pending, nccl_release_pending))
     }
 
     /// Whether any member of this rank's replica says yes.
@@ -1710,28 +2048,155 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(agreed != 0)
     }
 
-    /// Drop the prefix caches on every rank or on none: the ranks agree the
-    /// flush can happen before any of them clears.
-    fn clear_cache(&mut self) -> Result<bool, LoopError> {
-        let can_clear = self.scheduler.can_clear_cache();
-        if !self.converge(can_clear)? {
-            return Ok(false);
+    /// One clear attempt: None yields to the normal round so native I/O can
+    /// retire. Explicit unsafe access or the drain deadline selects recovery.
+    fn clear_cache(&mut self) -> Result<Option<bool>, LoopError> {
+        let result = self.advance_cache_clear()?;
+        if result.is_some() {
+            self.cache_clear_started = None;
         }
-        // The L3 objects go first, in a phase of its own: a store that
-        // fails to delete must leave every rank's indexes untouched.
+        Ok(result)
+    }
+
+    fn advance_cache_clear(&mut self) -> Result<Option<bool>, LoopError> {
+        let has_storage_owners = self.scheduler.storage_pending();
+        let storage_path = !self.converge(!has_storage_owners)?;
+        // Ordinary clear keeps the original indexed-pin semantics, including
+        // deployments without L3. Storage draining only discounts its own pins;
+        // the stronger all-owner check belongs to actual retained recovery.
+        let can_clear = if storage_path {
+            self.scheduler.can_prepare_storage_clear()
+        } else {
+            self.scheduler.can_clear_cache()
+        };
+        // Refusals log at debug, and only on the refusing rank: warm-up retries
+        // its clear every round, and the flush reply already reports failure.
+        if !self.converge(can_clear)? {
+            if !can_clear {
+                tracing::debug!("cache flush refused: non-storage resources remain held");
+            }
+            return Ok(Some(false));
+        }
+        let unsafe_current = self.scheduler.storage_blocking_quarantined() > 0
+            || self
+                .l3
+                .as_ref()
+                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
+        // Historical unsafe flags/tickets protect their own addresses. They
+        // do not force every later clear into another private namespace.
+        if !self.converge(!unsafe_current)? {
+            return self.clear_cache_retaining_storage().map(Some);
+        }
+        if self.cache_clear_started.is_none() {
+            if storage_path {
+                self.scheduler.cancel_storage_for_clear();
+            }
+            self.cache_clear_started = Some(Instant::now());
+        }
+        let pending = self.scheduler.storage_current_pending();
+        if !self.converge(!pending)? {
+            let budget = match &self.l3 {
+                Some(l3) => l3.executor.config().clear_cache_drain_timeout,
+                None => LOCAL_CLEAR_DRAIN_TIMEOUT,
+            };
+            let expired = self.cache_clear_started.expect("clear started").elapsed() >= budget;
+            if !self.converge(!expired)? {
+                return self.clear_cache_retaining_storage().map(Some);
+            }
+            return Ok(None);
+        }
+        // Current-namespace work has drained. Old retained tickets may still
+        // occupy slots, but cannot prevent purging this safe active prefix.
+        let retaining = self.scheduler.storage_has_retained_operations();
+        let can_finish = if retaining {
+            self.scheduler.can_clear_cache_retaining_storage()
+        } else {
+            self.scheduler.can_clear_cache()
+        };
+        if !self.converge(can_finish)? {
+            if !can_finish {
+                tracing::debug!("cache clear refused after storage drain: references remain held");
+            }
+            return Ok(Some(false));
+        }
         if let Some(l3) = &self.l3 {
+            // A failed backend purge logs its own error.
             let deleted = l3.executor.delete_namespace();
             if !self.converge(deleted)? {
-                return Ok(false);
+                if !deleted {
+                    tracing::debug!("cache flush refused at L3 namespace deletion");
+                }
+                return Ok(Some(false));
             }
         }
-        Ok(self.scheduler.clear_cache())
+        let cleared = if retaining {
+            self.scheduler.clear_cache_retaining_storage()
+        } else {
+            self.scheduler.clear_cache()
+        };
+        self.converge(cleared).map(Some)
+    }
+
+    /// Isolate old native I/O, then allow L3 in a fresh namespace using only
+    /// the remaining Host capacity. Old jobs keep their keys and addresses.
+    fn clear_cache_retaining_storage(&mut self) -> Result<bool, LoopError> {
+        let can_clear = self.scheduler.can_clear_cache_retaining_storage();
+        if !self.converge(can_clear)? {
+            if !can_clear {
+                tracing::debug!("cache recovery refused: non-storage resources remain held");
+            }
+            return Ok(false);
+        }
+        let Some(generation) = self.fresh_cache_generation()? else {
+            return Ok(false);
+        };
+        if let Some(l3) = &self.l3 {
+            // Fails only on a malformed or reused agreed nonce or an exhausted
+            // epoch counter: invariant violations, not refusals to converge.
+            // The scheduler clear below repeats the pure preflight agreed above
+            // with no scheduler mutation in between, so it cannot refuse either.
+            l3.executor.begin_cache_generation(&generation)?;
+        }
+        let cleared = self.scheduler.clear_cache_retaining_storage();
+        let cleared = self.converge(cleared)?;
+        tracing::warn!(
+            cleared,
+            "cache indexes cleared with storage references retained; L3 uses a fresh generation; remote purge deferred"
+        );
+        Ok(cleared)
+    }
+
+    fn fresh_cache_generation(&mut self) -> Result<Option<String>, LoopError> {
+        let mut nonce = [0u8; 16];
+        let generated = std::fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .is_ok();
+        if !self.converge(generated)? {
+            if !generated {
+                tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+            }
+            return Ok(None);
+        }
+        let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);
+        let nonce = self.ranks.mesh.broadcast(group, 0, nonce.to_vec())?;
+        let generation: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Some(generation))
     }
 
     /// Finish a gated weight operation: its result is agreed across the
     /// ranks before the reply. A weight load reaching here passed the
     /// all-rank admission in [`Self::gate`].
     fn complete_weight_op(&mut self, op: ControlRequest, flushed: bool) -> Result<(), LoopError> {
+        if let ControlRequest::ResumeMemoryOccupation(resume) = &op {
+            let tags = resume
+                .tags
+                .as_deref()
+                .expect("queued resume has normalized tags");
+            self.data_plane.resume_memory(tags)?;
+            tracing::info!(?tags, "memory resumed");
+            self.controls.finish_resume(tags);
+            return Ok(());
+        }
         let flush_refused = control::wants_flush(&op) && !flushed;
         let (success, message) = match &op {
             ControlRequest::RebalanceExperts(_) => {
@@ -1762,18 +2227,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     message
                 };
                 if agreed && control::is_weight_load(&op) {
-                    // New pages publish under the new checkpoint only once
-                    // every rank holds its weights.
-                    match self.controls.commit_l3_weight_version(&op) {
-                        Err(refusal) => (false, refusal),
-                        Ok(Some(version)) => {
-                            if let Some(l3) = &self.l3 {
-                                l3.executor.set_weight_version(&version)?;
-                            }
-                            (true, message)
-                        }
-                        Ok(None) => (true, message),
-                    }
+                    self.commit_weight_namespace(&op, message)?
                 } else {
                     (agreed, message)
                 }
@@ -1797,6 +2251,94 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.controls.finish_reload();
         }
         Ok(())
+    }
+
+    /// Every member of the agreed load executes the same collective sequence,
+    /// even if its local version stays unchanged or namespace publication fails.
+    fn commit_weight_namespace(
+        &mut self,
+        op: &ControlRequest,
+        message: String,
+    ) -> Result<(bool, String), LoopError> {
+        // Model loading is already agreed, but no namespace metadata becomes
+        // visible until entropy and every local namespace plan are ready.
+        let controls = self.controls.prepare_shared_weight_version(op);
+        let isolation = match &controls {
+            Err(refusal) => Err(refusal.clone()),
+            Ok(prepared) => match (prepared.changed_version(), &self.l3) {
+                (Some(version), Some(l3)) => l3
+                    .executor
+                    .weight_version_needs_isolation(version)
+                    .map_err(|error| error.to_string()),
+                _ => Ok(false),
+            },
+        };
+        if !self.converge(isolation.is_ok())? {
+            return Ok((
+                false,
+                isolation.err().unwrap_or_else(|| {
+                    "weight namespace preparation failed on another rank".to_owned()
+                }),
+            ));
+        }
+        // A -> B -> A must not re-enter a prefix touched by retained old A I/O.
+        // Unchanged-version ranks participate too; local change is not a gate
+        // for collective membership.
+        let generation = if !self.converge(!isolation.expect("namespace inspection agreed"))? {
+            let Some(generation) = self.fresh_cache_generation()? else {
+                return Ok((
+                    false,
+                    "could not isolate the weight namespace from old I/O".to_owned(),
+                ));
+            };
+            Some(generation)
+        } else {
+            None
+        };
+        let controls = controls.expect("control metadata preparation agreed");
+        // Allocate the peer's identity before publication too. An unchanged
+        // member still applies an agreed nonce if another owner needs it.
+        let peer_version = controls.changed_version().map(str::to_owned);
+        let storage = match &self.l3 {
+            Some(l3) if peer_version.is_some() || generation.is_some() => {
+                let version = controls
+                    .target_version()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| l3.executor.weight_version());
+                l3.executor
+                    .prepare_weight_version(&version, generation.as_deref())
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            }
+            _ => Ok(None),
+        };
+        if !self.converge(storage.is_ok())? {
+            return Ok((
+                false,
+                storage.err().unwrap_or_else(|| {
+                    "weight namespace preparation failed on another rank".to_owned()
+                }),
+            ));
+        }
+        // The exclusive control gate has submitted no new I/O or namespace
+        // changes since preparation. Publication now moves checked values;
+        // there are no backend/entropy calls or expected failures between the
+        // executor, Controls and Peer updates.
+        if let Some(prepared) = storage.expect("storage namespace preparation agreed") {
+            self.l3
+                .as_ref()
+                .expect("a storage plan has its executor")
+                .executor
+                .commit_prepared_weight_version(prepared);
+        }
+        self.controls
+            .commit_prepared_shared_weight_version(controls);
+        if let Some(version) = peer_version {
+            if let Some(peer) = &mut self.peer {
+                peer.set_weight_version(&version);
+            }
+        }
+        Ok((true, message))
     }
 
     /// Run a drained, gate-agreed forward reload; its result is agreed across the ranks.
@@ -1986,14 +2528,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// Resolve a local pause once drained; release memory only once every
-    /// rank has stopped admissions and drained its work.
-    fn finish_drain(&mut self, release_pending: bool) -> Result<(), LoopError> {
+    /// rank has stopped admissions and drained its work; NCCL also needs intent.
+    fn finish_drain(
+        &mut self,
+        release_pending: bool,
+        nccl_release_pending: bool,
+    ) -> Result<(), LoopError> {
         let drained = self.controls.admit_blocked() && self.drained();
+        let nccl_ready = !nccl_release_pending
+            || matches!(
+                self.controls.drain(),
+                Some(Drain::Release(tags)) if tags.iter().any(|tag| tag == "nccl")
+            );
         // Every rank joins, even without a local drain. An idle but unpaused
         // peer may admit work next round and still needs our idle forwards.
         let all_paused = release_pending
             && self.converge(
-                drained
+                nccl_ready
+                    && drained
                     && !self.controls.weights_busy()
                     && self.transfers_idle()
                     && self.cache_ops.open() == 0,
@@ -2005,7 +2557,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         }
         if matches!(drain, Drain::Reload)
-            && (!self.transfers_idle() || !self.scheduler.can_clear_cache())
+            && (!self.transfers_idle() || !self.scheduler.storage_non_storage_clearable())
         {
             // Capture writes KV pages a transfer or a Host write-back could still touch.
             return Ok(());
@@ -2072,6 +2624,52 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     },
                 ));
             }
+            Effect::DemoteCacheGroups(ids, ended) => {
+                let changed = self.scheduler.demote_cache_groups(&ids, ended);
+                self.controls.reply(ControlOutput::DemoteCacheGroups(
+                    ts_wire::control::DemoteCacheGroupsReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        message: format!("demoted {changed} exclusive cached blocks"),
+                    },
+                ));
+            }
+            Effect::SharedPrefixPublication(query_id, input_ids, max_prefix_tokens) => {
+                let result = self
+                    .scheduler
+                    .shared_prefix_publication(&input_ids, max_prefix_tokens);
+                let (success, message, status, confirmed_prefix_tokens, cache_epoch) = match result
+                {
+                    Ok(value) => (
+                        true,
+                        String::new(),
+                        value.status,
+                        i64::from(value.confirmed_prefix_tokens),
+                        value.cache_epoch,
+                    ),
+                    Err(error) => (false, error.to_string(), "unsupported".to_owned(), 0, 0),
+                };
+                self.controls
+                    .reply(ControlOutput::GetSharedPrefixPublication(
+                        ts_wire::control::GetSharedPrefixPublicationReqOutput {
+                            rid: None,
+                            http_worker_ipc: None,
+                            success,
+                            message,
+                            query_id,
+                            dp_rank: -1,
+                            status,
+                            confirmed_prefix_tokens,
+                            storage_namespace: self
+                                .l3
+                                .as_ref()
+                                .map(|tier| tier.executor.key_prefix())
+                                .unwrap_or_default(),
+                            cache_epoch,
+                        },
+                    ));
+            }
             Effect::AdmissionSnapshot => {
                 // Version 1 rounds demand up to 1024-token buckets. Bump the
                 // contract version if the curve's bucketing semantics change;
@@ -2097,6 +2695,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                         max_tokens: snapshot.max_tokens.into(),
                         capacity_token_step: snapshot.capacity_token_step.into(),
                         capacity_blocks: snapshot.capacity_blocks,
+                        cache_group_contract: 1,
+                        shared_prefix_publication_contract: 1,
+                        shared_prefix_storage_enabled: self.l3.is_some()
+                            && self.scheduler.shared_prefix_storage_enabled(),
                     },
                 ));
             }
@@ -2122,48 +2724,61 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's frontend messages, from the replica's first member, and
-    /// its stop request; with L3, every member's storage report, which this
-    /// rank's `l3_report` joins.
+    /// its stop request; with L3 or the Disk tier, every member's storage
+    /// report, which this rank's `storage_report` joins.
     fn relay(
         &mut self,
         stop_requested: bool,
         received: Vec<EngineRequest>,
-        l3_report: Option<Vec<u8>>,
+        storage_report: Option<Vec<u8>>,
+        peer_report: Option<Vec<u8>>,
     ) -> Result<Relayed, LoopError> {
         let replica = &self.ranks.replica;
         if replica.size() == 1 {
             return Ok(Relayed {
                 stop: stop_requested,
                 messages: received,
-                l3_reports: l3_report.into_iter().collect(),
+                storage_reports: storage_report.into_iter().collect(),
+                peer_reports: peer_report.into_iter().collect(),
             });
         }
+        let _span = profile::span("EventLoop::relay");
         let owner = self.owns_frontend();
         let payload = if owner {
             relay::encode(stop_requested, &received)
         } else {
             Vec::new()
         };
-        let (relayed, l3_reports) = match l3_report {
-            None => (self.ranks.mesh.broadcast(replica, 0, payload)?, Vec::new()),
-            Some(report) => {
-                // Every member's storage report rides the relay: one
-                // exchange a round for both.
-                let gathered = self
-                    .ranks
-                    .mesh
-                    .all_gather(replica, &relay::join(&payload, &report))?;
-                let mut relayed = Vec::new();
-                let mut reports = Vec::with_capacity(gathered.len());
-                for (member, part) in gathered.iter().enumerate() {
-                    let (relay, report) = relay::split(part)?;
-                    if member == 0 {
-                        relayed = relay.to_vec();
-                    }
-                    reports.push(report.to_vec());
+        // Every member's reports ride the relay: one exchange a round for
+        // all of them, in the same order on every member.
+        let (has_storage, has_peer) = (storage_report.is_some(), peer_report.is_some());
+        let reports: Vec<Vec<u8>> = storage_report.into_iter().chain(peer_report).collect();
+        let (mut storage_reports, mut peer_reports) = (Vec::new(), Vec::new());
+        let relayed = if reports.is_empty() {
+            self.ranks.mesh.broadcast(replica, 0, payload)?
+        } else {
+            let gathered = self
+                .ranks
+                .mesh
+                .all_gather(replica, &relay::join(&payload, &reports))?;
+            let mut relayed = Vec::new();
+            for (member, part) in gathered.iter().enumerate() {
+                let (relay, parts) = relay::split(part)?;
+                if parts.len() != reports.len() {
+                    return Err(RelayError::Truncated.into());
                 }
-                (relayed, reports)
+                if member == 0 {
+                    relayed = relay.to_vec();
+                }
+                let mut parts = parts.into_iter();
+                if has_storage {
+                    storage_reports.extend(parts.next().map(<[u8]>::to_vec));
+                }
+                if has_peer {
+                    peer_reports.extend(parts.next().map(<[u8]>::to_vec));
+                }
             }
+            relayed
         };
         let (stop, messages) = if owner {
             (stop_requested, received)
@@ -2173,8 +2788,84 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(Relayed {
             stop,
             messages,
-            l3_reports,
+            storage_reports,
+            peer_reports,
         })
+    }
+
+    /// The round's peer agreement, fed to the scheduler: the holder's
+    /// changes and the reader's answers and landings, then the clock its
+    /// deadlines run on. Returns whether anything happened.
+    fn peer_round(&mut self, reports: &[Vec<u8>]) -> Result<bool, LoopError> {
+        let Some(peer) = self.peer.as_mut() else {
+            return Ok(false);
+        };
+        let round = peer.agree(reports)?;
+        self.peer_now_us = round.now_us;
+        if let Some(metrics) = &self.metrics {
+            for (rid, result) in round.decisions {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.disposition = result;
+                    if result == "admission" {
+                        usage.admission_at = Some(Instant::now());
+                    } else if let Some(start) = usage.lookup_at.take() {
+                        metrics.peer.stage(
+                            "lookup_to_ready",
+                            "fallback",
+                            start.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+            }
+            for (rid, begin, end) in round.landed {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.window = Some((begin, end));
+                    usage.disposition = "unused_after_landing";
+                    if let Some(start) = usage.lookup_at.take() {
+                        metrics
+                            .peer
+                            .stage("lookup_to_ready", "ok", start.elapsed().as_secs_f64());
+                    }
+                }
+            }
+        }
+        peer.sample_scheduler(&mut self.scheduler, round.now_us);
+        self.scheduler
+            .advance_peer(round.now_us, &round.events)
+            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        Ok(!round.events.is_empty())
+    }
+
+    /// A plan's peer work goes out: its landings start (each read waits for
+    /// this plan's device work on its member), and the lookups it queued are
+    /// sent.
+    fn dispatch_peer(&mut self, plan: &ExecutionPlan) {
+        if let Some(peer) = self.peer.as_mut() {
+            let fetches = plan.peer_fetches();
+            let lookups = self.scheduler.take_peer_lookups();
+            if let Some(metrics) = &self.metrics {
+                let now = Instant::now();
+                for lookup in &lookups {
+                    if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
+                        usage.lookup_at = Some(now);
+                        usage.disposition = "lookup";
+                    }
+                }
+                for fetch in &fetches {
+                    if let Some(usage) = self.outputs.peer_usage(&fetch.request_id) {
+                        if let Some(start) = usage.admission_at.take() {
+                            metrics.peer.stage(
+                                "admission",
+                                "ok",
+                                now.duration_since(start).as_secs_f64(),
+                            );
+                        }
+                        usage.disposition = "landing";
+                    }
+                }
+            }
+            peer.dispatch(fetches, lookups, self.peer_now_us);
+        }
     }
 
     /// With attention DP, every rank's batch this round, and whether any
@@ -2216,6 +2907,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_prefill_round(num_extends, batch_size);
             return Ok(None);
         };
+        let _span = profile::span("EventLoop::dp_round");
         let row = [
             num_tokens,
             batch_size,
@@ -2274,8 +2966,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return true;
         }
         let rounds = self.rounds_since_prefill;
-        let any_point = rounds != 0 && rounds % delay.any_interval == 0;
-        let all_point = rounds % delay.attempt_interval == 0;
+        let (any_point, all_point) =
+            delay.attempt_points(rounds, self.dp_has_decode_work.iter().any(|d| *d));
         if !any_point && !all_point {
             return false;
         }
@@ -2355,6 +3047,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let Some(transfer) = self.transfer.as_mut() else {
             return Ok(());
         };
+        let _span = profile::span("EventLoop::poll_transfers");
         let polled = transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)?;
         for event in polled {
             tracing::debug!(?event, "transfer event");
@@ -2362,6 +3055,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 PdEvent::Bootstrapped(rid) => {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
+                }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));
@@ -2430,8 +3126,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         while self.in_flight.len() > depth {
+            let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
-            let result = self.data_plane.complete(pending)?;
+            let data_plane = &mut self.data_plane;
+            let result =
+                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;
             let Committed {
@@ -2483,6 +3182,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 let resident = kv_total_pages - i64::from(sizes.empty_lcm_blocks);
                 RoundStats {
                     queued: sizes.waiting,
+                    allocated_request_slots: sizes.allocated_request_slots,
+                    active_decode_slots: sizes.active_decode_slots,
+                    ready_waiting: sizes.ready_waiting,
                     active_pages: active,
                     cached_pages: (resident - active).max(0),
                     pd: [
@@ -2535,6 +3237,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
+        let _span = profile::span("EventLoop::admit");
         let mut admissions = Vec::new();
         let mut seen = HashSet::new();
         for message in received {
@@ -2625,14 +3328,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// paused (registered, so an abort still reaches them).
     fn register(
         &mut self,
-        admissions: Vec<Admission>,
+        mut admissions: Vec<Admission>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         if admissions.is_empty() {
             return Ok(());
         }
+        let _span = profile::span("EventLoop::register");
         tracing::debug!(admitted = admissions.len(), "requests admitted");
+        for admission in &mut admissions {
+            self.outputs.assign_admission(&mut admission.state);
+            admission.spec.admission_id = admission.state.admission;
+        }
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;
         let mut submissions = Vec::with_capacity(admissions.len());
@@ -2736,5 +3444,30 @@ mod tests {
             5
         );
         assert_eq!(walks, 4);
+    }
+
+    #[test]
+    fn single_round_windows_close_the_round_after_a_prefill_while_ranks_decode() {
+        let delay = |single_round| PrefillDelay {
+            attempt_interval: 3,
+            any_interval: 6,
+            single_round,
+        };
+        let all_points = |single_round, decoding| -> Vec<u64> {
+            (0..7)
+                .filter(|&r| delay(single_round).attempt_points(r, decoding).1)
+                .collect()
+        };
+        // Draining: the round after a prefill round is an ALL point.
+        assert_eq!(all_points(false, true), [0, 3, 6]);
+        // One round per window while anything decodes.
+        assert_eq!(all_points(true, true), [3, 6]);
+        // An idle engine admits at once.
+        assert_eq!(all_points(true, false), [0, 3, 6]);
+        // ANY points are unchanged.
+        let any_points: Vec<u64> = (0..13)
+            .filter(|&r| delay(true).attempt_points(r, true).0)
+            .collect();
+        assert_eq!(any_points, [6, 12]);
     }
 }

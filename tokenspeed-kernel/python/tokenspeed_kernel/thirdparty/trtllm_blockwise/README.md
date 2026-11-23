@@ -8,13 +8,17 @@ changes are limited to repository formatting. The adapter uses
 the upstream dynamic-shape wrapper; it does not require importing TensorRT-LLM.
 
 `__init__.py` exposes the public entry points and loads the autotuner lazily.
-`runner.py` owns tactic search and cache lookup; `_launch.py` owns compilation,
-scale-layout copies and launch. The runner imports the launch module directly,
+`runner.py` owns tactic search and cache lookup; `_launch.py` owns compilation
+and launch. The runner imports the launch module directly,
 so neither implementation module imports the package entry points.
 
-The contract is E4M3 A[M,K], E4M3 B[N,K], FP32 activation scales [M,K/128],
-and FP32 weight scales [N/128,K/128]. Output is BF16, accumulation is FP32.
-N and K must be divisible by 128. Scale layout copies do not change values.
+The contract is E4M3 A[M,K], E4M3 B[N,K], FP32 activation scales [M,K/128]
+stored MN-major, and contiguous FP32 weight scales [N/128,K/128]. Output is
+BF16, accumulation is FP32. N and K must be divisible by 128.
+The kernel reads both scale tensors in place. The activation scales' stride(1),
+at least M, is the row extent it reads them with, so the padded native layout
+of `quantize_fp8(override="trtllm_quantize_fp8_mn_major")` needs no copy.
+Other activation-scale layouts raise `ValueError` instead of being copied.
 No E8M0 conversion or weight requantization is performed.
 
 CuTe-DSL and TVM-FFI load when this backend is first used.
@@ -25,7 +29,7 @@ M/N dimensions are 1, 2 or 4. The upstream `can_implement` check filters invalid
 combinations. The kernel source itself is unchanged.
 
 The runner uses TokenSpeed's shared FlashInfer autotuner. Its default CUDA-event
-profiler measures the adapter, including scale-layout copies, with CUDA graphs
+profiler measures the adapter, given MN-major activation scales, with CUDA graphs
 while rotating independent input/output buffers, without an explicit L2 flush.
 For each shape, the number of groups is the L2 cache size divided by the size
 of one group, rounded up. Each timed graph uses every group the same number of

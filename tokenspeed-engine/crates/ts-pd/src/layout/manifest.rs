@@ -150,6 +150,8 @@ impl Manifest {
 /// a `full_suffix` group every retained block from the one holding
 /// `prefix_len` through the final partial block; a replayable group sends
 /// its whole retained window because the receiver caches none of it. A
+/// sliding group also sends its initial sink blocks beyond the receiver's
+/// prefix, once each where they overlap the retained window. A
 /// snapshot group sends its live slot unless the receiver holds the
 /// prompt-end checkpoint.
 pub fn logical_slots(
@@ -173,7 +175,11 @@ pub fn logical_slots(
             begin = begin.max(retained_begin.div_euclid(granularity));
         }
         let end = (prompt_len + granularity - 1).div_euclid(granularity);
-        return Ok((begin..end).collect());
+        let sink_begin = prefix_len.div_euclid(granularity);
+        let sink_end = (spec.sink_tokens.min(prompt_len) + granularity - 1).div_euclid(granularity);
+        let mut slots: Vec<i64> = (sink_begin..sink_end).collect();
+        slots.extend(begin.max(sink_end)..end);
+        return Ok(slots);
     }
     Ok(if state_prefix_cached {
         Vec::new()
@@ -419,23 +425,16 @@ pub fn build_selection(
         let (positions, slots): (Vec<usize>, Vec<i64>) = match spec.transfer_policy.as_deref() {
             Some("full_suffix") => {
                 let granularity = spec.block_granularity()?;
-                let count = final_slots.len() as i64;
-                let (start, ready) = match final_slots.first() {
-                    Some(&first) => {
-                        let ready_end = if is_final {
-                            (chunk_end + granularity - 1).div_euclid(granularity)
-                        } else {
-                            chunk_end.div_euclid(granularity)
-                        };
-                        (
-                            (chunk_start.div_euclid(granularity) - first).clamp(0, count),
-                            (ready_end - first).clamp(0, count),
-                        )
-                    }
-                    None => (0, 0),
+                let start = chunk_start.div_euclid(granularity);
+                let ready_end = if is_final {
+                    (chunk_end + granularity - 1).div_euclid(granularity)
+                } else {
+                    chunk_end.div_euclid(granularity)
                 };
-                (start..ready)
-                    .map(|position| (position as usize, final_slots[position as usize]))
+                final_slots
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, slot)| start <= slot && slot < ready_end)
                     .unzip()
             }
             Some("latest_snapshot") => {

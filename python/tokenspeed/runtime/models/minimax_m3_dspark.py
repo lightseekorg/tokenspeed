@@ -34,7 +34,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -181,15 +180,6 @@ class DSparkMiniMaxDraftModel(DSparkDraftModel):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def final_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
-    ) -> torch.Tensor:
-        """The last layer hands back its MLP's partial; reduce it here."""
-        if residual is None:
-            return self.norm(hidden_states)
-        hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-        return self.norm(hidden_states, residual)[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         def runtime_named(weights):

@@ -26,7 +26,13 @@ import dataclasses
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.sampling import vocab_shard_topk, vocab_topk_merge
+from tokenspeed_kernel.ops.sampling import (
+    vocab_shard_logprob_blocks,
+    vocab_shard_logprob_layout,
+    vocab_shard_logprobs,
+    vocab_shard_topk,
+    vocab_topk_merge,
+)
 
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
@@ -38,22 +44,24 @@ def gather_topk_pairs(
     tp_size: int,
     tp_group: tuple[int, ...],
 ) -> torch.Tensor:
-    """Every rank's packed ``vocab_shard_topk`` pairs, as ``[R, rows, 2k]``.
+    """Every rank's packed rows (the ``vocab_shard_topk`` pairs and what
+    travels with them, or int64 argmax keys), as ``[R, rows, width]``.
 
     A column gather the communication backend prepared for this group (Iris
-    on gfx950) moves the fp32 pairs as raw 16-bit words and lands rank r's
-    pairs in columns ``r * 2k`` onward of every row; otherwise they land
-    rank-major in ``landing`` through ``all_gather_single``.
+    on gfx950, the all-reduce workspace's lamport exchange on NVIDIA) moves
+    the rows as raw 16-bit words and lands rank r's row in columns
+    ``r * width`` onward of every row; otherwise they land rank-major in
+    ``landing`` through ``all_gather_single``.
 
     Args:
-        staged: This rank's contiguous fp32 ``[rows, 2k]`` pairs.
-        landing: Contiguous fp32 ``[tp_size * rows, 2k]`` destination of the
-            fallback gather.
+        staged: This rank's contiguous fp32 or int64 ``[rows, width]`` rows.
+        landing: Contiguous ``[tp_size * rows, width]`` destination of the
+            fallback gather, of ``staged``'s dtype.
         tp_size: Ranks the vocabulary is sharded over.
         tp_group: Their global ranks.
 
     Returns:
-        An fp32 ``[tp_size, rows, 2k]`` view; with the prepared gather it
+        A ``[tp_size, rows, width]`` view of ``staged``'s dtype; with the prepared gather it
         borrows collective storage, which the caller must read before the
         group's next collective.
     """
@@ -61,7 +69,7 @@ def gather_topk_pairs(
     words = staged.view(torch.bfloat16)
     gather = get_global_backend().get_prepared_all_gather(tp_group, words.dtype)
     if gather is not None and gather.can_run(words):
-        gathered = gather.run(words).view(torch.float32)
+        gathered = gather.run(words).view(staged.dtype)
         return gathered.as_strided(
             (tp_size, rows, width),
             (width, gathered.stride(0), 1),
@@ -84,9 +92,13 @@ class SampledVocabShard:
     Attributes:
         logits: ``[rows, shard]`` LM-head output, before the logit scale and
             the softcap.
+        columns: The shard's real vocabulary columns, its first ones: fewer
+            than ``shard`` where the vocabulary ends inside the padded head.
         vocab_start: Global token id of shard column 0.
         logit_scale: Multiplier the processor applies to the logits, or None.
         softcap: The processor's final logit softcapping, or None.
+        softcap_form: How the processor computes it (``vocab_shard_topk``'s
+            ``softcap_form``), None without one.
         tp_size: Ranks the vocabulary is sharded over.
         tp_group: Their global ranks.
         gather_full: The processor's own tail: whole-vocabulary rows,
@@ -94,9 +106,11 @@ class SampledVocabShard:
     """
 
     logits: torch.Tensor
+    columns: int
     vocab_start: int
     logit_scale: float | None
     softcap: float | None
+    softcap_form: str | None
     tp_size: int
     tp_group: tuple[int, ...]
     gather_full: Callable[[torch.Tensor], torch.Tensor]
@@ -121,6 +135,7 @@ class SampledVocabShard:
         landing: torch.Tensor,
         ids_out: torch.Tensor,
         values_out: torch.Tensor,
+        logprob_values: torch.Tensor | None,
     ) -> None:
         """Each row's ``k`` best logits over the whole vocabulary.
 
@@ -132,20 +147,86 @@ class SampledVocabShard:
             k: Candidates per row.
             vocab_mask: int32 whole-vocabulary token bitmask (xgrammar
                 layout, bit set when allowed) per row, or None.
-            staged: Contiguous fp32 ``[rows, 2k]`` scratch.
-            landing: Contiguous fp32 ``[tp_size * rows, 2k]`` scratch.
+            staged: Contiguous fp32 ``[rows, 2k + halo]`` scratch, ``halo``
+                the :meth:`logprob_halo` columns with ``logprob_values``,
+                else 0.
+            landing: Contiguous fp32 ``[tp_size * rows, 2k + halo]`` scratch.
             ids_out: Contiguous int32 ``[rows, k]`` token ids.
             values_out: Contiguous fp32 ``[rows, k]`` values.
+            logprob_values: Contiguous ``[rows, V]`` scratch of the logits'
+                dtype for :meth:`token_logprobs`, or None: it receives the
+                final logits of this shard's columns and of the next
+                shard's first ``halo``.
         """
+        width = 2 * k
+        halo = None
+        if logprob_values is not None:
+            halo = staged[:, width:]
         vocab_shard_topk(
-            self.logits,
+            self.logits[:, : self.columns],
             k,
             self.logit_scale,
             self.vocab_start,
-            staged,
+            staged[:, :width],
             softcap=self.softcap,
+            softcap_form=self.softcap_form,
             vocab_mask=vocab_mask,
+            values_out=logprob_values,
+            halo_out=halo,
         )
-        pairs = gather_topk_pairs(staged, landing, self.tp_size, self.tp_group)
+        gathered = gather_topk_pairs(staged, landing, self.tp_size, self.tp_group)
         # The values were capped before the selection; the merge only sorts.
-        vocab_topk_merge(pairs, k, None, ids_out, values_out)
+        vocab_topk_merge(gathered[:, :, :width], k, None, ids_out, values_out)
+        if logprob_values is not None:
+            # The next shard's leading columns that this shard's last
+            # denominator block reads.
+            shard = self.logits.shape[1]
+            nxt = self.vocab_start // shard + 1
+            vocab = logprob_values.shape[1]
+            reach = min(nxt * shard + halo.shape[1], vocab)
+            if nxt < self.tp_size and reach > nxt * shard:
+                logprob_values[:, nxt * shard : reach].copy_(
+                    gathered[nxt, :, width : width + reach - nxt * shard]
+                )
+
+    def logprob_halo(self, vocab_size: int) -> int:
+        """Columns of the next shard :meth:`top_k` gathers for
+        :meth:`token_logprobs` over a ``vocab_size`` vocabulary."""
+        return vocab_shard_logprob_layout(self.logits.shape[1], vocab_size)[0]
+
+    def logprob_width(self, vocab_size: int) -> int:
+        """Columns of :meth:`token_logprobs`'s ``staged`` rows."""
+        return vocab_shard_logprob_layout(self.logits.shape[1], vocab_size)[1]
+
+    def token_logprobs(
+        self,
+        logprob_values: torch.Tensor,
+        row_max: torch.Tensor,
+        rows: torch.Tensor,
+        tokens: torch.Tensor,
+        staged: torch.Tensor,
+        landing: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Selected-token logprobs, bit for bit ``selected_token_logprobs``
+        on the whole masked rows :meth:`full_logits` gives.
+
+        Args:
+            logprob_values: The :meth:`top_k` scratch of this step's rows.
+            row_max: fp32 ``[S]`` best value of each row (``values_out[:,
+                0]`` of :meth:`top_k`), any stride.
+            rows: ``[M]`` row of each logprob (a tree's accepted path).
+            tokens: ``[M]`` token each logprob scores.
+            staged: Contiguous fp32 ``[M, logprob_width]`` scratch.
+            landing: Contiguous fp32 ``[tp_size * M, logprob_width]``
+                scratch.
+            out: fp32 ``[>= M]`` logprobs.
+        """
+        shard = self.logits.shape[1]
+        vocab_shard_logprob_blocks(
+            logprob_values, rows, tokens, row_max, self.vocab_start, shard, staged
+        )
+        partials = gather_topk_pairs(staged, landing, self.tp_size, self.tp_group)
+        vocab_shard_logprobs(
+            partials, rows, tokens, row_max, shard, logprob_values.shape[1], out
+        )

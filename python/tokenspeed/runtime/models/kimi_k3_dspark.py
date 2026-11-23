@@ -44,6 +44,7 @@ from collections.abc import Iterable
 import torch
 from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed_kernel.ops.embedding import apply_k_rope
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     mla_latent_norm_rope_scatter,
@@ -56,7 +57,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -73,7 +74,11 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     absorb_mla_kv_b_proj,
 )
-from tokenspeed.runtime.models.dflash import DFlashDecoderLayer
+from tokenspeed.runtime.models.dflash import (
+    DFlashDecoderLayer,
+    prepare_reduce_norm_fusion,
+    reduce_norm,
+)
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
@@ -107,6 +112,11 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
     MLA backend supplies it by giving every block row the same block-end
     ``seq_len``, so each query sees the whole block including its own future.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
+        self.absorbed_weights_k_major = self.absorption_kernel_plan is None
 
     def _attn(
         self,
@@ -277,12 +287,14 @@ class K3DSparkDecoderLayer(DFlashDecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self._norm_with_allreduce(
+            hidden_states, residual = reduce_norm(
                 self.input_layernorm,
                 hidden_states,
                 residual,
                 ctx,
                 self.mapping.dense,
+                self.fused_reduce_norm,
+                self.allreduce_fusion,
             )
 
         hidden_states = self.self_attn(
@@ -291,35 +303,17 @@ class K3DSparkDecoderLayer(DFlashDecoderLayer):
             ctx=ctx,
             comm_manager=self.comm_manager,
         )
-        hidden_states, residual = self._norm_with_allreduce(
+        hidden_states, residual = reduce_norm(
             self.post_attention_layernorm,
             hidden_states,
             residual,
             ctx,
             self.mapping.attn,
+            self.fused_reduce_norm,
+            self.allreduce_fusion,
         )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
-
-    @staticmethod
-    def _norm_with_allreduce(
-        norm: RMSNorm,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        ctx: ForwardContext,
-        group,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce the preceding row-parallel output, then norm.
-
-        Deliberately the unfused path. The fused variant reduces through Iris
-        symmetric-heap buffers sized from the target's shapes, and the draft's
-        block forward is a different width; until that is verified the plain
-        all-reduce is the correct default. It costs one extra pass over an
-        8-row tensor.
-        """
-        del ctx
-        hidden_states = all_reduce(hidden_states, group.tp_group)
-        return norm(hidden_states, residual)
 
 
 class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
@@ -406,6 +400,9 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # context write; refreshed in place after each weight load.
         self.register_buffer("_kv_norm_weight", None, persistent=False)
         self.register_buffer("_kv_norm_eps", None, persistent=False)
+        # Every layer's KV rows of the fused down-projection, stacked so the
+        # context write projects all layers in one GEMM.
+        self.register_buffer("_kv_a_weight", None, persistent=False)
         # The draft cache planes the context write stores into, and the plane
         # addresses they were built for.
         self._latent_planes: LatentPlanes | None = None
@@ -452,6 +449,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # Names the DFlash drafter reads off the draft model.
         self.block_size = None
         self.hidden_size = hidden_size
+        # Whether the layer boundaries fuse the all-reduce into the norm.
+        self.allreduce_fusion = False
 
     def configure_target(self, target_model, target_config) -> None:
         """Bind trained tap indices and stream semantics on every owning stage."""
@@ -553,12 +552,46 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         return self.context_norm(columns)
 
     def _finalize_hidden(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """Reduce the last row-parallel MLP output before final normalization."""
-        hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-        hidden_states, _ = self.final_norm(hidden_states, residual)
+        hidden_states, _ = reduce_norm(
+            self.final_norm,
+            hidden_states,
+            residual,
+            ctx,
+            self.mapping.dense,
+            fused=None,
+            allreduce_fusion=self.allreduce_fusion,
+        )
         return hidden_states
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Arm the fused all-reduce + norm of the draft's layer boundaries.
+
+        Collective, before cache sizing and graph capture. A group without
+        it, or rows past ``comm_fusion_max_num_tokens``, reduce through the
+        draft all-reduce and norm unfused.
+
+        Args:
+            max_num_tokens: Most rows a forward carries; unused.
+
+        Returns:
+            Whether the draft armed the fusion.
+        """
+        del max_num_tokens
+        if not self.layers:
+            # A PP stage without draft layers has no boundary norms to fuse.
+            return False
+        self.allreduce_fusion = prepare_reduce_norm_fusion(
+            self.mapping, int(self.config.hidden_size)
+        )
+        for layer in self.layers:
+            layer.allreduce_fusion = self.allreduce_fusion
+        return self.allreduce_fusion
 
     # ------------------------------------------------------------------
     # Context-injection contract (see DFlashDraftModel for the GQA counterpart)
@@ -584,10 +617,11 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         """Project target-derived context into each draft layer's latent cache.
 
-        One row per token per layer, laid out ``[c_KV_norm | k_PE_RoPE]``. Each
-        layer's KV half of the fused down-projection runs as its own GEMM, then
-        one launch normalizes, rotates and stores every layer's rows with the
-        bytes of the per-layer norm, RoPE and store chain.
+        One row per token per layer, laid out ``[c_KV_norm | k_PE_RoPE]``. The
+        layers' KV halves of the fused down-projection run as one GEMM over
+        their stacked rows (one GEMM per layer when the weights do not stack),
+        then one launch normalizes, rotates and stores every layer's rows with
+        the bytes of the per-layer norm, RoPE and store chain.
         """
         rows = ctx_hidden.shape[0]
         if rows == 0:
@@ -595,12 +629,20 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         attns = [layer.self_attn for layer in self.layers]
         first = attns[0]
         width = first.kv_lora_rank + first.qk_rope_head_dim
-        # Each layer's rows start 512-byte aligned like a fresh allocation, so
-        # cuBLAS gets the problem the per-layer F.linear gave it.
-        layer_stride = -(-rows * width // 256) * 256
-        latent = ctx_hidden.new_empty((len(attns), layer_stride))[:, : rows * width]
-        for index, attn in enumerate(attns):
-            attn.project_latent_rows(ctx_hidden, latent[index].view(rows, width))
+        stacked = self._kv_a_weight
+        if stacked is not None and stacked.dtype == ctx_hidden.dtype:
+            latent = kernel_mm(ctx_hidden.contiguous(), stacked).view(
+                rows, len(attns), width
+            )
+        else:
+            # Each layer's rows start 512-byte aligned like a fresh allocation,
+            # so cuBLAS gets the problem the per-layer F.linear gave it.
+            layer_stride = -(-rows * width // 256) * 256
+            latent = ctx_hidden.new_empty((len(attns), layer_stride))
+            latent = latent[:, : rows * width]
+            for index, attn in enumerate(attns):
+                attn.project_latent_rows(ctx_hidden, latent[index].view(rows, width))
+            latent = latent.view(len(attns), rows, width).transpose(0, 1)
         # Context injection writes the same sharded cache as attention:
         # the backend's placement (None for a replicated group) decides
         # which rows this rank stores and where.
@@ -618,7 +660,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # Called directly: the kvcache family's one portable Triton solution
         # has no registry entry.
         mla_latent_norm_rope_scatter(
-            latent.view(len(attns), rows, width).transpose(0, 1),
+            latent,
             self._kv_norm_weight,
             self._kv_norm_eps,
             rotary.cos_sin_cache,
@@ -693,7 +735,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         if residual is None:
             hidden_states = self.final_norm(hidden_states)
         else:
-            hidden_states = self._finalize_hidden(hidden_states, residual)
+            hidden_states = self._finalize_hidden(hidden_states, residual, ctx)
 
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=hidden_states
@@ -816,7 +858,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        """Precompute the absorbed decode factors and the stacked context norms."""
+        """Precompute the absorbed decode factors and the stacked context norms
+        and KV rows."""
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
         if self.fc_norm is not None:
@@ -825,6 +868,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             ).contiguous()
         if self.layers:
             self._stack_latent_norms()
+            self._stack_latent_kv_rows()
 
     def _stack_latent_norms(self) -> None:
         """Stack every layer's kv_a_layernorm for the one-launch context write.
@@ -852,6 +896,36 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             return
         self._kv_norm_weight.copy_(weight)
         self._kv_norm_eps.copy_(eps)
+
+    def _stack_latent_kv_rows(self) -> None:
+        """Stack every layer's KV rows of the fused down-projection for the
+        one-GEMM context write.
+
+        Only unquantized fused weights stack; other layouts keep the per-layer
+        projection. A reload copies into the existing buffer, which captured
+        graphs read.
+        """
+        attns = [layer.self_attn for layer in self.layers]
+        weights = [
+            getattr(attn.fused_qkv_a_proj_with_mqa, "weight", None) for attn in attns
+        ]
+        if any(
+            weight is None or weight.dtype not in (torch.bfloat16, torch.float16)
+            for weight in weights
+        ):
+            self._kv_a_weight = None
+            return
+        width = attns[0].kv_lora_rank + attns[0].qk_rope_head_dim
+        stacked = torch.cat(
+            [
+                weight.detach()[attn.q_lora_rank : attn.q_lora_rank + width]
+                for attn, weight in zip(attns, weights, strict=True)
+            ]
+        )
+        if self._kv_a_weight is None or self._kv_a_weight.shape != stacked.shape:
+            self._kv_a_weight = stacked
+            return
+        self._kv_a_weight.copy_(stacked)
 
 
 EntryClass = [K3DSparkModel]

@@ -32,7 +32,7 @@ import pytest
 
 from tokenspeed.cli import main as cli_main
 from tokenspeed.runtime.cache.host_budget import (
-    ManifestInvalid,
+    ManifestInvalidError,
     evaluate_manifest,
     parse_manifest_json,
     pinned_reservation_bytes,
@@ -154,7 +154,7 @@ def by_id(entries: list[dict[str, Any]], entry_id: str) -> dict[str, Any]:
 
 
 def issues_of(document: Any) -> list[tuple[str, str]]:
-    with pytest.raises(ManifestInvalid) as raised:
+    with pytest.raises(ManifestInvalidError) as raised:
         evaluate_manifest(document)
     return [(issue.path, issue.message) for issue in raised.value.issues]
 
@@ -216,6 +216,30 @@ def test_rounding_basis_charges_the_reservation_not_the_tensor_bytes():
     assert by_id(report["containers"], "c")["by_kind"]["snapshot_pool"] == 2 * (
         512 << 20
     )
+
+
+@pytest.mark.parametrize("threshold,expected", [(None, 4 * GIB), (GIB, 3 * GIB)])
+def test_json_manifest_rounding_threshold_null_and_integer(
+    tmp_path, capsys, threshold, expected
+):
+    allocations = rank_allocations(
+        l2=0, snapshot=0, slot_state=0, segment=0, staging=0, headroom=0
+    )
+    allocations[0]["reservation"] = {
+        "basis": "pinned_rounding",
+        "requested_bytes": 3 * GIB,
+        "round_threshold_bytes": threshold,
+    }
+    document = manifest(
+        [node("n", 8 * GIB, 0)],
+        [],
+        [job("j", [[ranks("r", 1, {"node": "n"}, allocations)]], 1)],
+    )
+    code, output = run_cli(
+        ["cache-budget", write_manifest(tmp_path, document), "--format", "json"], capsys
+    )
+    assert code == 0
+    assert by_id(json.loads(output)["nodes"], "n")["by_kind"]["l2"] == expected
 
 
 # --- the example and the CLI -----------------------------------------------
@@ -482,7 +506,11 @@ def test_contradictory_shared_declarations_are_rejected():
     private = allocation("shm", "other", "private", declared(GIB))
 
     messages = [m for _, m in issues_of(two_users(shared, bigger, {"container": "c"}))]
-    assert any("has reservation" in m for m in messages)
+    assert any(
+        'has reservation {"basis": "declared", "bytes": 2147483648} here '
+        'but {"basis": "declared", "bytes": 1073741824}' in message
+        for message in messages
+    )
     messages = [m for _, m in issues_of(two_users(shared, shared, {"container": "d"}))]
     assert any("has memory domain container d" in m for m in messages)
     messages = [m for _, m in issues_of(two_users(shared, shared, {"node": "n"}))]
@@ -664,7 +692,7 @@ def test_unknown_fields_and_roles_are_rejected():
     ],
 )
 def test_manifest_text_must_be_strict_json(text, message):
-    with pytest.raises(ManifestInvalid) as raised:
+    with pytest.raises(ManifestInvalidError) as raised:
         parse_manifest_json(text)
     assert message in raised.value.issues[0].message
 

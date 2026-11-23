@@ -454,6 +454,12 @@ class MSAHybridAttnBackend(AttentionBackend):
             return self.sparse_router
         return self.full_router
 
+    def prefill_request_layout(self):
+        return self.full_router.prefill_request_layout()
+
+    def model_binding(self, layer_id, binding_type):
+        return self._router_for_layer(layer_id).model_binding(layer_id, binding_type)
+
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.full_router, self.sparse_router)
 

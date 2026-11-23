@@ -37,13 +37,19 @@ def rmsnorm(
     if x.shape[0] == 0:
         result = x if out is None else out
         return (result, residual) if residual is not None else result
+    # CANN requires matching activation and scale dtypes. Keep FP32 checkpoint
+    # scales intact, then restore the caller's activation/storage dtype.
+    compute_dtype = torch.promote_types(x.dtype, weight.dtype)
+    norm_x = x.to(compute_dtype)
+    norm_weight = weight.to(compute_dtype)
     if residual is not None:
         result, _, residual_out = torch_npu.npu_add_rms_norm(
-            x, residual, weight, epsilon=eps
+            norm_x, residual.to(compute_dtype), norm_weight, epsilon=eps
         )
         residual.copy_(residual_out)
-        return result, residual
-    result, _ = torch_npu.npu_rms_norm(x, weight, epsilon=eps)
+        return result.to(x.dtype), residual
+    result, _ = torch_npu.npu_rms_norm(norm_x, norm_weight, epsilon=eps)
+    result = result.to(x.dtype)
     if out is not None:
         out.copy_(result)
         result = out
@@ -66,13 +72,8 @@ def qk_rmsnorm(
     if q.shape[-1] % head_dim or k.shape[-1] % head_dim:
         raise ValueError("q and k widths must be divisible by the head dimension")
 
-    q_shape, k_shape = q.shape, k.shape
-    q_heads = q.reshape(-1, q.shape[-1] // head_dim, head_dim)
-    k_heads = k.reshape(-1, k.shape[-1] // head_dim, head_dim)
-    q_scale = torch.rsqrt(q_heads.float().square().mean(-1, keepdim=True) + eps)
-    k_scale = torch.rsqrt(k_heads.float().square().mean(-1, keepdim=True) + eps)
-    q_out = (q_heads * q_scale.to(q.dtype) * q_weight).reshape(q_shape)
-    k_out = (k_heads * k_scale.to(k.dtype) * k_weight).reshape(k_shape)
+    q_out = rmsnorm(q.reshape(-1, head_dim), q_weight, eps).reshape_as(q)
+    k_out = rmsnorm(k.reshape(-1, head_dim), k_weight, eps).reshape_as(k)
     return q_out, k_out
 
 

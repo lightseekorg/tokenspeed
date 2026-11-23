@@ -28,13 +28,16 @@ from tokenspeed_kernel._triton import tl, triton
 CAUSAL_CONV1D_BLOCK_M = 8
 
 
-@triton.jit
+# offsets starts CHUNKS int32s into its allocation: its alignment follows the batch
+@triton.jit(
+    do_not_specialize=["CHUNKS", "SEQUENCES"],
+    do_not_specialize_on_alignment=["offsets"],
+)
 def _refresh_conv_capacity_kernel(
     boundaries,
     batches,
     offsets,
-    # Chunk and sequence counts follow the batch; runtime so every batch shape
-    # shares one binary.
+    # Batch-shaped counts stay unspecialized, so every batch shape shares one binary.
     CHUNKS,
     SEQUENCES,
     BLOCK_M: tl.constexpr,

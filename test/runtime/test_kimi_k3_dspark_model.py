@@ -32,8 +32,12 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.configs.base import block_draft_is_causal
 from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
+from tokenspeed.runtime.models import dflash as dflash_module
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
-from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
+from tokenspeed.runtime.models.kimi_k3_dspark import (
+    K3DSparkDecoderLayer,
+    K3DSparkModel,
+)
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(
@@ -371,29 +375,141 @@ def test_idle_forward_with_no_rows_skips_dense_draft_layers() -> None:
     model.final_norm.assert_not_called()
 
 
-def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:
+_GROUP = tuple(range(8))
+
+
+def _tp(group: tuple[int, ...] = _GROUP) -> SimpleNamespace:
+    return SimpleNamespace(tp_group=group, tp_rank=3, tp_size=len(group))
+
+
+class _Norm(torch.nn.Module):
+    """Doubles the residual sum; its fused form sums the 8 ranks' rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fused: list[tuple] = []
+
+    def forward(self, hidden_states, residual):
+        total = hidden_states + residual
+        return total * 2, total
+
+    def forward_with_allreduce_fusion(self, rank, group, hidden_states, residual):
+        self.fused.append((rank, group))
+        total = hidden_states * 8 + residual
+        return total * 2, total, None
+
+
+def _fusion_patches(rows_cap: int):
+    return (
+        mock.patch.dict(
+            dflash_module.global_server_args_dict,
+            {"comm_fusion_max_num_tokens": rows_cap},
+        ),
+        mock.patch.object(
+            dflash_module,
+            "draft_all_reduce",
+            side_effect=lambda hidden, group: hidden * 8,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "armed,rows,fused", [(False, 2, False), (True, 2, True), (True, 5, False)]
+)
+def test_final_norm_reduces_the_last_row_parallel_mlp_output(armed, rows, fused):
+    """An armed draft fuses the reduce into the final norm up to the cap."""
     model = K3DSparkModel.__new__(K3DSparkModel)
     torch.nn.Module.__init__(model)
-    tp_group = object()
-    model.mapping = SimpleNamespace(dense=SimpleNamespace(tp_group=tp_group))
+    model.mapping = SimpleNamespace(dense=_tp())
+    model.allreduce_fusion = armed
+    model.final_norm = _Norm()
+    hidden = torch.arange(rows * 2, dtype=torch.float32).view(rows, 2)
+    residual = torch.full((rows, 2), 10.0)
+    cap, reduce = _fusion_patches(4)
 
-    class _FinalNorm(torch.nn.Module):
-        def forward(self, hidden_states, residual):
-            return hidden_states + residual, residual
+    with cap, reduce as all_reduce:
+        out = model._finalize_hidden(
+            hidden, residual, SimpleNamespace(input_num_tokens=rows)
+        )
 
-    model.final_norm = _FinalNorm()
-    local_hidden = torch.tensor([[1.0, 2.0]])
-    residual = torch.tensor([[10.0, 20.0]])
+    torch.testing.assert_close(out, (hidden * 8 + residual) * 2)
+    assert model.final_norm.fused == ([(3, _GROUP)] if fused else [])
+    assert all_reduce.call_count == (0 if fused else 1)
 
-    with mock.patch.object(
-        dspark_model_module,
-        "all_reduce",
-        side_effect=lambda hidden, group: hidden * 8,
-    ) as reduce:
-        out = model._finalize_hidden(local_hidden, residual)
 
-    reduce.assert_called_once_with(local_hidden, tp_group)
-    torch.testing.assert_close(out, local_hidden * 8 + residual)
+@pytest.mark.parametrize(
+    "armed,rows,fused", [(False, 2, False), (True, 2, True), (True, 5, False)]
+)
+def test_both_layer_boundaries_fuse_the_reduce_into_the_norm(armed, rows, fused):
+    """A layer's input and post-attention norms take the fusion together."""
+    layer = K3DSparkDecoderLayer.__new__(K3DSparkDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.mapping = SimpleNamespace(dense=_tp(), attn=_tp())
+    layer.input_layernorm = _Norm()
+    layer.post_attention_layernorm = _Norm()
+    layer.self_attn = lambda positions, hidden_states, ctx, comm_manager: (
+        hidden_states + 1
+    )
+    layer.comm_manager = None
+    layer.mlp = lambda hidden_states: hidden_states * 3
+    layer.fused_reduce_norm = None
+    layer.allreduce_fusion = armed
+    hidden = torch.arange(rows * 2, dtype=torch.float32).view(rows, 2)
+    residual = torch.full((rows, 2), 10.0)
+    cap, reduce = _fusion_patches(4)
+
+    with cap, reduce as all_reduce:
+        out, out_residual = layer(
+            positions=None,
+            hidden_states=hidden,
+            ctx=SimpleNamespace(input_num_tokens=rows),
+            residual=residual,
+        )
+
+    first = hidden * 8 + residual
+    second = (first * 2 + 1) * 8 + first
+    torch.testing.assert_close(out_residual, second)
+    torch.testing.assert_close(out, second * 2 * 3)
+    for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+        assert norm.fused == ([(3, _GROUP)] if fused else [])
+    assert all_reduce.call_count == (0 if fused else 2)
+
+
+@pytest.mark.parametrize(
+    "ranks,prepared,layers", [(8, True, 2), (8, False, 2), (1, True, 2), (8, True, 0)]
+)
+def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(
+    ranks, prepared, layers
+):
+    """The shared dense and attention group arms once; one rank never does.
+
+    Nor does a pipeline stage without draft layers: it has no norms to fuse.
+    """
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    group = tuple(range(ranks))
+    model.mapping = SimpleNamespace(dense=_tp(group), attn=_tp(group))
+    model.config = SimpleNamespace(hidden_size=7168)
+    model.layers = [SimpleNamespace(allreduce_fusion=False) for _ in range(layers)]
+    model.allreduce_fusion = False
+    armed = ranks > 1 and prepared and layers > 0
+
+    with (
+        mock.patch.dict(
+            dflash_module.global_server_args_dict,
+            {"comm_fusion_max_num_tokens": 2048},
+        ),
+        mock.patch.object(
+            dflash_module, "prepare_all_reduce_fusion", return_value=prepared
+        ) as prepare,
+    ):
+        assert model.prepare_communication_runtime(512) is armed
+
+    assert prepare.call_args_list == (
+        [mock.call(group, 7168, 2048)] if ranks > 1 and layers > 0 else []
+    )
+    assert model.allreduce_fusion is armed
+    assert [layer.allreduce_fusion for layer in model.layers] == [armed] * layers
 
 
 def test_every_remaining_checkpoint_key_has_a_destination() -> None:
@@ -547,18 +663,31 @@ class _LatentPool:
 def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
     """The per-layer context write the fused one replaced.
 
-    It runs F.linear over the KV rows, kv_a_layernorm, RoPE, then the latent
-    store.
+    It projects the KV rows the way the fused write does (one GEMM over the
+    stacked rows, else F.linear per layer), then runs kv_a_layernorm, RoPE and
+    the latent store layer by layer.
     """
+    from tokenspeed_kernel.ops.gemm import mm as kernel_mm
     from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
-    for layer, plane in zip(model.layers, planes, strict=True):
+    if model._kv_a_weight is not None:
+        projected = kernel_mm(rows, model._kv_a_weight)
+        projected = projected.view(rows.shape[0], len(model.layers), -1).unbind(1)
+    else:
+        projected = [
+            torch.nn.functional.linear(
+                rows,
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ],
+            )
+            for layer in model.layers
+        ]
+    for layer, plane, latent in zip(model.layers, planes, projected, strict=True):
         attn = layer.self_attn
         rank = attn.kv_lora_rank
-        weight = attn.fused_qkv_a_proj_with_mqa.weight
-        latent = torch.nn.functional.linear(rows, weight[attn.q_lora_rank :])
         latent = torch.cat(
             (attn.kv_a_layernorm(latent[:, :rank].contiguous()), latent[:, rank:]),
             dim=-1,
@@ -578,37 +707,84 @@ def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("sanitize", [False, True])
-@pytest.mark.parametrize("rows", [1, 8, 40])
+# Seed 61 reproduced the MI355 rounding difference across an FP8 boundary.
+# Weights that don't stack keep the per-layer projections.
+@pytest.mark.parametrize(
+    ("rows", "seed", "stacked"),
+    [(1, 1, True), (8, 8, True), (40, 40, True), (40, 61, True), (8, 8, False)],
+)
 def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
-    dtype, sanitize, rows
+    dtype, sanitize, rows, seed, stacked
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
-    generator = torch.Generator(device="cuda").manual_seed(rows)
+    if not stacked:
+        model._kv_a_weight = None
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = (torch.randn(rows, 256, device="cuda", generator=generator)).bfloat16()
     positions = torch.randint(4096, (rows,), device="cuda", generator=generator)
     slots = torch.randperm(127, device="cuda", generator=generator)[:rows] + 1
 
-    def planes():
+    def planes(cache_dtype):
         return [
-            torch.full((128, 1, 576), 3.0, device="cuda").to(dtype)
+            torch.full((128, 1, 576), 3.0, device="cuda").to(cache_dtype)
             for _ in model.layers
         ]
 
-    expected, actual = planes(), planes()
+    expected, actual = planes(dtype), planes(dtype)
     _chain_write(model, hidden, positions, slots, expected, None, sanitize)
     backend = SimpleNamespace(cache_placement=lambda layer: None)
     model.write_context_kv(
         hidden, positions, slots, _LatentPool(actual, sanitize), attn_backend=backend
     )
-    for got, want in zip(actual, expected, strict=True):
-        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    if torch.version.hip is None:
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+            assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
+        return
+
+    # Compare only the written RMSNorm values with tolerance. FP8 must
+    # still exactly encode the fused path's BF16 values.
+    bf16_expected, bf16_actual = expected, actual
+    if dtype != torch.bfloat16:
+        bf16_expected, bf16_actual = planes(torch.bfloat16), planes(torch.bfloat16)
+        _chain_write(model, hidden, positions, slots, bf16_expected, None, sanitize)
+        model.write_context_kv(
+            hidden,
+            positions,
+            slots,
+            _LatentPool(bf16_actual, sanitize),
+            attn_backend=backend,
+        )
+    written = torch.zeros(128, device=slots.device, dtype=torch.bool)
+    written[slots] = True
+    rank_width = model.layers[0].self_attn.kv_lora_rank
+    norm_bytes = rank_width * actual[0].element_size()
+    for got, want, got_bf16, want_bf16 in zip(
+        actual, expected, bf16_actual, bf16_expected, strict=True
+    ):
+        got_bytes = got.view(torch.uint8)
+        want_bytes = want.view(torch.uint8)
+        assert torch.equal(got_bytes[~written], want_bytes[~written])
+        assert torch.equal(got_bytes[..., norm_bytes:], want_bytes[..., norm_bytes:])
+        got_norm = got_bf16[slots, :, :rank_width].contiguous()
+        want_norm = want_bf16[slots, :, :rank_width].contiguous()
+        assert (
+            (got_norm.view(torch.int16).int() - want_norm.view(torch.int16).int()).abs()
+            <= 1
+        ).all()
+        if dtype != torch.bfloat16:
+            assert torch.equal(
+                got_bytes[slots, :, :norm_bytes], got_norm.to(dtype).view(torch.uint8)
+            )
         assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
-def test_context_kv_write_respects_dcp_ownership():
+# Seed 35 reproduced the one-ULP BF16 RMSNorm difference on MI355.
+@pytest.mark.parametrize("seed", [0, 35])
+def test_context_kv_write_respects_dcp_ownership(seed):
     """Under KV parallelism each rank stores only the rows it owns.
 
     A rank writes the rows whose pages it owns, at its local slots; padding
@@ -619,7 +795,10 @@ def test_context_kv_write_respects_dcp_ownership():
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
     slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1], device="cuda")
-    hidden = torch.randn(slots.numel(), 256, device="cuda").bfloat16()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = torch.randn(
+        slots.numel(), 256, device="cuda", generator=generator
+    ).bfloat16()
     positions = torch.arange(slots.numel(), device="cuda")
     owned_rows = 0
     for rank in range(4):
@@ -637,7 +816,48 @@ def test_context_kv_write_respects_dcp_ownership():
             attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         )
         for got, want in zip(actual, expected, strict=True):
-            assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+            got_bits = got.view(torch.int16)
+            want_bits = want.view(torch.int16)
+            if torch.version.hip is None:
+                assert torch.equal(got_bits, want_bits)
+                continue
+            written = (want != 0).any(dim=(1, 2))
+            assert torch.equal((got != 0).any(dim=(1, 2)), written)
+            assert torch.equal(got_bits[~written], want_bits[~written])
+            rank_width = model.layers[0].self_attn.kv_lora_rank
+            assert torch.equal(got_bits[..., rank_width:], want_bits[..., rank_width:])
+            # The fused RMSNorm uses FlashInfer's reduction order, which can
+            # round one BF16 value away from the AMD Triton reference.
+            got_norm = got_bits[written, :, :rank_width].int()
+            want_norm = want_bits[written, :, :rank_width].int()
+            assert ((got_norm - want_norm).abs() <= 1).all()
         owned_rows += int(actual[0].abs().sum(dim=(1, 2)).gt(0).sum())
     # Rows 128..896 are owned by exactly one rank each; 0, 1024 and -1 by none.
     assert owned_rows == 6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
+def test_stacked_kv_rows_follow_each_weight_load():
+    """The context write's stacked KV rows are every layer's, refreshed in
+    place on reload so captured graphs read the new weights."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    model = _tiny_draft(Mapping(rank=0, world_size=1))
+
+    def kv_rows():
+        return torch.cat(
+            [
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ]
+                for layer in model.layers
+            ]
+        )
+
+    stacked = model._kv_a_weight
+    assert torch.equal(stacked, kv_rows())
+    for layer in model.layers:
+        layer.self_attn.fused_qkv_a_proj_with_mqa.weight.data.mul_(2.0)
+    model.post_load_weights()
+    assert model._kv_a_weight is stacked
+    assert torch.equal(stacked, kv_rows())

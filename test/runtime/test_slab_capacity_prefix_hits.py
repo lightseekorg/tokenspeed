@@ -9,7 +9,7 @@ doubling, and behaviorally, via
 the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
 the legacy arm's halved pool recycles it before reuse).
 
-Requires the grouped-cache tokenspeed_scheduler extension.
+Requires the grouped-cache tokenspeed_engine.scheduler extension.
 
 Usage:
     cd test/runtime
@@ -246,8 +246,8 @@ class TestSlabCapacityPrefixHits:
 
     def setup_method(self):
         pytest.importorskip(
-            "tokenspeed_scheduler",
-            reason="tokenspeed_scheduler ext is not installed",
+            "tokenspeed_engine.scheduler",
+            reason="tokenspeed_engine.scheduler ext is not installed",
             exc_type=ImportError,
         )
         if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):

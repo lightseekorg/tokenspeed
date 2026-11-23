@@ -25,6 +25,7 @@ from unittest import mock
 
 import pytest
 import torch
+import utils
 from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
@@ -71,12 +72,16 @@ def reference(values, scale):
 
 def check(result, expected, dtype):
     tolerance = 0.04 if dtype == torch.bfloat16 else 0.008
+    check_within(result, expected, tolerance, tolerance)
+
+
+def check_within(result, expected, atol, rtol):
     for actual, wanted in zip(result, expected):
         if wanted is None:
             assert actual is None
         else:
             torch.testing.assert_close(
-                actual.cpu().double(), wanted, rtol=tolerance, atol=tolerance
+                actual.cpu().double(), wanted, rtol=rtol, atol=atol
             )
 
 
@@ -189,6 +194,7 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
 @pytest.mark.parametrize(
     "rows",
     [
+        16,
         17,
         24,
         31,
@@ -224,10 +230,13 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
 )
 def test_batched_fp64_and_changed_input_graph(rows):
     dtype = torch.bfloat16
+    # SM107 S16 rows: a lost split-K slice of the gate moves outputs by ~0.004.
+    s16 = current_platform().arch_version == ArchVersion(10, 7) and 17 <= rows <= 64
+    atol, rtol = (0.002, 0.01) if s16 else (0.04, 0.04)
     values = inputs(rows, dtype, True)
     pdl_enabled(True)
     result = mix(values, 0.25, True)
-    check(result, reference(values, 0.25), dtype)
+    check_within(result, reference(values, 0.25), atol, rtol)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -243,7 +252,7 @@ def test_batched_fp64_and_changed_input_graph(rows):
         torch.cuda.synchronize()
         expected = reference(values, 0.25)
         for output in outputs:
-            check(output, expected, dtype)
+            check_within(output, expected, atol, rtol)
         for output in outputs[1:]:
             for actual, first in zip(output, outputs[0]):
                 assert torch.equal(actual, first)
@@ -266,7 +275,7 @@ def test_up_activation_reuse_across_token_tiles(
 ):
     _reset_caches(monkeypatch)
     # Limit residency to one worker so its activation slot is overwritten for
-    # five token tiles, including a tail, within each launch.
+    # several token tiles, including a tail, within each launch.
     monkeypatch.setattr(
         cute_fused,
         "_capacity",
@@ -650,6 +659,7 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     workspaces = dict(cute_fused._WORKSPACES)
     graph = torch.cuda.CUDAGraph()
     with (
+        utils.assert_no_cute_compile(),
         mock.patch.object(
             cute_fused.cute_ext,
             "compile",
@@ -844,7 +854,8 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     with torch.cuda.stream(stream):
         mix(first, 0.25, True)
     stream.synchronize()
-    kernel = next(iter(cute_fused._PLANS.values()))[0]
+    # The last plan serves the call; the first is the single-worker capacity probe.
+    kernel = list(cute_fused._PLANS.values())[-1][0]
     span = kernel.n * kernel.workers
     values = [inputs(rows, dtype, True) for rows in (span + 1, span + 7, 2 * span - 1)]
     # A new scheduling-round bucket still needs warmup before capture.
@@ -881,7 +892,7 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     assert set(cute_fused._WORKSPACES) == workspace_keys
 
 
-@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 193, 385, 513, 1023])
+@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 65, 127, 193, 385, 513, 1023])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_tail_preserves_output_guards(rows, dtype):
     values = inputs(rows, dtype, True)

@@ -49,7 +49,7 @@ using token_span = std::span<const std::int32_t>;
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
-    return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
+    return CacheKey{.group_id = group_id, .content_hash = ContentHash{std::move(hashes.front())}};
 }
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.
@@ -118,11 +118,11 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
     CacheOnePage(mgr, pool, h4);
     std::vector<CacheKey> hashes{h0, h1, h2, h3, h4};
 
-    PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/5);
+    PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*end_block=*/5);
     EXPECT_EQ(unbounded.blocks.size(), 5u);
     EXPECT_EQ(unbounded.NumHitBlocks(), 3);
 
-    PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/4);
+    PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*end_block=*/4);
     EXPECT_TRUE(bounded.blocks.empty());
     EXPECT_EQ(bounded.NumHitBlocks(), 0);
 }
@@ -213,7 +213,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         mgr.CachedBlockMetadataFor(pool, speculative_location);
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
+    EXPECT_EQ(after->eviction.last_access_epoch, before->eviction.last_access_epoch);
 }
 
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
@@ -224,7 +224,8 @@ TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheOnePage(mgr, pool, h0);  // a real cached page must NOT shrink or anchor the match
 
-    std::vector<CacheKey> keys{h0, CacheKey{.content_hash = "k1"}, CacheKey{.content_hash = "k2"}};
+    std::vector<CacheKey> keys{h0, CacheKey{.content_hash = ContentHash{"k1"}},
+                               CacheKey{.content_hash = ContentHash{"k2"}}};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, 0}));
     EXPECT_EQ(m.NumHitBlocks(), 0);
@@ -330,15 +331,86 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     EXPECT_FALSE(table.Blocks()[0]);
 }
 
+TEST(GroupAllocatorTest, BucketBalanceCountsKeptHeadAfterReclaim) {
+    BlockPool pool(8, {4});
+    pool.RegisterGroup(0, 4, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/1);
+    BlockTable table;
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 8}, 0, {}));
+    allocator.ReclaimExpired(pool, table, 7);
+    ASSERT_EQ(table.ReclaimedPrefixBlocks(), 7);
+    ASSERT_TRUE(table.Blocks()[0]);
+    const auto head_bucket = allocator.BucketOf(table.Blocks()[0]->Location());
+
+    // The live tail keeps a second parent open with a hole in the head bucket.
+    ASSERT_TRUE(table.Blocks()[7]);
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}));
+    ASSERT_TRUE(table.Blocks().back());
+    EXPECT_NE(allocator.BucketOf(table.Blocks().back()->Location()), head_bucket);
+}
+
+TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInteriorHole) {
+    BlockPool pool(8, {4});
+    pool.RegisterGroup(0, 4, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
+    BlockTable table;
+    ASSERT_TRUE(allocator.Acquire(pool, table,
+                                  AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}));
+    ASSERT_EQ(table.ReclaimedPrefixBlocks(), 64);
+    table.EvictToNull(65).reset();
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
+    std::vector<std::int32_t> buckets;
+    for (const auto& ref : table.Blocks().subspan(67)) buckets.push_back(allocator.BucketOf(ref->Location()));
+    std::sort(buckets.begin(), buckets.end());
+    EXPECT_EQ(buckets, (std::vector<std::int32_t>{0, 1, 1, 3}));
+    const auto before = allocator.BlockTablePageIds(table);
+    const auto occupied = pool.NumOccupiedSlots();
+    EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}, 0, {}));
+    EXPECT_EQ(allocator.BlockTablePageIds(table), before);
+    EXPECT_EQ(pool.NumOccupiedSlots(), occupied);
+    allocator.Free(table);
+    EXPECT_EQ(table.ReclaimedPrefixBlocks(), 0);
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}));
+    EXPECT_EQ(allocator.BucketOf(table.Blocks()[0]->Location()), 0);
+}
+
+TEST(GroupAllocatorTest, ReclaimedSharedPrefixDoesNotCountTowardNewPlacement) {
+    BlockPool pool(8, {4});
+    pool.RegisterGroup(0, 4, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
+    BlockTable owner;
+    ASSERT_TRUE(allocator.Acquire(pool, owner, AcquirePlan{.num_blocks = 8}, 0, {}));
+    const auto owner_ids = allocator.BlockTablePageIds(owner);
+    PrefixMatch prefix;
+    prefix.blocks.assign(owner.Blocks().begin(), owner.Blocks().end());
+    BlockTable shared;
+    allocator.ClaimHitBlocks(shared, std::move(prefix));
+    allocator.ReclaimExpired(pool, shared, 6);
+    ASSERT_EQ(shared.ReclaimedPrefixBlocks(), 6);
+    auto replaced = allocator.SwapInFreshBlock(pool, shared, 7, 0, std::nullopt);
+    ASSERT_TRUE(replaced);
+    EXPECT_EQ(allocator.BucketOf(shared.Blocks()[7]->Location()), 3);
+    ASSERT_TRUE(allocator.Acquire(pool, shared, AcquirePlan{.num_blocks = 1}, 0, {}));
+    EXPECT_EQ(allocator.BucketOf(shared.Blocks()[8]->Location()), 0);
+    EXPECT_EQ(allocator.BlockTablePageIds(owner), owner_ids);
+    allocator.Free(shared);
+    allocator.Free(owner);
+    replaced.reset();
+    EXPECT_EQ(pool.NumOccupiedSlots(), 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);
+}
+
 TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
     BlockPool pool(6, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     PrefixCacheIndex index(/*group_id=*/0);
     std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(0, 6);
     ASSERT_EQ(blocks.size(), 6u);
     for (const std::int32_t slot : {2, 4}) {
-        index.Register(pool, blocks[slot], CacheKey{.content_hash = std::to_string(slot)}, /*access_epoch=*/1, slot,
-                       CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr, /*session=*/nullptr);
+        index.Register(pool, blocks[slot], CacheKey{.content_hash = ContentHash{std::to_string(slot)}},
+                       /*access_epoch=*/1, slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
     }
     BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, std::move(blocks), /*available_tokens=*/0);
     allocator.ReclaimExpired(pool, table, 1);
@@ -352,19 +424,20 @@ TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
             cached_pin.reset();
             uncached_pin.reset();
         }
-        for (const std::int32_t expired : {0, 1, 2, 3, 4, 5, 6, 10}) {
-            SCOPED_TRACE(expired);
+        for (const std::int32_t expired_block_end : {0, 1, 2, 3, 4, 5, 6, 10}) {
+            SCOPED_TRACE(expired_block_end);
             std::vector<CacheBlockLocation> expected;
             std::int32_t cached = 0;
-            for (std::int32_t slot = pinned ? 4 : 2; slot < std::min(expired, 6); ++slot) {
+            for (std::int32_t slot = pinned ? 4 : 2; slot < std::min(expired_block_end, 6); ++slot) {
                 expected.push_back(table.Blocks()[slot]->Location());
                 cached += slot == 2 || slot == 4;
             }
-            EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, expired), expected);
-            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/true), expected.size());
-            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/false), cached);
-            const auto slots = allocator.ExpiredBlockSlotsAt(table, expired);
-            EXPECT_EQ(slots.size(), std::max(std::min(expired, 6) - 1, 0));
+            EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, expired_block_end), expected);
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired_block_end, /*count_uncached=*/true),
+                      expected.size());
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired_block_end, /*count_uncached=*/false), cached);
+            const auto slots = allocator.ExpiredBlockSlotsAt(table, expired_block_end);
+            EXPECT_EQ(slots.size(), std::max(std::min(expired_block_end, 6) - 1, 0));
             EXPECT_GE(slots.size(), expected.size());
         }
     }

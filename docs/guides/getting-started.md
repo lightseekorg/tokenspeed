@@ -73,48 +73,42 @@ pin `tokenspeed==0.1.1.postYYYYMMDD` once that date is present in both ROCm
 nightly package indexes. When upgrading, avoid accidentally choosing a newer
 CUDA-only PyPI release.
 
-The nightly workflows build kernels at 02:00 UTC and TokenSpeed at 03:00 UTC.
-TokenSpeed checks the CUDA nightly index for its exact kernel dependency
-before building and publishing. It checks the ROCm index before adding the
-same wheel there. Each check waits up to one hour, and the ROCm check cannot
-block CUDA publication. Historical nightly wheels remain available. Nightlies
-publish to the wheel indexes, not PyPI.
+The **Publish nightly** workflow is the single nightly entry point. It runs
+daily at 01:00 UTC, or manually from `main`. It publishes, in order,
+`tokenspeed-kernel-amd`, the CUDA and ROCm `tokenspeed-kernel` wheels,
+`tokenspeed-engine`, and `tokenspeed`. Every stage uses the run's source commit
+and date, and TokenSpeed pins the exact kernel and engine versions. Nightlies
+publish to the wheel indexes, not PyPI. Stable release workflows remain separate.
 
-For a manual nightly, run **Build and Release tokenspeed-kernel for ROCm**
-from `main` with `nightly=true` and `publish_github=true`, then run **Build and
-Release TokenSpeed** with the same settings and `version_date`. Pull request
-branches can use `publish_github=false` to build without publishing.
+For a manual nightly, open **Publish nightly**, select `main`, and choose:
 
-To rebuild and replace an existing TokenSpeed nightly, select `main` in
-**Build and Release TokenSpeed** and set these **Run workflow** inputs:
-
-| Input | Value |
+| Input | Meaning |
 | --- | --- |
-| `nightly` | `true` |
-| `replace_nightly` | `true` |
-| `publish_github` | `true` |
-| `version_date` | The date to replace as `YYYYMMDD`, or blank for today (UTC) |
+| `version_date` | `YYYYMMDD`, or blank for the run's creation date in UTC |
+| `replace_nightly` | Defaults to `false`; enable to replace existing assets for every package |
+| `release_candidate` | Optional `N` or `rcN` for a CUDA-only candidate; leave blank for both backends |
 
-This rebuilds the distributions and refreshes their hashes and download URLs in
-both the CUDA and ROCm indexes. Replacement defaults to off. Normal reruns keep
-existing files. TokenSpeed uses one pure-Python wheel for both backends, so it
-does not need the kernel workflow's CUDA build-variant inputs. To install a
-replacement of an already installed version, add `--no-cache-dir --force-reinstall`
-to the corresponding pinned installation command above.
+By default, an existing version from the same commit is resumed: published files
+keep their bytes and hashes, missing assets are uploaded, and indexes are repaired.
+An existing version from another commit, or without source provenance, fails the
+preflight before publication. A regular nightly's engine uses the same date;
+re-running it does not silently allocate tomorrow's engine version.
 
-To publish a release candidate without touching the scheduled nightly of its
-date, run **Build and Release tokenspeed-kernel** and then **Build and Release
-TokenSpeed** from `main` with `nightly=true`, `publish_github=true`, the same
-`version_date`, and the same `release_candidate`, for example `1`. That
-publishes `tokenspeed==0.1.1rc1.post20261108` with
-`tokenspeed-kernel==0.1.4rc1.post20261108`. A release candidate sorts below
-every nightly of its release (`0.1.4.post*`): the scheduled nightly still
-publishes under its own version, and any install that such a nightly satisfies
-still gets a nightly, so pin the release candidate to install it. Runs on `main`
-queue behind each other in each workflow, scheduled nightlies (02:00 and 03:00
-UTC) included, so finish a release candidate before 02:00 UTC or start it after
-the scheduled nightlies. Release candidates skip the ROCm index; the scheduled
-nightly of the same date adds ROCm.
+With `replace_nightly=true`, all four packages are rebuilt and existing assets
+are overwritten. Both CUDA and ROCm indexes receive the new hashes and cache-busting
+download URLs. Replacement is not atomic across assets or packages: if a stage
+fails after uploading, installs may fail hash verification until its index is
+repaired. Use **Re-run all jobs** on the same run to retain the original source,
+date and replacement setting and complete the entire downstream chain. A new run
+on `main` uses its new source commit. To reinstall an already installed version,
+add `--no-cache-dir --force-reinstall` to the pinned installation command above.
+
+A release candidate publishes only the CUDA kernel, engine and TokenSpeed
+candidates, all using `rcN.postYYYYMMDD` versions.
+For example, candidate `1` gives `tokenspeed==0.1.1rc1.post20261108` and
+`tokenspeed-kernel==0.1.4rc1.post20261108`. It sorts below the normal nightly of the
+same base version. AMD and ROCm are skipped for candidates; the replacement option
+replaces all three candidate packages without consuming a future nightly date. Scheduled and manual nightly runs share one concurrency group.
 
 ### From source
 
@@ -142,10 +136,11 @@ backend dependencies automatically.
 pip install -e tokenspeed-kernel/python/ --no-build-isolation
 ```
 
-Install the scheduler package:
+Install the engine package, which builds the C++ scheduler in. It needs Rust,
+CMake and OpenSSL development headers (see `tokenspeed-engine/README.md`):
 
 ```bash
-pip install -e tokenspeed-scheduler/
+pip install -e tokenspeed-engine/
 ```
 
 ## Verify

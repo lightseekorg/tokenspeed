@@ -32,15 +32,15 @@ import inspect
 from pathlib import Path
 from typing import Literal
 
-_VERSION = "0.7.3"
+_VERSION = "0.7.5"
 # SHA256 of the official PyPI wheel sources. Update with ABI review and GPU
 # validation; a version string alone does not identify locally patched code.
 _SOURCES = {
     "prefill": {
-        "gdn_prefill": "56eea898c26ead1bb5e2b00ea0f75eb09448c88bf092dbd2414f17bdebd11c42",
-        "api_logging": "8bda6aba04be7eb5891a7fd07c88346d2282ecf2d2bf2f68787033f0e231b884",
+        "gdn_prefill": "1097ec9e1f70eb6bd6705966600cbec5c9c7ed3fed2a2c7f69236e95513bce73",
+        "api_logging": "55ef57cc4be6ed77ca3071668c525a3f1abee1fd7083b06a47c0a8967d621143",
         "gdn_kernels.blackwell.gdn_prefill": "0068d71f55cc5028f91fe1537e9d7b42143f4ab1cb089ded2d1307ee73438ae6",
-        "gdn_kernels.blackwell.gated_delta_net_chunked": "906173728b8134af20808e64cefe4a200839831d21d03dc8ab04565d5af96016",
+        "gdn_kernels.blackwell.gated_delta_net_chunked": "943312e93d876b952d91454603f12dbf487f1ac715b55e6dcfbca797b3f67629",
         "gdn_kernels.blackwell.gated_delta_net_chunked_sm107": "bb62ffeb6d1f428ee5df03dabc0da609d74d0597e5ed214081b0e015d5955e1e",
     },
     "decode": {

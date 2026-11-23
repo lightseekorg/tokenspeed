@@ -132,7 +132,7 @@ def _prepare(backend: SonicSamplingBackend, n: int) -> torch.Tensor:
         params.append(sp)
     slots = list(range(1, BS + 1))
     backend.prepare_step(
-        request_ids=[f"r{i}" for i in range(BS)],
+        admission_ids=list(range(1, BS + 1)),
         request_pool_indices=slots,
         sampling_params_list=params,
         num_tokens_per_req=n,
@@ -188,9 +188,11 @@ class _Group:
     def shard(self, rank: int) -> SampledVocabShard:
         return SampledVocabShard(
             logits=self.raw[:, rank * SHARD : (rank + 1) * SHARD],
+            columns=SHARD,
             vocab_start=rank * SHARD,
             logit_scale=SCALE if self.capped else None,
             softcap=SOFTCAP if self.capped else None,
+            softcap_form="sigmoid" if self.capped else None,
             tp_size=RANKS,
             tp_group=tuple(range(RANKS)),
             gather_full=lambda logits: self.whole.clone(),

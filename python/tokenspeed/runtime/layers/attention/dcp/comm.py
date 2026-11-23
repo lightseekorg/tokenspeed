@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     combine_dcp_attention_partials,
@@ -29,14 +32,103 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_weight_for_reduce_scatter,
     dispatch_dcp_attention_partials,
 )
+from tokenspeed_kernel.ops.attention.mla import mla_project_value
+from tokenspeed_kernel.ops.attention.mla.cute_dsl import (
+    DcpValueTail,
+    create_dcp_value_tail,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_exchange_input,
     all_gather,
     all_gather_single,
     all_reduce,
     all_to_all_single,
+    prepare_small_exchange,
     reduce_scatter,
+    try_combine_records,
 )
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
+
+logger = logging.getLogger(__name__)
+
+# Largest per-rank payload of a KVP group's one-hop exchange: the decode
+# exchanges up to 64 rows (eight requests of eight tokens) fit; larger ones,
+# and prefill's, keep the generic collectives, which win from about this size.
+DECODE_EXCHANGE_CAP_BYTES = 1 << 20
+# Largest per-rank gather of float words: the owned decode top-k's scores and
+# query rider at 64 requests of eight tokens.
+DECODE_FLOAT_EXCHANGE_CAP_BYTES = 8 << 20
+
+# Each KVP group's fused decode value tail, when prepared.
+_VALUE_TAILS: dict[tuple[int, ...], DcpValueTail] = {}
+
+
+@dataclass(frozen=True)
+class ValueProjection:
+    """An MLA decode's value projection, which a KVP combine may apply as it merges.
+
+    ``out = (latent @ weight) * sigmoid(gate)`` per local head, as
+    ``mla_project_value`` computes it.
+    """
+
+    weight: torch.Tensor
+    gate: torch.Tensor | None
+    out: torch.Tensor
+
+
+def prepare_decode_exchange(
+    group: tuple[int, ...],
+    timeout_s: float,
+    *,
+    value_heads: int | None,
+    decode_rows: int,
+    float_words: bool,
+) -> bool:
+    """Collectively prepare the KVP group's one-hop exchange of small payloads.
+
+    Every rank of ``group`` calls this once at the same program point, before
+    graph capture and before the KV cache is sized. The decode's query, index
+    and partial exchanges then take it whenever their payload fits; nothing
+    else changes, and every byte arrives as the generic collective delivers it.
+    With ``value_heads`` it also prepares the fused decode value tail
+    (:func:`combine_project_attention_partials`), and with ``float_words`` the
+    float-word gather of an owned decode top-k (:func:`select_owned_dsa_topk`).
+
+    Args:
+        group: Global ranks of the KVP group.
+        timeout_s: The process group's timeout; in-kernel waits end before it.
+        value_heads: Local query heads of an MLA model whose decode projects
+            512-wide latents to 128-wide values, or None.
+        decode_rows: Most rows of one decode forward.
+        float_words: Whether a decode gathers float words; without, no float
+            workspace is allocated.
+
+    Returns:
+        Whether the group exchanges through it.
+    """
+    timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
+    if value_heads is not None and group not in _VALUE_TAILS:
+        tail = create_dcp_value_tail(
+            process_group_manager.get_process_group("gloo", group),
+            torch.device("cuda", torch.cuda.current_device()),
+            heads=value_heads,
+            rows=decode_rows,
+            timeout_ns=timeout_ns,
+            eligible=True,
+        )
+        if tail is not None:
+            _VALUE_TAILS[group] = tail
+    float_cap = DECODE_FLOAT_EXCHANGE_CAP_BYTES if float_words else 0
+    prepared = prepare_small_exchange(
+        group, DECODE_EXCHANGE_CAP_BYTES, float_cap, timeout_ns
+    )
+    if torch.distributed.get_rank() == group[0]:
+        logger.info(
+            f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB "
+            f"per rank {'in one hop' if prepared else 'through its collectives'}"
+        )
+    return prepared
 
 
 def _query_payload(query: torch.Tensor) -> torch.Tensor:
@@ -65,6 +157,33 @@ def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Ten
     # capacity needs the symmetric buffers managed in one place first.
     gathered = all_gather(_query_payload(query), group, dim=-1).view(query.dtype)
     return gathered.reshape(tokens, heads * len(group), dim)
+
+
+def gather_query_heads_lent(
+    query: torch.Tensor, group: tuple[int, ...]
+) -> torch.Tensor:
+    """:func:`gather_query_heads` through the group's exchange input.
+
+    The rows are copied into ``acquire_exchange_input``'s storage, gathered
+    rank-major (pulled in place where the backend lends its buffer) and laid
+    out token-major in 8-byte words: the same bytes at the same places.
+    Only for callers whose ``query`` does not live in that storage.
+    """
+    if len(group) == 1:
+        return query
+    tokens, heads, dim = query.shape
+    payload = _query_payload(query)
+    send = acquire_exchange_input(payload.nbytes, query, group)
+    send = send.view(payload.dtype).view(payload.shape)
+    send.copy_(payload)
+    gathered = payload.new_empty((len(group) * tokens, payload.shape[1]))
+    all_gather_single(gathered, send, group)
+    rows = gathered.view(torch.uint8).view(len(group), tokens, -1)
+    if rows.shape[-1] % 8 == 0:
+        # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
+        rows = rows.view(torch.int64)
+    token_major = rows.transpose(0, 1).contiguous().view(torch.uint8)
+    return token_major.view(query.dtype).view(tokens, heads * len(group), dim)
 
 
 def gather_query_heads_rank_major(
@@ -162,6 +281,16 @@ def combine_attention_records(
     Returns:
         Contiguous ``[tokens, local_heads, head_dim]`` of this rank's heads.
     """
+    if sink is None:
+        combined = try_combine_records(
+            records,
+            group,
+            head_dim=head_dim,
+            partial_dtype=partial_dtype,
+            output_dtype=output_dtype,
+        )
+        if combined is not None:
+            return combined
     received = torch.empty_like(records)
     all_to_all_single(received.flatten(), records.flatten(), group)
     return combine_dcp_attention_partials(
@@ -173,6 +302,23 @@ def combine_attention_records(
     )
 
 
+def _lent_records(
+    partials: torch.Tensor, degree: int, group: tuple[int, ...]
+) -> torch.Tensor:
+    """Storage for ``dispatch_dcp_attention_partials``' records of
+    ``partials``, borrowed from the group's exchange input."""
+    tokens, heads, dim = partials.shape
+    shape = (
+        degree,
+        tokens,
+        heads // degree,
+        -(-dim * partials.element_size() // 4) + 1,
+    )
+    nbytes = shape[0] * shape[1] * shape[2] * shape[3] * 4
+    lent = acquire_exchange_input(nbytes, partials, group)
+    return lent.view(torch.int32).view(shape)
+
+
 def combine_attention_partials(
     local_output: torch.Tensor,
     local_lse: torch.Tensor,
@@ -181,6 +327,7 @@ def combine_attention_partials(
     rank: int,
     sink: torch.Tensor | None,
     keep_all_heads: bool,
+    lend_records: bool = False,
 ) -> torch.Tensor:
     """Combine partials across context shards, returning the requested heads.
 
@@ -202,6 +349,11 @@ def combine_attention_partials(
             sink yet. Both forms split heads by the group's degree, so
             ``heads % len(group) == 0`` holds
             for either.
+        lend_records: Pack the head-sharded form's records into the group's
+            exchange input (``acquire_exchange_input``), so a backend that
+            pulls it in place exchanges and combines them in one step
+            (``try_combine_records``). Only for callers whose inputs do not
+            live in that storage and who start no other exchange in between.
 
     Returns:
         Original-dtype output [tokens, heads, head_dim] -- the TP-local heads,
@@ -225,7 +377,10 @@ def combine_attention_partials(
         and (sink is None or local_output.dtype != torch.float32)
     ):
         packed = dispatch_dcp_attention_partials(
-            local_output, local_lse.float(), degree=degree
+            local_output,
+            local_lse.float(),
+            degree=degree,
+            out=_lent_records(local_output, degree, group) if lend_records else None,
         )
         return combine_attention_records(
             packed,
@@ -264,3 +419,52 @@ def combine_attention_partials(
             dtype=local_output.dtype, memory_format=torch.contiguous_format
         ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
+
+
+def combine_project_attention_partials(
+    local_output: torch.Tensor,
+    local_lse: torch.Tensor,
+    *,
+    group: tuple[int, ...],
+    rank: int,
+    projection: ValueProjection,
+) -> torch.Tensor:
+    """Combine head-sharded partials without a sink, then apply ``projection``.
+
+    The combine is :func:`combine_attention_partials`'s. A group with a
+    prepared fused value tail runs both in one launch, bit for bit; otherwise
+    the combine and ``mla_project_value`` run in turn.
+
+    Args:
+        local_output: This rank's partials of every gathered head,
+            ``[tokens, ranks * heads, 512]``.
+        local_lse: Their natural-log LSEs, ``[tokens, ranks * heads]``.
+        group: Global ranks of the KVP group.
+        rank: This rank's index in ``group``.
+        projection: The value projection to apply, whose ``out`` receives it.
+
+    Returns:
+        ``projection.out``, holding this rank's heads combined and projected.
+    """
+    lse = local_lse.float()
+    tail = _VALUE_TAILS.get(group)
+    if tail is not None and tail.serves(
+        local_output, lse, projection.weight, projection.gate, projection.out
+    ):
+        return tail(
+            local_output, lse, projection.weight, projection.gate, projection.out
+        )
+    latent = combine_attention_partials(
+        local_output,
+        lse,
+        group=group,
+        rank=rank,
+        sink=None,
+        keep_all_heads=False,
+    )
+    return mla_project_value(
+        latent.to(projection.out.dtype),
+        projection.weight,
+        gate=projection.gate,
+        out=projection.out,
+    )

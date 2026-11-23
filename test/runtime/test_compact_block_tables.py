@@ -14,7 +14,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 torch = pytest.importorskip("torch")
 
 
@@ -26,6 +26,7 @@ def _scheduler(*, mixed: bool = False):
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = 8
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = True

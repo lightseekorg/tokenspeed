@@ -301,6 +301,12 @@ def _warmup_sparse_mqa(api, blocks, device, enable_pdl):
     )
 
 
+def _sparse_blocks(count: int) -> int:
+    """Native sparse block slots for count candidates: DeepSelect-aligned rows."""
+    alignment = deep_select_alignment()[0] // 2
+    return triton.cdiv(count, alignment // 8) * (alignment // 8)
+
+
 def _sparse_candidate_scores(
     queries: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -326,11 +332,95 @@ def _sparse_candidate_scores(
     fit return zero valid logits and submit no scoring work, using live GPU
     lengths. Only the selected set is meaningful for those rows.
     """
+    scores, ends, normalized = _sparse_candidate_logits(
+        queries,
+        weights,
+        cache,
+        page_table,
+        visible,
+        candidates,
+        api,
+        skip_score_topk=skip_score_topk,
+        index_metadata=index_metadata,
+    )
+    tokens, count = candidates.shape
+    width = _sparse_blocks(count) * 8
+    _mask_candidate_logits[(tokens, triton.cdiv(width, 1024))](
+        scores,
+        ends,
+        scores.stride(0),
+        width,
+        skip_score_topk,
+        1024,
+    )
+    return scores, ends, normalized
+
+
+def _sparse_candidate_logits(
+    queries: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible: torch.Tensor,
+    candidates: torch.Tensor,
+    api: object,
+    *,
+    skip_score_topk: int,
+    index_metadata: IndexMetadata | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """_sparse_candidate_scores without its candidate mask.
+
+    Only [0, end) of a row whose candidate end exceeds skip_score_topk holds
+    logits; the rest of it, and every row whose pool fits skip_score_topk, is
+    left as the native scorer wrote it (possibly uninitialized). The consumer
+    selects a fitting pool whole without reading its logits
+    (finish_write_selection's short_rows_unscored).
+    """
+    normalized, ends, schedule, blocks = _sparse_geometry(
+        cache,
+        page_table,
+        visible,
+        candidates,
+        api,
+        skip_score_topk=skip_score_topk,
+        index_metadata=index_metadata,
+    )
+    scores = api.fp8_fp4_paged_sparse_mqa_logits(
+        q=(
+            queries[0].contiguous().view(torch.int8).unsqueeze(1),
+            queries[1].contiguous().unsqueeze(1),
+        ),
+        kv_cache=cache.as_strided(
+            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
+        ),
+        weights=weights.contiguous(),
+        metadata=schedule,
+        num_max_sparse_blocks=blocks,
+        sparse_block_kv=8,
+    )
+    return scores, ends, normalized
+
+
+def _sparse_geometry(
+    cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible: torch.Tensor,
+    candidates: torch.Tensor,
+    api: object,
+    *,
+    skip_score_topk: int,
+    index_metadata: IndexMetadata | None,
+) -> tuple[torch.Tensor, torch.Tensor, object, int]:
+    """Normalized blocks, candidate-row ends, schedule and block width of a tile.
+
+    The candidate geometry _sparse_candidate_logits scores against, built once
+    per index_metadata for these exact table, length and candidate views
+    (pointer-keyed) and reused by later calls, also from other streams;
+    prepare_index_topk builds it ahead with the same arguments.
+    """
     tokens, count = candidates.shape
     capacity = page_table.shape[1] * 64
-    alignment = deep_select_alignment()[0] // 2
-    blocks = triton.cdiv(count, alignment // 8) * (alignment // 8)
-    width = blocks * 8
+    blocks = _sparse_blocks(count)
     _warmup_sparse_mqa(api, blocks, cache.device, api.get_pdl())
     key = (
         cache.shape[0],
@@ -401,25 +491,4 @@ def _sparse_candidate_scores(
             )
     else:
         normalized, ends, schedule, *_ = geometry.acquire()
-    scores = api.fp8_fp4_paged_sparse_mqa_logits(
-        q=(
-            queries[0].contiguous().view(torch.int8).unsqueeze(1),
-            queries[1].contiguous().unsqueeze(1),
-        ),
-        kv_cache=cache.as_strided(
-            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
-        ),
-        weights=weights.contiguous(),
-        metadata=schedule,
-        num_max_sparse_blocks=blocks,
-        sparse_block_kv=8,
-    )
-    _mask_candidate_logits[(tokens, triton.cdiv(width, 1024))](
-        scores,
-        ends,
-        scores.stride(0),
-        width,
-        skip_score_topk,
-        1024,
-    )
-    return scores, ends, normalized
+    return normalized, ends, schedule, blocks

@@ -32,9 +32,13 @@ if not is_cdna4():
 from tokenspeed_kernel_amd._extern import (  # noqa: E402
     arithmetic_fence,
     extern_compile_options,
+    release_wait_vmem,
     sched_group,
     wait_vmem,
     wave_all_equal,
+    wave_ballot_i64,
+    wave_mbcnt,
+    wave_popcount_i64,
     wave_uniform_i32,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
@@ -95,3 +99,68 @@ def test_one_kernel_links_several_libraries():
     expected = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
     torch.testing.assert_close(all_equal, expected[wave])
     torch.testing.assert_close(fenced, a * 2.0, atol=0, rtol=0)
+
+
+@gluon.jit
+def _publish_probe(data, flag):
+    offset = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
+    gl.store(data + offset, offset)
+    release_wait_vmem()
+    gl.barrier()
+    gl.store(flag + offset, offset * 0 + 1, mask=offset == 0)
+
+
+def test_the_release_wait_links_a_fence_before_the_wait():
+    """``release_wait_vmem`` links a workgroup-scope release fence before
+    its ``vmcnt(0)`` wait, so LLVM cannot move the earlier data stores below
+    the wait. The check is on the IR: a run's results cannot show whether
+    a store was moved past the wait."""
+    data = torch.empty(256, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    compiled = _publish_probe[(1,)](data, flag, num_warps=4, **extern_compile_options())
+    llir = compiled.asm["llir"]
+    fence = llir.index('fence syncscope("workgroup") release')
+    assert fence < llir.index("@llvm.amdgcn.s.waitcnt(i32 3952)", fence)
+
+
+@gluon.jit
+def _wave_mask_probe(flags, masks, ranks, counts):
+    offset = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
+    value = gl.load(flags + offset)
+    mask = wave_ballot_i64(value)
+    gl.store(masks + offset, mask)
+    gl.store(ranks + offset, wave_mbcnt(mask))
+    gl.store(counts + offset, wave_popcount_i64(mask))
+
+
+@pytest.mark.parametrize("pattern", [0, 1, 2, 3])
+def test_wave_ballot_and_rank(pattern):
+    values = torch.arange(256, dtype=torch.int32)
+    if pattern == 0:
+        values[:] = 0
+    elif pattern == 1:
+        values[:] = -1
+    elif pattern == 2:
+        values = (values % 64 == 63).to(torch.int32)
+    else:
+        values = (values % 3 == 0).to(torch.int32) * -7
+    expected_masks = []
+    expected_ranks = []
+    for wave in values.reshape(4, 64).tolist():
+        mask = sum((v != 0) << lane for lane, v in enumerate(wave))
+        expected_masks.extend([mask if mask < 1 << 63 else mask - (1 << 64)] * 64)
+        expected_ranks.extend(
+            (mask & ((1 << lane) - 1)).bit_count() for lane in range(64)
+        )
+    flags = values.cuda()
+    masks = torch.empty(256, dtype=torch.int64, device="cuda")
+    ranks = torch.empty_like(flags)
+    counts = torch.empty_like(flags)
+    _wave_mask_probe[(1,)](
+        flags, masks, ranks, counts, num_warps=4, **extern_compile_options()
+    )
+    assert masks.cpu().tolist() == expected_masks
+    assert ranks.cpu().tolist() == expected_ranks
+    assert counts.cpu().tolist() == [
+        (m & ((1 << 64) - 1)).bit_count() for m in expected_masks
+    ]

@@ -26,14 +26,15 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.dense.fp8_weight_only import quantize_fp8_weight_rows
@@ -53,17 +54,17 @@ from tokenspeed.runtime.models.dflash import (
     _get_dflash_layer_sliding_window,
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
+    DFlash2MonokernelLayer,
+    DFlash2MonokernelState,
+    enable_draft_monokernels,
+)
 from tokenspeed.runtime.utils import add_prefix
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
         LamportResidualRMSNorm,
     )
-
-# Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
-# most the row-owned kernel keeps resident; larger draft forwards keep the
-# unfused reduction.
-_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 def _dflash2_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -332,8 +333,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             prefix=prefix,
         )
         self.comm_manager = None
-        # The draft's prepared reduce + norm, bound by the draft model.
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
             self.comm_manager = CommManager(
                 mapping=mapping,
@@ -443,10 +442,27 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         return hidden_states, residual
 
 
+class DFlash2MonokernelDecoderLayer(DFlash2MonokernelLayer, DFlash2DecoderLayer):
+    """DFlash2 draft layer whose block forwards run as one monokernel launch."""
+
+
 class DFlash2DraftModel(DFlashDraftModel):
     """DFlash2 checkpoint entry class."""
 
-    decoder_layer_cls = DFlash2DecoderLayer
+    @property
+    def decoder_layer_cls(self) -> type:
+        """The layer class: the monokernel class when the draft's config has
+        ``decode_monokernel``, which load_model_config declares on every
+        draft's config: True under --decode-monokernel for the draft of a
+        target with draft monokernels (Muse Spark). Such a draft packs every
+        piece after loading or startup fails and names why
+        (:func:`enable_draft_monokernels`); other drafts keep the regular
+        class."""
+        # No default: load_model_config declares the field on every draft's
+        # config, so a config that lacks it was not built for serving.
+        if self.config.decode_monokernel:
+            return DFlash2MonokernelDecoderLayer
+        return DFlash2DecoderLayer
 
     def __init__(
         self,
@@ -470,8 +486,13 @@ class DFlash2DraftModel(DFlashDraftModel):
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
-        # The draft's prepared reduce + norm (prepare_communication_runtime).
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
+        nested = getattr(config, "dflash_config", {}) or {}
+        # The candidate logits' scale and softcap (0: none): the drafter
+        # applies them, and the head monokernel bakes them in.
+        self.output_multiplier = float(nested.get("output_multiplier", 1.0))
+        self.final_logit_softcapping = float(
+            nested.get("final_logit_softcapping") or 0.0
+        )
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -480,16 +501,58 @@ class DFlash2DraftModel(DFlashDraftModel):
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )
+        # The state that the monokernel layers share (--decode-monokernel),
+        # set when enable_draft_monokernels packs them after loading. None
+        # runs every forward on the regular code.
+        self.monokernel_state: DFlash2MonokernelState | None = None
+
+    def run_decoder(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """The layers and the final norm. A block forward of one request that
+        the monokernels serve launches every layer, and the last launch runs
+        the final norm (``finish_step`` returns its output)."""
+        state = self.monokernel_state
+        if state is None:
+            return super().run_decoder(positions, hidden_states, residual, ctx)
+        state.start_step()
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                residual=residual,
+            )
+        lm_head_input = state.finish_step()
+        if lm_head_input is not None:
+            return lm_head_input
+        return self.final_norm(hidden_states, residual, ctx)
 
     def configure_target(self, target_model, target_config) -> None:
-        """Install the capture inputs, and the FP8 head copy if quantized.
+        """Install the capture inputs, the packed head monokernel under
+        --decode-monokernel, and the FP8 head copy if quantized.
 
-        Under ``fp8_weight_only`` the draft's candidate GEMM reads an FP8
-        copy of the target's (16-bit) head shard: the head is the largest
-        weight a draft step streams. It is made here, before the KV-cache
-        budget is profiled, so the copy's memory is counted.
+        Both head copies are made here, before the KV-cache budget is
+        profiled, so the copy's memory is counted. Under
+        --decode-monokernel the head monokernel packs a tiled copy of the
+        target's head shard (``DFlash2MonokernelState.pack_head``; the
+        drafter enables its launch when wired). Under ``fp8_weight_only``
+        the draft's candidate GEMM reads an FP8 copy of the target's
+        (16-bit) head shard: the head is the largest weight a draft step
+        streams.
         """
         super().configure_target(target_model, target_config)
+        if self.monokernel_state is not None:
+            self.monokernel_state.pack_head(
+                target_model.lm_head,
+                self.candidate_selector,
+                scale=self.output_multiplier,
+                softcap=self.final_logit_softcapping,
+            )
         if not isinstance(self.quant_config, Fp8WeightOnlyConfig):
             return
         head = target_model.lm_head
@@ -506,7 +569,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
 
     def final_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """The last layer hands back its MLP conv's partial; reduce it here."""
         if residual is None:
@@ -521,56 +587,27 @@ class DFlash2DraftModel(DFlashDraftModel):
         return hidden_states
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Prepare the fused reduce + norm of the draft's layer boundaries.
-
-        Collective: every rank prepares or declines alike, before cache
-        sizing and graph capture. Taken on gfx950 at TP4/TP8 for a BF16 draft
-        when the attention and dense groups are one group whose performance
-        route is Iris and whose all-reduce is already prepared (the
-        target's): the mailboxes come out of the headroom of the heap that
-        preparation sized, and an allocation past
-        it raises on every rank alike.
+        """Prepare the draft's collectives, before cache sizing and graph
+        capture: the fused reduce + norm of the regular layers' boundaries,
+        then the draft monokernels' mailbox scratch on the Iris heap
+        (--decode-monokernel). The fused reduce + norm goes first: its
+        mailboxes are sized against the heap's headroom.
 
         Args:
-            max_num_tokens: Most rows a forward carries; unused, the fused
-                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
+            max_num_tokens: Most rows a forward carries.
 
         Returns:
             Whether the draft prepared anything.
         """
-        del max_num_tokens
-        if self.fused_reduce_norm is not None:
-            return True
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_lamport_residual_rmsnorm_supported,
-            prepare_iris_lamport_residual_rmsnorm,
+        prepared = self._prepare_fused_reduce_norm(max_num_tokens)
+        if self.monokernel_state is None:
+            return prepared
+        group = self.mapping.attn.tp_group
+        self.monokernel_state.prepare(
+            process_group_manager.get_device_process_group(group),
+            process_group_manager.get_process_group("gloo", group),
+            group.index(dist.get_rank()),
         )
-
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-
-        mapping = self.mapping
-        group = mapping.attn.tp_group
-        backend = get_global_backend()
-        hidden_size = int(self.config.hidden_size)
-        # The kernel's predicate decides the device, group size and width.
-        if (
-            not iris_lamport_residual_rmsnorm_supported(
-                mapping.attn.tp_size, hidden_size, torch.bfloat16
-            )
-            or mapping.dense.tp_group != group
-            or self.fc.weight.dtype != torch.bfloat16
-            or not isinstance(backend, AutoBackend)
-            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
-        ):
-            return False
-        all_reduce_state = backend.iris.state(group, torch.bfloat16)
-        if all_reduce_state is None:
-            return False
-        self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
-            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
-        )
-        for layer in self.layers:
-            layer.fused_reduce_norm = self.fused_reduce_norm
         return True
 
     @property
@@ -616,9 +653,18 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        if not self._uses_mla:
-            return super().load_weights(weights)
+        if self._uses_mla:
+            loaded = self._load_mla_weights(weights)
+        else:
+            loaded = super().load_weights(weights)
+        # Packs every piece or fails startup naming why, an MLA draft too.
+        if self.config.decode_monokernel:
+            enable_draft_monokernels(self)
+        return loaded
 
+    def _load_mla_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         unexpected: list[str] = []
@@ -686,6 +732,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
+        return loaded
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):

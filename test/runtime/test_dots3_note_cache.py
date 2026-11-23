@@ -85,6 +85,7 @@ def _recipe(*, draft_layers: int, pd: bool):
         kv_cache_quant_method="none",
         context_len=8192,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=pd,
         components=(dsa,),
     )
@@ -372,7 +373,7 @@ def test_router_rejects_a_global_page_override():
 
 
 def test_scheduler_reuses_both_history_groups():
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine.scheduler as ts
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         cache_group_config,
@@ -392,6 +393,7 @@ def test_scheduler_reuses_both_history_groups():
     config.num_snapshot_pages = 1  # The null page alone; this test does not retract.
     config.max_scheduled_tokens = 1024
     config.max_batch_size = 2
+    config.max_resident_requests = 2
     config.enable_l3_storage = False
     config.disable_l2_cache = True
     config.disable_prefix_cache = False
@@ -493,7 +495,9 @@ def dots_runtime(monkeypatch):
     from tokenspeed.runtime.layers.attention.registry import create_paged_router
 
     recipe = _recipe(draft_layers=0, pd=False)
-    recipe.attn_config = replace(recipe.attn_config, device="cuda", max_bs=3)
+    recipe.attn_config = replace(
+        recipe.attn_config, device="cuda", max_bs=3, max_resident_requests=3
+    )
     setup = recipe.setup()
     arena = CacheArena(
         _layout(recipe).bind(40),
@@ -522,7 +526,14 @@ def test_swa_prefill_gathers_only_live_window_pages(swa_leaf):
     table[0, 112:129] = torch.arange(1, 18, device="cuda", dtype=torch.int32)
     table[1, :2] = torch.tensor([18, 19], device="cuda", dtype=torch.int32)
     leaf._init_prefill_metadata(
-        prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table
+        prefix + extend,
+        prefix,
+        prefix_cpu,
+        extend,
+        extend_cpu,
+        table,
+        None,
+        extend_with_prefix=True,
     )
     meta = leaf.chunked_prefill_metadata
     # The partial first page is retained; only its pre-window token is masked.
@@ -552,6 +563,8 @@ def test_swa_leaf_cold_prefill_masks_the_left_boundary(swa_leaf):
         lens_cpu.cuda(),
         lens_cpu,
         torch.zeros((1, 256), device="cuda", dtype=torch.int32),
+        None,
+        extend_with_prefix=False,
     )
     q = torch.zeros(length, heads, 256, device="cuda", dtype=torch.bfloat16)
     k, v = torch.zeros_like(q), torch.zeros(
@@ -621,7 +634,14 @@ def test_swa_prefix_lengths_do_not_recompile_metadata(swa_leaf):
         prefix_cpu = torch.tensor(prefix_lengths, dtype=torch.int32)
         prefix = prefix_cpu.cuda()
         swa_leaf._init_prefill_metadata(
-            prefix + extend, prefix, prefix_cpu, extend, extend_cpu, table
+            prefix + extend,
+            prefix,
+            prefix_cpu,
+            extend,
+            extend_cpu,
+            table,
+            None,
+            extend_with_prefix=True,
         )
 
     initialize([4097, 45, 0])

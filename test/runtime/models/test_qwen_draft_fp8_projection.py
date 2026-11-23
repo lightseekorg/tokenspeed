@@ -1,0 +1,183 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Target-only online FP8 projections preserve draft checkpoint quantization."""
+
+import pytest
+import torch
+
+from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5TextConfig
+from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.models.qwen3_5 import (
+    Qwen3_5AttentionDecoderLayer,
+    Qwen3_5ForCausalLM,
+)
+from tokenspeed.runtime.models.qwen3_5_nextn import (
+    Qwen3_5DraftAttentionDecoderLayer,
+    Qwen3_5DraftForCausalLM,
+)
+from tokenspeed.runtime.models.qwen4_exp import (
+    Qwen4ExpAttentionDecoderLayer,
+    Qwen4ExpModel,
+)
+from tokenspeed.runtime.models.qwen4_exp_nextn import (
+    Qwen4ExpDraftAttentionDecoderLayer,
+    Qwen4ExpDraftModel,
+)
+from tokenspeed.runtime.utils.env import global_server_args_dict
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "checkpoint", ["bf16", "nvfp4", "fp8", "mixed", "mixed_qkv", "mixed_o"]
+)
+@pytest.mark.parametrize(
+    "config_cls,layer_cls,draft",
+    [
+        (Qwen3_5TextConfig, Qwen3_5AttentionDecoderLayer, False),
+        (Qwen3_5TextConfig, Qwen3_5DraftAttentionDecoderLayer, True),
+        (Qwen4ExpTextConfig, Qwen4ExpAttentionDecoderLayer, False),
+        (Qwen4ExpTextConfig, Qwen4ExpDraftAttentionDecoderLayer, True),
+    ],
+)
+def test_draft_keeps_checkpoint_projections(
+    monkeypatch, enabled, checkpoint, config_cls, layer_cls, draft
+):
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", not enabled)
+    config = config_cls(
+        hidden_size=512,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        max_position_embeddings=128,
+        layer_types=["full_attention"],
+        num_experts=None,
+    )
+    config.dtype = torch.bfloat16
+    root = "mtp.layers.0" if draft else "model.layers.0"
+    prefix = f"{root}.self_attn"
+    serialized = {
+        "mixed_qkv": ("q_proj", "k_proj", "v_proj"),
+        "mixed_o": ("o_proj",),
+    }.get(checkpoint, ())
+    if checkpoint.startswith("mixed"):
+        quant = ModelOptMixedConfig(
+            quantized_layers={
+                **{
+                    f"{root}.mlp.{leaf}": "FP8"
+                    for leaf in ("gate_proj", "up_proj", "down_proj")
+                },
+                **{f"{prefix}.{leaf}": "FP8" for leaf in serialized},
+            }
+        )
+    else:
+        quant = {
+            "bf16": None,
+            "nvfp4": Nvfp4Config(exclude_modules=["*"]),
+            "fp8": Fp8Config(
+                is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+            ),
+        }[checkpoint]
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            layer = layer_cls(
+                config,
+                Mapping(rank=0, world_size=1),
+                0,
+                quant_config=quant,
+                enable_fp8_attn_proj=enabled and not draft,
+                prefix=prefix,
+            )
+        for projection, is_serialized in (
+            (layer.qkv_proj, checkpoint in ("fp8", "mixed_qkv")),
+            (layer.o_proj, checkpoint in ("fp8", "mixed_o")),
+        ):
+            if is_serialized:
+                assert projection.weight.dtype == torch.float8_e4m3fn
+                assert isinstance(projection.quant_method, Fp8LinearMethod)
+                if checkpoint.startswith("mixed"):
+                    assert projection.weight_scale.dtype == torch.float32
+                    assert projection.input_scale.dtype == torch.float32
+            elif enabled and not draft:
+                assert projection.weight.dtype == torch.bfloat16
+                assert isinstance(projection.quant_method, Fp8LinearMethod)
+                assert (
+                    not projection.quant_method.quant_config.is_checkpoint_fp8_serialized
+                )
+            else:
+                assert projection.weight.dtype == torch.bfloat16
+                assert isinstance(projection.quant_method, UnquantizedLinearMethod)
+        if checkpoint.startswith("mixed"):
+            assert isinstance(layer.mlp.gate_up_proj.quant_method, Fp8LinearMethod)
+    finally:
+        torch.set_default_dtype(old_dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "config_cls,model_cls,draft",
+    [
+        (Qwen3_5TextConfig, Qwen3_5ForCausalLM, False),
+        (Qwen3_5TextConfig, Qwen3_5DraftForCausalLM, True),
+        (Qwen4ExpTextConfig, Qwen4ExpModel, False),
+        (Qwen4ExpTextConfig, Qwen4ExpDraftModel, True),
+    ],
+)
+def test_model_entry_sets_projection_policy(
+    monkeypatch, enabled, config_cls, model_cls, draft
+):
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", enabled)
+    config = config_cls(
+        hidden_size=512,
+        intermediate_size=512,
+        vocab_size=128,
+        full_attention_interval=1,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        max_position_embeddings=128,
+        layer_types=["full_attention"],
+        num_experts=None,
+    )
+    config.dtype = torch.bfloat16
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            model = model_cls(config, Mapping(rank=0, world_size=1))
+        expected = Fp8LinearMethod if enabled and not draft else UnquantizedLinearMethod
+        layer = model.layers[0]
+        assert isinstance(layer.qkv_proj.quant_method, expected)
+        assert isinstance(layer.o_proj.quant_method, expected)
+    finally:
+        torch.set_default_dtype(previous_dtype)

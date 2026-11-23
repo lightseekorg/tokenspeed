@@ -22,6 +22,10 @@
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.fabric import (
+    group_has_fabric,
+    group_host_span,
+)
 from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherState,
     TrtllmReduceScatterState,
@@ -99,10 +103,12 @@ class SharedExpertCommunication:
 
     Allocate before memory profiling/capture; never alias main-stream attention
     buffers. Physical subgroup counts select the same path on every peer.
+    ``fused_rows`` bounds native collective storage; larger batches use NCCL.
     """
 
-    def __init__(self, parallel, capacity, hidden, device):
+    def __init__(self, parallel, capacity, hidden, device, fused_rows):
         self.parallel, self.capacity, self.hidden = parallel, capacity, hidden
+        self.fused_rows = fused_rows
         self.send = torch.empty(capacity, hidden, dtype=torch.bfloat16, device=device)
         self.received = torch.empty(
             parallel.tp_size * capacity, hidden, dtype=torch.bfloat16, device=device
@@ -110,14 +116,17 @@ class SharedExpertCommunication:
         self.gather = self.reduction = None
         # Native kernels support TP2/4/8/16; the gather wrapper requires
         # 128-aligned widths. Other geometries use NCCL.
-        if parallel.tp_size in (2, 4, 8, 16) and hidden > 0 and hidden % 128 == 0:
+        host_span = group_host_span(parallel.tp_group)
+        peer_access = host_span in (None, 1) or group_has_fabric(parallel.tp_group)
+        if (
+            parallel.tp_size in (2, 4, 8, 16)
+            and hidden > 0
+            and hidden % 128 == 0
+            and peer_access
+        ):
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            self.gather = TrtllmAllGatherState(
-                group, min(capacity, 128), hidden, device, True
-            )
-            self.reduction = TrtllmReduceScatterState(
-                group, min(capacity, 128), hidden, device
-            )
+            self.gather = TrtllmAllGatherState(group, fused_rows, hidden, device, True)
+            self.reduction = TrtllmReduceScatterState(group, fused_rows, hidden, device)
             probe = self.reduction.input_buffer(1)
             probe.zero_()
             trtllm_reduce_scatter(self.reduction, probe, 1)
@@ -146,7 +155,7 @@ class SharedExpertCommunication:
         if rows == 0:
             return inputs.new_empty((0, self.hidden))
         send = prepare_padded_rows(inputs, rows, self.send, alignment_bytes=1)
-        if self.gather is not None and rows <= 128:
+        if self.gather is not None and rows <= self.fused_rows:
             gathered = trtllm_allgather(self.gather, send)
         else:
             gathered = self.received[: p.tp_size * rows]
@@ -159,6 +168,7 @@ class SharedExpertCommunication:
         partial is BF16 [TP*padded_rows,H]; local_rows is this owner's valid
         count. Empty subgroups skip the collective; empty owners still join.
         Reduction may overlap finite routed BMM, but must finish before combine.
+        For peer-polling fused MoE, it starts after the fused kernel instead.
         """
         rows = partial.shape[0] // self.parallel.tp_size
         if (
@@ -168,7 +178,7 @@ class SharedExpertCommunication:
             raise ValueError("Shared-expert partials must match padded subgroup rows")
         if rows == 0:
             return partial.new_empty((0, self.hidden))
-        if self.reduction is not None and rows <= 128:
+        if self.reduction is not None and rows <= self.fused_rows:
             owned = trtllm_reduce_scatter(self.reduction, partial, rows)
         else:
             owned = reduce_scatter(partial, self.parallel.tp_group, backend=None)

@@ -290,3 +290,31 @@ def test_gpu_batch_size_and_strides_do_not_recompile():
     ):
         for b in (1, 16, 17, 64):
             step(b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_gpu_coin_draws_do_not_recompile():
+    # N and the coin buffers' [max_bs, max_n] shape are server geometry; the
+    # batch size, request slots, seeds and positions change every step and
+    # must stay runtime values.
+    from tokenspeed_kernel.ops.sampling.triton import rejection
+    from utils import assert_no_triton_compile
+
+    n, max_n, max_bs, pool = 4, 5, 64, 80
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    seed_pool = torch.randint(0, 2**62, (pool,), generator=gen, device="cuda")
+    offsets_pool = torch.randint(0, 2**20, (pool,), generator=gen, device="cuda")
+    coins_buf = torch.empty(max_bs, max_n, device="cuda")
+    final_buf = torch.empty(max_bs, device="cuda")
+
+    def step(b):
+        slots = torch.randperm(pool, generator=gen, device="cuda")[:b].int()
+        rejection.block_verify_coins_from_pools(
+            slots, seed_pool, offsets_pool, coins_buf[:b, :n], final_buf[:b]
+        )
+
+    step(3)
+    with assert_no_triton_compile(rejection._block_verify_coins_kernel):
+        for b in (1, 16, 17, 64):
+            step(b)
+            offsets_pool.add_(n)

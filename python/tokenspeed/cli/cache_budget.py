@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from tokenspeed.runtime.cache.host_budget import (
-    ManifestInvalid,
+    ManifestInvalidError,
     ManifestIssue,
     evaluate_manifest,
     invalid_report,
@@ -72,7 +72,7 @@ def build_report(manifest_path: Path) -> dict[str, Any]:
         )
     try:
         return evaluate_manifest(parse_manifest_json(text))
-    except ManifestInvalid as invalid:
+    except ManifestInvalidError as invalid:
         return invalid_report(invalid.issues)
 
 

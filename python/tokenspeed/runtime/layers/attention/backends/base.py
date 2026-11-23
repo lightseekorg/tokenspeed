@@ -43,8 +43,8 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
@@ -78,6 +78,48 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+ModelBindingT = TypeVar("ModelBindingT")
+
+
+@dataclass(frozen=True)
+class PrefillRequestLayout:
+    """Host request lengths for the extend prefix of one forward.
+
+    These immutable host integers describe the scheduler's input, before
+    query sharding or graph padding. Decode rows use the forward's explicit
+    decode width. No device-to-host copy is allowed when constructing this view.
+    """
+
+    input_lengths: tuple[int, ...]
+    prefix_lengths: tuple[int, ...]
+
+    @classmethod
+    def from_cpu_lengths(
+        cls,
+        num_extends: int,
+        input_lengths: torch.Tensor,
+        prefix_lengths: torch.Tensor,
+    ) -> PrefillRequestLayout:
+        """Copy the active extend prefix of CPU integer mirrors into a view."""
+        if num_extends < 0:
+            raise ValueError("num_extends must be nonnegative")
+        for lengths in (input_lengths, prefix_lengths):
+            if (
+                lengths.device.type != "cpu"
+                or lengths.ndim != 1
+                or lengths.dtype not in (torch.int32, torch.int64)
+                or lengths.numel() < num_extends
+            ):
+                raise ValueError(
+                    "Prefill request layout requires CPU integer length mirrors"
+                )
+        inputs = tuple(input_lengths[:num_extends].tolist())
+        prefixes = tuple(prefix_lengths[:num_extends].tolist())
+        if any(value < 0 for value in (*inputs, *prefixes)):
+            raise ValueError("Prefill request lengths must be nonnegative")
+        return cls(inputs, prefixes)
 
 
 @dataclass(frozen=True)
@@ -114,22 +156,39 @@ class SparseTopKShare:
     verify window); each family stores its own record type. ``qsa_metadata``
     holds QSA's layer-invariant row geometry so it is built once per forward;
     ``qsa_selection`` retains its logical candidates alongside physical slots.
+    ``write_slots`` holds the KVP-local write slots the layers resolved from
+    the round's virtual write slots (``placement.resolve_write_slots``).
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
     qsa_selection: Any | None = None
+    write_slots: list = field(default_factory=list)
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
         self.qsa_selection = None
+        self.write_slots = []
 
 
 class CachePoolBinding:
     """A node's bound cache pool."""
+
+    def preallocate_prefill_workspace(self, pool_options: object | None = None) -> int:
+        """Allocate recipe-budgeted Prefill storage; options belong to its owner."""
+        return sum(
+            child.preallocate_prefill_workspace(pool_options)
+            for child in self.child_backends()
+        )
+
+    @property
+    def prefill_kv_capacity(self) -> int:
+        """Maximum summed prefill KV rows supported by fixed workspace; 0 if unbounded."""
+        capacities = [child.prefill_kv_capacity for child in self.child_backends()]
+        return min((capacity for capacity in capacities if capacity), default=0)
 
     #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
     #: none by default; a node that keeps some names them.
@@ -142,6 +201,14 @@ class CachePoolBinding:
     def child_backends(self) -> tuple[CachePoolBinding, ...]:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
+
+    def fixed_workspace_bytes(self) -> int:
+        """Return recipe-reserved workspace bytes, excluding the shared arena.
+
+        Stateless leaves return zero. Owners add their allocations to the
+        children's total, without counting graph metadata or arena views.
+        """
+        return sum(child.fixed_workspace_bytes() for child in self.child_backends())
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
@@ -174,9 +241,30 @@ class CachePoolBinding:
         or per-tensor scales, a split schedule, another kernel family)."""
         return None
 
+    def takes_owned_decode_topk(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s sparse decode takes this rank's share of the
+        top-k as local cache slots (``topk_owned``) instead of the whole
+        selection as scheduler slots."""
+        return False
+
+    def dcp_decode_query_rider(
+        self, layer: PagedAttention, q: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Bytes of ``q`` for an owned decode top-k's score gather to carry
+        to ``layer``'s sparse decode (``gathered_query``), or None where
+        that decode gathers its query itself."""
+        return None
+
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
         was written at (``PagedAttention.fp8_kv_scales``)."""
+        return False
+
+    def gates_decode_output(self, layer: PagedAttention) -> bool:
+        """Whether ``forward_decode`` for ``layer`` takes
+        ``rmsnorm_output_gate`` and returns the gated output: from the store
+        of a kernel that can gate, else by running the separate op itself
+        (:meth:`PagedAttention.attend`)."""
         return False
 
     def query_dtype(
@@ -220,17 +308,17 @@ class CachePoolBinding:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         # Backend rows are rewritten by every forward and prepared at a PD
         # landing, never keyed by request: always valid, nothing to mark.
-        del request_id
+        del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        del request_id
+        del admission_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def prepare_cache_batch(
@@ -355,11 +443,34 @@ class AttentionBackend(CachePoolBinding, ABC):
         """The binding lifecycle fields; wrappers that skip __init__ call this."""
         super()._init_pool_binding()
         self._sparse_topk = SparseTopKShare()
+        self._prefill_request_layout: PrefillRequestLayout | None = None
+
+    def prefill_request_layout(self) -> PrefillRequestLayout | None:
+        """Return this forward's extend request layout, or None outside an extend.
+
+        Composites delegate to the attention child that receives the scheduler's
+        complete input span. Models must not recover these lengths from a
+        recurrent consumer's private metadata.
+        """
+        return self._prefill_request_layout
+
+    def model_binding(
+        self, layer_id: int, binding_type: type[ModelBindingT]
+    ) -> ModelBindingT | None:
+        """Return an explicitly offered model interface for ``layer_id``.
+
+        The consumer defines the interface type and its owner returns the bound
+        implementation. None means unsupported. Composites route by layer, never
+        search children by Python type. Bindings expose operands or preparation
+        operations; attention forward and lifecycle still go through this backend.
+        """
+        return None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         """Record the pool and clear shared sparse-forward metadata."""
         super()._publish_cache_pool(cache_pool)
         self._sparse_topk.clear()
+        self._prefill_request_layout = None
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (information unavailable at

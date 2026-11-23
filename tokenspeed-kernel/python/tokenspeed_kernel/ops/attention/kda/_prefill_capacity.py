@@ -22,8 +22,6 @@
 
 from dataclasses import dataclass
 
-import torch
-
 
 @dataclass(frozen=True)
 class KdaPrefillCapacity:
@@ -36,8 +34,7 @@ class KdaPrefillCapacity:
     Each sequence may use up to token_capacity rows, but their combined live
     lengths must fit token_capacity. Compact native planning bounds total
     chunks by ceil(token_capacity / chunk_size) + num_sequences - 1.
-    The compatibility path reserves capacity independently per sequence;
-    live GPU boundaries remain authoritative in either case.
+    Live GPU boundaries remain authoritative.
     """
 
     token_capacity: int
@@ -46,13 +43,6 @@ class KdaPrefillCapacity:
     def __post_init__(self):
         if self.token_capacity <= 0 or self.num_sequences <= 0:
             raise ValueError("KDA planning capacities must be positive")
-
-    def boundaries_cpu(self):
-        """Return host int64 planning boundaries, not live token boundaries."""
-        return (
-            torch.arange(self.num_sequences + 1, dtype=torch.int64)
-            * self.token_capacity
-        )
 
     def validate(self, live_boundaries, tokens):
         """Validate admission from the existing CPU mirror without a D2H."""

@@ -82,6 +82,13 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   and `cumulative_unpack_kernel` writes a draft row as the draft at its
   probability over the whole vocabulary and the draw without it at
   probability one (`whole_targets`), all under a new trailing `whole`;
+- draft-tree draws (not upstream): one draw per tree node in the singular
+  setting. `whole_reduction_kernel` and `cumulative_selection_kernel` take a
+  new trailing `u_ptr`, each row's noise step (its depth in its tree) in
+  place of its step in the window (`whole_block` keys its noise by a new
+  `draw_step`), and `decode_counts` reads a singular row's drafted tokens at
+  its row (`margin`) instead of its slot, so rows sharing a slot count their
+  own paths;
 - the Gumbel noise: `ops/base.py`'s `philox_gumbel` computes `log(-log u)`
   from the Philox draw's raw bits (`exponential_log`, on the same counters):
   `u` and `1 - u` come exactly from the bits and `-log u` from a short series below

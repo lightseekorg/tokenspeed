@@ -20,33 +20,54 @@
 
 #include "req_pool_allocator.h"
 
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace tokenspeed {
 
 ReqPoolIndex::ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator) : slot_(slot), allocator_(allocator) {}
 
-ReqPoolIndex::ReqPoolIndex(ReqPoolIndex&& other) noexcept : slot_(other.slot_), allocator_(other.allocator_) {
-    other.allocator_ = nullptr;
-    other.slot_ = -1;
-}
+ReqPoolIndex::ReqPoolIndex(ReqPoolIndex&& other) noexcept
+    : slot_(std::exchange(other.slot_, -1)), allocator_(std::exchange(other.allocator_, nullptr)) {}
 
 ReqPoolIndex& ReqPoolIndex::operator=(ReqPoolIndex&& other) noexcept {
     if (this != &other) {
-        if (allocator_) {
-            allocator_->deallocate(slot_);
-        }
-        slot_ = other.slot_;
-        allocator_ = other.allocator_;
-        other.slot_ = -1;
-        other.allocator_ = nullptr;
+        release();
+        slot_ = std::exchange(other.slot_, -1);
+        allocator_ = std::exchange(other.allocator_, nullptr);
     }
     return *this;
 }
 
 ReqPoolIndex::~ReqPoolIndex() {
+    release();
+}
+
+void ReqPoolIndex::release() noexcept {
     if (allocator_) {
         allocator_->deallocate(slot_);
+        allocator_ = nullptr;
+    }
+}
+
+void ReqPoolIndex::BindOwner(std::string_view request_id, std::uint64_t admission_id) {
+    if (!valid() || allocator_->slot_history_[slot_ - 1].bound) {
+        throw std::logic_error("request pool ownership requires a fresh allocated handle");
+    }
+    if (allocator_->event_sink_ && admission_id == 0) {
+        throw std::invalid_argument("observed request pool ownership requires a nonzero admission identity");
+    }
+    auto& history = allocator_->slot_history_[slot_ - 1];
+    // Copy before publishing the binding, so an allocation failure cannot
+    // produce a release observation for an owner that was never assigned.
+    if (allocator_->event_sink_) {
+        history.request_id = request_id;
+    }
+    history.admission_id = admission_id;
+    history.bound = true;
+    if (allocator_->event_sink_) {
+        allocator_->event_sink_->OnSlotAssigned(history.ownership(slot_));
     }
 }
 
@@ -54,11 +75,31 @@ bool ReqPoolIndex::valid() const {
     return allocator_ != nullptr;
 }
 
+std::uint64_t ReqPoolIndex::generation() const {
+    return valid() ? allocator_->slot_history_[slot_ - 1].generation : 0;
+}
+
+std::uint64_t ReqPoolIndex::previous_admission_id() const {
+    return valid() ? allocator_->slot_history_[slot_ - 1].previous_admission_id : 0;
+}
+
 ReqPoolAllocator::ReqPoolAllocator(std::int32_t size) : size_(size) {
-    // Slot 0 is conventionally reserved (matches Python which starts from index 1).
-    for (std::int32_t i = 1; i < size + 1; ++i) {
-        free_slots_.push_back(i);
+    if (size < 0) {
+        throw std::invalid_argument("request pool capacity must be nonnegative");
     }
+    slot_history_.resize(static_cast<std::size_t>(size));
+    // Slot 0 is conventionally reserved (matches Python which starts from
+    // index 1): slots 1..size, counted so that INT32_MAX ends the loop.
+    for (std::int32_t i = 0; i < size; ++i) {
+        free_slots_.push_back(i + 1);
+    }
+}
+
+void ReqPoolAllocator::SetEventSink(SlotEventSink* sink) {
+    if (allocated_) {
+        throw std::logic_error("install the slot event sink before allocating any slots");
+    }
+    event_sink_ = sink;
 }
 
 ReqPoolIndex ReqPoolAllocator::Allocate() {
@@ -66,7 +107,14 @@ ReqPoolIndex ReqPoolAllocator::Allocate() {
         throw std::runtime_error("ReqPoolAllocator::Allocate: no request pool slots available; capacity=" +
                                  std::to_string(size_));
     }
-    std::int32_t slot = free_slots_.front();
+    const std::int32_t slot = free_slots_.front();
+    SlotHistory& history = slot_history_[slot - 1];
+    if (history.generation == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("request pool slot generation exhausted");
+    }
+    ++history.generation;
+    history.previous_admission_id = history.admission_id;
+    allocated_ = true;
     free_slots_.pop_front();
     return ReqPoolIndex{slot, this};
 }
@@ -74,12 +122,17 @@ ReqPoolIndex ReqPoolAllocator::Allocate() {
 std::int32_t ReqPoolAllocator::Size() const {
     return size_;
 }
-
 std::int32_t ReqPoolAllocator::AvailableSlots() const {
     return static_cast<std::int32_t>(free_slots_.size());
 }
 
 void ReqPoolAllocator::deallocate(std::int32_t slot) {
+    auto& history = slot_history_[slot - 1];
+    if (history.bound && event_sink_) {
+        event_sink_->OnSlotReleased(history.ownership(slot));
+        std::string{}.swap(history.request_id);
+    }
+    history.bound = false;
     free_slots_.push_back(slot);
 }
 
