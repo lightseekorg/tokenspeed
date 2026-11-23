@@ -1002,11 +1002,12 @@ is needed only in rounds with a terminal status.
 final output: the output waits for the transfer's result. A transfer failure
 must publish an abort even after computation finished, unless the client
 already cancelled its stream or a final output was sent. A numerical error
-(NaN guard) on prefill ends the request at commit instead of waiting for the
-transfer: its `Abort` event cancels the transfer to stop remote decode, and the
-commit emits the terminal abort output unless the client already cancelled. A
-pause abort still notifies the client; repeated transfer events do not repeat
-the final output. This output fence does not retire source pages.
+(NaN guard) in the prefill role ends the request at commit instead of waiting
+for the transfer: its `Abort` event cancels the transfer to stop the remote
+decode, and the commit emits the terminal abort output unless the client
+already cancelled. A pause abort still notifies the client; repeated transfer
+events do not repeat the final output. This output fence does not retire source
+pages.
 
 **PD route refresh.** Before attaching a new room, the decode connection worker
 fetches the bootstrap route version. The version changes on bootstrap restart
