@@ -1056,6 +1056,10 @@ class HostDataPlane:
         for tag in tags:
             self._regions[tag].resume()
 
+    def finish_memory_resume(self) -> None:
+        """Rebuild resources after the scheduler's all-rank wake gate."""
+        self._device.finish_memory_resume()
+
     def set_grammar_entries(self, entries: list[tuple[str, int]]) -> None:
         """The host's matcher entries, before serving starts."""
         self._grammar_entries = HostGrammarEntries(dict(entries))

@@ -243,8 +243,11 @@ def _worker(rank, rendezvous):
 
 
 def test_native_k31_dsa_qkv_intermediate_output_lifetime(tmp_path):
-    if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("requires four GB300 GPUs on one node")
+    if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires four SM100 or SM103 GPUs on one node")
     mp.spawn(
         _worker,
         args=(f"file://{tmp_path / 'rendezvous'}",),

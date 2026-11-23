@@ -272,6 +272,9 @@ pub trait DataPlane {
     /// Restore these memory regions, in order.
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
 
+    /// Restore resources that require every rank's memory to be resident.
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError>;
+
     /// EPLB: this rank's route counters since the previous snapshot,
     /// `[layers, physical]`, with the placement they were counted under;
     /// starts a new window behind the forwards dispatched before it.
@@ -604,6 +607,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Without L3, the forward permission the scheduler last received; it
     /// starts allowed. With L3 every round's tick carries it.
     forward_allowed: bool,
+    /// A collective NCCL release may have discarded projection workspaces and graphs.
+    collective_resume_pending: bool,
     /// Last load report on the output wire, including idle heartbeats.
     last_load_report: Option<Instant>,
     /// Last load sent to the frontend, including rounds with no token output.
@@ -683,6 +688,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             staged: Vec::new(),
             dp_idle: true,
             forward_allowed: true,
+            collective_resume_pending: false,
             last_load_report: None,
             reported_load: None,
             active_pages: ActivePages::default(),
@@ -843,6 +849,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
+        if memory_resident && self.collective_resume_pending {
+            self.data_plane.finish_memory_resume()?;
+            self.collective_resume_pending = false;
+        }
         let forward_allowed = memory_resident && !self.controls.forward_blocked();
 
         // The storage tick and the cache-op acknowledgments advance at the
@@ -2286,6 +2296,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             Drain::Pause => self.controls.finish_pause_drain(),
             Drain::Release(tags) => {
                 self.data_plane.release_memory(&tags)?;
+                self.collective_resume_pending |= tags.iter().any(|tag| tag == "nccl");
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
             }

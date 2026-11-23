@@ -822,6 +822,12 @@ discardable under the separate `cuda_graph` tag.
 
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
+For engines with DP projections, the NCCL release drops captured graphs before
+closing the projection workspaces they reference. Each workspace owns its
+symmetric storage so it can release it at sleep. Full reclamation on CUDA
+requires a PyTorch build that frees symmetric-memory rendezvous pointer tables.
+The head gate waits for all memory regions on all ranks to resume, then rebuilds
+those workspaces and recaptures graphs before it permits a forward.
 Other regions still resume locally. A pending collective resume refuses a
 second memory resume until it finishes.
 

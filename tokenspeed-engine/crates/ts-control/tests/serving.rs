@@ -930,6 +930,14 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        self.device_ops
+            .lock()
+            .unwrap()
+            .push("finish memory resume".to_owned());
+        Ok(())
+    }
+
     fn attach_grammars(
         &mut self,
         grammars: &[(String, u64, Vec<i32>)],
@@ -5176,6 +5184,7 @@ fn nccl_resume_waits_for_every_dp_engine() {
                 vec![
                     "release kv_cache,weights,nccl",
                     "resume nccl,weights,kv_cache",
+                    "finish memory resume",
                 ]
             } else {
                 vec!["release kv_cache,weights,nccl"]
@@ -5757,7 +5766,7 @@ fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
 
 #[test]
 fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
-    for wake_peer in [false, true] {
+    for (nccl, wake_peer) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut scripts = vec![vec![Vec::new(); 90]; 2];
         for (rank, script) in scripts.iter_mut().enumerate() {
             script[0].push(EngineRequest::Control(Box::new(
@@ -5767,7 +5776,11 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
                     tags: None,
                 }),
             )));
-            for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
+            let mut wake = vec![(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")];
+            if nccl {
+                wake.insert(0, (2, "nccl"));
+            }
+            for (round, tag) in wake {
                 if rank == 1 && tag == "kv_cache" && !wake_peer {
                     continue;
                 }
@@ -5789,7 +5802,10 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
             Layout::Dp(2),
             0,
             Tiers::DeviceOnly,
-            Setup::default(),
+            Setup {
+                nccl_suspendable: nccl,
+                ..Setup::default()
+            },
             scripts,
             no_reaction,
         );
@@ -5797,14 +5813,21 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
             assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
             assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
         }
-        assert_eq!(
-            ranks[0].device_ops,
-            [
-                "release kv_cache,weights",
-                "resume weights",
-                "resume kv_cache"
-            ]
-        );
+        for (rank, result) in ranks.iter().enumerate() {
+            let mut expected = if nccl {
+                vec!["release kv_cache,weights,nccl", "resume nccl"]
+            } else {
+                vec!["release kv_cache,weights"]
+            };
+            expected.push("resume weights");
+            if rank == 0 || wake_peer {
+                expected.push("resume kv_cache");
+            }
+            if nccl && wake_peer {
+                expected.push("finish memory resume");
+            }
+            assert_eq!(result.device_ops, expected);
+        }
         assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
         if wake_peer {
             assert_eq!(

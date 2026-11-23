@@ -405,4 +405,6 @@ def test_native_fp8_tp_projection_smoke(tmp_path, kind):
 
 
 def test_native_bf16_dsa_column_projection(tmp_path):
-    _launch_bf16_projection(tmp_path, "column", 4, 7168, 14592, 2048, ((10, 3),))
+    _launch_bf16_projection(
+        tmp_path, "column", 4, 7168, 14592, 2048, ((10, 0), (10, 3))
+    )

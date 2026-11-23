@@ -28,6 +28,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import from_dlpack
+from tokenspeed_kernel.ops.communication._cuda.symmetric_memory import (
+    empty_owned_symmetric,
+)
 from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection_kernel import (
     FusedTPProjectionKernel,
 )
@@ -87,11 +90,10 @@ class FusedTPProjectionState:
     ) -> None:
         device_arch = torch.cuda.get_device_capability(device)
         column_96 = (
-            device_arch == (10, 3)
-            and not quantized
+            not quantized
             and not row_parallel
             and group.size() == 4
-            and output_size % (group.size() * 96) == 0
+            and (input_size, output_size) == (7168, 14592)
         )
         if (
             group.size() not in (2, 4, 8)
@@ -133,13 +135,13 @@ class FusedTPProjectionState:
         flag_words = 16 + self.active_ctas
         epoch_offset = (flag_words + 15) // 16 * 16
         capacity = _row_bucket(max_rows, row_parallel, self.world_size)
-        self.a = symm_mem.empty(
+        self.a = empty_owned_symmetric(
             (capacity * self.world_size, self.gemm_input_size),
             dtype=torch.float8_e4m3fn if quantized else torch.bfloat16,
             device=device,
         )
         self.sa = (
-            symm_mem.empty(
+            empty_owned_symmetric(
                 (capacity * self.world_size, self.gemm_input_size // 128),
                 dtype=torch.float32,
                 device=device,
@@ -147,14 +149,18 @@ class FusedTPProjectionState:
             if quantized
             else None
         )
-        self.receive = symm_mem.empty(
+        self.receive = empty_owned_symmetric(
             (capacity, self.receive_width), dtype=torch.bfloat16, device=device
         )
         if row_parallel:
             self.receive.view(torch.int16).fill_(-32768)
-        self.ready = symm_mem.empty((flag_words,), dtype=torch.int64, device=device)
-        self.ack = symm_mem.empty((flag_words,), dtype=torch.int64, device=device)
-        self.input_flags = symm_mem.empty(
+        self.ready = empty_owned_symmetric(
+            (flag_words,), dtype=torch.int64, device=device
+        )
+        self.ack = empty_owned_symmetric(
+            (flag_words,), dtype=torch.int64, device=device
+        )
+        self.input_flags = empty_owned_symmetric(
             (epoch_offset + self.world_size * 16 if row_parallel else flag_words,),
             dtype=torch.int64,
             device=device,
@@ -293,7 +299,7 @@ class FusedTPProjectionState:
             and not quantized
             and self.world_size == 4
             and (
-                (not row_parallel and input_size == 7168 and output_size == 14592)
+                column_96
                 or (row_parallel and input_size == 12288 and output_size == 7168)
             )
         )
@@ -312,23 +318,20 @@ class FusedTPProjectionState:
             dist.all_reduce(active, op=dist.ReduceOp.MIN, group=group)
             cluster_ctas = int(active.item()) // 4 * 4
         column_512_ctas = 0
-        if (
-            cooperative_projection
-            and not row_parallel
-            and self.input_multicast_ptr
-            and 512 in self.row_views
-        ):
+        if column_96 and self.input_multicast_ptr and 512 in self.row_views:
             active_pairs = utils.HardwareInfo(
                 device_id=device.index
             ).get_max_active_clusters(2)
-            active = torch.tensor(active_pairs * 2, dtype=torch.int32, device=device)
-            dist.all_reduce(active, op=dist.ReduceOp.MIN, group=group)
-            column_512_ctas = min(
-                self.active_ctas,
-                int(active.item()) // self.world_size * self.world_size,
+            active = torch.tensor(
+                min(active_pairs * 2, self.active_ctas),
+                dtype=torch.int32,
+                device=device,
             )
-        # The tiled 512-row column schedule distributes work across 76 CTA pairs.
-        column_512_cooperative = column_512_ctas == 152
+            dist.all_reduce(active, op=dist.ReduceOp.MIN, group=group)
+            # The preferred launch groups two MMA pairs into a four-CTA cluster.
+            column_512_ctas = int(active.item()) // 4 * 4
+        # The first eight CTAs include input publishers; arrival counts are bytes.
+        column_512_cooperative = 8 <= column_512_ctas < 256
         self.can_borrow_column_512 = (
             column_512_cooperative and column_512_ctas == self.active_ctas
         )

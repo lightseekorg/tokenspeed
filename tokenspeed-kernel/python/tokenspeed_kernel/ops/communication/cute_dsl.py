@@ -192,11 +192,7 @@ def fused_tp_column_projection_supported(
     if weight_dtype == torch.float8_e4m3fn:
         return aligned_output
     # BF16 TP4 DSA QKV-A uses 96-channel alignment for each output shard.
-    dsa_tp4_shape = (
-        device_arch == (10, 3)
-        and group_size == 4
-        and (input_size, output_size) == (7168, 14592)
-    )
+    dsa_tp4_shape = group_size == 4 and (input_size, output_size) == (7168, 14592)
     return (
         weight_dtype == torch.bfloat16
         and group_size in (2, 4)

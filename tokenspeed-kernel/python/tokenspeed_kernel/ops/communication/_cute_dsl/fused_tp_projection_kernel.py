@@ -893,7 +893,6 @@ class FusedTPProjectionKernel:
             and len(input_peers) == 4
             and input_source.shape[1] == 7168
             and output.shape[1] == 14592
-            and resident_ctas == 152
         )
         self.row_pipelined_input = (
             not self.quantized
@@ -1266,10 +1265,10 @@ class FusedTPProjectionKernel:
         launch_cluster = (*self.cluster_shape_mn, 1)
         fallback_cluster = None
         if cutlass.const_expr(self.column_tiled_input):
-            assert grid == (2, 1, 76)
+            assert grid[:2] == (2, 1) and grid[2] % 2 == 0
             fallback_cluster = launch_cluster
             launch_cluster = (4, 1, 1)
-            grid = (4, 1, 38)
+            grid = (4, 1, grid[2] // 2)
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -4437,44 +4436,49 @@ class FusedTPProjectionKernel:
     ):
         # Each packet is 32 consecutive rows in one K256 receive slab.
         # The local-input CTAs can proceed directly to GEMM.
+        workers = self.num_ctas // 8 * 4
         worker = block // 8 * 4 + block % 4
-        job = worker + warp * 76
-        if block % 8 >= 4 and job < 112:
-            slab = job // 8
-            row_tile = job % 8
-            source = cute.local_tile(tensor, (32, 256), (row_tile, slab, 0))
-            slot = scratch + warp * (32 * 256)
-            shared = cute.make_tensor(
-                slot, cute.make_layout((32, 256), stride=(256, 1))
-            )
-            local, remote = cpasync.tma_partition(
-                atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(shared, 0, 2),
-                cute.group_modes(source, 0, 2),
-            )
-            barrier = barriers + warp
-            if lane == 0:
-                cute.arch.mbarrier_init(barrier, 1)
-                cute.arch.mbarrier_init_fence()
-                cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.mbarrier_arrive_and_expect_tx(barrier, 32 * 256 * 2)
-            cute.arch.sync_warp()
-            cute.copy(atom, remote, local, tma_bar_ptr=barrier)
-            if lane == 0:
-                cute.arch.mbarrier_wait(barrier, 0)
-                offset = (
-                    cutlass.Int64(slab) * (2048 * 256)
-                    + (cutlass.Int64(rank) * 512 + row_tile * 32) * 256
+        # Only two warps use the prefix scratch slots.
+        for step in cutlass.range_constexpr(cute.ceil_div(112, 2 * workers)):
+            job = (warp + 2 * step) * workers + worker
+            if block % 8 >= 4 and warp < 2 and job < 112:
+                slab = job // 8
+                row_tile = job % 8
+                source = cute.local_tile(tensor, (32, 256), (row_tile, slab, 0))
+                slot = scratch + warp * (32 * 256)
+                shared = cute.make_tensor(
+                    slot, cute.make_layout((32, 256), stride=(256, 1))
                 )
-                for peer in cutlass.range_constexpr(1, len(peers)):
-                    cp_async_bulk_s2g(
-                        peers[peer].iterator + offset, slot, cutlass.Int32(32 * 256 * 2)
+                local, remote = cpasync.tma_partition(
+                    atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(shared, 0, 2),
+                    cute.group_modes(source, 0, 2),
+                )
+                barrier = barriers + warp
+                if lane == 0:
+                    cute.arch.mbarrier_init(barrier, 1)
+                    cute.arch.mbarrier_init_fence()
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.mbarrier_arrive_and_expect_tx(barrier, 32 * 256 * 2)
+                cute.arch.sync_warp()
+                cute.copy(atom, remote, local, tma_bar_ptr=barrier)
+                if lane == 0:
+                    cute.arch.mbarrier_wait(barrier, 0)
+                    offset = (
+                        cutlass.Int64(slab) * (2048 * 256)
+                        + (cutlass.Int64(rank) * 512 + row_tile * 32) * 256
                     )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=False)
-                cute.arch.fence_proxy("async.global")
+                    for peer in cutlass.range_constexpr(1, len(peers)):
+                        cp_async_bulk_s2g(
+                            peers[peer].iterator + offset,
+                            slot,
+                            cutlass.Int32(32 * 256 * 2),
+                        )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    cute.arch.fence_proxy("async.global")
 
     @cute.jit
     def copy_column_tail_packets(
@@ -4490,42 +4494,46 @@ class FusedTPProjectionKernel:
         first_slab: cutlass.Constexpr,
         slab_count: cutlass.Constexpr,
     ):
-        if block < slab_count * 16:
-            slab = first_slab + block // 16
-            row_tile = 16 + block % 16
-            source = cute.local_tile(tensor, (16, 256), (row_tile, slab, 0))
-            shared = cute.make_tensor(
-                scratch, cute.make_layout((16, 256), stride=(256, 1))
-            )
-            local, remote = cpasync.tma_partition(
-                atom,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(shared, 0, 2),
-                cute.group_modes(source, 0, 2),
-            )
-            if lane == 0:
-                cute.arch.mbarrier_init(barrier, 1)
-                cute.arch.mbarrier_init_fence()
-                cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.mbarrier_arrive_and_expect_tx(barrier, 16 * 256 * 2)
-            cute.arch.sync_warp()
-            cute.copy(atom, remote, local, tma_bar_ptr=barrier)
-            if lane == 0:
-                cute.arch.mbarrier_wait(barrier, 0)
-                offset = (
-                    cutlass.Int64(slab) * (2048 * 256)
-                    + (cutlass.Int64(rank) * 512 + row_tile * 16) * 256
+        for step in cutlass.range_constexpr(
+            cute.ceil_div(slab_count * 16, self.num_ctas)
+        ):
+            packet = block + step * self.num_ctas
+            if packet < slab_count * 16:
+                slab = first_slab + packet // 16
+                row_tile = 16 + packet % 16
+                source = cute.local_tile(tensor, (16, 256), (row_tile, slab, 0))
+                shared = cute.make_tensor(
+                    scratch, cute.make_layout((16, 256), stride=(256, 1))
                 )
-                for peer in cutlass.range_constexpr(1, len(peers)):
-                    cp_async_bulk_s2g(
-                        peers[peer].iterator + offset,
-                        scratch,
-                        cutlass.Int32(16 * 256 * 2),
+                local, remote = cpasync.tma_partition(
+                    atom,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(shared, 0, 2),
+                    cute.group_modes(source, 0, 2),
+                )
+                if lane == 0:
+                    cute.arch.mbarrier_init(barrier, 1)
+                    cute.arch.mbarrier_init_fence()
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.mbarrier_arrive_and_expect_tx(barrier, 16 * 256 * 2)
+                cute.arch.sync_warp()
+                cute.copy(atom, remote, local, tma_bar_ptr=barrier)
+                if lane == 0:
+                    cute.arch.mbarrier_wait(barrier, 0)
+                    offset = (
+                        cutlass.Int64(slab) * (2048 * 256)
+                        + (cutlass.Int64(rank) * 512 + row_tile * 16) * 256
                     )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=False)
-                cute.arch.fence_proxy("async.global")
+                    for peer in cutlass.range_constexpr(1, len(peers)):
+                        cp_async_bulk_s2g(
+                            peers[peer].iterator + offset,
+                            scratch,
+                            cutlass.Int32(16 * 256 * 2),
+                        )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    cute.arch.fence_proxy("async.global")
 
     @cute.jit
     def copy_column_panel(
@@ -4636,7 +4644,7 @@ class FusedTPProjectionKernel:
                 )
                 self.input_copy_join.arrive_and_wait()
             if worker_warp == 4 and lane == 0:
-                # At most 152 CTAs increment an eight-bit count. Pack the
+                # Each group of CTAs increments an eight-bit count. Pack the
                 # seven counts into one word, without carries between them.
                 shift = 8 * (segment - 1)
                 counters = cute.arch.atomic_add(
@@ -5363,11 +5371,13 @@ class FusedTPProjectionKernel:
     ):
         result = coord
         if cutlass.const_expr(self.column_tiled_input):
-            # Put both local row bands in wave one. Those tiles can read
-            # directly while the other owners' panels are still in flight.
-            cluster_tile = coord[1] * 8 + coord[0] // 2
-            wave = cluster_tile // 76
-            work = cluster_tile % 76
+            # Prioritize both local row bands while remote panels are in flight.
+            # The persistent scheduler may span this order across multiple waves.
+            row_tiles = world * rows // self.mma_tiler[0]
+            band_tiles = width // self.mma_tiler[1]
+            cluster_tile = coord[1] * row_tiles + coord[0] // 2
+            wave = cluster_tile // band_tiles
+            work = cluster_tile % band_tiles
             cohort = work % 4
             owner_step = cohort - 1
             band = wave

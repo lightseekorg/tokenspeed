@@ -1797,6 +1797,8 @@ class _SleepExecutor:
         self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
+        self.model_runner = None
+        self.draft_model_runner = None
 
     def complete_pending_drafting(self) -> None:
         # No drafter.
