@@ -727,41 +727,28 @@ for larger batches. Row-derived reduction groups and token pairing belong
 only to the wider model. Other dimensions keep ordinary kernel selection;
 the fused work budget still bounds automatic selection.
 
-FP8 mixer weights are E4M3 with FP32 per-tensor or per-channel scales.
-The same operator accepts explicit `activation_quantization="none"` (W8A16)
-or `"fp8"` (W8A8). With a 16-bit normalized input, W8A16 decodes resident
-weight tiles and W8A8 quantizes inputs per token for native FP8 MMA. These
-paths use three and four compute launches respectively. Both reduce split-K
-partials in FP32 split order, then round post-SiLU activations to the output
-dtype before Up. W8A8 applies the canonical FP8 scale floor and independently
-rounded multiplier. W8A16 uses compile-time parameters for Down K-tile
-rotation and the token layout of the decoded Up pipeline.
+FP8 mixer weights use E4M3 with FP32 tensor or channel scales.
+With 16-bit input, `activation_quantization="none"` decodes resident weight
+tiles (W8A16, three compute launches), and `"fp8"` quantizes input rows
+for native FP8 MMA (W8A8, four launches). All paths merge split-K partials in
+FP32 split order and round SiLU activations to the output dtype before Up.
+W8A8 uses the FP8 scale floor and rounds the multiplier independently.
 
-Prequantized W8A8 accepts E4M3 input codes, an FP32 tensor or row scale,
-and an explicit BF16 or FP16 output dtype. Down, reduction, SiLU, activation
-quantization, Up and residual mixing run in one cooperative kernel. The
-residual uses the input's FP8 codes and scale in FP32. A compiled plan
-bounds the resident grid by occupancy. Each stream owns its scratch and
-monotonic epochs, and reader acknowledgements protect TMEM and operand
-stage reuse. PDL waits precede reads of producer-owned data.
+Prequantized W8A8 takes E4M3 input, FP32 tensor or row scales and an explicit
+BF16 or FP16 output dtype. One cooperative kernel runs all stages and mixes
+the residual from the input codes and scale in FP32. Schedules share the
+resident loop, quantizer, TMEM readers and token-major Up epilogue, with
+compile-time operand layouts and handoff policies. The 16-token injection
+schedule publishes epoch-tagged activations for early Up MMA. The K128
+schedule prefetches Up weights as Down releases stages and can share weights
+across the two token parts at 256 rows.
 
-The launch plans take model dimensions from the operator. Startup warms
-finite bucket variants with the ordinary dispatch. Actual row counts control
-masks and additional token rounds at runtime. The prequantized schedules
-compile from a shared resident loop for Down, quantization, and Up. The
-shared quantizer reduces split-K partials, applies SiLU and rounds before
-per-row E4M3 encoding. Each schedule selects its partial layout, row
-reduction and activation publication at compile time. The schedules also
-share the TMEM readers and token-major Up epilogue. The compact 16-token
-injection plan publishes epoch-tagged activation records so Up can start on
-the first K plane. The full K128 Up schedule can issue weight loads as Down
-releases its operand stages. At 256 tokens it can share weight stages across
-both token parts.
-
-The weight preparation helper can build a tiled Up weight for the SM103
-full K128 injection schedule through 128 tokens. The owner refreshes the
-derived tensor in place when the canonical weight changes, preserving its
-address for CUDA graph replay.
+Compiled occupancy bounds the resident grid. Each stream owns scratch and
+monotonic epochs, reader acknowledgements protect TMEM and stage reuse, and
+PDL waits order reads of producer-owned data. Startup warms the bounded
+buckets using the operator's model dimensions. Runtime rows control masks
+and rounds. The SM103 K128 injection schedule can use tiled Up weights
+through 128 tokens. The owner refreshes them in place for CUDA graph replay.
 
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows

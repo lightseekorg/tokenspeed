@@ -38,6 +38,60 @@ def _has_full_up_tiles(lowrank: int) -> bool:
 
 
 @cute.experimental.jit
+def _scale_down_value(
+    value, input_scale, weight_scale, projection_scale, silu: cutlass.Constexpr
+):
+    if cutlass.const_expr(input_scale is not None):
+        value = value * input_scale
+    value = value * weight_scale
+    value = value * projection_scale
+    if cutlass.const_expr(silu):
+        value = value * cute.arch.rcp_approx(1.0 + cute.exp(-value, fastmath=True))
+    return value
+
+
+@cute.experimental.jit
+def _quant_scale(maximum, propagate_nan: cutlass.Constexpr):
+    return cute.math.max(
+        maximum / cutlass.Float32(448.0),
+        cutlass.Float32(1.0 / (448.0 * 512.0)),
+        propagate_nan=propagate_nan,
+    )
+
+
+@cute.experimental.jit
+def _quant_multiplier(maximum, propagate_nan: cutlass.Constexpr):
+    return cute.math.min(
+        cutlass.Float32(448.0) / maximum,
+        cutlass.Float32(448.0 * 512.0),
+        propagate_nan=propagate_nan,
+    )
+
+
+@cute.experimental.jit
+def _quantized_value(value, multiplier, clamp: cutlass.Constexpr):
+    value = value.to(cutlass.Float32) * multiplier
+    lower = cutlass.Float32(-448.0)
+    if cutlass.const_expr(clamp == "ptx_lower"):
+        # PTX max without .NaN selects the lower bound for NaN.
+        value = cutlass.Float32(
+            llvm.inline_asm(
+                T.f32(),
+                [value.ir_value(), lower.ir_value()],
+                "max.f32 $0, $1, $2;",
+                "=f,f,f",
+                has_side_effects=False,
+                asm_dialect=0,
+            )
+        )
+    else:
+        value = cute.math.max(value, lower)
+    if cutlass.const_expr(clamp == "both"):
+        value = cute.math.min(value, cutlass.Float32(448.0))
+    return value
+
+
+@cute.experimental.jit
 def _decode_residual(codes):
     # Every E4M3 value is exactly representable in BF16 and FP32.
     words = cute.recast_tensor(codes, cutlass.Uint16)
@@ -123,6 +177,32 @@ def _release(ptr, value):
         has_side_effects=True,
         asm_dialect=0,
     )
+
+
+@cute.experimental.jit
+def _arrive_phase_release(ptr, asynchronous: cutlass.Constexpr):
+    # Acquire polling observes preceding releases through the atomic RMW chain.
+    instruction = "red.async" if asynchronous else "red"
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value()],
+        f"{instruction}.release.gpu.global.add.u64 [$0], 1;",
+        "l,~{memory}",
+        has_side_effects=True,
+        asm_dialect=0,
+    )
+
+
+@cute.experimental.jit
+def _grid_barrier(epochs, expected, wait_for_all, asynchronous: cutlass.Constexpr):
+    # The cooperative grid is small enough for every CTA to stay resident.
+    cute.arch.sync_threads()
+    if cute.arch.thread_idx()[0] == 0:
+        _arrive_phase_release(epochs.iterator, asynchronous)
+        if wait_for_all:
+            while _acquire(epochs.iterator) < expected:
+                pass
+    cute.arch.sync_threads()
 
 
 @cute.experimental.jit
@@ -231,22 +311,88 @@ def _store_private_epoch(ptr, value):
 
 
 @cute.experimental.jit
-def _make_down_operands(arena, tile: cutlass.Constexpr, stages: cutlass.Constexpr):
-    m, n, _ = tile
-    dtype = cutlass.Float8E4M3FN
-    mma = sm100_utils.make_trivial_tiled_mma(
+def _issue_mma_block(mma, acc, a_desc, b_desc, block, stage):
+    cute.gemm(
+        mma,
+        acc,
+        a_desc[None, None, block, stage],
+        b_desc[None, None, block, stage],
+        acc,
+    )
+
+
+@cute.experimental.jit
+def _run_cute_mma_ring(
+    mma,
+    acc,
+    a_desc,
+    b_desc,
+    ready,
+    empty,
+    tiles: cutlass.Constexpr,
+    stages: cutlass.Constexpr,
+    k_unroll: cutlass.Constexpr,
+    retire_empty: cutlass.Constexpr,
+):
+    # CuTe tracks MMA state through each loop by seeing the set calls in scope.
+    mma.set(tcgen05.Field.ACCUMULATE, False)
+    for tile in cutlass.range(tiles, unroll=1):
+        stage = tile % stages
+        cute.arch.mbarrier_wait(ready + stage, tile // stages % 2)
+        if cutlass.const_expr(k_unroll is None):
+            for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
+                _issue_mma_block(mma, acc, a_desc, b_desc, block, stage)
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+        else:
+            for block in cutlass.range(cute.size(a_desc, mode=[2]), unroll=k_unroll):
+                _issue_mma_block(mma, acc, a_desc, b_desc, block, stage)
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(retire_empty):
+            with cute.arch.elect_one():
+                tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
+
+
+@cute.experimental.jit
+def _make_k_major_mma(dtype: cutlass.Constexpr, shape: cutlass.Constexpr):
+    return sm100_utils.make_trivial_tiled_mma(
         dtype,
         dtype,
         tcgen05.OperandMajorMode.K,
         tcgen05.OperandMajorMode.K,
         cutlass.Float32,
         tcgen05.CtaGroup.ONE,
-        (m, n),
+        shape,
     )
+
+
+@cute.experimental.jit
+def _make_down_operands(arena, tile: cutlass.Constexpr, stages: cutlass.Constexpr):
+    m, n, _ = tile
+    dtype = cutlass.Float8E4M3FN
+    mma = _make_k_major_mma(dtype, (m, n))
     weight = sm100_utils.make_smem_layout_a(mma, tile, dtype, stages)
     activation = sm100_utils.make_smem_layout_b(mma, tile, dtype, stages)
     sw, sx = _operand_storage(arena, weight, activation)
     return mma, sw, sx
+
+
+@cute.experimental.jit
+def _make_down_fragments(thread_mma, base, sw, sx, acc_shape):
+    a_desc = thread_mma.make_fragment_A(sw)
+    b_desc = thread_mma.make_fragment_B(sx)
+    fragment = thread_mma.make_fragment_C(acc_shape)
+    accumulator = cute.make_tensor(
+        cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
+    )
+    return accumulator, a_desc, b_desc
+
+
+@cute.experimental.jit
+def _tma_matrix_view(tensor, rows, row_stride: cutlass.Constexpr, k: cutlass.Constexpr):
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout((rows, (64, k // 64), 1), stride=(row_stride, (1, 64), 0)),
+    )
 
 
 @cute.experimental.jit
@@ -290,7 +436,7 @@ def _reduce_split_partials(
 
 
 @cute.experimental.jit
-def _make_up_reader(
+def _make_tmem_reader(
     accumulator,
     coords,
     original,
@@ -352,11 +498,11 @@ def _token_major_reader(
     coords = cute.local_tile(
         cute.make_identity_tensor((rows, hidden)), tile, (0, tid // 128)
     )
-    return _make_up_reader(accumulator, coords, original, tid, shape, tile)
+    return _make_tmem_reader(accumulator, coords, original, tid, shape, tile)
 
 
 @cute.experimental.jit
-def _hidden_major_reader(
+def _tiled_tmem_reader(
     accumulator,
     original,
     tid,
@@ -364,13 +510,11 @@ def _hidden_major_reader(
     shape: cutlass.Constexpr,
     columns: cutlass.Constexpr,
 ):
-    channels, rows, _ = shape
-    tile = (channels, columns)
+    m, n, _ = shape
+    tile = (m, columns)
     accumulator = cute.local_tile(accumulator, tile, (0, group))
-    coords = cute.local_tile(
-        cute.make_identity_tensor((channels, rows)), tile, (0, group)
-    )
-    return _make_up_reader(accumulator, coords, original, tid, shape, tile)
+    coords = cute.local_tile(cute.make_identity_tensor((m, n)), tile, (0, group))
+    return _make_tmem_reader(accumulator, coords, original, tid, shape, tile)
 
 
 @cute.experimental.jit

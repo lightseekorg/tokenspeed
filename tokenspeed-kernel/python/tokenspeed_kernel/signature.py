@@ -204,6 +204,40 @@ def dense_tensor_format(storage_dtype: torch.dtype) -> TensorFormat:
     return tensor_format("dense", storage_dtype)
 
 
+def _scaled_fp8_tensor_format(
+    storage_dtype: torch.dtype, scale_dtype: torch.dtype, granularity: str
+) -> TensorFormat:
+    return tensor_format(
+        "scaled-fp8",
+        storage_dtype,
+        scale=ScaleFormat(storage_dtype=scale_dtype, granularity=granularity),
+    )
+
+
+def _fp8_mixer_signatures(*, prequantized: bool) -> frozenset[FormatSignature]:
+    import torch
+
+    fp8, fp32 = torch.float8_e4m3fn, torch.float32
+    inputs = (
+        tuple(
+            _scaled_fp8_tensor_format(fp8, fp32, granularity)
+            for granularity in ("tensor", "token")
+        )
+        if prequantized
+        else (dense_tensor_format(torch.bfloat16), dense_tensor_format(torch.float16))
+    )
+    weights = tuple(
+        _scaled_fp8_tensor_format(fp8, fp32, granularity)
+        for granularity in ("tensor", "channel")
+    )
+    return frozenset(
+        format_signature(normalized=normalized, projection_weight=down, up_weight=up)
+        for normalized in inputs
+        for down in weights
+        for up in weights
+    )
+
+
 def format_signature(
     *, layouts: Iterable[Callable | None] | None = None, **roles: TensorFormat
 ) -> FormatSignature:

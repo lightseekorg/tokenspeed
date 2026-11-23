@@ -28,10 +28,9 @@ from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
-    ScaleFormat,
+    _scaled_fp8_tensor_format,
     dense_tensor_format,
     format_signature,
-    tensor_format,
 )
 
 # ===-----------------------------------------------------------------------===#
@@ -456,35 +455,24 @@ def select_gated_residual_mix_kernel(
     if projection_weight.dtype == _torch.float8_e4m3fn:
         if projection_weight_scale is None or up_weight_scale is None:
             raise ValueError("FP8 mixer requires both weight scales")
-        projection_format = tensor_format(
-            "scaled-fp8",
+        projection_format = _scaled_fp8_tensor_format(
             projection_weight.dtype,
-            scale=ScaleFormat(
-                storage_dtype=_torch.float32,
-                granularity=(
-                    "tensor" if projection_weight_scale.numel() == 1 else "channel"
-                ),
-            ),
+            _torch.float32,
+            "tensor" if projection_weight_scale.numel() == 1 else "channel",
         )
-        up_format = tensor_format(
-            "scaled-fp8",
+        up_format = _scaled_fp8_tensor_format(
             up_weight.dtype,
-            scale=ScaleFormat(
-                storage_dtype=_torch.float32,
-                granularity="tensor" if up_weight_scale.numel() == 1 else "channel",
-            ),
+            _torch.float32,
+            "tensor" if up_weight_scale.numel() == 1 else "channel",
         )
     normalized_format = dense_tensor_format(flat.dtype)
     if flat.dtype == _torch.float8_e4m3fn:
         if normalized_scale is None:
             raise ValueError("prequantized FP8 input requires normalized_scale")
-        normalized_format = tensor_format(
-            "scaled-fp8",
+        normalized_format = _scaled_fp8_tensor_format(
             flat.dtype,
-            scale=ScaleFormat(
-                storage_dtype=_torch.float32,
-                granularity="tensor" if normalized_scale.numel() == 1 else "token",
-            ),
+            _torch.float32,
+            "tensor" if normalized_scale.numel() == 1 else "token",
         )
     traits["activation_quantization"] = activation_quantization
     signature = format_signature(

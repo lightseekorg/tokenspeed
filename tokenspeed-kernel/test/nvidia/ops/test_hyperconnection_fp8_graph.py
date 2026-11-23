@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""One M64 row bucket must retain fresh graph data without recompiling."""
-
 """Numerics and CUDA graph replay across FP8 mixer schedules."""
+
+from dataclasses import replace
 
 import pytest
 import torch
-from test_hyperconnection_fp8 import _check, _inputs, _mix, _quantize, _Values
+from test_hyperconnection_fp8 import _check, _inputs, _mix, _offset_scale
 from test_hyperconnection_fp8 import fp8_device as fp8_device
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import pdl_enabled
@@ -75,11 +75,8 @@ def test_native_fp8_graph_reuse_with_updated_inputs(rows, dtype, enable_pdl):
     pdl_enabled(enable_pdl)
     model = (4, 8192, 1024)
     values = _inputs(model, rows, dtype, True, rows == 63)
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
     with kernel_warmup(enabled=True):
-        _mix(first, model, "fp8", False)
+        _mix(values.with_rows(1), model, "fp8", False)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile(), assert_no_triton_compile():
@@ -112,11 +109,8 @@ def test_native_fp8_reads_weights_produced_in_graph(
 ):
     pdl_enabled(enable_pdl)
     values = _inputs(model, rows, dtype, True, False)
-    warm = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
     with kernel_warmup(enabled=True):
-        _mix(warm, model, "fp8", independent)
+        _mix(values.with_rows(1), model, "fp8", independent)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile(), assert_no_triton_compile():
@@ -125,7 +119,7 @@ def test_native_fp8_reads_weights_produced_in_graph(
             # Dependent weights are produced inside the graph before the mixer.
             down = (values.down.float() * 0.875).to(values.down.dtype)
             up = (values.up.float() * 0.875).to(values.up.dtype)
-            supplied = _Values(values.x, down, up, values.down_scale, values.up_scale)
+            supplied = replace(values, down=down, up=up)
             actual = _mix(supplied, model, "fp8", independent)
         for _ in range(3):
             with torch.cuda.stream(stream):
@@ -195,39 +189,42 @@ def test_native_hidden_tail_observes_updated_weights(rows, dtype, enable_pdl):
     _check(actual, values, model, "fp8")
 
 
-@pytest.mark.parametrize("rows", [1, 15, 17, 31, 33, 63, 65, 127, 129, 255, 257])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "model,mode,rows,dtype",
+    [
+        ((4, 8192, 1024), "none", rows, dtype)
+        for rows in (1, 15, 17, 31, 33, 63, 65, 127, 129, 255, 257)
+        for dtype in (torch.bfloat16, torch.float16)
+    ]
+    + [
+        (model, mode, rows, torch.float16)
+        for model, mode, rows in (
+            ((4, 2560, 320), "none", 65),
+            ((4, 2560, 320), "none", 97),
+            ((4, 8192, 1024), "fp8", 129),
+            ((4, 8192, 1024), "fp8", 191),
+        )
+    ],
+)
 @pytest.mark.parametrize("tensor_scales", [False, True])
 @torch.inference_mode()
-def test_w8a16_graph_with_offset_scales(rows, dtype, tensor_scales):
+def test_fp8_graph_with_offset_scales(model, mode, rows, dtype, tensor_scales):
     pdl_enabled(True)
-    model = (4, 8192, 1024)
     values = _inputs(model, rows, dtype, False, tensor_scales)
-    for name in ("down_scale", "up_scale"):
-        original = values.down_scale if name == "down_scale" else values.up_scale
-        shifted = torch.empty(original.numel() + 1, device="cuda", dtype=torch.float32)[
-            1:
-        ].reshape_as(original)
-        shifted.copy_(original)
-        if name == "down_scale":
-            values.down_scale = shifted
-        else:
-            values.up_scale = shifted
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
+    values.down_scale = _offset_scale(values.down_scale)
+    values.up_scale = _offset_scale(values.up_scale)
     with kernel_warmup(enabled=True):
-        _mix(first, model, "none", False)
+        _mix(values.with_rows(1), model, mode, False)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile(), assert_no_triton_compile():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            actual = _mix(values, model, "none", False)
+            actual = _mix(values, model, mode, False)
         graph.replay()
         stream.synchronize()
-    _check(actual, values, model, "none")
+    _check(actual, values, model, mode)
 
 
 @pytest.mark.parametrize("rows", [64, 128, 256])
@@ -236,20 +233,7 @@ def test_w8a16_graph_with_offset_scales(rows, dtype, tensor_scales):
 def test_projection_updates_in_captured_graph(rows, use_pdl):
     pdl_enabled(use_pdl)
     model = (4, 8192, 1024)
-    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-        torch.manual_seed(20261046)
-        x = torch.randn(rows, 32768, device="cuda", dtype=torch.bfloat16)
-        down16 = (
-            torch.randn(1028, 32768, device="cuda", dtype=torch.bfloat16)
-            / (32768**0.5)
-            / 4
-        ).contiguous()
-        up16 = (
-            torch.randn(32768, 1024, device="cuda", dtype=torch.bfloat16) / 32
-        ).contiguous()
-    down, ds = _quantize(down16, False)
-    up, us = _quantize(up16, False)
-    values = _Values(x, down, up, ds, us)
+    values = _inputs(model, rows, torch.bfloat16, True, False)
     _mix(values, model, "none", True)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -272,21 +256,14 @@ def test_up_channel_scales_change_between_graph_replays(rows, dtype):
     pdl_enabled(True)
     model = (4, 8192, 1024)
     values = _inputs(model, rows, dtype, True, False)
-    shifted = torch.empty(
-        values.up_scale.numel() + 1, device="cuda", dtype=torch.float32
-    )[1:].reshape_as(values.up_scale)
-    shifted.copy_(values.up_scale)
-    values.up_scale = shifted
+    values.up_scale = _offset_scale(values.up_scale)
     base = values.up_scale.clone()
     factors = torch.exp2(
         (torch.arange(base.numel(), device="cuda") % 7 - 3).float()
     ).reshape_as(base)
     values.up_scale.copy_(base * factors)
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
     with kernel_warmup(enabled=True):
-        _mix(first, model, "none", False)
+        _mix(values.with_rows(1), model, "none", False)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

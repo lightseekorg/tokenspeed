@@ -33,7 +33,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+from tokenspeed_kernel.signature import _fp8_mixer_signatures
 
 try:
     import cutlass
@@ -116,11 +116,137 @@ def _allocate_workspace(rows, r, p, splits, epoch_slots, device):
     )
 
 
+def _standard_workspace(kernel, epoch_slots, device):
+    return _allocate_workspace(
+        kernel.n, kernel.r, kernel.p, kernel.splits, epoch_slots, device
+    )
+
+
 def _compiled_function(compiled, device):
     compiled.to(device=device.index)
     library = driver.CUlibrary(int(compiled.jit_module.cuda_library[0]))
     handle = _checked(driver.cuLibraryEnumerateKernels(1, library))[0]
     return _checked(driver.cuKernelGetFunction(handle))
+
+
+def _allocate_outputs(x, g, h, r, p, dtype):
+    rows = x.shape[0]
+    out = torch.empty((rows, h), device=x.device, dtype=dtype)
+    inject = torch.empty((rows, g), device=x.device, dtype=dtype) if p > r else None
+    return out, inject
+
+
+def _kernel_options(
+    g, h, r, p, token_bucket, projection_scale, weights_independent, ds, us
+):
+    return dict(
+        g=g,
+        h=h,
+        r=r,
+        p=p,
+        token_bucket=token_bucket,
+        projection_scale=projection_scale,
+        use_pdl=pdl_enabled(),
+        weights_independent=weights_independent,
+        down_per_channel=ds.numel() > 1,
+        up_per_channel=us.numel() > 1,
+    )
+
+
+def _launch_prequantized(
+    inputs,
+    outputs,
+    *,
+    kernel_type,
+    kernel_options,
+    key,
+    cache,
+    workspace_factory,
+    occupancy_probe,
+    launch_args,
+    has_quant_groups,
+    resource_tags,
+):
+    """Cache the cooperative grid and each stream's mixer workspace."""
+    device = inputs[0].device
+    out, inject = outputs
+    stream = CUstream(int(torch.cuda.current_stream(device).cuda_stream))
+    plans, workspaces, lock = cache
+    stream_key = key + (int(stream),)
+    with lock:
+        plan = plans.get(key)
+        workspace = workspaces.get(stream_key)
+        if plan is None or workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "warm the prequantized FP8 bucket on this stream before capture"
+                )
+            if plan is None:
+                # Compile with one safe cooperative block, then query real capacity.
+                kernel = kernel_type(**kernel_options)
+                scratch = workspace_factory(kernel, 2, device)
+                operands = _mixer_operands(*inputs, scratch, out, inject)
+                compiled = cute_ext.compile(
+                    kernel, *operands, cutlass.Int32(1), *launch_args, stream
+                )
+                function = _compiled_function(compiled, device)
+                if occupancy_probe is None:
+                    shared_bytes = kernel.shared_bytes
+                    blocks = _checked(
+                        driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                            function, kernel.threads, shared_bytes
+                        )
+                    )
+                else:
+                    shared_bytes, blocks = occupancy_probe(
+                        compiled,
+                        operands,
+                        function,
+                        kernel.threads,
+                        device,
+                        launch_args,
+                    )
+                sm_count = torch.cuda.get_device_properties(
+                    device
+                ).multi_processor_count
+                capacity = blocks * sm_count
+                if capacity <= 0:
+                    raise RuntimeError(
+                        "prequantized FP8 cooperative kernel has no resident capacity"
+                    )
+                desired_grid = max(kernel.down_tasks, kernel.up_tasks)
+                if has_quant_groups and kernel.dedicated_quant_ctas:
+                    desired_grid += kernel.quant_groups
+                grid = min(capacity, desired_grid)
+                attribute = driver.CUfunction_attribute
+                resources = {
+                    "registers": _checked(
+                        driver.cuFuncGetAttribute(
+                            attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, function
+                        )
+                    ),
+                    "local_bytes": _checked(
+                        driver.cuFuncGetAttribute(
+                            attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function
+                        )
+                    ),
+                    "query_shared_bytes": shared_bytes,
+                    "blocks_per_sm": blocks,
+                    "sm_count": sm_count,
+                    "grid": grid,
+                    "threads": kernel.threads,
+                    **resource_tags,
+                }
+                if has_quant_groups:
+                    resources["resident_capacity"] = capacity
+                plan = Plan(compiled, grid, kernel, resources)
+                plans[key] = plan
+            with torch.inference_mode(False):
+                workspace = workspace_factory(plan.kernel, plan.grid + 1, device)
+            workspaces[stream_key] = workspace
+    operands = _mixer_operands(*inputs, workspace, out, inject)
+    plan.compiled(*operands, cutlass.Int32(plan.grid), *launch_args, stream)
+    return outputs
 
 
 def _supports_sm103(device: torch.device) -> bool:
@@ -186,14 +312,12 @@ def _execute(
     weights_independent,
     token_bucket,
 ):
-    rows = x.shape[0]
-    out = torch.empty((rows, h), device=x.device, dtype=output_dtype)
-    inject = (
-        torch.empty((rows, g), device=x.device, dtype=output_dtype) if p > r else None
+    outputs = _allocate_outputs(x, g, h, r, p, output_dtype)
+    if x.shape[0] == 0:
+        return outputs
+    options = _kernel_options(
+        g, h, r, p, token_bucket, projection_scale, weights_independent, ds, us
     )
-    if rows == 0:
-        return out, inject
-    stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
     key = (
         x.device.index,
         g,
@@ -203,121 +327,30 @@ def _execute(
         output_dtype,
         projection_scale,
         weights_independent,
-        ds.numel() > 1,
-        us.numel() > 1,
-        pdl_enabled(),
+        options["down_per_channel"],
+        options["up_per_channel"],
+        options["use_pdl"],
         token_bucket,
     )
-    stream_key = key + (int(stream),)
-    with _LOCK:
-        plan = _PLANS.get(key)
-        workspace = _WORKSPACES.get(stream_key)
-        if plan is None or workspace is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "warm the prequantized FP8 bucket on this stream before capture"
-                )
-            kernel = Fp8FusedGatedResidualKernel(
-                g=g,
-                h=h,
-                r=r,
-                p=p,
-                token_bucket=token_bucket,
-                projection_scale=projection_scale,
-                use_pdl=pdl_enabled(),
-                weights_independent=weights_independent,
-                down_per_channel=ds.numel() > 1,
-                up_per_channel=us.numel() > 1,
-            )
-            if plan is None:
-                # Compile with one safe cooperative block, then query real capacity.
-                scratch = _allocate_workspace(
-                    token_bucket, r, p, kernel.splits, 2, x.device
-                )
-                operands = _mixer_operands(
-                    x, xs, down, ds, up, us, scratch, out, inject
-                )
-                compiled = cute_ext.compile(kernel, *operands, cutlass.Int32(1), stream)
-                function = _compiled_function(compiled, x.device)
-                blocks = _checked(
-                    driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                        function, kernel.threads, kernel.shared_bytes
-                    )
-                )
-                properties = torch.cuda.get_device_properties(x.device)
-                capacity = blocks * properties.multi_processor_count
-                if capacity <= 0:
-                    raise RuntimeError(
-                        "prequantized FP8 cooperative kernel has no resident capacity"
-                    )
-                grid = min(capacity, max(kernel.down_tasks, kernel.up_tasks))
-                resources = {
-                    "registers": _checked(
-                        driver.cuFuncGetAttribute(
-                            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
-                            function,
-                        )
-                    ),
-                    "local_bytes": _checked(
-                        driver.cuFuncGetAttribute(
-                            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-                            function,
-                        )
-                    ),
-                    "query_shared_bytes": kernel.shared_bytes,
-                    "blocks_per_sm": blocks,
-                    "sm_count": properties.multi_processor_count,
-                    "grid": grid,
-                    "threads": kernel.threads,
-                }
-                plan = Plan(compiled, grid, kernel, resources)
-                _PLANS[key] = plan
-            with torch.inference_mode(False):
-                workspace = _allocate_workspace(
-                    token_bucket, r, p, plan.kernel.splits, plan.grid + 1, x.device
-                )
-            _WORKSPACES[stream_key] = workspace
-    operands = _mixer_operands(x, xs, down, ds, up, us, workspace, out, inject)
-    plan.compiled(*operands, cutlass.Int32(plan.grid), stream)
-    return out, inject
+    return _launch_prequantized(
+        (x, xs, down, ds, up, us),
+        outputs,
+        kernel_type=Fp8FusedGatedResidualKernel,
+        kernel_options=options,
+        key=key,
+        cache=(_PLANS, _WORKSPACES, _LOCK),
+        workspace_factory=_standard_workspace,
+        occupancy_probe=None,
+        launch_args=(),
+        has_quant_groups=False,
+        resource_tags={},
+    )
 
 
-def _warmup(
-    execute,
-    x,
-    xs,
-    down,
-    ds,
-    up,
-    us,
-    *,
-    g,
-    h,
-    r,
-    p,
-    output_dtype,
-    projection_scale,
-    weights_independent,
-    **options,
-):
+def _warmup(execute, x, xs, down, ds, up, us, **options):
+    sample = (x[:1], xs.reshape(-1)[:1], down, ds, up, us)
     for bucket in (16, 32, 64, 128, 256):
-        execute(
-            x[:1],
-            xs.reshape(-1)[:1],
-            down,
-            ds,
-            up,
-            us,
-            g=g,
-            h=h,
-            r=r,
-            p=p,
-            output_dtype=output_dtype,
-            projection_scale=projection_scale,
-            weights_independent=weights_independent,
-            token_bucket=bucket,
-            **options,
-        )
+        execute(*sample, token_bucket=bucket, **options)
 
 
 if _AVAILABLE:
@@ -332,28 +365,7 @@ if _AVAILABLE:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 9),
         ),
-        signatures={
-            format_signature(
-                normalized=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=ScaleFormat(storage_dtype=torch.float32, granularity=xscale),
-                ),
-                projection_weight=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=ScaleFormat(storage_dtype=torch.float32, granularity=dscale),
-                ),
-                up_weight=tensor_format(
-                    "scaled-fp8",
-                    torch.float8_e4m3fn,
-                    scale=ScaleFormat(storage_dtype=torch.float32, granularity=uscale),
-                ),
-            )
-            for xscale in ("tensor", "token")
-            for dscale in ("tensor", "channel")
-            for uscale in ("tensor", "channel")
-        },
+        signatures=_fp8_mixer_signatures(prequantized=True),
         priority=Priority.SPECIALIZED,
         traits={
             "fused_shape_supported": frozenset({True}),

@@ -22,54 +22,11 @@
 
 import pytest
 import torch
-from test_hyperconnection_fp8 import _check, _inputs, _mix, _Values
+from test_hyperconnection_fp8 import _check, _inputs, _mix, _offset_scale
 from test_hyperconnection_fp8 import fp8_device as fp8_device
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import pdl_enabled
 from utils import assert_no_cute_compile, assert_no_triton_compile
-
-
-@pytest.mark.parametrize(
-    ("model", "mode", "rows"),
-    [
-        ((4, 8192, 1024), "none", 33),
-        ((4, 8192, 1024), "none", 63),
-        ((4, 2560, 320), "none", 65),
-        ((4, 2560, 320), "none", 97),
-        ((4, 8192, 1024), "fp8", 129),
-        ((4, 8192, 1024), "fp8", 191),
-    ],
-)
-@pytest.mark.parametrize("tensor_scales", [False, True])
-@torch.inference_mode()
-def test_fp8_tail_rows_with_offset_scales_and_capture(model, mode, rows, tensor_scales):
-    pdl_enabled(True)
-    values = _inputs(model, rows, torch.float16, False, tensor_scales)
-    for name in ("down_scale", "up_scale"):
-        original = values.down_scale if name == "down_scale" else values.up_scale
-        shifted = torch.empty(original.numel() + 1, device="cuda", dtype=torch.float32)[
-            1:
-        ].reshape_as(original)
-        shifted.copy_(original)
-        if name == "down_scale":
-            values.down_scale = shifted
-        else:
-            values.up_scale = shifted
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
-    with kernel_warmup(enabled=True):
-        _mix(first, model, mode, False)
-    torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with assert_no_cute_compile(), assert_no_triton_compile():
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            actual = _mix(values, model, mode, False)
-        graph.replay()
-        stream.synchronize()
-    _check(actual, values, model, mode)
 
 
 @pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
@@ -78,49 +35,29 @@ def test_fp8_tail_rows_with_offset_scales_and_capture(model, mode, rows, tensor_
 def test_unaligned_channel_scales_keep_graph_contract(model, mode):
     pdl_enabled(True)
     values = _inputs(model, 255, torch.bfloat16, True, False)
-    down = torch.empty(
-        values.down_scale.numel() + 1, device="cuda", dtype=torch.float32
-    )[1:].reshape_as(values.down_scale)
-    up = torch.empty(values.up_scale.numel() + 1, device="cuda", dtype=torch.float32)[
-        1:
-    ].reshape_as(values.up_scale)
-    down.copy_(values.down_scale)
-    up.copy_(values.up_scale)
-    values.down_scale, values.up_scale = down, up
-    first = _Values(values.x[:1], values.down, values.up, down, up)
+    values.down_scale = _offset_scale(values.down_scale)
+    values.up_scale = _offset_scale(values.up_scale)
     with kernel_warmup(enabled=True):
-        _mix(first, model, mode, True)
+        _mix(values.with_rows(1), model, mode, True)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile(), assert_no_triton_compile():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            results = []
-            for rows in [13, 31, 95, 127, 255]:
-                current = _Values(values.x[:rows], values.down, values.up, down, up)
-                results.append(_mix(current, model, mode, True))
+            batches = [values.with_rows(rows) for rows in (13, 31, 95, 127, 255)]
+            results = [_mix(batch, model, mode, True) for batch in batches]
         graph.replay()
         torch.cuda.synchronize()
-    for rows, result in zip([13, 31, 95, 127, 255], results, strict=True):
-        _check(
-            result,
-            _Values(values.x[:rows], values.down, values.up, down, up),
-            model,
-            mode,
-        )
+    for batch, result in zip(batches, results, strict=True):
+        _check(result, batch, model, mode)
     with torch.cuda.stream(stream):
-        down.mul_(1.25)
-        up.mul_(0.75)
+        values.down_scale.mul_(1.25)
+        values.up_scale.mul_(0.75)
         graph.replay()
     stream.synchronize()
-    for rows, result in zip([13, 31, 95, 127, 255], results, strict=True):
-        _check(
-            result,
-            _Values(values.x[:rows], values.down, values.up, down, up),
-            model,
-            mode,
-        )
+    for batch, result in zip(batches, results, strict=True):
+        _check(result, batch, model, mode)
 
 
 @torch.inference_mode()
@@ -128,11 +65,8 @@ def test_two_token_up_falls_back_above256_after_startup_warmup():
     pdl_enabled(False)
     model = (4, 8192, 1024)
     values = _inputs(model, 257, torch.bfloat16, True, False)
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
     with kernel_warmup(enabled=True):
-        _mix(first, model, "none", True)
+        _mix(values.with_rows(1), model, "none", True)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

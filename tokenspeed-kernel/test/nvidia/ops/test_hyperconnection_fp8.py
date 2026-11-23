@@ -21,7 +21,7 @@
 """FP8 mixer arithmetic, graph visibility, memory, and dynamic-row contracts."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -57,6 +57,15 @@ class _Values:
 
     def tensors(self):
         return self.x, self.down, self.up, self.down_scale, self.up_scale
+
+    def with_rows(self, rows):
+        return replace(self, x=self.x[:rows])
+
+
+def _offset_scale(scale):
+    shifted = scale.new_empty(scale.numel() + 1)[1:].reshape_as(scale)
+    shifted.copy_(scale)
+    return shifted
 
 
 def _quantize(value, per_tensor):
@@ -105,7 +114,7 @@ def _mix(values, model, mode, independent):
     )
 
 
-def _reference(values, model, mode):
+def _reference(values, model, mode, *, projection_scale=1.0):
     x, down, up, ds, us = (value.cpu() for value in values.tensors())
     return torch_fp8_hyperconnection_mix(
         x,
@@ -113,7 +122,7 @@ def _reference(values, model, mode):
         up,
         *model,
         model[2] if down.shape[0] == model[2] else model[2] + model[0],
-        1.0,
+        projection_scale,
         True,
         projection_weight_scale=ds,
         up_weight_scale=us,
@@ -121,8 +130,8 @@ def _reference(values, model, mode):
     )
 
 
-def _check(actual, values, model, mode):
-    expected = _reference(values, model, mode)
+def _check(actual, values, model, mode, *, projection_scale=1.0):
+    expected = _reference(values, model, mode, projection_scale=projection_scale)
     atol, rtol = (0.004, 0.01) if values.x.dtype == torch.bfloat16 else (0.001, 0.002)
     for value, reference in zip(actual, expected, strict=True):
         if reference is None:
@@ -131,6 +140,20 @@ def _check(actual, values, model, mode):
             torch.testing.assert_close(
                 value.cpu().double(), reference, atol=atol, rtol=rtol
             )
+
+
+def _kernel_nodes(graph):
+    handle = driver.CUgraph(graph.raw_cuda_graph())
+    status, _, count = driver.cuGraphGetNodes(handle, 0)
+    assert status == driver.CUresult.CUDA_SUCCESS
+    status, nodes, _ = driver.cuGraphGetNodes(handle, count)
+    assert status == driver.CUresult.CUDA_SUCCESS
+    kernels = 0
+    for node in nodes:
+        status, kind = driver.cuGraphNodeGetType(node)
+        assert status == driver.CUresult.CUDA_SUCCESS
+        kernels += kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+    return kernels
 
 
 @pytest.mark.parametrize(
@@ -176,16 +199,7 @@ def test_fp8_graph_observes_codes_and_scales(model, mode):
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph, stream=stream):
         actual = _mix(values, model, mode, False)
-    status, _, count = driver.cuGraphGetNodes(driver.CUgraph(graph.raw_cuda_graph()), 0)
-    assert status == driver.CUresult.CUDA_SUCCESS
-    status, nodes, _ = driver.cuGraphGetNodes(
-        driver.CUgraph(graph.raw_cuda_graph()), count
-    )
-    assert status == driver.CUresult.CUDA_SUCCESS
-    kinds = [driver.cuGraphNodeGetType(node)[1] for node in nodes]
-    assert kinds.count(driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL) == (
-        4 if mode == "fp8" else 3
-    )
+    assert _kernel_nodes(graph) == (4 if mode == "fp8" else 3)
     for changed in range(len(originals)):
         with torch.cuda.stream(stream):
             for tensor, original in zip(values.tensors(), originals, strict=True):
@@ -207,20 +221,11 @@ def test_fp8_graph_observes_codes_and_scales(model, mode):
 def test_fp8_rows_do_not_recompile_within_tile(mode):
     model = (4, 2560, 320)
     values = _inputs(model, 13, torch.bfloat16, True, False)
-    warm = _Values(
-        values.x[:5], values.down, values.up, values.down_scale, values.up_scale
-    )
-    _mix(warm, model, mode, True)
+    _mix(values.with_rows(5), model, mode, True)
     torch.cuda.synchronize()
     with assert_no_cute_compile(), assert_no_triton_compile():
         for rows in (9, 13):
-            current = _Values(
-                values.x[:rows],
-                values.down,
-                values.up,
-                values.down_scale,
-                values.up_scale,
-            )
+            current = values.with_rows(rows)
             _check(_mix(current, model, mode, True), current, model, mode)
 
 
@@ -278,23 +283,7 @@ def test_fp8_dispatch_preserves_mixed_scales_and_projection_scale(mode, tensor_s
         projection_weight_scale=values.down_scale,
         up_weight_scale=values.up_scale,
     )
-    x, down, up, ds, us = (value.cpu() for value in values.tensors())
-    expected = torch_fp8_hyperconnection_mix(
-        x,
-        down,
-        up,
-        *model,
-        324,
-        0.25,
-        True,
-        projection_weight_scale=ds,
-        up_weight_scale=us,
-        activation_quantization=mode,
-    )
-    for value, reference in zip(actual, expected, strict=True):
-        torch.testing.assert_close(
-            value.cpu().double(), reference, atol=0.004, rtol=0.01
-        )
+    _check(actual, values, model, mode, projection_scale=0.25)
 
 
 @pytest.mark.parametrize("mode", ["none", "fp8"], ids=["w8", "w8a8"])
@@ -344,31 +333,17 @@ def test_fp8_startup_warms_dynamic_tile_buckets(mode):
 
     model = (4, 2560, 320)
     values = _inputs(model, 255, torch.bfloat16, True, False)
-    first = _Values(
-        values.x[:1], values.down, values.up, values.down_scale, values.up_scale
-    )
     with kernel_warmup(enabled=True):
-        _mix(first, model, mode, True)
+        _mix(values.with_rows(1), model, mode, True)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile(), assert_no_triton_compile():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            outputs = []
-            for rows in (13, 31, 95, 127, 255):
-                current = _Values(
-                    values.x[:rows],
-                    values.down,
-                    values.up,
-                    values.down_scale,
-                    values.up_scale,
-                )
-                outputs.append(_mix(current, model, mode, True))
+            batches = [values.with_rows(rows) for rows in (13, 31, 95, 127, 255)]
+            outputs = [_mix(batch, model, mode, True) for batch in batches]
         graph.replay()
         torch.cuda.synchronize()
-    for rows, actual in zip((13, 31, 95, 127, 255), outputs, strict=True):
-        current = _Values(
-            values.x[:rows], values.down, values.up, values.down_scale, values.up_scale
-        )
-        _check(actual, current, model, mode)
+    for batch, actual in zip(batches, outputs, strict=True):
+        _check(actual, batch, model, mode)

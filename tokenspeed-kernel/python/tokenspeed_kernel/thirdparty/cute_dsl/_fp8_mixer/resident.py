@@ -24,19 +24,29 @@ from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import CopyUniversalOp
 from cutlass.cutlass_dsl import T
 from cutlass.experimental.primitives import tcgen05_fence
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
+    _commit_residual,
+    _copy_residual_16,
     _decode_residual,
-    _hidden_major_reader,
     _invalidate,
     _load_f32,
+    _make_k_major_mma,
+    _make_tmem_reader,
+    _operand_at,
     _prefetch_branch_residual,
+    _quant_multiplier,
+    _quant_scale,
+    _quantized_value,
     _reduce_split_partials,
+    _scale_down_value,
     _store_token_major_mix,
+    _tiled_tmem_reader,
     _token_major_reader,
     _x_scale,
 )
@@ -89,6 +99,12 @@ class UpTask(NamedTuple):
     hidden_tile: cutlass.Int32
     weights_prepared: cutlass.Boolean
     last: cutlass.Boolean
+
+
+class UpMmaFragments(NamedTuple):
+    a: tuple[cute.Tensor, cute.Tensor]
+    b: cute.Tensor
+    acc: tuple[cute.Tensor, cute.Tensor]
 
 
 class QuantizationConfig(NamedTuple):
@@ -154,45 +170,6 @@ def _rounded_quant_scales(maximum):
 
 
 @cute.experimental.jit
-def _quant_scale(maximum):
-    return cute.math.max(
-        maximum / cutlass.Float32(448.0),
-        cutlass.Float32(1.0 / (448.0 * 512.0)),
-    )
-
-
-@cute.experimental.jit
-def _quant_multiplier(maximum):
-    return cute.math.min(
-        cutlass.Float32(448.0) / maximum,
-        cutlass.Float32(448.0 * 512.0),
-    )
-
-
-@cute.experimental.jit
-def _quantized_value(value, multiplier, clamp: cutlass.Constexpr):
-    value = value.to(cutlass.Float32) * multiplier
-    lower = cutlass.Float32(-448.0)
-    if cutlass.const_expr(clamp == "ptx_lower"):
-        # PTX max without .NaN selects the lower bound for NaN.
-        value = cutlass.Float32(
-            llvm.inline_asm(
-                T.f32(),
-                [value.ir_value(), lower.ir_value()],
-                "max.f32 $0, $1, $2;",
-                "=f,f,f",
-                has_side_effects=False,
-                asm_dialect=0,
-            )
-        )
-    else:
-        value = cute.math.max(value, lower)
-    if cutlass.const_expr(clamp == "both"):
-        value = cute.math.min(value, cutlass.Float32(448.0))
-    return value
-
-
-@cute.experimental.jit
 def _mixer_cta():
     tid = cute.arch.thread_idx()[0]
     return MixerCta(
@@ -231,6 +208,28 @@ def _mixer_shared(
         cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
     )
     return MixerShared(arena, bars.iterator, up_bars, base.iterator, epoch)
+
+
+@cute.experimental.jit
+def _read_down_partials(
+    mma, base, partials, tid, shape: cutlass.Constexpr, groups: cutlass.Constexpr
+):
+    m, n, k = shape
+    fragment = mma.get_slice(0).make_fragment_C(mma.partition_shape_C((m, n)))
+    accumulator = cute.make_tensor(
+        cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
+    )[((None, None), 0, 0)]
+    columns = n // groups
+    tile = (m, columns)
+    group = tid // 128
+    accumulator = cute.local_tile(accumulator, tile, (0, group))
+    coords = cute.local_tile(cute.make_identity_tensor((m, n)), tile, (0, group))
+    accumulator, reader, values, coords = _make_tmem_reader(
+        accumulator, coords, partials, tid, (m, columns, k), tile
+    )
+    cute_ext.partition_and_copy(reader, accumulator, values)
+    cute.arch.fence_view_async_tmem_load()
+    return values, coords
 
 
 class ResidentMixer:
@@ -391,13 +390,9 @@ class ResidentMixer:
             input_scale, weight_scales = preloaded_scales
         values = self._partials(io.partials, row, col, columns, injection)
         for i in cutlass.range_constexpr(columns):
-            value = values[i] * input_scale
-            value = value * weight_scales[i]
-            value = value * self.scale
-            if cutlass.const_expr(not injection):
-                value = value * cute.arch.rcp_approx(
-                    1.0 + cute.exp(-value, fastmath=True)
-                )
+            value = _scale_down_value(
+                values[i], input_scale, weight_scales[i], self.scale, not injection
+            )
             dst[i] = value.to(dst.element_type)
 
     @cute.experimental.jit
@@ -526,9 +521,8 @@ class ResidentMixer:
                         if cutlass.const_expr(self.quantization.refined_scales):
                             scale, multiplier = _rounded_quant_scales(maximum)
                         else:
-                            scale, multiplier = _quant_scale(
-                                maximum
-                            ), _quant_multiplier(maximum)
+                            scale = _quant_scale(maximum, False)
+                            multiplier = _quant_multiplier(maximum, False)
                         self._store_quant_alpha(io, row, scale, target)
                         shared[group, row_warps + 1] = multiplier
                 _epilogue_barrier(self.quant_threads, cutlass.Int32(5 + group))
@@ -542,7 +536,7 @@ class ResidentMixer:
                     if cutlass.const_expr(self.quantization.refined_scales):
                         scale, multiplier = _rounded_quant_scales(maximum)
                     else:
-                        multiplier = _quant_multiplier(maximum)
+                        multiplier = _quant_multiplier(maximum, False)
                     if cutlass.const_expr(
                         self.quantization.activation_store != "stamped"
                     ):
@@ -551,7 +545,7 @@ class ResidentMixer:
                                 self._store_quant_alpha(io, row, scale, target)
                             else:
                                 self._store_quant_alpha(
-                                    io, row, _quant_scale(maximum), target
+                                    io, row, _quant_scale(maximum, False), target
                                 )
                 else:
                     multiplier = shared[group, row_warps + 1]
@@ -579,6 +573,112 @@ class ResidentMixer:
                     )
                 if cutlass.const_expr(self.quantization.release_writes):
                     _publish_activation_proxy()
+
+    @cute.experimental.jit
+    def _make_up_mma(self):
+        dtype = cutlass.Float8E4M3FN
+        return _make_k_major_mma(dtype, self.up_mn)
+
+    @cute.experimental.jit
+    def _up_operand_layouts(self):
+        dtype = cutlass.Float8E4M3FN
+        mma = self._make_up_mma()
+        tiler = (*self.up_mn, self.up_k)
+        al = sm100_utils.make_smem_layout_a(mma, tiler, dtype, self.up_stages)
+        bl = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.up_stages)
+        return mma, tiler, al, bl
+
+    @cute.experimental.jit
+    def _up_operand_storage(self, arena, al, bl):
+        sw = _operand_at(arena, bl, 0)
+        sa0 = _operand_at(arena, al, cute.cosize(bl))
+        sa1 = _operand_at(arena, al, cute.cosize(bl) + cute.cosize(al))
+        return sw, sa0, sa1
+
+    @cute.experimental.jit
+    def _up_weight_view(self, weight):
+        return cute.make_tensor(
+            weight.iterator,
+            cute.make_layout(
+                (
+                    (self.up_hidden, self.g, self.h // self.up_hidden),
+                    (64, self.r // 64),
+                    1,
+                ),
+                stride=((self.r, self.h * self.r, self.up_hidden * self.r), (1, 64), 0),
+            ),
+        )
+
+    @cute.experimental.jit
+    def _up_tma_operands(self, mma, tiler, activation, weight, hidden_tile):
+        av = cute.make_tensor(
+            activation.iterator,
+            cute.make_layout(
+                (activation.shape[0], (64, self.r // 64), 1),
+                stride=(self.r, (1, 64), 0),
+            ),
+        )
+        wv = self._up_weight_view(weight)
+        gx0 = cute.local_tile(av, (self.up_rows, self.up_k), (0, None, 0))
+        gx1 = cute.local_tile(av, (self.up_rows, self.up_k), (1, None, 0))
+        gw = cute.local_tile(wv, (self.up_channels, self.up_k), (hidden_tile, None, 0))
+        if cutlass.const_expr(self.token_major_up):
+            ga0, ga1, gb = gx0, gx1, gw
+            ma = cute_ext.get_cta_v_map_ab(av, tiler, mma, "A")
+            mb = cute_ext.get_cta_v_map_ab(wv, tiler, mma, "B")
+        else:
+            ga0, ga1, gb = gw, gw, gx0
+            ma = cute_ext.get_cta_v_map_ab(wv, tiler, mma, "A")
+            mb = cute_ext.get_cta_v_map_ab(av, tiler, mma, "B")
+        return ga0, ga1, gb, ma, mb
+
+    @cute.experimental.jit
+    def _load_up_tma_operand(self, source, target, tile, slot, full, mapping):
+        cute_ext.tma_load(
+            source[None, None, tile],
+            target[None, None, None, slot],
+            full.value,
+            cta_v_map=mapping,
+            update_expect_tx=False,
+        )
+
+    @cute.experimental.jit
+    def _up_mma_fragments(self, mma, base, sa0, sa1, sw):
+        tm = mma.get_slice(0)
+        ad0, bd = tm.make_fragment_A(sa0), tm.make_fragment_B(sw)
+        ad1 = ad0
+        if cutlass.const_expr(self.up_parts == 2):
+            ad1 = tm.make_fragment_A(sa1)
+        layout = cute_ext.make_tmem_layout_acc(mma, self.up_mn, acc_stage=self.up_parts)
+        all_acc = cute.make_tensor(
+            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), layout
+        )
+        acc0 = all_acc[None, None, None, 0]
+        acc1 = acc0
+        if cutlass.const_expr(self.up_parts == 2):
+            acc1 = all_acc[None, None, None, 1]
+        return UpMmaFragments((ad0, ad1), bd, (acc0, acc1))
+
+    @cute.experimental.jit
+    def _issue_up_mma_block(self, mma, fragments, block, slot, part: cutlass.Constexpr):
+        acc = fragments.acc[part]
+        cute.gemm(
+            mma,
+            acc,
+            fragments.a[part][None, None, block, slot],
+            fragments.b[None, None, block, slot],
+            acc,
+        )
+
+    @cute.experimental.jit
+    def _issue_up_mma_pair(self, mma, fragments, block, slot):
+        for part in cutlass.range_constexpr(self.up_parts):
+            self._issue_up_mma_block(mma, fragments, block, slot, part)
+
+    @cute.experimental.jit
+    def _issue_up_mma_part(self, mma, fragments, slot, part: cutlass.Constexpr):
+        for block in cutlass.range_constexpr(cute.size(fragments.a[part], mode=[2])):
+            self._issue_up_mma_block(mma, fragments, block, slot, part)
 
     @cute.experimental.jit
     def _reader(
@@ -610,7 +710,6 @@ class ResidentMixer:
         base,
         original,
         tid,
-        token_slice: cutlass.Constexpr,
         part: cutlass.Constexpr,
     ):
         if cutlass.const_expr(part is None):
@@ -629,15 +728,23 @@ class ResidentMixer:
             accumulator = accumulator[(None, None), 0, 0]
         else:
             accumulator = accumulator[((None, None), 0, 0, part)]
-        group = tid // 128 + token_slice * self.reader_groups
-        return _hidden_major_reader(
+        return _tiled_tmem_reader(
             accumulator,
             original,
             tid,
-            group,
+            tid // 128,
             (128, self.up_rows, self.up_k),
             self.hidden_reader_columns,
         )
+
+    @cute.experimental.jit
+    def _read_hidden_up(self, mma, base, original, tid, part: cutlass.Constexpr):
+        acc, reader, values, coords = self._hidden_reader(
+            mma, base, original, tid, part
+        )
+        cute_ext.partition_and_copy(reader, acc, values)
+        cute.arch.fence_view_async_tmem_load()
+        return values, coords
 
     @cute.experimental.jit
     def _prefetch_branch_x(
@@ -663,6 +770,129 @@ class ResidentMixer:
             self.g,
             self.h,
         )
+
+    @cute.experimental.jit
+    def _copy_hidden_residual(
+        self,
+        x,
+        target,
+        hidden_tile,
+        global_base,
+        tid,
+        threads: cutlass.Constexpr,
+        row_stride: cutlass.Constexpr,
+    ):
+        tile_bytes = self.up_rows * self.up_channels
+        copy_bytes = threads * 16
+        for copy_slice in cutlass.range_constexpr(
+            (tile_bytes + copy_bytes - 1) // copy_bytes
+        ):
+            linear = tid * 16 + copy_slice * copy_bytes
+            if linear < tile_bytes:
+                row, channel = linear // self.up_channels, linear % self.up_channels
+                global_row = global_base + cutlass.Int64(row)
+                source = (
+                    x.iterator
+                    + global_row * (self.g * self.h)
+                    + (channel // self.up_hidden) * self.h
+                    + hidden_tile * self.up_hidden
+                    + channel % self.up_hidden
+                )
+                size = cutlass.Int32(0)
+                if global_row < x.shape[0]:
+                    size = cutlass.Int32(16)
+                offset = linear
+                if cutlass.const_expr(row_stride != self.up_channels):
+                    offset = row * row_stride + channel
+                _copy_residual_16(target.iterator + offset, source, size)
+        _commit_residual()
+
+    @cute.experimental.jit
+    def _cache_up_row_scales(
+        self,
+        alpha,
+        xs,
+        cached,
+        x,
+        global_base,
+        tid,
+        row_count: cutlass.Constexpr,
+        read_alpha: cutlass.Constexpr,
+    ):
+        if tid < row_count:
+            global_row = global_base + cutlass.Int64(tid)
+            activation_scale = cutlass.Float32(0.0)
+            input_scale = cutlass.Float32(0.0)
+            if global_row < x.shape[0]:
+                if cutlass.const_expr(read_alpha):
+                    activation_scale = _load_f32(alpha.iterator + cutlass.Int64(tid))
+                input_scale = _x_scale(xs, global_row)
+            if cutlass.const_expr(read_alpha):
+                cached[tid] = activation_scale
+            cached[row_count + tid] = input_scale
+
+    @cute.experimental.jit
+    def _cache_up_weight_scales(
+        self, ws, cached, hidden_tile, tid, offset: cutlass.Constexpr, prepared
+    ):
+        # Keep the prepared-scale check in the warps that read the scales.
+        if tid < self.up_channels:
+            if not prepared:
+                channel = (
+                    (tid // self.up_hidden) * self.h
+                    + hidden_tile * self.up_hidden
+                    + tid % self.up_hidden
+                )
+                cached[offset + tid] = ws[channel if self.up_per_channel else 0]
+
+    @cute.experimental.jit
+    def _hidden_gate_tile(self, pointer):
+        return cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Float32,
+                pointer.toint(),
+                cute.AddressSpace.smem,
+                assumed_align=1024,
+            ),
+            cute.make_layout(
+                (self.up_rows, self.up_channels), stride=(self.up_channels, 1)
+            ),
+        )
+
+    @cute.experimental.jit
+    def _mix_hidden_major_up(
+        self,
+        gates,
+        residual_tile,
+        cached,
+        out,
+        rows,
+        tid,
+        hidden_tile,
+        global_base,
+        threads: cutlass.Constexpr,
+    ):
+        col = tid % self.up_hidden
+        hidden = hidden_tile * self.up_hidden + col
+        scales = cute.make_rmem_tensor(self.g, cutlass.Float32)
+        for branch in cutlass.range_constexpr(self.g):
+            scales[branch] = cached[2 * self.up_rows + branch * self.up_hidden + col]
+        rows_per_step = threads // self.up_hidden
+        for row_part in cutlass.range_constexpr(self.up_rows // rows_per_step):
+            row = tid // self.up_hidden + row_part * rows_per_step
+            global_row = global_base + cutlass.Int64(row)
+            if global_row < rows:
+                activation_scale = cached[row]
+                input_scale = cached[self.up_rows + row]
+                total = cutlass.Float32(0.0)
+                for branch in cutlass.range_constexpr(self.g):
+                    channel = branch * self.up_hidden + col
+                    gate = gates[row, channel]
+                    factor = activation_scale * scales[branch]
+                    code = residual_tile[row, channel]
+                    res = code.to(cutlass.Float32) * input_scale
+                    total = total + res * _up_sigmoid_tanh(gate * factor)
+                out[global_row, hidden] = (total / self.g).to(out.element_type)
 
     @cute.experimental.jit
     def _mix_token_major_up(

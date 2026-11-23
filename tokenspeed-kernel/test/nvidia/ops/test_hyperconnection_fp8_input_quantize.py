@@ -22,31 +22,23 @@
 
 import pytest
 import torch
+from test_hyperconnection_fp8 import _quantize
 from test_hyperconnection_fp8 import fp8_device as fp8_device
 from tokenspeed_kernel.ops.residual.cute_dsl_fp8 import _quantize_input
 from tokenspeed_kernel.platform import pdl_enabled
 from utils import assert_no_cute_compile
 
 
-def _reference(x):
-    values = x.float()
-    maximum = values.abs().amax(-1, keepdim=True)
-    limit = torch.full_like(maximum, 448.0)
-    scales = (maximum / limit).clamp_min(1.0 / (448.0 * 512.0))
-    multiplier = (limit / maximum).clamp_max(448.0 * 512.0)
-    return (values * multiplier).clamp(-448, 448).to(
-        torch.float8_e4m3fn
-    ), scales.reshape(-1)
-
-
 def _check(codes, scales, x):
-    expected_codes, expected_scales = _reference(x)
+    expected_codes, expected_scales = _quantize(x, False)
     nan = torch.isnan(expected_codes)
     assert torch.equal(torch.isnan(codes), nan)
     assert torch.equal(
         codes.view(torch.uint8)[~nan], expected_codes.view(torch.uint8)[~nan]
     )
-    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0, equal_nan=True)
+    torch.testing.assert_close(
+        scales, expected_scales.reshape(-1), atol=0, rtol=0, equal_nan=True
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

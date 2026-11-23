@@ -25,19 +25,16 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn.functional as F
+from test_hyperconnection_fp8 import _kernel_nodes
+from test_hyperconnection_fp8 import _quantize as _quantize_fp8
 from test_hyperconnection_fp8 import fp8_device as fp8_device
 from tokenspeed_kernel.ops.residual import (
     gated_residual_mix,
     prepare_gated_residual_up_weight,
 )
-from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import _checked
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import pdl_enabled
 from utils import assert_no_cute_compile
-
-driver = pytest.importorskip("cuda.bindings.driver")
-
-torch.set_num_threads(4)
 
 
 @dataclass
@@ -51,12 +48,8 @@ class Inputs:
 
 
 def _quantize(value, tensor):
-    f = value.float()
-    maximum = f.abs().amax().reshape(1, 1) if tensor else f.abs().amax(-1, keepdim=True)
-    limit = torch.full_like(maximum, 448.0)
-    scale = (maximum / limit).clamp_min(1 / (448 * 512))
-    multiplier = (limit / maximum).clamp_max(448 * 512)
-    return (f * multiplier).clamp(-448, 448).to(torch.float8_e4m3fn), scale.reshape(-1)
+    codes, scale = _quantize_fp8(value, tensor)
+    return codes, scale.reshape(-1)
 
 
 def _inputs(model, rows, inject, tensor):
@@ -114,12 +107,7 @@ def _reference(v, model, dtype, projection_scale):
     if ds.numel() > 1:
         ds = ds[:p]
     projected = (x @ v.down[:p].cpu().float().double().T) * xs * ds * projection_scale
-    activation = F.silu(projected[:, :r]).to(dtype).float()
-    maximum = activation.abs().amax(-1, keepdim=True)
-    limit = torch.full_like(maximum, 448.0)
-    scale = (maximum / limit).clamp_min(1 / (448 * 512))
-    multiplier = (limit / maximum).clamp_max(448 * 512)
-    codes = (activation * multiplier).clamp(-448, 448).to(torch.float8_e4m3fn)
+    codes, scale = _quantize_fp8(F.silu(projected[:, :r]).to(dtype), False)
     gate = (
         (codes.float().double() @ v.up.cpu().float().double().T)
         * scale.double()
@@ -192,20 +180,6 @@ def test_fused_row_quantization_scale_floor(model, rows):
     )
 
 
-def _nodes(graph):
-    _, count = _checked(
-        driver.cuGraphGetNodes(driver.CUgraph(graph.raw_cuda_graph()), 0)
-    )
-    nodes, _ = _checked(
-        driver.cuGraphGetNodes(driver.CUgraph(graph.raw_cuda_graph()), count)
-    )
-    return sum(
-        _checked(driver.cuGraphNodeGetType(n))
-        == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
-        for n in nodes
-    )
-
-
 @pytest.mark.parametrize(
     "rows,dtype,enable_pdl,tensor,inject",
     [
@@ -256,7 +230,7 @@ def test_prepared_wide_fp8_up_graph_refresh(rows, dtype, enable_pdl, tensor, inj
     with assert_no_cute_compile():
         with torch.cuda.graph(graph, stream=stream):
             actual = mix(packed)
-        assert _nodes(graph) == 1
+        assert _kernel_nodes(graph) == 1
         last = None
         for factor in (1.0, -1.0, 0.75):
             with torch.cuda.stream(stream):
@@ -342,7 +316,7 @@ def test_mutable_one_kernel_graph(model, dtype, enable_pdl, rows, independent):
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph, stream=stream):
             actual = _run(v, model, dtype, independent)
-        assert _nodes(graph) == 1
+        assert _kernel_nodes(graph) == 1
         for _ in range(3):
             with torch.cuda.stream(stream):
                 v.x.copy_((v.x.float() * 0.875).to(v.x.dtype))
@@ -404,7 +378,7 @@ def test_narrow_fp8_graph_reuses_activation_workspace(
         with torch.cuda.graph(graph, stream=stream):
             full_output = _run(full, model, dtype, False)
             tail_outputs = [_run(tail, model, dtype, False) for tail in tails]
-        assert _nodes(graph) == 1 + len(tails)
+        assert _kernel_nodes(graph) == 1 + len(tails)
         for factor in (1.0, -0.875, 0.75):
             with torch.cuda.stream(stream):
                 full.x.copy_((full.x.float() * factor).to(full.x.dtype))
@@ -456,7 +430,7 @@ def test_concurrent_graphs(model, enable_pdl):
         stream.synchronize()
         with torch.cuda.graph(graph, stream=stream):
             outputs.append(_run(v, model, torch.bfloat16, False))
-        assert _nodes(graph) == 1
+        assert _kernel_nodes(graph) == 1
     with assert_no_cute_compile():
         for _ in range(4):
             for v, stream, graph in zip(values, streams, graphs, strict=True):
@@ -749,7 +723,7 @@ def test_small_up_tiles_preserve_all_finite_residual_codes(rows, dtype, enable_p
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph, stream=stream):
             actual, inject = _run(v, model, dtype, False)
-        assert _nodes(graph) == 1
+        assert _kernel_nodes(graph) == 1
         for _ in range(3):
             with torch.cuda.stream(stream):
                 v.x.view(torch.uint8).bitwise_xor_(128)

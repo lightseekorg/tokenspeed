@@ -29,10 +29,9 @@ import torch.nn.functional as F
 from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
-    ScaleFormat,
+    _fp8_mixer_signatures,
     dense_tensor_format,
     format_signature,
-    tensor_format,
 )
 
 
@@ -248,46 +247,8 @@ def _fp8_token_reference(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     "hyperconnection_mix",
     name="torch_fp8_hyperconnection_mix",
     solution="torch",
-    signatures=frozenset(
-        format_signature(
-            normalized=dense_tensor_format(dtype),
-            projection_weight=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=ScaleFormat(storage_dtype=torch.float32, granularity=down_scale),
-            ),
-            up_weight=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=ScaleFormat(storage_dtype=torch.float32, granularity=up_scale),
-            ),
-        )
-        for dtype in (torch.bfloat16, torch.float16)
-        for down_scale in ("tensor", "channel")
-        for up_scale in ("tensor", "channel")
-    )
-    | frozenset(
-        format_signature(
-            normalized=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=ScaleFormat(storage_dtype=torch.float32, granularity=xscale),
-            ),
-            projection_weight=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=ScaleFormat(storage_dtype=torch.float32, granularity=dscale),
-            ),
-            up_weight=tensor_format(
-                "scaled-fp8",
-                torch.float8_e4m3fn,
-                scale=ScaleFormat(storage_dtype=torch.float32, granularity=uscale),
-            ),
-        )
-        for xscale in ("tensor", "token")
-        for dscale in ("tensor", "channel")
-        for uscale in ("tensor", "channel")
-    ),
+    signatures=_fp8_mixer_signatures(prequantized=False)
+    | _fp8_mixer_signatures(prequantized=True),
     priority=Priority.REFERENCE,
 )
 def torch_fp8_hyperconnection_mix(

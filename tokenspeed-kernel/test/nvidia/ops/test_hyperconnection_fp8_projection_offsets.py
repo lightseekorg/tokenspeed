@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Exercise the real projection partial helper beyond signed32bit offsets."""
+"""Exercise mixer partial and residual loads beyond signed 32-bit offsets."""
 
 import cutlass
 import cutlass.cute as cute
@@ -30,8 +30,13 @@ from cutlass.cute.runtime import from_dlpack
 from test_hyperconnection_fp8 import fp8_device as fp8_device
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
     Fp8GatedResidualProjectionEpilogue,
+    _load_up_residual_vector,
 )
 from utils import assert_no_cute_compile
+
+
+def _view(value):
+    return from_dlpack(value).mark_layout_dynamic(leading_dim=value.ndim - 1)
 
 
 class _TailPartials:
@@ -58,7 +63,7 @@ def test_partial_reduction_uses_full_offset_width():
     required = splits * rows * columns * 4
     free, _ = torch.cuda.mem_get_info()
     if free < required + 2**30:
-        pytest.skip("projection offset test requires about9GiB of free GPU memory")
+        pytest.skip("projection offset test requires about 9 GiB of free GPU memory")
     assert splits * rows * columns - 1 > 2**31
     partial = torch.empty((splits, rows, columns), device="cuda", dtype=torch.float32)
     # Only the eight far-end packets are initialized or read by this test.
@@ -82,13 +87,69 @@ def test_partial_reduction_uses_full_offset_width():
         parallel_inject=False,
     )
     stream = CUstream(int(torch.cuda.current_stream().cuda_stream))
-    view = lambda tensor: from_dlpack(tensor).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
     compiled = cute_ext.compile(
-        _TailPartials(epilogue), view(small), view(output), cutlass.Int32(0), stream
+        _TailPartials(epilogue), _view(small), _view(output), cutlass.Int32(0), stream
     )
-    compiled(view(small), view(output), cutlass.Int32(0), stream)
+    compiled(_view(small), _view(output), cutlass.Int32(0), stream)
     with assert_no_cute_compile():
-        compiled(view(partial), view(output), cutlass.Int32(rows - 1), stream)
+        compiled(_view(partial), _view(output), cutlass.Int32(rows - 1), stream)
     torch.testing.assert_close(output.cpu(), torch.tensor([4.5, -9.0]), atol=0, rtol=0)
+
+
+@cute.experimental.kernel
+def _read_residual_row(
+    original,
+    output,
+    row: cutlass.Int32,
+    width: cutlass.Constexpr,
+    count: cutlass.Constexpr,
+):
+    if cute.arch.thread_idx()[0] == 0:
+        values = cute.make_rmem_tensor((count, 1), original.element_type)
+        _load_up_residual_vector(
+            original, values, row, 0, 0, 0, width, width, count * 16
+        )
+        for i in cutlass.range_constexpr(count):
+            output[i] = values[i, 0]
+
+
+@cute.experimental.jit
+def _launch_residual_row(
+    original,
+    output,
+    row: cutlass.Int32,
+    width: cutlass.Constexpr,
+    count: cutlass.Constexpr,
+    stream: CUstream,
+):
+    _read_residual_row(original, output, row, width, count).launch(
+        grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+    )
+
+
+@pytest.mark.parametrize("count", (2, 8))
+@torch.inference_mode()
+def test_up_residual_prefetch_beyond_int32(count):
+    width = 16
+    row = (1 << 31) // width + 1
+    free, _ = torch.cuda.mem_get_info()
+    if free < (row + 1) * width * 2 + (1 << 30):
+        pytest.skip("residual offset test requires about 5 GiB of free GPU memory")
+    original = torch.empty((row + 1, width), device="cuda", dtype=torch.bfloat16)
+    expected = torch.arange(1, count + 1, device="cuda", dtype=torch.bfloat16)
+    original[row, :count].copy_(expected)
+    small = torch.zeros((1, width), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty_like(expected)
+    stream = CUstream(int(torch.cuda.current_stream().cuda_stream))
+    compiled = cute_ext.compile(
+        _launch_residual_row,
+        _view(small),
+        _view(output),
+        cutlass.Int32(0),
+        width,
+        count,
+        stream,
+    )
+    with assert_no_cute_compile():
+        compiled(_view(original), _view(output), cutlass.Int32(row), stream)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)

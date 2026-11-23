@@ -24,7 +24,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import tcgen05
-from cutlass.cutlass_dsl import T
 from cutlass.experimental.primitives import Tcgen05InstrDesc
 
 
@@ -72,22 +71,6 @@ def fp8_mma_encoded(acc, da, db, instruction, accumulate):
         "{ .reg .pred p; setp.ne.u32 p, $4, 0; "
         "tcgen05.mma.cta_group::1.kind::f8f6f4 [$0], $1, $2, $3, p; }",
         "r,l,l,r,r,~{memory}",
-        has_side_effects=True,
-        asm_dialect=0,
-    )
-
-
-@cute.experimental.jit
-def fp8_mbarrier_wait(barrier, phase):
-    # Same acquire wait and 10 ms suspension hint as the NVVM wrapper. Keep the
-    # compiler memory clobber on this synchronization point.
-    llvm.inline_asm(
-        None,
-        [cutlass.Int32(barrier.toint()).ir_value(), cutlass.Int32(phase).ir_value()],
-        "{ .reg .pred ready; fp8_wait_loop: "
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready, [$0], $1, 10000000; "
-        "@!ready bra fp8_wait_loop; }",
-        "r,r,~{memory}",
         has_side_effects=True,
         asm_dialect=0,
     )
