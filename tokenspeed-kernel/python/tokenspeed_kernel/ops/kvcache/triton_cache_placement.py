@@ -53,6 +53,7 @@ def _translate_virtual_slots(
     VIRTUAL_COUNT: tl.constexpr,
     DEGREE: tl.constexpr,
     RANK: tl.constexpr,
+    INVALID: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -61,9 +62,10 @@ def _translate_virtual_slots(
     safe = tl.maximum(raw, 0)
     local, owner = virtual_block_to_local(safe // ROWS, DEGREE, RANK)
     owner = owner & (raw >= ROWS) & (raw < VIRTUAL_COUNT * ROWS)
-    slot = tl.where(owner, local * ROWS + safe % ROWS, 0)
+    slot = tl.where(owner, local * ROWS + safe % ROWS, INVALID)
     tl.store(destination + offsets, slot, mask=active)
-    tl.store(owner_mask + offsets, owner, mask=active)
+    if owner_mask is not None:
+        tl.store(owner_mask + offsets, owner, mask=active)
 
 
 def virtual_slots_to_local(
@@ -127,6 +129,7 @@ def virtual_slots_to_local(
             VIRTUAL_COUNT=virtual_block_count,
             DEGREE=degree,
             RANK=rank,
+            INVALID=0,
             BLOCK=256,
         )
     else:
@@ -142,6 +145,69 @@ def virtual_slots_to_local(
         out.copy_(torch.where(owned, local, 0))
         owner_mask.copy_(owned)
     return out, owner_mask
+
+
+def virtual_pages_to_local_table(
+    pages: torch.Tensor,
+    *,
+    pages_per_block: int,
+    virtual_block_count: int,
+    degree: int,
+    rank: int,
+) -> torch.Tensor:
+    """Translate a virtual page table to ``rank``'s local pages in one launch.
+
+    Page ``p`` lies in virtual block ``p // pages_per_block``, which
+    :func:`virtual_slots_to_local`'s rule places on one rank at the same
+    offset: translating pages with ``rows_per_page=pages_per_block`` is
+    translating their first token slots and dividing by the page size. Pages
+    ``rank`` does not hold (page 0's block, blocks past the capacity,
+    negative entries and other ranks' blocks) become -1 rather than a safe 0,
+    so the table carries its own ownership.
+
+    Args:
+        pages: Int32 or int64 virtual page ids of any shape.
+        pages_per_block: Pages per virtual block.
+        virtual_block_count: Scheduler capacity including null block 0.
+        degree: Number of owners (the KVP group width).
+        rank: Owner index in [0, degree).
+
+    Returns:
+        A contiguous int32 tensor of ``pages``' shape: local pages, or -1.
+    """
+    if pages_per_block <= 0 or virtual_block_count <= 1 or degree <= 0:
+        raise ValueError(
+            "virtual page geometry must be positive and include usable pages"
+        )
+    if not 0 <= rank < degree:
+        raise ValueError("virtual page owner rank is out of range")
+    if pages.dtype not in (torch.int32, torch.int64):
+        raise TypeError("virtual pages must be int32 or int64")
+    out = torch.empty(pages.shape, dtype=torch.int32, device=pages.device)
+    if pages.numel() == 0:
+        return out
+    if pages.is_cuda or pages.device.type == "npu":
+        _translate_virtual_slots[(triton.cdiv(pages.numel(), 256),)](
+            pages.contiguous(),
+            out,
+            None,
+            pages.numel(),
+            ROWS=pages_per_block,
+            VIRTUAL_COUNT=virtual_block_count,
+            DEGREE=degree,
+            RANK=rank,
+            INVALID=-1,
+            BLOCK=256,
+        )
+        return out
+    local, owned = virtual_slots_to_local(
+        pages,
+        rows_per_page=pages_per_block,
+        virtual_block_count=virtual_block_count,
+        degree=degree,
+        rank=rank,
+    )
+    return out.copy_(torch.where(owned, local, -1))
 
 
 @triton.jit(do_not_specialize=["COUNT"])

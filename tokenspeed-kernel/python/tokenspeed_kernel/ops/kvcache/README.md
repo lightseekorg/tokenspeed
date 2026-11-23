@@ -103,6 +103,14 @@ binary-search lookup, and adjacent-entry miss deduplication have been removed.
 Hash ownership merges duplicate loads while preserving all attention references;
 upstream top-k ordering remains part of the attention numerical contract.
 
+## KVP page tables
+
+`virtual_pages_to_local_table` translates a virtual page table to one rank's
+local pages in one launch. A page lies in virtual block `page //
+pages_per_block`, which the cyclic block rule of `virtual_slots_to_local`
+places with the page's offset kept; pages the rank does not hold become -1
+rather than a safe 0, so the table needs no owner mask.
+
 ## Ascend KVP page compaction
 
 Compact KVP tables retain owned physical pages in their original virtual

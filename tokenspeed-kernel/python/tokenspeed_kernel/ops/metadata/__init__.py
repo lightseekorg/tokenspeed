@@ -27,7 +27,10 @@ from tokenspeed_kernel.ops.metadata.block_table_rows import (
     BLOCK_TABLE_ROW_FIELDS,
     expand_block_table_rows,
 )
-from tokenspeed_kernel.ops.metadata.k_row_lengths import expand_k_row_lengths
+from tokenspeed_kernel.ops.metadata.k_row_lengths import (
+    expand_k_row_lengths,
+    expand_k_row_requests,
+)
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.stop_conditions import apply_stop_conditions
 
@@ -40,5 +43,6 @@ __all__ = [
     "broadcast_block_lengths",
     "expand_block_table_rows",
     "expand_k_row_lengths",
+    "expand_k_row_requests",
     "gather_last_accepted_rows",
 ]

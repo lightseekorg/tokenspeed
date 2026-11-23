@@ -59,9 +59,12 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _decode_visible_lengths,
     _local_visible_lengths,
     _split_slots_by_owner,
+    _translate_virtual_slots,
     kvp_decode_visible_lengths,
     kvp_local_visible_lengths,
     split_slots_by_owner,
+    virtual_pages_to_local_table,
+    virtual_slots_to_local,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import (
@@ -114,6 +117,48 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(3, 63, 4, 0)
         run(2, 129, 3, 13)
         run(5, 1024, 4, 16)
+
+
+def test_virtual_pages_to_local_table_matches_the_slot_translation(
+    device: str,
+) -> None:
+    page = 64
+
+    def run(block, degree, dtype, shape, seed):
+        pages_per_block = block // page
+        virtual = 1 + degree * 37
+        generator = torch.Generator().manual_seed(seed)
+        # Negative entries, page 0's block, every owner and pages past capacity.
+        table = torch.randint(-3, (virtual + 3) * pages_per_block, shape, generator=generator).to(dtype)  # fmt: skip
+        table[0, :4] = torch.tensor([-1, 0, pages_per_block - 1, virtual * pages_per_block])  # fmt: skip
+        # A column slice: the translation reads any layout.
+        table = table[:, : shape[1] - 3]
+        for rank in range(degree):
+            slots, owned = virtual_slots_to_local(
+                table.long() * page,
+                rows_per_page=block,
+                virtual_block_count=virtual,
+                degree=degree,
+                rank=rank,
+            )
+            out = virtual_pages_to_local_table(
+                table.to(device),
+                pages_per_block=pages_per_block,
+                virtual_block_count=virtual,
+                degree=degree,
+                rank=rank,
+            )
+            assert out.dtype == torch.int32 and out.is_contiguous()
+            expected = torch.where(owned, slots // page, -1).int()
+            torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    run(128, 4, torch.int32, (7, 45), 1)
+    run(64, 8, torch.int64, (3, 20), 2)
+    run(256, 2, torch.int32, (5, 33), 3)
+    # The table's shape is a runtime value.
+    with assert_no_triton_compile(_translate_virtual_slots):
+        run(128, 4, torch.int32, (9, 130), 4)
+        run(128, 4, torch.int32, (1, 7), 5)
 
 
 @pytest.mark.parametrize(

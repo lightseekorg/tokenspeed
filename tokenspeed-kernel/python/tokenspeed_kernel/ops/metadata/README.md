@@ -37,6 +37,10 @@ length repeated `k` times) and the sparse decode core's causal KV rows (row
 runs the Triton kernel; other devices run the same integer arithmetic as
 tensor ops.
 
+`expand_k_row_requests` writes the same verify's rows for a KVP indexer in
+one launch: every row's request and its causal end `length + t - (k - 1)`,
+not clamped, so a row past a short request keeps a non-positive end.
+
 # Block-end lengths
 
 `broadcast_block_lengths` serves a block drafter's draft decode, where every
