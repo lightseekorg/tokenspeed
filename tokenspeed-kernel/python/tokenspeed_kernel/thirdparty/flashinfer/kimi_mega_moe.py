@@ -34,8 +34,16 @@ no other stream running on the device.
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
+from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.shim import (
+    runtime as kimi_runtime,
+)
+from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers import epoch
+from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers.device_workspace import (
+    DeviceWorkspace,
+)
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,160 @@ _SCALE_BLOCK = 32
 _MIN_CAPACITY = 128
 
 _runners: dict[tuple, KimiMegaMoERunner] = {}
+
+
+def _share_kernel_layouts(kernels):
+    layouts = {}
+    for space in ("local", "shared"):
+        regions, alignments = {}, {}
+        for kernel in kernels:
+            layout = kernel._device_workspace
+            for region in layout.regions(space):
+                # finalize() adds the epoch counter itself.
+                if region.name == epoch.REGION:
+                    continue
+                size = layout.nbytes(region.name)
+                alignments[region.name] = max(
+                    alignments.get(region.name, 1), region.byte_alignment
+                )
+                if region.name not in regions or size > regions[region.name][0]:
+                    regions[region.name] = (size, region)
+        shared = layouts[space] = DeviceWorkspace()
+        for _, region in regions.values():
+            shared.register(
+                region.name,
+                region.dtype,
+                region.shape,
+                buffer_space=space,
+                stride=region.stride,
+                byte_alignment=alignments[region.name],
+                reset=region.reset,
+            )
+        shared.finalize()
+
+    for kernel in kernels:
+        layout = kernel._device_workspace
+        # Keep each variant's shapes/strides, but fix region and epoch offsets.
+        layout._offset = {
+            region.name: layouts[space].offset(region.name)
+            for space in ("local", "shared")
+            for region in layout.regions(space)
+        }
+        layout._total = {
+            space: shared._total[space] for space, shared in layouts.items()
+        }
+        layout._zero_leading = {
+            space: shared._zero_leading[space] for space, shared in layouts.items()
+        }
+        layout._tail_leading = {
+            space: shared._tail_leading[space] for space, shared in layouts.items()
+        }
+        layout._tail_block = {
+            space: shared._tail_block[space] for space, shared in layouts.items()
+        }
+    return layouts
+
+
+class _SharedBuffers:
+    def __init__(self, group, config, fleet, layouts):
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        capacity, hidden = fleet.max_tokens_per_rank, fleet.token_hidden_size
+        regions = (
+            ((capacity, hidden), torch.uint8),
+            ((capacity, hidden // _SCALE_BLOCK), torch.uint8),
+            ((capacity, config.top_k), torch.float32),
+            ((capacity, hidden), torch.bfloat16),
+            ((layouts["shared"].total_bytes("shared"),), torch.uint8),
+            ((capacity, config.top_k), torch.int32),
+            ((1,), torch.float32),
+        )
+        sizes = [math.prod(shape) * dtype.itemsize for shape, dtype in regions]
+        padded_sizes = [(size + 127) // 128 * 128 for size in sizes]
+        self.symm_handle = None
+        if group.size() > 1:
+            import torch.distributed._symmetric_memory as symm
+
+            symm.enable_symm_mem_for_group(group.group_name)
+            self.storage = symm.empty(
+                sum(padded_sizes), dtype=torch.uint8, device=self.device
+            )
+            self.symm_handle = symm.rendezvous(self.storage, group.group_name)
+            peer_offsets = tuple(
+                int(ptr) - self.storage.data_ptr()
+                for ptr in self.symm_handle.buffer_ptrs
+            )
+        else:
+            self.storage = torch.empty(
+                sum(padded_sizes), dtype=torch.uint8, device=self.device
+            )
+            peer_offsets = (0,)
+        views, offset = [], 0
+        for (shape, dtype), size, padded in zip(
+            regions, sizes, padded_sizes, strict=True
+        ):
+            views.append(self.storage[offset : offset + size].view(dtype).view(shape))
+            offset += padded
+        (
+            self.activation,
+            self.activation_sf,
+            self.scores,
+            self.output,
+            self.shared_workspace,
+            self.ids,
+            self.input_scale,
+        ) = views
+        self.mapper = kimi_runtime.SymmetricBufferHost(
+            base_address=self.storage.data_ptr(),
+            offsets=peer_offsets,
+            rank=group.rank(),
+            max_ranks=group.size(),
+        )
+        self.local_workspace = torch.empty(
+            layouts["local"].total_bytes("local"), dtype=torch.uint8, device=self.device
+        )
+        self.storage.zero_()
+        self.ids.fill_(-1)
+        self.input_scale.fill_(config.input_norm_const)
+        self.local_workspace[: layouts["local"].zero_on_allocate_bytes("local")].zero_()
+        torch.cuda.current_stream().synchronize()
+        if group.size() > 1:
+            torch.distributed.barrier(group=group)
+
+
+class _BucketWorkspace(kimi_runtime.KimiWorkspace):
+    """Use FlashInfer's launchers with views into one shared allocation."""
+
+    def __init__(self, group, config, fleet, kernel, buffers, quantizer):
+        self.config, self.fleet_params = config, fleet
+        self.rank, self.world_size, self.process_group = (
+            group.rank(),
+            group.size(),
+            group,
+        )
+        self.device = buffers.device
+        self.kernel = kernel
+        self.options = {"MEGAMOE_SITU_FAST": "1" if config.fast_situ else "0"}
+        self._compiled = None
+        self._quantizer = quantizer
+        self._routes = {}
+        self._inputs = None
+        self._destroyed = False
+        self._nvfp4 = False
+        self._block = _SCALE_BLOCK
+        self._sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self._buffer = buffers.storage
+        self._symm_handle = buffers.symm_handle
+        self.mapper = buffers.mapper
+        self.local_workspace = buffers.local_workspace
+        self.shared_workspace = buffers.shared_workspace
+        self._input_scale = buffers.input_scale
+        capacity = fleet.max_tokens_per_rank
+        self.activation = buffers.activation[:capacity]
+        self.activation_sf = buffers.activation_sf[:capacity]
+        self.scores = buffers.scores[:capacity]
+        self.output = buffers.output[:capacity]
+        self.ids = buffers.ids[:capacity]
+        self._live = 0
 
 
 def prepare_kimi_mega_moe_weights(
@@ -120,7 +282,6 @@ class KimiMegaMoERunner:
         ``prepare_kimi_mega_moe_weights`` result, used for the warm launches.
         """
         from flashinfer import moe_ep
-        from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as kimi
 
         config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
             intermediate_size=intermediate_size,
@@ -131,35 +292,39 @@ class KimiMegaMoERunner:
             quant_kind="mxfp4_mxfp8",
             combine_dtype="bf16",
         )
-        self.workspaces: dict[int, object] = {}
+        fleets, kernels = {}, {}
+        for power in range(_MIN_CAPACITY.bit_length() - 1, max_tokens.bit_length()):
+            capacity = 1 << power
+            fleet = fleets[capacity] = moe_ep.FleetParams(
+                num_experts=num_experts,
+                token_hidden_size=hidden_size,
+                max_tokens_per_rank=capacity,
+            )
+            with kimi_runtime.option_scope(
+                {"MEGAMOE_SITU_FAST": "1" if config.fast_situ else "0"}
+            ):
+                kernels[capacity] = kimi_runtime._kernel(config, fleet, group.size())
+        layouts = _share_kernel_layouts(tuple(kernels.values()))
+        buffers = _SharedBuffers(group, config, fleets[max_tokens], layouts)
+        logger.info(
+            f"Kimi MegaMoE workspace for {max_tokens} tokens per rank: "
+            f"{buffers.local_workspace.numel() / 2**20:.0f} MiB local, "
+            f"{buffers.storage.numel() / 2**20:.0f} MiB shared with peers"
+        )
+        self.workspaces: dict[int, _BucketWorkspace] = {}
         device = torch.device("cuda", torch.cuda.current_device())
         # One masked row warms quantization and the expert launch before serving.
         row = torch.zeros(1, hidden_size, dtype=torch.bfloat16, device=device)
         ids = torch.full((1, top_k), -1, dtype=torch.int32, device=device)
         scores = torch.zeros(1, top_k, dtype=torch.float32, device=device)
-        capacity = _MIN_CAPACITY
-        while True:
-            workspace = kimi.create_workspace(
-                config,
-                moe_ep.FleetParams(
-                    num_experts=num_experts,
-                    token_hidden_size=hidden_size,
-                    max_tokens_per_rank=capacity,
-                ),
-                rank=group.rank(),
-                world_size=group.size(),
-                process_group=group,
+        quantizer = None
+        for capacity, kernel in kernels.items():
+            workspace = _BucketWorkspace(
+                group, config, fleets[capacity], kernel, buffers, quantizer
             )
             self.workspaces[capacity] = workspace
             self.run(row, ids, scores, weights, capacity)
-            logger.info(
-                f"Kimi MegaMoE workspace for {capacity} tokens per rank: "
-                f"{workspace.local_workspace.numel() / 2**20:.0f} MiB local, "
-                f"{workspace._buffer.numel() / 2**20:.0f} MiB shared with peers"
-            )
-            if capacity >= max_tokens:
-                break
-            capacity *= 2
+            quantizer = workspace._quantizer
         torch.cuda.synchronize()
 
     def input_buffers(

@@ -624,7 +624,7 @@ def _check_megamoe_buffers_on_cuda():
                 experts.w2_weight_scale.fill_(124)
             experts.process_weights_after_loading(experts)
 
-        for rows in (128, 256):
+        for rows in (128, 256, 128):
             with saver.named_region("runtime_states"):
                 x = torch.full((rows, 3584), 0.01, device="cuda", dtype=torch.bfloat16)
             buffers = experts.input_buffers(rows, rows)

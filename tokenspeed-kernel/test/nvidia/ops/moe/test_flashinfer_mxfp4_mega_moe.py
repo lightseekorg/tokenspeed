@@ -262,22 +262,47 @@ def test_matches_the_references(experts, num_tokens, capacity) -> None:
 
 def test_cuda_graph_replay_follows_its_inputs(experts) -> None:
     plan, w, _, non_fused = experts
-    hidden_states, topk_ids, topk_weights = _inputs(64, 31, w)
-    eager = _apply(plan, w, hidden_states, topk_ids, topk_weights, 128).clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = _apply(plan, w, hidden_states, topk_ids, topk_weights, 128)
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+    cases = []
+    for capacity in (128, 256, 8192):
+        inputs = _inputs(64, 31, w)
+        eager = _apply(plan, w, *inputs, capacity).clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _apply(plan, w, *inputs, capacity)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+        cases.append((inputs, graph, captured))
 
-    changed = _inputs(64, 32, w)
-    for tensor, value in zip((hidden_states, topk_ids, topk_weights), changed):
-        tensor.copy_(value)
-    graph.replay()
-    torch.cuda.synchronize()
-    expected = _non_fused(non_fused, hidden_states, topk_ids, topk_weights)
-    assert _relative_error(captured, expected) < SAME_PRECISION_TOLERANCE
+    for step, index in enumerate((2, 0, 1, 2, 1, 0)):
+        inputs, graph, captured = cases[index]
+        for tensor, value in zip(inputs, _inputs(64, 32 + step, w), strict=True):
+            tensor.copy_(value)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _non_fused(non_fused, *inputs)
+        assert _relative_error(captured, expected) < SAME_PRECISION_TOLERANCE
+
+
+def test_buckets_use_only_the_largest_workspace_storage(experts) -> None:
+    plan, w, _, _ = experts
+    runner = moe_prepare_input_buffers(plan, w).__self__
+
+    def storage_bytes(workspaces):
+        storages = {}
+        for workspace in workspaces:
+            for tensor in (
+                workspace.local_workspace,
+                workspace._buffer,
+                workspace.ids,
+                workspace._input_scale,
+            ):
+                storage = tensor.untyped_storage()
+                storages[storage.data_ptr()] = storage.nbytes()
+        return sum(storages.values())
+
+    largest = runner.workspaces[max(runner.workspaces)]
+    assert storage_bytes(runner.workspaces.values()) == storage_bytes([largest])
 
 
 def test_token_counts_of_one_capacity_share_one_compile(experts) -> None:
