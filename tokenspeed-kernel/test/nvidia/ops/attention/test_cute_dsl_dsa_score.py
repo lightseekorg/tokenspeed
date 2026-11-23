@@ -55,7 +55,7 @@ def _reference(q, keys, weights, table, lengths, rows, width, page_size):
     return scores.masked_fill(~valid, -float("inf"))
 
 
-@pytest.mark.parametrize("heads", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("heads", [8, 16, 32])
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_paged_bf16_scores(heads, page_size):
     rng = torch.Generator(device="cuda").manual_seed(312)
@@ -69,6 +69,9 @@ def test_paged_bf16_scores(heads, page_size):
         )
         * 0.2
     )
+    # Outer padding in Q and K is supported when the innermost stride is one.
+    q = q.new_empty((6, heads * 2, 128))[:, ::2].copy_(q)
+    k = k.new_empty((16 * page_size, 128))[::2].copy_(k)
     weights = torch.randn((6, heads * 2), device="cuda", generator=rng)[:, :heads]
     # Page 0 is live, and rows may have a padded outer stride.
     table = torch.tensor(
@@ -79,7 +82,8 @@ def test_paged_bf16_scores(heads, page_size):
         device="cuda",
         dtype=torch.int32,
     )
-    rows = torch.tensor([1, 0, 1, 0, 0, 1], device="cuda", dtype=torch.int32)
+    q_len = 3
+    rows = torch.arange(q.shape[0], device=q.device) // q_len
     width = 4 * page_size + 3
     expected = _reference(q, k, weights, table, lengths, rows, width, page_size)
     actual = dsa_paged_score(
@@ -90,24 +94,22 @@ def test_paged_bf16_scores(heads, page_size):
         lengths,
         max_seq_len=width,
         page_size=page_size,
-        q_len_per_req=None,
-        request_ids=rows,
+        q_len_per_req=q_len,
     )
     torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
-    rows[2] = -1
-    rows[5] = table.shape[0]
-    actual = dsa_paged_score(
-        q,
-        k,
-        weights,
-        table,
-        lengths,
-        max_seq_len=width,
-        page_size=page_size,
-        q_len_per_req=None,
-        request_ids=rows,
+
+
+@pytest.mark.parametrize("width", [1, 63])
+def test_paged_bf16_scores_subtile_history(width):
+    q = torch.ones((1, 16, 128), device="cuda", dtype=torch.bfloat16)
+    keys = q.new_ones((64, 128))
+    weights = torch.ones((1, 16), device="cuda")
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    lengths = torch.full((1,), width, device="cuda", dtype=torch.int32)
+    actual = dsa_paged_score(q, keys, weights, table, lengths, width, 64, 1)
+    torch.testing.assert_close(
+        actual, torch.full_like(actual, 16 * 128), rtol=0, atol=0
     )
-    assert torch.isneginf(actual[[2, 5]]).all()
 
 
 def test_paged_bf16_graph_replay_and_dynamic_shapes():
@@ -166,6 +168,57 @@ def test_paged_bf16_graph_replay_and_dynamic_shapes():
     assert actual.data_ptr() == output.data_ptr()
 
 
+@pytest.mark.parametrize(
+    "batch,q_len,width",
+    [
+        (16, 1, 32 * 1024),
+        (1, 1, 64 * 1024),
+        (2, 1, 96 * 1024),
+        (2, 1, 128 * 1024),
+        (8, 1, 64 * 1024),
+        (3, 4, 32 * 1024 + 1),
+        (1, 8, 64 * 1024),
+        (3, 8, 32 * 1024),
+    ],
+)
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_paged_bf16_long_rectangular_matches_reference(batch, q_len, width, page_size):
+    heads = 32
+    query_rows = batch * q_len
+    num_pages = (width + page_size - 1) // page_size
+    rng = torch.Generator(device="cuda").manual_seed(819)
+    q = (
+        torch.randn(
+            (query_rows, heads, 128), device="cuda", dtype=torch.bfloat16, generator=rng
+        )
+        * 0.2
+    )
+    k = (
+        torch.randn(
+            (num_pages * page_size, 128),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=rng,
+        )
+        * 0.2
+    )
+    weights = torch.randn((query_rows, heads), device="cuda", generator=rng)
+    table = torch.randperm(
+        num_pages, device="cuda", dtype=torch.int32, generator=rng
+    ).repeat(batch, 1)
+    table[0, 0] = -1
+    token_rows = torch.arange(query_rows, device="cuda", dtype=torch.int32)
+    requests = token_rows // q_len
+    lengths = width - requests % 4 * 513 - (q_len - 1 - token_rows % q_len)
+    actual = dsa_paged_score(q, k, weights, table, lengths, width, page_size, q_len)
+    for start in range(0, query_rows, 4):
+        ix = slice(start, start + 4)
+        expected = _reference(
+            q[ix], k, weights[ix], table, lengths[ix], requests[ix], width, page_size
+        )
+        torch.testing.assert_close(actual[ix], expected, atol=3e-5, rtol=3e-4)
+
+
 def test_paged_bf16_offsets_past_int32():
     page_size = 64
     rng = torch.Generator(device="cuda").manual_seed(71)
@@ -221,3 +274,15 @@ def test_paged_bf16_empty_and_unsupported():
     )
     with pytest.raises(NoKernelFoundError):
         dsa_paged_score(q.float(), keys, w, table, lengths, **kwargs)
+
+
+@pytest.mark.parametrize("heads", [4, 64])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_paged_bf16_rejects_unsupported_heads(heads, page_size):
+    q = torch.zeros((1, heads, 128), device="cuda", dtype=torch.bfloat16)
+    keys = q.new_zeros((page_size, 128))
+    weights = torch.ones((1, heads), device="cuda")
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    lengths = torch.full((1,), page_size, device="cuda", dtype=torch.int32)
+    with pytest.raises(NoKernelFoundError):
+        dsa_paged_score(q, keys, weights, table, lengths, page_size, page_size, 1)

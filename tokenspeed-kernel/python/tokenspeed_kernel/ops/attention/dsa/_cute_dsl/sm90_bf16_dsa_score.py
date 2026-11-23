@@ -62,7 +62,7 @@ _THREADS_PER_CTA = 256
         }
     ),
     traits={
-        "index_heads": frozenset({4, 8, 16, 32, 64}),
+        "index_heads": frozenset({8, 16, 32}),
         "head_dim": frozenset({128}),
         "page_size": frozenset({64, 128}),
     },
@@ -76,73 +76,53 @@ def cute_dsl_dsa_paged_score_sm90(
     context_lens,
     max_seq_len,
     page_size,
-    q_len_per_req,
-    request_ids,
-    out,
+    q_len_per_req: int,
+    out=None,
 ):
     rows, heads, dim = q.shape
     cache_length, key_dim = index_k_cache.shape
-    if (
-        key_dim != dim
-        or cache_length % page_size
-        or not index_k_cache.is_contiguous()
-        or not q.is_contiguous()
-    ):
-        raise ValueError(
-            "TMA requires 16-byte aligned packed Q and whole packed K pages"
-        )
+    if key_dim != dim or cache_length % page_size:
+        raise ValueError("Expected matching Q/K head dimensions and whole K pages")
     if (
         weights.shape != (rows, heads)
-        or weights.stride(-1) != 1
         or block_table.ndim != 2
         or block_table.stride(-1) != 1
         or context_lens.shape != (rows,)
-        or not context_lens.is_contiguous()
     ):
         raise ValueError(
             "Expected row weights, a page table and one context length per query"
         )
-    if request_ids is None:
-        if q_len_per_req is None or q_len_per_req <= 0 or rows % q_len_per_req:
-            raise ValueError("q_len_per_req must divide query rows")
-        if block_table.shape[0] < rows // q_len_per_req:
-            raise ValueError("Expected one page-table row per request")
-    elif (
-        q_len_per_req is not None
-        or request_ids.shape != (rows,)
-        or request_ids.dtype != torch.int32
-        or not request_ids.is_contiguous()
-    ):
+    if not isinstance(q_len_per_req, int) or q_len_per_req <= 0 or rows % q_len_per_req:
         raise ValueError(
-            "Explicit request_ids requires a contiguous int32 row map and q_len_per_req=None"
+            "q_len_per_req must be a positive integer that divides query rows"
         )
 
-    reqs = context_lens if request_ids is None else request_ids
-    if not 0 <= max_seq_len < 2**31:
-        raise ValueError("Score width and query rows must fit in int32")
+    if block_table.shape[0] < rows // q_len_per_req:
+        raise ValueError("Expected one page-table row per request")
 
     partitions = 1
     if rows and max_seq_len and cache_length and block_table.numel():
         sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
         max_wave = 16
-        # The measured 78-SM Hopper geometry benefits from fewer CTA splits
-        # at small row counts and more at 128–256 rows.
-        if (
-            sm_count == 78
-            and page_size == 64
-            and heads in (16, 32)
-            and q_len_per_req in (1, 4, 8)
-            and 64 * 1024 <= max_seq_len <= 256 * 1024
-        ):
-            if rows == 1:
-                max_wave = 4
-            elif rows < 8 or (rows == 8 and max_seq_len == 64 * 1024):
-                max_wave = 8
-            elif 128 <= rows <= 256:
-                max_wave = 32
-        target = (max_wave * sm_count + rows - 1) // rows
-        tiles = (max_seq_len + SM90_WGMMA_M - 1) // SM90_WGMMA_M
-        partitions = min(tiles, triton.next_power_of_2(target))
+
+        tiles = triton.cdiv(max_seq_len, SM90_WGMMA_M)
+        tile_wave = 0
+
+        wave_cap = 3
+        tiles_per_cta = 8
+        max_bucket_tiles = 8192
+        bucket_len = 1 << (max_seq_len.bit_length() - 1)
+        total_tiles = rows * (bucket_len // SM90_WGMMA_M)
+
+        if 0 < total_tiles <= max_bucket_tiles:
+            tile_wave = min(
+                wave_cap, triton.cdiv(total_tiles, tiles_per_cta * sm_count)
+            )
+        if tile_wave:
+            partitions = min(tiles, triton.cdiv(tile_wave * sm_count, rows))
+        else:
+            target = triton.cdiv(max_wave * sm_count, rows)
+            partitions = min(tiles, triton.next_power_of_2(target))
 
         # Tail columns are int32, including the rounded-up tile, CTA offset
         # and the final stride. The row-strided output address is still int64.
@@ -154,7 +134,6 @@ def cute_dsl_dsa_paged_score_sm90(
     elif (
         out.shape != (rows, max_seq_len)
         or out.dtype != torch.float32
-        or out.device != q.device
         or not out.is_contiguous()
     ):
         raise ValueError(
@@ -168,8 +147,10 @@ def cute_dsl_dsa_paged_score_sm90(
 
     with torch.cuda.device(q.device):
         _compile_score(heads, page_size, q.device.index)(
-            *_tensors(index_k_cache, q, weights, block_table, reqs, context_lens, out),
-            cutlass.Int32(q_len_per_req or 0),
+            *_tensors(
+                index_k_cache, q, weights, block_table, context_lens, context_lens, out
+            ),
+            cutlass.Int32(q_len_per_req),
             cutlass.Int32(partitions),
             CUstream(torch.cuda.current_stream(q.device).cuda_stream),
         )
@@ -527,7 +508,7 @@ class PagedDSAScore:
         count,
         page_table,
         requests,
-        qolen, # for decode-spec
+        qolen,  # for decode-spec
         cache_length,
     ):
         row, _, _ = cute.arch.block_idx()

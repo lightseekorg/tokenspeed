@@ -2187,8 +2187,7 @@ def dsa_paged_score(
     context_lens: torch.Tensor,
     max_seq_len: int,
     page_size: int,
-    q_len_per_req: int | None,
-    request_ids: torch.Tensor | None = None,
+    q_len_per_req: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute FP32 DSA scores in logical token order over paged BF16 keys.
@@ -2202,9 +2201,8 @@ def dsa_paged_score(
             its own position.
         max_seq_len: Output width in tokens, independent of each row's visibility.
         page_size: Number of tokens per physical page.
-        q_len_per_req: Queries per request for a rectangular batch, or None
-            when using explicit request_ids.
-        request_ids: Optional INT32 page-table row for each query [tokens].
+        q_len_per_req: Consecutive queries per request, 1 for plain decode.
+            Query row r uses block_table[r // q_len_per_req].
         out: Optional contiguous FP32 output [tokens, max_seq_len].
 
     Returns:
@@ -2238,7 +2236,6 @@ def dsa_paged_score(
         max_seq_len=max_seq_len,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
-        request_ids=request_ids,
         out=out,
     )
 
