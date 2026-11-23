@@ -119,3 +119,25 @@ def test_gated_fp8_cuda_graph_uses_updated_inputs(normalize):
             values.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
         )
         torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+
+
+def test_rmsnorm_gated_sigmoid_gate_row_offset_past_int32():
+    heads, head_dim = 2, 64
+    width = heads * head_dim
+    # The last gate row starts more than 2**31 elements into the gate's
+    # storage, as a gate sliced out of a wide projection does on a long forward.
+    row_stride = (1 << 30) + width
+    storage = torch.empty(2 * row_stride + width, device="cuda", dtype=torch.bfloat16)
+    gate = storage.as_strided((3, width), (row_stride, 1))
+    assert 2 * row_stride > 2**31
+    torch.manual_seed(0)
+    gate.copy_(torch.randn(3, width, device="cuda", dtype=torch.bfloat16))
+    x = torch.randn(3, width, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    actual = rmsnorm_gated_sigmoid(
+        x, gate, weight, 1e-6, heads, head_dim, enable_pdl=False
+    )
+    expected = rmsnorm_gated_sigmoid(
+        x, gate.contiguous(), weight, 1e-6, heads, head_dim, enable_pdl=False
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

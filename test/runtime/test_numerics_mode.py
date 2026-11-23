@@ -179,6 +179,46 @@ class TestNumericsMode:
         assert not (args.enable_allreduce_fusion)
         assert (args.comm_fusion_max_num_tokens) == (-1)
 
+    def test_dense_fp8_small_m_is_refused_under_a_bitwise_envelope(self):
+        assert ServerArgs(model="x").dense_fp8_small_m == "none"
+        assert ServerArgs(model="x", dense_fp8_small_m="qkv").dense_fp8_small_m == (
+            "qkv"
+        )
+        with pytest.raises(ValueError, match="--dense-fp8-small-m qkv.*rl-bitwise"):
+            ServerArgs(model="x", numerics="rl-bitwise", dense_fp8_small_m="qkv")
+        with pytest.raises(ValueError, match="--dense-fp8-small-m"):
+            ServerArgs(model="x", dense_fp8_small_m="all")
+        with pytest.raises(ValueError, match="batch-invariant-collectives"):
+            ServerArgs(
+                model="x",
+                batch_invariant_collectives=True,
+                dense_fp8_small_m="qkv",
+            )
+        # Run-to-run determinism alone keeps the flag.
+        assert (
+            ServerArgs(
+                model="x", force_deterministic_rsag=True, dense_fp8_small_m="qkv"
+            ).dense_fp8_small_m
+            == "qkv"
+        )
+
+    def test_dense_fp8_small_m_refuses_a_checkpoint_without_fp8_projections(
+        self, tmp_path
+    ):
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"architectures": ["Qwen3ForCausalLM"]})
+        )
+        with pytest.raises(
+            ValueError, match="no FP8 projections for .*Qwen3ForCausalLM"
+        ):
+            ServerArgs(model=str(tmp_path), dense_fp8_small_m="qkv")
+        (tmp_path / "config.json").write_text(
+            json.dumps({"architectures": ["MuseSparkForConditionalGeneration"]})
+        )
+        ServerArgs(model=str(tmp_path), dense_fp8_small_m="qkv")
+
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")

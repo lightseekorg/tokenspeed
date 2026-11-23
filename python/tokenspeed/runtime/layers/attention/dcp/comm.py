@@ -235,22 +235,37 @@ def gather_query_heads_padded(
         ``r * heads + h`` at ``[token, r * heads + h]`` as
         :func:`gather_query_heads` places it, zeros after.
     """
-    tokens, heads, dim = query.shape
-    total = heads * len(group)
-    if padded_heads < total:
+    return token_major_query_heads(
+        gather_query_heads_rank_major(query, group), padded_heads
+    )
+
+
+def token_major_query_heads(gathered: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    """Lay a rank-major query gather out token-major, zero-padded.
+
+    Args:
+        gathered: Every rank's ``[ranks, tokens, heads, dim]`` TP heads, as
+            :func:`gather_query_heads_rank_major` lands them.
+        padded_heads: The core's head count, at least the gathered heads.
+
+    Returns:
+        ``[tokens, padded_heads, dim]`` in ``gathered``'s dtype: head ``h`` of
+        rank ``r`` at ``[token, r * heads + h]`` as :func:`gather_query_heads`
+        places it, zeros after; one copy, and a fill only past the heads.
+    """
+    ranks, tokens, heads, dim = gathered.shape
+    if padded_heads < ranks * heads:
         raise ValueError("padded query heads must hold every gathered head")
-    padded = query.new_empty((tokens, padded_heads, dim))
-    gathered = gather_query_heads_rank_major(query, group)
-    rows = padded.view(torch.uint8).view(tokens, padded_heads * dim * query.itemsize)
-    src = gathered.view(torch.uint8).view(len(group), tokens, -1)
+    padded = gathered.new_empty((tokens, padded_heads, dim))
+    rows = padded.view(torch.uint8).view(tokens, -1)
+    src = gathered.view(torch.uint8).view(ranks, tokens, -1)
     width = src.shape[-1]
     if width % 8 == 0 and rows.shape[-1] % 8 == 0:
         # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
         rows, src, width = rows.view(torch.int64), src.view(torch.int64), width // 8
-    rows[:, len(group) * width :].zero_()
-    rows[:, : len(group) * width].view(tokens, len(group), width).copy_(
-        src.transpose(0, 1)
-    )
+    if padded_heads > ranks * heads:
+        rows[:, ranks * width :].zero_()
+    rows[:, : ranks * width].view(tokens, ranks, width).copy_(src.transpose(0, 1))
     return padded
 
 

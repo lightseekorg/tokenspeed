@@ -160,6 +160,11 @@ pub trait TransferPeer {
     /// the cache.
     fn has_in_flight(&self) -> bool;
 
+    /// Whether a tracked (including draining) request already owns `room`.
+    /// Decided solely from replica-identical loop state, never from worker
+    /// threads.
+    fn has_room(&self, room: u64) -> bool;
+
     /// EPD, P role: tell the decode node waiting on room `room` that the
     /// request failed before it could register (its embeddings never
     /// arrived), so its receiver fails instead of waiting. Best effort.
