@@ -26,10 +26,7 @@ import threading
 
 import torch
 from tokenspeed_kernel.ops.quantization.triton import (
-    fp8_quantize_by_multiplier,
     fp8_quantize_per_token,
-    fp8_token_multiplier,
-    fp8_token_scale,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -44,27 +41,22 @@ try:
     from cuda.bindings.driver import CUstream
     from cutlass.cute import experimental as cute_ext
     from cutlass.cute.runtime import from_dlpack
+    from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
+        _has_full_up_tiles,
+    )
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
-        Fp8GatedResidualBranchUp,
         Fp8GatedResidualGemm,
         Fp8GatedResidualInputQuantize,
         Fp8GatedResidualM32WeightStationaryUp,
         Fp8GatedResidualM64H32IndependentAUp,
-        Fp8GatedResidualM64H56Up,
-        Fp8GatedResidualM64H64CachedS5Up,
-        Fp8GatedResidualM64H64Up,
-        Fp8GatedResidualPairedHiddenUp,
         Fp8GatedResidualProjectionEpilogue,
         Fp8GatedResidualTokenReuseUp,
         W8GatedResidualBranchUp,
         W8GatedResidualCachedScaleTokenReuse,
         W8GatedResidualCachedScaleUp,
         W8GatedResidualDecodedRingUp,
-        W8GatedResidualDecodedTokenReuse,
-        W8GatedResidualIndependentUp,
         W8GatedResidualRotatedProjection,
         W8GatedResidualTmemProjection,
-        W8GatedResidualTokenReuse,
     )
 
     _AVAILABLE = True
@@ -94,19 +86,19 @@ def _projection_epilogue(
     input_fp8,
     activation_fp8,
 ):
-    threads = 512 if r >= 1024 else 256
+    threads = 512 if _has_full_up_tiles(r) else 256
     splits = partial.shape[0]
     # Near-full legacy Up tiles are faster when activation quantization finishes first.
     early_up_signal = (
         pdl_enabled()
         and activation_fp8
-        and not (r == 320 and 112 < partial.shape[1] <= 128)
+        and not (not _has_full_up_tiles(r) and 112 < partial.shape[1] <= 128)
     )
     parallel_inject = (
         pdl_enabled()
         and activation_fp8
         and p > r
-        and r == 1024
+        and _has_full_up_tiles(r)
         and partial.shape[1] > 32
     )
     key = (
@@ -179,15 +171,16 @@ def _branch_up(
     activation_scale,
     out,
     *,
+    g,
     h,
     r,
     weights_independent,
 ):
-    n = 16 if x.shape[0] <= 16 else (32 if x.shape[0] <= 32 else 64)
-    k, stages = 128, (2 if n == 64 else 3)
+    n, k, stages = 16, 128, 3
     key = (
         x.device.index,
         x.dtype,
+        g,
         h,
         r,
         n,
@@ -212,6 +205,7 @@ def _branch_up(
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("warm W8 branch Up before graph capture")
                 kernel = W8GatedResidualBranchUp(
+                    hc_count=g,
                     hidden_size=h,
                     lowrank=r,
                     token_tile=n,
@@ -237,6 +231,7 @@ def _reuse_up(
     activation_scale,
     out,
     *,
+    g,
     h,
     r,
     weights_independent,
@@ -245,6 +240,7 @@ def _reuse_up(
     key = (
         x.device.index,
         x.dtype,
+        g,
         h,
         r,
         pdl_enabled(),
@@ -269,6 +265,7 @@ def _reuse_up(
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("warm token-reuse Up before graph capture")
                 kernel = W8GatedResidualCachedScaleTokenReuse(
+                    hc_count=g,
                     hidden_size=h,
                     lowrank=r,
                     raw_stages=4,
@@ -295,6 +292,7 @@ def _independent_up(
     activation_scale,
     out,
     *,
+    g,
     h,
     r,
     weights_independent,
@@ -303,10 +301,11 @@ def _independent_up(
     up_token_rows = 64 if x.shape[0] <= 64 else 128
     raw_stages = 6 if up_token_rows == 64 else 5
     input_stages = 4 if up_token_rows == 64 else 3
-    decoded_stages = 3 if up_token_rows == 64 else 3
+    decoded_stages = 3
     key = (
         x.device.index,
         x.dtype,
+        g,
         h,
         r,
         pdl_enabled(),
@@ -339,6 +338,7 @@ def _independent_up(
                     if up_token_rows == 128
                     else W8GatedResidualDecodedRingUp
                 )(
+                    hc_count=g,
                     hidden_size=h,
                     lowrank=r,
                     use_pdl=pdl_enabled(),
@@ -371,70 +371,6 @@ def _gemm(
     p,
     weights_independent,
 ):
-    if (
-        role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (x.shape[0] > 16)
-        and (not 128 < x.shape[0] <= 256)
-    ):
-        return _independent_up(
-            x,
-            weight,
-            original,
-            weight_scale,
-            activation_scale,
-            out,
-            h=h,
-            r=r,
-            weights_independent=weights_independent,
-        )
-    if (
-        role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (128 < x.shape[0] <= 256)
-    ):
-        return _reuse_up(
-            x,
-            weight,
-            original,
-            weight_scale,
-            activation_scale,
-            out,
-            h=h,
-            r=r,
-            weights_independent=weights_independent,
-        )
-    if (
-        role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (x.shape[0] <= 32)
-    ):
-        return _branch_up(
-            x,
-            weight,
-            original,
-            weight_scale,
-            activation_scale,
-            out,
-            h=h,
-            r=r,
-            weights_independent=weights_independent,
-        )
-    k = 128
-    original_n = 16 if x.shape[0] <= 16 else 32 if x.shape[0] <= 32 else 64
-    n = 128 if x.shape[0] > 64 else original_n
-    m = (64 if r <= 384 else 128) if role == "projection" else 128
-    split = 16 if role == "projection" else 1
-    stages = (
-        3
-        if x.dtype == torch.float8_e4m3fn
-        else 6 if n == 16 else 5 if n == 32 else 4 if n == 64 else 3
-    )
-    if x.dtype != torch.float8_e4m3fn and r == 1024 and (n == 16):
-        stages = 3
     if x.dtype == torch.float8_e4m3fn:
         return _native_gemm(
             x,
@@ -451,56 +387,50 @@ def _gemm(
             p=p,
             weights_independent=weights_independent,
         )
-    if role == "projection" and x.shape[0] > 128:
-        n = 256
-        stages = 2
+
+    rows = x.shape[0]
+    full_up_tiles = _has_full_up_tiles(r)
+    if role == "mix" and full_up_tiles:
+        if rows <= 16:
+            up = _branch_up
+        elif 128 < rows <= 256:
+            up = _reuse_up
+        else:
+            up = _independent_up
+        return up(
+            x,
+            weight,
+            original,
+            weight_scale,
+            activation_scale,
+            out,
+            g=g,
+            h=h,
+            r=r,
+            weights_independent=weights_independent,
+        )
+
+    n = 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
+    stages = 6 if n == 16 else 5 if n == 32 else 4 if n == 64 else 3
+    if role == "projection" and rows > 128:
+        n, stages = 256, 2
+    m = 64 if role == "projection" and not full_up_tiles else 128
+    split = 16 if role == "projection" else 1
     token_major_up = role == "mix" and n > 64
-    if role == "mix" and x.dtype != torch.float8_e4m3fn and (r == 320) and (n > 64):
+    k = 192 if token_major_up else 128
+    if token_major_up:
         stages = 2
-    up_hidden_tile = (
-        64
-        if role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (n >= 64)
-        else 32
-    )
-    if up_hidden_tile == 64:
-        stages = 2
-    separate_operand_ready = (
-        role == "projection"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (x.shape[0] > 64)
-    )
-    up_token_rows = (
-        64
-        if role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 1024)
-        and (n == 64)
-        else 128
-    )
-    if up_token_rows == 64:
-        token_major_up = True
-    if (
-        role == "mix"
-        and x.dtype != torch.float8_e4m3fn
-        and (r == 320)
-        and (x.shape[0] > 64)
-    ):
-        k, stages = (192, 2)
+    up_hidden_tile = 32
+    up_token_rows = 128
     weight_scale_vectorized = (
         role == "mix"
         and weight_scale.numel() > 1
         and (weight_scale.data_ptr() % 16 == 0)
     )
-    use_tmem_weights = (
-        role == "projection" and x.dtype != torch.float8_e4m3fn and (r == 1024)
-    )
+    use_tmem_weights = role == "projection" and full_up_tiles
+    separate_operand_ready = use_tmem_weights
     if use_tmem_weights:
         stages = 7 if n <= 64 else 6 if n == 128 else 4
-        separate_operand_ready = True
     key = (
         x.device.index,
         x.dtype,
@@ -613,121 +543,6 @@ def _gemm(
     compiled(*operands, stream)
 
 
-_NATIVE_BRANCH_PLANS = {}
-_PAIRED_PLANS = {}
-
-
-def _native_branch_up(
-    x,
-    weight,
-    original,
-    weight_scale,
-    activation_scale,
-    out,
-    *,
-    h,
-    r,
-    weights_independent,
-):
-    n = 16 if x.shape[0] <= 16 else 32
-    k = 256
-    stages = 3
-    key = (
-        x.device.index,
-        original.dtype,
-        h,
-        r,
-        n,
-        k,
-        stages,
-        pdl_enabled(),
-        weights_independent,
-        weight_scale.numel() > 1,
-    )
-    operands = tuple(
-        from_dlpack(
-            t.detach(), assumed_align=4 if t.ndim == 1 else 16
-        ).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (x, weight, original, weight_scale, activation_scale, out)
-    )
-    stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
-    compiled = _NATIVE_BRANCH_PLANS.get(key)
-    if compiled is None:
-        with _PLAN_LOCK:
-            compiled = _NATIVE_BRANCH_PLANS.get(key)
-            if compiled is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("warm branch Up before graph capture")
-                kernel = Fp8GatedResidualBranchUp(
-                    hidden_size=h,
-                    lowrank=r,
-                    token_tile=n,
-                    k_tile=k,
-                    stages=stages,
-                    use_pdl=pdl_enabled(),
-                    weights_independent=weights_independent,
-                    weight_scale_per_channel=weight_scale.numel() > 1,
-                )
-                compiled = cute_ext.compile(kernel, *operands, stream)
-                _NATIVE_BRANCH_PLANS[key] = compiled
-    compiled(*operands, stream)
-
-
-def _paired_up(
-    x,
-    weight,
-    original,
-    weight_scale,
-    activation_scale,
-    out,
-    *,
-    h,
-    r,
-    weights_independent,
-):
-    n = 32 if x.shape[0] <= 32 else 64
-    k, stages = (256, 3) if n == 32 else (128, 3)
-    key = (
-        x.device.index,
-        original.dtype,
-        h,
-        r,
-        n,
-        k,
-        stages,
-        pdl_enabled(),
-        weights_independent,
-        weight_scale.numel() > 1,
-    )
-    operands = tuple(
-        from_dlpack(
-            t.detach(), assumed_align=4 if t.ndim == 1 else 16
-        ).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (x, weight, original, weight_scale, activation_scale, out)
-    )
-    stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
-    compiled = _PAIRED_PLANS.get(key)
-    if compiled is None:
-        with _PLAN_LOCK:
-            compiled = _PAIRED_PLANS.get(key)
-            if compiled is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("warm paired hidden Up before graph capture")
-                kernel = Fp8GatedResidualPairedHiddenUp(
-                    hidden_size=h,
-                    lowrank=r,
-                    token_tile=n,
-                    k_tile=k,
-                    stages=stages,
-                    use_pdl=pdl_enabled(),
-                    weights_independent=weights_independent,
-                    weight_scale_per_channel=weight_scale.numel() > 1,
-                )
-                compiled = cute_ext.compile(kernel, *operands, stream)
-                _PAIRED_PLANS[key] = compiled
-    compiled(*operands, stream)
-
-
 def _native_gemm(
     x,
     weight,
@@ -744,118 +559,36 @@ def _native_gemm(
     p,
     weights_independent,
 ):
-    middle_fp8 = (
-        x.dtype == torch.float8_e4m3fn and r == 1024 and (16 < x.shape[0] <= 64)
-    )
-    original_n = (
-        16
-        if x.shape[0] <= 16
-        else 32 if x.dtype != torch.float8_e4m3fn or x.shape[0] <= 32 else 64
-    )
-    n = 128 if x.shape[0] > 64 else original_n
-    m = (64 if r <= 384 else 128) if role == "projection" else 128
-    split = (
-        8
-        if role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (n > 64)
-        else 16 if role == "projection" else 1
-    )
-    if (
-        role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (n > 64)
-    ):
-        m = 64
-    stages = 3 if x.dtype == torch.float8_e4m3fn else 2
+    rows = x.shape[0]
+    full_up_tiles = _has_full_up_tiles(r)
+    n = 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
+    k, stages = 128, 3
+    m = 64 if role == "projection" and not full_up_tiles else 128
+    split = (8 if full_up_tiles else 16) if role == "projection" else 1
+    epilogue_threads = 256 if n == 16 else 512
+    interleave_tma = role == "projection" and full_up_tiles and rows > 16
     token_major_up = role == "mix" and n > 64
-    up_hidden_tile = (
-        64 if token_major_up and x.dtype == torch.float8_e4m3fn and (r == 1024) else 32
-    )
-    k = (
-        256
-        if role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (n > 64)
-        else 128
-    )
-    if k == 256:
+    up_hidden_tile = 64 if token_major_up and full_up_tiles else 32
+    up_token_rows = 128
+    shared_up_scales = token_major_up and full_up_tiles
+    token_reuse = role == "mix" and full_up_tiles and rows > 128
+    up_m32 = role == "mix" and full_up_tiles and n <= 32
+    up_m64 = role == "mix" and full_up_tiles and n == 64
+    if role == "projection":
+        if full_up_tiles:
+            if rows > 128:
+                stages = 6 if rows <= 192 else 7
+            elif n <= 32:
+                m, k, stages = 64, 512, 4
+            else:
+                m, k, stages = 64, 256, 7 if n == 64 else 4
+        elif rows > 128:
+            n, stages = 256, 4
+    elif up_m32 or up_m64:
+        token_major_up = shared_up_scales = True
         stages = 4
-    if x.dtype == torch.float8_e4m3fn and r == 1024 and (n <= 64):
-        k = 512 if role == "projection" else 1024
-        stages = (3 if n == 16 else 2) if role == "projection" else 1
-    up_m64 = (
-        role == "mix" and x.dtype == torch.float8_e4m3fn and (r == 1024) and (n == 64)
-    )
-    up_token_rows = 64 if up_m64 else 128
-    epilogue_threads = 256 if up_m64 or n == 16 else 512
-    if up_m64:
-        token_major_up = True
-        up_hidden_tile = 32
-        k = 1024
-        stages = 1
-    if role == "projection" and original.shape[0] > 128:
-        n = 256
-        m = 128 if r == 1024 else 64
-        split = 16
-        k = 256 if x.dtype == torch.float8_e4m3fn and r == 1024 else 128
-        stages = 4 if x.dtype == torch.float8_e4m3fn and r == 320 else 2
-    if (
-        role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (n == 16)
-    ):
-        m = 64
-        split = 8
-        k = 512
-        stages = 4
-        epilogue_threads = 256
-    shared_up_scales = (
-        token_major_up and up_hidden_tile == 64 and (x.dtype == torch.float8_e4m3fn)
-    )
-    if (
-        role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (original.shape[0] > 128)
-    ):
-        n, m, split, k, stages = (
-            128,
-            128,
-            8,
-            128,
-            6 if original.shape[0] <= 192 else 7,
-        )
-    interleave_tma = (
-        role == "projection"
-        and x.dtype == torch.float8_e4m3fn
-        and (r == 1024)
-        and (x.shape[0] > 16)
-    )
-    if role == "projection" and middle_fp8:
-        m, split, epilogue_threads = (64, 8, 512)
-        k, stages = (512, 4) if n == 32 else (256, 7)
-    token_reuse = (
-        role == "mix"
-        and r == 1024
-        and (x.dtype == torch.float8_e4m3fn)
-        and (x.shape[0] > 128)
-    )
-    if up_m64:
-        k, stages, up_hidden_tile, epilogue_threads = (128, 4, 32, 512)
-        shared_up_scales = True
-    up_m32 = (
-        role == "mix" and x.dtype == torch.float8_e4m3fn and (r == 1024) and (n <= 32)
-    )
-    if up_m32:
-        k, stages, up_hidden_tile, epilogue_threads = (128, 4, 32, 128)
-        up_token_rows = 32
-        token_major_up = True
-        shared_up_scales = True
+        up_token_rows = 32 if up_m32 else 64
+        epilogue_threads = 128 if up_m32 else 512
     weight_scale_vectorized = (
         role == "mix"
         and weight_scale.numel() > 1
@@ -976,11 +709,10 @@ def _set_pdl_carveout(compiled, device_index, *, use_pdl):
     )
 
 
-def _quantize_input(x):
+def _quantize_input(x, *, block_threads: int):
     codes = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
     scales = torch.empty((x.shape[0],), device=x.device, dtype=torch.float32)
-    threads = 1024 if x.shape[1] == 32768 and pdl_enabled() else 256
-    key = (x.device.index, x.dtype, x.shape[1], threads, pdl_enabled())
+    key = (x.device.index, x.dtype, x.shape[1], block_threads, pdl_enabled())
     operands = tuple(
         from_dlpack(
             t.detach(), assumed_align=4 if t.ndim == 1 else 16
@@ -996,7 +728,9 @@ def _quantize_input(x):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("warm input quantization before graph capture")
                 kernel = Fp8GatedResidualInputQuantize(
-                    columns=x.shape[1], block_threads=threads, use_pdl=pdl_enabled()
+                    columns=x.shape[1],
+                    block_threads=block_threads,
+                    use_pdl=pdl_enabled(),
                 )
                 compiled = cute_ext.compile(kernel, *operands, stream)
                 _set_pdl_carveout(compiled, x.device.index, use_pdl=pdl_enabled())
@@ -1023,14 +757,16 @@ def _execute(
     if activation_quantization == "fp8":
         # Input and post-SiLU quantization share the same rounded scale and
         # multiplier, including the minimum scale for zero and tiny rows.
-        if r == 1024 and 0 < rows <= 256 and (rows > 128 or pdl_enabled()):
-            x, xs = _quantize_input(normalized)
+        if _has_full_up_tiles(r) and 0 < rows <= 256 and (rows > 128 or pdl_enabled()):
+            x, xs = _quantize_input(
+                normalized, block_threads=1024 if pdl_enabled() else 256
+            )
         else:
             x, xs = fp8_quantize_per_token(normalized, enable_pdl=pdl_enabled())
         xs = xs.reshape(-1)
     else:
         x, xs = normalized, projection_weight_scale[:1]
-    splits = 8 if activation_quantization == "fp8" and r == 1024 else 16
+    splits = 8 if activation_quantization == "fp8" and _has_full_up_tiles(r) else 16
     partials = torch.empty(
         (splits, rows, p), device=normalized.device, dtype=torch.float32
     )
@@ -1189,7 +925,7 @@ if _AVAILABLE:
                 warm_rows = (1, 17, 33, 65, 129, 193)
                 if (
                     activation_quantization == "fp8"
-                    and lowrank == 320
+                    and not _has_full_up_tiles(lowrank)
                     and pdl_enabled()
                 ):
                     warm_rows = (1, 17, 33, 65, 113, 129, 193)

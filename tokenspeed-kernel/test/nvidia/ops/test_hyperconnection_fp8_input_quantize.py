@@ -50,10 +50,12 @@ def _check(codes, scales, x):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("columns", [10240, 32768])
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize(
+    "columns,block_threads,pdl",
+    [(10240, 256, True), (32768, 256, False), (32768, 1024, True)],
+)
 @torch.inference_mode()
-def test_quantize_bits_scales_and_replay(dtype, columns, pdl):
+def test_quantize_bits_scales_and_replay(dtype, columns, block_threads, pdl):
     pdl_enabled(pdl)
     torch.manual_seed(248)
     x = torch.randn((17, columns), device="cuda", dtype=dtype)
@@ -64,13 +66,13 @@ def test_quantize_bits_scales_and_replay(dtype, columns, pdl):
     x[4, 0] = float("nan")
     x[5, 0] = float("inf")
     x[6, 0] = -float("inf")
-    _check(*_quantize_input(x), x)
+    _check(*_quantize_input(x, block_threads=block_threads), x)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with assert_no_cute_compile():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            codes, scales = _quantize_input(x)
+            codes, scales = _quantize_input(x, block_threads=block_threads)
         graph.replay()
         stream.synchronize()
         _check(codes, scales, x)

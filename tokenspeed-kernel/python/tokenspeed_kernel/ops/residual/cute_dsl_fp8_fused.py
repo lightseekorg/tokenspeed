@@ -41,6 +41,9 @@ try:
     from cuda.bindings.driver import CUstream
     from cutlass.cute import experimental as cute_ext
     from cutlass.cute.runtime import from_dlpack
+    from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
+        _has_full_up_tiles,
+    )
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8_fused import (
         Fp8FusedGatedResidualKernel,
     )
@@ -131,7 +134,13 @@ def _supports_sm103(device: torch.device) -> bool:
 
 def supports_packed_fp8_up_weight(device: torch.device, g: int, h: int, r: int) -> bool:
     """Check whether the device can use the wide FP8 Up weight layout."""
-    return (g, h, r) == (4, 8192, 1024) and _supports_sm103(device)
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc_shape
+
+    return (
+        _supports_sm103(device)
+        and supports_fused_hc_shape(g, h, r)
+        and _has_full_up_tiles(r)
+    )
 
 
 def prepare_fp8_up_weight(
@@ -408,9 +417,14 @@ if _AVAILABLE:
         from tokenspeed_kernel.ops.tuning import is_warming_up
 
         execute = _execute
-        model = (hc_count, hidden_size, lowrank)
+        from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc_shape
+
+        if not supports_fused_hc_shape(hc_count, hidden_size, lowrank):
+            raise ValueError(
+                "prequantized FP8 mixer requires validated model dimensions"
+            )
         sm103 = _supports_sm103(normalized.device)
-        if sm103 and model == (4, 8192, 1024):
+        if sm103 and _has_full_up_tiles(lowrank):
             from tokenspeed_kernel.ops.residual._cute_dsl.hc_fp8_wide import (
                 _execute as execute_wide,
             )
@@ -419,7 +433,7 @@ if _AVAILABLE:
             kwargs["packed_up_weight"] = packed_up_weight
         elif packed_up_weight is not None:
             raise ValueError("Packed E4M3 Up weights require the wide SM103 mixer")
-        elif sm103 and model == (4, 2560, 320):
+        elif sm103:
             from tokenspeed_kernel.ops.residual._cute_dsl.hc_fp8_narrow import (
                 _execute as execute_narrow,
             )

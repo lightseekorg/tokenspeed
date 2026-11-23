@@ -29,6 +29,13 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import CopyUniversalOp, tcgen05
 from cutlass.cutlass_dsl import T
 
+# The ring-based Up schedule consumes full K128 tiles.
+_UP_K_TILE = 128
+
+
+def _has_full_up_tiles(lowrank: int) -> bool:
+    return lowrank % _UP_K_TILE == 0
+
 
 @cute.experimental.jit
 def _decode_residual(codes):

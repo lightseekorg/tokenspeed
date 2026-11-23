@@ -57,213 +57,6 @@ _DOWN_TACTICS = {
 }
 
 
-def _select_early_entry_weights(g, h, r, token_bucket):
-    return int((g, h, r) == (4, 8192, 1024) and token_bucket in (16, 64, 128))
-
-
-def _select_activation_wait(g, h, r, token_bucket):
-    if (g, h, r) == (4, 8192, 1024):
-        if token_bucket == 32:
-            return "warp_sync"
-        if token_bucket in (64, 128, 256):
-            return "warp_arrive"
-    return "grid"
-
-
-def _select_entry_scale_prefetches(g, h, r, token_bucket):
-    selected = (g, h, r, token_bucket) == (4, 8192, 1024, 128)
-    return selected, selected, selected
-
-
-def _select_quant_handoff(g, h, r, token_bucket):
-    if (g, h, r, token_bucket) == (4, 8192, 1024, 128):
-        return "replicate", "native", True
-    return "native", "native", False
-
-
-def _select_quant_scale_mode(g, h, r, token_bucket):
-    if (g, h, r) == (4, 8192, 1024):
-        if token_bucket in (32, 64, 256):
-            return "scales_clamp"
-        if token_bucket == 128:
-            return "scales_clamp"
-    return "original"
-
-
-def _select_quant_max_mode(g, h, r, token_bucket, device):
-    if (g, h, r) == (4, 8192, 1024) and torch.cuda.get_device_capability(device)[
-        0
-    ] == 10:
-        if token_bucket == 16:
-            return "warp"
-        if token_bucket in (32, 64, 128, 256):
-            return "warp_local"
-    return "shuffle"
-
-
-def _select_down_mma_unroll(g, h, r, token_bucket, issue_style):
-    if issue_style == "cute":
-        return 4
-    # A native dense E4M3 instruction consumes 32 elements along K.
-    return _DOWN_TACTICS[token_bucket][2] // 32
-
-
-def _select_up_tactic(g, h, r, token_bucket):
-    channel_parts = 2 if g == 4 and r == 1024 and token_bucket <= 64 else 1
-    k = 128 if r == 1024 else (64 if token_bucket == 128 else 320)
-    stages = 5 if channel_parts == 2 and token_bucket == 16 else min(3, r // k)
-    return channel_parts, k, stages
-
-
-def _select_issue_style(g, h, r, token_bucket):
-    if _select_up_refill_unroll(g, h, r, token_bucket):
-        return "cute", "cute_unrolled"
-    return (
-        ("raw_unrolled", "raw_unrolled")
-        if r == 1024 and token_bucket == 64
-        else ("cute", "cute")
-    )
-
-
-def _select_down_arrival_actor(g, h, r, token_bucket):
-    return (
-        "mma"
-        if (g, h, r) == (4, 8192, 1024) and token_bucket in (32, 64, 128)
-        else "thread0"
-    )
-
-
-def _select_up_barrier_placement(g, h, r, token_bucket):
-    return "entry" if (g, h, r, token_bucket) == (4, 8192, 1024, 128) else "handoff"
-
-
-def _select_up_weight_handoff(g, h, r, token_bucket):
-    if (g, h, r) != (4, 8192, 1024):
-        return "native"
-    return {
-        16: "retire_first_stage",
-        32: "retire_first_stage",
-        64: "retire_part0",
-        128: "reuse_pair",
-        256: "reuse_pair",
-    }[token_bucket]
-
-
-def _select_up_prefetch_stages(g, h, r, token_bucket):
-    if r == 1024:
-        return _select_up_tactic(g, h, r, token_bucket)[2] if token_bucket == 16 else 2
-    return 0
-
-
-def _select_up_activation_prefetch(g, h, r, token_bucket):
-    if (g, h, r) != (4, 8192, 1024):
-        return 0, 0, 1
-    return {
-        16: (5, 2, 1),
-        32: (3, 1, 1),
-        64: (3, 1, 1),
-        128: (3, 1, 1),
-        256: (7, 1, 1),
-    }[token_bucket]
-
-
-def _select_up_prefetch_split(g, h, r, p, token_bucket, device):
-    if (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 16):
-        if torch.cuda.get_device_capability(device) == (10, 3):
-            return 1, 1, 0
-    return 0, 1, -1
-
-
-def _select_up_followup_prefetch(g, h, r, token_bucket):
-    if (g, h, r) != (4, 8192, 1024):
-        return "off", -1, 1
-    return {
-        16: ("off", -1, 1),
-        32: ("reader", 5, 1),
-        64: ("before_acquire", 5, 1),
-        128: ("before_acquire", 5, 1),
-        256: ("down_handoff", 6, 1),
-    }[token_bucket]
-
-
-def _select_last_up_weight_prefetch(g, h, r, p, token_bucket, up_weight_is_packed):
-    if up_weight_is_packed and (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 32):
-        return "after_release", 16
-    if (g, h, r, token_bucket) == (4, 8192, 1024, 128) and p == r + g:
-        return "before_invalidate", 16
-    return "off", 0
-
-
-def _select_up_refill_unroll(g, h, r, token_bucket):
-    return (g, h, r, token_bucket) == (4, 8192, 1024, 256)
-
-
-def _select_up_tile4_hint_stride(g, h, r, token_bucket):
-    return 2 if _select_up_refill_unroll(g, h, r, token_bucket) else 0
-
-
-def _select_up_skip_final(g, h, r, token_bucket):
-    return (g, h, r) == (4, 8192, 1024) and token_bucket in (16, 32, 64, 256)
-
-
-def _select_up_tmem_dealloc_site(g, h, r, p, token_bucket):
-    if (g, h, r, token_bucket) == (4, 8192, 1024, 128) and p == r + g:
-        return "after_reads"
-    return "kernel_tail"
-
-
-def _select_up_w2_issue_site(g, h, r, p, token_bucket):
-    if (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 128):
-        return "handoff"
-    return "activation_demand"
-
-
-def _select_up_unused_empty(g, h, r, p, token_bucket):
-    return int(_select_up_tmem_dealloc_site(g, h, r, p, token_bucket) == "after_reads")
-
-
-def _select_up_residual_order(g, h, r, p, token_bucket):
-    if (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 128):
-        return "before_acquire"
-    return "native"
-
-
-def _select_up_hidden_mix(g, h, r, p, token_bucket):
-    if (g, h, r, p) == (4, 8192, 1024, 1028) and token_bucket in (32, 64):
-        return "vector_pair"
-    return "native"
-
-
-def _select_up_final_part_mode(g, h, r, p, token_bucket, device):
-    if (g, h, r, p, token_bucket) == (
-        4,
-        8192,
-        1024,
-        1028,
-        16,
-    ) and torch.cuda.get_device_capability(device) == (10, 3):
-        return "split"
-    return "native"
-
-
-def _select_up_mix_input_prefetch(g, h, r, p, token_bucket, device):
-    if (g, h, r, p, token_bucket) == (
-        4,
-        8192,
-        1024,
-        1028,
-        16,
-    ) and torch.cuda.get_device_capability(device) == (10, 3):
-        return "both"
-    return "none"
-
-
-def _select_up_hidden_pair_mul(device, g, h, r, p, token_bucket):
-    return (g, h, r, p, token_bucket) == (4, 8192, 1024, 1028, 64) and (
-        torch.cuda.get_device_capability(device) == (10, 3)
-    )
-
-
 def _query_actual_resources(
     compiled, operands, function, threads, device, tma_l2_ids, weight_priority_ids
 ):
@@ -331,27 +124,6 @@ def _query_actual_resources(
             _checked(driver.cuStreamDestroy(probe_stream))
 
 
-def _select_up_scale_cache(g, h, r, token_bucket):
-    if (g, h, r, token_bucket) == (4, 8192, 1024, 256):
-        return "vector_register_rows"
-    return "vector" if r == 1024 and token_bucket >= 128 else "native"
-
-
-def _select_partial_store_packet(g, h, r, token_bucket):
-    return 4 if r == 1024 and token_bucket == 256 else 1
-
-
-def _select_native_down_partials(g, h, r, token_bucket):
-    return (g, h, r, token_bucket) == (4, 8192, 1024, 128)
-
-
-def _select_async_phase_arrivals(device, g, h, r, token_bucket):
-    if (g, h, r) == (4, 8192, 1024) and token_bucket in (128, 256):
-        if torch.cuda.get_device_capability(device)[0] == 10:
-            return "both" if token_bucket == 256 else "activation"
-    return "native"
-
-
 def _execute(
     x,
     xs,
@@ -370,24 +142,12 @@ def _execute(
     token_bucket,
     packed_up_weight,
 ):
+    has_injection = p == r + g
     up_weight_is_packed = (
-        packed_up_weight is not None
-        and p == r + g
-        and token_bucket in (16, 32, 64, 128)
-        and torch.cuda.get_device_capability(up.device) == (10, 3)
+        packed_up_weight is not None and has_injection and token_bucket <= 128
     )
-    if packed_up_weight is not None:
-        if (
-            (g, h, r) != (4, 8192, 1024)
-            or packed_up_weight.shape != up.shape
-            or packed_up_weight.dtype != up.dtype
-            or packed_up_weight.device != up.device
-            or not packed_up_weight.is_contiguous()
-            or packed_up_weight.data_ptr() % 16
-        ):
-            raise ValueError("Invalid storage for packed wide E4M3 Up tiles")
-        if up_weight_is_packed:
-            up = packed_up_weight
+    if up_weight_is_packed:
+        up = packed_up_weight
     rows = x.shape[0]
     out = torch.empty((rows, h), device=x.device, dtype=output_dtype)
     inject = (
@@ -396,126 +156,151 @@ def _execute(
     if rows == 0:
         return out, inject
     stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
+    first_bucket = token_bucket == 16
+    entry_barriers = token_bucket == 128
+    two_token_parts = token_bucket == 256
+    small_injection = has_injection and first_bucket
+    release_after_reads = has_injection and entry_barriers
+
     down_tactic = _DOWN_TACTICS[token_bucket]
-    issue_style = _select_issue_style(g, h, r, token_bucket)
-    down_mma_unroll = _select_down_mma_unroll(g, h, r, token_bucket, issue_style[0])
-    up_tactic = _select_up_tactic(g, h, r, token_bucket)
-    up_prefetch_stages = _select_up_prefetch_stages(g, h, r, token_bucket)
-    up_prefetch_split = _select_up_prefetch_split(g, h, r, p, token_bucket, x.device)
-    up_activation_prefetch = _select_up_activation_prefetch(g, h, r, token_bucket)
-    up_followup_prefetch = _select_up_followup_prefetch(g, h, r, token_bucket)
-    last_up_weight_prefetch = _select_last_up_weight_prefetch(
-        g, h, r, p, token_bucket, up_weight_is_packed
+    down_issue = "raw_unrolled" if token_bucket == 64 else "cute"
+    up_issue = "cute_unrolled" if two_token_parts else down_issue
+    issue_style = (down_issue, up_issue)
+    down_mma_unroll = 4 if down_issue == "cute" else down_tactic[2] // 32
+    down_arrival_actor = "mma" if token_bucket in (32, 64, 128) else "thread0"
+    partial_store_packet = 4 if two_token_parts else 1
+    native_down_partials = entry_barriers
+    entry_down_prefill = True
+    early_entry_weights = int(token_bucket in (16, 64, 128))
+
+    activation_wait = (
+        "grid" if first_bucket else "warp_sync" if token_bucket == 32 else "warp_arrive"
     )
-    up_tmem_dealloc_site = _select_up_tmem_dealloc_site(g, h, r, p, token_bucket)
-    up_unused_empty = _select_up_unused_empty(g, h, r, p, token_bucket)
-    up_residual_order = _select_up_residual_order(g, h, r, p, token_bucket)
-    up_hidden_mix = _select_up_hidden_mix(g, h, r, p, token_bucket)
-    up_final_part_mode = _select_up_final_part_mode(g, h, r, p, token_bucket, x.device)
-    up_mix_input_prefetch = _select_up_mix_input_prefetch(
-        g, h, r, p, token_bucket, x.device
+    async_phase_arrivals = (
+        "both" if two_token_parts else "activation" if entry_barriers else "native"
     )
-    up_reader_pair_arithmetic = "separate"
-    if (g, h, r, p, token_bucket) == (
-        4,
-        8192,
-        1024,
-        1028,
-        16,
-    ) and torch.cuda.get_device_capability(x.device) == (10, 3):
+    quant_max_mode = "warp" if first_bucket else "warp_local"
+    quant_scale_mode = "original" if first_bucket else "scales_clamp"
+    quant_max_join = "replicate" if entry_barriers else "native"
+    quant_publication = "native"
+    up_wait_once = entry_barriers
+    entry_scale_prefetches = (entry_barriers,) * 3
+
+    channel_parts = 2 if token_bucket <= 64 else 1
+    stages = 5 if first_bucket else min(3, r // 128)
+    up_tactic = (channel_parts, 128, stages)
+    up_prefetch_stages = stages if first_bucket else 3 if release_after_reads else 2
+    up_prefetch_split = (1, 1, 0) if small_injection else (0, 1, -1)
+    up_activation_prefetch = (
+        (5, 2, 1) if first_bucket else (7, 1, 1) if two_token_parts else (3, 1, 1)
+    )
+    up_followup_prefetch = {
+        16: ("off", -1, 1),
+        32: ("reader", 5, 1),
+        64: ("before_acquire", 5, 1),
+        128: ("before_acquire", 5, 1),
+        256: ("down_handoff", 6, 1),
+    }[token_bucket]
+    if up_weight_is_packed and token_bucket == 32:
+        last_up_weight_prefetch = "after_release", 16
+    elif release_after_reads:
+        last_up_weight_prefetch = "before_invalidate", 16
+    else:
+        last_up_weight_prefetch = "off", 0
+    up_tmem_dealloc_site = "after_reads" if release_after_reads else "kernel_tail"
+    up_unused_empty = int(release_after_reads)
+    up_residual_order = "before_acquire" if release_after_reads else "native"
+    up_hidden_mix = "native"
+    if small_injection:
         up_hidden_mix = "register_half_group_no_join"
-        up_reader_pair_arithmetic = "scalar_pair"
-    up_hidden_pair_mul = _select_up_hidden_pair_mul(x.device, g, h, r, p, token_bucket)
-    up_refill_unroll = _select_up_refill_unroll(g, h, r, token_bucket)
-    up_tile4_hint_stride = _select_up_tile4_hint_stride(g, h, r, token_bucket)
-    up_skip_final = (
-        _select_up_skip_final(g, h, r, token_bucket)
-        or up_tmem_dealloc_site == "after_reads"
+    elif has_injection and token_bucket in (32, 64):
+        up_hidden_mix = "vector_pair"
+    up_final_part_mode = "split" if small_injection else "native"
+    up_mix_input_prefetch = "both" if small_injection else "none"
+    up_reader_pair_arithmetic = "scalar_pair" if small_injection else "separate"
+    up_hidden_pair_mul = has_injection and token_bucket == 64
+    up_refill_unroll = two_token_parts
+    up_tile4_hint_stride = 2 if two_token_parts else 0
+    up_skip_final = not entry_barriers or release_after_reads
+    up_weight_handoff = (
+        "retire_first_stage"
+        if token_bucket <= 32
+        else "retire_part0" if token_bucket == 64 else "reuse_pair"
     )
-    up_weight_handoff = _select_up_weight_handoff(g, h, r, token_bucket)
-    up_w2_issue_site = _select_up_w2_issue_site(g, h, r, p, token_bucket)
-    if up_w2_issue_site != "activation_demand":
-        up_prefetch_stages = 3
-    up_barrier_placement = _select_up_barrier_placement(g, h, r, token_bucket)
-    down_arrival_actor = _select_down_arrival_actor(g, h, r, token_bucket)
-    partial_store_packet = _select_partial_store_packet(g, h, r, token_bucket)
-    native_down_partials = _select_native_down_partials(g, h, r, token_bucket)
-    up_scale_cache = _select_up_scale_cache(g, h, r, token_bucket)
+    up_w2_issue_site = "handoff" if release_after_reads else "activation_demand"
+    up_barrier_placement = "entry" if entry_barriers else "handoff"
+    up_scale_cache = (
+        "vector_register_rows"
+        if two_token_parts
+        else "vector" if entry_barriers else "native"
+    )
     private_epoch_order = "store"
     release_phase_arrivals = True
-    async_phase_arrivals = _select_async_phase_arrivals(x.device, g, h, r, token_bucket)
-    # All wide buckets use explicit Down and Up fetches with these policies.
     operand_transport = ("explicit", "explicit")
     minimum_blocks_per_sm = 1
     tma_l2_ids = (cutlass.Int32(0),) * 4
     weight_cache_hint = True
     weight_priority_ids = (cutlass.Int32(1),) * 2
-    entry_down_prefill = True
-    early_entry_weights = _select_early_entry_weights(g, h, r, token_bucket)
-    activation_wait = _select_activation_wait(g, h, r, token_bucket)
-    quant_scale_mode = _select_quant_scale_mode(g, h, r, token_bucket)
-    quant_max_join, quant_publication, up_wait_once = _select_quant_handoff(
-        g, h, r, token_bucket
+    kernel_options = dict(
+        g=g,
+        h=h,
+        r=r,
+        p=p,
+        token_bucket=token_bucket,
+        projection_scale=projection_scale,
+        use_pdl=pdl_enabled(),
+        weights_independent=weights_independent,
+        down_per_channel=ds.numel() > 1,
+        up_per_channel=us.numel() > 1,
+        down_tactic=down_tactic,
+        down_mma_unroll=down_mma_unroll,
+        up_tactic=up_tactic,
+        up_weight_is_packed=up_weight_is_packed,
+        up_prefetch_stages=up_prefetch_stages,
+        up_prefetch_split=up_prefetch_split,
+        up_activation_prefetch=up_activation_prefetch,
+        up_followup_prefetch=up_followup_prefetch,
+        last_up_weight_prefetch=last_up_weight_prefetch,
+        up_tmem_dealloc_site=up_tmem_dealloc_site,
+        up_unused_empty=up_unused_empty,
+        up_residual_order=up_residual_order,
+        up_hidden_mix=up_hidden_mix,
+        up_final_part_mode=up_final_part_mode,
+        up_mix_input_prefetch=up_mix_input_prefetch,
+        up_reader_pair_arithmetic=up_reader_pair_arithmetic,
+        up_hidden_pair_mul=up_hidden_pair_mul,
+        up_w2_issue_site=up_w2_issue_site,
+        up_refill_unroll=up_refill_unroll,
+        up_tile4_hint_stride=up_tile4_hint_stride,
+        up_skip_final=up_skip_final,
+        up_weight_handoff=up_weight_handoff,
+        up_barrier_placement=up_barrier_placement,
+        down_arrival_actor=down_arrival_actor,
+        issue_style=issue_style,
+        partial_store_packet=partial_store_packet,
+        native_down_partials=native_down_partials,
+        up_scale_cache=up_scale_cache,
+        private_epoch_order=private_epoch_order,
+        release_phase_arrivals=release_phase_arrivals,
+        async_phase_arrivals=async_phase_arrivals,
+        operand_transport=operand_transport,
+        minimum_blocks_per_sm=minimum_blocks_per_sm,
+        weight_cache_hint=weight_cache_hint,
+        entry_down_prefill=entry_down_prefill,
+        early_entry_weights=early_entry_weights,
+        activation_wait=activation_wait,
+        quant_scale_mode=quant_scale_mode,
+        quant_max_mode=quant_max_mode,
+        quant_max_join=quant_max_join,
+        quant_publication=quant_publication,
+        up_wait_once=up_wait_once,
+        entry_scale_prefetches=entry_scale_prefetches,
     )
-    entry_scale_prefetches = _select_entry_scale_prefetches(g, h, r, token_bucket)
-    quant_max_mode = _select_quant_max_mode(g, h, r, token_bucket, x.device)
     key = (
         x.device.index,
-        g,
-        h,
-        r,
-        p,
         output_dtype,
-        projection_scale,
-        weights_independent,
-        ds.numel() > 1,
-        us.numel() > 1,
-        pdl_enabled(),
-        down_tactic,
-        down_mma_unroll,
-        up_tactic,
-        up_weight_is_packed,
-        up_prefetch_stages,
-        up_prefetch_split,
-        up_activation_prefetch,
-        up_followup_prefetch,
-        last_up_weight_prefetch,
-        up_tmem_dealloc_site,
-        up_unused_empty,
-        up_residual_order,
-        up_hidden_mix,
-        up_final_part_mode,
-        up_mix_input_prefetch,
-        up_reader_pair_arithmetic,
-        up_hidden_pair_mul,
-        up_w2_issue_site,
-        up_refill_unroll,
-        up_tile4_hint_stride,
-        up_skip_final,
-        up_weight_handoff,
-        up_barrier_placement,
-        down_arrival_actor,
-        issue_style,
         _EPOCH_PROTOCOL_VERSION,
-        partial_store_packet,
-        native_down_partials,
-        up_scale_cache,
-        private_epoch_order,
-        release_phase_arrivals,
-        async_phase_arrivals,
-        operand_transport,
-        minimum_blocks_per_sm,
-        entry_down_prefill,
-        early_entry_weights,
-        activation_wait,
-        quant_scale_mode,
-        quant_max_mode,
-        quant_max_join,
-        quant_publication,
-        up_wait_once,
-        entry_scale_prefetches,
-        weight_cache_hint,
-        token_bucket,
+        *kernel_options.values(),
     )
     stream_key = key + (int(stream),)
     with _LOCK:
@@ -526,61 +311,7 @@ def _execute(
                 raise RuntimeError(
                     "warm the prequantized FP8 bucket on this stream before capture"
                 )
-            kernel = Fp8FusedGatedResidualKernel(
-                g=g,
-                h=h,
-                r=r,
-                p=p,
-                token_bucket=token_bucket,
-                projection_scale=projection_scale,
-                use_pdl=pdl_enabled(),
-                weights_independent=weights_independent,
-                down_per_channel=ds.numel() > 1,
-                up_per_channel=us.numel() > 1,
-                down_tactic=down_tactic,
-                down_mma_unroll=down_mma_unroll,
-                up_tactic=up_tactic,
-                up_weight_is_packed=up_weight_is_packed,
-                up_prefetch_stages=up_prefetch_stages,
-                up_prefetch_split=up_prefetch_split,
-                up_activation_prefetch=up_activation_prefetch,
-                up_followup_prefetch=up_followup_prefetch,
-                last_up_weight_prefetch=last_up_weight_prefetch,
-                up_tmem_dealloc_site=up_tmem_dealloc_site,
-                up_unused_empty=up_unused_empty,
-                up_residual_order=up_residual_order,
-                up_hidden_mix=up_hidden_mix,
-                up_final_part_mode=up_final_part_mode,
-                up_mix_input_prefetch=up_mix_input_prefetch,
-                up_reader_pair_arithmetic=up_reader_pair_arithmetic,
-                up_hidden_pair_mul=up_hidden_pair_mul,
-                up_w2_issue_site=up_w2_issue_site,
-                up_refill_unroll=up_refill_unroll,
-                up_tile4_hint_stride=up_tile4_hint_stride,
-                up_skip_final=up_skip_final,
-                up_weight_handoff=up_weight_handoff,
-                up_barrier_placement=up_barrier_placement,
-                down_arrival_actor=down_arrival_actor,
-                issue_style=issue_style,
-                partial_store_packet=partial_store_packet,
-                native_down_partials=native_down_partials,
-                up_scale_cache=up_scale_cache,
-                private_epoch_order=private_epoch_order,
-                release_phase_arrivals=release_phase_arrivals,
-                async_phase_arrivals=async_phase_arrivals,
-                operand_transport=operand_transport,
-                minimum_blocks_per_sm=minimum_blocks_per_sm,
-                weight_cache_hint=weight_cache_hint,
-                entry_down_prefill=entry_down_prefill,
-                early_entry_weights=early_entry_weights,
-                activation_wait=activation_wait,
-                quant_scale_mode=quant_scale_mode,
-                quant_max_mode=quant_max_mode,
-                quant_max_join=quant_max_join,
-                quant_publication=quant_publication,
-                up_wait_once=up_wait_once,
-                entry_scale_prefetches=entry_scale_prefetches,
-            )
+            kernel = Fp8FusedGatedResidualKernel(**kernel_options)
             if plan is None:
                 # Compile with one safe cooperative block, then query real capacity.
                 scratch = _allocate_workspace(

@@ -47,74 +47,14 @@ _LOCK = threading.RLock()
 # Phase ordinals must never reuse scratch initialized with round generations.
 _EPOCH_PROTOCOL_VERSION = 8
 
-# Token bucket to (projection tile, split count, K tile, stages).
+# Token bucket to (projection tile, split count, stages).
 _DOWN_TACTICS = {
-    16: (64, 16, 320, 2),
-    32: (64, 16, 320, 2),
-    64: (64, 8, 640, 2),
-    128: (64, 8, 640, 2),
-    256: (64, 4, 512, 3),
+    16: (64, 16, 2),
+    32: (64, 16, 2),
+    64: (64, 8, 2),
+    128: (64, 8, 2),
+    256: (64, 4, 3),
 }
-
-
-def _select_residual_issue(g, h, r, p, token_bucket):
-    if (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 16):
-        return "register_before_mma"
-    if (g, h, r) == (4, 2560, 320):
-        if token_bucket == 128:
-            return "down_entry"
-        if token_bucket in (32, 64):
-            return "handoff"
-    return "up"
-
-
-def _select_residual_transfer(g, h, r, token_bucket):
-    return "tma" if (g, h, r, token_bucket) == (4, 2560, 320, 128) else "lane"
-
-
-def _select_up_retirement(g, h, r, token_bucket, has_injection):
-    if has_injection and token_bucket in (32, 64):
-        return "skip_final_and_tail_join"
-    if (g, h, r) == (4, 2560, 320):
-        return "skip_final"
-    return "native"
-
-
-def _select_up_hidden_columns(g, h, r, p, token_bucket):
-    if (g, h, r, p) == (4, 2560, 320, 324):
-        if token_bucket == 16:
-            return 2
-        if token_bucket in (32, 64):
-            return 4
-    return 1
-
-
-def _select_up_gate_exchange(has_injection, token_bucket):
-    return "row_pairs_scalar" if has_injection and token_bucket == 64 else "native"
-
-
-def _select_quant_copy_warp(has_injection, token_bucket):
-    return 5 if has_injection and token_bucket == 32 else -1
-
-
-def _select_warp_owned_gates(has_injection, token_bucket):
-    return has_injection and token_bucket == 32
-
-
-def _select_up_scale_issue(g, h, r, token_bucket):
-    return "up_async" if (g, h, r, token_bucket) == (4, 2560, 320, 128) else "native"
-
-
-def _select_quant_down_overlap(has_injection, token_bucket):
-    return "early_scalar" if has_injection and token_bucket == 16 else "native"
-
-
-def _select_quant_down_poll(has_injection, token_bucket):
-    return "acquire_fence" if has_injection and token_bucket == 16 else "native"
-
-
-def _select_aligned_partial_rows(has_injection, token_bucket):
-    return has_injection and token_bucket == 16
 
 
 def _allocate_partials(kernel, rows, projection_rows, device):
@@ -124,112 +64,6 @@ def _allocate_partials(kernel, rows, projection_rows, device):
         return torch.empty(shape, device=device, dtype=torch.float32).transpose(0, 1)
     shape = (kernel.splits, rows, projection_rows)
     return torch.empty(shape, device=device, dtype=torch.float32)
-
-
-def _select_quant_activation_store(has_injection, token_bucket):
-    return "pack_max" if has_injection and token_bucket in (16, 32, 64) else "native"
-
-
-def _select_up_activation_prefix(has_injection, token_bucket):
-    return (3, True) if has_injection and token_bucket == 64 else (0, False)
-
-
-def _select_activation_retry_ns(g, h, r, token_bucket):
-    return 64 if (g, h, r, token_bucket) == (4, 2560, 320, 16) else 0
-
-
-def _select_stage_handoff(g, h, r, p, token_bucket, async_phase_arrivals):
-    if (g, h, r) == (4, 2560, 320):
-        if token_bucket == 16:
-            if p == r + g and async_phase_arrivals == "both":
-                return "row_async_bulk", True
-            return "grid", True
-        if token_bucket == 32 and p == r + g and async_phase_arrivals == "down":
-            return "row_tags_quant", False
-        if token_bucket == 64:
-            return "warp", False
-    return "grid", False
-
-
-def _select_down_input_refill_hint(has_injection, token_bucket):
-    return (3, 4) if has_injection and token_bucket == 256 else ()
-
-
-def _select_up_activation_transport(g, h, r, token_bucket):
-    if (g, h, r) == (4, 2560, 320):
-        if token_bucket == 16:
-            return "packed_tma"
-        if token_bucket == 64:
-            return "bulk"
-    return "native"
-
-
-def _select_up_resident_tactic(g, h, r, token_bucket):
-    if (g, h, r, token_bucket) == (4, 2560, 320, 128):
-        return 64, 5
-    k = 128 if r == 1024 else 64 if token_bucket == 128 else 320
-    return k, min(3, r // k)
-
-
-def _select_down_token_tile(g, h, r, token_bucket):
-    if (g, h, r) == (4, 2560, 320):
-        return {64: 32, 128: 64, 256: 64}.get(token_bucket, token_bucket)
-    return token_bucket
-
-
-def _select_cta_reader_handoff(r, token_bucket):
-    return r == 320 and token_bucket <= 128
-
-
-def _select_partial_geometry(r, token_bucket):
-    """Select fixed workspace geometry for (Down stores, ordered merge loads)."""
-    if r == 320 and token_bucket == 16:
-        return False, True
-    if r == 320 and token_bucket == 32:
-        return True, True
-    return False, False
-
-
-def _select_quant_max_join(g, h, r, token_bucket):
-    if (g, h, r) == (4, 2560, 320):
-        if token_bucket in (16, 32, 128):
-            return "single_full"
-        if token_bucket == 64:
-            return "single_active"
-    return "double"
-
-
-def _select_quant_warp_handoff(g, h, r, token_bucket):
-    return (g, h, r, token_bucket) == (4, 2560, 320, 64)
-
-
-def _select_down_release(g, h, r, token_bucket):
-    if (g, h, r, token_bucket) == (4, 2560, 320, 16):
-        return "early_arrive"
-    return "native"
-
-
-def _select_down_writer_release(has_injection, token_bucket):
-    return 1, has_injection and token_bucket == 16, False
-
-
-def _select_async_phase_arrivals(device, g, h, r, token_bucket):
-    if (g, h, r) == (4, 2560, 320) and torch.cuda.get_device_capability(device)[
-        0
-    ] == 10:
-        if token_bucket == 16:
-            return "both"
-        if token_bucket == 32:
-            return "down"
-    return "native"
-
-
-def _select_omit_down_empty(g, h, r, token_bucket):
-    return (g, h, r) == (4, 2560, 320) and token_bucket in (16, 32, 64)
-
-
-def _select_up_register_rows(g, h, r, token_bucket):
-    return (g, h, r, token_bucket) == (4, 2560, 320, 256)
 
 
 def _activation_workspace(rows, width, device, bundle_alpha):
@@ -288,124 +122,169 @@ def _execute(
         return out, inject
     stream = CUstream(int(torch.cuda.current_stream(x.device).cuda_stream))
     has_injection = p == r + g
-    down_tactic = _DOWN_TACTICS[token_bucket]
-    if has_injection and token_bucket == 16:
-        # Fit 120 shorter Down tasks and 16 dedicated quantization CTAs in one resident grid.
+    first_bucket = token_bucket == 16
+    second_bucket = token_bucket == 32
+    third_bucket = token_bucket == 64
+    long_tile = token_bucket == 128
+    two_token_parts = token_bucket == 256
+    stamped_activation = has_injection and first_bucket
+    warp_owned_gates = has_injection and second_bucket
+    split_activation_counter = has_injection and third_bucket
+
+    down_m, splits, stages = _DOWN_TACTICS[token_bucket]
+    down_k = 512 if two_token_parts else g * h // (splits * stages)
+    down_tactic = (down_m, splits, down_k, stages)
+    if stamped_activation:
+        # Shorter split-K tasks make room for dedicated quantization CTAs.
         down_tactic = 64, 20, 256, 2
-    down_token_tile = _select_down_token_tile(g, h, r, token_bucket)
-    up_tactic = _select_up_resident_tactic(g, h, r, token_bucket)
-    use_cta_reader_handoff = _select_cta_reader_handoff(r, token_bucket)
-    partial_geometry = _select_partial_geometry(r, token_bucket)
-    if (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 64):
-        partial_geometry = True, True
-    quant_max_join = _select_quant_max_join(g, h, r, token_bucket)
-    quant_warp_handoff = _select_quant_warp_handoff(g, h, r, token_bucket)
-    down_release = _select_down_release(g, h, r, token_bucket)
-    async_phase_arrivals = _select_async_phase_arrivals(x.device, g, h, r, token_bucket)
-    omit_down_empty = _select_omit_down_empty(g, h, r, token_bucket)
-    up_register_rows = _select_up_register_rows(g, h, r, token_bucket)
-    # These launch settings apply to every SM103 narrow bucket.
+    down_token_tile = {64: 32, 128: 64, 256: 64}.get(token_bucket, token_bucket)
+    partial_geometry = (
+        second_bucket or split_activation_counter,
+        first_bucket or second_bucket or split_activation_counter,
+    )
+    down_release = "early_arrive" if first_bucket else "native"
+    down_writer_release = (1, stamped_activation, False)
+    omit_down_empty = token_bucket <= 64
+    entry_down_input_ring_first = token_bucket <= 64
+    entry_down_prefill = True
+    evict_down_weights_last = True
+    input_refill_hint = (3, 4) if has_injection and two_token_parts else ()
+
+    async_phase_arrivals = (
+        "both" if first_bucket else "down" if second_bucket else "native"
+    )
+    quant_max_join = (
+        "double"
+        if two_token_parts
+        else "single_active" if third_bucket else "single_full"
+    )
+    quant_warp_handoff = third_bucket
+    quant_copy_warp = 5 if warp_owned_gates else -1
+    quant_down_overlap = "early_scalar" if stamped_activation else "native"
+    quant_down_poll = "acquire_fence" if stamped_activation else "native"
+    quant_activation_store = (
+        "pack_max" if has_injection and token_bucket <= 64 else "native"
+    )
+    activation_handoff = (
+        "row_async_bulk"
+        if stamped_activation
+        else (
+            "row_tags_quant" if warp_owned_gates else "warp" if third_bucket else "grid"
+        )
+    )
+    dedicated_quant_ctas = first_bucket
+    activation_retry_ns = 64 if first_bucket else 0
+
+    up_k = 64 if long_tile else r
+    up_tactic = (up_k, r // up_k)
+    use_cta_reader_handoff = token_bucket <= 128
+    up_register_rows = two_token_parts
+    residual_issue = (
+        "register_before_mma"
+        if stamped_activation
+        else (
+            "down_entry"
+            if long_tile
+            else "handoff" if second_bucket or third_bucket else "up"
+        )
+    )
+    residual_transfer = "tma" if long_tile else "lane"
+    if residual_transfer == "tma" and rows >= 1 << 31:
+        raise ValueError("Residual TMA coordinates must fit signed int32")
+    up_hidden_columns = (
+        2
+        if stamped_activation
+        else 4 if warp_owned_gates or split_activation_counter else 1
+    )
+    up_scale_issue = "up_async" if long_tile else "native"
+    up_gate_exchange = "row_pairs_scalar" if split_activation_counter else "native"
+    up_retirement = (
+        "skip_final_and_tail_join"
+        if warp_owned_gates or split_activation_counter
+        else "skip_final"
+    )
+    up_activation_prefix = (3, True) if split_activation_counter else (0, False)
+    aligned_partial_rows = stamped_activation
+    pad_residual_rows = split_activation_counter
+    paired_up_sigmoid = warp_owned_gates
+    prefetch_up_weights_on_down_retire = split_activation_counter
+    up_activation_transport = (
+        "bulk"
+        if stamped_activation or second_bucket or third_bucket
+        else "packed_tma" if first_bucket else "native"
+    )
+    up_activation_delivery = (
+        "bundle_deferred"
+        if warp_owned_gates
+        else "private_deferred" if second_bucket else "native"
+    )
     omit_up_empty = True
     use_native_warp_max = True
     private_epoch_order = "coherent"
     entry_transport = "deferred"
     minimum_blocks_per_sm = 1
-    entry_down_prefill = True
-    entry_down_input_ring_first = token_bucket <= 64
-    evict_down_weights_last = True
-    residual_issue = _select_residual_issue(g, h, r, p, token_bucket)
-    residual_transfer = _select_residual_transfer(g, h, r, token_bucket)
-    if residual_transfer == "tma" and rows >= 1 << 31:
-        raise ValueError("Residual TMA coordinates must fit signed int32")
-    up_hidden_columns = _select_up_hidden_columns(g, h, r, p, token_bucket)
-    up_scale_issue = _select_up_scale_issue(g, h, r, token_bucket)
-    activation_handoff, dedicated_quant_ctas = _select_stage_handoff(
-        g, h, r, p, token_bucket, async_phase_arrivals
+    kernel_options = dict(
+        g=g,
+        h=h,
+        r=r,
+        p=p,
+        token_bucket=token_bucket,
+        projection_scale=projection_scale,
+        use_pdl=pdl_enabled(),
+        weights_independent=weights_independent,
+        down_per_channel=ds.numel() > 1,
+        up_per_channel=us.numel() > 1,
+        down_tactic=down_tactic,
+        down_token_tile=down_token_tile,
+        up_tactic=up_tactic,
+        use_cta_reader_handoff=use_cta_reader_handoff,
+        static_partial_store=partial_geometry[0],
+        static_partial_stride=partial_geometry[1],
+        quant_max_join=quant_max_join,
+        quant_warp_handoff=quant_warp_handoff,
+        down_release=down_release,
+        down_writer_release=down_writer_release,
+        async_phase_arrivals=async_phase_arrivals,
+        omit_down_empty=omit_down_empty,
+        up_register_rows=up_register_rows,
+        omit_up_empty=omit_up_empty,
+        use_native_warp_max=use_native_warp_max,
+        private_epoch_order=private_epoch_order,
+        entry_transport=entry_transport,
+        minimum_blocks_per_sm=minimum_blocks_per_sm,
+        entry_down_prefill=entry_down_prefill,
+        entry_down_input_ring_first=entry_down_input_ring_first,
+        evict_down_weights_last=evict_down_weights_last,
+        residual_issue=residual_issue,
+        residual_transfer=residual_transfer,
+        pad_residual_rows=pad_residual_rows,
+        up_hidden_columns=up_hidden_columns,
+        up_gate_exchange=up_gate_exchange,
+        warp_owned_gates=warp_owned_gates,
+        quant_copy_warp=quant_copy_warp,
+        paired_up_sigmoid=paired_up_sigmoid,
+        up_scale_issue=up_scale_issue,
+        prefetch_up_weights_on_down_retire=prefetch_up_weights_on_down_retire,
+        up_retirement=up_retirement,
+        activation_handoff=activation_handoff,
+        split_activation_counter=split_activation_counter,
+        dedicated_quant_ctas=dedicated_quant_ctas,
+        quant_down_overlap=quant_down_overlap,
+        quant_down_poll=quant_down_poll,
+        quant_activation_store=quant_activation_store,
+        up_activation_prefix=up_activation_prefix,
+        stamped_activation=stamped_activation,
+        aligned_partial_rows=aligned_partial_rows,
+        up_activation_transport=up_activation_transport,
+        activation_retry_ns=activation_retry_ns,
+        input_refill_hint=input_refill_hint,
+        up_activation_delivery=up_activation_delivery,
     )
-    down_writer_release = _select_down_writer_release(has_injection, token_bucket)
-    up_gate_exchange = _select_up_gate_exchange(has_injection, token_bucket)
-    warp_owned_gates = _select_warp_owned_gates(has_injection, token_bucket)
-    quant_copy_warp = _select_quant_copy_warp(has_injection, token_bucket)
-    up_retirement = _select_up_retirement(g, h, r, token_bucket, has_injection)
-    quant_down_overlap = _select_quant_down_overlap(has_injection, token_bucket)
-    quant_down_poll = _select_quant_down_poll(has_injection, token_bucket)
-    quant_activation_store = _select_quant_activation_store(has_injection, token_bucket)
-    up_activation_prefix = _select_up_activation_prefix(has_injection, token_bucket)
-    stamped_activation = has_injection and token_bucket == 16
-    aligned_partial_rows = _select_aligned_partial_rows(has_injection, token_bucket)
-    pad_residual_rows = has_injection and token_bucket == 64
-    paired_up_sigmoid = has_injection and token_bucket == 32
-    input_refill_hint = _select_down_input_refill_hint(has_injection, token_bucket)
-    split_activation_counter = has_injection and token_bucket == 64
-    prefetch_up_weights_on_down_retire = has_injection and token_bucket == 64
-    up_activation_transport = _select_up_activation_transport(g, h, r, token_bucket)
-    activation_retry_ns = _select_activation_retry_ns(g, h, r, token_bucket)
-    if activation_handoff == "row_tags_quant":
-        up_activation_delivery = "bundle_deferred"
-    elif token_bucket == 32:
-        up_activation_delivery = "private_deferred"
-    else:
-        up_activation_delivery = "native"
-    if up_activation_delivery != "native" or activation_handoff == "row_async_bulk":
-        up_activation_transport = "bulk"
     key = (
         x.device.index,
-        g,
-        h,
-        r,
-        p,
         output_dtype,
-        projection_scale,
-        weights_independent,
-        ds.numel() > 1,
-        us.numel() > 1,
-        pdl_enabled(),
-        down_tactic,
-        down_token_tile,
-        up_tactic,
-        use_cta_reader_handoff,
-        partial_geometry,
-        quant_max_join,
-        quant_warp_handoff,
-        down_release,
-        down_writer_release,
-        async_phase_arrivals,
-        omit_down_empty,
-        up_register_rows,
-        omit_up_empty,
-        use_native_warp_max,
-        private_epoch_order,
-        entry_transport,
-        minimum_blocks_per_sm,
-        entry_down_prefill,
-        entry_down_input_ring_first,
-        evict_down_weights_last,
-        residual_issue,
-        residual_transfer,
-        pad_residual_rows,
-        up_hidden_columns,
-        up_gate_exchange,
-        warp_owned_gates,
-        quant_copy_warp,
-        paired_up_sigmoid,
-        up_scale_issue,
-        prefetch_up_weights_on_down_retire,
-        up_retirement,
-        activation_handoff,
-        split_activation_counter,
-        dedicated_quant_ctas,
-        quant_down_overlap,
-        quant_down_poll,
-        quant_activation_store,
-        up_activation_prefix,
-        stamped_activation,
-        aligned_partial_rows,
-        up_activation_transport,
-        activation_retry_ns,
-        input_refill_hint,
-        up_activation_delivery,
         _EPOCH_PROTOCOL_VERSION,
-        token_bucket,
+        *kernel_options.values(),
     )
     stream_key = key + (int(stream),)
     with _LOCK:
@@ -416,63 +295,7 @@ def _execute(
                 raise RuntimeError(
                     "warm the prequantized FP8 bucket on this stream before capture"
                 )
-            kernel = Fp8FusedGatedResidualKernel(
-                g=g,
-                h=h,
-                r=r,
-                p=p,
-                token_bucket=token_bucket,
-                projection_scale=projection_scale,
-                use_pdl=pdl_enabled(),
-                weights_independent=weights_independent,
-                down_per_channel=ds.numel() > 1,
-                up_per_channel=us.numel() > 1,
-                down_tactic=down_tactic,
-                down_token_tile=down_token_tile,
-                up_tactic=up_tactic,
-                use_cta_reader_handoff=use_cta_reader_handoff,
-                static_partial_store=partial_geometry[0],
-                static_partial_stride=partial_geometry[1],
-                quant_max_join=quant_max_join,
-                quant_warp_handoff=quant_warp_handoff,
-                down_release=down_release,
-                down_writer_release=down_writer_release,
-                async_phase_arrivals=async_phase_arrivals,
-                omit_down_empty=omit_down_empty,
-                up_register_rows=up_register_rows,
-                omit_up_empty=omit_up_empty,
-                use_native_warp_max=use_native_warp_max,
-                private_epoch_order=private_epoch_order,
-                entry_transport=entry_transport,
-                minimum_blocks_per_sm=minimum_blocks_per_sm,
-                entry_down_prefill=entry_down_prefill,
-                entry_down_input_ring_first=entry_down_input_ring_first,
-                evict_down_weights_last=evict_down_weights_last,
-                residual_issue=residual_issue,
-                residual_transfer=residual_transfer,
-                pad_residual_rows=pad_residual_rows,
-                up_hidden_columns=up_hidden_columns,
-                up_gate_exchange=up_gate_exchange,
-                warp_owned_gates=warp_owned_gates,
-                quant_copy_warp=quant_copy_warp,
-                paired_up_sigmoid=paired_up_sigmoid,
-                up_scale_issue=up_scale_issue,
-                prefetch_up_weights_on_down_retire=prefetch_up_weights_on_down_retire,
-                up_retirement=up_retirement,
-                activation_handoff=activation_handoff,
-                split_activation_counter=split_activation_counter,
-                dedicated_quant_ctas=dedicated_quant_ctas,
-                quant_down_overlap=quant_down_overlap,
-                quant_down_poll=quant_down_poll,
-                quant_activation_store=quant_activation_store,
-                up_activation_prefix=up_activation_prefix,
-                stamped_activation=stamped_activation,
-                aligned_partial_rows=aligned_partial_rows,
-                up_activation_transport=up_activation_transport,
-                activation_retry_ns=activation_retry_ns,
-                input_refill_hint=input_refill_hint,
-                up_activation_delivery=up_activation_delivery,
-            )
+            kernel = Fp8FusedGatedResidualKernel(**kernel_options)
             if plan is None:
                 # Compile with one safe cooperative block, then query real capacity.
                 scratch = Workspace(

@@ -47,7 +47,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _make_down_operands,
     _mul_hidden_float_pair,
     _operand_at,
-    _operand_storage,
     _prefetch_branch_residual,
     _reduce_split_partials,
     _release,
@@ -572,22 +571,13 @@ class _DownPhase(Fp8GatedResidualGemm):
         target,
         cache_policy,
     ):
-        if cutlass.const_expr(self.evict_weights_last):
-            cute.copy(
-                atom,
-                source[None, input_tile],
-                target[None, stage],
-                tma_bar_ptr=full + stage,
-                cache_policy=cache_policy,
-            )
-        else:
-            cute_ext.tma_load(
-                gw[None, None, input_tile],
-                sw[None, None, None, stage],
-                (full + stage).value,
-                cta_v_map=map_w,
-                update_expect_tx=False,
-            )
+        cute.copy(
+            atom,
+            source[None, input_tile],
+            target[None, stage],
+            tma_bar_ptr=full + stage,
+            cache_policy=cache_policy,
+        )
 
     @cute.experimental.jit
     def project(
@@ -640,11 +630,10 @@ class _DownPhase(Fp8GatedResidualGemm):
         stage_bytes = (self.m + self.n) * self.k
         if warp == self.producer_warp:
             weight_source, weight_target, cache_policy = None, None, None
-            if cutlass.const_expr(self.evict_weights_last):
-                weight_target, weight_source = self._partition_weight(
-                    weight_atom, weight_coords, sw, output_tile
-                )
-                cache_policy = _down_weight_cache_policy()
+            weight_target, weight_source = self._partition_weight(
+                weight_atom, weight_coords, sw, output_tile
+            )
+            cache_policy = _down_weight_cache_policy()
             if not entry_prefilled:
                 # The enclosing kernel already waited for input and weight producers.
                 # Pair each stage's operands so its MMA can start before later loads.
@@ -861,11 +850,10 @@ class _DownPhase(Fp8GatedResidualGemm):
         stage_bytes = (self.m + self.n) * self.k
         if warp == self.producer_warp:
             weight_source, weight_target, cache_policy = None, None, None
-            if cutlass.const_expr(self.evict_weights_last):
-                weight_target, weight_source = self._partition_weight(
-                    weight_atom, weight_coords, sw, output_tile
-                )
-                cache_policy = _down_weight_cache_policy()
+            weight_target, weight_source = self._partition_weight(
+                weight_atom, weight_coords, sw, output_tile
+            )
+            cache_policy = _down_weight_cache_policy()
             # The enclosing kernel already waited for input and weight producers.
             if cutlass.const_expr(self.entry_input_ring_first):
                 # Fetch the reused input across the resident ring before
@@ -966,8 +954,7 @@ class Fp8FusedGatedResidualKernel:
         if type(entry_down_input_ring_first) is not bool or (
             entry_down_input_ring_first
             and (
-                (g, h, r) != (4, 2560, 320)
-                or token_bucket not in (16, 32, 64)
+                token_bucket not in (16, 32, 64)
                 or not entry_down_prefill
                 or down_tactic[3] != 2
             )
@@ -992,9 +979,7 @@ class Fp8FusedGatedResidualKernel:
         self.up_activation_transport = up_activation_transport
         if activation_retry_ns not in (0, 64, 128, 256):
             raise ValueError("Select an explicit activation retry interval")
-        if activation_retry_ns and (
-            (g, h, r) != (4, 2560, 320) or token_bucket not in (16, 32, 64)
-        ):
+        if activation_retry_ns and token_bucket not in (16, 32, 64):
             raise ValueError(
                 "Activation retry delay requires a narrow 16, 32 or 64 bucket"
             )
@@ -1054,33 +1039,21 @@ class Fp8FusedGatedResidualKernel:
             raise ValueError(
                 "Select terminal Down events and Up row scale storage explicitly"
             )
-        if up_register_rows and (
-            (g, h, r, token_bucket) != (4, 2560, 320, 256)
-            or activation_handoff != "grid"
-        ):
+        if up_register_rows and (token_bucket != 256 or activation_handoff != "grid"):
             raise ValueError("Register row scales require the narrow256 M128 Up reader")
         self.up_register_rows = up_register_rows
-        self.prefill_scales = r == 320 and token_bucket == 16
+        self.prefill_scales = token_bucket == 16
         if up_scale_issue not in ("native", "up_async", "handoff_async"):
             raise ValueError("Select the Up weight scale issue point explicitly")
-        if up_scale_issue != "native" and (g, h, r, token_bucket) != (
-            4,
-            2560,
-            320,
-            128,
-        ):
+        if up_scale_issue != "native" and token_bucket != 128:
             raise ValueError("Async Up weight scales require narrow128")
         self.up_scale_issue = up_scale_issue
-        if up_retirement not in (
-            "native",
-            "skip_final",
-            "skip_final_and_tail_join",
-        ) or (up_retirement != "native" and (g, h, r) != (4, 2560, 320)):
+        if up_retirement not in ("native", "skip_final", "skip_final_and_tail_join"):
             raise ValueError("Final Up retirement uses the narrow persistent tile loop")
         if up_retirement == "skip_final_and_tail_join" and (
-            (g, h, r, p) != (4, 2560, 320, 324)
+            p != r + g
             or token_bucket not in (16, 32, 64)
-            or not use_cta_reader_handoff
+            or (not use_cta_reader_handoff)
         ):
             raise ValueError(
                 "Independent warp exit requires the local narrow TMEM handoff"
@@ -1089,17 +1062,13 @@ class Fp8FusedGatedResidualKernel:
         self.final_cta_join = up_retirement != "skip_final_and_tail_join"
         self.async_up_scales = up_scale_issue != "native" and up_per_channel
         # Two reader groups cover the small narrow tiles without idle warps.
-        self.compute_threads = 256 if r == 320 and token_bucket <= 32 else 512
+        self.compute_threads = 256 if token_bucket <= 32 else 512
         self.reader_groups = self.compute_threads // 128
         self.producer_warp = self.compute_threads // 32
         self.mma_warp = self.producer_warp + 1
         self.threads = self.compute_threads + 64
         # Independent row groups avoid serial quantization passes in large buckets.
-        self.quant_rows = (
-            (4 if token_bucket == 256 else 2 if token_bucket == 128 else 1)
-            if r == 320
-            else (2 if token_bucket == 256 else 1)
-        )
+        self.quant_rows = 4 if token_bucket == 256 else 2 if token_bucket == 128 else 1
         self.quant_threads = self.compute_threads // self.quant_rows
         self.quant_columns = max(
             2,
@@ -1115,17 +1084,14 @@ class Fp8FusedGatedResidualKernel:
         ):
             raise ValueError("Select the FP8 activation write policy explicitly")
         if quant_activation_store != "native" and (
-            (g, h, r, p) != (4, 2560, 320, 324)
-            or token_bucket not in (16, 32, 64)
-            or self.quant_columns != 2
+            p != r + g or token_bucket not in (16, 32, 64) or self.quant_columns != 2
         ):
             raise ValueError("The two-column FP8 store requires a small narrow bucket")
         self.quant_activation_store = quant_activation_store
         if quant_max_join not in ("double", "single_full", "single_active"):
             raise ValueError("Select the quantization maximum handoff explicitly")
         if quant_max_join != "double" and (
-            (g, h, r) != (4, 2560, 320)
-            or token_bucket > 128
+            token_bucket > 128
             or r % (32 * self.quant_columns)
             or r // self.quant_columns > self.quant_threads
         ):
@@ -1141,21 +1107,23 @@ class Fp8FusedGatedResidualKernel:
         if type(quant_warp_handoff) is not bool:
             raise TypeError("Select the quantization handoff explicitly")
         if quant_warp_handoff and (
-            (g, h, r, token_bucket) != (4, 2560, 320, 64)
+            token_bucket != 64
             or quant_max_join != "single_active"
             or activation_handoff != "warp"
-            or residual_issue
-            not in ("handoff", "register_before_mma", "register_after_mma")
+            or (
+                residual_issue
+                not in ("handoff", "register_before_mma", "register_after_mma")
+            )
         ):
             raise ValueError("Warp-local quantization requires the narrow64 handoff")
         self.quant_warp_handoff = quant_warp_handoff
         # The warp after the FP8 writers handles the injection columns.
         self.quant_handoff_threads = self.quant_max_threads + 32
-        self.up_hidden = 64 if r == 1024 else 32
+        self.up_hidden = 32
         self.up_channels = self.up_hidden * g
         self.up_parts = 2 if token_bucket == 256 else 1
         # Small narrow tiles avoid padding tokens to the native M128 reader.
-        self.token_major_up = r == 1024 or token_bucket == 256
+        self.token_major_up = token_bucket == 256
         self.up_rows = (
             min(128, max(64, token_bucket)) if self.token_major_up else token_bucket
         )
@@ -1169,22 +1137,20 @@ class Fp8FusedGatedResidualKernel:
         self.reader_columns = self.up_hidden // self.reader_groups
         self.up_k, self.up_stages = up_tactic
         if up_activation_transport != "native" and (
-            (g, h, r) != (4, 2560, 320)
-            or token_bucket not in (16, 32, 64)
+            token_bucket not in (16, 32, 64)
             or self.token_major_up
             or self.up_parts != 1
-            or self.up_stages != 1
-            or self.up_k != r
+            or (self.up_stages != 1)
+            or (self.up_k != r)
         ):
             raise ValueError("Packed activation requires one resident narrow Up tile")
-        if self.up_k not in (64, 128, 320) or r % self.up_k:
+        if self.up_k not in (64, r) or r % self.up_k:
             raise ValueError("Up K tiles must evenly cover the reduction")
         self.up_tiles = r // self.up_k
         if not 1 <= self.up_stages <= self.up_tiles:
             raise ValueError("Up stages must fit the reduction")
         if type(omit_up_empty) is not bool or (
-            omit_up_empty
-            and ((g, h, r) != (4, 2560, 320) or self.up_tiles != self.up_stages)
+            omit_up_empty and self.up_tiles != self.up_stages
         ):
             raise ValueError(
                 "Omitting Up empty events requires a resident narrow reduction"
@@ -1194,7 +1160,7 @@ class Fp8FusedGatedResidualKernel:
         self.up_tail_tiles = (
             self.up_stages if self.up_parts == 2 and self.up_tiles > 1 else 0
         )
-        self.early_up_weights = r == 320
+        self.early_up_weights = True
         if residual_issue not in (
             "up",
             "handoff",
@@ -1216,8 +1182,7 @@ class Fp8FusedGatedResidualKernel:
             "register_after_mma",
         )
         if self.residual_in_registers and (
-            (g, h, r) != (4, 2560, 320)
-            or token_bucket not in (16, 32, 64)
+            token_bucket not in (16, 32, 64)
             or p != r + g
             or residual_transfer != "lane"
         ):
@@ -1227,18 +1192,17 @@ class Fp8FusedGatedResidualKernel:
         if residual_transfer not in ("lane", "aligned_lane", "tma"):
             raise ValueError("Select the residual transfer explicitly")
         if residual_transfer != "lane" and (
-            (g, h, r, token_bucket) != (4, 2560, 320, 128)
-            or residual_issue == "activation"
+            token_bucket != 128 or residual_issue == "activation"
         ):
             raise ValueError("Aligned or TMA residual transfer requires narrow128")
         self.residual_tma = residual_transfer == "tma"
         if type(pad_residual_rows) is not bool or (
             pad_residual_rows
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 64)
+                (p != r + g or token_bucket != 64)
                 or residual_issue != "handoff"
                 or residual_transfer != "lane"
-                or up_hidden_columns != 4
+                or (up_hidden_columns != 4)
             )
         ):
             raise ValueError(
@@ -1250,12 +1214,10 @@ class Fp8FusedGatedResidualKernel:
             raise ValueError("Select the contiguous Up output width explicitly")
         self.vector_hidden_up = up_hidden_columns > 1
         if self.vector_hidden_up and (
-            (g, h, r, p) != (4, 2560, 320, 324)
+            p != r + g
             or (
-                (
-                    token_bucket == 16
-                    and (up_hidden_columns != 2 or not self.residual_in_registers)
-                )
+                token_bucket == 16
+                and (up_hidden_columns != 2 or not self.residual_in_registers)
                 or (
                     token_bucket in (32, 64)
                     and (up_hidden_columns != 4 or self.residual_in_registers)
@@ -1274,10 +1236,10 @@ class Fp8FusedGatedResidualKernel:
         ) or (
             up_gate_exchange != "native"
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 64)
+                (p != r + g or token_bucket != 64)
                 or self.up_rows != 64
                 or self.up_channels != 128
-                or not self.vector_hidden_up
+                or (not self.vector_hidden_up)
             )
         ):
             raise ValueError(
@@ -1287,26 +1249,26 @@ class Fp8FusedGatedResidualKernel:
         if type(warp_owned_gates) is not bool or (
             warp_owned_gates
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 32)
+                (p != r + g or token_bucket != 32)
                 or self.up_hidden_columns != 4
                 or self.hidden_reader_columns != 16
-                or self.up_stages != 1
-                or self.up_k != r
-                or residual_issue != "handoff"
-                or not self.use_cta_reader_handoff
+                or (self.up_stages != 1)
+                or (self.up_k != r)
+                or (residual_issue != "handoff")
+                or (not self.use_cta_reader_handoff)
             )
         ):
             raise ValueError("Warp-owned mixing requires the resident narrow32 Up plan")
         if quant_copy_warp not in (-1, 5) or (
             quant_copy_warp >= 0
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 32)
+                (p != r + g or token_bucket != 32)
                 or residual_issue != "handoff"
                 or residual_transfer != "lane"
-                or activation_handoff != "row_tags_quant"
-                or self.quant_rows != 1
-                or 32 * quant_copy_warp * self.quant_columns < r
-                or 32 * quant_copy_warp >= self.compute_threads
+                or (activation_handoff != "row_tags_quant")
+                or (self.quant_rows != 1)
+                or (32 * quant_copy_warp * self.quant_columns < r)
+                or (32 * quant_copy_warp >= self.compute_threads)
             )
         ):
             raise ValueError("A residual copy warp requires the narrow32 row-tag plan")
@@ -1317,10 +1279,7 @@ class Fp8FusedGatedResidualKernel:
             self.residual_row_stride = 144
         if type(paired_up_sigmoid) is not bool or (
             paired_up_sigmoid
-            and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 32)
-                or up_hidden_columns != 4
-            )
+            and ((p != r + g or token_bucket != 32) or up_hidden_columns != 4)
         ):
             raise ValueError(
                 "Paired sigmoid requires the four-column narrow 32-token plan"
@@ -1361,11 +1320,11 @@ class Fp8FusedGatedResidualKernel:
         if type(split_activation_counter) is not bool or (
             split_activation_counter
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 64)
+                (p != r + g or token_bucket != 64)
                 or activation_handoff != "warp"
                 or up_activation_delivery != "native"
                 or dedicated_quant_ctas
-                or async_phase_arrivals != "native"
+                or (async_phase_arrivals != "native")
             )
         ):
             raise ValueError(
@@ -1406,22 +1365,22 @@ class Fp8FusedGatedResidualKernel:
             raise ValueError("Dedicated quantization CTAs require the early-Up handoff")
         if self.activation_row_gate:
             narrow16 = (
-                (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 16)
+                (p == r + g and token_bucket == 16)
                 and self.activation_row_tags
                 and dedicated_quant_ctas
-                and up_activation_delivery == "native"
-                and up_activation_transport == "bulk"
-                and async_phase_arrivals == "both"
-                and self.up_stages == 1
-                and self.up_tiles == 1
+                and (up_activation_delivery == "native")
+                and (up_activation_transport == "bulk")
+                and (async_phase_arrivals == "both")
+                and (self.up_stages == 1)
+                and (self.up_tiles == 1)
             )
             narrow32 = (
-                (g, h, r, p, token_bucket) == (4, 2560, 320, 324, 32)
+                (p == r + g and token_bucket == 32)
                 and self.quant_only_down_acquire
-                and not dedicated_quant_ctas
-                and up_activation_delivery in ("private_deferred", "bundle_deferred")
-                and up_activation_transport == "bulk"
-                and async_phase_arrivals == "down"
+                and (not dedicated_quant_ctas)
+                and (up_activation_delivery in ("private_deferred", "bundle_deferred"))
+                and (up_activation_transport == "bulk")
+                and (async_phase_arrivals == "down")
             )
             if not (narrow16 or narrow32):
                 raise ValueError(
@@ -1431,15 +1390,12 @@ class Fp8FusedGatedResidualKernel:
         if down_release not in ("native", "early_arrive"):
             raise ValueError("Select the Down release point explicitly")
         if down_release == "early_arrive" and (
-            (g, h, r) != (4, 2560, 320)
-            or token_bucket > 128
-            or not use_cta_reader_handoff
+            token_bucket > 128 or not use_cta_reader_handoff
         ):
             raise ValueError("Early Down release requires the narrow CTA reader join")
         self.down_release = down_release
         if async_phase_arrivals not in ("native", "down", "activation", "both") or (
-            async_phase_arrivals != "native"
-            and ((g, h, r) != (4, 2560, 320) or token_bucket not in (16, 32, 64))
+            async_phase_arrivals != "native" and token_bucket not in (16, 32, 64)
         ):
             raise ValueError("Async release is scoped to small narrow startup buckets")
         self.async_down_arrival = async_phase_arrivals in ("down", "both")
@@ -1463,9 +1419,10 @@ class Fp8FusedGatedResidualKernel:
             + int(self.residual_tma)
         )
         self.down_m, self.splits, down_k, down_stages = down_tactic
-        if down_token_tile != token_bucket and (
-            (g, h, r) != (4, 2560, 320)
-            or (token_bucket, down_token_tile) not in ((64, 32), (128, 64), (256, 64))
+        if down_token_tile != token_bucket and (token_bucket, down_token_tile) not in (
+            (64, 32),
+            (128, 64),
+            (256, 64),
         ):
             raise ValueError("Unsupported Down token tile")
         self.down_token_parts = token_bucket // down_token_tile
@@ -1480,13 +1437,13 @@ class Fp8FusedGatedResidualKernel:
         if group_count not in (1, 2) or (separate_row_halves and group_count != 2):
             raise ValueError("Invalid Down writer release groups")
         if down_writer_release != (1, False, False) and (
-            (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 16)
+            (p != r + g or token_bucket != 16)
             or down_token_tile != token_bucket
             or down_epilogue_threads != 256
-            or not dedicated_quant_ctas
-            or not self.activation_row_tags
-            or not self.async_down_arrival
-            or down_release != "early_arrive"
+            or (not dedicated_quant_ctas)
+            or (not self.activation_row_tags)
+            or (not self.async_down_arrival)
+            or (down_release != "early_arrive")
         ):
             raise ValueError(
                 "Down writer release groups require the narrow16 reader groups"
@@ -1500,7 +1457,7 @@ class Fp8FusedGatedResidualKernel:
         if type(aligned_partial_rows) is not bool or (
             aligned_partial_rows
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 16)
+                (p != r + g or token_bucket != 16)
                 or (self.down_m, self.splits, down_token_tile) != (64, 20, 16)
             )
         ):
@@ -1509,7 +1466,7 @@ class Fp8FusedGatedResidualKernel:
         if input_refill_hint not in ((), (3,), (4,), (3, 4)):
             raise ValueError("Invalid Down input refill hint")
         if input_refill_hint and (
-            (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 256)
+            (p != r + g or token_bucket != 256)
             or (down_k, down_stages, down_token_tile) != (512, 3, 64)
         ):
             raise ValueError("Down input refill hints require the narrow256 Down ring")
@@ -1558,7 +1515,7 @@ class Fp8FusedGatedResidualKernel:
         ):
             raise ValueError("Select the quantization Down overlap explicitly")
         if quant_down_overlap != "native" and (
-            (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 16)
+            (p != r + g or token_bucket != 16)
             or activation_handoff != "row_async_bulk"
             or self.quant_columns != 2
         ):
@@ -1587,7 +1544,7 @@ class Fp8FusedGatedResidualKernel:
         if type(prefetch_up_weights_on_down_retire) is not bool or (
             prefetch_up_weights_on_down_retire
             and (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 64)
+                (p != r + g or token_bucket != 64)
                 or not self.early_up_weights
                 or self.up_stages != 1
             )
@@ -1609,14 +1566,13 @@ class Fp8FusedGatedResidualKernel:
         ):
             raise ValueError("Select a supported Up activation split")
         if prefix_planes != 0 and (
-            (g, h, r, p) != (4, 2560, 320, 324)
+            p != r + g
             or token_bucket not in (16, 64)
-            or (self.up_k, self.up_tiles, self.up_stages, self.up_parts)
-            != (320, 1, 1, 1)
+            or (self.up_k, self.up_tiles, self.up_stages, self.up_parts) != (r, 1, 1, 1)
             or self.token_major_up
             or self.residual_tma
-            or up_activation_delivery != "native"
-            or up_activation_transport != "bulk"
+            or (up_activation_delivery != "native")
+            or (up_activation_transport != "bulk")
         ):
             raise ValueError(
                 "The activation split requires the local resident narrow K320 layout"
@@ -1639,19 +1595,19 @@ class Fp8FusedGatedResidualKernel:
         self.up_full_arrivals = 1
         if stamped_activation:
             if (
-                (g, h, r, p, token_bucket) != (4, 2560, 320, 324, 16)
+                (p != r + g or token_bucket != 16)
                 or up_activation_transport != "bulk"
                 or activation_handoff != "row_async_bulk"
-                or self.up_rows != self.n
-                or self.up_k != self.r
-                or self.up_tiles != 1
-                or self.up_parts != 1
+                or (self.up_rows != self.n)
+                or (self.up_k != self.r)
+                or (self.up_tiles != 1)
+                or (self.up_parts != 1)
                 or self.token_major_up
-                or up_activation_delivery != "native"
+                or (up_activation_delivery != "native")
                 or prefix_planes
-                or quant_activation_store not in ("pack", "pack_sat", "pack_max")
-                or not self.quant_early_scales
-                or quant_max_join != "single_full"
+                or (quant_activation_store not in ("pack", "pack_sat", "pack_max"))
+                or (not self.quant_early_scales)
+                or (quant_max_join != "single_full")
             ):
                 raise ValueError(
                     "Stamped activation requires the narrow 16-token packed plan"
@@ -1713,8 +1669,7 @@ class Fp8FusedGatedResidualKernel:
         stream: CUstream,
     ):
         weight_atom, weight_coords = None, None
-        if cutlass.const_expr(self.evict_down_weights_last):
-            weight_atom, weight_coords = self.down.make_weight_atom(down)
+        weight_atom, weight_coords = self.down.make_weight_atom(down)
         residual_atom, residual_coords = None, None
         if cutlass.const_expr(self.residual_tma):
             residual_source = cute.make_tensor(
@@ -1848,10 +1803,6 @@ class Fp8FusedGatedResidualKernel:
             down_actor = pid < self.down_tasks
             if ctas > self.down_tasks:
                 down_arrivals = cutlass.Int64(self.down_tasks)
-            if cutlass.const_expr(
-                self.down_publish_groups > 1 and not self.down_publish_row_halves
-            ):
-                down_arrivals = down_arrivals * self.down_publish_groups
             mma_workers = max(self.down_tasks, self.up_tasks)
             allocate_tmem = pid < mma_workers
             if ctas > mma_workers:
@@ -1872,8 +1823,6 @@ class Fp8FusedGatedResidualKernel:
         elif cutlass.const_expr(self.copied_alpha):
             activation_counter = epochs.iterator
         second_down_counter = None
-        if cutlass.const_expr(self.down_publish_row_halves):
-            second_down_counter = activation_counter + self.n
         arena = cute_ext.allocate(
             cutlass.Uint8,
             cute.AddressSpace.smem,
@@ -1905,45 +1854,35 @@ class Fp8FusedGatedResidualKernel:
             prepared_residual = self._residual_tile()
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(self.entry_down_prefill):
-            if pid < self.down_tasks:
-                # Keep the original two joins; overlap actual first-ring TMA
-                # with TMEM allocation and the deferred private epoch copy.
-                output_tile = pid // self.splits
-                input_tile = cutlass.Int64(0)
-                if cutlass.const_expr(self.down_token_parts > 1):
-                    input_tile = cutlass.Int64(output_tile // self.down_tiles)
-                    output_tile = output_tile % self.down_tiles
-                self.down.prepare_entry(
-                    x,
-                    down,
-                    arena,
-                    bars.iterator,
-                    output_tile,
-                    pid % self.splits,
-                    input_tile,
-                    weight_atom,
-                    weight_coords,
-                )
+        if pid < self.down_tasks:
+            # Keep the original two joins; overlap actual first-ring TMA
+            # with TMEM allocation and the deferred private epoch copy.
+            output_tile = pid // self.splits
+            input_tile = cutlass.Int64(0)
+            if cutlass.const_expr(self.down_token_parts > 1):
+                input_tile = cutlass.Int64(output_tile // self.down_tiles)
+                output_tile = output_tile % self.down_tiles
+            self.down.prepare_entry(
+                x,
+                down,
+                arena,
+                bars.iterator,
+                output_tile,
+                pid % self.splits,
+                input_tile,
+                weight_atom,
+                weight_coords,
+            )
         if tid == 0:
             # This slot has one writer per call and is private to this stream.
             # Stream completion or the PDL wait above orders the previous call.
-            if cutlass.const_expr(self.entry_transport == "deferred"):
-                _copy_entry_epoch(
-                    epoch.iterator, epochs.iterator + cutlass.Int64(pid) + 1
-                )
-                _commit_residual()
-            elif cutlass.const_expr(self.private_epoch_order in ("load", "coherent")):
-                epoch[0] = _load_private_epoch(epochs.iterator + cutlass.Int64(pid) + 1)
-            else:
-                epoch[0] = _acquire(epochs.iterator + cutlass.Int64(pid) + 1)
+            _copy_entry_epoch(epoch.iterator, epochs.iterator + cutlass.Int64(pid) + 1)
+            _commit_residual()
         if allocate_tmem and warp == self.mma_warp:
             cute.arch.alloc_tmem(self.columns, base.iterator, is_two_cta=False)
             cute.arch.relinquish_tmem_alloc_permit()
         cute.arch.sync_threads()
         phase_base = cutlass.Int64(0)
-        if cutlass.const_expr(self.entry_transport == "native"):
-            phase_base = epoch[0]
         token_round = cutlass.Int64(0)
         global_base = cutlass.Int64(0)
         while global_base < x.shape[0]:
@@ -1966,8 +1905,7 @@ class Fp8FusedGatedResidualKernel:
             task = cutlass.Int32(pid)
             while task < self.down_tasks:
                 entry_prefilled = cutlass.Boolean(False)
-                if cutlass.const_expr(self.entry_down_prefill):
-                    entry_prefilled = (global_base == 0) & (task == cutlass.Int32(pid))
+                entry_prefilled = (global_base == 0) & (task == cutlass.Int32(pid))
                 output_tile = task // self.splits
                 input_tile = token_round
                 if cutlass.const_expr(self.down_token_parts > 1):
@@ -2010,135 +1948,117 @@ class Fp8FusedGatedResidualKernel:
                     self.down_release == "early_arrive"
                     and not self.down_publish_before_join
                 ):
-                    if cutlass.const_expr(self.down_publish_groups == 1):
-                        if tid == 0 and task + cutlass.Int32(ctas) >= self.down_tasks:
-                            # The last Down task's partial stores precede the reader join.
-                            _arrive_phase_release(
-                                epochs.iterator, self.async_down_arrival
-                            )
-                    elif task + cutlass.Int32(ctas) >= self.down_tasks:
-                        self._publish_down_readers(
-                            tid, epochs.iterator, second_down_counter
-                        )
+                    if tid == 0 and task + cutlass.Int32(ctas) >= self.down_tasks:
+                        # The last Down task's partial stores precede the reader join.
+                        _arrive_phase_release(epochs.iterator, self.async_down_arrival)
                 if warp == self.mma_warp:
                     _invalidate(bars.iterator, self.down_barrier_count)
                 cute.arch.sync_threads()
                 task = task + cutlass.Int32(ctas)
-            if cutlass.const_expr(self.early_up_weights):
-                # The ordinal is not used by Down. Complete its initial copy
-                # before this existing CTA join, then read it exactly once.
-                if cutlass.const_expr(self.entry_transport == "deferred"):
-                    if global_base == 0 and tid == 0:
-                        _wait_residual()
-                # Publish Down before reusing its operand arena for Up weights.
-                cute.arch.sync_threads()
-                if cutlass.const_expr(self.entry_transport == "deferred"):
-                    if global_base == 0:
-                        phase_base = epoch[0]
-                if tid == 0 and down_actor:
-                    if cutlass.const_expr(self.down_release == "early_arrive"):
-                        # CTAs with no Down task still participate in the full-grid protocol.
-                        if pid >= self.down_tasks:
-                            _arrive_phase_release(
-                                epochs.iterator, self.async_down_arrival
+            # The ordinal is not used by Down. Complete its initial copy
+            # before this existing CTA join, then read it exactly once.
+            if global_base == 0 and tid == 0:
+                _wait_residual()
+            # Publish Down before reusing its operand arena for Up weights.
+            cute.arch.sync_threads()
+            if global_base == 0:
+                phase_base = epoch[0]
+            if tid == 0 and down_actor:
+                if cutlass.const_expr(self.down_release == "early_arrive"):
+                    # CTAs with no Down task still participate in the full-grid protocol.
+                    if pid >= self.down_tasks:
+                        _arrive_phase_release(epochs.iterator, self.async_down_arrival)
+                else:
+                    _arrive_phase_release(epochs.iterator, self.async_down_arrival)
+            if pid < self.up_tasks:
+                self._prefetch_up_weights(
+                    up,
+                    us,
+                    cached_scales,
+                    arena,
+                    bars.iterator,
+                    pid,
+                    up_weight_map,
+                )
+                if cutlass.const_expr(self.residual_issue == "handoff"):
+                    if cutlass.const_expr(self.residual_tma):
+                        if warp == self.producer_warp:
+                            self._issue_residual_tma(
+                                residual_atom,
+                                residual_coords,
+                                prepared_residual,
+                                bars.iterator + self.up_barrier_count - 1,
+                                pid,
+                                global_base,
+                            )
+                    elif cutlass.const_expr(self.quant_warp_handoff):
+                        if self.quant_handoff_threads <= tid < self.compute_threads:
+                            self._issue_residual_copy(
+                                x,
+                                prepared_residual,
+                                pid,
+                                global_base,
+                                self.quant_handoff_threads,
+                                self.compute_threads - self.quant_handoff_threads,
+                            )
+                    elif cutlass.const_expr(self.quant_copy_warp >= 0):
+                        # The copy warp finishes its group before the Up reader-input join.
+                        first_copy_thread = self.quant_copy_warp * 32
+                        if first_quant_group < self.quant_groups:
+                            if first_copy_thread <= tid < first_copy_thread + 32:
+                                self._issue_residual_copy(
+                                    x,
+                                    prepared_residual,
+                                    pid,
+                                    global_base,
+                                    first_copy_thread,
+                                    32,
+                                )
+                        elif tid < self.compute_threads:
+                            self._issue_residual_copy(
+                                x,
+                                prepared_residual,
+                                pid,
+                                global_base,
+                                0,
+                                self.compute_threads,
                             )
                     else:
-                        _arrive_phase_release(epochs.iterator, self.async_down_arrival)
-                if pid < self.up_tasks:
-                    self._prefetch_up_weights(
-                        up,
-                        us,
-                        cached_scales,
-                        arena,
-                        bars.iterator,
-                        pid,
-                        up_weight_map,
-                    )
-                    if cutlass.const_expr(self.residual_issue == "handoff"):
-                        if cutlass.const_expr(self.residual_tma):
-                            if warp == self.producer_warp:
-                                self._issue_residual_tma(
-                                    residual_atom,
-                                    residual_coords,
-                                    prepared_residual,
-                                    bars.iterator + self.up_barrier_count - 1,
-                                    pid,
-                                    global_base,
-                                )
-                        elif cutlass.const_expr(self.quant_warp_handoff):
-                            if self.quant_handoff_threads <= tid < self.compute_threads:
-                                self._issue_residual_copy(
-                                    x,
-                                    prepared_residual,
-                                    pid,
-                                    global_base,
-                                    self.quant_handoff_threads,
-                                    self.compute_threads - self.quant_handoff_threads,
-                                )
-                        elif cutlass.const_expr(self.quant_copy_warp >= 0):
-                            # The copy warp finishes its group before the Up reader-input join.
-                            first_copy_thread = self.quant_copy_warp * 32
-                            if first_quant_group < self.quant_groups:
-                                if first_copy_thread <= tid < first_copy_thread + 32:
-                                    self._issue_residual_copy(
-                                        x,
-                                        prepared_residual,
-                                        pid,
-                                        global_base,
-                                        first_copy_thread,
-                                        32,
-                                    )
-                            elif tid < self.compute_threads:
-                                self._issue_residual_copy(
-                                    x,
-                                    prepared_residual,
-                                    pid,
-                                    global_base,
-                                    0,
-                                    self.compute_threads,
-                                )
-                        else:
-                            if tid < self.compute_threads:
-                                self._issue_residual_copy(
-                                    x,
-                                    prepared_residual,
-                                    pid,
-                                    global_base,
-                                    0,
-                                    self.compute_threads,
-                                )
-                if cutlass.const_expr(self.quant_warp_handoff):
-                    if (
-                        first_quant_group < self.quant_groups
-                        and tid < self.quant_handoff_threads
-                    ):
-                        if tid == 0:
-                            _wait_activation(
-                                epochs.iterator, (2 * phase_base + 1) * ctas
+                        if tid < self.compute_threads:
+                            self._issue_residual_copy(
+                                x,
+                                prepared_residual,
+                                pid,
+                                global_base,
+                                0,
+                                self.compute_threads,
                             )
-                        _epilogue_barrier(self.quant_handoff_threads, cutlass.Int32(14))
-                else:
-                    wait_down = cutlass.Boolean(True)
-                    if cutlass.const_expr(
-                        self.quant_only_down_acquire
-                        or self.quant_down_overlap == "quant_cta"
-                    ):
-                        wait_down = first_quant_group < self.quant_groups
-                    if cutlass.const_expr(self.quant_warp_down):
-                        wait_down = cutlass.Boolean(False)
-                    if tid == 0 and wait_down:
-                        down_target = (phase_base + 1) * ctas
-                        if cutlass.const_expr(self.dedicated_quant_ctas):
-                            down_target = phase_base + down_arrivals
-                        elif cutlass.const_expr(self.activation_handoff == "warp"):
-                            down_target = (2 * phase_base + 1) * ctas
-                        while _acquire(epochs.iterator) < down_target:
-                            pass
-                    cute.arch.sync_threads()
+            if cutlass.const_expr(self.quant_warp_handoff):
+                if (
+                    first_quant_group < self.quant_groups
+                    and tid < self.quant_handoff_threads
+                ):
+                    if tid == 0:
+                        _wait_activation(epochs.iterator, (2 * phase_base + 1) * ctas)
+                    _epilogue_barrier(self.quant_handoff_threads, cutlass.Int32(14))
             else:
-                _grid_barrier(
-                    epochs, (phase_base + 1) * ctas, True, self.async_down_arrival
-                )
+                wait_down = cutlass.Boolean(True)
+                if cutlass.const_expr(
+                    self.quant_only_down_acquire
+                    or self.quant_down_overlap == "quant_cta"
+                ):
+                    wait_down = first_quant_group < self.quant_groups
+                if cutlass.const_expr(self.quant_warp_down):
+                    wait_down = cutlass.Boolean(False)
+                if tid == 0 and wait_down:
+                    down_target = (phase_base + 1) * ctas
+                    if cutlass.const_expr(self.dedicated_quant_ctas):
+                        down_target = phase_base + down_arrivals
+                    elif cutlass.const_expr(self.activation_handoff == "warp"):
+                        down_target = (2 * phase_base + 1) * ctas
+                    while _acquire(epochs.iterator) < down_target:
+                        pass
+                cute.arch.sync_threads()
             activation_target = cutlass.Int64(0)
             tag_increment = cutlass.Int64(0)
             if cutlass.const_expr(self.activation_row_gate):
@@ -2159,9 +2079,6 @@ class Fp8FusedGatedResidualKernel:
                     row = cutlass.Int64(self.n)
             while row < self.n:
                 down_counter = epochs.iterator
-                if cutlass.const_expr(self.down_publish_row_halves):
-                    if row >= self.n // 2:
-                        down_counter = second_down_counter
                 self._epilogue(
                     partials,
                     xs,
@@ -2183,11 +2100,6 @@ class Fp8FusedGatedResidualKernel:
             if cutlass.const_expr(self.quant_warp_handoff):
                 # The quantization and copy warps reunite before Up consumes the arena.
                 cute.arch.sync_threads()
-            if cutlass.const_expr(self.residual_issue == "activation"):
-                if pid < self.up_tasks and tid < self.compute_threads:
-                    self._issue_residual_copy(
-                        x, prepared_residual, pid, global_base, 0, self.compute_threads
-                    )
             if cutlass.const_expr(self.activation_handoff == "grid"):
                 _publish_activation_proxy()
                 activation_target = (phase_base + 2) * ctas
@@ -2218,13 +2130,11 @@ class Fp8FusedGatedResidualKernel:
             task = cutlass.Int32(pid)
             while task < self.up_tasks:
                 weights_prepared = cutlass.Boolean(False)
-                if cutlass.const_expr(self.early_up_weights):
-                    weights_prepared = task == cutlass.Int32(pid)
+                weights_prepared = task == cutlass.Int32(pid)
                 terminal_up_task = cutlass.Boolean(False)
-                if cutlass.const_expr(self.up_skip_final):
-                    terminal_up_task = (task + cutlass.Int32(ctas) >= self.up_tasks) & (
-                        global_base + self.n >= x.shape[0]
-                    )
+                terminal_up_task = (task + cutlass.Int32(ctas) >= self.up_tasks) & (
+                    global_base + self.n >= x.shape[0]
+                )
                 self._up(
                     activation,
                     alpha,
@@ -2250,9 +2160,8 @@ class Fp8FusedGatedResidualKernel:
                     up_weight_map,
                 )
                 reuse_barriers = cutlass.Boolean(True)
-                if cutlass.const_expr(self.up_skip_final):
-                    # Keep retirement only when the CTA will reuse these addresses.
-                    reuse_barriers = not terminal_up_task
+                # Keep retirement only when the CTA will reuse these addresses.
+                reuse_barriers = not terminal_up_task
                 if reuse_barriers:
                     cute.arch.sync_threads()
                     if warp == self.mma_warp:
@@ -2285,14 +2194,9 @@ class Fp8FusedGatedResidualKernel:
             else:
                 phase_base = phase_base + 1
             if tid == 0:
-                if cutlass.const_expr(
-                    self.private_epoch_order in ("store", "coherent")
-                ):
-                    _store_private_epoch(
-                        epochs.iterator + cutlass.Int64(pid) + 1, phase_base
-                    )
-                else:
-                    _release(epochs.iterator + cutlass.Int64(pid) + 1, phase_base)
+                _store_private_epoch(
+                    epochs.iterator + cutlass.Int64(pid) + 1, phase_base
+                )
             # Only another token round needs a global handoff before reuse.
             # Stream completion or the successor's PDL wait orders a new call.
             if cutlass.const_expr(self.activation_row_gate):
@@ -2315,11 +2219,6 @@ class Fp8FusedGatedResidualKernel:
                             # An idle CTA cannot contribute to reuse before
                             # the previous Down count is complete.
                             _wait_activation(epochs.iterator, down_target)
-                    if cutlass.const_expr(self.down_publish_row_halves):
-                        if pid == 0 and tid == 0:
-                            # Up consumed both row halves, so this counter has
-                            # all Down arrivals before advancing its ordinal.
-                            _arrive_activation_row(second_down_counter, ctas)
                     _grid_barrier(epochs, reuse_target, True, False)
             elif cutlass.const_expr(self.dedicated_quant_ctas):
                 if more_rounds:
@@ -2369,9 +2268,6 @@ class Fp8FusedGatedResidualKernel:
                 )
             if tid % threads == 0:
                 counter = root
-                if cutlass.const_expr(self.down_publish_row_halves):
-                    if group == 1:
-                        counter = second
                 _arrive_phase_release(counter, self.async_down_arrival)
 
     @cute.experimental.jit
@@ -2416,12 +2312,9 @@ class Fp8FusedGatedResidualKernel:
 
     @cute.experimental.jit
     def _warp_maximum(self, value):
-        if cutlass.const_expr(self.use_native_warp_max):
-            return cute.arch.warp_redux_sync(
-                value, "fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
-            )
-        else:
-            return cute.arch.warp_reduction_max(value, threads_in_group=32)
+        return cute.arch.warp_redux_sync(
+            value, "fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
+        )
 
     @cute.experimental.jit
     def _publish_warp_maximum(self, rounded, shared, group, local_tid):
@@ -2446,22 +2339,6 @@ class Fp8FusedGatedResidualKernel:
         input_scale = _x_scale(xs, row)
         pair = cute.make_rmem_tensor(2, cutlass.Float32)
         vector = cutlass.Boolean(False)
-        if cutlass.const_expr(
-            self.down_per_channel and self.quant_down_overlap == "early_vector"
-        ):
-            pointer = ds.iterator + col
-            vector = (pointer.toint() & 7) == 0
-            if vector:
-                bits = llvm.inline_asm(
-                    llvm.StructType.get_literal([T.f32(), T.f32()]),
-                    [pointer.toint().ir_value()],
-                    "ld.global.cg.v2.f32 {$0,$1}, [$2];",
-                    "=f,=f,l,~{memory}",
-                    has_side_effects=True,
-                    asm_dialect=0,
-                )
-                for i in cutlass.range_constexpr(2):
-                    pair[i] = cutlass.Float32(llvm.extractvalue(T.f32(), bits, [i]))
         if not vector:
             for i in cutlass.range_constexpr(2):
                 pair[i] = ds[col + i if self.down_per_channel else 0]
@@ -2829,8 +2706,6 @@ class Fp8FusedGatedResidualKernel:
             with cute.arch.elect_one():
                 for stage in cutlass.range_constexpr(self.up_stages):
                     cute.arch.mbarrier_init(full + stage, self.up_full_arrivals)
-                    if cutlass.const_expr(not self.omit_up_empty):
-                        cute.arch.mbarrier_init(empty + stage, 1)
                 for part in cutlass.range_constexpr(self.up_parts):
                     cute.arch.mbarrier_init(done + part, 1)
                 if cutlass.const_expr(self.up_mma_before_suffix):
@@ -2964,11 +2839,6 @@ class Fp8FusedGatedResidualKernel:
                 cached[2 * self.n + tid] = _load_f32(
                     ws.iterator + cutlass.Int64(channel if self.up_per_channel else 0)
                 )
-        if cutlass.const_expr(
-            self.async_up_scales and self.up_scale_issue == "handoff_async"
-        ):
-            if (ws.iterator.toint() & 15) == 0:
-                self._issue_up_scale_copy(ws, cached, hidden_tile)
 
     @cute.experimental.jit
     def _issue_up_scale_copy(self, scales, cached, hidden_tile):
@@ -3505,10 +3375,7 @@ class Fp8FusedGatedResidualKernel:
                 + self._up_gate_channel(channel, row) * 2
             )
             address = cutlass.Uint32(target.toint())
-            if cutlass.const_expr(self.up_gate_exchange == "row_pairs_vector"):
-                inst = "st.shared.v2.f32 [$0], {$1,$2};"
-            else:
-                inst = "st.shared.f32 [$0], $1; st.shared.f32 [$0+4], $2;"
+            inst = "st.shared.f32 [$0], $1; st.shared.f32 [$0+4], $2;"
             llvm.inline_asm(
                 None,
                 [
@@ -3705,21 +3572,7 @@ class Fp8FusedGatedResidualKernel:
             ma = cute_ext.get_cta_v_map_ab(wv, tiler, mma, "A")
             mb = cute_ext.get_cta_v_map_ab(av, tiler, mma, "B")
         if warp == self.producer_warp:
-            if cutlass.const_expr(self.activation_row_count):
-                if cute.arch.lane_idx() == 0:
-                    if cutlass.const_expr(self.activation_retry_ns > 0):
-                        _wait_activation_with_delay(
-                            activation_counter,
-                            activation_target * self.n,
-                            self.activation_retry_ns,
-                        )
-                    else:
-                        _wait_activation(activation_counter, activation_target * self.n)
-                if cutlass.const_expr(self.copied_alpha):
-                    cute.arch.sync_warp()
-                else:
-                    self._join_activation_readers()
-            elif cutlass.const_expr(
+            if cutlass.const_expr(
                 self.activation_row_tags and not self.stamped_activation
             ):
                 _wait_activation_rows(
@@ -3913,9 +3766,6 @@ class Fp8FusedGatedResidualKernel:
                             acc1,
                         )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
-                if cutlass.const_expr(not self.omit_up_empty):
-                    with cute.arch.elect_one():
-                        tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
             if cutlass.const_expr(self.up_parts == 2):
                 for tile in cutlass.range(
                     self.up_tiles - self.up_tail_tiles, self.up_tiles, unroll=1
@@ -3945,9 +3795,6 @@ class Fp8FusedGatedResidualKernel:
                             bd[None, None, block, slot],
                             acc1,
                         )
-                    if cutlass.const_expr(not self.omit_up_empty):
-                        with cute.arch.elect_one():
-                            tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
                 with cute.arch.elect_one():
                     tcgen05.commit(done + 1, None, tcgen05.CtaGroup.ONE)
             else:
@@ -4143,8 +3990,6 @@ class Fp8FusedGatedResidualKernel:
                                 alpha_ptr, cute.make_layout(self.up_rows)
                             )
                             cached[tid] = scales[tid]
-                if cutlass.const_expr(self.residual_issue == "register_after_mma"):
-                    self._load_up_residual(x, residual, hidden_tile, global_base, tid)
                 if cutlass.const_expr(self.warp_owned_gates):
                     # Residual copies and cached scales are shared across warps.
                     # Complete those inputs while the independent MMA runs.

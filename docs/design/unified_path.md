@@ -564,137 +564,36 @@ for larger batches. Row-derived reduction groups and token pairing belong
 only to the wider model. Other dimensions keep ordinary kernel selection;
 the fused work budget still bounds automatic selection.
 
-FP8 mixer weights use the same operator entry, with explicit
-`activation_quantization="none"` (W8A16) or `"fp8"` (W8A8), and FP32
-dequantization scales per output channel or per tensor. The validated FP8
-CuTe models are `(4, 2560, 320)` and `(4, 8192, 1024)` on Blackwell.
-Weights remain E4M3 in global memory. W8A16 converts only the resident weight
-tile to the activation dtype; W8A8 feeds native FP8 MMA. Split-K projection partials
-are reduced in rank order before scaling, inject stores and SiLU. SiLU
-rounds to the selected output dtype before Up; for 16-bit inputs this is
-the normalized-input dtype.
+FP8 mixer weights are E4M3 with FP32 per-tensor or per-channel scales.
+The same operator accepts explicit `activation_quantization="none"` (W8A16)
+or `"fp8"` (W8A8). With a 16-bit normalized input, W8A16 decodes resident
+weight tiles and W8A8 quantizes inputs per token for native FP8 MMA. These
+paths use three and four compute launches respectively. Both reduce split-K
+partials in FP32 split order, then round post-SiLU activations to the output
+dtype before Up. W8A8 applies the canonical FP8 scale floor and independently
+rounded multiplier.
 
-With 16-bit normalized input, W8A8 applies the canonical per-token scale floor
-and independently rounded quantization multiplier to both normalized inputs
-and post-SiLU activations.
-The packed input quantizer retains 16-bit values in registers until
-the row maximum is available, then converts them with the same FP32 rounding.
-Up fuses weight/activation scaling, sigmoid gating and branch summation;
-it reads the original 16-bit normalized residual. This takes three compute
-launches for W8A16 and four for W8A8, including input quantization. The FP64
-reference includes these explicit quantization/rounding edges; quantization
-error against the unquantized model is a separate comparison. Weight-code
-and scale updates preserve their storage across graph replay, and share
-the existing PDL readiness contract. FP8 startup warms the finite token-tile
-buckets through the same execution helper.
+Prequantized W8A8 accepts E4M3 input codes, an FP32 tensor or row scale,
+and an explicit BF16 or FP16 output dtype. Down, reduction, SiLU, activation
+quantization, Up and residual mixing run in one cooperative kernel. The
+residual uses the input's FP8 codes and scale in FP32. A compiled plan
+bounds the resident grid by occupancy. Each stream owns its scratch and
+monotonic epochs, and reader acknowledgements protect TMEM and operand
+stage reuse. PDL waits precede reads of producer-owned data.
 
-Prequantized W8A8 uses that same operator with E4M3 input codes, an explicit
-FP32 `normalized_scale` (one value or one per flattened token row), and an
-explicit BF16/FP16 `output_dtype`. The residual is input codes times their
-scale in FP32; it does not round through a separate 16-bit input. The
-predecessor owns input quantization. Mixer fusion preserves post-SiLU rounding
-to `output_dtype`, followed by canonical per-token FP8 quantization for Up.
+The launch plans take model dimensions from the operator. Startup warms
+finite bucket variants with the ordinary dispatch. Actual row counts control
+masks and additional token rounds at runtime. SM103 schedules share
+operand layouts, split reduction and Up readers and stores. The compact
+16-token injection plan publishes epoch-tagged activation records so Up can
+start on the first K plane. The full K128 Up schedule can issue weight loads
+as Down releases its operand stages. At 256 tokens it can share weight
+stages across both token parts.
 
-For the validated Blackwell model dimensions, Down, ordered split reduction,
-SiLU/FP8 quantization, Up and residual mixing execute in one cooperative
-kernel. Down and Up both use native FP8 MMA with FP32 accumulation. The
-resident grid is bounded by the compiled function's measured occupancy;
-device-scope arrival counters publish each phase and protect scratch reuse.
-The phases reuse one shared operand arena and TMEM allocation, with MMA
-completion and reader acknowledgements before reuse. Each execution stream
-owns persistent scratch and monotonic epochs initialized during warmup;
-graph replay needs no reset kernel. Startup warms finite token buckets
-16/32/64/128/256, with runtime row masks and additional rounds for larger
-batches. PDL waits precede producer-owned input, weight and scale reads.
-
-The prequantized registry entry selects the SM103 narrow or wide schedule
-by model dimensions. Each schedule uses one kernel definition for its token
-buckets. The narrow, wide and generic prequantized implementations share
-Down MMA operand setup, ordered FP32 split reduction, and the tile readers
-and output stores for Up. The schedules choose the partials layout and
-when to publish or acquire each tile. The common reduction loads the chosen
-layout and adds the partials in split order.
-
-In the SM103 narrow mixer's 32-token plan, a separate warp issues the
-residual copies on quantizing CTAs. The Up output warp reads its own gate
-values after the shared inputs and MMA results are ready.
-
-The SM103 narrow mixer's 16-token plan keeps the low-rank Down partials in
-aligned projection tiles and the injection columns in a separate region of
-the same scratch allocation. The quantization reader still adds the FP32
-partials in split order.
-
-The SM103 narrow mixer with injection hands off the 16-token bucket's FP8
-activation in aligned records that carry the current epoch. Up checks each
-record before use. Three warps copy contiguous groups of the first K64 plane.
-Once it and the weights are ready, Up can issue its first MMA instructions
-while three other warps copy the remaining planes. The last record of each
-row's first plane supplies both FP32 row scales to the Up epilogue. The
-quantizer also writes the canonical activation scale with the full epoch.
-Each round refreshes the records for both valid and padded rows.
-
-Prequantized Up uses token-major tiles for the wide model and the largest
-narrow-model bucket, with four branches of contiguous hidden channels (64 per
-branch for the wide model, 32 for the narrow model). Wide-model buckets up to
-64 tokens use M64; larger buckets and the narrow model use M128. The
-256-token bucket retains two TMEM accumulators and shares each weight stage
-across their independent activation tiles. The last operand stages stay owned
-until both token parts finish; publishing the first accumulator before the
-second part's MMA tail lets its residual epilogue overlap that tail.
-
-An SM103 wide mixer with injection can prepare its Up weight at load time
-through the ordinary weight preparation helper. Each K128 tile stores all
-four 64-channel branch segments contiguously. The prepared weight is optional
-for the 16-, 32-, 64-, and 128-token buckets and the 256-token bucket reads the
-canonical weight. The owner refreshes the derived tensor in place whenever it
-updates the canonical weight so captured graphs retain a valid address.
-
-M128 readers own contiguous hidden vectors within one token. M64 readers
-interleave token rows and read and write adjacent channel pairs. Packed register
-loads prefetch the next branch's FP8 residual while the current branch consumes
-TMEM. Residual codes decode in pairs through exact BF16 values. Scaling and
-residual arithmetic use FP32. Output stores use the reader's contiguous vectors.
-Input, activation and weight scales are cached per tile. Small narrow buckets
-retain the hidden-major layout and shared residual/gate staging to avoid padding
-token MMA work. Both layouts use the same resident phases and
-producer/MMA stage pipeline. Another token round waits before scratch reuse;
-the final round publishes its arrivals without polling, with stream and PDL
-completion ordering protecting the next invocation.
-
-Under PDL, FP8 quantization can permit independent GEMM weight prefetch during
-its local math, after its upstream wait. GEMMs still wait before activation
-reads. Packed wide-input quantization uses a larger CTA under PDL to shorten
-the Down activation wait. Model width and PDL select its plan; row counts remain
-runtime arguments. Epilogue notification timing is a finite plan choice; nearly full
-legacy Up tiles retain late signaling because early launch increases latency.
-Wider token buckets can assign inject work to a separate warp while activation
-threads alone participate in quantization barriers. Startup warms these finite
-choices through the ordinary operator.
-
-The native FP8 Down projection pairs its initial weight and activation
-transfers when PDL is disabled. Full/empty barriers protect stage reuse;
-PDL retains its readiness dependency ordering. The prequantized fused kernel
-pairs these transfers after its enclosing PDL wait, including when its weights
-depend on the preceding kernel.
-
-The wider model's larger W8A8 Up buckets reuse each resident FP8 weight tile
-across two independent 128-token MMA tiles. Separate activation tiles and
-TMEM accumulators retain each token's reduction; a shared operand stage is
-released after both MMAs finish.
-
-The FP8 plans choose resident operand tiles from model dimensions and finite
-row buckets. The wider model's W8 Down converts resident weight codes in
-registers directly into TMEM, with separate rings for compressed weights,
-decoded weights and original 16-bit activations. A raw slot stays owned until
-conversion and TMEM stores finish. The wider model's smallest W8 Up bucket
-expands a resident compressed shared tile in place. Its larger Up buckets use
-separate raw and decoded weight rings, allowing conversion to advance without
-overwriting MMA operands. Independent activation loading follows the same
-ownership rules. Up owns every HC branch of each output tile within one CTA,
-and can reuse decoded weights across two token tiles. Its larger token tiles
-cache output-channel scales in shared memory after the same readiness
-dependency, once per CTA across both token epilogues. Runtime row masks and
-startup bucket warming preserve the same graph replay contract.
+The weight preparation helper can build a tiled Up weight for the SM103
+full K128 injection schedule through 128 tokens. The owner refreshes the
+derived tensor in place when the canonical weight changes, preserving its
+address for CUDA graph replay.
 
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows

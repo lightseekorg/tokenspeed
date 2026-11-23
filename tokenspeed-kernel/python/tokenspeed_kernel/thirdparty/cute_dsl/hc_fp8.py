@@ -32,6 +32,7 @@ from cutlass._mlir.extras import types as T
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.experimental.primitives import tcgen05_fence
+from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import _UP_K_TILE
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import (
     _epilogue_barrier,
     _up_sigmoid_tanh,
@@ -370,8 +371,6 @@ class Fp8GatedResidualGemm:
     ):
         if role not in ("projection", "mix"):
             raise ValueError("FP8 HC GEMM role must be projection or mix")
-        if (hc_count, hidden_size, lowrank) not in ((4, 2560, 320), (4, 8192, 1024)):
-            raise ValueError("FP8 HC requires validated model dimensions")
         self.separate_operand_ready = separate_operand_ready
         self.role = role
         self.hc_count = hc_count
@@ -1178,7 +1177,7 @@ class Fp8GatedResidualGemm:
                         converted + stage,
                         (
                             1
-                            if self.lowrank == 320 and self.n == 16
+                            if self.lowrank % _UP_K_TILE != 0 and self.n == 16
                             else self.epilogue_threads // 32
                         ),
                     )
@@ -1405,7 +1404,9 @@ class Fp8GatedResidualGemm:
                             dst,
                         )
                     cute.arch.fence_view_async_shared()
-                    if cutlass.const_expr(self.lowrank == 320 and self.n == 16):
+                    if cutlass.const_expr(
+                        self.lowrank % _UP_K_TILE != 0 and self.n == 16
+                    ):
                         _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
                         if tid == 0:
                             cute.arch.mbarrier_arrive(converted + stage)
@@ -2404,9 +2405,9 @@ class Fp8GatedResidualGemm:
                         channel if self.weight_scale_per_channel else 0
                     ]
                 _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                if cutlass.const_expr(native_fp8):
-                    if global_row < x.shape[0]:
-                        alpha = activation_scale[global_row]
+            if cutlass.const_expr(native_fp8):
+                if global_row < x.shape[0]:
+                    alpha = activation_scale[global_row]
             if cutlass.const_expr(self.up_token_rows == 64):
                 for branch in cutlass.range_constexpr(self.hc_count):
                     self._native_up_fragment_prefetch(
@@ -2538,6 +2539,7 @@ class W8GatedResidualBranchUp:
     def __init__(
         self,
         *,
+        hc_count: int,
         hidden_size: int,
         lowrank: int,
         token_tile: int,
@@ -2547,6 +2549,7 @@ class W8GatedResidualBranchUp:
         weights_independent: bool,
         weight_scale_per_channel: bool,
     ):
+        self.hc_count = hc_count
         self.hidden_size = hidden_size
         self.r = lowrank
         self.n = token_tile
@@ -2556,7 +2559,7 @@ class W8GatedResidualBranchUp:
         self.pdl = use_pdl
         self.weights_independent = weights_independent
         self.per_channel = weight_scale_per_channel
-        self.columns = max(32, 4 * token_tile)
+        self.columns = max(32, hc_count * token_tile)
         self.threads = 320
         self.readers = 256 if token_tile >= 64 else 128
         self.reader_groups = self.readers // 128
@@ -2595,7 +2598,8 @@ class W8GatedResidualBranchUp:
             tcgen05.CtaGroup.ONE,
             (64, self.n),
         )
-        tiler = (256, self.n, self.k)
+        channels = 64 * self.hc_count
+        tiler = (channels, self.n, self.k)
         weight_layout = sm100_utils.make_smem_layout_a(mma, tiler, dtype, self.stages)
         x_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
         sw = cute_ext.allocate(
@@ -2654,7 +2658,7 @@ class W8GatedResidualBranchUp:
         weights = cute.make_tensor(
             weight.iterator,
             cute.make_layout(
-                ((64, 4, self.hidden_size // 64), (64, self.r // 64), 1),
+                ((64, self.hc_count, self.hidden_size // 64), (64, self.r // 64), 1),
                 stride=((self.r, self.hidden_size * self.r, 64 * self.r), (1, 64), 0),
             ),
         )
@@ -2664,7 +2668,7 @@ class W8GatedResidualBranchUp:
                 (x.shape[0], (64, self.r // 64), 1), stride=(self.r, (1, 64), 0)
             ),
         )
-        gw = cute.local_tile(weights, (256, self.k), (hidden_tile, None, 0))
+        gw = cute.local_tile(weights, (channels, self.k), (hidden_tile, None, 0))
         gx = cute.local_tile(activation, (self.n, self.k), (token_tile, None, 0))
         map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "A")
         map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "B")
@@ -2672,7 +2676,7 @@ class W8GatedResidualBranchUp:
             for stage in cutlass.range_constexpr(self.stages):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, (256 + self.n * 2) * self.k
+                        full + stage, (channels + self.n * 2) * self.k
                     )
                 if cutlass.const_expr(self.weights_independent):
                     cute_ext.tma_load(
@@ -2706,7 +2710,7 @@ class W8GatedResidualBranchUp:
                 cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, (256 + self.n * 2) * self.k
+                        full + stage, (channels + self.n * 2) * self.k
                     )
                 cute_ext.tma_load(
                     gw[None, None, tile],
@@ -2732,7 +2736,7 @@ class W8GatedResidualBranchUp:
                 stage = tile % self.stages
                 cute.arch.mbarrier_wait(converted + stage, tile // self.stages % 2)
                 for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    for branch in cutlass.range_constexpr(4):
+                    for branch in cutlass.range_constexpr(self.hc_count):
                         fragment = mma.get_slice(0).make_fragment_C(
                             mma.partition_shape_C((64, self.n))
                         )
@@ -2761,7 +2765,7 @@ class W8GatedResidualBranchUp:
             for tile in cutlass.range(self.tiles, unroll=1):
                 stage = tile % self.stages
                 cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                packets: cutlass.Constexpr = 256 * self.k // (256 * 8)
+                packets: cutlass.Constexpr = channels * self.k // (256 * 8)
                 raw_values = cute.make_rmem_tensor((8, packets), cutlass.Float8E4M3FN)
                 source = raw[None, None, None, stage]
                 target = sw[None, None, None, stage]
@@ -2776,7 +2780,7 @@ class W8GatedResidualBranchUp:
                         row % atom_m
                         + (k % atom_k) * atom_m
                         + (row // atom_m) * atom_m * atom_k
-                        + (k // atom_k) * 256 * atom_k
+                        + (k // atom_k) * channels * atom_k
                     )
                     src = cute.make_tensor(
                         cute.make_ptr(
@@ -2807,7 +2811,7 @@ class W8GatedResidualBranchUp:
                         row % decoded_m
                         + (k % decoded_k) * decoded_m
                         + (row // decoded_m) * decoded_m * decoded_k
-                        + (k // decoded_k) * 256 * decoded_k
+                        + (k // decoded_k) * channels * decoded_k
                     )
                     dst = cute.make_tensor(
                         cute.make_ptr(
@@ -2887,7 +2891,7 @@ class W8GatedResidualBranchUp:
             sums = cute.make_rmem_tensor(count, cutlass.Float32)
             sums.fill(0.0)
             cute.arch.mbarrier_wait(done, 0)
-            for branch in cutlass.range_constexpr(4):
+            for branch in cutlass.range_constexpr(self.hc_count):
                 acc = cute.local_tile(
                     self._accumulator(mma, base, branch), tile_shape, (0, group)
                 )
@@ -2897,7 +2901,7 @@ class W8GatedResidualBranchUp:
                     sums[i] = sums[i] + residual[i, slot].to(
                         cutlass.Float32
                     ) * _up_sigmoid_tanh(gates[i] * scales[i, slot])
-                if cutlass.const_expr(branch + ring_slots < 4):
+                if cutlass.const_expr(branch + ring_slots < self.hc_count):
                     for i in cutlass.range_constexpr(count):
                         col, row = coords[i]
                         global_row = token_tile * self.n + row
@@ -2918,1256 +2922,8 @@ class W8GatedResidualBranchUp:
                 col, row = coords[i]
                 global_row = token_tile * self.n + row
                 if global_row < x.shape[0]:
-                    out[global_row, hidden_tile * 64 + col] = (sums[i] / 4).to(
-                        out.element_type
-                    )
-
-
-class W8GatedResidualTokenReuse(Fp8GatedResidualGemm):
-    """Share each decoded weight stage across two M128 token accumulators."""
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        lowrank: int,
-        use_pdl: bool,
-        weights_independent: bool,
-        weight_scale_per_channel: bool,
-        weight_scale_vectorized: bool,
-    ):
-        super().__init__(
-            role="mix",
-            hc_count=4,
-            hidden_size=hidden_size,
-            lowrank=lowrank,
-            projection_rows=lowrank + 4,
-            token_tile=128,
-            projection_tile=128,
-            k_tile=128,
-            stages=2,
-            split_k=1,
-            use_pdl=use_pdl,
-            weights_independent=weights_independent,
-            weight_scale_per_channel=weight_scale_per_channel,
-            token_major_up=True,
-            weight_scale_vectorized=weight_scale_vectorized,
-            up_hidden_tile=64,
-            up_token_rows=128,
-            separate_operand_ready=False,
-            epilogue_threads=512,
-            shared_up_scales=False,
-            interleave_tma=False,
-        )
-        self.up_hidden_tile = 64
-
-    @cute.experimental.jit
-    def __call__(
-        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
-    ):
-        self.kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(self.hidden_size // 64, 1, 1),
-            block=(self.epilogue_threads + 64, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.jit
-    def _up_prefetch(
-        self,
-        original,
-        weight_scale,
-        activation_scale,
-        residual,
-        scales,
-        row,
-        hidden,
-        rows,
-        branch: cutlass.Constexpr,
-        slot: cutlass.Constexpr,
-        native_fp8: cutlass.Constexpr,
-    ):
-        count = cute.size(residual, mode=[0])
-        if row < rows:
-            source = cute.make_tensor(
-                cute.make_ptr(
-                    original.element_type,
-                    (
-                        original.iterator
-                        + row * self.wide
-                        + branch * self.hidden_size
-                        + hidden
-                    ).toint(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                ),
-                cute.make_layout(count),
-            )
-            cute.copy(
-                cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
-                    original.element_type,
-                    num_bits_per_copy=128,
-                ),
-                source,
-                residual[None, slot],
-            )
-            if cutlass.const_expr(
-                self.weight_scale_per_channel and self.weight_scale_vectorized
-            ):
-                source_scale = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Float32,
-                        (
-                            weight_scale.iterator + branch * self.hidden_size + hidden
-                        ).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout(count),
-                )
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        cutlass.Float32,
-                        num_bits_per_copy=128,
-                    ),
-                    source_scale,
-                    scales[None, slot],
-                )
-            else:
-                for i in cutlass.range_constexpr(count):
-                    scales[i, slot] = weight_scale[
-                        (
-                            branch * self.hidden_size + hidden + i
-                            if self.weight_scale_per_channel
-                            else 0
-                        )
-                    ]
-            if cutlass.const_expr(native_fp8):
-                for i in cutlass.range_constexpr(count):
-                    scales[i, slot] = scales[i, slot] * activation_scale[row]
-
-    @cute.experimental.jit
-    def _up_reader(
-        self, base, layout, original, tid, branch: cutlass.Constexpr, token_part
-    ):
-        tile = (128, self.up_hidden_tile // self.epilogue_groups)
-        group = tid // 128 + branch * self.epilogue_groups
-        accumulator = cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + token_part * 256,
-            layout,
-        )[((None, None), 0, 0)]
-        accumulator = cute.local_tile(accumulator, tile, (0, group))
-        coordinates = cute.local_tile(
-            cute.make_identity_tensor((128, self.up_hidden_tile * self.hc_count)),
-            tile,
-            (0, group),
-        )
-        copy = tcgen05.make_tmem_copy(
-            sm100_utils.get_tmem_load_op(
-                (128, self.up_hidden_tile * self.hc_count, self.k),
-                cute_utils.LayoutEnum.COL_MAJOR,
-                cutlass.Float32,
-                cutlass.Float32,
-                tile,
-                False,
-            ),
-            accumulator,
-        )
-        reader = copy.get_slice(tid % 128)
-        dummy = cute.make_tensor(
-            original.iterator, cute.make_layout(tile, stride=(1, 128))
-        )
-        values = cute_ext.allocate(
-            cutlass.Float32,
-            cute.AddressSpace.rmem,
-            cute_ext.make_t2r_rmem_layout(
-                copy, cute.flat_divide(dummy, tile), tid % 128
-            ),
-            alignment=32,
-        )
-        return accumulator, reader, values, reader.partition_D(coordinates)
-
-    @cute.experimental.kernel
-    def kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (128, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (128, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        if cutlass.const_expr(native_fp8):
-            raw = cute_ext.allocate(
-                cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-            )
-            sw = raw
-        else:
-            sw = cute_ext.allocate(
-                dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-            )
-            raw_base = cute.get_nonswizzle_portion(raw_layout)
-            weight_base = cute.get_nonswizzle_portion(weight_layout)
-            # Raw and converted tiles share the larger decoded-weight slot.
-            raw = cute.make_tensor(
-                cute.make_ptr(
-                    cutlass.Float8E4M3FN,
-                    sw.iterator.toint(),
-                    cute.AddressSpace.smem,
-                    assumed_align=1024,
-                    swizzle_=cute.get_swizzle_portion(raw_layout),
-                ),
-                cute.make_layout(
-                    raw_base.shape,
-                    stride=(
-                        raw_base.stride[0],
-                        raw_base.stride[1],
-                        raw_base.stride[2],
-                        weight_base.stride[3] * (dtype.width // 8),
-                    ),
-                ),
-            )
-        x1_layout = sm100_utils.make_smem_layout_a(mma, tiler, dtype, 1)
-        sx1 = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, x1_layout, alignment=1024
-        )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(3 * self.stages + 4),
-            alignment=8,
-        ).iterator
-        full = barriers
-        converted = full + self.stages
-        empty = converted + self.stages
-        done, read_done = empty + self.stages, empty + self.stages + 1
-        x1_full, x1_empty = empty + self.stages + 2, empty + self.stages + 3
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(
-                        converted + stage, self.epilogue_threads // 32
-                    )
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(x1_full, 1)
-                cute.arch.mbarrier_init(x1_empty, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(512, base, is_two_cta=False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1),
-                stride=(self.inner, (1, 64), 0),
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(activation, (128, self.k), (token_tile, None, 0))
-        gx1 = cute.local_tile(activation, (128, self.k), (1, None, 0))
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        if warp == self.producer_warp:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + 128 * self.k * (dtype.width // 8),
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(x1_full, 128 * self.k * 2)
-            cute_ext.tma_load(
-                gx1[None, None, 0],
-                sx1[None, None, None, 0],
-                x1_full.value,
-                cta_v_map=map_x,
-                update_expect_tx=False,
-            )
-            for tile in cutlass.range(1, self.tiles, unroll=1):
-                # The second token tile has one slot. Its next load overlaps
-                # the first token's MMA, while decoded weights have two slots.
-                cute.arch.mbarrier_wait(x1_empty, (tile - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(x1_full, 128 * self.k * 2)
-                cute_ext.tma_load(
-                    gx1[None, None, tile],
-                    sx1[None, None, None, 0],
-                    x1_full.value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-                future = tile + self.stages - 1
-                if future < self.tiles:
-                    stage = future % self.stages
-                    cute.arch.mbarrier_wait(
-                        empty + stage, (future // self.stages - 1) % 2
-                    )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            full + stage, (256 + 128 * 2) * self.k
-                        )
-                    cute_ext.tma_load(
-                        gw[None, None, future],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                    cute_ext.tma_load(
-                        gx[None, None, future],
-                        sx[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_x,
-                        update_expect_tx=False,
-                    )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C((128, self.up_hidden_tile * self.hc_count))
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            a1_desc = thread_mma.make_fragment_A(sx1)
-            accumulator1 = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + 256,
-                fragment.layout,
-            )
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(converted + stage, tile // self.stages % 2)
-                mma.set(tcgen05.Field.ACCUMULATE, tile > 0)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                cute.arch.mbarrier_wait(x1_full, tile % 2)
-                mma.set(tcgen05.Field.ACCUMULATE, tile > 0)
-                for block in cutlass.range_constexpr(cute.size(a1_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator1,
-                        a1_desc[None, None, block, 0],
-                        b_desc[None, None, block, stage],
-                        accumulator1,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-                    tcgen05.commit(x1_empty, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), 512
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                    source, target = (
-                        raw[None, None, None, stage],
-                        sw[None, None, None, stage],
-                    )
-                    packets = (
-                        self.up_hidden_tile
-                        * self.hc_count
-                        * self.k
-                        // (self.epilogue_threads * 8)
-                    )
-                    raw_values = cute.make_rmem_tensor(
-                        (8, packets), cutlass.Float8E4M3FN
-                    )
-                    # Every reader finishes before expanded stores can
-                    # overwrite another thread's compressed source bytes.
-                    for offset in cutlass.range_constexpr(packets):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = (
-                            linear // self.k
-                            + (linear % self.k) * self.up_hidden_tile * self.hc_count
-                        )
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values[None, offset],
-                        )
-                    _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
-                    for offset in cutlass.range_constexpr(packets):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = (
-                            linear // self.k
-                            + (linear % self.k) * self.up_hidden_tile * self.hc_count
-                        )
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        converted_values = cute.make_rmem_tensor(8, dtype)
-                        _convert_fp8_weight(raw_values[None, offset], converted_values)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            converted_values,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp(mask=0xFFFFFFFF)
-                    if tid % 32 == 0:
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            for token_part in cutlass.range(2, unroll=1):
-                thread_mma = mma.get_slice(0)
-                fragment = thread_mma.make_fragment_C(
-                    mma.partition_shape_C((128, self.up_hidden_tile * self.hc_count))
-                )
-                _, _, template, coordinates = self._up_reader(
-                    base, fragment.layout, original, tid, 0, token_part
-                )
-                count = cute.size(template)
-                ring_slots = 2 if self.up_hidden_tile == 64 else self.hc_count
-                residual = cute.make_rmem_tensor(
-                    (count, ring_slots), original.element_type
-                )
-                scales = cute.make_rmem_tensor((count, ring_slots), cutlass.Float32)
-                residual.fill(0.0)
-                scales.fill(1.0)
-                sums = cute.make_rmem_tensor(count, cutlass.Float32)
-                sums.fill(0.0)
-                first_row, first_col = coordinates[0]
-                global_row = token_part * 128 + first_row
-                hidden = hidden_tile * self.up_hidden_tile + first_col
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-                cute.arch.mbarrier_wait(done, 0)
-                if ((tid % 128) // 32) * 32 < x.shape[0] - token_part * 128:
-                    for branch in cutlass.range_constexpr(self.hc_count):
-                        slot = branch % ring_slots
-                        accumulator, reader, gates, _ = self._up_reader(
-                            base, fragment.layout, original, tid, branch, token_part
-                        )
-                        cute_ext.partition_and_copy(reader, accumulator, gates)
-                        cute.arch.fence_view_async_tmem_load()
-                        for i in cutlass.range_constexpr(count):
-                            sums[i] = sums[i] + residual[i, slot].to(
-                                cutlass.Float32
-                            ) * _up_sigmoid_tanh(gates[i] * scales[i, slot])
-                        if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                            self._up_prefetch(
-                                original,
-                                weight_scale,
-                                activation_scale,
-                                residual,
-                                scales,
-                                global_row,
-                                hidden,
-                                x.shape[0],
-                                branch + ring_slots,
-                                slot,
-                                native_fp8,
-                            )
-                tcgen05_fence("before_thread_sync")
-                if global_row < x.shape[0]:
-                    packed = cute.make_rmem_tensor(count, out.element_type)
-                    for i in cutlass.range_constexpr(count):
-                        packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                    target = cute.make_tensor(
-                        cute.make_ptr(
-                            out.element_type,
-                            (
-                                out.iterator + global_row * self.hidden_size + hidden
-                            ).toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        ),
-                        cute.make_layout(count),
-                    )
-                    cute.copy(
-                        cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(),
-                            out.element_type,
-                            num_bits_per_copy=128,
-                        ),
-                        packed,
-                        target,
-                    )
-            cute.arch.mbarrier_arrive(read_done)
-
-
-class Fp8GatedResidualBranchUp:
-    """Keep each HC branch on identical TMEM lanes in separate column ranges."""
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        lowrank: int,
-        token_tile: int,
-        k_tile: int,
-        stages: int,
-        use_pdl: bool,
-        weights_independent: bool,
-        weight_scale_per_channel: bool,
-    ):
-        self.hidden_size = hidden_size
-        self.r = lowrank
-        self.n = token_tile
-        self.k = k_tile
-        self.stages = stages
-        self.tiles = (lowrank + k_tile - 1) // k_tile
-        self.pdl = use_pdl
-        self.weights_independent = weights_independent
-        self.per_channel = weight_scale_per_channel
-        self.columns = max(32, 4 * token_tile)
-        self.threads = 192
-
-    @cute.experimental.jit
-    def __call__(
-        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
-    ):
-        self.kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(self.hidden_size // 64, cute.ceil_div(x.shape[0], self.n), 1),
-            block=(self.threads, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.jit
-    def _accumulator(self, mma, base, branch: cutlass.Constexpr):
-        fragment = mma.get_slice(0).make_fragment_C(mma.partition_shape_C((64, self.n)))
-        return cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + branch * self.n,
-            fragment.layout,
-        )[((None, None), 0, 0)]
-
-    @cute.experimental.kernel
-    def kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        dtype = cutlass.Float8E4M3FN
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (64, self.n),
-        )
-        tiler = (256, self.n, self.k)
-        weight_layout = sm100_utils.make_smem_layout_a(mma, tiler, dtype, self.stages)
-        x_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sw = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-        )
-        sx = cute_ext.allocate(dtype, cute.AddressSpace.smem, x_layout, alignment=1024)
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(2 * self.stages + 2),
-            alignment=8,
-        ).iterator
-        full, empty = barriers, barriers + self.stages
-        done, read_done = empty + self.stages, empty + self.stages + 1
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == 5:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, 128)
-            cute.arch.alloc_tmem(self.columns, base, is_two_cta=False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                ((64, 4, self.hidden_size // 64), (64, self.r // 64), 1),
-                stride=((self.r, self.hidden_size * self.r, 64 * self.r), (1, 64), 0),
-            ),
-        )
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.r // 64), 1), stride=(self.r, (1, 64), 0)
-            ),
-        )
-        gw = cute.local_tile(weights, (256, self.k), (hidden_tile, None, 0))
-        gx = cute.local_tile(activation, (self.n, self.k), (token_tile, None, 0))
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "A")
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "B")
-        if warp == 4:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, (256 + self.n) * self.k
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        sw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        sw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, (256 + self.n) * self.k
-                    )
-                cute_ext.tma_load(
-                    gw[None, None, tile],
-                    sw[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_w,
-                    update_expect_tx=False,
-                )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == 5:
-            thread_mma = mma.get_slice(0)
-            a_desc, b_desc = thread_mma.make_fragment_A(sw), thread_mma.make_fragment_B(
-                sx
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    for branch in cutlass.range_constexpr(4):
-                        fragment = mma.get_slice(0).make_fragment_C(
-                            mma.partition_shape_C((64, self.n))
-                        )
-                        acc = cute.make_tensor(
-                            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base)
-                            + branch * self.n,
-                            fragment.layout,
-                        )
-                        a_branch = cute.local_tile(
-                            a_desc[None, None, block, stage], (1, 1), (0, branch)
-                        )
-                        cute.gemm(
-                            mma, acc, a_branch, b_desc[None, None, block, stage], acc
-                        )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), self.columns
-            )
-        else:
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            acc = self._accumulator(mma, base, 0)
-            tile_shape = (64, self.n)
-            copy = tcgen05.make_tmem_copy(
-                sm100_utils.get_tmem_load_op(
-                    (64, self.n, self.k),
-                    cute_utils.LayoutEnum.COL_MAJOR,
-                    cutlass.Float32,
-                    cutlass.Float32,
-                    tile_shape,
-                    False,
-                ),
-                acc,
-            )
-            reader = copy.get_slice(tid)
-            dummy = cute.make_tensor(
-                original.iterator, cute.make_layout(tile_shape, stride=(1, 64))
-            )
-            gates = cute_ext.allocate(
-                cutlass.Float32,
-                cute.AddressSpace.rmem,
-                cute_ext.make_t2r_rmem_layout(
-                    copy, cute.flat_divide(dummy, tile_shape), tid
-                ),
-                alignment=32,
-            )
-            coords = reader.partition_D(cute.make_identity_tensor(tile_shape))
-            count = cute.size(gates)
-            residual = cute.make_rmem_tensor((count, 4), original.element_type)
-            scales = cute.make_rmem_tensor((count, 4), cutlass.Float32)
-            residual.fill(0.0)
-            scales.fill(1.0)
-            for branch in cutlass.range_constexpr(4):
-                for i in cutlass.range_constexpr(count):
-                    col, row = coords[i]
-                    global_row = token_tile * self.n + row
-                    global_col = branch * self.hidden_size + hidden_tile * 64 + col
-                    if global_row < x.shape[0]:
-                        residual[i, branch] = original[global_row, global_col]
-                        scales[i, branch] = (
-                            weight_scale[global_col if self.per_channel else 0]
-                            * activation_scale[global_row]
-                        )
-            sums = cute.make_rmem_tensor(count, cutlass.Float32)
-            sums.fill(0.0)
-            cute.arch.mbarrier_wait(done, 0)
-            for branch in cutlass.range_constexpr(4):
-                acc = self._accumulator(mma, base, branch)
-                cute_ext.partition_and_copy(reader, acc, gates)
-                for i in cutlass.range_constexpr(count):
-                    sums[i] = sums[i] + residual[i, branch].to(
-                        cutlass.Float32
-                    ) * _up_sigmoid_tanh(gates[i] * scales[i, branch])
-            cute.arch.fence_view_async_tmem_load()
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            for i in cutlass.range_constexpr(count):
-                col, row = coords[i]
-                global_row = token_tile * self.n + row
-                if global_row < x.shape[0]:
-                    out[global_row, hidden_tile * 64 + col] = (sums[i] / 4).to(
-                        out.element_type
-                    )
-
-
-@cute.experimental.jit
-def _pack_residual_halves(a, b):
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [a.to(cutlass.Uint32).ir_value(), b.to(cutlass.Uint32).ir_value()],
-            "prmt.b32 $0, $1, $2, 0x5410;",
-            "=r,r,r",
-            has_side_effects=True,
-            asm_dialect=0,
-        )
-    )
-
-
-@cute.experimental.jit
-def _unpack_residual_half(word, high: cutlass.Constexpr, dtype: cutlass.Constexpr):
-    if cutlass.const_expr(dtype == cutlass.BFloat16):
-        if cutlass.const_expr(high):
-            code = "{ .reg .b32 bits; and.b32 bits, $1, 0xffff0000; mov.b32 $0, bits; }"
-        else:
-            code = "{ .reg .b32 bits; shl.b32 bits, $1, 16; mov.b32 $0, bits; }"
-    else:
-        if cutlass.const_expr(high):
-            code = "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $1; cvt.f32.f16 $0, hi; }"
-        else:
-            code = "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $1; cvt.f32.f16 $0, lo; }"
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [word.ir_value()],
-            code,
-            "=f,r",
-            has_side_effects=False,
-            asm_dialect=0,
-        )
-    )
-
-
-class Fp8GatedResidualPairedHiddenUp:
-    """Two M128 GEMMs cover four H64 branches with coalesced residual reads."""
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        lowrank: int,
-        token_tile: int,
-        k_tile: int,
-        stages: int,
-        use_pdl: bool,
-        weights_independent: bool,
-        weight_scale_per_channel: bool,
-    ):
-        self.h = hidden_size
-        self.r = lowrank
-        self.n = token_tile
-        self.k = k_tile
-        self.stages = stages
-        self.tiles = lowrank // k_tile
-        self.pdl = use_pdl
-        self.independent = weights_independent
-        self.per_channel = weight_scale_per_channel
-        self.epi_threads = {32: 256, 64: 512, 96: 384}[token_tile]
-        self.groups = self.epi_threads // 128
-        self.producer = self.epi_threads // 32
-        self.issuer = self.producer + 1
-        self.columns = max(32, 1 << (token_tile * 2 - 1).bit_length())
-        self.arena_bytes = max(
-            (256 + token_tile) * k_tile * stages, 256 * token_tile * 4
-        )
-
-    @cute.experimental.jit
-    def __call__(
-        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
-    ):
-        self.kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(self.h // 64, cute.ceil_div(x.shape[0], self.n), 1),
-            block=(self.epi_threads + 64, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.jit
-    def _accumulator(self, mma, base, pair: cutlass.Constexpr):
-        fragment = mma.get_slice(0).make_fragment_C(
-            mma.partition_shape_C((128, self.n))
-        )
-        return cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + pair * self.n,
-            fragment.layout,
-        )[((None, None), 0, 0)]
-
-    @cute.experimental.kernel
-    def kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        dtype = cutlass.Float8E4M3FN
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (128, self.n),
-        )
-        tiler = (256, self.n, self.k)
-        wl = sm100_utils.make_smem_layout_a(mma, tiler, dtype, self.stages)
-        xl = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        arena = cute_ext.allocate(
-            cutlass.Uint8,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.arena_bytes),
-            alignment=1024,
-        )
-        sw = cute.make_tensor(
-            cute.make_ptr(
-                dtype,
-                arena.iterator.toint(),
-                cute.AddressSpace.smem,
-                assumed_align=1024,
-                swizzle_=cute.get_swizzle_portion(wl),
-            ),
-            cute.get_nonswizzle_portion(wl),
-        )
-        sx = cute.make_tensor(
-            cute.make_ptr(
-                dtype,
-                arena.iterator.toint() + cute.cosize(wl),
-                cute.AddressSpace.smem,
-                assumed_align=1024,
-                swizzle_=cute.get_swizzle_portion(xl),
-            ),
-            cute.get_nonswizzle_portion(xl),
-        )
-        gate = cute.make_tensor(
-            cute.recast_ptr(arena.iterator, dtype=cutlass.Float32),
-            cute.make_layout((256, self.n), stride=(1, 256)),
-        )
-        scale_cache = cute_ext.allocate(
-            cutlass.Float32, cute.AddressSpace.smem, cute.make_layout(256), alignment=32
-        )
-        alpha_cache = cute_ext.allocate(
-            cutlass.Float32,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.n),
-            alignment=32,
-        )
-        bars = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(2 * self.stages + 2),
-            alignment=8,
-        ).iterator
-        full, empty = bars, bars + self.stages
-        done, read_done = empty + self.stages, empty + self.stages + 1
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.issuer:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epi_threads)
-            cute.arch.alloc_tmem(self.columns, base, is_two_cta=False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        w = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                ((64, 4, self.h // 64), (64, self.r // 64), 1),
-                stride=((self.r, self.h * self.r, 64 * self.r), (1, 64), 0),
-            ),
-        )
-        a = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.r // 64), 1), stride=(self.r, (1, 64), 0)
-            ),
-        )
-        gw = cute.local_tile(w, (256, self.k), (hidden_tile, None, 0))
-        gx = cute.local_tile(a, (self.n, self.k), (token_tile, None, 0))
-        map_w = cute_ext.get_cta_v_map_ab(w, tiler, mma, "A")
-        map_x = cute_ext.get_cta_v_map_ab(a, tiler, mma, "B")
-        if warp == self.producer:
-            if cutlass.const_expr(not self.pdl):
-                # Make stage0 usable before queuing later cold weight tiles.
-                for stage in cutlass.range_constexpr(self.stages):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            full + stage, (256 + self.n) * self.k
-                        )
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        sw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                    cute_ext.tma_load(
-                        gx[None, None, stage],
-                        sx[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_x,
-                        update_expect_tx=False,
-                    )
-            else:
-                for stage in cutlass.range_constexpr(self.stages):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            full + stage, (256 + self.n) * self.k
-                        )
-                    if cutlass.const_expr(self.independent):
-                        cute_ext.tma_load(
-                            gw[None, None, stage],
-                            sw[None, None, None, stage],
-                            (full + stage).value,
-                            cta_v_map=map_w,
-                            update_expect_tx=False,
-                        )
-                if cutlass.const_expr(self.pdl):
-                    cute.arch.griddepcontrol_wait()
-                    cute.arch.griddepcontrol_launch_dependents()
-                for stage in cutlass.range_constexpr(self.stages):
-                    if cutlass.const_expr(not self.independent):
-                        cute_ext.tma_load(
-                            gw[None, None, stage],
-                            sw[None, None, None, stage],
-                            (full + stage).value,
-                            cta_v_map=map_w,
-                            update_expect_tx=False,
-                        )
-                    cute_ext.tma_load(
-                        gx[None, None, stage],
-                        sx[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_x,
-                        update_expect_tx=False,
-                    )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, (256 + self.n) * self.k
-                    )
-                cute_ext.tma_load(
-                    gw[None, None, tile],
-                    sw[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_w,
-                    update_expect_tx=False,
-                )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == self.issuer:
-            thread_mma = mma.get_slice(0)
-            ad = thread_mma.make_fragment_A(sw)
-            bd = thread_mma.make_fragment_B(sx)
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                for block in cutlass.range_constexpr(cute.size(ad, mode=[2])):
-                    for pair in cutlass.range_constexpr(2):
-                        fragment = thread_mma.make_fragment_C(
-                            mma.partition_shape_C((128, self.n))
-                        )
-                        acc = cute.make_tensor(
-                            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base)
-                            + pair * self.n,
-                            fragment.layout,
-                        )
-                        a_pair = cute.local_tile(
-                            ad[None, None, block, stage], (1, 1), (0, pair)
-                        )
-                        cute.gemm(mma, acc, a_pair, bd[None, None, block, stage], acc)
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), self.columns
-            )
-        elif tid < self.epi_threads:
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            if tid < 256:
-                channel = (tid // 64) * self.h + hidden_tile * 64 + tid % 64
-                scale_cache[tid] = weight_scale[channel if self.per_channel else 0]
-            if tid < self.n:
-                alpha_cache[tid] = 1.0
-                if token_tile * self.n + tid < x.shape[0]:
-                    alpha_cache[tid] = activation_scale[token_tile * self.n + tid]
-            _epilogue_barrier(self.epi_threads, cutlass.Int32(3))
-            tile_shape = (128, self.n // self.groups)
-            group = tid // 128
-            acc = cute.local_tile(
-                self._accumulator(mma, base, 0), tile_shape, (0, group)
-            )
-            coords = cute.local_tile(
-                cute.make_identity_tensor((128, self.n)), tile_shape, (0, group)
-            )
-            copy = tcgen05.make_tmem_copy(
-                sm100_utils.get_tmem_load_op(
-                    (128, self.n, self.k),
-                    cute_utils.LayoutEnum.COL_MAJOR,
-                    cutlass.Float32,
-                    cutlass.Float32,
-                    tile_shape,
-                    False,
-                ),
-                acc,
-            )
-            reader = copy.get_slice(tid % 128)
-            dummy = cute.make_tensor(
-                original.iterator, cute.make_layout(tile_shape, stride=(1, 128))
-            )
-            gates = cute_ext.allocate(
-                cutlass.Float32,
-                cute.AddressSpace.rmem,
-                cute_ext.make_t2r_rmem_layout(
-                    copy, cute.flat_divide(dummy, tile_shape), tid % 128
-                ),
-                alignment=32,
-            )
-            coordinates = reader.partition_D(coords)
-            count = cute.size(gates)
-            residual_words = cute.make_rmem_tensor((count // 2, 2), cutlass.Uint32)
-            residual_words.fill(0)
-            original_bits = cute.recast_tensor(original, cutlass.Uint16)
-            for pair in cutlass.range_constexpr(2):
-                for packet in cutlass.range_constexpr(count // 2):
-                    col0, row0 = coordinates[packet * 2]
-                    col1, row1 = coordinates[packet * 2 + 1]
-                    global_row0 = token_tile * self.n + row0
-                    global_row1 = token_tile * self.n + row1
-                    global_col0 = (
-                        (pair * 2 + col0 // 64) * self.h + hidden_tile * 64 + col0 % 64
-                    )
-                    global_col1 = (
-                        (pair * 2 + col1 // 64) * self.h + hidden_tile * 64 + col1 % 64
-                    )
-                    bits0 = cutlass.Uint16(0)
-                    bits1 = cutlass.Uint16(0)
-                    if global_row0 < x.shape[0]:
-                        bits0 = original_bits[global_row0, global_col0]
-                    if global_row1 < x.shape[0]:
-                        bits1 = original_bits[global_row1, global_col1]
-                    residual_words[packet, pair] = _pack_residual_halves(bits0, bits1)
-            cute.arch.mbarrier_wait(done, 0)
-            for pair in cutlass.range_constexpr(2):
-                acc_pair = cute.local_tile(
-                    self._accumulator(mma, base, pair), tile_shape, (0, group)
-                )
-                cute_ext.partition_and_copy(reader, acc_pair, gates)
-                cute.arch.fence_view_async_tmem_load()
-                for i in cutlass.range_constexpr(count):
-                    col, row = coordinates[i]
-                    if token_tile * self.n + row < x.shape[0]:
-                        factor = scale_cache[pair * 128 + col] * alpha_cache[row]
-                        gate[pair * 128 + col, row] = _unpack_residual_half(
-                            residual_words[i // 2, pair],
-                            i % 2 != 0,
-                            original.element_type,
-                        ) * _up_sigmoid_tanh(gates[i] * factor)
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            _epilogue_barrier(self.epi_threads, cutlass.Int32(2))
-            for offset in cutlass.range_constexpr(64 * self.n // self.epi_threads):
-                index = tid + offset * self.epi_threads
-                row, col = index // 64, index % 64
-                if token_tile * self.n + row < x.shape[0]:
-                    value = cutlass.Float32(0.0)
-                    for branch in cutlass.range_constexpr(4):
-                        value = value + gate[branch * 64 + col, row]
-                    out[token_tile * self.n + row, hidden_tile * 64 + col] = (
-                        value / 4.0
+                    out[global_row, hidden_tile * 64 + col] = (
+                        sums[i] / self.hc_count
                     ).to(out.element_type)
 
 
@@ -4351,539 +3107,6 @@ class Fp8GatedResidualInputQuantize:
             )
         if cutlass.const_expr(self.pdl):
             cute.arch.sync_threads()
-
-
-class W8GatedResidualIndependentUp(Fp8GatedResidualGemm):
-    """Six decoded weight slots overlap with four independent input slots."""
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        lowrank: int,
-        weight_stages: int,
-        input_stages: int,
-        use_pdl: bool,
-        weights_independent: bool,
-        weight_scale_per_channel: bool,
-        weight_scale_vectorized: bool,
-    ):
-        super().__init__(
-            role="mix",
-            hc_count=4,
-            hidden_size=hidden_size,
-            lowrank=lowrank,
-            projection_rows=lowrank + 4,
-            token_tile=64,
-            projection_tile=128,
-            k_tile=64,
-            stages=weight_stages,
-            split_k=1,
-            use_pdl=use_pdl,
-            weights_independent=weights_independent,
-            weight_scale_per_channel=weight_scale_per_channel,
-            token_major_up=True,
-            weight_scale_vectorized=weight_scale_vectorized,
-            up_hidden_tile=64,
-            up_token_rows=64,
-            separate_operand_ready=False,
-            epilogue_threads=512,
-            shared_up_scales=False,
-            interleave_tma=False,
-        )
-        self.input_stages = input_stages
-
-    @cute.experimental.jit
-    def __call__(
-        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
-    ):
-        self.up_kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(
-                self.hidden_size // self.up_hidden_tile,
-                cute.ceil_div(x.shape[0], self.up_token_rows),
-                1,
-            ),
-            block=(self.epilogue_threads + 64, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.kernel
-    def up_kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (self.up_token_rows, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (self.up_token_rows, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.input_stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        if cutlass.const_expr(native_fp8):
-            raw = cute_ext.allocate(
-                cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-            )
-            sw = raw
-        else:
-            sw = cute_ext.allocate(
-                dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-            )
-            raw_base = cute.get_nonswizzle_portion(raw_layout)
-            weight_base = cute.get_nonswizzle_portion(weight_layout)
-            raw = cute.make_tensor(
-                cute.make_ptr(
-                    cutlass.Float8E4M3FN,
-                    sw.iterator.toint(),
-                    cute.AddressSpace.smem,
-                    assumed_align=1024,
-                    swizzle_=cute.get_swizzle_portion(raw_layout),
-                ),
-                cute.make_layout(
-                    raw_base.shape,
-                    stride=(
-                        raw_base.stride[0],
-                        raw_base.stride[1],
-                        raw_base.stride[2],
-                        weight_base.stride[3] * (dtype.width // 8),
-                    ),
-                ),
-            )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(3 * self.stages + 2 * self.input_stages + 2),
-            alignment=8,
-        ).iterator
-        full = barriers
-        converted = full + self.stages
-        empty = converted + self.stages
-        x_full = empty + self.stages
-        x_empty = x_full + self.input_stages
-        done, read_done = (x_empty + self.input_stages, x_empty + self.input_stages + 1)
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(
-                        converted + stage, self.epilogue_threads // 32
-                    )
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                for stage in cutlass.range_constexpr(self.input_stages):
-                    cute.arch.mbarrier_init(x_full + stage, 1)
-                    cute.arch.mbarrier_init(x_empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(
-                self.up_hidden_tile * self.hc_count, base, is_two_cta=False
-            )
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(
-            activation, (self.up_token_rows, self.k), (token_tile, None, 0)
-        )
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        if warp == self.producer_warp:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage, self.up_hidden_tile * self.hc_count * self.k
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            if cutlass.const_expr(not self.weights_independent):
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            for stage in cutlass.range_constexpr(self.input_stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        x_full + stage, self.up_token_rows * self.k * 2
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (x_full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            for tile in cutlass.range(self.input_stages, self.tiles, unroll=1):
-                input_stage = tile % self.input_stages
-                cute.arch.mbarrier_wait(
-                    x_empty + input_stage, (tile // self.input_stages - 1) % 2
-                )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        x_full + input_stage, self.up_token_rows * self.k * 2
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, input_stage],
-                    (x_full + input_stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-                future = tile + self.stages - self.input_stages
-                if future < self.tiles:
-                    stage = future % self.stages
-                    cute.arch.mbarrier_wait(
-                        empty + stage, (future // self.stages - 1) % 2
-                    )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            full + stage, self.up_hidden_tile * self.hc_count * self.k
-                        )
-                    cute_ext.tma_load(
-                        gw[None, None, future],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                input_stage = tile % self.input_stages
-                ready = full if cutlass.const_expr(native_fp8) else converted
-                cute.arch.mbarrier_wait(ready + stage, tile // self.stages % 2)
-                cute.arch.mbarrier_wait(
-                    x_full + input_stage, tile // self.input_stages % 2
-                )
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, input_stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-                    tcgen05.commit(x_empty + input_stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base),
-                self.up_hidden_tile * self.hc_count,
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                    source, target = (
-                        raw[None, None, None, stage],
-                        sw[None, None, None, stage],
-                    )
-                    packets = (
-                        self.up_hidden_tile
-                        * self.hc_count
-                        * self.k
-                        // (self.epilogue_threads * 8)
-                    )
-                    raw_values = cute.make_rmem_tensor(
-                        (8, packets), cutlass.Float8E4M3FN
-                    )
-                    for offset in cutlass.range_constexpr(packets):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = (
-                            linear // self.k
-                            + linear % self.k * self.up_hidden_tile * self.hc_count
-                        )
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values[None, offset],
-                        )
-                    _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
-                    for offset in cutlass.range_constexpr(packets):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = (
-                            linear // self.k
-                            + linear % self.k * self.up_hidden_tile * self.hc_count
-                        )
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        converted_values = cute.make_rmem_tensor(8, dtype)
-                        _convert_fp8_weight(raw_values[None, offset], converted_values)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            converted_values,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp(mask=4294967295)
-                    if tid % 32 == 0:
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            thread_mma = mma.get_slice(0)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            _, _, template, coordinates = self._up_reader(
-                base, fragment.layout, original, tid, 0
-            )
-            count = cute.size(template)
-            ring_slots = (
-                self.hc_count
-                if self.up_token_rows == 64
-                else 2 if self.up_hidden_tile == 64 else self.hc_count
-            )
-            residual = cute.make_rmem_tensor((count, ring_slots), original.element_type)
-            scales = cute.make_rmem_tensor(
-                (1, 1) if self.up_token_rows == 64 else (count, ring_slots),
-                cutlass.Float32,
-            )
-            residual.fill(0.0)
-            scales.fill(1.0)
-            sums = cute.make_rmem_tensor(count, cutlass.Float32)
-            sums.fill(0.0)
-            first_row, first_col = coordinates[0]
-            global_row = token_tile * self.up_token_rows + first_row
-            hidden = hidden_tile * self.up_hidden_tile + first_col
-            if cutlass.const_expr(self.up_token_rows == 64):
-                assert not native_fp8
-                scale_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(256),
-                    alignment=32,
-                )
-                if tid < 256:
-                    channel = tid // 64 * self.hidden_size + hidden_tile * 64 + tid % 64
-                    scale_cache[tid] = weight_scale[
-                        channel if self.weight_scale_per_channel else 0
-                    ]
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                for branch in cutlass.range_constexpr(4):
-                    self._up_pair_prefetch(
-                        original,
-                        residual,
-                        coordinates,
-                        token_tile,
-                        hidden_tile,
-                        x.shape[0],
-                        branch,
-                    )
-            else:
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-            cute.arch.mbarrier_wait(done, 0)
-            if (
-                tid % 128 // 32 * (self.up_token_rows // 4)
-                < x.shape[0] - token_tile * self.up_token_rows
-            ):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    slot = branch % ring_slots
-                    accumulator, reader, gates, _ = self._up_reader(
-                        base, fragment.layout, original, tid, branch
-                    )
-                    cute_ext.partition_and_copy(reader, accumulator, gates)
-                    cute.arch.fence_view_async_tmem_load()
-                    for i in cutlass.range_constexpr(count):
-                        factor = cutlass.Float32(1.0)
-                        if cutlass.const_expr(self.up_token_rows == 64):
-                            _, col = coordinates[i]
-                            factor = scale_cache[branch * 64 + col]
-                        else:
-                            factor = scales[i, slot]
-                        sums[i] = sums[i] + residual[i, slot].to(
-                            cutlass.Float32
-                        ) * _up_sigmoid_tanh(gates[i] * factor)
-                    if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                        self._up_prefetch(
-                            original,
-                            weight_scale,
-                            activation_scale,
-                            residual,
-                            scales,
-                            global_row,
-                            hidden,
-                            x.shape[0],
-                            branch + ring_slots,
-                            slot,
-                            native_fp8,
-                        )
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for packet in cutlass.range_constexpr(count // 2):
-                    row, col = coordinates[packet * 2]
-                    output_row = token_tile * self.up_token_rows + row
-                    if output_row < x.shape[0]:
-                        packed = cute.make_rmem_tensor(2, out.element_type)
-                        for j in cutlass.range_constexpr(2):
-                            packed[j] = (sums[packet * 2 + j] / self.hc_count).to(
-                                out.element_type
-                            )
-                        target = cute.make_tensor(
-                            cute.make_ptr(
-                                out.element_type,
-                                (
-                                    out.iterator
-                                    + output_row * self.hidden_size
-                                    + hidden_tile * self.up_hidden_tile
-                                    + col
-                                ).toint(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=4,
-                            ),
-                            cute.make_layout(2),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                out.element_type,
-                                num_bits_per_copy=32,
-                            ),
-                            packed,
-                            target,
-                        )
-            elif global_row < x.shape[0]:
-                packed = cute.make_rmem_tensor(count, out.element_type)
-                for i in cutlass.range_constexpr(count):
-                    packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                target = cute.make_tensor(
-                    cute.make_ptr(
-                        out.element_type,
-                        (out.iterator + global_row * self.hidden_size + hidden).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout(count),
-                )
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        out.element_type,
-                        num_bits_per_copy=128,
-                    ),
-                    packed,
-                    target,
-                )
 
 
 class W8GatedResidualTmemProjection(Fp8GatedResidualGemm):
@@ -5082,30 +3305,13 @@ class W8GatedResidualTmemProjection(Fp8GatedResidualGemm):
                 (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
             ),
         )
-        if cutlass.const_expr(self.role == "projection"):
-            w_view = cute.make_tensor(
-                weight.iterator,
-                cute.make_layout(
-                    (self.projection_rows, (64, self.inner // 64), 1),
-                    stride=(self.inner, (1, 64), 0),
-                ),
-            )
-        else:
-            w_view = cute.make_tensor(
-                weight.iterator,
-                cute.make_layout(
-                    (
-                        (32, self.hc_count, self.hidden_size // 32),
-                        (64, self.inner // 64),
-                        1,
-                    ),
-                    stride=(
-                        (self.inner, self.hidden_size * self.inner, 32 * self.inner),
-                        (1, 64),
-                        0,
-                    ),
-                ),
-            )
+        w_view = cute.make_tensor(
+            weight.iterator,
+            cute.make_layout(
+                (self.projection_rows, (64, self.inner // 64), 1),
+                stride=(self.inner, (1, 64), 0),
+            ),
+        )
         gw = cute.local_tile(w_view, (self.m, self.k), (output_tile, None, 0))
         gx = cute.local_tile(x_view, (self.n, self.k), (token_tile, None, 0))
         map_w = cute_ext.get_cta_v_map_ab(w_view, tiler, mma, "A")
@@ -5276,54 +3482,14 @@ class W8GatedResidualTmemProjection(Fp8GatedResidualGemm):
             coords = reader.partition_D(coordinates)
             cute_ext.partition_and_copy(reader, acc, values)
             cute.arch.fence_view_async_tmem_load()
-            if cutlass.const_expr(self.role == "mix"):
-                residual = cute.make_rmem_tensor_like(values, original.element_type)
-                scales = cute.make_rmem_tensor_like(values)
-                residual.fill(0.0)
-                scales.fill(1.0)
-                for index in cutlass.range_constexpr(cute.size(values)):
-                    col, row = coords[index]
-                    global_row = token_tile * self.n + row
-                    global_col = (
-                        col // 32 * self.hidden_size + output_tile * 32 + col % 32
-                    )
-                    if global_row < x.shape[0]:
-                        residual[index] = original[global_row, global_col]
-                        scale = weight_scale[
-                            global_col if self.weight_scale_per_channel else 0
-                        ]
-                        if cutlass.const_expr(native_fp8):
-                            scale = scale * activation_scale[global_row]
-                        scales[index] = scale
-                for i in cutlass.range_constexpr(cute.size(values)):
-                    values[i] = residual[i].to(cutlass.Float32) * _up_sigmoid_tanh(
-                        values[i] * scales[i]
-                    )
             for index in cutlass.range_constexpr(cute.size(values)):
                 col, row = coords[index]
                 global_row = token_tile * self.n + row
-                if cutlass.const_expr(self.role == "projection"):
-                    global_col = output_tile * self.m + col
-                    if global_row < x.shape[0] and global_col < self.projection_rows:
-                        partials[split, global_row, global_col] = values[index]
-                elif global_row < x.shape[0]:
-                    gate[col, row] = values[index]
+                global_col = output_tile * self.m + col
+                if global_row < x.shape[0] and global_col < self.projection_rows:
+                    partials[split, global_row, global_col] = values[index]
             tcgen05_fence("before_thread_sync")
             cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.role == "mix"):
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(2))
-                for offset in cutlass.range_constexpr(
-                    self.n * 32 // self.epilogue_threads
-                ):
-                    index = tid + offset * self.epilogue_threads
-                    row, col = (index // 32, index % 32)
-                    if token_tile * self.n + row < x.shape[0]:
-                        value = cutlass.Float32(0.0)
-                        for branch in cutlass.range_constexpr(self.hc_count):
-                            value = value + gate[branch * 32 + col, row]
-                        out[token_tile * self.n + row, output_tile * 32 + col] = (
-                            value / self.hc_count
-                        ).to(original.element_type)
 
 
 class W8GatedResidualRotatedProjection(W8GatedResidualTmemProjection):
@@ -5416,30 +3582,13 @@ class W8GatedResidualRotatedProjection(W8GatedResidualTmemProjection):
                 (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
             ),
         )
-        if cutlass.const_expr(self.role == "projection"):
-            w_view = cute.make_tensor(
-                weight.iterator,
-                cute.make_layout(
-                    (self.projection_rows, (64, self.inner // 64), 1),
-                    stride=(self.inner, (1, 64), 0),
-                ),
-            )
-        else:
-            w_view = cute.make_tensor(
-                weight.iterator,
-                cute.make_layout(
-                    (
-                        (32, self.hc_count, self.hidden_size // 32),
-                        (64, self.inner // 64),
-                        1,
-                    ),
-                    stride=(
-                        (self.inner, self.hidden_size * self.inner, 32 * self.inner),
-                        (1, 64),
-                        0,
-                    ),
-                ),
-            )
+        w_view = cute.make_tensor(
+            weight.iterator,
+            cute.make_layout(
+                (self.projection_rows, (64, self.inner // 64), 1),
+                stride=(self.inner, (1, 64), 0),
+            ),
+        )
         gw = cute.local_tile(w_view, (self.m, self.k), (output_tile, None, 0))
         gx = cute.local_tile(x_view, (self.n, self.k), (token_tile, None, 0))
         map_w = cute_ext.get_cta_v_map_ab(w_view, tiler, mma, "A")
@@ -5610,62 +3759,23 @@ class W8GatedResidualRotatedProjection(W8GatedResidualTmemProjection):
             coords = reader.partition_D(coordinates)
             cute_ext.partition_and_copy(reader, acc, values)
             cute.arch.fence_view_async_tmem_load()
-            if cutlass.const_expr(self.role == "mix"):
-                residual = cute.make_rmem_tensor_like(values, original.element_type)
-                scales = cute.make_rmem_tensor_like(values)
-                residual.fill(0.0)
-                scales.fill(1.0)
-                for index in cutlass.range_constexpr(cute.size(values)):
-                    col, row = coords[index]
-                    global_row = token_tile * self.n + row
-                    global_col = (
-                        col // 32 * self.hidden_size + output_tile * 32 + col % 32
-                    )
-                    if global_row < x.shape[0]:
-                        residual[index] = original[global_row, global_col]
-                        scale = weight_scale[
-                            global_col if self.weight_scale_per_channel else 0
-                        ]
-                        if cutlass.const_expr(native_fp8):
-                            scale = scale * activation_scale[global_row]
-                        scales[index] = scale
-                for i in cutlass.range_constexpr(cute.size(values)):
-                    values[i] = residual[i].to(cutlass.Float32) * _up_sigmoid_tanh(
-                        values[i] * scales[i]
-                    )
             for index in cutlass.range_constexpr(cute.size(values)):
                 col, row = coords[index]
                 global_row = token_tile * self.n + row
-                if cutlass.const_expr(self.role == "projection"):
-                    global_col = output_tile * self.m + col
-                    if global_row < x.shape[0] and global_col < self.projection_rows:
-                        partials[split, global_row, global_col] = values[index]
-                elif global_row < x.shape[0]:
-                    gate[col, row] = values[index]
+                global_col = output_tile * self.m + col
+                if global_row < x.shape[0] and global_col < self.projection_rows:
+                    partials[split, global_row, global_col] = values[index]
             tcgen05_fence("before_thread_sync")
             cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.role == "mix"):
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(2))
-                for offset in cutlass.range_constexpr(
-                    self.n * 32 // self.epilogue_threads
-                ):
-                    index = tid + offset * self.epilogue_threads
-                    row, col = (index // 32, index % 32)
-                    if token_tile * self.n + row < x.shape[0]:
-                        value = cutlass.Float32(0.0)
-                        for branch in cutlass.range_constexpr(self.hc_count):
-                            value = value + gate[branch * 32 + col, row]
-                        out[token_tile * self.n + row, output_tile * 32 + col] = (
-                            value / self.hc_count
-                        ).to(original.element_type)
 
 
-class W8GatedResidualDecodedRingUp(W8GatedResidualIndependentUp):
+class W8GatedResidualDecodedRingUp(Fp8GatedResidualGemm):
     """Separate compressed and decoded rings remove in-place expansion barriers."""
 
     def __init__(
         self,
         *,
+        hc_count: int,
         hidden_size: int,
         lowrank: int,
         raw_stages: int,
@@ -5680,10 +3790,10 @@ class W8GatedResidualDecodedRingUp(W8GatedResidualIndependentUp):
         Fp8GatedResidualGemm.__init__(
             self,
             role="mix",
-            hc_count=4,
+            hc_count=hc_count,
             hidden_size=hidden_size,
             lowrank=lowrank,
-            projection_rows=lowrank + 4,
+            projection_rows=lowrank,
             token_tile=up_token_rows,
             projection_tile=128,
             k_tile=64,
@@ -6152,456 +4262,6 @@ class W8GatedResidualDecodedRingUp(W8GatedResidualIndependentUp):
                 )
 
 
-class W8GatedResidualDecodedTokenReuse(W8GatedResidualTokenReuse):
-    """Share decoded weights across two token tiles with separate raw and decoded rings."""
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        lowrank: int,
-        raw_stages: int,
-        decoded_stages: int,
-        input_stages: int,
-        use_pdl: bool,
-        weights_independent: bool,
-        weight_scale_per_channel: bool,
-        weight_scale_vectorized: bool,
-    ):
-        Fp8GatedResidualGemm.__init__(
-            self,
-            role="mix",
-            hc_count=4,
-            hidden_size=hidden_size,
-            lowrank=lowrank,
-            projection_rows=lowrank + 4,
-            token_tile=128,
-            projection_tile=128,
-            k_tile=64,
-            stages=decoded_stages,
-            split_k=1,
-            use_pdl=use_pdl,
-            weights_independent=weights_independent,
-            weight_scale_per_channel=weight_scale_per_channel,
-            token_major_up=True,
-            weight_scale_vectorized=weight_scale_vectorized,
-            up_hidden_tile=64,
-            up_token_rows=128,
-            separate_operand_ready=False,
-            epilogue_threads=512,
-            shared_up_scales=False,
-            interleave_tma=False,
-        )
-        self.input_stages = input_stages
-        self.raw_stages = raw_stages
-        self.input_producer_warp = self.producer_warp + 1
-        self.mma_warp = self.producer_warp + 2
-
-    @cute.experimental.jit
-    def __call__(
-        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
-    ):
-        self.kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(self.hidden_size // 64, 1, 1),
-            block=(self.epilogue_threads + 96, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.kernel
-    def kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (128, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (128, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.input_stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.raw_stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        assert not native_fp8
-        raw = cute_ext.allocate(
-            cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-        )
-        sw = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-        )
-        x1_layout = sm100_utils.make_smem_layout_a(mma, tiler, dtype, self.input_stages)
-        sx1 = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, x1_layout, alignment=1024
-        )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(
-                2 * self.raw_stages + 2 * self.stages + 4 * self.input_stages + 2
-            ),
-            alignment=8,
-        ).iterator
-        full = barriers
-        raw_empty = full + self.raw_stages
-        converted = raw_empty + self.raw_stages
-        empty = converted + self.stages
-        x0_full = empty + self.stages
-        x0_empty = x0_full + self.input_stages
-        x1_full = x0_empty + self.input_stages
-        x1_empty = x1_full + self.input_stages
-        done = x1_empty + self.input_stages
-        read_done = done + 1
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.raw_stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(
-                        raw_empty + stage, self.epilogue_threads // 32
-                    )
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(
-                        converted + stage, self.epilogue_threads // 32
-                    )
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                for stage in cutlass.range_constexpr(self.input_stages):
-                    cute.arch.mbarrier_init(x0_full + stage, 1)
-                    cute.arch.mbarrier_init(x0_empty + stage, 1)
-                    cute.arch.mbarrier_init(x1_full + stage, 1)
-                    cute.arch.mbarrier_init(x1_empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(512, base, is_two_cta=False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(activation, (128, self.k), (token_tile, None, 0))
-        gx1 = cute.local_tile(activation, (128, self.k), (1, None, 0))
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        if warp == self.producer_warp:
-            if cutlass.const_expr(self.pdl and (not self.weights_independent)):
-                cute.arch.griddepcontrol_wait()
-            for tile in cutlass.range(self.tiles, unroll=1):
-                raw_stage = tile % self.raw_stages
-                if tile >= self.raw_stages:
-                    cute.arch.mbarrier_wait(
-                        raw_empty + raw_stage, (tile // self.raw_stages - 1) % 2
-                    )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + raw_stage, self.up_hidden_tile * self.hc_count * self.k
-                    )
-                cute_ext.tma_load(
-                    gw[None, None, tile],
-                    raw[None, None, None, raw_stage],
-                    (full + raw_stage).value,
-                    cta_v_map=map_w,
-                    update_expect_tx=False,
-                )
-        elif warp == self.input_producer_warp:
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.input_stages
-                if tile >= self.input_stages:
-                    cute.arch.mbarrier_wait(
-                        x0_empty + stage, (tile // self.input_stages - 1) % 2
-                    )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        x0_full + stage, 128 * self.k * 2
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (x0_full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-                if tile >= self.input_stages:
-                    cute.arch.mbarrier_wait(
-                        x1_empty + stage, (tile // self.input_stages - 1) % 2
-                    )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        x1_full + stage, 128 * self.k * 2
-                    )
-                cute_ext.tma_load(
-                    gx1[None, None, tile],
-                    sx1[None, None, None, stage],
-                    (x1_full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C((128, self.up_hidden_tile * self.hc_count))
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            a1_desc = thread_mma.make_fragment_A(sx1)
-            accumulator1 = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + 256,
-                fragment.layout,
-            )
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                input_stage = tile % self.input_stages
-                input_phase = tile // self.input_stages % 2
-                cute.arch.mbarrier_wait(converted + stage, tile // self.stages % 2)
-                cute.arch.mbarrier_wait(x0_full + input_stage, input_phase)
-                mma.set(tcgen05.Field.ACCUMULATE, tile > 0)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, input_stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(x0_empty + input_stage, None, tcgen05.CtaGroup.ONE)
-                cute.arch.mbarrier_wait(x1_full + input_stage, input_phase)
-                mma.set(tcgen05.Field.ACCUMULATE, tile > 0)
-                for block in cutlass.range_constexpr(cute.size(a1_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator1,
-                        a1_desc[None, None, block, input_stage],
-                        b_desc[None, None, block, stage],
-                        accumulator1,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-                    tcgen05.commit(x1_empty + input_stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), 512
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    raw_stage = tile % self.raw_stages
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(
-                        full + raw_stage, tile // self.raw_stages % 2
-                    )
-                    if tile >= self.stages:
-                        cute.arch.mbarrier_wait(
-                            empty + stage, (tile // self.stages - 1) % 2
-                        )
-                    source = raw[None, None, None, raw_stage]
-                    target = sw[None, None, None, stage]
-                    packets = (
-                        self.up_hidden_tile
-                        * self.hc_count
-                        * self.k
-                        // (self.epilogue_threads * 8)
-                    )
-                    for offset in cutlass.range_constexpr(packets):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = (
-                            linear // self.k
-                            + linear % self.k * self.up_hidden_tile * self.hc_count
-                        )
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        raw_values = cute.make_rmem_tensor(8, cutlass.Float8E4M3FN)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values,
-                        )
-                        decoded = cute.make_rmem_tensor(8, dtype)
-                        _convert_fp8_weight(raw_values, decoded)
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            decoded,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp(mask=4294967295)
-                    # Finish conversion before returning raw storage to TMA.
-                    if tid % 32 == 0:
-                        cute.arch.mbarrier_arrive(raw_empty + raw_stage)
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            for token_part in cutlass.range(2, unroll=1):
-                thread_mma = mma.get_slice(0)
-                fragment = thread_mma.make_fragment_C(
-                    mma.partition_shape_C((128, self.up_hidden_tile * self.hc_count))
-                )
-                _, _, template, coordinates = self._up_reader(
-                    base, fragment.layout, original, tid, 0, token_part
-                )
-                count = cute.size(template)
-                ring_slots = 2 if self.up_hidden_tile == 64 else self.hc_count
-                residual = cute.make_rmem_tensor(
-                    (count, ring_slots), original.element_type
-                )
-                scales = cute.make_rmem_tensor((count, ring_slots), cutlass.Float32)
-                residual.fill(0.0)
-                scales.fill(1.0)
-                sums = cute.make_rmem_tensor(count, cutlass.Float32)
-                sums.fill(0.0)
-                first_row, first_col = coordinates[0]
-                global_row = token_part * 128 + first_row
-                hidden = hidden_tile * self.up_hidden_tile + first_col
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-                cute.arch.mbarrier_wait(done, 0)
-                if tid % 128 // 32 * 32 < x.shape[0] - token_part * 128:
-                    for branch in cutlass.range_constexpr(self.hc_count):
-                        slot = branch % ring_slots
-                        accumulator, reader, gates, _ = self._up_reader(
-                            base, fragment.layout, original, tid, branch, token_part
-                        )
-                        cute_ext.partition_and_copy(reader, accumulator, gates)
-                        cute.arch.fence_view_async_tmem_load()
-                        for i in cutlass.range_constexpr(count):
-                            sums[i] = sums[i] + residual[i, slot].to(
-                                cutlass.Float32
-                            ) * _up_sigmoid_tanh(gates[i] * scales[i, slot])
-                        if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                            self._up_prefetch(
-                                original,
-                                weight_scale,
-                                activation_scale,
-                                residual,
-                                scales,
-                                global_row,
-                                hidden,
-                                x.shape[0],
-                                branch + ring_slots,
-                                slot,
-                                native_fp8,
-                            )
-                tcgen05_fence("before_thread_sync")
-                if global_row < x.shape[0]:
-                    packed = cute.make_rmem_tensor(count, out.element_type)
-                    for i in cutlass.range_constexpr(count):
-                        packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                    target = cute.make_tensor(
-                        cute.make_ptr(
-                            out.element_type,
-                            (
-                                out.iterator + global_row * self.hidden_size + hidden
-                            ).toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        ),
-                        cute.make_layout(count),
-                    )
-                    cute.copy(
-                        cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(),
-                            out.element_type,
-                            num_bits_per_copy=128,
-                        ),
-                        packed,
-                        target,
-                    )
-            cute.arch.mbarrier_arrive(read_done)
-
-
 @cute.experimental.jit
 def _up_residual_prefetch(
     original,
@@ -7009,8 +4669,103 @@ class W8GatedResidualCachedScaleUp(W8GatedResidualDecodedRingUp):
                 )
 
 
-class W8GatedResidualCachedScaleTokenReuse(W8GatedResidualDecodedTokenReuse):
+class W8GatedResidualCachedScaleTokenReuse(Fp8GatedResidualGemm):
     """Reuse per-channel scales in shared memory without changing operand pipelines."""
+
+    def __init__(
+        self,
+        *,
+        hc_count: int,
+        hidden_size: int,
+        lowrank: int,
+        raw_stages: int,
+        decoded_stages: int,
+        input_stages: int,
+        use_pdl: bool,
+        weights_independent: bool,
+        weight_scale_per_channel: bool,
+        weight_scale_vectorized: bool,
+    ):
+        Fp8GatedResidualGemm.__init__(
+            self,
+            role="mix",
+            hc_count=hc_count,
+            hidden_size=hidden_size,
+            lowrank=lowrank,
+            projection_rows=lowrank,
+            token_tile=128,
+            projection_tile=128,
+            k_tile=64,
+            stages=decoded_stages,
+            split_k=1,
+            use_pdl=use_pdl,
+            weights_independent=weights_independent,
+            weight_scale_per_channel=weight_scale_per_channel,
+            token_major_up=True,
+            weight_scale_vectorized=weight_scale_vectorized,
+            up_hidden_tile=64,
+            up_token_rows=128,
+            separate_operand_ready=False,
+            epilogue_threads=512,
+            shared_up_scales=False,
+            interleave_tma=False,
+        )
+        self.input_stages = input_stages
+        self.raw_stages = raw_stages
+        self.input_producer_warp = self.producer_warp + 1
+        self.mma_warp = self.producer_warp + 2
+
+    @cute.experimental.jit
+    def __call__(
+        self, x, weight, original, weight_scale, activation_scale, out, stream: CUstream
+    ):
+        self.kernel(x, weight, original, weight_scale, activation_scale, out).launch(
+            grid=(self.hidden_size // 64, 1, 1),
+            block=(self.epilogue_threads + 96, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
+        )
+
+    @cute.experimental.jit
+    def _up_reader(
+        self, base, layout, original, tid, branch: cutlass.Constexpr, token_part
+    ):
+        tile = (128, self.up_hidden_tile // self.epilogue_groups)
+        group = tid // 128 + branch * self.epilogue_groups
+        accumulator = cute.make_tensor(
+            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base) + token_part * 256,
+            layout,
+        )[((None, None), 0, 0)]
+        accumulator = cute.local_tile(accumulator, tile, (0, group))
+        coordinates = cute.local_tile(
+            cute.make_identity_tensor((128, self.up_hidden_tile * self.hc_count)),
+            tile,
+            (0, group),
+        )
+        copy = tcgen05.make_tmem_copy(
+            sm100_utils.get_tmem_load_op(
+                (128, self.up_hidden_tile * self.hc_count, self.k),
+                cute_utils.LayoutEnum.COL_MAJOR,
+                cutlass.Float32,
+                cutlass.Float32,
+                tile,
+                False,
+            ),
+            accumulator,
+        )
+        reader = copy.get_slice(tid % 128)
+        dummy = cute.make_tensor(
+            original.iterator, cute.make_layout(tile, stride=(1, 128))
+        )
+        values = cute_ext.allocate(
+            cutlass.Float32,
+            cute.AddressSpace.rmem,
+            cute_ext.make_t2r_rmem_layout(
+                copy, cute.flat_divide(dummy, tile), tid % 128
+            ),
+            alignment=32,
+        )
+        return accumulator, reader, values, reader.partition_D(coordinates)
 
     @cute.experimental.kernel
     def kernel(self, x, weight, original, weight_scale, activation_scale, out):
@@ -8016,1702 +5771,6 @@ class Fp8GatedResidualTokenReuseUp(Fp8GatedResidualGemm):
             cute.arch.mbarrier_arrive(read_done)
 
 
-class Fp8GatedResidualM64H64Up(Fp8GatedResidualGemm):
-    """Native M64/N256 Up with four fragment-correct HC branches and a register fold."""
-
-    @cute.experimental.jit
-    def _up_fragment_prefetch(
-        self,
-        original,
-        weight_scale,
-        activation_scale,
-        residual,
-        scales,
-        coordinates,
-        token_tile,
-        hidden_tile,
-        rows,
-        branch: cutlass.Constexpr,
-    ):
-        count = cute.size(residual, mode=[0])
-        for packet in cutlass.range_constexpr(count // 2):
-            row, col = coordinates[packet * 2]
-            input_row = token_tile * self.up_token_rows + row
-            hidden = hidden_tile * self.up_hidden_tile + col
-            if input_row < rows:
-                source = cute.make_tensor(
-                    cute.make_ptr(
-                        original.element_type,
-                        (
-                            original.iterator
-                            + input_row * self.wide
-                            + branch * self.hidden_size
-                            + hidden
-                        ).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=4,
-                    ),
-                    cute.make_layout(2),
-                )
-                values = cute.make_rmem_tensor(2, original.element_type)
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        original.element_type,
-                        num_bits_per_copy=32,
-                    ),
-                    source,
-                    values,
-                )
-                for j in cutlass.range_constexpr(2):
-                    residual[packet * 2 + j, branch] = values[j]
-                    scales[packet * 2 + j, branch] = (
-                        weight_scale[
-                            (
-                                branch * self.hidden_size + hidden + j
-                                if self.weight_scale_per_channel
-                                else 0
-                            )
-                        ]
-                        * activation_scale[input_row]
-                    )
-
-    @cute.experimental.kernel
-    def up_kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        token_tile = cutlass.Int64(token_tile)
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (self.up_token_rows, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (self.up_token_rows, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        raw = cute_ext.allocate(
-            cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-        )
-        sw = raw
-        if cutlass.const_expr(not native_fp8):
-            sw = cute_ext.allocate(
-                dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-            )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(3 * self.stages + 2),
-            alignment=8,
-        ).iterator
-        full = barriers
-        converted = full + self.stages
-        empty = converted + self.stages
-        done, read_done = (empty + self.stages, empty + self.stages + 1)
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(converted + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(
-                self.up_hidden_tile * self.hc_count, base, is_two_cta=False
-            )
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(
-            activation, (self.up_token_rows, self.k), (token_tile, None, 0)
-        )
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        if warp == self.producer_warp:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                cute_ext.tma_load(
-                    gw[None, None, tile],
-                    raw[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_w,
-                    update_expect_tx=False,
-                )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                ready = full if cutlass.const_expr(native_fp8) else converted
-                cute.arch.mbarrier_wait(ready + stage, tile // self.stages % 2)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base),
-                self.up_hidden_tile * self.hc_count,
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                    source, target = (
-                        raw[None, None, None, stage],
-                        sw[None, None, None, stage],
-                    )
-                    for offset in cutlass.range(
-                        128 * self.k // (self.epilogue_threads * 8), unroll=4
-                    ):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = linear // self.k + linear % self.k * 128
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        raw_values = cute.make_rmem_tensor(8, cutlass.Float8E4M3FN)
-                        converted_values = cute.make_rmem_tensor(8, dtype)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values,
-                        )
-                        converted_values.store(raw_values.load().to(dtype))
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            converted_values,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
-                    if tid == 0:
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            thread_mma = mma.get_slice(0)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            _, _, template, coordinates = self._up_reader(
-                base, fragment.layout, original, tid, 0
-            )
-            count = cute.size(template)
-            ring_slots = 4
-            residual = cute.make_rmem_tensor((count, ring_slots), original.element_type)
-            scales = cute.make_rmem_tensor(
-                (1, 1) if self.shared_up_scales else (count, ring_slots),
-                cutlass.Float32,
-            )
-            residual.fill(0.0)
-            scales.fill(1.0)
-            sums = cute.make_rmem_tensor(count, cutlass.Float32)
-            sums.fill(0.0)
-            first_row, first_col = coordinates[0]
-            global_row = token_tile * self.up_token_rows + first_row
-            hidden = hidden_tile * self.up_hidden_tile + first_col
-            alpha = cutlass.Float32(1.0)
-            if cutlass.const_expr(self.shared_up_scales):
-                scale_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(256),
-                    alignment=32,
-                )
-                if tid < 256:
-                    channel = tid // 64 * self.hidden_size + hidden_tile * 64 + tid % 64
-                    scale_cache[tid] = weight_scale[
-                        channel if self.weight_scale_per_channel else 0
-                    ]
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                if cutlass.const_expr(native_fp8):
-                    if global_row < x.shape[0]:
-                        alpha = activation_scale[global_row]
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    self._up_fragment_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        coordinates,
-                        token_tile,
-                        hidden_tile,
-                        x.shape[0],
-                        branch,
-                    )
-            else:
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-            cute.arch.mbarrier_wait(done, 0)
-            if (
-                tid % 128 // 32 * (self.up_token_rows // 4)
-                < x.shape[0] - token_tile * self.up_token_rows
-            ):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    slot = branch % ring_slots
-                    accumulator, reader, gates, _ = self._up_reader(
-                        base, fragment.layout, original, tid, branch
-                    )
-                    cute_ext.partition_and_copy(reader, accumulator, gates)
-                    cute.arch.fence_view_async_tmem_load()
-                    for i in cutlass.range_constexpr(count):
-                        factor = cutlass.Float32(1.0)
-                        if cutlass.const_expr(self.shared_up_scales):
-                            factor = scale_cache[branch * 64 + first_col + i] * alpha
-                        else:
-                            factor = scales[i, slot]
-                        sums[i] = sums[i] + residual[i, slot].to(
-                            cutlass.Float32
-                        ) * _up_sigmoid_tanh(gates[i] * factor)
-                    if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                        self._up_prefetch(
-                            original,
-                            weight_scale,
-                            activation_scale,
-                            residual,
-                            scales,
-                            global_row,
-                            hidden,
-                            x.shape[0],
-                            branch + ring_slots,
-                            slot,
-                            native_fp8,
-                        )
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for packet in cutlass.range_constexpr(count // 2):
-                    row, col = coordinates[packet * 2]
-                    output_row = token_tile * self.up_token_rows + row
-                    if output_row < x.shape[0]:
-                        packed = cute.make_rmem_tensor(2, out.element_type)
-                        for j in cutlass.range_constexpr(2):
-                            packed[j] = (sums[packet * 2 + j] / self.hc_count).to(
-                                out.element_type
-                            )
-                        target = cute.make_tensor(
-                            cute.make_ptr(
-                                out.element_type,
-                                (
-                                    out.iterator
-                                    + output_row * self.hidden_size
-                                    + hidden_tile * self.up_hidden_tile
-                                    + col
-                                ).toint(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=4,
-                            ),
-                            cute.make_layout(2),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                out.element_type,
-                                num_bits_per_copy=32,
-                            ),
-                            packed,
-                            target,
-                        )
-            elif global_row < x.shape[0]:
-                packed = cute.make_rmem_tensor(count, out.element_type)
-                for i in cutlass.range_constexpr(count):
-                    packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                target = cute.make_tensor(
-                    cute.make_ptr(
-                        out.element_type,
-                        (out.iterator + global_row * self.hidden_size + hidden).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout(count),
-                )
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        out.element_type,
-                        num_bits_per_copy=128,
-                    ),
-                    packed,
-                    target,
-                )
-
-    @cute.experimental.jit
-    def __call__(
-        self,
-        x,
-        weight,
-        original,
-        weight_scale,
-        activation_scale,
-        partials,
-        out,
-        stream: CUstream,
-    ):
-        if cutlass.const_expr(self.role == "mix" and self.token_major_up):
-            self.up_kernel(
-                x, weight, original, weight_scale, activation_scale, out
-            ).launch(
-                grid=(
-                    self.hidden_size // self.up_hidden_tile,
-                    cute.ceil_div(x.shape[0], self.up_token_rows),
-                    1,
-                ),
-                block=(self.epilogue_threads + 64, 1, 1),
-                stream=stream,
-                use_pdl=self.pdl,
-            )
-        else:
-            self.kernel(
-                x, weight, original, weight_scale, activation_scale, partials, out
-            ).launch(
-                grid=(
-                    (
-                        (self.projection_rows + self.m - 1) // self.m
-                        if self.role == "projection"
-                        else self.hidden_size // 32
-                    ),
-                    cute.ceil_div(x.shape[0], self.n),
-                    self.split_k,
-                ),
-                block=(self.epilogue_threads + 64, 1, 1),
-                stream=stream,
-                use_pdl=self.pdl,
-            )
-
-
-class Fp8GatedResidualM64H64CachedS5Up(Fp8GatedResidualM64H64Up):
-    """Native M64/N256 Up with four fragment-correct HC branches and a register fold."""
-
-    @cute.experimental.jit
-    def _up_fragment_prefetch(
-        self,
-        original,
-        weight_scale,
-        activation_scale,
-        residual,
-        scales,
-        coordinates,
-        token_tile,
-        hidden_tile,
-        rows,
-        branch: cutlass.Constexpr,
-    ):
-        count = cute.size(residual, mode=[0])
-        for packet in cutlass.range_constexpr(count // 2):
-            row, col = coordinates[packet * 2]
-            input_row = token_tile * self.up_token_rows + row
-            hidden = hidden_tile * self.up_hidden_tile + col
-            if input_row < rows:
-                source = cute.make_tensor(
-                    cute.make_ptr(
-                        original.element_type,
-                        (
-                            original.iterator
-                            + input_row * self.wide
-                            + branch * self.hidden_size
-                            + hidden
-                        ).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=4,
-                    ),
-                    cute.make_layout(2),
-                )
-                values = cute.make_rmem_tensor(2, original.element_type)
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        original.element_type,
-                        num_bits_per_copy=32,
-                    ),
-                    source,
-                    values,
-                )
-                for j in cutlass.range_constexpr(2):
-                    residual[packet * 2 + j, branch] = values[j]
-                    if cutlass.const_expr(not self.shared_up_scales):
-                        scales[packet * 2 + j, branch] = (
-                            weight_scale[
-                                (
-                                    branch * self.hidden_size + hidden + j
-                                    if self.weight_scale_per_channel
-                                    else 0
-                                )
-                            ]
-                            * activation_scale[input_row]
-                        )
-
-    @cute.experimental.kernel
-    def up_kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        token_tile = cutlass.Int64(token_tile)
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (self.up_token_rows, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (self.up_token_rows, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        raw = cute_ext.allocate(
-            cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-        )
-        sw = raw
-        if cutlass.const_expr(not native_fp8):
-            sw = cute_ext.allocate(
-                dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-            )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(3 * self.stages + 2),
-            alignment=8,
-        ).iterator
-        full = barriers
-        converted = full + self.stages
-        empty = converted + self.stages
-        done, read_done = (empty + self.stages, empty + self.stages + 1)
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(converted + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(
-                self.up_hidden_tile * self.hc_count, base, is_two_cta=False
-            )
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(
-            activation, (self.up_token_rows, self.k), (token_tile, None, 0)
-        )
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        if warp == self.producer_warp:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    cute_ext.tma_load(
-                        gw[None, None, stage],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                cute_ext.tma_load(
-                    gw[None, None, tile],
-                    raw[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_w,
-                    update_expect_tx=False,
-                )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                ready = full if cutlass.const_expr(native_fp8) else converted
-                cute.arch.mbarrier_wait(ready + stage, tile // self.stages % 2)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base),
-                self.up_hidden_tile * self.hc_count,
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                    source, target = (
-                        raw[None, None, None, stage],
-                        sw[None, None, None, stage],
-                    )
-                    for offset in cutlass.range(
-                        128 * self.k // (self.epilogue_threads * 8), unroll=4
-                    ):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = linear // self.k + linear % self.k * 128
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        raw_values = cute.make_rmem_tensor(8, cutlass.Float8E4M3FN)
-                        converted_values = cute.make_rmem_tensor(8, dtype)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values,
-                        )
-                        converted_values.store(raw_values.load().to(dtype))
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            converted_values,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
-                    if tid == 0:
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            thread_mma = mma.get_slice(0)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            _, _, template, coordinates = self._up_reader(
-                base, fragment.layout, original, tid, 0
-            )
-            count = cute.size(template)
-            ring_slots = 4
-            residual = cute.make_rmem_tensor((count, ring_slots), original.element_type)
-            scales = cute.make_rmem_tensor(
-                (1, 1) if self.shared_up_scales else (count, ring_slots),
-                cutlass.Float32,
-            )
-            residual.fill(0.0)
-            scales.fill(1.0)
-            sums = cute.make_rmem_tensor(count, cutlass.Float32)
-            sums.fill(0.0)
-            first_row, first_col = coordinates[0]
-            global_row = token_tile * self.up_token_rows + first_row
-            hidden = hidden_tile * self.up_hidden_tile + first_col
-            alpha = cutlass.Float32(1.0)
-            if cutlass.const_expr(self.shared_up_scales):
-                scale_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(256),
-                    alignment=32,
-                )
-                if tid < 256:
-                    channel = tid // 64 * self.hidden_size + hidden_tile * 64 + tid % 64
-                    scale_cache[tid] = weight_scale[
-                        channel if self.weight_scale_per_channel else 0
-                    ]
-                alpha_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(64),
-                    alignment=32,
-                )
-                if tid < 64:
-                    alpha_cache[tid] = 1.0
-                    if token_tile * self.up_token_rows + tid < x.shape[0]:
-                        alpha_cache[tid] = activation_scale[
-                            token_tile * self.up_token_rows + tid
-                        ]
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                if cutlass.const_expr(native_fp8):
-                    if global_row < x.shape[0]:
-                        alpha = activation_scale[global_row]
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    self._up_fragment_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        coordinates,
-                        token_tile,
-                        hidden_tile,
-                        x.shape[0],
-                        branch,
-                    )
-            else:
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-            cute.arch.mbarrier_wait(done, 0)
-            if (
-                tid % 128 // 32 * (self.up_token_rows // 4)
-                < x.shape[0] - token_tile * self.up_token_rows
-            ):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    slot = branch % ring_slots
-                    accumulator, reader, gates, _ = self._up_reader(
-                        base, fragment.layout, original, tid, branch
-                    )
-                    cute_ext.partition_and_copy(reader, accumulator, gates)
-                    cute.arch.fence_view_async_tmem_load()
-                    for i in cutlass.range_constexpr(count):
-                        factor = cutlass.Float32(1.0)
-                        if cutlass.const_expr(self.shared_up_scales):
-                            # M64 fragments interleave rows; each value uses its own scale coordinates.
-                            factor = (
-                                scale_cache[
-                                    branch * self.up_hidden_tile + coordinates[i][1]
-                                ]
-                                * alpha_cache[coordinates[i][0]]
-                            )
-                        else:
-                            factor = scales[i, slot]
-                        sums[i] = sums[i] + residual[i, slot].to(
-                            cutlass.Float32
-                        ) * _up_sigmoid_tanh(gates[i] * factor)
-                    if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                        self._up_prefetch(
-                            original,
-                            weight_scale,
-                            activation_scale,
-                            residual,
-                            scales,
-                            global_row,
-                            hidden,
-                            x.shape[0],
-                            branch + ring_slots,
-                            slot,
-                            native_fp8,
-                        )
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for packet in cutlass.range_constexpr(count // 2):
-                    row, col = coordinates[packet * 2]
-                    output_row = token_tile * self.up_token_rows + row
-                    if output_row < x.shape[0]:
-                        packed = cute.make_rmem_tensor(2, out.element_type)
-                        for j in cutlass.range_constexpr(2):
-                            packed[j] = (sums[packet * 2 + j] / self.hc_count).to(
-                                out.element_type
-                            )
-                        target = cute.make_tensor(
-                            cute.make_ptr(
-                                out.element_type,
-                                (
-                                    out.iterator
-                                    + output_row * self.hidden_size
-                                    + hidden_tile * self.up_hidden_tile
-                                    + col
-                                ).toint(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=4,
-                            ),
-                            cute.make_layout(2),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                out.element_type,
-                                num_bits_per_copy=32,
-                            ),
-                            packed,
-                            target,
-                        )
-            elif global_row < x.shape[0]:
-                packed = cute.make_rmem_tensor(count, out.element_type)
-                for i in cutlass.range_constexpr(count):
-                    packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                target = cute.make_tensor(
-                    cute.make_ptr(
-                        out.element_type,
-                        (out.iterator + global_row * self.hidden_size + hidden).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout(count),
-                )
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        out.element_type,
-                        num_bits_per_copy=128,
-                    ),
-                    packed,
-                    target,
-                )
-
-
-class Fp8GatedResidualM64H56Up(Fp8GatedResidualM64H64CachedS5Up):
-    """Native M64/H56 Up with padded readers and a bounded H16 hidden tail."""
-
-    @cute.experimental.jit
-    def __call__(
-        self,
-        x,
-        weight,
-        original,
-        weight_scale,
-        activation_scale,
-        partials,
-        out,
-        stream: CUstream,
-    ):
-        self.up_kernel(x, weight, original, weight_scale, activation_scale, out).launch(
-            grid=(
-                cute.ceil_div(self.hidden_size, self.up_hidden_tile),
-                cute.ceil_div(x.shape[0], self.up_token_rows),
-                1,
-            ),
-            block=(self.epilogue_threads + 64, 1, 1),
-            stream=stream,
-            use_pdl=self.pdl,
-        )
-
-    @cute.experimental.jit
-    def _up_reader(self, base, layout, original, tid, branch: cutlass.Constexpr):
-        tile = (self.up_token_rows, 16)
-        group = tid // 128
-        accumulator = cute.make_tensor(
-            cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), layout
-        )[(None, None), 0, 0]
-        # Padding each reader to16 columns preserves vector loads at H56.
-        column = branch * self.up_hidden_tile + group * 16
-        accumulator = cute.make_tensor(
-            accumulator.iterator + accumulator.layout((0, column)),
-            cute.make_layout(
-                (cute.shape(accumulator, mode=[0]), 16),
-                stride=(accumulator.stride[0], accumulator.stride[1]),
-            ),
-        )
-        coordinates = cute.local_tile(
-            cute.make_identity_tensor((self.up_token_rows, 64)), tile, (0, group)
-        )
-        copy = tcgen05.make_tmem_copy(
-            sm100_utils.get_tmem_load_op(
-                (self.up_token_rows, self.up_hidden_tile * self.hc_count, self.k),
-                cute_utils.LayoutEnum.COL_MAJOR,
-                cutlass.Float32,
-                cutlass.Float32,
-                tile,
-                False,
-            ),
-            accumulator,
-        )
-        reader = copy.get_slice(tid % 128)
-        dummy = cute.make_tensor(
-            original.iterator, cute.make_layout(tile, stride=(1, self.up_token_rows))
-        )
-        values = cute_ext.allocate(
-            cutlass.Float32,
-            cute.AddressSpace.rmem,
-            cute_ext.make_t2r_rmem_layout(
-                copy, cute.flat_divide(dummy, tile), tid % 128
-            ),
-            alignment=32,
-        )
-        return (accumulator, reader, values, reader.partition_D(coordinates))
-
-    @cute.experimental.jit
-    def _up_fragment_prefetch(
-        self,
-        original,
-        weight_scale,
-        activation_scale,
-        residual,
-        scales,
-        coordinates,
-        token_tile,
-        hidden_tile,
-        rows,
-        branch: cutlass.Constexpr,
-    ):
-        count = cute.size(residual, mode=[0])
-        for packet in cutlass.range_constexpr(count // 2):
-            row, col = coordinates[packet * 2]
-            input_row = token_tile * self.up_token_rows + row
-            hidden = hidden_tile * self.up_hidden_tile + col
-            if (
-                input_row < rows
-                and col < self.up_hidden_tile
-                and (hidden < self.hidden_size)
-            ):
-                source = cute.make_tensor(
-                    cute.make_ptr(
-                        original.element_type,
-                        (
-                            original.iterator
-                            + input_row * self.wide
-                            + branch * self.hidden_size
-                            + hidden
-                        ).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=4,
-                    ),
-                    cute.make_layout(2),
-                )
-                values = cute.make_rmem_tensor(2, original.element_type)
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        original.element_type,
-                        num_bits_per_copy=32,
-                    ),
-                    source,
-                    values,
-                )
-                for j in cutlass.range_constexpr(2):
-                    residual[packet * 2 + j, branch] = values[j]
-                    if cutlass.const_expr(not self.shared_up_scales):
-                        scales[packet * 2 + j, branch] = (
-                            weight_scale[
-                                (
-                                    branch * self.hidden_size + hidden + j
-                                    if self.weight_scale_per_channel
-                                    else 0
-                                )
-                            ]
-                            * activation_scale[input_row]
-                        )
-
-    @cute.experimental.kernel
-    def up_kernel(self, x, weight, original, weight_scale, activation_scale, out):
-        tid = cute.arch.thread_idx()[0]
-        warp = cute.arch.make_warp_uniform(tid // 32)
-        hidden_tile, token_tile, _ = cute.arch.block_idx()
-        token_tile = cutlass.Int64(token_tile)
-        dtype = x.element_type
-        native_fp8 = cutlass.const_expr(dtype == cutlass.Float8E4M3FN)
-        mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (self.up_token_rows, self.up_hidden_tile * self.hc_count),
-        )
-        tiler = (self.up_token_rows, self.up_hidden_tile * self.hc_count, self.k)
-        activation_layout = sm100_utils.make_smem_layout_a(
-            mma, tiler, dtype, self.stages
-        )
-        raw_layout = sm100_utils.make_smem_layout_b(
-            mma, tiler, cutlass.Float8E4M3FN, self.stages
-        )
-        weight_layout = sm100_utils.make_smem_layout_b(mma, tiler, dtype, self.stages)
-        sx = cute_ext.allocate(
-            dtype, cute.AddressSpace.smem, activation_layout, alignment=1024
-        )
-        raw = cute_ext.allocate(
-            cutlass.Float8E4M3FN, cute.AddressSpace.smem, raw_layout, alignment=1024
-        )
-        sw = raw
-        if cutlass.const_expr(not native_fp8):
-            sw = cute_ext.allocate(
-                dtype, cute.AddressSpace.smem, weight_layout, alignment=1024
-            )
-        barriers = cute_ext.allocate(
-            cutlass.Int64,
-            cute.AddressSpace.smem,
-            cute.make_layout(3 * self.stages + 2),
-            alignment=8,
-        ).iterator
-        full = barriers
-        converted = full + self.stages
-        empty = converted + self.stages
-        done, read_done = (empty + self.stages, empty + self.stages + 1)
-        base = cute_ext.allocate(
-            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
-        ).iterator
-        if warp == self.mma_warp:
-            with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(converted + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
-            cute.arch.alloc_tmem(256, base, is_two_cta=False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
-        activation = cute.make_tensor(
-            x.iterator,
-            cute.make_layout(
-                (x.shape[0], (64, self.inner // 64), 1), stride=(self.inner, (1, 64), 0)
-            ),
-        )
-        weights = cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (
-                        self.up_hidden_tile,
-                        self.hc_count,
-                        self.hidden_size // self.up_hidden_tile,
-                    ),
-                    (64, self.inner // 64),
-                    1,
-                ),
-                stride=(
-                    (
-                        self.inner,
-                        self.hidden_size * self.inner,
-                        self.up_hidden_tile * self.inner,
-                    ),
-                    (1, 64),
-                    0,
-                ),
-            ),
-        )
-        gx = cute.local_tile(
-            activation, (self.up_token_rows, self.k), (token_tile, None, 0)
-        )
-        gw = cute.local_tile(
-            weights,
-            (self.up_hidden_tile * self.hc_count, self.k),
-            (hidden_tile, None, 0),
-        )
-        map_x = cute_ext.get_cta_v_map_ab(activation, tiler, mma, "A")
-        map_w = cute_ext.get_cta_v_map_ab(weights, tiler, mma, "B")
-        tail_weights = cute.make_tensor(
-            weight.iterator
-            + self.hidden_size
-            // self.up_hidden_tile
-            * self.up_hidden_tile
-            * self.inner,
-            cute.make_layout(
-                (
-                    self.hidden_size % self.up_hidden_tile,
-                    (64, self.inner // 64),
-                    self.hc_count,
-                ),
-                stride=(self.inner, (1, 64), self.hidden_size * self.inner),
-            ),
-        )
-        tail_mma = sm100_utils.make_trivial_tiled_mma(
-            dtype,
-            dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (self.up_token_rows, self.up_hidden_tile),
-        )
-        tail_tiler = (self.up_token_rows, self.up_hidden_tile, self.k)
-        tail_layout = sm100_utils.make_smem_layout_b(tail_mma, tail_tiler, dtype, 1)
-        tail_map = cute_ext.get_cta_v_map_ab(tail_weights, tail_tiler, tail_mma, "B")
-        tail_gw = cute.local_tile(
-            tail_weights, (self.up_hidden_tile, self.k), (0, None, None)
-        )
-        if warp == self.producer_warp:
-            for stage in cutlass.range_constexpr(self.stages):
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                if cutlass.const_expr(self.weights_independent):
-                    if hidden_tile < self.hidden_size // self.up_hidden_tile:
-                        cute_ext.tma_load(
-                            gw[None, None, stage],
-                            raw[None, None, None, stage],
-                            (full + stage).value,
-                            cta_v_map=map_w,
-                            update_expect_tx=False,
-                        )
-                    else:
-                        for branch in cutlass.range_constexpr(self.hc_count):
-                            tail_dst = cute.make_tensor(
-                                cute.recast_ptr(
-                                    raw.iterator
-                                    + stage
-                                    * self.up_hidden_tile
-                                    * self.hc_count
-                                    * self.k
-                                    + branch * self.up_hidden_tile * self.k,
-                                    swizzle_=cute.get_swizzle_portion(tail_layout),
-                                    dtype=dtype,
-                                ),
-                                cute.get_nonswizzle_portion(tail_layout),
-                            )
-                            cute_ext.tma_load(
-                                tail_gw[None, None, stage, branch],
-                                tail_dst[None, None, None, 0],
-                                (full + stage).value,
-                                cta_v_map=tail_map,
-                                update_expect_tx=False,
-                            )
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-                cute.arch.griddepcontrol_launch_dependents()
-            for stage in cutlass.range_constexpr(self.stages):
-                if cutlass.const_expr(not self.weights_independent):
-                    if hidden_tile < self.hidden_size // self.up_hidden_tile:
-                        cute_ext.tma_load(
-                            gw[None, None, stage],
-                            raw[None, None, None, stage],
-                            (full + stage).value,
-                            cta_v_map=map_w,
-                            update_expect_tx=False,
-                        )
-                    else:
-                        for branch in cutlass.range_constexpr(self.hc_count):
-                            tail_dst = cute.make_tensor(
-                                cute.recast_ptr(
-                                    raw.iterator
-                                    + stage
-                                    * self.up_hidden_tile
-                                    * self.hc_count
-                                    * self.k
-                                    + branch * self.up_hidden_tile * self.k,
-                                    swizzle_=cute.get_swizzle_portion(tail_layout),
-                                    dtype=dtype,
-                                ),
-                                cute.get_nonswizzle_portion(tail_layout),
-                            )
-                            cute_ext.tma_load(
-                                tail_gw[None, None, stage, branch],
-                                tail_dst[None, None, None, 0],
-                                (full + stage).value,
-                                cta_v_map=tail_map,
-                                update_expect_tx=False,
-                            )
-                cute_ext.tma_load(
-                    gx[None, None, stage],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        full + stage,
-                        self.up_hidden_tile * self.hc_count * self.k
-                        + self.up_token_rows * self.k * (dtype.width // 8),
-                    )
-                if hidden_tile < self.hidden_size // self.up_hidden_tile:
-                    cute_ext.tma_load(
-                        gw[None, None, tile],
-                        raw[None, None, None, stage],
-                        (full + stage).value,
-                        cta_v_map=map_w,
-                        update_expect_tx=False,
-                    )
-                else:
-                    for branch in cutlass.range_constexpr(self.hc_count):
-                        tail_dst = cute.make_tensor(
-                            cute.recast_ptr(
-                                raw.iterator
-                                + stage * self.up_hidden_tile * self.hc_count * self.k
-                                + branch * self.up_hidden_tile * self.k,
-                                swizzle_=cute.get_swizzle_portion(tail_layout),
-                                dtype=dtype,
-                            ),
-                            cute.get_nonswizzle_portion(tail_layout),
-                        )
-                        cute_ext.tma_load(
-                            tail_gw[None, None, tile, branch],
-                            tail_dst[None, None, None, 0],
-                            (full + stage).value,
-                            cta_v_map=tail_map,
-                            update_expect_tx=False,
-                        )
-                cute_ext.tma_load(
-                    gx[None, None, tile],
-                    sx[None, None, None, stage],
-                    (full + stage).value,
-                    cta_v_map=map_x,
-                    update_expect_tx=False,
-                )
-        elif warp == self.mma_warp:
-            thread_mma = mma.get_slice(0)
-            a_desc = thread_mma.make_fragment_A(sx)
-            b_desc = thread_mma.make_fragment_B(sw)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            accumulator = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), fragment.layout
-            )
-            mma.set(tcgen05.Field.ACCUMULATE, False)
-            for tile in cutlass.range(self.tiles, unroll=1):
-                stage = tile % self.stages
-                ready = full if cutlass.const_expr(native_fp8) else converted
-                cute.arch.mbarrier_wait(ready + stage, tile // self.stages % 2)
-                for block in cutlass.range_constexpr(cute.size(a_desc, mode=[2])):
-                    cute.gemm(
-                        mma,
-                        accumulator,
-                        a_desc[None, None, block, stage],
-                        b_desc[None, None, block, stage],
-                        accumulator,
-                    )
-                    mma.set(tcgen05.Field.ACCUMULATE, True)
-                with cute.arch.elect_one():
-                    tcgen05.commit(empty + stage, None, tcgen05.CtaGroup.ONE)
-            with cute.arch.elect_one():
-                tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-            cute.arch.mbarrier_wait(read_done, 0)
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                cute.arch.retrieve_tmem_ptr(cutlass.Float32, 16, base), 256
-            )
-        elif tid < self.epilogue_threads:
-            if cutlass.const_expr(not native_fp8):
-                for tile in cutlass.range(self.tiles, unroll=1):
-                    stage = tile % self.stages
-                    cute.arch.mbarrier_wait(full + stage, tile // self.stages % 2)
-                    source, target = (
-                        raw[None, None, None, stage],
-                        sw[None, None, None, stage],
-                    )
-                    for offset in cutlass.range(
-                        128 * self.k // (self.epilogue_threads * 8), unroll=4
-                    ):
-                        linear = (tid + offset * self.epilogue_threads) * 8
-                        index = linear // self.k + linear % self.k * 128
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (source.iterator + source.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=8,
-                                swizzle_=cute.get_swizzle_portion(raw_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        dst = cute.make_tensor(
-                            cute.make_ptr(
-                                dtype,
-                                (target.iterator + target.layout(index)).toint(),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                                swizzle_=cute.get_swizzle_portion(weight_layout),
-                            ),
-                            cute.make_layout(8),
-                        )
-                        raw_values = cute.make_rmem_tensor(8, cutlass.Float8E4M3FN)
-                        converted_values = cute.make_rmem_tensor(8, dtype)
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                cutlass.Float8E4M3FN,
-                                num_bits_per_copy=64,
-                            ),
-                            src,
-                            raw_values,
-                        )
-                        converted_values.store(raw_values.load().to(dtype))
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                dtype,
-                                num_bits_per_copy=128,
-                            ),
-                            converted_values,
-                            dst,
-                        )
-                    cute.arch.fence_view_async_shared()
-                    _epilogue_barrier(self.epilogue_threads, cutlass.Int32(1))
-                    if tid == 0:
-                        cute.arch.mbarrier_arrive(converted + stage)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_wait()
-            thread_mma = mma.get_slice(0)
-            fragment = thread_mma.make_fragment_C(
-                mma.partition_shape_C(
-                    (self.up_token_rows, self.up_hidden_tile * self.hc_count)
-                )
-            )
-            _, _, template, coordinates = self._up_reader(
-                base, fragment.layout, original, tid, 0
-            )
-            count = cute.size(template)
-            ring_slots = 4
-            residual = cute.make_rmem_tensor((count, ring_slots), original.element_type)
-            scales = cute.make_rmem_tensor(
-                (1, 1) if self.shared_up_scales else (count, ring_slots),
-                cutlass.Float32,
-            )
-            residual.fill(0.0)
-            scales.fill(1.0)
-            sums = cute.make_rmem_tensor(count, cutlass.Float32)
-            sums.fill(0.0)
-            first_row, first_col = coordinates[0]
-            global_row = token_tile * self.up_token_rows + first_row
-            hidden = hidden_tile * self.up_hidden_tile + first_col
-            alpha = cutlass.Float32(1.0)
-            if cutlass.const_expr(self.shared_up_scales):
-                scale_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(256),
-                    alignment=32,
-                )
-                if tid < 256:
-                    scale_cache[tid] = 1.0
-                    if tid < self.up_hidden_tile * self.hc_count:
-                        channel = (
-                            tid // self.up_hidden_tile * self.hidden_size
-                            + hidden_tile * self.up_hidden_tile
-                            + tid % self.up_hidden_tile
-                        )
-                        if (
-                            hidden_tile * self.up_hidden_tile
-                            + tid % self.up_hidden_tile
-                            < self.hidden_size
-                        ):
-                            scale_cache[tid] = weight_scale[
-                                channel if self.weight_scale_per_channel else 0
-                            ]
-                alpha_cache = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(64),
-                    alignment=32,
-                )
-                if tid < 64:
-                    alpha_cache[tid] = 1.0
-                    if token_tile * self.up_token_rows + tid < x.shape[0]:
-                        alpha_cache[tid] = activation_scale[
-                            token_tile * self.up_token_rows + tid
-                        ]
-                _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                if cutlass.const_expr(native_fp8):
-                    if global_row < x.shape[0]:
-                        alpha = activation_scale[global_row]
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    self._up_fragment_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        coordinates,
-                        token_tile,
-                        hidden_tile,
-                        x.shape[0],
-                        branch,
-                    )
-            else:
-                for branch in cutlass.range_constexpr(ring_slots):
-                    self._up_prefetch(
-                        original,
-                        weight_scale,
-                        activation_scale,
-                        residual,
-                        scales,
-                        global_row,
-                        hidden,
-                        x.shape[0],
-                        branch,
-                        branch,
-                        native_fp8,
-                    )
-            cute.arch.mbarrier_wait(done, 0)
-            if (
-                tid % 128 // 32 * (self.up_token_rows // 4)
-                < x.shape[0] - token_tile * self.up_token_rows
-            ):
-                for branch in cutlass.range_constexpr(self.hc_count):
-                    slot = branch % ring_slots
-                    accumulator, reader, gates, _ = self._up_reader(
-                        base, fragment.layout, original, tid, branch
-                    )
-                    cute_ext.partition_and_copy(reader, accumulator, gates)
-                    cute.arch.fence_view_async_tmem_load()
-                    for i in cutlass.range_constexpr(count):
-                        factor = cutlass.Float32(1.0)
-                        if cutlass.const_expr(self.shared_up_scales):
-                            factor = (
-                                scale_cache[
-                                    branch * self.up_hidden_tile + coordinates[i][1]
-                                ]
-                                * alpha_cache[coordinates[i][0]]
-                            )
-                        else:
-                            factor = scales[i, slot]
-                        sums[i] = sums[i] + residual[i, slot].to(
-                            cutlass.Float32
-                        ) * _up_sigmoid_tanh(gates[i] * factor)
-                    if cutlass.const_expr(branch + ring_slots < self.hc_count):
-                        self._up_prefetch(
-                            original,
-                            weight_scale,
-                            activation_scale,
-                            residual,
-                            scales,
-                            global_row,
-                            hidden,
-                            x.shape[0],
-                            branch + ring_slots,
-                            slot,
-                            native_fp8,
-                        )
-            tcgen05_fence("before_thread_sync")
-            cute.arch.mbarrier_arrive(read_done)
-            if cutlass.const_expr(self.up_token_rows == 64):
-                for packet in cutlass.range_constexpr(count // 2):
-                    row, col = coordinates[packet * 2]
-                    output_row = token_tile * self.up_token_rows + row
-                    if (
-                        output_row < x.shape[0]
-                        and col < self.up_hidden_tile
-                        and (hidden_tile * self.up_hidden_tile + col < self.hidden_size)
-                    ):
-                        packed = cute.make_rmem_tensor(2, out.element_type)
-                        for j in cutlass.range_constexpr(2):
-                            packed[j] = (sums[packet * 2 + j] / self.hc_count).to(
-                                out.element_type
-                            )
-                        target = cute.make_tensor(
-                            cute.make_ptr(
-                                out.element_type,
-                                (
-                                    out.iterator
-                                    + output_row * self.hidden_size
-                                    + hidden_tile * self.up_hidden_tile
-                                    + col
-                                ).toint(),
-                                cute.AddressSpace.gmem,
-                                assumed_align=4,
-                            ),
-                            cute.make_layout(2),
-                        )
-                        cute.copy(
-                            cute.make_copy_atom(
-                                cute.nvgpu.CopyUniversalOp(),
-                                out.element_type,
-                                num_bits_per_copy=32,
-                            ),
-                            packed,
-                            target,
-                        )
-            elif global_row < x.shape[0]:
-                packed = cute.make_rmem_tensor(count, out.element_type)
-                for i in cutlass.range_constexpr(count):
-                    packed[i] = (sums[i] / self.hc_count).to(out.element_type)
-                target = cute.make_tensor(
-                    cute.make_ptr(
-                        out.element_type,
-                        (out.iterator + global_row * self.hidden_size + hidden).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout(count),
-                )
-                cute.copy(
-                    cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        out.element_type,
-                        num_bits_per_copy=128,
-                    ),
-                    packed,
-                    target,
-                )
-
-
 from cutlass.experimental.primitives import Tcgen05InstrDesc
 
 
@@ -10204,8 +6263,31 @@ class Fp8GatedResidualM32WeightStationaryUp(Fp8GatedResidualGemm):
                         scales[i, slot] = scales[i, slot] * activation_scale[row]
 
 
-class Fp8GatedResidualM64H32IndependentAUp(Fp8GatedResidualM64H56Up):
+class Fp8GatedResidualM64H32IndependentAUp(Fp8GatedResidualGemm):
     """Use A256/two-stage and B128/four-stage operand rings."""
+
+    @cute.experimental.jit
+    def __call__(
+        self,
+        x,
+        weight,
+        original,
+        weight_scale,
+        activation_scale,
+        partials,
+        out,
+        stream: CUstream,
+    ):
+        self.up_kernel(x, weight, original, weight_scale, activation_scale, out).launch(
+            grid=(
+                cute.ceil_div(self.hidden_size, self.up_hidden_tile),
+                cute.ceil_div(x.shape[0], self.up_token_rows),
+                1,
+            ),
+            block=(self.epilogue_threads + 64, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
+        )
 
     @cute.experimental.jit
     def _up_reader(self, base, layout, original, tid, branch: cutlass.Constexpr):
@@ -10249,6 +6331,68 @@ class Fp8GatedResidualM64H32IndependentAUp(Fp8GatedResidualM64H56Up):
             alignment=32,
         )
         return (accumulator, reader, values, reader.partition_D(coordinates))
+
+    @cute.experimental.jit
+    def _up_fragment_prefetch(
+        self,
+        original,
+        weight_scale,
+        activation_scale,
+        residual,
+        scales,
+        coordinates,
+        token_tile,
+        hidden_tile,
+        rows,
+        branch: cutlass.Constexpr,
+    ):
+        count = cute.size(residual, mode=[0])
+        for packet in cutlass.range_constexpr(count // 2):
+            row, col = coordinates[packet * 2]
+            input_row = token_tile * self.up_token_rows + row
+            hidden = hidden_tile * self.up_hidden_tile + col
+            if (
+                input_row < rows
+                and col < self.up_hidden_tile
+                and (hidden < self.hidden_size)
+            ):
+                source = cute.make_tensor(
+                    cute.make_ptr(
+                        original.element_type,
+                        (
+                            original.iterator
+                            + input_row * self.wide
+                            + branch * self.hidden_size
+                            + hidden
+                        ).toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    ),
+                    cute.make_layout(2),
+                )
+                values = cute.make_rmem_tensor(2, original.element_type)
+                cute.copy(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(),
+                        original.element_type,
+                        num_bits_per_copy=32,
+                    ),
+                    source,
+                    values,
+                )
+                for j in cutlass.range_constexpr(2):
+                    residual[packet * 2 + j, branch] = values[j]
+                    if cutlass.const_expr(not self.shared_up_scales):
+                        scales[packet * 2 + j, branch] = (
+                            weight_scale[
+                                (
+                                    branch * self.hidden_size + hidden + j
+                                    if self.weight_scale_per_channel
+                                    else 0
+                                )
+                            ]
+                            * activation_scale[input_row]
+                        )
 
     @cute.experimental.kernel
     def up_kernel(self, x, weight, original, weight_scale, activation_scale, out):
@@ -10545,7 +6689,6 @@ class Fp8GatedResidualM64H32IndependentAUp(Fp8GatedResidualM64H56Up):
             first_row, first_col = coordinates[0]
             global_row = token_tile * self.up_token_rows + first_row
             hidden = hidden_tile * self.up_hidden_tile + first_col
-            alpha = cutlass.Float32(1.0)
             if cutlass.const_expr(self.shared_up_scales):
                 scale_cache = cute_ext.allocate(
                     cutlass.Float32,
@@ -10582,9 +6725,6 @@ class Fp8GatedResidualM64H32IndependentAUp(Fp8GatedResidualM64H56Up):
                             token_tile * self.up_token_rows + tid
                         ]
                 _epilogue_barrier(self.epilogue_threads, cutlass.Int32(3))
-                if cutlass.const_expr(native_fp8):
-                    if global_row < x.shape[0]:
-                        alpha = activation_scale[global_row]
             if cutlass.const_expr(self.up_token_rows == 64):
                 for branch in cutlass.range_constexpr(self.hc_count):
                     self._up_fragment_prefetch(

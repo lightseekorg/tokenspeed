@@ -26,19 +26,19 @@ import cutlass.utils as cute_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cuda.bindings.driver import CUstream
 from cutlass.cute import experimental as cute_ext
-from cutlass.cute.nvgpu import CopyUniversalOp, tcgen05
+from cutlass.cute.nvgpu import tcgen05
 from cutlass.experimental.primitives import tcgen05_fence
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _acquire,
     _commit_residual,
     _copy_residual_16,
     _decode_residual,
+    _has_full_up_tiles,
     _hidden_major_reader,
     _invalidate,
     _load_f32,
     _make_down_operands,
     _operand_at,
-    _operand_storage,
     _prefetch_branch_residual,
     _reduce_split_partials,
     _release,
@@ -275,11 +275,12 @@ class Fp8FusedGatedResidualKernel:
         self.down_per_channel = down_per_channel
         self.up_per_channel = up_per_channel
         self.threads = 576
-        self.up_hidden = 64 if r == 1024 else 32
+        full_up_tiles = _has_full_up_tiles(r)
+        self.up_hidden = 64 if full_up_tiles else 32
         self.up_channels = self.up_hidden * g
         self.up_parts = 2 if token_bucket == 256 else 1
         # Small narrow tiles avoid padding tokens to the native M128 reader.
-        self.token_major_up = r == 1024 or token_bucket == 256
+        self.token_major_up = full_up_tiles or token_bucket == 256
         self.up_rows = (
             min(128, max(64, token_bucket)) if self.token_major_up else token_bucket
         )
@@ -291,7 +292,7 @@ class Fp8FusedGatedResidualKernel:
         self.hidden_reader_columns = min(32, token_bucket // 4)
         self.hidden_reader_passes = 1
         self.reader_columns = self.up_hidden // 4
-        self.up_k = 128 if r == 1024 else 64
+        self.up_k = 128 if full_up_tiles else 64
         self.up_stages = 3
         self.up_tiles = r // self.up_k
         self.up_tail_tiles = self.up_stages if self.up_parts == 2 else 0
@@ -302,11 +303,11 @@ class Fp8FusedGatedResidualKernel:
             * self.up_stages
         )
         self.up_barrier_count = 2 * self.up_stages + self.up_parts + 1
-        self.splits = 8 if r == 1024 else 16
-        down_k = (512 if token_bucket == 16 else 256) if r == 1024 else 128
+        self.splits = 8 if full_up_tiles else 16
+        down_k = (512 if token_bucket == 16 else 256) if full_up_tiles else 128
         if token_bucket >= 128:
-            down_k = 256 if r == 1024 else 128
-        down_stages = 2 if r == 1024 and token_bucket == 256 else 3
+            down_k = 256 if full_up_tiles else 128
+        down_stages = 2 if full_up_tiles and token_bucket == 256 else 3
         down_epilogue_threads = 256 if token_bucket == 16 else 512
         self.down = _DownPhase(
             role="projection",
@@ -673,7 +674,9 @@ class Fp8FusedGatedResidualKernel:
             residual_tile = cute_ext.allocate(
                 cutlass.Float8E4M3FN,
                 cute.AddressSpace.smem,
-                cute.make_layout((self.up_rows, 128), stride=(128, 1)),
+                cute.make_layout(
+                    (self.up_rows, self.up_channels), stride=(self.up_channels, 1)
+                ),
                 alignment=16,
             )
         dtype = cutlass.Float8E4M3FN
@@ -947,20 +950,22 @@ class Fp8FusedGatedResidualKernel:
                 tcgen05_fence("before_thread_sync")
                 cute.arch.mbarrier_arrive(read_done)
             else:
+                tile_bytes = self.up_rows * self.up_channels
+                copy_bytes = 512 * 16
                 for copy_slice in cutlass.range_constexpr(
-                    (self.up_rows * 128 + 8191) // 8192
+                    (tile_bytes + copy_bytes - 1) // copy_bytes
                 ):
-                    linear = tid * 16 + copy_slice * 8192
-                    if linear < self.up_rows * 128:
-                        local_row = linear // 128
-                        channel = linear % 128
+                    linear = tid * 16 + copy_slice * copy_bytes
+                    if linear < tile_bytes:
+                        local_row = linear // self.up_channels
+                        channel = linear % self.up_channels
                         global_row = global_base + cutlass.Int64(local_row)
                         source = (
                             x.iterator
                             + global_row * (self.g * self.h)
-                            + (channel // 32) * self.h
-                            + hidden_tile * 32
-                            + channel % 32
+                            + (channel // self.up_hidden) * self.h
+                            + hidden_tile * self.up_hidden
+                            + channel % self.up_hidden
                         )
                         size = cutlass.Int32(0)
                         if global_row < x.shape[0]:
@@ -978,8 +983,12 @@ class Fp8FusedGatedResidualKernel:
                         input_scale = _x_scale(xs, global_row)
                     cached[tid] = activation_scale
                     cached[self.up_rows + tid] = input_scale
-                if tid < 128:
-                    channel = (tid // 32) * self.h + hidden_tile * 32 + tid % 32
+                if tid < self.up_channels:
+                    channel = (
+                        (tid // self.up_hidden) * self.h
+                        + hidden_tile * self.up_hidden
+                        + tid % self.up_hidden
+                    )
                     cached[2 * self.up_rows + tid] = ws[
                         channel if self.up_per_channel else 0
                     ]
@@ -991,7 +1000,9 @@ class Fp8FusedGatedResidualKernel:
                         cute.AddressSpace.smem,
                         assumed_align=1024,
                     ),
-                    cute.make_layout((self.up_rows, 128), stride=(128, 1)),
+                    cute.make_layout(
+                        (self.up_rows, self.up_channels), stride=(self.up_channels, 1)
+                    ),
                 )
                 for token_slice in cutlass.range_constexpr(self.hidden_reader_passes):
                     acc, reader, values, coords = self._hidden_reader(
@@ -1015,16 +1026,20 @@ class Fp8FusedGatedResidualKernel:
                         cute.AddressSpace.smem,
                         assumed_align=1024,
                     ),
-                    cute.make_layout((self.up_rows, 128), stride=(128, 1)),
+                    cute.make_layout(
+                        (self.up_rows, self.up_channels), stride=(self.up_channels, 1)
+                    ),
                 )
-                col = tid % 32
-                hidden = hidden_tile * 32 + col
+                col = tid % self.up_hidden
+                hidden = hidden_tile * self.up_hidden + col
                 scales = cute.make_rmem_tensor(self.g, cutlass.Float32)
                 for branch in cutlass.range_constexpr(self.g):
                     channel = branch * self.h + hidden
-                    scales[branch] = cached[2 * self.up_rows + branch * 32 + col]
+                    scales[branch] = cached[
+                        2 * self.up_rows + branch * self.up_hidden + col
+                    ]
                 for row_part in cutlass.range_constexpr(self.up_rows // 16):
-                    row = tid // 32 + row_part * 16
+                    row = tid // self.up_hidden + row_part * (512 // self.up_hidden)
                     global_row = global_base + cutlass.Int64(row)
                     if global_row < x.shape[0]:
                         activation_scale = cached[row]
@@ -1032,10 +1047,10 @@ class Fp8FusedGatedResidualKernel:
                         total = cutlass.Float32(0.0)
                         for branch in cutlass.range_constexpr(self.g):
                             channel = branch * self.h + hidden
-                            gate = gates[row, branch * 32 + col]
+                            gate = gates[row, branch * self.up_hidden + col]
                             factor = activation_scale * scales[branch]
                             residual = (
-                                residual_tile[row, branch * 32 + col].to(
+                                residual_tile[row, branch * self.up_hidden + col].to(
                                     cutlass.Float32
                                 )
                                 * input_scale
