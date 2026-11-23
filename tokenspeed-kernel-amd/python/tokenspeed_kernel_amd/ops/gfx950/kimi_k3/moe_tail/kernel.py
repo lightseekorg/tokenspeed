@@ -78,6 +78,7 @@ from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.next_mix import (
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.oproj import (
     rearm_ar,
     stage_oproj,
+    stage_oproj_third,
     stage_reduce,
 )
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.projections import (
@@ -301,8 +302,15 @@ def gluon_kimi_k3_moe_tail_gfx950(
                 (epoch, own, peers, rank, FLAGS_OFFSET, 8),
             )
     if bid < 56:
+        if bid < 48:
+            # The third round of output groups, ahead of this workgroup's
+            # wait for their reduction: no workgroup runs more than two.
+            stage_oproj_third(
+                core, w_o, xl, red, regions, rank, bid + 400, S,
+                gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+            )
         preloads = slice_loads(
-            prefix_in, blocks, ares_nw, ares_qk, bid, blk_sm, blk_sr, S, NB
+            prefix_in, blocks, ares_nw, ares_qk, in_nw, bid, blk_sm, blk_sr, S, NB
         )
         stage_reduce(ar_own, delta, bid, epoch, own, peers, rank, S, FLAGS_OFFSET)
         stage_slice_delta(
@@ -326,7 +334,7 @@ def gluon_kimi_k3_moe_tail_gfx950(
             scratch + XRDY,
             vals,
             red,
-            in_nw,
+            preloads[4],
             (scratch + XROW).to(gl.pointer_type(gl.bfloat16)),
             bid,
             tag,
