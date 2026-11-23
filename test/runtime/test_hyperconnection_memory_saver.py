@@ -41,15 +41,35 @@ def _ordinary_bytes() -> int:
     )
 
 
-def _check_mix_workspaces_survive_release() -> None:
-    """Release and resume warmed and later-grown fused mix workspaces on CUDA."""
+def _segment_pools(pointers: list[int]) -> set[tuple[int, int]]:
+    """Allocator pool ids of the segments holding ``pointers`` on this device."""
+    pools = set()
+    for segment in torch.cuda.memory_snapshot():
+        if segment["device"] != torch.cuda.current_device():
+            continue
+        first = segment["address"]
+        last = first + segment["total_size"]
+        if any(first <= pointer < last for pointer in pointers):
+            pools.add(tuple(segment["segment_pool_id"]))
+    return pools
+
+
+def _check_mix_workspaces_survive_release(
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    phases: tuple[tuple[int, bool, bool], ...],
+) -> None:
+    """Release and resume eager-grown and warmed fused mix workspaces on CUDA."""
     from tokenspeed_kernel.ops.residual import cute_fused
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.selection import kernel_override
 
     from tokenspeed.runtime.layers.hyperconnection import (
         GatedResidualSimple,
         HyperConnectionConfig,
+        register_workspace_region,
     )
     from tokenspeed.runtime.utils.env import global_server_args_dict
     from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
@@ -58,61 +78,93 @@ def _check_mix_workspaces_survive_release() -> None:
 
     global_server_args_dict["enable_memory_saver"] = True
     saver = TorchMemorySaverAdapter.create(enable=True)
-    config = HyperConnectionConfig(hc_count=4, hidden_size=2560, hc_lowrank=320)
+    # The executor registers the process's workspace region through the same call.
+    register_workspace_region(saver)
+    config = HyperConnectionConfig(
+        hc_count=hc_count, hidden_size=hidden_size, hc_lowrank=lowrank
+    )
+    wide = hc_count * hidden_size
+    projection_rows = lowrank + hc_count
     # Backed-up weights let resumed forwards reuse the loaded parameters.
     with saver.region(tag="weights", enable_cpu_backup=True), torch.device("cuda"):
         mixer = GatedResidualSimple(config).to(torch.bfloat16)
         generator = torch.Generator(device="cuda").manual_seed(83)
         projection = (
-            torch.randn(324, 10240, dtype=torch.bfloat16, generator=generator) * 0.01
+            torch.randn(
+                projection_rows, wide, dtype=torch.bfloat16, generator=generator
+            )
+            * 0.01
         )
-        up = torch.randn(10240, 320, dtype=torch.bfloat16, generator=generator) * 0.01
+        up = (
+            torch.randn(wide, lowrank, dtype=torch.bfloat16, generator=generator) * 0.01
+        )
         param = mixer.mix_inject_proj.weight
-        param.weight_loader(param, projection[:320], "mix")
-        param.weight_loader(param, projection[320:], "inject")
+        param.weight_loader(param, projection[:lowrank], "mix")
+        param.weight_loader(param, projection[lowrank:], "inject")
         up_param = mixer.input_mix_weight_up.weight
         up_param.weight_loader(up_param, up)
         del projection, up
     with saver.named_region("executor_inputs"):
         hyper_input = torch.randn(
-            256, 10240, dtype=torch.bfloat16, device="cuda", generator=generator
+            256, wide, dtype=torch.bfloat16, device="cuda", generator=generator
         )
+    with saver.named_region("workspace"):
+        probe = torch.empty(1, device="cuda")
+    # The pool that named workspace allocations land in.
+    workspace_pools = _segment_pools([probe.data_ptr()])
 
     @torch.inference_mode()
     def forward(rows: int, warm: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        with kernel_warmup(enabled=warm):
-            mixed, residuals = mixer.mix(hyper_input[:rows], normalized=None)
+        fused = "cute_fused_hyperconnection_mix"
+        with kernel_override("residual", "hyperconnection_mix", fused):
+            with kernel_warmup(enabled=warm):
+                mixed, residuals = mixer.mix(hyper_input[:rows], normalized=None)
         return mixed.cpu(), residuals[2].cpu()
 
+    def streams_at(rows: int) -> bool:
+        if (hc_count, hidden_size, lowrank) != (4, 2560, 320):
+            return False
+        if current_platform().arch_version != ArchVersion(10, 7):
+            return False
+        streams = cute_fused._streams_in_one_round
+        return streams(rows, hc_count, hidden_size, lowrank, 324)
+
     expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    streaming = cute_fused._SM107_HC_STREAM_GROUPS
-    # Eager calls grow layouts, SM107 streaming plans included; warmup walks the rest.
-    # 256 rows reuse the 128-row streaming layout; the other phases add new ones.
-    for rows, warm, grows in (
-        (1, False, True),
-        (128, False, True),
-        (256, False, False),
-        (1, True, True),
-    ):
-        sm107 = current_platform().arch_version == ArchVersion(10, 7)
-        if sm107 and not warm and rows > 64:
-            assert cute_fused._model_tactic(rows, 4, 2560, 320, 324)[-1] == streaming
+    # Phases: (rows, kernel warmup walks every row count, layouts grow).
+    for rows, warm, grows in phases:
         layouts = len(cute_fused._WORKSPACES)
         expected[rows] = forward(rows, warm)
         assert (len(cute_fused._WORKSPACES) > layouts) == grows
+        if streams_at(rows) and not warm:
+            # SM107 grows the streaming layout lazily once it fits one resident round.
+            streaming = cute_fused._SM107_HC_STREAM_GROUPS
+            tactic = cute_fused._model_tactic(rows, hc_count, hidden_size, lowrank, 324)
+            assert tactic[-1] == streaming
+        tensors = {
+            tensor.data_ptr(): tensor
+            for workspace in cute_fused._WORKSPACES.values()
+            for tensor in workspace
+        }
+        assert _segment_pools(list(tensors)) == workspace_pools
+        if lowrank > 6 * 64:
+            assert any(
+                partials.dtype == torch.float32
+                and partials.data_ptr() != activation.data_ptr()
+                for activation, partials, _ in cute_fused._WORKSPACES.values()
+            )
+        workspace_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
         for _ in range(3):
             torch.cuda.synchronize()
-            retained = [
-                (tensor, tensor.data_ptr(), tensor.cpu())
-                for workspace in cute_fused._WORKSPACES.values()
-                for tensor in workspace
-            ]
-            saver.pause(tag="weights")
+            retained = [(t, t.data_ptr(), t.cpu()) for t in tensors.values()]
+            torch.cuda.empty_cache()
+            free_before = torch.cuda.mem_get_info()[0]
+            saver.pause()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            assert torch.cuda.mem_get_info()[0] - free_before >= workspace_bytes
             ordinary_bytes = _ordinary_bytes()
             assert ordinary_bytes == 0, ordinary_bytes
-            saver.resume(tag="weights")
+            saver.resume()
             for tensor, pointer, reference in retained:
                 assert tensor.data_ptr() == pointer
                 torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
@@ -126,7 +178,17 @@ def _check_mix_workspaces_survive_release() -> None:
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="requires native CUDA VMM memory-saver hooks",
 )
-def test_mix_workspaces_survive_release_and_later_growth() -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Eager growth at 1 and 200 rows, then the startup warmup's 1..256 rows.
+        "4, 2560, 320, ((1, False, True), (200, False, True), (1, True, True))",
+        # Reduction groups keep fp32 partials apart from the activation storage.
+        "4, 8192, 1024, ((1, False, True), (128, False, True))",
+    ],
+    ids=["model", "separate-partials"],
+)
+def test_mix_workspaces_survive_release_and_later_growth(case: str) -> None:
     memory_saver = pytest.importorskip("torch_memory_saver")
     from tokenspeed_kernel.ops.residual import cute_fused
 
@@ -140,7 +202,7 @@ def test_mix_workspaces_survive_release_and_later_growth() -> None:
                 "-c",
                 "from test.runtime.test_hyperconnection_memory_saver import "
                 "_check_mix_workspaces_survive_release; "
-                "_check_mix_workspaces_survive_release()",
+                f"_check_mix_workspaces_survive_release({case})",
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,

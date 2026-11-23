@@ -126,6 +126,8 @@ def set_gated_residual_workspace_region(
 
     The workspaces are process-wide and keep their contents across calls, so a
     runtime that releases memory passes a scope that preserves their storage.
+    A process has one such region: the runtime registers it once, before kernel
+    warmup, and a later call replaces it for workspaces allocated afterwards.
 
     Args:
         region: Factory of the allocation scope entered around each new

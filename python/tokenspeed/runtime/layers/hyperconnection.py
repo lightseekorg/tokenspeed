@@ -40,8 +40,12 @@ from tokenspeed_kernel.ops.residual import (
 )
 from torch import nn
 
-from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+
+def register_workspace_region(adapter: TorchMemorySaverAdapter) -> None:
+    """Keep fused HC workspaces, including ones grown later, in ``adapter``'s workspace region."""
+    set_gated_residual_workspace_region(partial(adapter.named_region, "workspace"))
 
 
 @dataclass(frozen=True)
@@ -167,11 +171,6 @@ class GatedResidualSimple(nn.Module):
         )
         if self.input_mix_weight_up is not None:
             self.input_mix_weight_up.weight.weight_loader = self._load_up_weight
-        # Persistent mix workspaces, even ones grown after warmup, survive releases.
-        saver = TorchMemorySaverAdapter.create(
-            enable=global_server_args_dict["enable_memory_saver"]
-        )
-        set_gated_residual_workspace_region(partial(saver.named_region, "workspace"))
 
     @staticmethod
     def process_weights_after_loading(module: GatedResidualSimple) -> None:
