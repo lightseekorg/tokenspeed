@@ -275,24 +275,15 @@ class GdnAttnBackend(CapacityPrefillBackend):
         if pending is None:
             return
         metadata = self._deferred_verify_metadata(allow_defer=allow_defer)
-        reads = writes = None
+        reads = None
         if metadata is not None:
-            groups = self._state_groups()
             reads = torch.stack(
                 [
                     metadata.state_in_blocks_by_group[group][: slots.numel()]
-                    for group in groups
+                    for group in self._state_groups()
                 ]
             )
-            writes = torch.stack(
-                [
-                    metadata.state_out_blocks_by_group[group][: slots.numel()]
-                    for group in groups
-                ]
-            )
-        pending.prepare(
-            slots, frontier, enabled=metadata is not None, reads=reads, writes=writes
-        )
+        pending.prepare(slots, frontier, enabled=metadata is not None, reads=reads)
 
     def prepare_recurrent_state_acceptance(
         self, stopped: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
@@ -338,10 +329,11 @@ class GdnAttnBackend(CapacityPrefillBackend):
     def _replay_commit(self, payload, parameters, **tables) -> None:
         pending = self._pending_state
         if pending is not None and pending.enabled:
-            batch = tables["accepted_length"].numel()
-            pending.reads[:, :batch].copy_(tables["read_indices"])
-            pending.writes[:, :batch].copy_(tables["write_indices"])
-            pending.accept(tables["accepted_length"])
+            pending.accept(
+                tables["accepted_length"],
+                read_indices=tables["read_indices"],
+                write_indices=tables["write_indices"],
+            )
         else:
             super()._replay_commit(payload, parameters, **tables)
 

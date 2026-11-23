@@ -1344,7 +1344,13 @@ def launch_gdn_deferred_wy(
         or initial_state.dtype != torch.bfloat16
     ):
         raise ValueError("pending replay requires T4 and BF16 K128/V128 state")
-    if initial_state.data_ptr() % 16 or initial_state.stride(0) * 2 % 16:
+    row_stride = initial_state.stride(0)
+    if (
+        initial_state.stride()[1:] != (128 * 128, 128, 1)
+        or row_stride < vheads * 128 * 128
+    ):
+        raise ValueError("pending replay requires dense K-last state rows")
+    if initial_state.data_ptr() % 16 or row_stride * initial_state.element_size() % 16:
         raise ValueError("pending replay requires 16-byte aligned state rows")
 
     capacity = pending.steps.shape[1]
@@ -1353,8 +1359,7 @@ def launch_gdn_deferred_wy(
         leading_dim=3
     )
     if (
-        initial_state.stride()[1:] == (128 * 128, 128, 1)
-        and pending.payload.stride(-1) == 1
+        pending.payload.stride(-1) == 1
         and pending.payload.shape[-1] * pending.payload.element_size() % 16 == 0
         and A_log.dtype == dt_bias.dtype == torch.float32
         and all(
@@ -1404,7 +1409,7 @@ def launch_gdn_deferred_wy(
         strides = tuple(tuple(Int64(s) for s in x.stride()) for x in (a, b)) + (
             (Int64(4 * width), Int64(width), Int64(1)),
             (Int64(4 * width), Int64(width), Int64(1)),
-            Int64(initial_state.stride(0)),
+            Int64(row_stride),
             Int64(bank_stride),
             Int64(pending.pages.stride(0)),
         )

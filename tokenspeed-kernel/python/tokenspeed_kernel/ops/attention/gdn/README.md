@@ -331,7 +331,8 @@ selected row counts on device, so an empty selection does no State I/O.
 The banked WY kernel uses V32 tiles and two state stages. It splits the
 value tiles across CTAs for small batches and streams the tiles within
 a CTA for larger batches. Both variants warm at startup. Batch sizes,
-page strides, accepted lengths and bank indices are runtime values.
+page strides, accepted lengths and bank indices are runtime values. State
+rows are dense K-last and 16-byte aligned, with room for padding between rows.
 The launcher also accepts strided Q/K/V inputs through a variant with
 scalar input loads and the same replay-before-verify contract.
 

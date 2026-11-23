@@ -2974,8 +2974,8 @@ recurrent state is a separate fact, never an artificially shortened frontier.
 Eager and graph decode execute the same device metadata operations. Two
 maximum-decode-batch payload banks retain `[k, v, a, b]` across forwards.
 Stable slot records carry a generation, bank/row, logical frontier and current
-batch membership. Layer mappings are copied before refresh can overwrite
-them. A new forward toggles the destination bank, matches its slots against
+batch membership. The preceding accepted pages remain in the payload bank's
+metadata. A new forward toggles the destination bank, matches its slots against
 the old generation and materializes rows absent from the new batch before
 convolution can reuse their bank. Each layer consumes the matched old row;
 acceptance retires that generation and records the new one. Padding owns no
@@ -2986,7 +2986,9 @@ replays defer acceptance again after an eager prefill.
 
 Only an in-place live state may be deferred. A first decode or checkpoint
 rotation with distinct source/destination blocks commits immediately, as do
-stopped rows. Mixed, prefill, tree verification and other unsupported
+stopped rows. Acceptance and immediate replay use the same resolved live
+page tables as convolution commit, including when the verify graph is padded.
+Mixed, prefill, tree verification and other unsupported
 forwards materialize existing pending rows before execution. Monokernels
 keep the immediate path. Pending work is not flushed from ordinary `settle()`;
 that would remove the opportunity to share the next WY state read. The runtime

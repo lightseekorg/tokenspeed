@@ -231,20 +231,23 @@ def run(args):
                 raise RuntimeError("checkpoint geometry did not enable deferred WY")
             backend.materialize_recurrent_state(None)
             zero_accept = torch.zeros_like(accepted)
+            live_pages = slots.expand(layers, -1).contiguous()
 
             def metadata():
                 backend.prepare_pending_recurrent_state(
                     slots, frontier, allow_defer=True
                 )
                 pending.prepare_acceptance(stopped, frontier)
-                pending.accept(zero_accept)
+                pending.accept(
+                    zero_accept, read_indices=live_pages, write_indices=live_pages
+                )
 
             measurements["metadata_ms"] = timed(
                 metadata, execution=args.execution, repetitions=args.repetitions
             )
             copy_tables = backend._verify_copy_tables_get()
             source = ((slots - 1) * 5 + 4).repeat(layers)
-            destination = slots.repeat(layers)
+            destination = live_pages.flatten()
 
             def conv_commit():
                 copy_state_rows(
@@ -301,7 +304,9 @@ def run(args):
                     )
                 conv_commit()
                 pending.prepare_acceptance(stopped, frontier)
-                pending.accept(accepted)
+                pending.accept(
+                    accepted, read_indices=live_pages, write_indices=live_pages
+                )
                 frontier.index_add_(0, slots.long(), accepted)
 
             recurrent_ms = timed(
@@ -313,24 +318,28 @@ def run(args):
             )
             backend.materialize_recurrent_state(None)
 
-            def dropout_flush():
+            def record_pending_replay():
                 pending._metadata(
-                    "accept", input_accepted=accepted, batch=batch, requested=0
+                    "accept",
+                    input_accepted=accepted,
+                    input_reads=live_pages,
+                    input_writes=live_pages,
+                    batch=batch,
+                    requested=0,
                 )
-                pending.materialize(None)
+
+            def dropout_flush(selected_slots):
+                record_pending_replay()
+                pending.materialize(selected_slots)
 
             measurements["dropout_flush_ms"] = timed(
-                dropout_flush, execution=args.execution, repetitions=args.repetitions
+                lambda: dropout_flush(None),
+                execution=args.execution,
+                repetitions=args.repetitions,
             )
 
-            def single_dropout_flush():
-                pending._metadata(
-                    "accept", input_accepted=accepted, batch=batch, requested=0
-                )
-                pending.materialize(slots[:1])
-
             measurements["single_dropout_flush_ms"] = timed(
-                single_dropout_flush,
+                lambda: dropout_flush(slots[:1]),
                 execution=args.execution,
                 repetitions=args.repetitions,
             )
@@ -349,9 +358,7 @@ def run(args):
                     pending.bank[0].long() * batch + torch.arange(batch, device="cuda")
                 ).to(torch.int32)
             )
-            pending._metadata(
-                "accept", input_accepted=accepted, batch=batch, requested=0
-            )
+            record_pending_replay()
 
             def one_layer():
                 gdn_decode_mtp(

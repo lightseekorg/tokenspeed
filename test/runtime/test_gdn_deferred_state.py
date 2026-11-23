@@ -185,6 +185,23 @@ def test_first_decode_commits_distinct_source_before_pending_and_masked_material
     assert not pending.valid.any().item()
 
 
+def test_padded_verify_commits_the_live_rotated_state():
+    regular, deferred = case(False), case(True)
+    slots = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    frontier = torch.zeros(4, device="cuda", dtype=torch.int32)
+    stopped = torch.zeros(4, device="cuda", dtype=torch.bool)
+    accepted = torch.tensor([3], device="cuda", dtype=torch.int32)
+    before = deferred.state[5:7].clone()
+    for value in (regular, deferred):
+        refresh(value, [1], pages=[2])
+        run(value, slots, frontier, stopped, accepted)
+    assert not torch.equal(regular.state[5], before[0])
+    torch.testing.assert_close(
+        deferred.state[5], regular.state[5], rtol=2e-2, atol=1e-3
+    )
+    torch.testing.assert_close(deferred.state[6], before[1], rtol=0, atol=0)
+
+
 def test_retracted_replay_metadata_round_trips_to_a_new_slot():
     from tokenspeed.runtime.execution.slot_state import SlotStateLayout
 

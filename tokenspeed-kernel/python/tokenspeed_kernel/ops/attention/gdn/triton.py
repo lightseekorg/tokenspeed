@@ -2032,7 +2032,7 @@ def triton_gdn_pending_metadata(
     from tokenspeed_kernel.ops.attention.gdn._triton.pending import pending_metadata
 
     capacity = buffers["slots"].numel()
-    layers = buffers["reads"].shape[0]
+    layers = buffers["pages"].shape[1]
     slot_count = buffers["records"].shape[0]
     operations = {
         "begin": 0,
@@ -2063,8 +2063,6 @@ def triton_gdn_pending_metadata(
         buffers["bank"],
         buffers["rows"],
         buffers["slots"],
-        buffers["reads"],
-        buffers["writes"],
         buffers["immediate"],
         buffers["current_steps"],
         buffers["current_stopped"],

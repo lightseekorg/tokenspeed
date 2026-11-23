@@ -189,8 +189,10 @@ def test_deferred_wy_state_offsets_exceed_int32():
     )
 
 
-@pytest.mark.parametrize("batch", [1, 16])
-def test_deferred_wy_real_model_geometry(batch):
+@pytest.mark.parametrize(
+    ("batch", "heads", "vheads"), [(1, 16, 48), (16, 16, 48), (128, 4, 12)]
+)
+def test_deferred_wy_real_model_geometry(batch, heads, vheads):
     case = make_case(
         batch=batch,
         tokens=4,
@@ -198,8 +200,8 @@ def test_deferred_wy_real_model_geometry(batch):
         state_dtype=torch.bfloat16,
         tree=False,
         strided=False,
-        heads=16,
-        vheads=48,
+        heads=heads,
+        vheads=vheads,
     )
     counts = torch.arange(batch, device="cuda", dtype=torch.int32) % 5
     if batch == 1:
@@ -220,3 +222,21 @@ def test_deferred_wy_real_model_geometry(batch):
     torch.testing.assert_close(
         case["initial_state"][indices], expected_state.bfloat16(), rtol=8e-3, atol=5e-4
     )
+
+
+def test_deferred_wy_rejects_non_k_last_state_rows():
+    case = make_case(
+        batch=2,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=1,
+        vheads=4,
+    )
+    counts = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+    pending = make_pending(case, counts, capacity=2, bank=0)
+    case["initial_state"] = case["initial_state"].transpose(-1, -2)
+    with pytest.raises(ValueError, match="dense K-last state rows"):
+        gdn_decode_mtp(**case, pending_replay=pending)

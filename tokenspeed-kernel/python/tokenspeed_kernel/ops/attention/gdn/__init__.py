@@ -1284,8 +1284,9 @@ def gdn_pending_metadata(
         input_frontier: Slot-indexed logical cache lengths for snapshot/facts.
         input_stopped: Slot-indexed stop flags for accept_facts.
         input_accepted: Current batch's stop-truncated accepted lengths.
-        input_reads: Group-major state read indices for snapshot.
-        input_writes: Matching group-major state destinations.
+        input_reads: Group-major state read indices for snapshot, or layer-major
+            accepted state read indices for accept.
+        input_writes: Layer-major accepted state destinations for accept.
         batch: Current padded request count for snapshot/accept.
         requested: Number of slots for select_slots or discard_slots.
 

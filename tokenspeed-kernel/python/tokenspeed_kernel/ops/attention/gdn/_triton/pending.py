@@ -54,8 +54,6 @@ def pending_metadata(
     bank,
     rows,
     slots,
-    reads,
-    writes,
     immediate,
     current_steps,
     current_stopped,
@@ -95,9 +93,6 @@ def pending_metadata(
         old_bank = tl.maximum(code, 0) // C
         group = tl.load(group_indices + layer, layer < L, 0).to(tl.int64)
         source = tl.load(input_reads + group * B + row, (layer < L) & (row < B), -1)
-        destination = tl.load(
-            input_writes + group * B + row, (layer < L) & (row < B), -1
-        )
         old_page = tl.load(
             pages + (old_bank * L + layer.to(tl.int64)) * C + old_row, layer < L, -1
         )
@@ -108,8 +103,6 @@ def pending_metadata(
         usable &= tl.load(record + 2) == tl.load(input_frontier + slot)
         tl.store(slots + row, slot)
         tl.store(rows + row, tl.where(usable, code, -1).to(tl.int32))
-        tl.store(reads + layer.to(tl.int64) * C + row, source, layer < L)
-        tl.store(writes + layer.to(tl.int64) * C + row, destination, layer < L)
         if live:
             tl.store(record + 3, row)
     elif OP == 2 or OP == 3 or OP == 6:
@@ -140,10 +133,12 @@ def pending_metadata(
         row = tl.program_id(0)
         layer = tl.arange(0, LB)
         slot = tl.load(slots + row).to(tl.int64)
-        live = (slot > 0) & (slot < S - 1)
+        live = (row < B) & (slot > 0) & (slot < S - 1)
         count = tl.minimum(4, tl.maximum(0, tl.load(input_accepted + row, row < B, 0)))
-        source = tl.load(reads + layer.to(tl.int64) * C + row, layer < L, -1)
-        destination = tl.load(writes + layer.to(tl.int64) * C + row, layer < L, -1)
+        page_offset = layer.to(tl.int64) * B + row
+        live_layer = (layer < L) & (row < B)
+        source = tl.load(input_reads + page_offset, live_layer, -1)
+        destination = tl.load(input_writes + page_offset, live_layer, -1)
         same_pages = (
             tl.sum(
                 ((source != destination) | (destination <= 0)).to(tl.int32)

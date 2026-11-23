@@ -236,7 +236,8 @@ if _AVAILABLE:
             "tree": frozenset({False}),
             "varlen": frozenset({False}),
             "pending_replay": frozenset({True}),
-            "strided_qkv": frozenset({True, False}),
+            "strided_qkv": frozenset({False, True}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def cute_dsl_gdn_deferred_mtp(
