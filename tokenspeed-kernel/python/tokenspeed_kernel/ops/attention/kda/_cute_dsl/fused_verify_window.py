@@ -243,6 +243,13 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self.smem_bytes += 4 * (tile_words - self.tile_words)
         self.tile_words = tile_words
         self.smem_bytes = max(self.smem_bytes, smem_floor)
+        # A 32-row tile loads its key channel's keys and decays of the
+        # records after the gate projection, so the loads fly through the
+        # token exchange; phase 1 used to wait on them (0.2-0.4 us of a T 4
+        # batch-1 layer with records on GB300). A 64-row tile keeps loading
+        # them in phase 1: started there, they slowed it 3-5% without
+        # records. A 128-row tile starts them with the CTA.
+        self.preload_history_channel = self.history_rows > 0 and value_tile_rows == 32
         if gated_norm:
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
@@ -444,6 +451,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
         # Loaded once, early: phase 1 branches on it.
         count = Int32(0)
         history_keys, history_decays, history_us = self._early_history_registers()
+        if const_expr(self.preload_history_channel):
+            history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
+            history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
         if live:
             count = retained_length(retained, slot)
             self._start_early_history(
@@ -566,6 +576,18 @@ class FusedVerifyWindow(RecoverSsmVerify):
             )
             if live:
                 self._project_gate(shared, gate_inputs, value_start, warp, lane)
+                if const_expr(self.preload_history_channel):
+                    if count > 0:
+                        if tidx < K:
+                            self._load_history_channel(
+                                retained,
+                                slot,
+                                head,
+                                count,
+                                tidx,
+                                history_keys,
+                                history_decays,
+                            )
                 if const_expr(self.cluster == 1):
                     cute.arch.barrier()
                 else:
@@ -605,6 +627,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     history_keys,
                     history_decays,
                     history_us,
+                    self.preload_history_channel,
                 )
 
                 # Phase 3, one thread per value channel; the surplus warps repeat

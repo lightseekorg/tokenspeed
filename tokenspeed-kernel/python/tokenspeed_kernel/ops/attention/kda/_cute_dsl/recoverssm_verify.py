@@ -719,6 +719,7 @@ class RecoverSsmVerify:
                 history_keys,
                 history_decays,
                 history_us,
+                False,
             )
 
             # Phase 3, one thread per value channel.
@@ -771,6 +772,7 @@ class RecoverSsmVerify:
         early_keys,
         early_decays,
         early_us,
+        channel_loaded: cutlass.Constexpr[bool],
     ):
         """Phases 1 and 2 on the token rows in shared memory.
 
@@ -782,9 +784,10 @@ class RecoverSsmVerify:
         A CTA stores the window's normalized keys and decays after the records
         when ``records_keys`` is set. ``early_keys``, ``early_decays`` and
         ``early_us`` hold this thread's channels of the records when the CTA
-        started loading them (``_start_early_history``); otherwise phase 1
-        loads the keys and decays, and the u load after phase 1
-        (``preload_history_us``) or in ``_add_history_products``.
+        started loading them (``_start_early_history``), and with
+        ``channel_loaded`` the keys and decays its caller started loading;
+        otherwise phase 1 loads the keys and decays, and the u load after
+        phase 1 (``preload_history_us``) or in ``_add_history_products``.
         """
         K = self.key_dim
         W = self.window
@@ -795,12 +798,13 @@ class RecoverSsmVerify:
         history_decays = early_decays
         history_us = early_us
         if const_expr(late_loads):
-            history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
-            history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
+            if const_expr(not channel_loaded):
+                history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
+                history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
             history_us = cute.make_rmem_tensor((self._history_u_count(),), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
-            if const_expr(late_loads):
+            if const_expr(late_loads and not channel_loaded):
                 if record_start > 0:
                     # In flight during the key channel's work.
                     self._load_history_channel(
