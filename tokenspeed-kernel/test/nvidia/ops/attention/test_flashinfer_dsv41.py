@@ -136,9 +136,13 @@ def test_graph_refresh_with_warmed_schedule():
         torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-3)
 
 
-def test_cake_b8_graph_refresh(monkeypatch):
+@pytest.mark.parametrize(
+    "rows,wide", [(48, False), (24, True), (48, True), (96, True), (192, True)]
+)
+def test_cake_graph_refresh(monkeypatch, rows, wide):
     monkeypatch.setenv("TOKENSPEED_SM120_CAKE_DECODE_MLA", "1")
-    case = make_case(48, 64, 512, True)
+    monkeypatch.setenv("TOKENSPEED_SM120_CAKE_DECODE_MLA_WIDE", "1" if wide else "0")
+    case = make_case(rows, 64, 512, True)
     schedule = dsv41.new_attention_schedule()
     run(case, schedule)
     graph = torch.cuda.CUDAGraph()

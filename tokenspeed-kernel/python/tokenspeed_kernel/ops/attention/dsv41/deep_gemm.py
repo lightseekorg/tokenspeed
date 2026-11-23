@@ -99,7 +99,7 @@ if _SM120_NATIVE:
     if not has_optional_package("deep_gemm_sm120"):
         raise ImportError(
             "SM120 native FP4 Indexer requires the pinned deep_gemm_sm120 build; "
-            "see .agents/deploy/w4a8/setup/README.md"
+            "see docs/design/sm120.md"
         )
     prepare_cuda_toolkit_env()
     from tokenspeed_kernel.thirdparty import deepgemm_sm120 as deep_gemm

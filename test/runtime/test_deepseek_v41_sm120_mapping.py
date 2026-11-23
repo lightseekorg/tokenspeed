@@ -87,7 +87,12 @@ def test_head_tensor_parallel_is_rejected():
 
 
 @pytest.mark.parametrize(
-    "decode,max_rows,expected", [(False, 18, 32), (False, 2051, 2048), (True, 7, 7)]
+    "decode,max_rows,expected",
+    [
+        (False, 18, [(18, 32)]),
+        (False, 2051, [(2048, 2048), (3, 4)]),
+        (True, 7, [(7, 7)]),
+    ],
 )
 def test_active_and_idle_ranks_use_identical_dispatch_capacities(
     monkeypatch, decode, max_rows, expected
@@ -109,7 +114,9 @@ def test_active_and_idle_ranks_use_identical_dispatch_capacities(
     capacities = []
 
     def apply(_buffer, x, _state, _ids, _weights, **kwargs):
-        capacities.append(kwargs["num_max_tokens_per_rank"])
+        capacities.append(
+            (kwargs["num_max_tokens_per_rank"], kwargs["communication_capacity"])
+        )
         return torch.zeros_like(x)
 
     def routes(self, x, ids):
@@ -145,7 +152,4 @@ def test_active_and_idle_ranks_use_identical_dispatch_capacities(
             ctx=SimpleNamespace(forward_mode=mode, all_decode_or_idle=decode),
         )
         traces.append(list(capacities))
-    assert traces[0] == traces[1]
-    assert traces[0][0] == expected
-    if max_rows > 2048:
-        assert traces[0] == [2048, 4]
+    assert traces == [expected, expected]
