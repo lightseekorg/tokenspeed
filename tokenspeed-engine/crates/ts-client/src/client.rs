@@ -655,10 +655,12 @@ impl EngineClient {
                     usage: Usage::default(),
                 },
             );
+            // Count it under the same lock: an abort() that finds the request
+            // stops counting it, which must not run before this increment.
+            self.shared.engines[engine]
+                .in_flight
+                .fetch_add(1, Ordering::Relaxed);
         }
-        self.shared.engines[engine]
-            .in_flight
-            .fetch_add(1, Ordering::Relaxed);
         let frames = EngineRequest::Add(Box::new(request)).to_frames();
         if let Err(error) = self.shared.send(engine, frames).await {
             self.shared.forget(&rid);

@@ -279,11 +279,7 @@ fn step(
     let token = 1000 * i32::from(index) + k as i32;
     EngineOutput::Batch(Box::new(BatchTokenIDOutSlim {
         rids: Some(vec![rid.to_owned()]),
-        output_ids: vec![if finish == Some("abort") {
-            vec![]
-        } else {
-            vec![token]
-        }],
+        output_ids: vec![vec![token]],
         finished_reasons: vec![finish.unwrap_or("").to_owned()],
         prompt_tokens: vec![prompt],
         completion_tokens: vec![k],
