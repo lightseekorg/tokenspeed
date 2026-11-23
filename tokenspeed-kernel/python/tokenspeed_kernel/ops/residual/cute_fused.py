@@ -238,6 +238,8 @@ _SM107_HC_ROW_TILES = (
 )
 # (split_k, M_proj, B_mma, stages) of the one-round SM107 tiles.
 _SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
+# Generic tactic that SM107 runs as split-K 16 at 17-64 rows.
+_SM107_S16_GENERIC = (8, 64, 32, 1, 1, 5, 32)
 
 
 def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
@@ -730,6 +732,9 @@ def _model_tactic(
     measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
     if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
         # Only the generic tactic of a range is replaced, not a forced one.
+        if 16 < rows <= 64 and (split_k, m, n, lp, lb, stages, f) == _SM107_S16_GENERIC:
+            # Fused HC needs six resident 16-CTA clusters: one S16 round holds 64 rows.
+            split_k, n = 16, 32 if rows <= 32 else 64
         for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
             if (
                 first <= rows

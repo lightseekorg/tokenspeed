@@ -26,6 +26,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention.qsa.triton import (
+    QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE,
+    QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -72,6 +76,44 @@ class QSAIndexerMetadata:
     recent_block_table: torch.Tensor
 
 
+def qsa_indexer_table_specs(
+    cache_pool: CachePool, max_context_len: int
+) -> tuple[GroupTableSpec, ...]:
+    """Validate one cache view's compressed and recent QSA groups for the indexer's
+    tables and the write slots ``qwen4_exp_qsa_prepare_metadata`` emits for them."""
+    groups = (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+    local_groups = {
+        field.group_id
+        for field in cache_pool.arena.plan.fields
+        if field.group_id in groups
+        and cache_field_layer_id(field.field_id) in cache_pool.field_layer_range
+    }
+    if local_groups != set(groups):
+        raise RuntimeError(
+            "QSA indexer cache view requires compressed and recent fields"
+        )
+    specs = {spec.group_id: spec for spec in cache_pool.arena.cache_group_specs}
+    slot_dtypes = {
+        QWEN4_EXP_QSA_CACHE_GROUP: QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP: QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE,
+    }
+    return tuple(
+        GroupTableSpec(
+            group_id=gid,
+            block_granularity=specs[gid].block_granularity,
+            kernel_page_size=specs[gid].block_granularity,
+            max_num_pages=(max_context_len + specs[gid].block_granularity - 1)
+            // specs[gid].block_granularity,
+            atom_pages_per_block=cache_pool.atom_pages_per_block(
+                gid,
+                specs[gid].block_granularity,
+                write_slot_dtype=slot_dtypes[gid],
+            ),
+        )
+        for gid in groups
+    )
+
+
 class QSAIndexerBackend(AttentionBackend):
     """Prepare the two indexer cache groups once for all local QSA layers."""
 
@@ -96,31 +138,7 @@ class QSAIndexerBackend(AttentionBackend):
 
     def _table_specs_for(self, cache_pool: CachePool) -> tuple[GroupTableSpec, ...]:
         """Validate this view's indexer groups without publishing any state."""
-        groups = (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
-        local_groups = {
-            field.group_id
-            for field in cache_pool.arena.plan.fields
-            if field.group_id in groups
-            and cache_field_layer_id(field.field_id) in cache_pool.field_layer_range
-        }
-        if local_groups != set(groups):
-            raise RuntimeError(
-                "QSA indexer cache view requires compressed and recent fields"
-            )
-        specs = {spec.group_id: spec for spec in cache_pool.arena.cache_group_specs}
-        return tuple(
-            GroupTableSpec(
-                group_id=gid,
-                block_granularity=specs[gid].block_granularity,
-                kernel_page_size=specs[gid].block_granularity,
-                max_num_pages=(self.max_context_len + specs[gid].block_granularity - 1)
-                // specs[gid].block_granularity,
-                atom_pages_per_block=cache_pool.atom_pages_per_block(
-                    gid, specs[gid].block_granularity
-                ),
-            )
-            for gid in groups
-        )
+        return qsa_indexer_table_specs(cache_pool, self.max_context_len)
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
