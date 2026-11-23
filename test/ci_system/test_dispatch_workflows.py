@@ -972,6 +972,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml",
+        "ut-bf16-tp-projection-gb300-slurm.yaml",
     ]
 
 
@@ -1143,11 +1144,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     gate = next(
         step for step in scan_steps if step.get("name") == "Check trusted source"
     )
-    matrix_step = next(
-        step
-        for step in scan_steps
-        if step.get("name") == "Build multi-node task matrix"
-    )
+    matrix_step = next(step for step in scan_steps if step.get("id") == "matrix")
     submit_script = next(
         step["run"]
         for step in submit["steps"]

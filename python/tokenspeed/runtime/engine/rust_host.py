@@ -1085,6 +1085,10 @@ class HostDataPlane:
         for tag in tags:
             self._regions[tag].resume()
 
+    def finish_memory_resume(self) -> None:
+        """Rebuild resources after the scheduler's all-rank wake gate."""
+        self._device.finish_memory_resume()
+
     def set_grammar_entries(self, entries: list[tuple[str, int]]) -> None:
         """The host's matcher entries, before serving starts."""
         self._grammar_entries = HostGrammarEntries(dict(entries))
@@ -1236,22 +1240,14 @@ def _peer_sharing_settings(
     host_cache,
     geometry,
 ) -> PeerSharingSettings:
-    """What the host starts this rank's peer sharing from. A collective of
-    the world (the namespace's checkpoint agreement) and of the attention-TP
-    group (one incarnation for the replica, whose members' schedulers must
-    agree on their lease ids)."""
+    """Build the live cache namespace and agree on the TP replica's incarnation."""
     mapping = server_args.mapping
-    world_group = (
-        pg_manager.get_process_group("gloo", mapping.world_group)
-        if mapping.world_size > 1
-        else None
-    )
     deployment_id = cache_deployment_id(
         server_args,
         model_config,
         draft_model_config,
         host_cache=host_cache,
-        world_cpu_group=world_group,
+        world_cpu_group=None,
         for_peer=True,
     )
     incarnation = [peer_incarnation()]
@@ -1263,11 +1259,21 @@ def _peer_sharing_settings(
         )
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)
-    port = server_args.peer_prefix_port + mapping.attn.dp_rank
+    port = server_args.peer_prefix_port
     # The name a router's hint carries: the advertised host when given.
     host = server_args.peer_prefix_host or local_ip
     return PeerSharingSettings(
-        name=peer_endpoint_name(host, port),
+        name=peer_endpoint_name(host, port, mapping.attn.dp_rank),
+        node_leaders=(
+            ((mapping.rank, mapping.attn.dp_rank),)
+            if server_args.emulate_rank_zero
+            else tuple(
+                (rank, dp_rank)
+                for dp_rank, rank in enumerate(mapping.attn.dp_group)
+                if rank // mapping.nprocs_per_node
+                == mapping.rank // mapping.nprocs_per_node
+            )
+        ),
         bind_host="::" if ":" in local_ip else "0.0.0.0",
         port=port,
         incarnation=incarnation[0],

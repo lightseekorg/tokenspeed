@@ -61,7 +61,7 @@ engines.
   messages and answers them.
 
 Holder and reader must share the cache namespace: the same deployment
-identity (checkpoint, layout, attention TP, KV parallelism, backends,
+identity (configured model and revision, layout, attention TP, KV parallelism, backends,
 quantization, compatibility epoch) and weight version. Under `numerics=auto`,
 the live peer identity allows different MoE expert-parallel sizes. Other
 numerical policies and persistent L3 keys retain the expert-parallel size.
@@ -278,7 +278,7 @@ engine can unregister its memory.
 
 Control messages (lookup, pin, release) travel between the replicas'
 servicers over ZMQ, not through the data plane. A holder's name is its
-servicer's endpoint (`host:port`, one per attention-DP replica), which the
+logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
@@ -367,8 +367,10 @@ moving PD itself onto the new read entry point.
 
 ### Configuration
 
-`--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
-`port + r`, and a replica's name is `host:port`, with the host from
+`--peer-prefix-port` turns sharing on; each node binds one public port. Rank zero is
+`host:port` and other attention-DP replicas are `host:port/rank`. The first
+local replica leader forwards control frames to the addressed sibling over
+loopback. The host comes from
 `--peer-prefix-host` (the address the worker advertises to the router) or
 else the detected local address. A holder hint must name the holder exactly
 so: a reader matches the holder's answers by that name.

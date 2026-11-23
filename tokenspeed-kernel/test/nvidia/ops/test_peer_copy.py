@@ -90,24 +90,28 @@ def test_schedule_order_is_fixed_per_rank_and_differs_across_ranks():
 
 
 @needs_gpu
-def test_worker_copies_after_release_and_before_ready_readers():
+@pytest.mark.parametrize("batch_copies", [1, 5, 4096])
+def test_worker_copies_after_release_and_before_ready_readers(batch_copies):
     device = torch.device("cuda", torch.cuda.current_device())
     copy_stream, writer, reader = (torch.cuda.Stream(device=device) for _ in range(3))
     src = torch.zeros(3 << 20, dtype=torch.uint8, device=device)
     dst = torch.zeros_like(src)
     seen = torch.empty_like(src)
+    pattern = (torch.arange(src.numel(), device=device) % 251).to(torch.uint8)
     flags = SequenceFlags(2, device)
-    worker = CopyEngineWorker(device, copy_stream)
+    worker = CopyEngineWorker(device, copy_stream, batch_copies)
     try:
         schedule = build_copy_schedule(
-            {1: [(dst.data_ptr(), src.data_ptr(), src.numel())]}, ranks=4, rank=0
+            {1: [(dst.data_ptr(), src.data_ptr(), src.numel())]}, ranks=64, rank=0
         )
+        # 24 chunks: one batch, several full batches plus a short one, or one each.
+        assert schedule[2].numel() == 24
         worker.set_layer(7, schedule)
         torch.cuda.synchronize()
         # Every flag wait is enqueued after its write, as the store does.
         with torch.cuda.stream(writer):
             torch.cuda._sleep(200_000_000)
-            src.fill_(42)
+            src.copy_(pattern)
             flags.write(1, 1, writer)
         job = worker.fetch(
             7, flags, wait_index=1, wait_value=1, ready_index=0, ready_value=1
@@ -117,6 +121,6 @@ def test_worker_copies_after_release_and_before_ready_readers():
             flags.wait(0, 1, reader)
             seen.copy_(dst)
         torch.cuda.synchronize()
-        torch.testing.assert_close(seen, torch.full_like(seen, 42), rtol=0, atol=0)
+        torch.testing.assert_close(seen, pattern, rtol=0, atol=0)
     finally:
         worker.close()

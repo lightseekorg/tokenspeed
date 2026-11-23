@@ -1484,12 +1484,28 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows, owner_rows = _projection_rows(
-            inputs, ctx, self.parallel, self.projection_workspace, None
-        )
+        output = self._forward_projection(inputs, ctx=ctx, borrow_output=False)
+        return output, None
+
+    def _forward_projection(
+        self,
+        inputs: torch.Tensor,
+        *,
+        ctx: "ForwardContext",
+        borrow_output: bool,
+    ) -> torch.Tensor:
+        workspace = self.projection_workspace
+        rows, owner_rows = _projection_rows(inputs, ctx, self.parallel, workspace, None)
         if rows == 0:
-            return inputs.new_empty((0, self.logical_output_size)), None
-        output = inputs.new_empty((rows, self.output_size))
+            return inputs.new_empty((0, self.logical_output_size))
+        borrowed = None
+        if borrow_output and workspace.fused_column is not None:
+            borrowed = workspace.fused_column.borrow_column_output(owner_rows)
+        output = (
+            borrowed
+            if borrowed is not None
+            else inputs.new_empty((rows, self.output_size))
+        )
         weight_scales = (
             self.weight_scale_inv
             if isinstance(self.quant_method, Fp8LinearMethod)
@@ -1503,12 +1519,14 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             weight_scales,
             owner_rows,
             output,
-            self.projection_workspace,
+            workspace,
             self.comm_backend,
         ):
-            return output[: inputs.shape[0], : self.logical_output_size], None
+            return output[: inputs.shape[0], : self.logical_output_size]
+        if borrowed is not None:
+            output = inputs.new_empty((rows, self.output_size))
         values, _ = projection_all_gather(
-            inputs, rows, False, self.projection_workspace, self.comm_backend
+            inputs, rows, False, workspace, self.comm_backend
         )
         local, _ = super().forward(values, block_scale=None, output_dtype=None)
         output, _ = projection_all_to_all(
@@ -1517,10 +1535,10 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             True,
             False,
             output,
-            self.projection_workspace,
+            workspace,
             self.comm_backend,
         )
-        return output[: inputs.shape[0], : self.logical_output_size], None
+        return output[: inputs.shape[0], : self.logical_output_size]
 
 
 class DPRowParallelLinear(RowParallelLinear):
@@ -1688,6 +1706,7 @@ def prepare_dp_linear_communication(
             output_size=module.output_size,
             max_tokens=max_tokens,
             dtype=model_activation_dtype,
+            weight_dtype=module.weight.dtype,
             device=module.weight.device,
         )
         for module in linears
