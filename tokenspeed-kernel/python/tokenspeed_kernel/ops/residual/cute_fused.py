@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache
 
 import torch
@@ -51,6 +53,7 @@ except (ImportError, NotImplementedError):
 _CACHE_LOCK = threading.Lock()
 _WORKSPACES = {}
 _WORKSPACE_LOCK = threading.Lock()
+_WORKSPACE_REGION: Callable[[], AbstractContextManager[object]] = nullcontext
 _PROBE_SPLIT_K = 16
 _MAX_OVERRIDE_TOKENS = 1024
 _PLANS = {}
@@ -116,6 +119,23 @@ def supports_fused_hc(device: torch.device) -> bool:
     return _resident_clusters(index, stream) >= 6
 
 
+def set_gated_residual_workspace_region(
+    region: Callable[[], AbstractContextManager[object]],
+) -> None:
+    """Allocate later persistent fused mix workspaces inside ``region()``.
+
+    The workspaces are process-wide and keep their contents across calls, so a
+    runtime that releases memory passes a scope that preserves their storage.
+
+    Args:
+        region: Factory of the allocation scope entered around each new
+            workspace, including layouts first reached after warmup. CUDA
+            graph capture never allocates one.
+    """
+    global _WORKSPACE_REGION
+    _WORKSPACE_REGION = region
+
+
 def _workspace_for_plan(
     device: torch.device,
     projection_rows: int,
@@ -162,7 +182,7 @@ def _workspace_for_plan(
                 # post-SiLU activation.
                 # Persistent scratch can be reused by calls made outside the
                 # inference-mode context that first warmed this layout.
-                with torch.inference_mode(False):
+                with torch.inference_mode(False), _WORKSPACE_REGION():
                     activation_storage = torch.empty(
                         (workers * slot_rows, lowrank), device=device, dtype=torch.int16
                     )
