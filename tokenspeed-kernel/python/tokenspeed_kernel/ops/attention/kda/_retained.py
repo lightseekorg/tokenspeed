@@ -464,12 +464,13 @@ def batched_prepare(
         record_slot_count,
     )
     keys = triton.next_power_of_2(head_dim)
-    # Split a request's heads over enough programs to keep every SM streaming
-    # when few requests fold; a large batch keeps one program per request so
-    # rows that do not fold cost one early exit each.
+    # Split a request's heads over about 16 programs per SM, so every SM keeps
+    # loads in flight when few requests fold (a batch-1 fold of 69 layers takes
+    # 52 us on GB300, 70 us at 2 programs per SM); a large batch keeps one
+    # program per request so rows that do not fold cost one early exit each.
     splits = min(
         num_heads,
-        max(1, triton.cdiv(2 * current_platform().sm_count, layers * batch)),
+        max(1, triton.cdiv(16 * current_platform().sm_count, layers * batch)),
     )
     retained.retained_batched_consolidate_kernel[(layers, batch, splits)](
         *args,
