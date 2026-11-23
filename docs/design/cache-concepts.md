@@ -1540,8 +1540,8 @@ Its responsibilities:
   every Device-covered copy and before any dirty entry, whatever its age:
   dropping it loses nothing a prefetch cannot read back. A checkpoint ranks
   clean by its State; one whose victim would also take a dirty page (above it
-  or under it) ranks with the dirty Host-only cache instead. Its evictions
-  count as `HostEvictionStats::clean`.
+  or under it) ranks with the dirty Host-only cache instead. Evictions in the
+  clean class count as `HostEvictionStats::clean`.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree counts each node's closed-group duplicates as entries
