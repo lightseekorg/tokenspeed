@@ -1008,7 +1008,7 @@ class MambaAttnBackend(AttentionBackend):
             )
         if not 0 <= num_extends <= bs:
             raise ValueError("num_extends must be between 0 and bs")
-        self._prefill_request_layout = (
+        request_layout = (
             PrefillRequestLayout.from_cpu_lengths(
                 num_extends, extend_seq_lens_cpu, extend_prefix_lens_cpu
             )
@@ -1016,6 +1016,7 @@ class MambaAttnBackend(AttentionBackend):
             else None
         )
         if forward_mode.is_idle():
+            self._prefill_request_layout = None
             # Idle warmup carries no requests and never reaches the state
             # kernels (the router returns early); the rows only take the
             # decode query shape — one token, or the verify window under
@@ -1127,6 +1128,9 @@ class MambaAttnBackend(AttentionBackend):
                 block_tables,
                 state_checkpoints=state_checkpoints,
             )
+        # The split decode tail refreshes its own metadata first; publish the
+        # complete forward's extend layout only after that refresh finishes.
+        self._prefill_request_layout = request_layout
 
     def _scan_state_checkpoints(
         self,
@@ -1354,6 +1358,7 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        self._prefill_request_layout = None
         mamba_output_indices = None
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None

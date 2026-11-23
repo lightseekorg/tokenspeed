@@ -23,6 +23,8 @@
 from dataclasses import dataclass
 from test.ci_system.ci_register import register_cuda_ci
 from test.runtime import test_cache_group_router as router_tests
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+from test.runtime.test_gdn_state_paging import _mamba_config_pair
 
 import pytest
 import torch
@@ -35,13 +37,18 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.msa import MSAHybridAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention, bind_cache_groups
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
@@ -181,3 +188,143 @@ def test_hybrid_prefill_layout_refreshes_and_clears_with_router_metadata():
     )
     # The outer sparse entry resolves the same scheduler pages for this layer.
     torch.testing.assert_close(slots.long(), torch.tensor([6 * 4 + 1, 9 * 4 + 2]))
+
+
+class CPUModelRouter(CacheGroupRouter):
+    """A model-binding owner with CPU metadata; only attention kernels are absent."""
+
+    def __init__(self, factor):
+        super().__init__(
+            lambda group_id, grain: router_tests._StubLeaf(grain),
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        self.input_transform = InputTransform(factor)
+
+    def model_binding(self, layer_id, binding_type):
+        if binding_type is InputTransform:
+            return self.input_transform
+        return super().model_binding(layer_id, binding_type)
+
+
+def _msa_backend():
+    spec = MSAConfig(
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=8,
+        attn_tp_size=1,
+        full_attn_backend_name="mha",
+        compute_layer_types=("full", "sparse"),
+        sparse_layer_ids=frozenset({1}),
+        index_head_dim=8,
+        index_n_heads=1,
+        index_topk_blocks=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.float32,
+        kv_cache_dtype=torch.float32,
+        kv_cache_quant_method="none",
+        context_len=32,
+        max_bs=2,
+        max_resident_requests=2,
+        components=(spec,),
+    )
+    backend = MSAHybridAttnBackend(config, spec)
+    # Keep the real composite and routers; replace GPU compute with the CPU
+    # metadata leaves so both owners can offer independent model transforms.
+    backend.full_router = CPUModelRouter(2)
+    backend.sparse_router = CPUModelRouter(7)
+    pool = make_mha_pool_for_groups(
+        tuple(
+            CacheGroupSpec(group, "full_history", 4, 1, replayable=False)
+            for group in ("full_attention", "history_1")
+        ),
+        device="cpu",
+    )
+    backend.set_cache_pool(pool)
+    backend.init_cuda_graph_state(2)
+    tables = {
+        group: torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        for group in ("full_attention", "history_1")
+    }
+    return backend, tables
+
+
+def _publish_prefill(backend, tables, *, num_extends):
+    lengths, prefixes = torch.tensor([3, 2]), torch.tensor([2, 0])
+    backend.init_forward_metadata(
+        2,
+        num_extends,
+        torch.arange(2),
+        prefixes + lengths,
+        ForwardMode.EXTEND if num_extends == 2 else ForwardMode.MIXED,
+        block_tables=tables,
+        block_tables_cpu={},
+        extend_seq_lens=lengths[:num_extends],
+        extend_seq_lens_cpu=lengths[:num_extends],
+        extend_prefix_lens=prefixes[:num_extends],
+        extend_prefix_lens_cpu=prefixes[:num_extends],
+        extend_replay_lens_cpu=torch.zeros(num_extends, dtype=torch.int64),
+        extend_prompt_lens_cpu=(prefixes + lengths)[:num_extends],
+        extend_with_prefix=True,
+        query_shard=None,
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_msa_model_inputs_and_request_layout_follow_the_routed_owner(nested):
+    backend, tables = _msa_backend()
+    if nested:
+        backend = Qwen4ExpBackend(CPUAttention(2).test_config, backend, None, None)
+    _publish_prefill(backend, tables, num_extends=2)
+    layout = backend.prefill_request_layout()
+    assert layout == PrefillRequestLayout((3, 2), (2, 0))
+    positions = torch.tensor(layout.prefix_lengths)
+    for layer_id, expected in ((0, [4, 0]), (1, [14, 0])):
+        binding = backend.model_binding(layer_id, InputTransform)
+        torch.testing.assert_close(binding.apply(positions), torch.tensor(expected))
+    assert backend.model_binding(1, str) is None
+
+
+@pytest.mark.parametrize("kind", ["router", "mamba", "msa"])
+@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.IDLE])
+def test_capture_discards_a_previous_live_prefill_layout(kind, mode):
+    if kind == "router":
+        fixture = router_tests.TestCacheGroupRouterTest()
+        backend, _ = fixture._router()
+        tables = fixture._tables()
+    elif kind == "mamba":
+        backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=1, head_dim=8, spec_tokens=1)
+        )
+        backend.init_cuda_graph_state(2)
+        tables = {}
+    else:
+        backend, tables = _msa_backend()
+    _publish_prefill(backend, tables, num_extends=2)
+    snapshot = backend.prefill_request_layout()
+    assert snapshot == PrefillRequestLayout((3, 2), (2, 0))
+    backend.init_forward_metadata_capture_cuda_graph(
+        2, torch.arange(2), torch.tensor([5, 2]), mode, block_tables=tables
+    )
+    assert backend.prefill_request_layout() is None
+    # A retained view is a snapshot; clearing the owner must not mutate it.
+    assert snapshot == PrefillRequestLayout((3, 2), (2, 0))
+    _publish_prefill(backend, tables, num_extends=2)
+    assert backend.prefill_request_layout() == snapshot
+
+
+def test_mamba_mixed_keeps_prefill_layout_while_preparing_its_decode_tail():
+    backend = MambaAttnBackend(
+        *_mamba_config_pair(torch, heads=1, head_dim=8, spec_tokens=2)
+    )
+    backend.init_cuda_graph_state(2)
+    _publish_prefill(backend, {}, num_extends=1)
+    assert backend.prefill_request_layout() == PrefillRequestLayout((3,), (2,))
+    torch.testing.assert_close(
+        backend.forward_metadata.query_start_loc,
+        torch.tensor([0, 3, 5], dtype=torch.int32),
+    )

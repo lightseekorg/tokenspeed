@@ -877,6 +877,7 @@ class CacheGroupRouter(AttentionBackend):
             raise NotImplementedError(
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
             )
+        self._prefill_request_layout = None
         # The idle arm of the refresh replay runs, so capture compiles the
         # kernel replay launches.
         self._fill_decode_stacks(bs, 0, block_tables, seq_lens)
