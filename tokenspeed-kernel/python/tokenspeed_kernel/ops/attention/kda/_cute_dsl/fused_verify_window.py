@@ -94,7 +94,6 @@ NORM_GROUPS = DIM // 32
 
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
-    initialize_page_tile,
     retained_arguments,
     retained_length,
     retained_row,
@@ -489,20 +488,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     VT * GATE_RANK * 2,
                     Int32(shared.weight_barrier.toint()),
                 )
-            initialize_page_tile(
-                shared.tile,
-                retained,
-                live_page,
-                slot,
-                head,
-                value_start,
-                VT,
-                K,
-                tidx,
-                THREADS,
+            self._load_base_tile(
+                shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            if tidx == 0:
-                cute.arch.mbarrier_arrive(shared.state_barrier)
+            self._prefetch_records(retained, slot, head, value_start, warp, lane)
 
         # Issued here and first used after the wait, so no load stalls before it.
         channels = []
@@ -637,6 +626,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     slot,
                     head,
                     retained_length(retained, slot),
+                    value_start,
                     Int32(value_tile == 0),
                     valid_tokens,
                 )

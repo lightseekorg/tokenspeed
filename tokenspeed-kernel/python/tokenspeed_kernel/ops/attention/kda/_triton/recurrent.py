@@ -16,18 +16,9 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit(
-    do_not_specialize=[
-        "stride_original_tok",
-        "stride_raw_tok",
-        "stride_out_tok",
-        "stride_conv_page",
-        "query_stride",
-        "read_stride",
-        "total_tokens",
-        "pages",
-    ]
-)
+# The row and page strides stay specialized: they are fixed for a model, and
+# their divisibility by 16 lets the loads and stores of each row vectorize.
+@triton.jit(do_not_specialize=["query_stride", "read_stride", "total_tokens", "pages"])
 def fused_kda_verify_conv_update_kernel(
     qkv_raw,
     conv_w,

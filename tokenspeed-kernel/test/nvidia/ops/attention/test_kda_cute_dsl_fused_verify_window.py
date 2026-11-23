@@ -61,6 +61,9 @@ from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._cute_dsl import (  # noqa: E402
     fused_verify_window as window_kernel,
 )
+from tokenspeed_kernel.ops.attention.kda._cute_dsl import (  # noqa: E402
+    recoverssm_verify as recoverssm_kernel,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     fused_kda_verify_conv_update,
 )
@@ -121,8 +124,11 @@ def _inputs(batch, window, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0
     )
 
 
-def _records(x, *, original, capacity, correction_stride=1):
-    """Sentinel-filled request records, with padding around each slot."""
+def _records(x, *, original, capacity, correction_stride=1, history_length=0):
+    """Sentinel-filled request records, with padding around each slot.
+
+    With ``history_length``, every slot first holds that many accepted records.
+    """
     slots, rows = x["slots"], x["mixed_qkv"].shape[0]
     correction_rows = torch.full(
         (slots, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
@@ -147,6 +153,20 @@ def _records(x, *, original, capacity, correction_stride=1):
         x["state_indices"],
         torch.arange(x["state_indices"].numel(), device="cuda", dtype=torch.int32),
     )
+    if history_length:
+        gen = torch.Generator(device="cuda").manual_seed(history_length)
+        shape = (slots, HEADS, history_length, DIM)
+        accepted = slice(0, history_length)
+        history.correction[:, :, accepted] = 0.02 * torch.randn(
+            shape, device="cuda", generator=gen
+        )
+        history.key[:, :, accepted] = F.normalize(
+            torch.randn(shape, device="cuda", generator=gen), dim=-1
+        )
+        history.decay[:, :, accepted] = 0.7 + 0.25 * torch.rand(
+            shape, device="cuda", generator=gen
+        )
+        history.length.fill_(history_length)
     stamps = torch.full(
         (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
     )
@@ -192,10 +212,14 @@ def _verify(x, records, output_norm, *, override=None, **producers):
     )
 
 
-def _split(x, capacity, *, correction_stride=1):
+def _split(x, capacity, *, correction_stride=1, history_length=0):
     """The serving split producers, then the registered record verify."""
     records, buffers = _records(
-        x, original=False, capacity=capacity, correction_stride=correction_stride
+        x,
+        original=False,
+        capacity=capacity,
+        correction_stride=correction_stride,
+        history_length=history_length,
     )
     conv_qkv = fused_kda_verify_conv_update(
         x["mixed_qkv"],
@@ -212,8 +236,10 @@ def _split(x, capacity, *, correction_stride=1):
     return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
 
 
-def _fused(x, capacity, output_norm=None):
-    records, buffers = _records(x, original=True, capacity=capacity)
+def _fused(x, capacity, output_norm=None, *, history_length=0):
+    records, buffers = _records(
+        x, original=True, capacity=capacity, history_length=history_length
+    )
     return _verify(x, records, output_norm), buffers
 
 
@@ -422,6 +448,33 @@ def test_every_value_tile_gives_the_same_bits(batch, window, monkeypatch):
         assert torch.equal(other_out, out)
         for got, want in zip(other_records, records):
             assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("history_length", [5, 12])
+def test_accepted_history_gives_the_same_bits_in_every_value_tile(
+    batch, history_length, monkeypatch
+):
+    """Accepted records advance the base alike however the values split.
+
+    The fused window and the split verify share the replay. Each must store
+    the same outputs and records for every value tile, up to one CTA per head
+    whose warps replay 32 rows each; 5 records end in a partial group of four.
+    """
+    x = _inputs(batch, 4, seed=90 + batch + history_length)
+    fused, split = [], []
+    for rows in (32, 64, 128):
+        monkeypatch.setattr(window_kernel, "_value_tile_rows", lambda *_, n=rows: n)
+        monkeypatch.setattr(recoverssm_kernel, "_value_tile_rows", lambda *_, n=rows: n)
+        fused.append(_fused(x, 16, history_length=history_length))
+        split.append(_split(x, 16, history_length=history_length))
+    for results in (fused, split):
+        out, records = results[0]
+        for other_out, other_records in results[1:]:
+            assert torch.equal(other_out, out)
+            for got, want in zip(other_records, records):
+                assert torch.equal(got, want)
+    _assert_matches(split[0], fused[0], 16)
 
 
 def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():

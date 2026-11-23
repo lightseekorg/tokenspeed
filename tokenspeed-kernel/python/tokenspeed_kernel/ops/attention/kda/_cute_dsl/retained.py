@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared FP32 logical-state initialization for the retained CuTe producers."""
+"""Retained-history arguments and loads shared by the CuTe verify kernels."""
 
-import cutlass
 from cutlass import Float32, Int32, Int64, cute
 
 
@@ -52,36 +51,6 @@ def retained_length(history, slot):
             length.iterator + Int64(slot) * length.stride[0], cute.make_layout((1,))
         )[0]
     )
-
-
-@cute.jit
-def initialize_page_tile(
-    tile,
-    history,
-    page,
-    slot,
-    head,
-    value_start,
-    rows: cutlass.Constexpr[int],
-    keys: cutlass.Constexpr[int],
-    tidx,
-    threads: cutlass.Constexpr[int],
-):
-    """Load page's base plus slot's accepted history in FP32 without changing storage."""
-    count = retained_length(history, slot)
-    for item in cutlass.range_constexpr(0, rows * keys, threads):
-        offset = item + tidx
-        if offset < rows * keys:
-            value = value_start + offset // keys
-            key = offset % keys
-            current = load_element(history[0], page, head, value, key)
-            for position in cutlass.range(count):
-                u = load_element(history[1], slot, head, position, value)
-                k = load_element(history[2], slot, head, position, key)
-                decay = load_element(history[3], slot, head, position, key)
-                current = current * decay + u * k
-            tile[offset] = current
-    cute.arch.barrier()
 
 
 def retained_arguments(state, history):

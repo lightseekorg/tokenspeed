@@ -71,6 +71,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     _bulk_load,
     _div,
     _exp,
+    _ldg_bf16x4,
     _lds_f32x4,
     _load,
     _rsqrt,
@@ -99,26 +100,6 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     retained_length,
     retained_row,
 )
-
-
-@dsl_user_op
-def _ldg_bf16x4(byte_addr: Int64, *, loc=None, ip=None):
-    """Four BF16 values from an 8-byte aligned global address, as FP32."""
-    value = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [Int64(byte_addr)],
-        "{ .reg .b32 a, b; ld.global.v2.b32 {a, b}, [$4]; "
-        "shl.b32 $0, a, 16; and.b32 $1, a, 0xffff0000; "
-        "shl.b32 $2, b, 16; and.b32 $3, b, 0xffff0000; }",
-        "=f,=f,=f,=f,l",
-        True,
-        loc,
-        ip,
-    )
-    return [
-        Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip))
-        for i in range(4)
-    ]
 
 
 @dsl_user_op

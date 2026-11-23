@@ -25,6 +25,8 @@ from tokenspeed_kernel._triton import tl, triton
 # Row width of the retained commit descriptor ABI
 # (KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS).
 _DESCRIPTOR_COLUMNS = tl.constexpr(14)
+# Records a fold applies per unrolled step, so their loads issue together.
+_FOLD_RECORDS = tl.constexpr(8)
 
 
 @triton.jit(
@@ -727,32 +729,37 @@ def retained_batched_consolidate_kernel(
                 + keys[None, :] * key_stride
             )
             running = tl.load(source_page + tile, mask=mask, other=0).to(tl.float32)
-            for position in range(count):
-                uv = tl.load(
-                    u
-                    + head * correction_strides[2]
-                    + position * correction_strides[3]
-                    + values * correction_strides[4],
-                    mask=value_mask,
-                    other=0,
-                )
-                kv = tl.load(
-                    k
-                    + head * key_strides[2]
-                    + position * key_strides[3]
-                    + keys * key_strides[4],
-                    mask=key_mask,
-                    other=0,
-                )
-                dv = tl.load(
-                    d
-                    + head * decay_strides[2]
-                    + position * decay_strides[3]
-                    + keys * decay_strides[4],
-                    mask=key_mask,
-                    other=0,
-                )
-                running = running * dv[None, :] + uv[:, None] * kv[None, :]
+            # Positions past the count are identity records (decay 1, u 0,
+            # k -0), which leave every value unchanged, a zero's sign included.
+            for first in range(0, count, _FOLD_RECORDS):
+                for offset in tl.static_range(_FOLD_RECORDS):
+                    position = first + offset
+                    present = position < count
+                    uv = tl.load(
+                        u
+                        + head * correction_strides[2]
+                        + position * correction_strides[3]
+                        + values * correction_strides[4],
+                        mask=value_mask & present,
+                        other=0.0,
+                    )
+                    kv = tl.load(
+                        k
+                        + head * key_strides[2]
+                        + position * key_strides[3]
+                        + keys * key_strides[4],
+                        mask=key_mask & present,
+                        other=-0.0,
+                    )
+                    dv = tl.load(
+                        d
+                        + head * decay_strides[2]
+                        + position * decay_strides[3]
+                        + keys * decay_strides[4],
+                        mask=key_mask & present,
+                        other=1.0,
+                    )
+                    running = running * dv[None, :] + uv[:, None] * kv[None, :]
             tl.store(live_page + tile, running.to(STATE), mask=mask)
 
 

@@ -117,7 +117,11 @@ prefix sums, value tiles and clustered producer sharing. Bounded windows with
 `window * abs(lower_bound) <= 48` form pairwise products through factored rows;
 other windows sum intermediate gates directly so a large early gate cannot
 erase later decay. Runtime counts, arena strides and stamp-ring capacity remain
-runtime values in compiled launch interfaces.
+runtime values in compiled launch interfaces. The window and split cores load
+the live page's base tile with one bulk copy and prefetch the accepted records
+into L2. Once the window's columns form, the CTA advances the tile over the
+records in place, in record order and four at a time, before the tile product.
+A request without records waits only for the copy.
 
 ## Output norm and prefill
 

@@ -23,8 +23,9 @@
 Contract: inputs, outputs and records match ``kda_recoverssm_verify``, and the
 checkpoint is read only.
 
-Chunked form. For one request and head, let S0 be the [V, K] checkpoint, G_t
-the cumulative gate (one value per key), k_t and q_t the raw keys and queries,
+Chunked form. For one request and head, let S0 be the [V, K] state: the live
+page's dense base advanced over the request's accepted records. G_t is the
+cumulative gate (one value per key), k_t and q_t the raw keys and queries,
 rk_t = rsqrt(|k_t|^2 + 1e-6) and rq_t = rsqrt(|q_t|^2 + 1e-6) / sqrt(K). Then
 
     P     = S0 @ [k_0 e^G_0, ..., k_{W-1} e^G_{W-1} | q_0 e^G_0, ...]
@@ -36,10 +37,12 @@ rk_t = rsqrt(|k_t|^2 + 1e-6) and rq_t = rsqrt(|q_t|^2 + 1e-6) / sqrt(K). Then
 where c_t is the correction record and out_t the verify output.
 
 A CTA of 128 threads bulk-copies the window's token rows and its [rows, K]
-checkpoint tile into shared memory, forms the gates and the decayed columns
-(one thread per key), forms the pair sums, multiplies the tile by the columns
-on CUDA cores with K split over eight lanes, finalizes a_tj and b_tj, and
-solves the window for c_t and out_t (one thread per value channel).
+base tile into shared memory, forms the gates and the decayed columns (one
+thread per key), forms the pair sums, advances the tile over the accepted
+records in place, multiplies it by the columns on CUDA cores with K split over
+eight lanes, finalizes a_tj and b_tj, and solves the window for c_t and out_t
+(one thread per value channel). The base copy is in flight while the columns
+and pair sums form, so a request without records waits only for the copy.
 
 Pair sums. With a bounded gate and spec_query_len * |lower_bound| <=
 FACTORED_DECAY, e^-G stays a normal FP32 number, so extra tile rows
@@ -86,7 +89,6 @@ _DTYPES = {
 
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
-    initialize_page_tile,
     retained_arguments,
     retained_length,
     retained_row,
@@ -122,6 +124,23 @@ def _lds_f32x4(byte_addr: Int32, *, loc=None, ip=None):
         [Int32(byte_addr)],
         "ld.shared.v4.f32 {$0,$1,$2,$3}, [$4];",
         "=f,=f,=f,=f,r",
+        True,
+        loc,
+        ip,
+    )
+    return _unpack(value, 4, loc, ip)
+
+
+@dsl_user_op
+def _ldg_bf16x4(byte_addr: Int64, *, loc=None, ip=None):
+    """Four BF16 values from an 8-byte aligned global address, as FP32."""
+    value = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int64(byte_addr)],
+        "{ .reg .b32 a, b; ld.global.v2.b32 {a, b}, [$4]; "
+        "shl.b32 $0, a, 16; and.b32 $1, a, 0xffff0000; "
+        "shl.b32 $2, b, 16; and.b32 $3, b, 0xffff0000; }",
+        "=f,=f,=f,=f,l",
         True,
         loc,
         ip,
@@ -185,6 +204,12 @@ def _bulk_load(
         loc,
         ip,
     )
+
+
+@dsl_user_op
+def _prefetch_l2_line(byte_addr: Int64, *, loc=None, ip=None):
+    """Prefetch the 128-byte line holding a global address into L2."""
+    _asm(None, [Int64(byte_addr)], "prefetch.global.L2 [$0];", "l", True, loc, ip)
 
 
 @dsl_user_op
@@ -296,8 +321,9 @@ class RecoverSsmVerify:
     """Verify kernel for one head shape, window, value tile and gate form.
 
     Shared memory per CTA:
-      tile: the [tile_rows, K] FP32 checkpoint tile, then (factored) the extra
-        rows k_j e^-G_j and q_j e^-G_j; after the product it is reused for the
+      tile: the [tile_rows, K] FP32 state tile (the base, then advanced over
+        the accepted records), then (factored) the extra rows k_j e^-G_j and
+        q_j e^-G_j; after the product it is reused for the
         [KEY_SPLITS, tile_rows, partial_row_stride] FP32 partial products.
       columns: M, the [K, padded_columns] decayed keys then queries, stored in
         the order the product loads them (see ``_column_offset``).
@@ -318,6 +344,10 @@ class RecoverSsmVerify:
         factored: bool,
         has_metadata: bool,
     ) -> None:
+        # The record replay gives each warp VT / 4 rows, one lane loading each
+        # row's u, and each lane four key channels.
+        assert value_tile_rows % 4 == 0 and value_tile_rows <= 4 * 32
+        assert key_dim % 4 == 0 and key_dim <= 4 * 32
         self.key_dim = key_dim
         self.value_dim = value_dim
         self.window = window
@@ -535,20 +565,10 @@ class RecoverSsmVerify:
                 warp,
                 lane,
             )
-            initialize_page_tile(
-                shared.tile,
-                retained,
-                live_page,
-                slot,
-                head,
-                value_start,
-                VT,
-                K,
-                tidx,
-                THREADS,
+            self._load_base_tile(
+                shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            if tidx == 0:
-                cute.arch.mbarrier_arrive(shared.state_barrier)
+            self._prefetch_records(retained, slot, head, value_start, warp, lane)
 
             stamp_slot = Int64(request)
             generation = Int64(0)
@@ -596,6 +616,7 @@ class RecoverSsmVerify:
                 slot,
                 head,
                 retained_length(retained, slot),
+                value_start,
                 Int32(value_tile == 0),
                 valid_tokens,
             )
@@ -644,14 +665,16 @@ class RecoverSsmVerify:
         record_slot: Int64,
         record_head: Int32,
         record_start: Int32,
+        value_start: Int32,
         records_keys: Int32,
         valid_tokens: Int32,
     ):
         """Phases 1 and 2 on the token rows in shared memory.
 
         Leaves P's partials in the tile and the coefficients in the sums table
-        for ``_solve_window``. ``key_record`` is this (slot, head)'s key and
-        raw-gate record; a CTA stores its window positions when
+        for ``_solve_window``. ``record_start`` counts the (slot, head)'s
+        accepted records, which advance the base tile before the product; a CTA
+        stores the window's normalized keys and decays after them when
         ``records_keys`` is set.
         """
         K = self.key_dim
@@ -674,6 +697,16 @@ class RecoverSsmVerify:
 
         # Phase 2: tile @ M; the barrier after it frees the tile for partials.
         cute.arch.mbarrier_wait(shared.state_barrier, 0)
+        self._apply_records(
+            shared,
+            retained,
+            record_slot,
+            record_head,
+            record_start,
+            value_start,
+            warp,
+            lane,
+        )
         products = self._tile_times_columns(shared, warp, lane)
         cute.arch.barrier()
         self._store_partials(shared, products, warp, lane)
@@ -801,6 +834,207 @@ class RecoverSsmVerify:
         _bulk_load(
             shared.tokens_addr + token_offset * 2, src.toint(), elems * 2, barrier
         )
+
+    @cute.jit
+    def _load_base_tile(
+        self,
+        shared: _Shared,
+        retained: tuple,
+        page: Int64,
+        head: Int32,
+        value_start: Int32,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+    ):
+        """Load this tile's rows of the live page's dense base, then the state barrier.
+
+        An FP32 base lands with one bulk copy that stays in flight through
+        phase 1; the CTA widens a BF16 base. ``_apply_records`` then advances
+        the rows over the request's accepted records.
+        """
+        K = self.key_dim
+        VT = self.value_tile_rows
+        state = retained[0]
+        base = state.iterator + (
+            page * state.stride[0]
+            + Int64(head) * state.stride[1]
+            + Int64(value_start) * K
+        )
+        if const_expr(state.element_type == Float32):
+            if tidx == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    shared.state_barrier, VT * K * 4
+                )
+                _bulk_load(
+                    shared.tile_addr,
+                    base.toint(),
+                    VT * K * 4,
+                    Int32(shared.state_barrier.toint()),
+                )
+        else:
+            # Each lane widens four channels of its warp's VT / 4 rows, eight
+            # rows' loads in flight before their stores.
+            rows = VT // 4
+            channel = cutlass.min(4 * lane, K - 4)
+            for first in cutlass.range_constexpr(0, rows, 8):
+                batch = min(8, rows - first)
+                values = []
+                for r in cutlass.range_constexpr(batch):
+                    element = (warp * rows + first + r) * K + channel
+                    values.append(_ldg_bf16x4((base + element).toint()))
+                for r in cutlass.range_constexpr(batch):
+                    element = (warp * rows + first + r) * K + channel
+                    if 4 * lane < K:
+                        _sts_f32x4(shared.tile_addr + element * 4, values[r])
+            cute.arch.barrier()
+            if tidx == 0:
+                cute.arch.mbarrier_arrive(shared.state_barrier)
+
+    @cute.jit
+    def _prefetch_records(
+        self,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        value_start: Int32,
+        warp: Int32,
+        lane: Int32,
+    ):
+        """Prefetch the (slot, head)'s accepted records into L2 for ``_apply_records``.
+
+        Records were written rounds ago and are usually only in DRAM; the
+        prefetch overlaps their latency with phase 1. The last warp issues it,
+        so the others start phase 1 without waiting for the record count.
+        Lanes 2p and 2p + 1 cover record p, the even one its key row and this
+        tile's u, the odd one its decay row, a 128-byte line at a time over
+        dense rows (other layouts prefetch lines the replay may not read).
+        """
+        K = self.key_dim
+        VT = self.value_tile_rows
+        if warp == THREADS // 32 - 1:
+            count = retained_length(retained, slot)
+            correction, key, decay = retained[1], retained[2], retained[3]
+            for group in cutlass.range((count + 15) // 16, unroll=1):
+                record = group * 16 + lane // 2
+                position = Int64(record)
+                if record < count:
+                    if lane % 2 == 0:
+                        key_row = key.iterator + (
+                            slot * key.stride[0]
+                            + Int64(head) * key.stride[1]
+                            + position * key.stride[2]
+                        )
+                        for line in cutlass.range_constexpr((K + 31) // 32):
+                            _prefetch_l2_line((key_row + line * 32).toint())
+                        u_row = correction.iterator + (
+                            slot * correction.stride[0]
+                            + Int64(head) * correction.stride[1]
+                            + position * correction.stride[2]
+                            + Int64(value_start)
+                        )
+                        for line in cutlass.range_constexpr((VT + 31) // 32):
+                            _prefetch_l2_line((u_row + line * 32).toint())
+                    else:
+                        decay_row = decay.iterator + (
+                            slot * decay.stride[0]
+                            + Int64(head) * decay.stride[1]
+                            + position * decay.stride[2]
+                        )
+                        for line in cutlass.range_constexpr((K + 31) // 32):
+                            _prefetch_l2_line((decay_row + line * 32).toint())
+
+    @cute.jit
+    def _apply_records(
+        self,
+        shared: _Shared,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        count: Int32,
+        value_start: Int32,
+        warp: Int32,
+        lane: Int32,
+    ):
+        """Advance the base tile over the (slot, head)'s ``count`` accepted records.
+
+        Record p maps S to S * decay_p + u_p k_p^T. Records apply in order, and
+        each rounds the decayed value before fusing in u_p k_p. Lane l owns key
+        channels 4l..4l+3 of its warp's VT / 4 rows, and lane r loads the u of
+        the warp's row r. Records go four at a time: a lane keeps the group's
+        keys and decays for its channels in registers and takes each row's u
+        from the lane that loaded it. Positions past ``count`` are identity
+        records (decay 1, u 0, k -0), which leave every value unchanged, a
+        zero's sign included. A CTA barrier then makes the tile whole for the
+        product.
+        """
+        K = self.key_dim
+        rows = self.value_tile_rows // 4
+        if count > 0:
+            correction, key, decay = retained[1], retained[2], retained[3]
+            first_row = warp * rows
+            channel = cutlass.min(4 * lane, K - 4)
+            # Lanes past the warp's rows repeat its last row's u.
+            u_row = correction.iterator + (
+                slot * correction.stride[0]
+                + Int64(head) * correction.stride[1]
+                + Int64(value_start + first_row + cutlass.min(lane, rows - 1))
+            )
+            key_row = key.iterator + (
+                slot * key.stride[0] + Int64(head) * key.stride[1]
+            )
+            decay_row = decay.iterator + (
+                slot * decay.stride[0] + Int64(head) * decay.stride[1]
+            )
+            for group in cutlass.range((count + 3) // 4, unroll=1):
+                us = []
+                keys = []
+                decays = []
+                for j in cutlass.range_constexpr(4):
+                    position = group * 4 + j
+                    # Clamped, so every load addresses an accepted record.
+                    at = Int64(cutlass.min(position, count - 1))
+                    u = _load(u_row, at * correction.stride[2])
+                    key_at = key_row + at * key.stride[2]
+                    decay_at = decay_row + at * decay.stride[2]
+                    k0 = _load(key_at, Int64(channel) * key.stride[3])
+                    k1 = _load(key_at, Int64(channel + 1) * key.stride[3])
+                    k2 = _load(key_at, Int64(channel + 2) * key.stride[3])
+                    k3 = _load(key_at, Int64(channel + 3) * key.stride[3])
+                    d0 = _load(decay_at, Int64(channel) * decay.stride[3])
+                    d1 = _load(decay_at, Int64(channel + 1) * decay.stride[3])
+                    d2 = _load(decay_at, Int64(channel + 2) * decay.stride[3])
+                    d3 = _load(decay_at, Int64(channel + 3) * decay.stride[3])
+                    if position >= count:
+                        u = Float32(0.0)
+                        k0 = Float32(-0.0)
+                        k1 = Float32(-0.0)
+                        k2 = Float32(-0.0)
+                        k3 = Float32(-0.0)
+                        d0 = Float32(1.0)
+                        d1 = Float32(1.0)
+                        d2 = Float32(1.0)
+                        d3 = Float32(1.0)
+                    us.append(u)
+                    keys.append(((k0, k1), (k2, k3)))
+                    decays.append(((d0, d1), (d2, d3)))
+                for r in cutlass.range(rows, unroll=4):
+                    address = shared.tile_addr + ((first_row + r) * K + channel) * 4
+                    values = _lds_f32x4(address)
+                    pairs = [(values[0], values[1]), (values[2], values[3])]
+                    for j in cutlass.range_constexpr(4):
+                        row_u = cute.arch.shuffle_sync(us[j], r)
+                        for half in cutlass.range_constexpr(2):
+                            pairs[half] = cute.arch.fma_packed_f32x2(
+                                (row_u, row_u),
+                                keys[j][half],
+                                cute.arch.mul_packed_f32x2(
+                                    pairs[half], decays[j][half]
+                                ),
+                            )
+                    if 4 * lane < K:
+                        _sts_f32x4(address, [*pairs[0], *pairs[1]])
+            cute.arch.barrier()
 
     @cute.jit
     def _load_key_channel(self, shared: _Shared, key: Int32):
