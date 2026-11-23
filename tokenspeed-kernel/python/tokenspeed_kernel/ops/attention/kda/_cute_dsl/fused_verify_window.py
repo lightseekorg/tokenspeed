@@ -243,13 +243,21 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self.smem_bytes += 4 * (tile_words - self.tile_words)
         self.tile_words = tile_words
         self.smem_bytes = max(self.smem_bytes, smem_floor)
-        # A 32-row tile loads its key channel's keys and decays of the
-        # records after the gate projection, so the loads fly through the
-        # token exchange; phase 1 used to wait on them (0.2-0.4 us of a T 4
-        # batch-1 layer with records on GB300). A 64-row tile keeps loading
-        # them in phase 1: started there, they slowed it 3-5% without
-        # records. A 128-row tile starts them with the CTA.
-        self.preload_history_channel = self.history_rows > 0 and value_tile_rows == 32
+        # Where a tile starts its key channel's loads of the records' keys and
+        # decays, so they fly before phase 1 uses them (phase 1 used to wait
+        # on them, 0.2-0.4 us of a T 4 batch-1 layer with records on GB300).
+        # A 32-row tile starts them after the gate projection, a 64-row tile
+        # after its row loads when its u load early too (after the gate
+        # projection they slowed it 3-5% without records; at T 8, its product
+        # registers already many, they slowed a batch-16 round 2-3%), and a
+        # 128-row tile with the CTA (``early_history_loads``); otherwise
+        # phase 1 loads them.
+        self.history_channel_start = None
+        if self.history_rows > 0 and value_tile_rows == 32:
+            self.history_channel_start = "gate"
+        elif value_tile_rows == 64 and self.preload_history_us:
+            self.history_channel_start = "rows"
+        self.preload_history_channel = self.history_channel_start is not None
         if gated_norm:
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
@@ -549,6 +557,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
             gate_inputs = [_ldg_b32x2(address) for address in gate_addresses]
             raw_beta = _load(beta, beta_offset)
             logits = [_load(gate, offset) for offset in logit_offsets]
+            if const_expr(self.history_channel_start == "rows"):
+                if live:
+                    self._start_history_channel(
+                        retained, slot, head, count, tidx, history_keys, history_decays
+                    )
             gate_scale = _exp(a_log_value.to(Float32))
             gate_bias = gate_bias_value.to(Float32)
             norm_scale = Float32(0.0)
@@ -576,18 +589,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
             )
             if live:
                 self._project_gate(shared, gate_inputs, value_start, warp, lane)
-                if const_expr(self.preload_history_channel):
-                    if count > 0:
-                        if tidx < K:
-                            self._load_history_channel(
-                                retained,
-                                slot,
-                                head,
-                                count,
-                                tidx,
-                                history_keys,
-                                history_decays,
-                            )
+                if const_expr(self.history_channel_start == "gate"):
+                    self._start_history_channel(
+                        retained, slot, head, count, tidx, history_keys, history_decays
+                    )
                 if const_expr(self.cluster == 1):
                     cute.arch.barrier()
                 else:
@@ -685,6 +690,24 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         _store_if(
                             Int32(t < valid_tokens), row.toint(), Float32(0.0), True
                         )
+
+    @cute.jit
+    def _start_history_channel(
+        self,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        count: Int32,
+        tidx: Int32,
+        keys,
+        decays,
+    ):
+        """Start key channel ``tidx``'s loads of the records' keys and decays."""
+        if count > 0:
+            if tidx < self.key_dim:
+                self._load_history_channel(
+                    retained, slot, head, count, tidx, keys, decays
+                )
 
     @cute.jit
     def _gate_input_addresses(
