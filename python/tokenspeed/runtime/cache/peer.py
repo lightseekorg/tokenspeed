@@ -80,12 +80,13 @@ def peer_incarnation() -> int:
     return secrets.randbits(32) or 1
 
 
-def peer_endpoint_name(host: str, port: int) -> str:
+def peer_endpoint_name(host: str, port: int, dp_rank: int = 0) -> str:
     """The name a replica is known by: the endpoint other replicas and the
     router reach it at."""
     from tokenspeed.runtime.utils.network import join_host_port
 
-    return join_host_port(host, port)
+    address = join_host_port(host, port)
+    return f"{address}/{dp_rank}" if dp_rank else address
 
 
 def peer_scheduler_config(
@@ -287,7 +288,8 @@ class PeerSharingSettings:
     """What the engine host starts this rank's peer sharing from.
 
     Attributes:
-        name: The replica's endpoint name, ``host:port``.
+        name: The advertised endpoint, including the nonzero DP rank suffix.
+        node_leaders: (global rank, DP rank) of each local replica leader.
         bind_host: The host the replica's first member binds its endpoint
             on.
         port: The endpoint's port.
@@ -311,6 +313,7 @@ class PeerSharingSettings:
     """
 
     name: str
+    node_leaders: tuple[tuple[int, int], ...]
     bind_host: str
     port: int
     incarnation: int

@@ -37,7 +37,6 @@ from tokenspeed.runtime.cache.l3.config import (
     MooncakeStoreSettings,
     parse_extra_config,
 )
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -119,6 +118,8 @@ def mooncake_store_library() -> str:
     """The Mooncake store library the engine host loads:
     ``TOKENSPEED_MOONCAKE_STORE_LIBRARY``, else the store's C ABI the
     tokenspeed-mooncake wheel installs."""
+    from tokenspeed.runtime.utils.env import envs
+
     override = envs.TOKENSPEED_MOONCAKE_STORE_LIBRARY.get()
     if override:
         return override
@@ -135,6 +136,62 @@ def mooncake_store_library() -> str:
             "with the store's C ABI"
         )
     return path
+
+
+def _cache_checkpoint_ids(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    world_cpu_group: ProcessGroup | None,
+    *,
+    for_peer: bool,
+) -> list[str]:
+    if for_peer:
+        from tokenspeed.runtime.cache.l3.identity import warn_if_unpinned_peer_weights
+
+        target = str(model_config.revision or "")
+        draft = (
+            str(draft_model_config.revision or "")
+            if draft_model_config is not None
+            else ""
+        )
+        if server_args.mapping.rank == 0:
+            revisions = [target] if draft_model_config is None else [target, draft]
+            warn_if_unpinned_peer_weights(server_args.weight_version, revisions)
+        return [target, draft]
+
+    import torch.distributed as dist
+
+    from tokenspeed.runtime.cache.l3.identity import share_l3_checkpoint_ids
+
+    initialized = dist.is_available() and dist.is_initialized()
+    if world_cpu_group is not None:
+        if not initialized or dist.get_backend(world_cpu_group) != "gloo":
+            raise ValueError("L3 checkpoint agreement requires a Gloo CPU group")
+        world_size = dist.get_world_size(world_cpu_group)
+        rank = dist.get_rank(world_cpu_group)
+    else:
+        if initialized and dist.get_world_size() > 1:
+            raise ValueError("L3 checkpoint agreement requires an explicit CPU group")
+        world_size, rank = 1, 0
+    checkpoint_id = model_checkpoint_id(server_args, model_config)
+    draft_revision = (
+        model_checkpoint_id(server_args, draft_model_config)
+        if draft_model_config is not None
+        else ""
+    )
+
+    def gather_checkpoint_ids(payload: list) -> list:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, payload, group=world_cpu_group)
+        return gathered
+
+    return share_l3_checkpoint_ids(
+        [checkpoint_id, draft_revision],
+        rank=rank,
+        world_size=world_size,
+        gather=gather_checkpoint_ids,
+    )
 
 
 def cache_deployment_id(
@@ -157,8 +214,8 @@ def cache_deployment_id(
         draft_model_config: Draft checkpoint configuration, or None.
         host_cache: Shared Host resources and resolved CPU cache facts.
         for_peer: Apply the live peer cache compatibility rules.
-        world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment. Every rank calls this.
+        world_cpu_group: Gloo group for multi-rank persistent L3 checkpoint
+            agreement. Live peers and single-process L3 pass None.
 
     Returns:
         The id; the weight version is not part of it.
@@ -185,42 +242,18 @@ def cache_deployment_id(
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
         checkpoint_granularities=host_cache.checkpoint_granularities,
     )
-    import torch.distributed as dist
-
     from tokenspeed.runtime.cache.l3.identity import (
         L3_RUNTIME_COMPAT,
         l3_cache_quantization_id,
-        share_l3_checkpoint_ids,
         storage_deployment_id,
     )
 
-    initialized = dist.is_available() and dist.is_initialized()
-    if world_cpu_group is not None:
-        if not initialized or dist.get_backend(world_cpu_group) != "gloo":
-            raise ValueError("L3 checkpoint agreement requires a Gloo CPU group")
-        world_size = dist.get_world_size(world_cpu_group)
-        rank = dist.get_rank(world_cpu_group)
-    else:
-        if initialized and dist.get_world_size() > 1:
-            raise ValueError("L3 checkpoint agreement requires an explicit CPU group")
-        world_size, rank = 1, 0
-    checkpoint_id = model_checkpoint_id(server_args, model_config)
-    draft_revision = (
-        model_checkpoint_id(server_args, draft_model_config)
-        if draft_model_config is not None
-        else ""
-    )
-
-    def gather_checkpoint_ids(payload: list) -> list:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, payload, group=world_cpu_group)
-        return gathered
-
-    checkpoint_id, draft_revision = share_l3_checkpoint_ids(
-        [checkpoint_id, draft_revision],
-        rank=rank,
-        world_size=world_size,
-        gather=gather_checkpoint_ids,
+    checkpoint_id, draft_revision = _cache_checkpoint_ids(
+        server_args,
+        model_config,
+        draft_model_config,
+        world_cpu_group,
+        for_peer=for_peer,
     )
     pipeline_rank = server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
     if draft_model_config is not None:

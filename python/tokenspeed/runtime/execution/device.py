@@ -1950,17 +1950,12 @@ def build_device_side(
             from tokenspeed.runtime.cache.l2.executor import (
                 release_checkpoint_file_cache,
             )
-            from tokenspeed.runtime.cache.l3.factory import model_checkpoint_id
 
             configs = (
                 [model_config]
                 if draft_model_config is None
                 else [model_config, draft_model_config]
             )
-            if server_args.peer_prefix_port is not None:
-                # Compute the mandatory identity while the loaded shards are still cached.
-                for config in configs:
-                    model_checkpoint_id(server_args, config)
             release_checkpoint_file_cache(
                 [config.model_path for config in configs],
                 node_leader=(global_rank % server_args.mapping.nprocs_per_node == 0),
