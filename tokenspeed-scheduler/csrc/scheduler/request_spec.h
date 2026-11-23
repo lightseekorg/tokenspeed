@@ -30,11 +30,17 @@ namespace tokenspeed {
 
 struct RequestSpec {
     std::string request_id;
+    // The control plane's immutable admission identity. Required when cache
+    // events are enabled; zero preserves standalone callers without a sink.
+    std::uint64_t admission_id{0};
     std::string session_id;
     // Shared cache owner for independent sessions; empty preserves session ownership.
     std::string cache_group_id;
     // Remote checkpoint discovery only; content is always rehashed locally.
     std::vector<std::int32_t> shared_prefix_tokens;
+    // The replica the router expects to hold this prompt's prefix
+    // (PeerConfig::name there); empty for none. A hint: the holder confirms.
+    std::string peer_holder;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
     // Upper bound on the prompt prefix the first admission's probe may claim

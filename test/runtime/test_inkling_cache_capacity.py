@@ -25,7 +25,7 @@ from pathlib import Path
 from test.runtime.models.test_inkling2_config import _checkpoint
 
 import pytest
-from tokenspeed_scheduler import CapacityModel
+from tokenspeed_engine.scheduler import CapacityModel
 
 from tokenspeed.runtime.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
 from tokenspeed.runtime.configs.inkling_config import InklingMMConfig
@@ -237,6 +237,50 @@ def test_native_draft_workspace_matches_target_ring(tmp_path: Path) -> None:
             qsa_bf16_scratch=None,
             expected_bytes=recipe.workspace_bytes() + 1,
         )
+
+
+def test_model_free_drafting_plans_the_target_verify_ring(tmp_path: Path) -> None:
+    """DUMMY drafting verifies like a draft model without one: the planned
+    workspace holds the target's verify-row rings it allocates."""
+    recipe = _recipe(
+        tmp_path,
+        inkling2=True,
+        token_limit=_CONTEXT,
+        budget_bytes=64 << 30,
+        overlap_depth=1,
+    )
+    args = recipe.server_args
+    args.speculative_algorithm = "DUMMY"
+    args.speculative_num_draft_tokens = 4
+    recipe.attn_config = replace(
+        MHAConfig.generate(args, recipe.model_config, is_draft=False),
+        device="cpu",
+        max_bs=1,
+    )
+    recipe.decode_input_tokens = 4
+    target = InklingAttnBackend.from_config(
+        create_paged_router(
+            recipe.attn_config,
+            recipe.model_config.attention_arch,
+            backend_name="triton",
+        ),
+        recipe.model_config.hf_text_config,
+        recipe.attn_config,
+        num_layers=recipe.num_target_layers,
+        is_draft=False,
+        enable_layerwise_cache_ready=False,
+    )
+    assert target.conv_pool.conv_state.shape[2] == 3 + 4
+    _prepare_fixed_workspaces(
+        server_args=args,
+        config=recipe.attn_config,
+        backend=target,
+        draft_backend=None,
+        uses_paged_state_verify=False,
+        is_inkling=True,
+        qsa_bf16_scratch=None,
+        expected_bytes=recipe.workspace_bytes(),
+    )
 
 
 @pytest.mark.parametrize("token_limit", [None, _CONTEXT])

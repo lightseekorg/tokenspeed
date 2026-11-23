@@ -507,9 +507,10 @@ def _is_inkling_model(model_id: str | None) -> bool:
     config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return (
-        config.get("model_type") in {"inkling_mm_model", "inkling2"}
+        config.get("model_type") in {"inkling_mm_model", "inkling2", "inkling2_loop"}
         or "InklingForConditionalGeneration" in architectures
         or "Inkling2ForConditionalGeneration" in architectures
+        or "Inkling2LoopForConditionalGeneration" in architectures
     )
 
 
@@ -519,8 +520,10 @@ def _is_inkling2_model(model_id: str) -> bool:
         # A whole "inkling2" / "inkling-2" name token; "inkling-2025-..." is not one.
         name = re.search(r"(?<![a-z0-9])inkling[-_]?2(?![a-z0-9])", model_id.lower())
         return name is not None
-    return config.get("model_type") == "inkling2" or (
-        "Inkling2ForConditionalGeneration" in (config.get("architectures") or [])
+    architectures = config.get("architectures") or []
+    return config.get("model_type") in {"inkling2", "inkling2_loop"} or (
+        "Inkling2ForConditionalGeneration" in architectures
+        or "Inkling2LoopForConditionalGeneration" in architectures
     )
 
 

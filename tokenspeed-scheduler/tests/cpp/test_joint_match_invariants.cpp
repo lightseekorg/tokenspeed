@@ -125,11 +125,11 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64, {1, 1});
         {
-            CacheCoordinator coordinator =
-                MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                /*snapshot_pool=*/nullptr,
-                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
-                                /*checkpoint_retention_requests=*/0);
+            CacheCoordinator coordinator = MakeCoordinator(
+                specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                /*snapshot_pool=*/nullptr,
+                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                /*checkpoint_retention_requests=*/0);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).
@@ -205,7 +205,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64, {1, 1});
         CacheCoordinator coordinator = MakeCoordinator(
-            specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+            specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
             /*snapshot_pool=*/nullptr,
             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
@@ -275,7 +275,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
         pages.emplace_back(tokens.data() + page * kP, kP);
     }
     const std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
-    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = kMaxTokens};
+    const PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = kMaxTokens};
     std::mt19937 rng(20261023);
     std::uniform_int_distribution<std::int32_t> page_dist(0, kPages - 1);
     std::uniform_int_distribution<std::int32_t> tail_dist(1, kP - 1);
@@ -291,7 +291,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
             BlockPool device(64, {4, 1, 1, 1});
             BlockPool host(64, {4, 1, 1, 1});
             CacheCoordinator coordinator =
-                MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host,
+                MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host, /*disk_pool=*/nullptr,
                                 /*snapshot_pool=*/nullptr,
                                 /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
                                 /*checkpoint_retention_requests=*/0);
@@ -355,8 +355,8 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
             for (std::size_t t = 0; t < kNumTails; ++t) {
                 hinted[t] = std::ranges::any_of(present[kHost][kFirstTailRow + t], [](bool held) { return held; });
                 if (hinted[t]) {
-                    coordinator.CacheHostTail(tail_prior,
-                                              TailPublication{.tail_tokens = tail_tokens[t], .hash = tail_hash[t]});
+                    coordinator.Host().CacheHostTail(
+                        tail_prior, TailPublication{.tail_tokens = tail_tokens[t], .hash = tail_hash[t]});
                 }
             }
 
@@ -404,7 +404,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
                 }
             }
 
-            CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+            PrefixProbe probe = coordinator.Prober().ProbePromptPrefix(prompt);
             const std::int32_t hit = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
             EXPECT_EQ(probe.device_only_hit_tokens, device_hit) << "l3=" << l3 << " round " << round;
             EXPECT_EQ(hit, best) << "l3=" << l3 << " round " << round << ": D=" << device_hit << " L=" << device_kv
@@ -416,8 +416,8 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
                 EXPECT_EQ(probe.device.full_page_tokens, std::min(device_kv, hit_pages * kP)) << "round " << round;
             }
             std::vector<BlockTable> tables(4);
-            const std::optional<CacheCoordinator::AdmissionResult> result = AdmitForTest(
-                coordinator, tables, CacheCoordinator::PrefixProbe{probe}, GroupDemand{.extent = DenseGrowth{1}});
+            const std::optional<AdmissionResult> result =
+                AdmitForTest(coordinator, tables, PrefixProbe{probe}, GroupDemand{.extent = DenseGrowth{1}});
             ASSERT_TRUE(result) << "l3=" << l3 << " round " << round;
             for (std::int32_t page = 0; page < hit_pages; ++page) {
                 EXPECT_TRUE(tables[0].Blocks()[static_cast<std::size_t>(page)]) << "round " << round;
@@ -449,7 +449,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
             if (!l3) {
                 continue;
             }
-            for (const CacheKey& key : coordinator.MissingStorageKeys(prompt, /*max_keys=*/64).keys) {
+            for (const CacheKey& key : coordinator.Storage().MissingStorageKeys(prompt, /*max_keys=*/64).keys) {
                 if (!coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Contains(device, key)) {
                     continue;
                 }
@@ -492,7 +492,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
         BlockPool device(24, {4, 1, 1, 1});
         BlockPool host(1, {4, 1, 1, 1});
         CacheCoordinator coordinator =
-            MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host,
+            MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                             /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                             /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers{coordinator};
@@ -536,12 +536,12 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
 
             // Resume on what the Device holds, below the last token.
             const std::int32_t max_tokens = num_tokens - 1;
-            const CacheCoordinator::PromptPrefix prompt{
+            const PromptPrefix prompt{
                 .prefix_hashes =
                     std::span<const std::string>(session.hashes).first(static_cast<std::size_t>(max_tokens / kP)),
                 .tokens = session.tokens,
                 .max_tokens = max_tokens};
-            CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+            PrefixProbe probe = coordinator.Prober().ProbePromptPrefix(prompt);
             const std::int32_t hit = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
             hits += hit > 0 ? 1 : 0;
             // A chunk end with its checkpoint at a page past the hit, before the
@@ -572,7 +572,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
                                        .boundary_kind = CacheBoundaryKind::kChunk},
                     .num_computed_tokens = first_end,
                 };
-                if (!AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}),
+                if (!AdmitForTest(coordinator, tables, coordinator.Prober().ProbePrefix({}),
                                   GroupDemand{.extent = DenseGrowth{num_tokens - first_end}}, chunk_end)) {
                     coordinator.Free(tables);
                     continue;
@@ -597,7 +597,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             // several checkpoint boundaries share leave too.
             if (flood(rng)) {
                 std::vector<BlockTable> flood_tables(4);
-                EXPECT_TRUE(AdmitForTest(coordinator, flood_tables, coordinator.ProbePrefix({}),
+                EXPECT_TRUE(AdmitForTest(coordinator, flood_tables, coordinator.Prober().ProbePrefix({}),
                                          GroupDemand{.extent = DenseGrowth{96 * kP}}, RequestProgress{},
                                          StateStep{.kind = StateStep::Kind::kKeep}))
                     << "round " << round;
@@ -651,7 +651,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
         EXPECT_GT(chunked, 0);
         EXPECT_GT(floods, 0);
         EXPECT_GT(peak_checkpoints, 0u);
-        const CacheCoordinator::DeviceEvictionStats& evictions = coordinator.DeviceEvictions();
+        const CacheEvictor::DeviceEvictionStats& evictions = coordinator.DeviceEvictions();
         EXPECT_GT(evictions.admission.blocks, 0u);
         EXPECT_GT(evictions.stranded_suffix.blocks, 0u);
     }
@@ -678,10 +678,10 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64, {1, 2, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the
@@ -709,9 +709,10 @@ TEST(JointMatchInvariantsTest, RejectedCheckpointsDoNotKeepHitsAtTheOlderBoundar
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
     BlockPool device(16, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
     for (const auto& hash : hashes) {
         CacheBlockFor(coordinator, device, hash, 0);
@@ -721,8 +722,8 @@ TEST(JointMatchInvariantsTest, RejectedCheckpointsDoNotKeepHitsAtTheOlderBoundar
     }
     CacheBlockFor(coordinator, device, hashes[2], 1);
     CacheBlockFor(coordinator, device, hashes[1], 2);
-    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
-    const auto older = coordinator.ProbePromptPrefix(prompt);
+    const PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
+    const auto older = coordinator.Prober().ProbePromptPrefix(prompt);
     EXPECT_EQ(older.device.num_common_tokens, 4);
     EXPECT_EQ(older.device.kv_tokens, 12);
     for (const auto& group : older.device.per_group) {
@@ -730,7 +731,7 @@ TEST(JointMatchInvariantsTest, RejectedCheckpointsDoNotKeepHitsAtTheOlderBoundar
     }
 
     CacheBlockFor(coordinator, device, hashes[2], 2);
-    const auto newer = coordinator.ProbePromptPrefix(prompt);
+    const auto newer = coordinator.Prober().ProbePromptPrefix(prompt);
     EXPECT_EQ(newer.device.num_common_tokens, 12);
     for (std::size_t group : {1u, 2u}) {
         EXPECT_EQ(newer.device.per_group[group].hits, (std::vector<std::uint8_t>{0, 0, 1}));
@@ -745,7 +746,7 @@ TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissin
     };
     BlockPool device(64, {1, 1, 1});
     BlockPool host(64, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
@@ -755,9 +756,9 @@ TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissin
     CacheBlockFor(coordinator, host, hashes[0], 2);
     CacheBlockFor(coordinator, host, hashes[2], 1);
     CacheBlockFor(coordinator, device, hashes[2], 2);
-    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
-    const auto before = coordinator.ProbePromptPrefix(prompt);
-    const auto rows = coordinator.InspectPrefixAvailability(prompt);
+    const PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
+    const auto before = coordinator.Prober().ProbePromptPrefix(prompt);
+    const auto rows = coordinator.Prober().InspectPrefixAvailability(prompt);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows[0].tokens, 12);
     EXPECT_EQ(rows[0].union_missing, 1u);  // Both states exist, the Full KV has a hole.
@@ -767,7 +768,7 @@ TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissin
     EXPECT_EQ(rows[2].union_missing, 2u);  // state1 and state2 have no common boundary.
     EXPECT_EQ(rows[1].device_missing, 5u);
     EXPECT_EQ(rows[1].host_missing, 7u);
-    const auto after = coordinator.ProbePromptPrefix(prompt);
+    const auto after = coordinator.Prober().ProbePromptPrefix(prompt);
     EXPECT_EQ(before.host.num_common_tokens, after.host.num_common_tokens);
     EXPECT_EQ(before.device.num_common_tokens, after.device.num_common_tokens);
     EXPECT_EQ(after.host.num_common_tokens, 0);
@@ -787,16 +788,17 @@ TEST(JointMatchInvariantsTest, AvailabilityChecksSlidingLookbackAndSkipsReplayab
          .block_granularity = 4},
     };
     BlockPool device(64, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
     for (const auto& hash : hashes) {
         CacheBlockFor(coordinator, device, hash, 0);
     }
     CacheBlockFor(coordinator, device, hashes[0], 1);
     CacheBlockFor(coordinator, device, hashes[2], 1);
-    const auto rows = coordinator.InspectPrefixAvailability({.prefix_hashes = hashes, .max_tokens = 12});
+    const auto rows = coordinator.Prober().InspectPrefixAvailability({.prefix_hashes = hashes, .max_tokens = 12});
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows[0].union_missing, 2u);  // Last window block alone is insufficient.
     EXPECT_EQ(rows[1].union_missing, 2u);
@@ -811,7 +813,7 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     };
     BlockPool device(64, {1, 1});
     BlockPool host(64, {1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6};
@@ -820,19 +822,18 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     CacheBlockFor(coordinator, device, hashes[0], 0);
     CacheBlockFor(coordinator, device, hashes[0], 1);
     CacheBlockFor(coordinator, host, tail_hash, 0);
-    const CacheCoordinator::PromptPrefix prompt{
-        .prefix_hashes = hashes,
-        .tokens = tokens,
-        .max_tokens = 6,
-        .tail = TailPublication{.tail_tokens = 2, .hash = ContentHash{tail_hash}}};
-    auto rows = coordinator.InspectPrefixAvailability(prompt);
+    const PromptPrefix prompt{.prefix_hashes = hashes,
+                              .tokens = tokens,
+                              .max_tokens = 6,
+                              .tail = TailPublication{.tail_tokens = 2, .hash = ContentHash{tail_hash}}};
+    auto rows = coordinator.Prober().InspectPrefixAvailability(prompt);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0].tokens, 6);
     EXPECT_EQ(rows[0].union_missing, 2u);
     EXPECT_EQ(rows[1].tokens, 4);
     EXPECT_EQ(rows[1].union_missing, 0u);
     CacheBlockFor(coordinator, host, tail_hash, 1);
-    rows = coordinator.InspectPrefixAvailability(prompt);
+    rows = coordinator.Prober().InspectPrefixAvailability(prompt);
     EXPECT_EQ(rows[0].union_missing, 0u);
     EXPECT_EQ(rows[0].device_missing, 3u);
     EXPECT_EQ(rows[0].host_missing, 1u);
@@ -846,9 +847,10 @@ TEST(JointMatchInvariantsTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/&host,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/&host, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto entries = [&](const BlockPool& pool) {
         return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, ContentHash{"page"});
     };
@@ -860,13 +862,13 @@ TEST(JointMatchInvariantsTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
     auto device_kv = device.AcquireBlock(0);
     auto host_kv = host.AcquireBlock(0);
     coordinator.CacheDeviceBlock(device_kv, KeyFor("page", 0), 0, CacheBoundaryKind::kChunk, 1);
-    coordinator.CacheHostBlock(host_kv, KeyFor("page", 0), std::nullopt);
+    coordinator.Host().CacheHostBlock(host_kv, KeyFor("page", 0), std::nullopt);
     EXPECT_EQ(groups(device), (std::vector<std::uint32_t>{0}));
     EXPECT_EQ(groups(host), (std::vector<std::uint32_t>{0}));
 
     // A single State group is still a checkpoint mark, independently per tier.
     auto host_state = host.AcquireBlock(2);
-    coordinator.CacheHostBlock(host_state, KeyFor("page", 2), std::nullopt);
+    coordinator.Host().CacheHostBlock(host_state, KeyFor("page", 2), std::nullopt);
     EXPECT_EQ(groups(host), (std::vector<std::uint32_t>{2, 0}));
     EXPECT_TRUE(entries(host).front().in_use);
     host_state.reset();

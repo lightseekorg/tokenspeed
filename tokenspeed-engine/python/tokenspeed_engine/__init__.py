@@ -32,6 +32,8 @@
   host runs its own.
 * ``BootstrapServer`` is a disaggregated deployment's HTTP rendezvous
   (``ts-pd``), which the launcher hosts.
+* ``tokenspeed_engine.scheduler`` is the C++ scheduler's Python API, from
+  the build linked into the host extension.
 """
 
 from pathlib import Path

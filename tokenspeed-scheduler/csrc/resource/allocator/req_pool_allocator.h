@@ -22,8 +22,30 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace tokenspeed {
+
+// Borrowed for the duration of a sink callback. Generation counts allocations
+// of this slot, including assignments to other admissions; zero means unused.
+struct SlotOwnershipEvent {
+    std::int32_t slot;
+    std::uint64_t generation;
+    std::uint64_t admission_id;
+    std::uint64_t previous_admission_id;
+    std::string_view request_id;
+};
+
+// The sink must outlive the allocator and every handle. Callbacks must be
+// nonblocking; a sink may drop records, but cannot affect resource ownership.
+class SlotEventSink {
+public:
+    virtual ~SlotEventSink() = default;
+    virtual void OnSlotAssigned(const SlotOwnershipEvent& event) noexcept = 0;
+    virtual void OnSlotReleased(const SlotOwnershipEvent& event) noexcept = 0;
+};
 
 class ReqPoolAllocator;
 
@@ -44,6 +66,11 @@ struct ReqPoolIndex {
     ~ReqPoolIndex();
 
     bool valid() const;
+    std::uint64_t generation() const;
+    std::uint64_t previous_admission_id() const;
+    // Called once when an allocated request row is bound to its admission.
+    // The external ID is retained only while observing this live ownership.
+    void BindOwner(std::string_view request_id, std::uint64_t admission_id);
 
     // A moved-from index has slot_ == -1 and no longer owns a slot.
     std::int32_t slot_{};
@@ -52,6 +79,7 @@ private:
     friend class ReqPoolAllocator;
 
     ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator);
+    void release() noexcept;
     ReqPoolAllocator* allocator_{nullptr};
 };
 
@@ -68,6 +96,8 @@ public:
     ReqPoolAllocator& operator=(ReqPoolAllocator&&) = delete;
 
     ReqPoolIndex Allocate();
+    // Install before the first allocation, including when replacing a sink.
+    void SetEventSink(SlotEventSink* sink);
 
     std::int32_t Size() const;
     std::int32_t AvailableSlots() const;
@@ -79,6 +109,23 @@ private:
 
     std::int32_t size_{};
     std::deque<std::int32_t> free_slots_;
+    struct SlotHistory {
+        std::uint64_t generation{0};
+        std::uint64_t admission_id{0};
+        std::uint64_t previous_admission_id{0};
+        bool bound{false};
+        // Only an observed live owner retains its external ID. Keeping it
+        // here avoids moving a string on every request FSM transition (and
+        // on decode-permit moves, which use the same RAII handle).
+        std::string request_id;
+
+        SlotOwnershipEvent ownership(std::int32_t slot) const {
+            return {slot, generation, admission_id, previous_admission_id, request_id};
+        }
+    };
+    std::vector<SlotHistory> slot_history_;
+    SlotEventSink* event_sink_{nullptr};
+    bool allocated_{false};
 };
 
 // The slot-state blob slots of retracted requests: the same RAII slot pool,
@@ -88,5 +135,10 @@ private:
 // its slot by dropping the index.
 using SnapshotSlotAllocator = ReqPoolAllocator;
 using SnapshotSlotIndex = ReqPoolIndex;
+
+// A decode keeps its execution permit across rounds, including finishing
+// forwards and a restore awaiting its ACK. These indices never address data.
+using DecodeSlotAllocator = ReqPoolAllocator;
+using DecodeSlotIndex = ReqPoolIndex;
 
 }  // namespace tokenspeed

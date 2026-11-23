@@ -305,6 +305,8 @@ fn step(
         kv_active_pages: 0,
         kv_total_pages: 100,
         kv_used_pages: 7,
+        num_resident_tokens: Some(if running.is_empty() { 0 } else { prompt + k }),
+        num_waiting_uncached_tokens: Some(0),
         finish_reason_details: vec![None],
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],

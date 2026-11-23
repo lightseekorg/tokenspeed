@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -57,7 +58,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::{pd::Streams, LAUNCHER_FAILURE};
+use crate::{cache_events::CacheEvents, pd::Streams, LAUNCHER_FAILURE};
 
 mod result_buffers;
 
@@ -66,6 +67,7 @@ pub type ForwardId = u64;
 
 /// One round's plan and what its forward needs besides.
 struct Execution {
+    queued_at: Option<Instant>,
     plan: ExecutionPlan,
     forward: Option<ForwardId>,
     dp: Option<DpRound>,
@@ -288,6 +290,7 @@ pub struct PythonDataPlane {
     ops: Option<mpsc::Sender<Op>>,
     shared: Arc<Shared>,
     next_forward: ForwardId,
+    cache_events: Option<CacheEvents>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -296,7 +299,11 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
+    pub(crate) fn start(
+        plane: Py<PyAny>,
+        streams: Option<Streams>,
+        cache_events: Option<CacheEvents>,
+    ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
@@ -311,6 +318,7 @@ impl PythonDataPlane {
             ops: Some(ops),
             shared: shared.clone(),
             next_forward: 0,
+            cache_events,
             thread: None,
         };
         let thread = thread::Builder::new()
@@ -441,6 +449,7 @@ impl DataPlane for PythonDataPlane {
         });
         let idle_forward = dispatch.dp.is_some_and(|dp| dp.idle_forward);
         self.queue(Op::Execute(Box::new(Execution {
+            queued_at: tracing::enabled!(tracing::Level::DEBUG).then(Instant::now),
             plan,
             forward,
             dp: dispatch.dp.cloned(),
@@ -470,9 +479,11 @@ impl DataPlane for PythonDataPlane {
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         let _span = profile::span("DataPlane::poll_cache_events");
         let polled: Vec<(String, u32)> = self.query(|plane| {
-            plane
-                .call_method0("poll_cache_events")
-                .and_then(|events| events.extract())
+            let events = plane.call_method0("poll_cache_events")?.extract()?;
+            if let Some(observations) = &self.cache_events {
+                observations.poll(plane);
+            }
+            Ok(events)
         })?;
         polled
             .into_iter()
@@ -745,6 +756,7 @@ fn run(
         }
         Op::Execute(execution) => {
             let Execution {
+                queued_at,
                 plan,
                 forward,
                 dp,
@@ -753,6 +765,19 @@ fn run(
                 logprobs,
                 history,
             } = *execution;
+            if let Some(queued_at) = queued_at {
+                let batches = plan.forward_batches();
+                let forward_rids: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| batch.request_ids.iter())
+                    .collect();
+                tracing::debug!(
+                    queue_ms = queued_at.elapsed().as_secs_f64() * 1000.0,
+                    forward_rids = ?forward_rids,
+                    remote_prefill_rids = ?plan.remote_prefill().map(|batch| batch.request_ids),
+                    "event=ts_data_plane_execute_started"
+                );
+            }
             // The plan's remote stream goes out from the data plane's
             // execution, once its device prerequisites are met.
             if let Some(streams) = streams {
@@ -1010,4 +1035,4 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
 
 #[cfg(test)]
 #[path = "tests/data_plane.rs"]
-mod tests;
+pub(crate) mod tests;

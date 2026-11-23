@@ -23,7 +23,12 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_scheduler import SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import (
+    DiskConfig,
+    PeerConfig,
+    SchedulerConfig,
+    StorageConfig,
+)
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -253,12 +258,16 @@ def scheduler_config_from_args(
     specs,
     *,
     storage_config: StorageConfig | None,
+    num_disk_pages: int,
+    disk_config: DiskConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
+    peer_config: PeerConfig | None,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -268,25 +277,42 @@ def scheduler_config_from_args(
             geometry, the cache groups and the Host tiers' page counts.
         storage_config: Shared storage scheduling limits, or None
             when no storage backend is configured.
+        num_disk_pages: The Disk tier's LCM blocks including the null page,
+            0 without the tier.
+        disk_config: The Disk tier's limits (``cache/disk.py``), or None
+            without the tier.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
+        max_resident_requests: Rank-local resident request slots.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
+        peer_config: Peer prefix sharing's limits (``cache/peer.py``), or
+            None without peer sharing.
     """
+    # Both explicit batching policy and allocated device workspace constrain the
+    # same summed-page budget. Decode capacity remains the cache arena's limit.
+    prefill_limits = [
+        limit
+        for limit in (
+            server_args.chunk_prefill_kv_size,
+            specs.cache_storage.get("prefill_kv_capacity", 0),
+        )
+        if limit
+    ]
+    prefill_kv_rows = min(prefill_limits) if prefill_limits else 0
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
-    return make_config(
+    config = make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_kv_page_num=(
-            0
-            if server_args.chunk_prefill_kv_size is None
-            else (server_args.chunk_prefill_kv_size + geometry.prefix_granularity - 1)
+            (prefill_kv_rows + geometry.prefix_granularity - 1)
             // geometry.prefix_granularity
         ),
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
         disable_l2_cache=not server_args.enable_kvstore,
@@ -296,8 +322,12 @@ def scheduler_config_from_args(
         host_group_packing=specs.host_group_packing,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
+        num_disk_pages=num_disk_pages,
+        disk_config=disk_config,
         host_write_policy=server_args.kvstore_write_policy,
+        decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        debug_force_retraction_max_per_request=server_args.debug_force_retraction_max_per_request,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
@@ -307,6 +337,7 @@ def scheduler_config_from_args(
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         prefill_decode_interval=server_args.prefill_decode_interval,
         prefill_decode_min_interval=server_args.prefill_decode_min_interval,
+        max_consecutive_prefill_rounds=server_args.max_consecutive_prefill_rounds,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         demote_superseded_state_checkpoints=_implied_scheduler_policy(
@@ -321,3 +352,5 @@ def scheduler_config_from_args(
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )
+    config.peer_config = peer_config
+    return config

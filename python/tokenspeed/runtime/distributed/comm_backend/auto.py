@@ -115,6 +115,12 @@ class Route(enum.Enum):
     TIERED = "tiered"
 
 
+def _aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` contiguous at a 16-byte aligned address: itself, or a copy."""
+    tensor = tensor.contiguous()
+    return tensor.clone() if tensor.data_ptr() % 16 else tensor
+
+
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
@@ -128,6 +134,8 @@ class AutoBackend(CommBackend):
         # Lamport token/channel-shard exchanges prepared by layers at build
         # time (prepare_shard_exchange), keyed by (group, full channel width).
         self._shard_exchanges: dict[tuple[Group, int], object] = {}
+        # One-hop LL exchanges of small payloads (prepare_small_exchange).
+        self._small_exchanges: dict[Group, object] = {}
 
     @property
     def nccl(self) -> NcclBackend:
@@ -181,9 +189,19 @@ class AutoBackend(CommBackend):
             if folded is not None:
                 return folded
         rows = tensor.contiguous().view(-1, tensor.shape[-1] if tensor.dim() else 1)
-        # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
-        gathered = self.all_gather(rows, group, dim=-1)
-        parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(0, 1)
+        if current_platform().is_amd and not self._iris.gathers_in_one_launch(
+            rows, group
+        ):
+            # Past one Iris launch, NCCL's row gather is faster (TP4 MI350, 2048
+            # rows of 2304: 221 against 778 us) and is already rank-major.
+            parts = rows.new_empty((world_size, *rows.shape))
+            self._nccl.all_gather_single(parts.view(-1, rows.shape[1]), rows, group)
+        else:
+            # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
+            gathered = self.all_gather(rows, group, dim=-1)
+            parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(
+                0, 1
+            )
         ordered_fold_sum(parts, rows)
         if rows.data_ptr() != tensor.data_ptr():
             tensor.copy_(rows.view(tensor.shape))
@@ -361,6 +379,11 @@ class AutoBackend(CommBackend):
     # ---- Public CommBackend interface ----
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        if current_platform().is_nvidia:
+            # One lamport exchange on the all-reduce workspace; the NCCL-only knob keeps NCCL.
+            if self._force_deterministic_rsag():
+                return None
+            return self._trtllm_ar.prepared_lamport_all_gather(group, dtype)
         if (
             not current_platform().is_cdna4
             or len(group) not in (4, 8)
@@ -379,6 +402,9 @@ class AutoBackend(CommBackend):
         ):
             return False
         return self._iris.broadcast_from_first_rank(tensor, group)
+
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        return self._iris.try_word_max(words, group)
 
     def all_reduce(
         self,
@@ -572,6 +598,11 @@ class AutoBackend(CommBackend):
             dtype=dtype,
         )
 
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        if not self.can_prepare_all_reduce_buffers(group, dtype):
+            return False
+        return self._iris.prepare_all_reduce_runtime(group, dtype)
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
@@ -646,10 +677,40 @@ class AutoBackend(CommBackend):
                 return self._iris.all_gather(tensor, group, dim)
             # Small rows ride the all-reduce workspace's barrier-free exchange.
             gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
+            if gathered is None:
+                gathered = self._small_all_gather(tensor, group, dim)
             if gathered is not None:
                 return gathered
             return self._rsag.all_gather(tensor, group, dim)
+        gathered = self._small_all_gather(tensor, group, dim)
+        if gathered is not None:
+            return gathered
         return self._nccl.all_gather(tensor, group, dim)
+
+    def _small_all_gather(
+        self, tensor: torch.Tensor, group: Group, dim: int
+    ) -> torch.Tensor | None:
+        """Run ``all_gather`` through the group's prepared one-hop exchange.
+
+        Returns None where the exchange does not serve ``tensor``.
+        """
+        state = self._small_exchanges.get(group)
+        # Only the size decides, which every rank of a call shares.
+        if state is None or not state.serves(
+            tensor.numel() * tensor.element_size(), floats=False
+        ):
+            return None
+        from tokenspeed_kernel.ops.communication.cute_dsl import cute_dsl_ll_all_gather
+
+        # NCCL's layout: rank blocks gathered along dim 0, then moved to ``dim``.
+        world = len(group)
+        gathered = tensor.new_empty((world * tensor.shape[0], *tensor.shape[1:]))
+        cute_dsl_ll_all_gather(state, _aligned(tensor), gathered)
+        dim = dim + tensor.dim() if dim < 0 else dim
+        if dim == 0:
+            return gathered
+        blocks = gathered.reshape((world, *tensor.shape)).unbind(0)
+        return torch.cat(blocks, dim=dim)
 
     def acquire_exchange_input(
         self, nbytes: int, like: torch.Tensor, group: Group
@@ -679,11 +740,109 @@ class AutoBackend(CommBackend):
             )
         return None
 
+    def prepare_small_exchange(
+        self, group: Group, cap_bytes: int, float_cap_bytes: int, timeout_ns: int
+    ) -> bool:
+        # Pure data movement over symmetric memory; the NCCL-only switch keeps NCCL.
+        if group in self._small_exchanges:
+            state = self._small_exchanges[group]
+            return (
+                state.cap_bytes >= cap_bytes
+                and state.float_cap_bytes >= float_cap_bytes
+            )
+        if len(group) < 2 or not current_platform().is_nvidia:
+            return False
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            create_ll_exchange_state,
+        )
+
+        state = create_ll_exchange_state(
+            pg_manager.get_process_group("gloo", group),
+            torch.device("cuda", torch.cuda.current_device()),
+            cap_bytes=cap_bytes,
+            float_cap_bytes=float_cap_bytes,
+            timeout_ns=timeout_ns,
+            eligible=not self._force_deterministic_rsag(),
+        )
+        if state is None:
+            return False
+        self._small_exchanges[group] = state
+        return True
+
+    def all_gather_float_words_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        # Words travel as themselves when the prepared exchange serves the size.
+        state = self._small_exchanges.get(group)
+        payload = input.numel() * input.element_size()
+        received = output.numel() * output.element_size()
+        if (
+            state is None
+            or not state.serves(payload, floats=True)
+            or received != payload * len(group)
+        ):
+            return self.all_gather_single(output, input, group)
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_ll_all_gather_floats,
+        )
+
+        target = output
+        if not output.is_contiguous() or output.data_ptr() % 16:
+            target = torch.empty(output.shape, dtype=output.dtype, device=output.device)
+        cute_dsl_ll_all_gather_floats(state, _aligned(input), target)
+        if target is not output:
+            output.copy_(target)
+
+    def _small_exchange(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group, gather: bool
+    ) -> object | None:
+        """The group's prepared LL exchange when it serves this call, else None.
+
+        Only sizes and the group decide, which every rank of a call shares;
+        a rank's unaligned or strided operands are staged locally
+        (``_run_small_exchange``).
+        """
+        state = self._small_exchanges.get(group)
+        if state is None:
+            return None
+        payload = input.numel() * input.element_size()
+        if not gather:
+            if payload % len(group):
+                return None
+            payload //= len(group)
+        received = output.numel() * output.element_size()
+        if not state.serves(payload, floats=False) or received != payload * len(group):
+            return None
+        return state
+
+    @staticmethod
+    def _run_small_exchange(
+        state, output: torch.Tensor, input: torch.Tensor, gather: bool
+    ) -> None:
+        """Run one LL call into ``output``, staging operands it cannot address."""
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_ll_all_gather,
+            cute_dsl_ll_all_to_all,
+        )
+
+        exchange = cute_dsl_ll_all_gather if gather else cute_dsl_ll_all_to_all
+        # The call writes every output byte: a staged output needs no copy in.
+        target = output
+        if not output.is_contiguous() or output.data_ptr() % 16:
+            target = torch.empty(output.shape, dtype=output.dtype, device=output.device)
+        exchange(state, _aligned(input), target)
+        if target is not output:
+            output.copy_(target)
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         # Pure data movement: an input borrowed from Iris's pull exchange is
-        # pulled in place, every bit preserved.
+        # pulled in place, every bit preserved. Only NVIDIA prepares the
+        # one-hop exchange, and Iris is AMD's.
+        state = self._small_exchange(output, input, group, gather=True)
+        if state is not None:
+            return self._run_small_exchange(state, output, input, gather=True)
         if self._iris_reaches(group):
             return self._iris.all_gather_single(output, input, group)
         return self._nccl.all_gather_single(output, input, group)
@@ -764,6 +923,12 @@ class AutoBackend(CommBackend):
     ) -> None:
         # Pure data movement: no reduction, so nothing to fold for the
         # batch-invariant envelope and no symmetric-memory path to veto.
+        even = output_split_sizes is None and input_split_sizes is None
+        state = (
+            self._small_exchange(output, input, group, gather=False) if even else None
+        )
+        if state is not None:
+            return self._run_small_exchange(state, output, input, gather=False)
         if self._iris_reaches(group):
             return self._iris.all_to_all_single(
                 output,
@@ -837,6 +1002,34 @@ class AutoBackend(CommBackend):
         workspace: ProjectionWorkspace,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self._projection.all_gather(tensor, rows, quantize, workspace)
+
+    def projection_gather_mm(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.gather_mm(tensor, rows, weight, out, workspace)
+
+    def projection_mm_reduce_scatter(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.mm_reduce_scatter(tensor, rows, weight, workspace)
+
+    def projection_mm_to_owners(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.mm_to_owners(tensor, rows, weight, workspace)
 
     def projection_all_to_all(
         self,

@@ -79,6 +79,7 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -181,7 +182,8 @@ class VocabParallelArgmax:
     Each rank packs its shard's row maximum and global index into an int64
     key, and an all-reduce MAX over the group picks the same token the
     argmax of the gathered row would. It exchanges 8 bytes per row instead
-    of the logits shards.
+    of the logits shards, through the group's prepared word MAX where the
+    backend has one.
     """
 
     def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
@@ -191,7 +193,8 @@ class VocabParallelArgmax:
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
         vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
-        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        if not get_global_backend().try_word_max(keys, self.tp_group):
+            keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
         return argmax_key_index(keys, out=torch.empty_like(keys))
 
 
@@ -460,6 +463,12 @@ class LogitsProcessor(nn.Module):
         """The dtype of the shard logits ``sampled_vocab_shard`` hands the sampler: the head's projection dtype."""
         return lm_head.weight.dtype
 
+    def sampled_shard_softcap(self) -> tuple[float | None, str | None]:
+        """The softcap ``_finish_logits`` applies, as ``vocab_shard_topk``'s
+        ``(softcap, softcap_form)``: the fused sigmoid form."""
+        cap = self.final_logit_softcapping
+        return (cap, "sigmoid") if cap else (None, None)
+
     def keep_sampled_logits_vocab_sharded(
         self,
         lm_head: VocabParallelEmbedding,
@@ -482,7 +491,8 @@ class LogitsProcessor(nn.Module):
 
         Returns:
             Whether the head's layout allows it (then it is on): plain TP
-            vocabulary sharding of an unpadded 16-bit head whose token ids are
+            vocabulary sharding of a dense 16-bit head (its rows padded past
+            the vocabulary at most in the last shards) whose token ids are
             exact in the fp32 the candidates travel in, in shards the sampler
             takes.
         """
@@ -498,18 +508,27 @@ class LogitsProcessor(nn.Module):
             or self.dp_lm_head_tp
             or self.dp_sampling_enabled
             or self.do_argmax
-            or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+            # A quantized head's method; a dense head's (Inkling2's FP32
+            # output) only chooses the GEMM's output precision.
+            or (
+                should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+                and not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+            )
             or self.config.vocab_size > 2**24
         ):
             return False
         columns = int(shard.num_org_elements)
+        vocab_size = self.config.vocab_size
+        # The real vocabulary ends in the last shard; the head's padding
+        # rows past it are never sampled (the gathered rows drop them).
+        last = vocab_size - columns * (self.tp_size - 1)
         if (
             int(shard.num_added_elements) != 0
             or int(shard.num_org_elements_padded) != columns
-            or columns * self.tp_size != self.config.vocab_size
+            or not 0 < last <= columns
             or int(shard.org_vocab_start_index) != columns * self.tp_rank
             or weight.dtype not in (torch.bfloat16, torch.float16)
-            or not supports(self.sampled_shard_dtype(lm_head), columns, self.tp_size)
+            or not supports(self.sampled_shard_dtype(lm_head), last, self.tp_size)
         ):
             return False
         self._sampled_shard_start = columns * self.tp_rank
@@ -531,11 +550,15 @@ class LogitsProcessor(nn.Module):
             The shard ``forward`` hands the sampler as ``vocab_shard``.
         """
         assert self._sampled_shard_start is not None
+        softcap, softcap_form = self.sampled_shard_softcap()
+        start = self._sampled_shard_start
         return SampledVocabShard(
             logits=logits,
-            vocab_start=self._sampled_shard_start,
+            columns=min(logits.shape[1], self.config.vocab_size - start),
+            vocab_start=start,
             logit_scale=self.logit_scale,
-            softcap=self.final_logit_softcapping,
+            softcap=softcap,
+            softcap_form=softcap_form,
             tp_size=self.tp_size,
             tp_group=self.tp_group,
             gather_full=functools.partial(

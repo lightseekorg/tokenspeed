@@ -2116,6 +2116,51 @@ def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
     torch.testing.assert_close(actual, torch.cat((logits, logits + 100), dim=1))
 
 
+@pytest.mark.parametrize("vocab", [8, 7, 5, 4])
+def test_sampled_rows_stay_sharded_when_the_vocabulary_ends_in_the_last_shard(
+    vocab,
+):
+    """A head padded past the vocabulary keeps its sampled rows sharded while
+    the padding stays inside the last shard; the shard selects from its real
+    columns only, and the sampler is asked about the narrowest one."""
+    from transformers import PretrainedConfig
+
+    asked = []
+
+    def supports(dtype, columns, tp_size):
+        asked.append(columns)
+        return True
+
+    shards = []
+    for rank in (0, 1):
+        processor = LogitsProcessor(
+            PretrainedConfig(vocab_size=vocab),
+            tp_rank=rank,
+            tp_size=2,
+            tp_group=(0, 1),
+            attn_tp_size=1,
+            dp_lm_head_tp=False,
+        )
+        head = ParallelLMHead(
+            8,
+            2,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            tp_rank=rank,
+            tp_size=2,
+            tp_group=(0, 1),
+        )
+        kept = processor.keep_sampled_logits_vocab_sharded(head, supports)
+        # The last shard would hold only padding.
+        assert kept == (vocab > 4)
+        if kept:
+            logits = torch.zeros(3, 4, dtype=torch.bfloat16)
+            shards.append(processor.sampled_vocab_shard(logits, head).columns)
+    if vocab > 4:
+        assert asked == [vocab - 4, vocab - 4]
+        assert shards == [4, vocab - 4]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("attn_tp,head_tp", [(2, 8), (2, 2), (4, 2), (1, 8)])
 @pytest.mark.parametrize("rank", range(8))
@@ -2253,3 +2298,43 @@ def test_dp_head_argmax_and_local_head_input(monkeypatch, attn_tp, head_tp, rank
         torch.testing.assert_close(
             result.next_token_logits, hidden[rank] @ head.weight.T * 2.0
         )
+
+
+@pytest.mark.parametrize("reduced", [True, False])
+def test_packed_key_argmax_reduces_through_a_prepared_word_max(monkeypatch, reduced):
+    """The packed keys take the group's word MAX where the backend prepared
+    one, and the all-reduce MAX otherwise."""
+    keys = torch.tensor([7, 3], dtype=torch.int64)
+
+    def fake_keys(logits, *, vocab_offset, out):
+        assert vocab_offset == 8
+        return out.copy_(keys)
+
+    def fake_word_max(words, group):
+        assert group == (0, 1)
+        if reduced:
+            words.add_(100)  # the group's maximum, as another rank sent it
+        return reduced
+
+    def fake_all_reduce(tensor, group, op):
+        assert not reduced, "a prepared word MAX replaces the all-reduce"
+        assert group == (0, 1) and op == torch.distributed.ReduceOp.MAX
+        return tensor + 200
+
+    monkeypatch.setattr(
+        logits_processor_module, "vocab_parallel_argmax_keys", fake_keys
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "argmax_key_index",
+        lambda keys, *, out: out.copy_(keys),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "get_global_backend",
+        lambda: SimpleNamespace(try_word_max=fake_word_max),
+    )
+    monkeypatch.setattr(logits_processor_module, "all_reduce", fake_all_reduce)
+
+    ids = VocabParallelArgmax((0, 1), 8)(torch.zeros((2, 4)))
+    assert ids.tolist() == ([107, 103] if reduced else [207, 203])

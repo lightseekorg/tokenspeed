@@ -41,7 +41,8 @@ pub(crate) struct Draining {
 /// The transfers draining for [`DRAIN_STALL`] or longer, as log entries; at
 /// most once per [`DRAIN_STALL`] (`logged_at`). One that never stops (a
 /// write whose DMA may still land, a peer lost mid-drain) keeps its pages
-/// pinned and holds off a cache release.
+/// pinned and holds off a cache release until a Decode revocation fences its
+/// writers, where the transport allows one.
 pub(crate) fn stalled_drains<'a>(
     draining: impl IntoIterator<Item = &'a Draining>,
     logged_at: &mut Option<Instant>,
@@ -102,8 +103,16 @@ pub struct RemotePrefill {
 /// A transfer whose state the replica agreed changed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PdEvent {
-    /// The request's peers are connected.
+    /// The request may be admitted. D role: its peers are connected and,
+    /// when the prefill node defers the decode allocation, that node holds every
+    /// page of the prompt. P role under early decode allocation: every
+    /// decode rank allocated its destination. P role under deferred
+    /// decode allocation: its decode node announced it; the destination has
+    /// its own event.
     Bootstrapped(String),
+    /// P role, deferred decode allocation: every decode rank allocated
+    /// the request's destination.
+    DestinationReady(String),
     /// The request's transfer failed. Its readers or writers may still be
     /// stopping: [`PdEvent::Stopped`] follows.
     Failed(String),
@@ -150,6 +159,11 @@ pub trait TransferPeer {
     /// A transfer is still tracked or stopping: it may yet read or write
     /// the cache.
     fn has_in_flight(&self) -> bool;
+
+    /// Whether a tracked (including draining) request already owns `room`.
+    /// Decided solely from replica-identical loop state, never from worker
+    /// threads.
+    fn has_room(&self, room: u64) -> bool;
 
     /// EPD, P role: tell the decode node waiting on room `room` that the
     /// request failed before it could register (its embeddings never

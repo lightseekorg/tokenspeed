@@ -259,7 +259,7 @@ class TestFinishTailHitCopyCudaTest:
         return make_arena(plan, "cuda")
 
     def test_the_hitters_block_holds_the_published_partial_page_byte_for_byte(self):
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.scheduler_driver import (
             advance_scheduler,
             make_extend_result_event,
@@ -275,6 +275,7 @@ class TestFinishTailHitCopyCudaTest:
                 num_device_pages=page_count,
                 max_scheduled_tokens=256,
                 max_batch_size=4,
+                max_resident_requests=4,
                 prefix_granularity=self.PAGE,
                 num_host_pages=0,
                 disable_l2_cache=True,
@@ -286,6 +287,7 @@ class TestFinishTailHitCopyCudaTest:
                 host_write_policy="write_through",
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
+                max_consecutive_prefill_rounds=0,
                 storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
@@ -295,6 +297,8 @@ class TestFinishTailHitCopyCudaTest:
                         attn_kind=ts.AttnKind.Full,
                     )
                 ],
+                num_disk_pages=0,
+                disk_config=None,
             )
         )
 
@@ -395,7 +399,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
 
     @pytest.mark.parametrize("held", ["store", "forward", "forward_and_store"])
     def test_pages_a_plan_reuses_reach_the_host_as_the_prompts_left_them(self, held):
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
@@ -470,6 +474,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model (none is loaded here): the fields
         # its page copy and page zeroing read, and no drafter for the handle
@@ -494,6 +499,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 ).num_device_pages,
                 max_scheduled_tokens=256,
                 max_batch_size=4,
+                max_resident_requests=4,
                 prefix_granularity=self.PAGE,
                 num_host_pages=executor.num_host_pages,
                 disable_l2_cache=False,
@@ -506,7 +512,10 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 host_write_policy="write_back",
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
+                max_consecutive_prefill_rounds=0,
                 cache_groups=pool_to_cache_groups(pool),
+                num_disk_pages=0,
+                disk_config=None,
             )
             scheduler = ts.Scheduler(scheduler_config)
 
@@ -725,7 +734,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         plan writes page X back to Host block 1 and restores the image into
         X; Host block 1 then comes back into page Y.
         """
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
@@ -790,6 +799,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model, as above; the plans here copy and
         # zero no page.
@@ -942,7 +952,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         writes Y back to Host block 1, and block 1 comes back into page Z
         with X's bytes.
         """
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
@@ -1006,6 +1016,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model, as above.
         model_executor = ModelExecutor.__new__(ModelExecutor)

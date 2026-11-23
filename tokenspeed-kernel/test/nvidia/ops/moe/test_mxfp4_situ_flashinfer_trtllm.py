@@ -158,6 +158,8 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
+    topk_ids[0] = -1
+    topk_ids[1, 0] = -1
     expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
@@ -228,6 +230,53 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
         )
     manual = acc.to(torch.bfloat16)
     torch.testing.assert_close(manual, finalized, atol=1e-2, rtol=1e-2)
+
+
+@requires_flashinfer_situ
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_situ_owner_shards_rebuild_resident_weights(precomputed) -> None:
+    """Shards preprocessed by separate owners serve like resident weights."""
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_mxfp4_situ_moe_apply,
+        flashinfer_trtllm_mxfp4_situ_moe_weights,
+    )
+
+    raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
+        _kernel_routing_case(20260901, 16)
+    )
+    resident = _prepare_kernel_routing_weights(raw, bias)
+    owned = NUM_EXPERTS // 2
+    owners = []
+    for first in (0, owned):
+        owner = _MoEWeights(
+            {name: value[first : first + owned].clone() for name, value in raw.items()}
+        ).cuda()
+        owners.append((owner, flashinfer_trtllm_mxfp4_situ_moe_weights({}, owner)))
+    shared, prepared = owners[0]
+    shared.routing_config = resident.routing_config
+    prepared.bind(
+        shared,
+        {
+            shard.name: torch.cat(
+                [owner.get_parameter(shard.name).data for owner, _ in owners]
+            )
+            for shard in prepared.shards
+        },
+    )
+
+    hidden_states, router_logits = hidden_states.cuda(), router_logits.cuda()
+    routes = (
+        dict(topk_weights=topk_weights.cuda(), topk_ids=topk_ids.cuda())
+        if precomputed
+        else {}
+    )
+    expected = flashinfer_trtllm_mxfp4_situ_moe_apply(
+        {}, hidden_states, resident, router_logits, **routes
+    )
+    actual = flashinfer_trtllm_mxfp4_situ_moe_apply(
+        {}, hidden_states, shared, router_logits, **routes
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @requires_flashinfer_situ

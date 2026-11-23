@@ -136,8 +136,10 @@ def _launch_prefill_rows(
 def _owned_query_group_metadata(q, pages, lengths, query_group_size):
     """Validate the dense plan before forming its strided per-request view:
     every request's page list, its last row's."""
-    if query_group_size not in (1, 2, 3, 4, 5, 6):
-        raise ValueError("owned-page query groups must contain one to six verify rows")
+    if not 1 <= query_group_size <= 8:
+        raise ValueError(
+            "owned-page query groups must contain one to eight verify rows"
+        )
     if q.shape[0] % query_group_size:
         raise ValueError("owned-page query groups must be complete")
     if pages.shape[0] != q.shape[0] or lengths.numel() != q.shape[0]:

@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include <spdlog/spdlog.h>
+
 #include "utils.h"
 
 namespace tokenspeed {
@@ -63,7 +65,75 @@ std::uint64_t StorageTransferManager::nextId() {
 
 bool StorageTransferManager::CanStart() const {
     return !pressure_gate_closed_ && operations_.size() < static_cast<std::size_t>(config_.max_operations) &&
-           NumQuarantined() == 0;
+           NumBlockingQuarantined() == 0;
+}
+
+bool StorageTransferManager::HasRetainedOperations() const {
+    return std::ranges::any_of(operations_, [](const auto& entry) { return entry.second.retained_after_clear; });
+}
+
+bool StorageTransferManager::HasCurrentPending() const {
+    return std::ranges::any_of(operations_, [](const auto& entry) { return !entry.second.retained_after_clear; });
+}
+
+bool StorageTransferManager::HasProgressPending() const {
+    return std::ranges::any_of(
+        operations_, [](const auto& entry) { return !entry.second.retained_after_clear && !entry.second.quarantined; });
+}
+
+std::size_t StorageTransferManager::NumRetainedOperations() const {
+    return std::ranges::count_if(operations_, [](const auto& entry) { return entry.second.retained_after_clear; });
+}
+
+std::size_t StorageTransferManager::NumRetainedHostBlocks() const {
+    std::size_t count = 0;
+    for (const auto& [id, ticket] : operations_) {
+        if (ticket.retained_after_clear) count += ticket.blocks.size();
+    }
+    return count;
+}
+
+void StorageTransferManager::UpdateRetainedCapacityWarning() {
+    const bool exhausted =
+        HasRetainedOperations() &&
+        (operations_.size() >= static_cast<std::size_t>(config_.max_operations) || availableHostCredits() == 0);
+    if (exhausted && !retained_capacity_exhausted_) {
+        ++retained_capacity_warnings_;
+        spdlog::warn(
+            "[L3] storage capacity exhausted with retained I/O: retained_operations={} "
+            "retained_host_blocks={} operations={}/{} held_host_blocks={}/{}; "
+            "retained buffers remain protected until native retirement",
+            NumRetainedOperations(), NumRetainedHostBlocks(), NumOperations(), config_.max_operations, NumHeldBlocks(),
+            config_.max_host_blocks);
+    }
+    retained_capacity_exhausted_ = exhausted;
+}
+
+std::vector<const CacheBlockRef*> StorageTransferManager::HeldBlockRefs() const {
+    std::vector<const CacheBlockRef*> refs;
+    for (const auto& [id, ticket] : operations_) {
+        for (const auto& block : ticket.blocks) {
+            if (block) refs.push_back(&block);
+        }
+    }
+    return refs;
+}
+
+bool StorageTransferManager::CanRetainForClear(std::span<const std::uint64_t> request_lease_ids) const {
+    for (const auto& [id, ticket] : operations_) {
+        if (!ticket.detached && ticket.kind != StorageKind::kPut &&
+            std::ranges::find(request_lease_ids, id) == request_lease_ids.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void StorageTransferManager::RetainForClear() {
+    FatalCheck(std::ranges::all_of(operations_, [](const auto& item) { return item.second.detached; }),
+               "request leases and backups detach before old storage operations are retained");
+    for (auto& [id, ticket] : operations_) ticket.retained_after_clear = true;
+    clearMetadata();
 }
 
 void StorageTransferManager::UpdatePressure(const StoragePressure& pressure) {
@@ -98,6 +168,11 @@ std::size_t StorageTransferManager::NumQuarantined() const {
     return std::ranges::count_if(operations_, [](const auto& entry) { return entry.second.quarantined; });
 }
 
+std::size_t StorageTransferManager::NumBlockingQuarantined() const {
+    return std::ranges::count_if(
+        operations_, [](const auto& entry) { return entry.second.quarantined && !entry.second.retained_after_clear; });
+}
+
 std::size_t StorageTransferManager::availableHostCredits() const {
     const auto used = NumHeldBlocks();
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
@@ -121,7 +196,7 @@ StorageLease::~StorageLease() {
 }
 
 void StorageLease::reset() noexcept {
-    if (StorageTransferManager* manager = std::exchange(manager_, nullptr)) {
+    if (StorageLeaseIssuer* manager = std::exchange(manager_, nullptr)) {
         manager->detach(std::exchange(operation_id_, 0));
     }
 }
@@ -141,7 +216,7 @@ StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std:
 
 bool StorageTransferManager::Completed(std::uint64_t id) const {
     const auto it = operations_.find(id);
-    return it == operations_.end() || it->second.completed;
+    return it == operations_.end() || it->second.Completed();
 }
 
 bool StorageTransferManager::IsQuery(std::uint64_t id) const {
@@ -149,7 +224,7 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+std::vector<CacheKey> StorageTransferManager::RecordQueryHits(std::uint64_t id) {
     Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
@@ -160,10 +235,9 @@ std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
     return keys;
 }
 
-StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
-                                               std::span<const CacheKey> hits) {
+StorageLease StorageTransferManager::StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits) {
     if (!CanStart() || hits.empty()) return {};
-    auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
+    auto reservation = coordinator_.Storage().ReserveStoragePrefix(prompt, hits, availableHostCredits());
     if (reservation.keys.empty()) return {};
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
@@ -202,7 +276,7 @@ void StorageTransferManager::rememberPublished(const CacheKey& key) {
 
 void StorageTransferManager::Complete(const cache::StorageDone& event) {
     const auto it = operations_.find(event.op_id);
-    if (it == operations_.end() || it->second.completed) return;
+    if (it == operations_.end() || it->second.Completed()) return;
     Ticket& ticket = it->second;
     if (event.success.size() != ticket.keys.size() || event.object_failures.size() != event.success.size()) {
         throw std::invalid_argument("L3 completion size differs from its immutable operation");
@@ -214,7 +288,6 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
         }
     }
     ticket.success = event.success;
-    ticket.completed = true;
     ticket.quarantined = !event.retired;
     const auto kind = ticket.kind;
     if (kind == StorageKind::kGet) {
@@ -225,18 +298,19 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
                 std::erase(published_order_, ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
+                coordinator_.Host().CacheHostBlock(ticket.blocks[i], ticket.keys[i],
+                                                   /*inherited_metadata=*/std::nullopt);
                 // A successful accepted GET proves the immutable object also
                 // existed remotely. A later producer need not PUT it again.
                 rememberPublished(ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
-            coordinator_.CacheHostTail(ticket.tail_prior, *ticket.tail);
+            coordinator_.Host().CacheHostTail(ticket.tail_prior, *ticket.tail);
         }
     }
     if (!event.retired) return;  // Quarantine is charged until a process/transport teardown proves safety.
-    if (kind == StorageKind::kPut) {
+    if (kind == StorageKind::kPut && !ticket.detached) {
         for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
             if (ticket.success[i]) rememberPublished(ticket.keys[i]);
         }
@@ -251,7 +325,7 @@ void StorageTransferManager::detach(std::uint64_t id) noexcept {
     Ticket& ticket = it->second;
     ticket.detached = true;
     if (ticket.quarantined) return;
-    if (ticket.completed) {
+    if (ticket.Completed()) {
         operations_.erase(it);
         return;
     }
@@ -293,7 +367,7 @@ void StorageTransferManager::StartBackups() {
     std::size_t backup_blocks = 0;
     std::unordered_set<CacheKey, CacheKeyHash> pending;
     for (const auto& [id, ticket] : operations_) {
-        if (ticket.kind == StorageKind::kPut) {
+        if (ticket.kind == StorageKind::kPut && !ticket.retained_after_clear) {
             ++backup_operations;
             backup_blocks += ticket.blocks.size();
             pending.insert(ticket.keys.begin(), ticket.keys.end());
@@ -315,7 +389,7 @@ void StorageTransferManager::StartBackups() {
         CacheKey key = std::move(backup_candidates_.front());
         backup_candidates_.pop_front();
         if (!pending.insert(key).second) continue;
-        CacheBlockRef ref = coordinator_.AcquireHostCachedBlock(key);
+        CacheBlockRef ref = coordinator_.Store().AcquireHostCachedBlock(key);
         if (!ref) {
             ++unavailable_dropped_backup_keys_;
             continue;
@@ -336,8 +410,23 @@ void StorageTransferManager::DropBackups() {
     backup_candidates_.clear();
 }
 
+void StorageTransferManager::CancelBackups() {
+    DropBackups();
+    // detach can erase an operation that is still in our outbox. Collect ids
+    // first, and use the same cancellation/retirement ownership as GET leases.
+    std::vector<std::uint64_t> ids;
+    for (const auto& [id, ticket] : operations_) {
+        if (ticket.kind == StorageKind::kPut && !ticket.detached) ids.push_back(id);
+    }
+    for (const auto id : ids) detach(id);
+}
+
 void StorageTransferManager::ClearMetadata() {
     if (HasPending()) throw std::logic_error("cannot clear L3 metadata while operations hold resources");
+    clearMetadata();
+}
+
+void StorageTransferManager::clearMetadata() {
     DropBackups();
     negative_.clear();
     negative_order_.clear();

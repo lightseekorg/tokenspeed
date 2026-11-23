@@ -63,6 +63,7 @@ def _config(*, is_draft: bool, width: int):
         speculative_num_draft_tokens=width,
         context_len=512,
         max_bs=4,
+        max_resident_requests=4,
         qcp_size=1,
         kvp_size=1,
     )
@@ -178,10 +179,14 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
             calls.append((name, max_bs, draft_token_num))
             return nbytes
 
-        return SimpleNamespace(preallocate_verify_workspace=preallocate)
+        return SimpleNamespace(
+            preallocate_verify_workspace=preallocate,
+            preallocate_prefill_workspace=lambda pool_options=None: 0,
+        )
 
     config = _config(is_draft=is_draft, width=width)
     config.max_bs = 2
+    config.max_resident_requests = 2
     attention = AttentionBackend(config, config.component(SoftmaxAttnConfig))
     if has_gdn:
         attention = HybridLinearAttnBackend(attention, consumer("gdn", 3), [0])

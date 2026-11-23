@@ -51,7 +51,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     )
 
     import torch
-    from tokenspeed_scheduler import StorageKind
+    from tokenspeed_engine.scheduler import StorageKind
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
@@ -126,6 +126,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
         # These owner processes run sequentially without a process group.
         nprocs_per_node=1,
         world_cpu_group=None,
+        block_alignment=1,
     )
     config = json.loads(os.environ["MOONCAKE_GPU_TEST_CONFIG"])
     assert config["global_segment_size"] == 0 and config["protocol"] == "rdma"

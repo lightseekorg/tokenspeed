@@ -9,7 +9,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip("tokenspeed_scheduler")
+pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.scheduler_utils import (
@@ -26,6 +26,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -37,8 +38,11 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
         storage_config=None,
         **kwargs,
+        num_disk_pages=0,
+        disk_config=None,
     )
 
 
@@ -145,6 +149,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=8,
         disable_l2_cache=False,
@@ -156,6 +161,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2
@@ -170,6 +176,8 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         cache_groups=None,
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
+        num_disk_pages=0,
+        disk_config=None,
     )
     assert config.enable_l3_storage is enable_l3_storage
 

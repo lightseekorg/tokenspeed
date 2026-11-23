@@ -185,11 +185,13 @@ def qwen4_exp_delta_layer_decode(
             * ``context_out``: ``[*, 2]``.
             * ``conv_out``: ``[*, hc_count * hidden, 9]``.
 
-            The state after each row's token goes to its output row of the
-            two outputs. In decode, these are the pools and the output pages.
-            In a verify, these are the verify scratch and its rows. ``ple``
-            is None for any other layer. The kernel does the n-gram lookup
-            itself.
+            Decode writes the context and full conv state to their cache
+            pages. Verify writes context windows to scratch, and stores the
+            carried conv state before each request's first candidate row.
+            Each candidate row of ``conv_out`` stores its normalized input
+            vector in the first ``hc_count * hidden`` elements. The verify
+            commit builds the final conv state. ``ple`` is None for any
+            other layer. The kernel does the n-gram lookup itself.
         warm: The next launch's ``late_weights`` (None for the last layer).
             The launch may read them into the memory-side cache while it has
             little HBM traffic, so the next launch reads them sooner. It

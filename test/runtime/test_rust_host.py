@@ -47,7 +47,7 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
 
-from tokenspeed_scheduler import (  # noqa: E402
+from tokenspeed_engine.scheduler import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,
@@ -109,7 +109,7 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None)
+        host.__init__(args, None, None, None, None, None, peer_outbox=None)
     assert host._gpu_id == 3
 
 
@@ -269,16 +269,28 @@ def test_spawned_host_inherits_engine_log_level(
         proc.join(timeout=10)
 
 
-def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "inherited_preload, expected_preload",
+    [
+        ("", "libm.so.6"),
+        ("libm.so.6", "libm.so.6"),
+        ("libm.so.6:libc.so.6", "libm.so.6:libc.so.6"),
+    ],
+)
+def test_spawned_host_inherits_start_context_environment(
+    tmp_path, monkeypatch, inherited_preload, expected_preload
+):
     from contextlib import contextmanager
 
     key = "TS_TEST_LAUNCH_CONTEXT"
     monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LD_PRELOAD", inherited_preload)
 
     @contextmanager
     def configure_child():
         with monkeypatch.context() as scoped:
             scoped.setenv(key, "configured")
+            scoped.setenv("LD_PRELOAD", f"libm.so.6:{inherited_preload}")
             yield
 
     binary = _fake_host(
@@ -286,7 +298,8 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
         """
         import os
         connection.recv()
-        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT")})
+        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT"),
+                         "preload": os.environ.get("LD_PRELOAD")})
         time.sleep(600)
         """,
     )
@@ -296,8 +309,11 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
     try:
         (ready,) = receive_ready_messages([reader], [proc])
         assert ready["context"] == "configured"
+        assert ready["preload"] == expected_preload
         assert key not in os.environ
+        assert os.environ["LD_PRELOAD"] == inherited_preload
     finally:
+        reader.close()
         proc.terminate()
         proc.join(timeout=10)
 
@@ -530,6 +546,7 @@ def _scheduler(*, max_batch_size: int) -> Scheduler:
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64
     config.max_batch_size = max_batch_size
+    config.max_resident_requests = max_batch_size
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.cache_groups = [

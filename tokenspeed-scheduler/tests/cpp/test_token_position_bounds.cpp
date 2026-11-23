@@ -60,13 +60,14 @@ TEST(TokenPositionBoundsTest, ASlidingWindowNearInt32MaxEndsAtItsLastBlock) {
                                           .sliding_window = 4096,
                                           .cache_blocks_per_lcm_block = 1,
                                           .block_granularity = 1024}};
-    const auto coordinator = MakeCoordinator(specs, 1024, pool, false, nullptr, nullptr, false, false, 0);
+    const auto coordinator =
+        MakeCoordinator(specs, 1024, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     // T = 2^31 - 1001: rows [T - 4095, T) lie in blocks 2097147 to 2097151.
-    const CacheCoordinator::BlockRange window = coordinator.SlidingWindowBlocks(0, kInt32Max - 1000);
+    const CacheStore::BlockRange window = coordinator.Store().SlidingWindowBlocks(0, kInt32Max - 1000);
     EXPECT_EQ(window.first, 2097147);
     EXPECT_EQ(window.past_end, 2097152);
     // The 23-token tail at T copies into the window's last block.
-    const CacheCoordinator::BlockRange copy_in = coordinator.CopyInSlots(0, kInt32Max - 1000);
+    const CacheStore::BlockRange copy_in = coordinator.Store().CopyInSlots(0, kInt32Max - 1000);
     EXPECT_EQ(copy_in.first, 2097151);
     EXPECT_EQ(copy_in.past_end, 2097152);
 }
@@ -84,9 +85,9 @@ protected:
     void SetUp() override {
         std::array<BlockTable, 1>& tables = tables_.emplace();
         const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{kTokens}}};
-        const std::optional<CacheCoordinator::AdmissionResult> admitted =
-            coordinator_.Admit(coordinator_.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
-                               /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{},
+        const std::optional<AdmissionResult> admitted =
+            coordinator_.Admit(coordinator_.Prober().ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
+                               /*copy_in_point=*/std::nullopt, std::nullopt, /*session_id=*/{},
                                /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         ASSERT_EQ(tables[0].NumBlocks(), kBlocks);
@@ -103,7 +104,8 @@ protected:
     static constexpr std::array kSpecs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kPage}};
     BlockPool pool_{kBlocks, {1}};
-    CacheCoordinator coordinator_ = MakeCoordinator(kSpecs, kPage, pool_, false, nullptr, nullptr, false, false, 0);
+    CacheCoordinator coordinator_ =
+        MakeCoordinator(kSpecs, kPage, pool_, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     const std::vector<std::string> hashes_ = PageHashes(kFullPages);
     std::optional<std::array<BlockTable, 1>> tables_;
 };
@@ -120,11 +122,11 @@ TEST_F(LongestRequestTest, AProbeMatchesItsWholePublishedPrefix) {
     coordinator_.Free(*tables_);
     tables_.reset();
     // The page after the hit ends at 2^31 + 16384, past INT32_MAX.
-    EXPECT_EQ(coordinator_.ProbePrefix(hashes_).device.num_common_tokens, kFullPages * kPage);
+    EXPECT_EQ(coordinator_.Prober().ProbePrefix(hashes_).device.num_common_tokens, kFullPages * kPage);
     // One page more would end past INT32_MAX.
     std::vector<std::string> longer = hashes_;
     longer.push_back("page-past-the-limit");
-    EXPECT_THROW((void)coordinator_.ProbePrefix(longer), std::runtime_error);
+    EXPECT_THROW((void)coordinator_.Prober().ProbePrefix(longer), std::runtime_error);
 }
 
 TEST(TokenPositionBoundsTest, AnInt32MaxWindowsLookbackRoundsUpToWholeBlocks) {
@@ -135,7 +137,7 @@ TEST(TokenPositionBoundsTest, AnInt32MaxWindowsLookbackRoundsUpToWholeBlocks) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 1024,
     });
-    EXPECT_EQ(matcher->BoundaryLookbackPages(), 2097152);
+    EXPECT_EQ(matcher->BoundaryLookbackBlocks(), 2097152);
 }
 
 }  // namespace

@@ -43,6 +43,7 @@ from utils import (
     is_cdna4,
     is_cdna5,
     make_mxfp4_moe_weights,
+    make_mxfp4_scale_ladder,
     make_round_robin_topk,
 )
 
@@ -1134,6 +1135,25 @@ def test_gfx1250_mxfp4_activation_quantize_matches_reference(
     assert torch.equal(scale, expected_scale)
 
 
+# Fewer than 128 rows and 128 and up use different block configurations.
+@pytest.mark.parametrize("rows", [11, 128])
+def test_gfx1250_mxfp4_activation_quantize_scale_bytes(rows: int) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 quantizer")
+
+    # Block maxima from 2**-20 to 2**10 plus an all-zero block (byte 0); most
+    # are below 4, where the scale exponent is negative before the bias.
+    x, expected_scale = make_mxfp4_scale_ladder(rows, 11)
+
+    packed, scale = launch_triton_quantize_mxfp4_activation_gfx1250(x)
+    torch.cuda.synchronize()
+
+    assert torch.equal(scale.cpu(), expected_scale)
+    step = torch.exp2(expected_scale.float() - 127.0).repeat_interleave(32, dim=-1)
+    error = (dequantize_mxfp4(packed, scale).cpu() - x.cpu().float()).abs()
+    assert (error <= 0.5 * step).all()
+
+
 def test_gfx1250_mxfp4_activation_quantize_reuses_binaries_across_rows() -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 MXFP4 quantizer")
@@ -1391,7 +1411,7 @@ def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
         **(
             decode_tile_config(hidden_size)
             if decode
-            else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_TILES
+            else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
         ),
     )
     w13 = module.w13_weight_triton_tensor

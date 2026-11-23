@@ -1,30 +1,14 @@
 name: Build and Release tokenspeed-kernel
 
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      nightly:
-        description: "Build CUDA 13 wheels with a .postYYYYMMDD version; enable publish_github on main to publish."
-        required: false
-        default: false
-        type: boolean
-      replace_nightly:
-        description: "Replace existing nightly assets and refresh their pip index hashes (main only)."
-        required: false
-        default: false
-        type: boolean
       tag_name:
         description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>; non-release refs include the date and source SHA."
         required: false
         type: string
       version_date:
         description: "Version date override for development builds, formatted as YYYYMMDD."
-        required: false
-        type: string
-      release_candidate:
-        description: "Nightly only: a release candidate number N (or rcN). The build is 0.1.4rcN.post20261108, which sorts below every 0.1.4 nightly, so it neither collides with nor shadows the scheduled nightly of that date."
         required: false
         type: string
       cuda_variant:
@@ -59,12 +43,51 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      nightly:
+        type: boolean
+        required: true
+      replace_nightly:
+        type: boolean
+        required: true
+      publish_github:
+        type: boolean
+        required: true
+      version_date:
+        type: string
+        required: true
+      release_candidate:
+        type: string
+        required: false
+      tag_name:
+        type: string
+        required: false
+      cuda_variant:
+        type: string
+        required: false
+        default: all
+      pypi_cuda_variant:
+        type: string
+        required: false
+        default: cu130
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+      publish_pypi:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      LIGHTSEEK_BOT_TOKEN:
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: release-tokenspeed-kernel-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -101,13 +124,13 @@ jobs:
         id: metadata
         env:
           CUDA_VARIANT: ${{ inputs.cuda_variant }}
-          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+          NIGHTLY: ${{ inputs.nightly }}
           VERSION_DATE: ${{ inputs.version_date }}
           RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           REQUESTED_TAG: ${{ inputs.tag_name }}
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
-          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          PUBLISH_GITHUB: ${{ inputs.publish_github }}
         run: |
           if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
             echo "Replacing nightly assets requires nightly publication from main." >&2
@@ -368,7 +391,7 @@ jobs:
 
   release:
     name: Create wheelhouse release
-    if: github.event_name == 'schedule' || inputs.publish_github
+    if: inputs.publish_github && github.repository == 'lightseekorg/tokenspeed' && (!inputs.nightly || github.ref == 'refs/heads/main')
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false
@@ -424,6 +447,13 @@ jobs:
             fi
 
             if gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+              if [ "$NIGHTLY" = true ]; then
+                replace_args=()
+                if [ "$REPLACE_NIGHTLY" = true ]; then
+                  replace_args+=(--replace)
+                fi
+                python .github/scripts/nightly-release.py --source-sha "$SOURCE_SHA" "${replace_args[@]}" check "$release_tag"
+              fi
               if [ "${#prerelease_args[@]}" -gt 0 ]; then
                 gh release edit "$release_tag" \
                   --repo "$RELEASE_REPOSITORY" \
@@ -433,17 +463,12 @@ jobs:
                 gh release upload "$release_tag" "${assets[@]}" \
                   --repo "$RELEASE_REPOSITORY" --clobber
                 gh release edit "$release_tag" --repo "$RELEASE_REPOSITORY" \
-                  --notes "$release_title replacement assets built from lightseekorg/tokenspeed@$SOURCE_SHA"
+                  --notes "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA"
               elif [ "$NIGHTLY" = "true" ]; then
                 # Same-day reruns preserve existing assets, including their hashes.
                 existing_assets=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json assets --jq '.assets[].name')
                 for asset in "${assets[@]}"; do
                   if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
-                    release_notes=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json body --jq .body)
-                    if [ "$release_notes" != "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA" ]; then
-                      echo "Cannot complete a nightly release from a different source commit." >&2
-                      exit 1
-                    fi
                     gh release upload "$release_tag" "$asset" --repo "$RELEASE_REPOSITORY"
                   fi
                 done

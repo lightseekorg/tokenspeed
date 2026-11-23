@@ -603,7 +603,11 @@ def prepare_mxfp8_mm(
             request.family,
             request.mode,
             dtype=_MXFP8_DTYPE,
-            traits={"a_layout": "MK", "b_layout": "NK"},
+            traits={
+                "a_layout": "MK",
+                "b_layout": "NK",
+                "a_scales_layout": spec.traits.get("a_scales_layout", "k_major"),
+            },
             format_signature=signature,
             device="cuda",
             seed=seed,

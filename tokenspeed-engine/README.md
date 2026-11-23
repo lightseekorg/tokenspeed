@@ -90,14 +90,18 @@ installed. The scheduler source is bundled in its crate; the grammar build
 downloads the pinned, SHA256-checked xgrammar source release and therefore
 needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
 
+For `cargo test --locked`, install `numpy` and `prometheus-client` in that
+interpreter too. The metrics tests read the real Prometheus multiprocess files.
+
 Install a development build with `pip install -e tokenspeed-engine` from the
 repository root. It builds both native extensions and the scheduler together.
 `tokenspeed_engine.host_binary()` still names the `ts-host` launcher. It keeps
 the existing arguments and execs the selected `--python` interpreter to enter
 `tokenspeed_engine.host`, preserving the PID and inherited descriptors.
-The host loads its linked scheduler before importing the existing
-`tokenspeed_scheduler` Python wrapper. The runtime's scheduler dependency
-and imports are unchanged.
+`tokenspeed_engine.scheduler` is the scheduler's Python API, the same names
+`tokenspeed_scheduler` exports, served by the scheduler linked into `_host`.
+TokenSpeed imports it, so it needs no separate `tokenspeed-scheduler` install,
+and a rank's plans and the Python types come from one build.
 
 `TS_HOST_LOG` sets the Rust log
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op

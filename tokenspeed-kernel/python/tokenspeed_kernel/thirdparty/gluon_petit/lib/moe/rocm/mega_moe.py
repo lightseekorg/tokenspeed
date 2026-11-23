@@ -130,16 +130,17 @@ def _MegaMoESolutions():
         4096,
         (P.kCta56, P.kCta128, P.kCta192),
     )
-    for experts, topk in ((384, 6), (128, 3)):
-        register(
-            kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
-            8,
-            experts,
-            topk,
-            5120,
-            2560,
-            (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
-        )
+    for ranks in (4, 8):
+        for experts, topk in ((384, 6), (128, 3)):
+            register(
+                kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+                ranks,
+                experts,
+                topk,
+                5120,
+                2560,
+                (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
+            )
     return dict(entries)
 
 
@@ -200,12 +201,10 @@ class MegaMoESolutionAdapter:
             or external_input_count not in (0, 3)
         ):
             return kFusedMoEErrorInvalidArgument
-        kM64MinTokens = 128 if C.kNumExperts == 256 else 256
-        kM64W8MinTokens = 1024 if C.kNumExperts == 128 else kM64MinTokens
         stage1, stage2, combine = self.Kernels(
             external_input_count == 3,
-            p.num_tokens >= kM64MinTokens,
-            p.num_tokens >= kM64W8MinTokens,
+            p.num_tokens >= C.kM64MinTokens,
+            p.num_tokens >= C.kM64W8MinTokens,
             p.reduce_routes,
         )
         import torch

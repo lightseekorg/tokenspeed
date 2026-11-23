@@ -278,7 +278,7 @@ protected:
 TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     SetupHostCache();
     // The fills' admissions evicted r1's two pages after they reached Host.
-    const CacheCoordinator::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
+    const CacheEvictor::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
     EXPECT_EQ(seeded.blocks, 2u);
     EXPECT_EQ(seeded.host_resident, 2u);
 
@@ -320,6 +320,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
@@ -380,6 +381,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 5;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -426,6 +428,7 @@ protected:
         cfg.host_allocator.total_pages = 7;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -486,6 +489,7 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -502,6 +506,7 @@ protected:
         cfg.device_allocator.total_pages = 9;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -549,6 +554,57 @@ protected:
         return cfg;
     }
 };
+
+// The D role with write-back (docs/rfcs/0005-runtime-pd-roles.md): what its
+// admissions evict is written back to the Host, and a later remote admission
+// loads its Host hit below the landing, so the peer sends only what lies past
+// it.
+class DecodeWriteBackTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = false;
+        cfg.device_allocator.total_pages = 5;  // the null page and four
+        cfg.host_allocator.total_pages = 9;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Lands `id`'s prompt and finishes it right after its first token.
+    ExecutionPlan LandAndFinish(const RequestSpec& spec) {
+        Submit({spec});
+        SendBootstrapped(spec.request_id);
+        ExecutionPlan admission = PlanOnce();
+        EXPECT_NE(FindRemoteAdmission(admission), nullptr) << spec.request_id;
+        SendRemotePrefillDone(spec.request_id, /*bootstrap_token=*/42);
+        SendFinish(spec.request_id);
+        PlanOnce();
+        return admission;
+    }
+};
+
+TEST_F(DecodeWriteBackTestSuite, ARemoteAdmissionLoadsItsHostHitAndLandsOnlyPastIt) {
+    LandAndFinish(MakeRequestSpec("seed", /*num_pages=*/2, /*start=*/1));
+    // Three pages and the decode room fill the Device: seed's cached pages
+    // are evicted and written back.
+    const ExecutionPlan pressure = LandAndFinish(MakeRequestSpec("pressure", /*num_pages=*/3, /*start=*/101));
+    ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(pressure).empty());
+    AckWriteBacks(pressure);
+
+    // hit continues seed's prompt by a page. The Device no longer holds
+    // seed's two pages; the Host does.
+    Submit({MakeRequestSpec("hit", /*num_pages=*/3, /*start=*/1)});
+    SendBootstrapped("hit");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* landing = FindRemoteAdmission(plan);
+    ASSERT_NE(landing, nullptr);
+    EXPECT_EQ(landing->request_ids, std::vector<std::string>{"hit"});
+    EXPECT_EQ(landing->extend_prefix_lens, std::vector<std::int32_t>{4}) << "the peer sends only the third page";
+    EXPECT_EQ(landing->input_lengths, std::vector<std::int32_t>{2});
+    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty()) << "the Host hit is loaded";
+}
 
 TEST_F(DecodeRetractionCapacityTestSuite, AdmissionDoesNotReserveFutureRetractionCapacity) {
     RequestSpec longest = MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1);
@@ -1055,6 +1111,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_prefix_cache = false;
 
         CacheGroupConfig full = cfg.cache_groups.front();
@@ -1233,7 +1290,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyB
         ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
         // Each state at 9 leaves with its tail's KV block: old's as an
         // admission victim, r0's, once r1 decoded, as r1's reclaim.
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         EXPECT_EQ(evictions.admission.blocks, 2u);
         EXPECT_EQ(evictions.request_reclaim.blocks, r1_decodes ? 2u : 0u);
         SendAbortEvent("big");
@@ -1656,6 +1713,7 @@ protected:
         cfg.role = Role::kP;
         cfg.max_scheduled_tokens = 16;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         // Null parent plus four usable: exactly "a"'s two pages and "b"'s
         // two pages, none spare for "c".
         cfg.device_allocator.total_pages = 5;
@@ -2116,9 +2174,9 @@ TEST_F(PdTransferParkingDecodeTestSuite, FailedEventWhileRemotePrefillingParksUn
     EXPECT_FALSE(PlanSchedulesD0());
 }
 
-// Fused role: forward::Abort frees pages immediately. pdTransferInFlight is
-// always false there, so no request ever parks.
-TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
+// A fused cancellation has no PD transfer to retire, but its queued forward
+// still owns the request's pages until its result lands.
+TEST_F(SchedulerTestSuite, FusedRoleAbortWaitsForForwardCompletion) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     Submit({MakeRequestSpec("f1", /*num_pages=*/2)});
     PlanOnce();
@@ -2126,7 +2184,9 @@ TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
     SendAbortEvent("f1");
     EXPECT_FALSE(scheduler_->PdTransferPinned("f1"));
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0) << "the fused role never parks: its pages free immediately";
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    SendForwardDone("f1");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 

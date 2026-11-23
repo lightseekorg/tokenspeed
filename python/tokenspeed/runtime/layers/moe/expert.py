@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
     TRTLLM_UNQUANT_ISPP_ALIGNMENT,
 )
+from tokenspeed_kernel.ops.moe.gluon import GLUON_PETIT_WORLD_SIZES
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -70,6 +71,30 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_commu
 logger = logging.getLogger(__name__)
 
 
+def _moe_quant_config(quant_config, prefix: str):
+    """The MoE layer at ``prefix``'s quantization config, or None when its
+    experts stay unquantized. ignored_layers (compressed-tensors) keys the MoE
+    block; exclude_modules (ModelOpt) keys the fused experts."""
+    if (
+        quant_config is None
+        or should_ignore_quant_layer(prefix, quant_config.ignored_layers)
+        or should_exclude_quant_module(
+            f"{prefix}.experts", quant_config.exclude_modules
+        )
+    ):
+        return None
+    return quant_config.get_moe_quant_config(prefix)
+
+
+def moe_expert_weight_dtype(quant_config, prefix: str) -> str:
+    """The stored weight format of the routed experts of the MoE layer at
+    ``prefix`` ("unquant", "fp8", "mxfp4", ...), as that layer resolves it."""
+    moe_quant_config = _moe_quant_config(quant_config, prefix)
+    if moe_quant_config is None:
+        return "unquant"
+    return moe_quant_config.moe_weight_dtype(prefix)
+
+
 class MoELayer(torch.nn.Module):
     def __init__(
         self,
@@ -101,6 +126,9 @@ class MoELayer(torch.nn.Module):
         input_dtype: torch.dtype | None = None,
         peer_weights: MoEPeerWeights | None = None,
         a2a_backend: str | None = None,
+        # The routed-expert bank layout the selected kernel must read
+        # (``moe_plan``'s ``expert_layout``); None leaves it to selection.
+        expert_layout: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -223,17 +251,10 @@ class MoELayer(torch.nn.Module):
         ):
             raise ValueError("fp32_correction_bias requires DeepSeekV3 routing")
 
-        # Quantization config. ignored_layers (compressed-tensors) keys the MoE
-        # block; exclude_modules (ModelOpt) keys the fused experts.
         self._quant_kind = "unquant"
-        if (
-            quant_config is not None
-            and not should_ignore_quant_layer(self.prefix, quant_config.ignored_layers)
-            and not should_exclude_quant_module(
-                f"{self.prefix}.experts", quant_config.exclude_modules
-            )
-        ):
-            self.quant_config = quant_config.get_moe_quant_config(self.prefix)
+        moe_quant_config = _moe_quant_config(quant_config, self.prefix)
+        if moe_quant_config is not None:
+            self.quant_config = moe_quant_config
             self._quant_kind = self.quant_config.moe_weight_dtype(self.prefix)
 
         fp8_scale_block_shape = None
@@ -323,8 +344,17 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
                 )
-            if mapping.world_size != 8 or mapping.moe.ep_size != 8 or self.ep_size != 8:
-                raise ValueError("Gluon Petit MegaMoE requires world_size=ep_size=8")
+            if (
+                mapping.world_size not in GLUON_PETIT_WORLD_SIZES
+                or mapping.moe.ep_size != mapping.world_size
+                or self.ep_size != mapping.world_size
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires world_size=ep_size in "
+                    f"{sorted(GLUON_PETIT_WORLD_SIZES)}; got world_size="
+                    f"{mapping.world_size}, moe.ep_size={mapping.moe.ep_size}, "
+                    f"layer ep_size={self.ep_size}"
+                )
             if (
                 global_server_args_dict["enable_eplb"]
                 or self.ep_num_redundant_experts
@@ -530,6 +560,7 @@ class MoELayer(torch.nn.Module):
             expert_id_repeats=self.zero_expert_num > 0,
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
+            expert_layout=expert_layout,
             with_bias=with_bias,
             process_group=process_group,
             deepep_mode=deepep_mode,
@@ -585,12 +616,21 @@ class MoELayer(torch.nn.Module):
                     "Peer weights require local full-expert TP1/EP1 compute"
                 )
             if not (
-                self._quant_kind == "nvfp4"
-                and self.activation == "situ"
-                and self.plan["solution"] == "flashinfer_trtllm"
+                self.plan["supports_peer_weights"]
+                or (
+                    self.activation == "situ"
+                    and (self.plan["solution"], self._quant_kind)
+                    in {
+                        ("flashinfer_trtllm", "nvfp4"),
+                        ("flashinfer_trtllm", "mxfp4"),
+                        ("flashinfer_cutedsl", "nvfp4"),
+                    }
+                )
             ):
                 raise ValueError(
-                    "Peer weights currently require FlashInfer TRTLLM NVFP4 SiTU"
+                    "Peer weights require a MoE kernel that declares "
+                    "supports_peer_weights, or FlashInfer TRTLLM NVFP4/MXFP4 "
+                    "or CuTe DSL NVFP4 SiTU"
                 )
             self._storage_spec = replace(
                 self._spec,

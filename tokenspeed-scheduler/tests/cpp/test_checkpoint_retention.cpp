@@ -341,7 +341,8 @@ TEST(CheckpointRetention, DeviceEvictsNonLeafCheckpointsBeforeOlderSessions) {
     for (const std::int64_t retention : {std::int64_t{0}, std::int64_t{1000}}) {
         SCOPED_TRACE(retention);
         BlockPool device(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false, retention);
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false,
+                                     false, retention);
         const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
         for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
         const std::vector<bool> kept = AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c});
@@ -355,8 +356,9 @@ TEST(CheckpointRetention, DeviceEvictsNonLeafCheckpointsBeforeOlderSessions) {
 
 TEST(CheckpointRetention, StaleSessionsLeaveFirstAndRecentOnesOutlastNonLeafCheckpoints) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/4);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/4);
     const Checkpoint stale{{90, 91, 92, 93}}, recent{{80, 81, 82, 83}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&stale, &recent, &a, &b, &c}) Publish(cache, *point);
     // The last four admissions began with `recent`'s: `stale` is older, and A
@@ -367,8 +369,9 @@ TEST(CheckpointRetention, StaleSessionsLeaveFirstAndRecentOnesOutlastNonLeafChec
 
 TEST(CheckpointRetention, PlannedRemovalOfTheOnlyDescendantRestoresTheLeafRank) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000);
     const Checkpoint older{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)};
     for (const Checkpoint* point : {&older, &a, &b}) Publish(cache, *point);
     // B ranks first, at epoch 0; once the plan takes it, A is a leaf again
@@ -390,15 +393,16 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
             SCOPED_TRACE(testing::Message() << "retention " << retention << ", placement " << placement);
             BlockPool device(16, {1, 1});
             BlockPool host(16, {1, 1});
-            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false, retention);
+            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr,
+                                         false, false, retention);
             const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
             for (const Checkpoint* point : {&other, &a, &b, &c}) {
                 Publish(cache, *point);
                 for (std::uint32_t group : {0u, 1u}) {
-                    CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                    CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                     ASSERT_TRUE(block);
-                    cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
-                                         std::nullopt);
+                    cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                                std::nullopt);
                 }
             }
             ASSERT_TRUE(cache.ClearDeviceCache());
@@ -406,10 +410,10 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
             while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
             const std::array<std::uint32_t, 1> groups{0};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                                : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                                 : cache.AcquireHostSegments(groups, buckets, boundaries);
+            const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                                : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                                 : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
             ASSERT_EQ(result.stats.allocated, 1u);
             const std::vector<bool> kept{Holds(cache, host, other), Holds(cache, host, a), Holds(cache, host, b),
                                          Holds(cache, host, c)};
@@ -427,17 +431,19 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
         SCOPED_TRACE(placement);
         BlockPool device(16, {1, 1});
         BlockPool host(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
-                                     /*checkpoint_retention_requests=*/1000);
+        auto cache =
+            MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, false,
+                            /*checkpoint_retention_requests=*/1000);
         // A is older and deeper than B; each has one newer checkpoint after it.
         const Checkpoint a{{10, 11, 12, 13, 14, 15, 16, 17}}, a_next{{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}};
         const Checkpoint b{{50, 51, 52, 53}}, b_next{{50, 51, 52, 53, 54, 55, 56, 57}};
         for (const Checkpoint* point : {&a, &a_next, &b, &b_next}) {
             Publish(cache, *point);
             for (std::uint32_t group : {0u, 1u}) {
-                CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                 ASSERT_TRUE(block);
-                cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()}, std::nullopt);
+                cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                            std::nullopt);
             }
         }
         ASSERT_TRUE(cache.ClearDeviceCache());
@@ -445,10 +451,10 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
         while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
         const std::array<std::uint32_t, 1> groups{0};
         const std::array<std::int32_t, 1> buckets{0};
-        const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-        const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                            : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                             : cache.AcquireHostSegments(groups, buckets, boundaries);
+        const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                            : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                             : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
         ASSERT_EQ(result.stats.allocated, 1u);
         EXPECT_FALSE(Holds(cache, host, a));
         EXPECT_TRUE(Holds(cache, host, b));
@@ -459,8 +465,9 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
 // leaf, so LRU takes the other session instead.
 TEST(CheckpointRetention, LeafDistanceKeepsThePreviousTurnsCheckpoint) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
     const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
     EXPECT_EQ(AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c}), (std::vector<bool>{false, false, true, true}));
@@ -472,16 +479,17 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
             SCOPED_TRACE(testing::Message() << "leaf distance " << leaf_distance << ", placement " << placement);
             BlockPool device(16, {1, 1});
             BlockPool host(16, {1, 1});
-            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
-                                         /*checkpoint_retention_requests=*/1000, leaf_distance);
+            auto cache =
+                MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, false,
+                                /*checkpoint_retention_requests=*/1000, leaf_distance);
             const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)};
             for (const Checkpoint* point : {&other, &a, &b}) {
                 Publish(cache, *point);
                 for (std::uint32_t group : {0u, 1u}) {
-                    CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                    CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                     ASSERT_TRUE(block);
-                    cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
-                                         std::nullopt);
+                    cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                                std::nullopt);
                 }
             }
             ASSERT_TRUE(cache.ClearDeviceCache());
@@ -489,10 +497,10 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
             while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
             const std::array<std::uint32_t, 1> groups{0};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                                : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                                 : cache.AcquireHostSegments(groups, buckets, boundaries);
+            const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                                : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                                 : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
             ASSERT_EQ(result.stats.allocated, 1u);
             // A, at distance 1, is aged only with leaf distance 0.
             EXPECT_EQ(Holds(cache, host, other), leaf_distance == 0);
@@ -503,8 +511,9 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
 
 TEST(CheckpointRetention, PlannedRemovalCanBringACheckpointWithinTheLeafDistance) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
     const Checkpoint older{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&older, &a, &b, &c}) Publish(cache, *point);
     // C ranks first, at epoch 0; once the plan takes it, B is the leaf and A
@@ -522,8 +531,9 @@ TEST(CheckpointRetention, PlannedRemovalCanBringACheckpointWithinTheLeafDistance
 
 TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) {
     BlockPool device(32, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/0);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/0);
     const Checkpoint a{Sequence(4)};
     Publish(cache, a);
     for (const std::int32_t first : {100, 200, 300})
@@ -531,26 +541,28 @@ TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) 
     std::vector<BlockTable> tables(2);
     auto admission = AdmitForTest(
         cache, tables,
-        cache.ProbePromptPrefix(CacheCoordinator::PromptPrefix{
+        cache.Prober().ProbePromptPrefix(PromptPrefix{
             .prefix_hashes = a.hashes, .tokens = a.tokens, .max_tokens = static_cast<std::int32_t>(a.tokens.size())}),
         GroupDemand{.extent = DenseGrowth{0}});
     ASSERT_TRUE(admission);
     EXPECT_EQ(admission->device_prefix_tokens, 4);
     // Three new requests came between: index 2 counts [2, 4).
-    std::vector<std::uint64_t> expected(cache.CheckpointResumeGaps().size(), 0);
+    std::vector<std::uint64_t> expected(cache.History().CheckpointResumeGaps().size(), 0);
     expected[2] = 1;
-    EXPECT_EQ(cache.CheckpointResumeGaps(), expected);
+    EXPECT_EQ(cache.History().CheckpointResumeGaps(), expected);
     cache.Free(tables);
 }
 
 TEST(CheckpointRetention, DefaultIsSixteenBatchesOfNewRequests) {
     SchedulerConfig config;
     config.max_batch_size = 8;
+    config.max_resident_requests = config.max_batch_size;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 128);
     EXPECT_EQ(config.checkpoint_retention_leaf_distance, 0);
     config.checkpoint_retention_requests = 0;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 0);
     config.max_batch_size = 1 << 20;
+    config.max_resident_requests = config.max_batch_size;
     config.checkpoint_retention_requests.reset();
     EXPECT_EQ(config.CheckpointRetentionRequests(), kMaxCheckpointRetentionRequests);
 }

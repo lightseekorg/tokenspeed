@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     check_mla_latent_geometry,
@@ -72,6 +73,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
     read_checkpoint_block_size,
@@ -226,6 +228,8 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
+        # A draft-owned mask row replaces the target's; wire_target binds it.
+        self.mask_embedding_partial: torch.Tensor | None = None
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._validate_draft_window_sink()
@@ -425,6 +429,25 @@ class DFlash(BaseDrafter):
         if self.embed_tokens is None:
             self.embed_tokens = self.model.embed_tokens
         self._first_layer_input = self._first_layer_input_mode()
+        # Drafts without their own embedding table use the target's mask row.
+        own_mask_embedding = getattr(self.model, "own_mask_embedding", None)
+        own_row = own_mask_embedding() if own_mask_embedding is not None else None
+        self.mask_embedding_partial = None
+        if own_row is not None:
+            logger.info(
+                "Block draft uses its own embedding for mask token "
+                f"{self.mask_token_id}."
+            )
+            # The row joins the first layer's input as _first_layer_embeds
+            # hands it in: whole on every rank ("full"), else whole on the
+            # dense group's first rank and zeros on the others.
+            whole = (
+                self._first_layer_input == "full"
+                or self.model.mapping.dense.tp_rank == 0
+            )
+            self.mask_embedding_partial = (
+                own_row if whole else torch.zeros_like(own_row)
+            )
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         self._replicate_head_over_attention_dp()
@@ -593,7 +616,7 @@ class DFlash(BaseDrafter):
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if is_current_stream_capturing(device):
                 return None  # rendezvous is collective; leave it to warmup
             self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
         return self._dist_argmax_state
@@ -673,10 +696,14 @@ class DFlash(BaseDrafter):
             self.lm_head, "shard_indices"
         ):
             # Replicated draft rows: no query shard.
-            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
-            logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata, require_full_vocab=False
-            )
+            if base_logits is None:
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE, query_shard=None
+                )
+                base_logits = self.logits_processor._get_logits(
+                    hidden_states, self.lm_head, metadata, require_full_vocab=False
+                )
+            logits = base_logits
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
             argmax = torch.argmax(logits, dim=-1)
@@ -870,10 +897,8 @@ class DFlash(BaseDrafter):
         """Publish valid draft history independently of who produces cache bytes."""
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        if (
-            base_ctx.num_extends == 0
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
+        if base_ctx.num_extends == 0 and is_current_stream_capturing(
+            accept_lengths.device
         ):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
@@ -958,22 +983,26 @@ class DFlash(BaseDrafter):
             )
 
     def warmup_extend(self, num_tokens: int) -> None:
-        """Project ``num_tokens`` rows of zero taps, as an extend's context
-        write does (``_write_native_cache``). The projection ends in a column
-        all-gather over the attention TP group; a decode warmup whose context
-        write takes the draft monokernels never reaches it. Warm both long
-        and short chunks because the gather chooses its subgroup count by
-        the rank-local payload size."""
+        """Write the context of ``num_tokens`` rows of zero taps, as an extend
+        does (``_write_native_cache``), all into slot 0, the dummy slot padded
+        rows write to. The projection ends in a column all-gather over the
+        attention TP group, and the per-layer K/V write runs kernels such as
+        the K norm at head width; a decode warmup whose context write takes
+        the draft monokernels or the fused write reaches neither. Warm both
+        long and short chunks because the gather chooses its subgroup count
+        by the rank-local payload size."""
         model = self.draft_model_runner.model
         taps = torch.zeros(
             (num_tokens, model.context_in_features),
             dtype=model.context_dtype,
             device=self.device,
         )
-        with torch.inference_mode():
-            model.project_target_hidden(taps)
-            if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
-                model.project_target_hidden(taps[:_SHORT_CONTEXT_PROJECTION_ROWS])
+        positions = torch.zeros(num_tokens, dtype=torch.int64, device=self.device)
+        slots = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        self._write_native_cache(taps, positions, slots)
+        if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
+            rows = _SHORT_CONTEXT_PROJECTION_ROWS
+            self._write_native_cache(taps[:rows], positions[:rows], slots[:rows])
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""
@@ -984,6 +1013,24 @@ class DFlash(BaseDrafter):
         # Same order as __init__.
         self._init_context_taps()
 
+    def _draft_cache_page_sharded(self) -> bool:
+        """Whether any draft layer's cache group is page-sharded (KVP).
+
+        Asks the pool's plan, not the layers: this runs at construction,
+        before bind_cache_groups stamps the layers' groups.
+        """
+        if self.draft_model_runner.mapping.attn.kvp_size == 1:
+            return False
+        pool = self.token_to_kv_pool
+        shard_counts = {
+            str(spec.group_id): spec.shard_count
+            for spec in pool.arena.cache_group_specs
+        }
+        return any(
+            shard_counts[group_id] > 1
+            for group_id in pool.history_group_by_layer().values()
+        )
+
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache for the bound pool."""
         self._fused_kv_enabled = False
@@ -992,12 +1039,12 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
         self._fused_kv_latent_planes: LatentPlanes | None = None
-        # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
+        # The projection writes into a workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
         if not self.uses_shared_context_projection:
             return
-        if self.draft_model_runner.mapping.attn.kvp_size > 1:
+        if self._draft_cache_page_sharded():
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.
             logger.info(
@@ -1066,8 +1113,7 @@ class DFlash(BaseDrafter):
                 k_norm_rows.append(attn.k_norm.weight)
                 eps_values.append(float(attn.k_norm.variance_epsilon))
 
-            flat_kv_weight = torch.cat(kv_weight_rows, dim=0)
-            self._fused_kv_flat_weight_t = flat_kv_weight.t().contiguous()
+            self._fused_kv_flat_weight = torch.cat(kv_weight_rows, dim=0).contiguous()
             self._fused_kv_k_norm_weight = torch.stack(k_norm_rows, dim=0).contiguous()
             self._fused_kv_eps = torch.tensor(
                 eps_values, dtype=torch.float32, device=self.device
@@ -1389,7 +1435,7 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
+        kernel_mm(ctx_hidden, self._fused_kv_flat_weight, out=proj_out_2d)
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
@@ -1467,9 +1513,7 @@ class DFlash(BaseDrafter):
                 out=block_positions,
             )
 
-        is_capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        is_capturing = is_current_stream_capturing(block_positions.device)
         # MLA block rows are all decode rows. Treating them as extends makes
         # MLA backends slice the entire block out of their decode metadata.
         metadata_num_extends = 0 if self.attention_kind == "kimi_mla" else bs
@@ -1501,6 +1545,11 @@ class DFlash(BaseDrafter):
 
         flat_ids = block_ids.reshape(-1)
         input_embeds = self._first_layer_embeds(flat_ids)
+        if self.mask_embedding_partial is not None:
+            # Row 0 is the anchor; every later row is the mask token.
+            input_embeds.view(bs, self.draft_query_width, -1)[:, 1:].copy_(
+                self.mask_embedding_partial
+            )
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
@@ -1708,6 +1757,10 @@ class DFlash(BaseDrafter):
         if self.target_model is None:
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
+        if self.draft_sampler is not None:
+            self.draft_sampler.prepare_round(
+                accept_lengths, num_extends=base_ctx.num_extends
+            )
         if base_ctx.target_capture_sink is self and not self._context_written:
             raise RuntimeError(
                 "DFLASH armed the capture sink, but the target never handed "

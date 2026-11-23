@@ -73,6 +73,7 @@ def mha_recipe(
         kernel_page_size=64,
         context_len=1024,
         max_bs=1,
+        max_resident_requests=1,
         components=(
             MHAConfig(
                 backend_name="fa2",
@@ -185,6 +186,7 @@ def test_qcp_reserves_one_shared_workspace_before_sizing(qcp, draft):
         kernel_page_size=64,
         context_len=65536,
         max_bs=1,
+        max_resident_requests=1,
         kvp_size=8,
         qcp_size=qcp,
         components=(
@@ -240,13 +242,16 @@ def test_qcp_reserves_one_shared_workspace_before_sizing(qcp, draft):
     )
 
 
-def test_probe_uses_demand_and_reports_resident_bytes_with_zero_budget():
-    recipe = mha_recipe(budget=0, probe=3)
+@pytest.mark.parametrize("demand,expected", [(3, 4), (8, 8)])
+def test_probe_uses_demand_and_reports_resident_bytes_with_zero_budget(
+    demand, expected
+):
+    recipe = mha_recipe(budget=0, probe=demand)
     setup = recipe.setup_for_layers(
         resident_cache_window=(0, 2), synchronize_capacity=local_cache_capacity
     )
     resident = setup.spec.memory_plan.narrow_to_layers(0, 2)
-    assert resident.num_lcm_blocks == 3
+    assert resident.num_lcm_blocks == expected
     assert setup.cache_budget_bytes == resident.arena_bytes
 
 

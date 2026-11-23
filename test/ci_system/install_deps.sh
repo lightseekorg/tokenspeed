@@ -193,19 +193,9 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolati
 show_nvcc_cache_stats after
 
 # ============================================================
-# Step 5: Install TokenSpeed Scheduler (C++)
+# Step 5: Install TokenSpeed Engine (with the C++ scheduler)
 # ============================================================
-echo "=== Step 5: Install TokenSpeed Scheduler ==="
-pip_install_with_retry pip3 install cmake ninja
-# Scheduler changes intentionally accumulate without a version bump. Build in
-# a fresh directory so a persistent runner cannot reuse a same-version native
-# extension left by an earlier checkout.
-SCHEDULER_BUILD_DIR="$(mktemp -d)"
-pip_install_with_retry pip3 install --force-reinstall --no-deps \
-    tokenspeed-scheduler/ \
-    --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
-rm -rf "${SCHEDULER_BUILD_DIR}"
-echo "=== Step 5b: Install TokenSpeed Engine ==="
+echo "=== Step 5: Install TokenSpeed Engine ==="
 WORKSPACE="${WORKSPACE}" bash "${SCRIPT_DIR}/install_tokenspeed_engine.sh"
 
 # ============================================================
@@ -269,6 +259,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         0.7.2.post1) FLASHINFER_CUBIN_SHA256="1998c7006bcc06ee5dd3208a682af247382c6710d6b370a961381262c04c11f0" ;;
         0.7.3) FLASHINFER_CUBIN_SHA256="115b96065fa2dcc1674c74fcb0544ec2890a6fa4a8519b2251d1f6ab3d780093" ;;
         0.7.4) FLASHINFER_CUBIN_SHA256="8af62986f52e8cd29d1eaef7ecc63c441c1c214bd33175019a8f548a128bc2e2" ;;
+        0.7.5) FLASHINFER_CUBIN_SHA256="d9e45f4b025d1fd81ad99dc73a2d865e1037b1313fe7bc04de8bfb4d2612a71c" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
@@ -319,7 +310,7 @@ if [ "${CUDA_VERSION%%.*}" = "13" ]; then
 fi
 
 echo "=== Verify installed Torch and native kernel dependencies ==="
-python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<'PY'
+python3 - "${CUDA_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<'PY'
 import importlib.metadata
 import os
 import sys
@@ -328,22 +319,19 @@ from pathlib import Path
 import torch
 from packaging.requirements import Requirement
 
-sys.path.insert(0, sys.argv[4])
+sys.path.insert(0, sys.argv[3])
 from flashinfer_jit_cache_installer import install_url_if_needed
 
 checked_packages = (
     "torch",
-    "tokenspeed-trtllm-kernel",
-    "tokenspeed-cutedsl-kda",
     "flashinfer-python",
     "nvidia-cudnn-frontend",
 )
 requirements = {}
-for path in sys.argv[1:3]:
-    for line in Path(path).read_text().splitlines():
-        if line.startswith(tuple(f"{name}==" for name in checked_packages)):
-            requirement = Requirement(line)
-            requirements[requirement.name] = requirement
+for line in Path(sys.argv[1]).read_text().splitlines():
+    if line.startswith(tuple(f"{name}==" for name in checked_packages)):
+        requirement = Requirement(line)
+        requirements[requirement.name] = requirement
 requirements["flashinfer-cubin"] = Requirement(
     f"flashinfer-cubin{requirements['flashinfer-python'].specifier}"
 )
@@ -352,14 +340,14 @@ for name in (*checked_packages, "flashinfer-cubin"):
     print(f"Installed {name}=={installed}", flush=True)
     if installed not in requirements[name].specifier:
         raise SystemExit(f"Installed {name}=={installed} does not satisfy {requirements[name]}")
-expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
+expected_cuda = f"{sys.argv[2][:-1]}.{sys.argv[2][-1]}"
 print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
 if torch.version.cuda != expected_cuda:
     raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
 if os.environ.get("CI_RUNNER_LABEL", "").startswith(
     ("gb200", "gb300", "b200", "b300", "slurm-gb200-", "slurm-gb300-", "slurm-b300-")
 ):
-    url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
+    url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[2])
     print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
     if url is not None:
         raise SystemExit(f"FlashInfer JIT cache or providers do not match {expected}")

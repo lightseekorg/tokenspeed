@@ -328,7 +328,7 @@ class InklingAttnBackend(AttentionBackend):
         conv_pool = InklingConvStatePool(
             num_layers=num_layers,
             # Row 0 is reserved; the additional slot covers padding.
-            num_slots=attn_config.max_bs + 2,
+            num_slots=attn_config.max_resident_requests + 2,
             conv_dim=inkling_conv_total_dim(
                 text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
             ),
@@ -338,7 +338,7 @@ class InklingAttnBackend(AttentionBackend):
         )
         logger.info(
             f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
-            f"layers x {attn_config.max_bs + 2:d} slots, "
+            f"layers x {attn_config.max_resident_requests + 2:d} slots, "
             f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
         )
         kv_dequant_scratch = None
@@ -424,6 +424,12 @@ class InklingAttnBackend(AttentionBackend):
         if name == "conv_columns":
             raise AttributeError("conv_columns is learnt by set_cache_pool")
         return getattr(self.inner, name)
+
+    def model_binding(self, layer_id, binding_type):
+        return self.inner.model_binding(layer_id, binding_type)
+
+    def prefill_request_layout(self):
+        return self.inner.prefill_request_layout()
 
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.inner,)

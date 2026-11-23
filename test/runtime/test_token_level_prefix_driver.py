@@ -37,7 +37,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from test.runtime.scheduler_driver import (  # noqa: E402
     advance_scheduler,
@@ -73,6 +73,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             num_device_pages=64 + 1,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,
@@ -84,8 +85,11 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             host_write_policy="write_through",
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
+            max_consecutive_prefill_rounds=0,
             storage_config=None,
             cache_groups=groups,
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
 

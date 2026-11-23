@@ -49,6 +49,19 @@ void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     }
 }
 
+void Scheduler::handleEvent(const pd::DestinationReadyEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr) {
+        return;
+    }
+    // Whatever the prompt's state, its final result no longer parks it; one
+    // already parked sends its KV.
+    request->MarkDestinationReady();
+    if (request->Is<fsm::PrefillAwaitingDestination>()) {
+        request->Apply(fsm::DestinationReadyEvent{});
+    }
+}
+
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
@@ -138,8 +151,10 @@ void Scheduler::settleFinishedRequests() {
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
-        if (auto store = publishCompletedPages(*request)) {
-            pending_write_back_operations_.push_back(std::move(*store));
+        if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
+            if (auto store = publishCompletedPages(*request)) {
+                pending_write_back_operations_.push_back(std::move(*store));
+            }
         }
         request->Apply(fsm::ReleaseEvent{&coordinator_});
     }
@@ -200,7 +215,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     if (completed.completed_pages && completed.completed_pages->tail) {
         store_hashes.push_back(completed.completed_pages->tail->hash.ToString());
     }
-    coordinator_.QueueCachedBlocksForStore(store_hashes);
+    coordinator_.Host().QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
@@ -398,7 +413,13 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
             profile_span.emplace("Scheduler::handlePrefillResult");
         }
         request->NoteResultLanded();
-        request->Apply(fsm::ExtendResultEvent{event.tokens});
+        // Under early decode allocation an admitted prompt has its
+        // destination; under deferred it has one once
+        // pd::DestinationReadyEvent arrived.
+        const bool await_destination =
+            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
+            !request->DestinationReady();
+        request->Apply(fsm::ExtendResultEvent{event.tokens, await_destination});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
@@ -415,6 +436,8 @@ void Scheduler::abortRequest(Request& request) {
     if (pdTransferInFlight(request)) {
         // The transport stops the transfer; the pages wait for it.
         request.Apply(fsm::StopPdTransferEvent{});
+    } else if (request.ResultsInFlight() > 0) {
+        request.Apply(fsm::AbortInFlightEvent{});
     } else {
         request.Apply(fsm::AbortEvent{&coordinator_});
     }
@@ -435,11 +458,13 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
             retracted->image.FollowPublished(published);
         }
     }
-    if (storage_transfers_ && storage_allowed_) {
+    if ((storage_transfers_ || disk_transfers_) && storage_allowed_) {
         std::vector<CacheKey> keys;
         keys.reserve(published.size());
         for (const auto& entry : published) keys.push_back(entry.key);
-        storage_transfers_->QueueBackups(keys);
+        if (storage_transfers_) storage_transfers_->QueueBackups(keys);
+        // What the write-back brought to Host is dirty there until cleaned.
+        if (disk_transfers_) disk_transfers_->QueueCleaning(keys);
     }
 }
 
@@ -470,9 +495,10 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
         // issues.
         registerKvEventRestore(*request, restoring->resources.cache_progress.prefix_hashes, restoring->kv_event_tails);
     }
-    ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    TierTransferManager::RestoredSlots slots =
+        tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
     if (resumes) {
-        request->Apply(fsm::RestoreDoneEvent{std::move(request_pool_index)});
+        request->Apply(fsm::RestoreDoneEvent{std::move(slots.request_pool_index), std::move(slots.decode_slot)});
     }
     // Otherwise the row and the blob slot return with the ticket: the request
     // that would have used them is gone.

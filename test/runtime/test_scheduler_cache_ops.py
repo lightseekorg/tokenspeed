@@ -32,7 +32,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
@@ -79,6 +79,7 @@ def wire(monkeypatch):
             StorageGetOp=ts.Cache.StorageGetOp,
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
+            DiskOp=ts.Cache.DiskOp,
         ),
     )
 
@@ -219,6 +220,7 @@ def _config(**overrides):
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -230,7 +232,10 @@ def _config(**overrides):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)
@@ -316,3 +321,13 @@ def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     ]
     assert prepared.storage[0].op_id == original.op_id
     assert prepared.storage[1].op_id > original.op_id
+
+
+@pytest.mark.parametrize("cap", [None, 0, 1, 64, 2**31 - 1])
+def test_make_config_preserves_optional_forced_cap_exactly(cap):
+    # Validation belongs to ServerArgs/native scheduler. This adapter must not
+    # turn the invalid explicit zero into the valid unlimited None value.
+    config = _config(
+        debug_force_retraction_interval=3, debug_force_retraction_max_per_request=cap
+    )
+    assert config.debug_force_retraction_max_per_request == cap

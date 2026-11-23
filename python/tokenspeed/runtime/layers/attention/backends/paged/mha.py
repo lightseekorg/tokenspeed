@@ -34,8 +34,10 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_prefill,
 )
 from tokenspeed_kernel.ops.attention.tree import tree_window_attention
+from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 from tokenspeed_kernel.ops.tuning import is_warming_up
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
@@ -54,6 +56,9 @@ from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    GLUON_MHA_DECODE_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
@@ -140,6 +145,25 @@ class MHAAttnBackend(PagedAttentionBackend):
     # cannot serve one and says so before a layer declares a sink.
     supports_layer_window_sink: bool = False
 
+    @classmethod
+    def resolve_kernel_page_size(
+        cls, config: AttnConfig, block_granularity: int
+    ) -> int:
+        """On gfx950, view a block of whole 64-token pages as those pages.
+
+        The Gluon decode there reads only 64-token pages. A coarser block
+        (128 under a hybrid GDN model's prefix granularity) would leave its
+        decode on the Triton split kernel, whose fixed split count lets the
+        longest request of a ragged batch set the step time.
+        """
+        if (
+            config.kernel_page_size is None
+            and current_platform().is_cdna4
+            and block_granularity % GLUON_MHA_DECODE_PAGE_SIZE == 0
+        ):
+            return GLUON_MHA_DECODE_PAGE_SIZE
+        return super().resolve_kernel_page_size(config, block_granularity)
+
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
@@ -173,10 +197,18 @@ class MHAAttnBackend(PagedAttentionBackend):
             return_lse=False,
             solution=self.kernel_solution,
         )
-        # DFLASH draft: the whole block in one decode forward, with one
-        # decode metadata entry per block position and uniform non-causal
-        # seq_lens (block_decode_expansion).
+        # DFLASH draft: the whole block in one decode forward. A non-causal
+        # block keeps one decode metadata entry per block position, all at the
+        # block-end seq_len (block_decode_expansion). A causal block keeps one
+        # entry per request and decodes its positions as packed causal query
+        # rows, as a verify does, so each request's keys are read once.
         self.draft_block_decode = bool(config.draft_block_decode)
+        self.draft_block_causal = bool(config.draft_block_causal)
+        # The block_draft kernel trait selects non-causal block attention; a
+        # causal block's packed rows decode as a verify does.
+        self.noncausal_block_draft = (
+            self.draft_block_decode and not self.draft_block_causal
+        )
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -353,6 +385,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             self._decode_views_by_bs[bs] = metadata
         return metadata
 
+    @property
+    def block_decode_expansion(self) -> int:
+        if self.draft_block_causal:
+            return 1
+        return super().block_decode_expansion
+
     def refresh_decode_metadata(
         self,
         bs: int,
@@ -366,14 +404,14 @@ class MHAAttnBackend(PagedAttentionBackend):
         del num_extends
         if self.block_decode_active:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block positions. Under replay the block-end
+            # block_decode_expansion entries. Under replay the block-end
             # seq_lens are re-derived inside the captured graph
             # (fill_block_decode_seq_lens); eager has no in-graph writer, and
             # the capture seeding needs the same safe baseline.
-            spec = self.spec_num_tokens
-            self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(
-                page_table[:bs, None, :]
-            )
+            expansion = self.block_decode_expansion
+            self.page_table_buf[: bs * expansion].view(
+                bs, expansion, self.max_num_pages
+            ).copy_(page_table[:bs, None, :])
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
         else:
@@ -440,6 +478,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     logit_cap=layer.logit_cap,
                     sinks=sinks,
+                    block_draft=self.noncausal_block_draft,
                     solution=self.kernel_solution,
                     **scale_kwargs,
                 )
@@ -457,6 +496,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 sinks=sinks,
                 out=self.decode_schedule_buf,
+                block_draft=self.noncausal_block_draft,
                 solution=self.kernel_solution,
                 **scale_kwargs,
             )
@@ -474,6 +514,11 @@ class MHAAttnBackend(PagedAttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    def gates_decode_output(self, layer: PagedAttention) -> bool:
+        # mha_decode_with_kvcache gates in the kernel that stores the output,
+        # or runs the separate op after where none here can.
+        return True
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -483,6 +528,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
+        *,
+        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
@@ -495,8 +542,19 @@ class MHAAttnBackend(PagedAttentionBackend):
             bs, max_seqlen_q, metadata.page_table, metadata.seq_lens
         )
         if tree is not None:
-            return self._tree_cascade(
+            output = self._tree_cascade(
                 q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
+            )
+            if rmsnorm_output_gate is None:
+                return output
+            gate, eps = rmsnorm_output_gate
+            return weightless_rmsnorm_gated_sigmoid(
+                output.contiguous(),
+                gate,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                eps,
+                pdl_enabled(),
             )
 
         scale_kwargs = {}
@@ -534,6 +592,14 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
+            block_draft=self.noncausal_block_draft,
+            output_gate=None if rmsnorm_output_gate is None else rmsnorm_output_gate[0],
+            output_gate_eps=(
+                None if rmsnorm_output_gate is None else rmsnorm_output_gate[1]
+            ),
+            # A draft block's positions share their request's page-table row
+            # and length (refresh_decode_metadata): one key read per block.
+            uniform_row_groups=self.block_decode_expansion,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
@@ -598,6 +664,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 return_lse=True,
                 softmax_scale=layer.scaling,
                 solution="triton",
+                block_draft=False,
             )
         else:
             prefix_out, prefix_lse = self._lane_prefix_decode(
@@ -655,6 +722,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             return_lse=True,
             softmax_scale=layer.scaling,
             solution="triton",
+            block_draft=False,
         )
         out = out.view(num_reqs, heads, rows, -1).transpose(1, 2)
         lse = lse.view(num_reqs, heads, rows).transpose(1, 2)

@@ -37,6 +37,10 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
+from test.runtime.dsa_index_k_test_utils import (
+    assert_top_k_up_to_ties,
+    index_candidate_scores,
+)
 
 from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.platform import current_platform
@@ -716,10 +720,13 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     prefix = min(slots, 40000) - num_rows
     q = torch.randn(num_rows, 32, 128, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(num_rows, 32, device="cuda", dtype=torch.bfloat16)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=(slots + 1535) // 1536)
+    page = 64
+    # The workspace starts past the reserved null page 0, as in serving.
+    kv_slots = torch.arange(page, page + slots, device="cuda", dtype=torch.int64)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=(page + slots + 1535) // 1536)
     pool.set_index_k_buffer(
         3,
-        torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_slots,
         torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
         write_mask=None,
     )
@@ -728,12 +735,12 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     args = dict(
         q=q,
         weights=weights,
-        kv_workspace_slots=torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_workspace_slots=kv_slots,
         row_starts=torch.zeros(num_rows, device="cuda", dtype=torch.int32),
         row_ends=row_ends_cpu.to(device="cuda", dtype=torch.int32),
         candidate_lens_cpu=row_ends_cpu,
         index_k_cache=plane,
-        page_size=64,
+        page_size=page,
         max_logits_bytes=1 << 30,
         topk=2048,
     )
@@ -770,7 +777,26 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     assert projected_rows == [num_rows - 1264, 1264]
     selected = workspace_indices_to_kv_slots(selected, None)
     assert torch.equal(lens, expected_lens)
-    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    mine, theirs = selected.sort(dim=1).values, expected.sort(dim=1).values
+    # Workspace page p is plane page p + 1.
+    table = torch.arange(1, 1 - (-slots // page), device="cuda", dtype=torch.int32)
+    # The top-k keeps tied candidates in atomic order, so two runs may differ on an exact tie.
+    for row in (mine != theirs).any(dim=1).nonzero().flatten().tolist():
+        query, q_scales = attention._scorer_index_query(q[row : row + 1], plane)
+        scores = index_candidate_scores(
+            query,
+            weights[row : row + 1],
+            plane,
+            table[None],
+            torch.zeros(1, device="cuda", dtype=torch.int32),
+            args["row_ends"][row : row + 1],
+            page_size=page,
+            softmax_scale=attention.indexer.weights_softmax_scale,
+            q_scales=q_scales,
+        )
+        assert_top_k_up_to_ties(
+            row, (mine[row], theirs[row]), int(row_ends_cpu[row]), scores[0], 2048
+        )
 
 
 @requires_gpu
@@ -1265,6 +1291,57 @@ def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
     bitwise.fuse_query_projections()
     assert bitwise.q_b_wq_b_weight is None
+
+
+@requires_gpu
+@pytest.mark.parametrize("rows", [2, 8, 12])
+def test_the_query_norm_and_projection_match_the_two_launches(
+    monkeypatch, rows
+) -> None:
+    """A decode round's q/KV latent norms and stacked [q_b; wq_b] projection
+    give ``fused_qk_layernorm`` then ``mm`` bit for bit, in one launch on
+    gfx950 up to eight rows. TP8 widths; the latents are views of the wider
+    a-projection."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+    from tokenspeed.runtime.models import kimi_k31
+
+    torch.manual_seed(rows)
+    norms = FusedRMSNorm(RMSNorm(1536), RMSNorm(512)).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        norms.weight_q_a.uniform_(0.5, 1.5)
+        norms.weight_kv_a.uniform_(0.5, 1.5)
+    layer = SimpleNamespace(
+        fused_qk_layernorm=norms,
+        q_b_wq_b_weight=torch.randn(6400, 1536, device="cuda", dtype=torch.bfloat16)
+        / 32,
+    )
+    projected = torch.randn(rows, 3648, device="cuda", dtype=torch.bfloat16) * 4
+    want_rows = projected.clone()
+    want_norm = want_rows.new_empty(rows, 1536)
+    norms(
+        input_q_a=want_rows[:, :1536],
+        input_kv_a=want_rows[:, 1536:2048],
+        output_q_a=want_norm,
+    )
+    want = mm(want_norm, layer.q_b_wq_b_weight)
+
+    launches = []
+    fused = kimi_k31.mv_rmsnorm
+    monkeypatch.setattr(
+        kimi_k31,
+        "mv_rmsnorm",
+        lambda *args: launches.append(args) or fused(*args),
+    )
+    q_norm = torch.empty_like(want_norm)
+    got = kimi_k31.KimiK31SparseMLAAttention._normalize_project_query(
+        layer, projected[:, :1536], projected[:, 1536:2048], q_norm
+    )
+    assert len(launches) == int(rows <= 8 and current_platform().is_cdna4)
+    assert torch.equal(got, want)
+    assert torch.equal(q_norm, want_norm)
+    assert torch.equal(projected, want_rows)
 
 
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
@@ -2067,6 +2144,7 @@ def _dsa_leaf(pool, *, q_len: int, heads: int, padded_prefill_replay: bool = Fal
         kernel_page_size=None,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_quant_method=None,
         speculative_num_draft_tokens=q_len,
         components=(spec,),
@@ -2393,6 +2471,7 @@ def _k31_attention_stack(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
         max_bs=4,
+        max_resident_requests=4,
         context_len=context_len,
         speculative_num_draft_tokens=spec_width,
         kvp_size=kvp_size,
@@ -2891,8 +2970,9 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     """Only decode-chain rounds take the front.
 
     It serves decode rounds whose keys and head weights come from the
-    a-projection and whose index-K write quantizes the query, without KV
-    placement or a breakable capture, over at most 32 rows it addresses.
+    a-projection and whose index-K write quantizes the query, without a
+    breakable capture, over at most 32 rows it addresses, KV placement or
+    not.
     """
     from tokenspeed.runtime.models import kimi_k31
 
@@ -2922,9 +3002,9 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     monkeypatch.setattr(
         kimi_k31, "is_breakable_capture_active", lambda: case == "breakable_capture"
     )
-    takes = case in ("takes", "most_rows")
+    takes = case in ("takes", "placed", "most_rows")
     assert attention._takes_decode_front(ctx, q_a, kv_a, keys) == takes
-    if case in ("takes", "unsupported_rows", "most_rows"):
+    if case in ("takes", "placed", "unsupported_rows", "most_rows"):
         assert supported == [((rows, 1536), (rows, 512), (rows, 128), (rows, 32))]
 
 
@@ -2964,6 +3044,28 @@ def _bf16_step(x: torch.Tensor) -> torch.Tensor:
     """The BF16 spacing at |x| (8 significant bits; the subnormal spacing below)."""
     exponent = torch.floor(torch.log2(x.abs().double().clamp_min(2.0**-126)))
     return torch.exp2(exponent - 7)
+
+
+def test_the_front_writes_index_keys_through_the_kvp_placement() -> None:
+    """The front's ``slot_owner`` is the leaf's KVP placement, or None.
+
+    The placement is the full-attention leaf's, of the round's virtual slots,
+    and an unplaced cache gives None.
+    """
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+    from tokenspeed.runtime.models import kimi_k31
+
+    attention = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    placement = CachePlacement(128, 45, (0, 1, 2, 3), 2)
+    for leaf_placement, owner in ((None, None), (placement, (128, 45, 4, 2))):
+        leaf = SimpleNamespace(cache_placement=lambda layer, p=leaf_placement: p)
+        hybrid = object.__new__(kimi_k31.HybridLinearAttnBackend)
+        hybrid.full_attn_backend = leaf
+        for backend in (leaf, hybrid):
+            ctx = SimpleNamespace(attn_backend=backend)
+            assert attention._index_slot_owner(ctx) == owner
 
 
 @requires_gpu

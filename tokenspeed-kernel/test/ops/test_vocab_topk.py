@@ -40,32 +40,100 @@ _SHARD = 25256
 _VOCAB_START = 3 * _SHARD
 
 
-def _logits(rows: int, seed: int, device: str, levels: int | None) -> torch.Tensor:
+def _logits(
+    rows: int,
+    seed: int,
+    device: str,
+    levels: int | None,
+    columns: int,
+    dtype=torch.bfloat16,
+) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed)
-    logits = torch.randn(rows, _SHARD, generator=gen) * 4
+    logits = torch.randn(rows, columns, generator=gen) * 4
     if levels is not None:
         # Few distinct values: the k-th largest is tied across many columns.
         logits = torch.round(logits * levels / 4) / levels
-    return logits.to(device, torch.bfloat16)
+    return logits.to(device, dtype)
 
 
 @pytest.mark.parametrize("k", [16, 10])
 @pytest.mark.parametrize("levels", [None, 2])
 @pytest.mark.parametrize("scale", [None, 0.1767766952966369])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_shard_topk_keeps_the_best_values_lowest_column_first(
-    levels, scale, k, device: str
+    levels, scale, k, dtype, device: str
 ) -> None:
     """The shard's chunks select in parallel and merge; ties straddling the
     k-th slot (few distinct values) keep the lowest columns."""
     rows = 14
-    logits = _logits(rows, 7, device, levels)
+    logits = _logits(rows, 7, device, levels, _SHARD, dtype)
     out = torch.full((rows, 2 * k), -1.0, device=device)
 
-    vocab_shard_topk(logits, k, scale, _VOCAB_START, out, softcap=None, vocab_mask=None)
+    vocab_shard_topk(
+        logits,
+        k,
+        scale,
+        _VOCAB_START,
+        out,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
+    )
 
     expected = torch.empty_like(out)
     torch_vocab_shard_topk(
-        logits, k, scale, _VOCAB_START, expected, softcap=None, vocab_mask=None
+        logits,
+        k,
+        scale,
+        _VOCAB_START,
+        expected,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
+    )
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("k", [128, 64])
+@pytest.mark.parametrize("levels", [None, 2])
+def test_shard_topk_splits_a_shard_wider_than_one_program(
+    levels, k, device: str
+) -> None:
+    """A TP4 shard of the same vocabulary has more columns than one program's
+    15-bit column key holds; its chunks key only their own columns."""
+    rows, columns = 5, 2 * _SHARD
+    logits = _logits(rows, 11, device, levels, columns)
+    out = torch.full((rows, 2 * k), -1.0, device=device)
+
+    vocab_shard_topk(
+        logits,
+        k,
+        None,
+        columns,
+        out,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
+    )
+
+    expected = torch.empty_like(out)
+    torch_vocab_shard_topk(
+        logits,
+        k,
+        None,
+        columns,
+        expected,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
     )
     assert torch.equal(out, expected)
 
@@ -74,9 +142,31 @@ def test_shard_topk_handles_a_shard_narrower_than_its_block(device: str) -> None
     # 1000 columns pad to a 1024-wide block; the padding never wins.
     logits = -torch.rand(3, 1000, device=device).to(torch.bfloat16) - 1
     out = torch.empty(3, 8, device=device)
-    vocab_shard_topk(logits, 4, None, 0, out, softcap=None, vocab_mask=None)
+    vocab_shard_topk(
+        logits,
+        4,
+        None,
+        0,
+        out,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
+    )
     expected = torch.empty_like(out)
-    torch_vocab_shard_topk(logits, 4, None, 0, expected, softcap=None, vocab_mask=None)
+    torch_vocab_shard_topk(
+        logits,
+        4,
+        None,
+        0,
+        expected,
+        softcap=None,
+        softcap_form=None,
+        vocab_mask=None,
+        values_out=None,
+        halo_out=None,
+    )
     assert torch.equal(out, expected)
 
 
@@ -114,7 +204,7 @@ def test_merge_sorts_every_rank_candidates_lowest_slot_first(
 
 def test_row_counts_and_shard_offsets_never_recompile(device: str) -> None:
     k = 16
-    logits = _logits(24, 1, device, None)
+    logits = _logits(24, 1, device, None, _SHARD)
     out = torch.empty(24, 2 * k, device=device)
     pairs = torch.randn(8, 24, 2 * k, device=device)
     ids_out = torch.empty(24, k, dtype=torch.int64, device=device)
@@ -122,7 +212,16 @@ def test_row_counts_and_shard_offsets_never_recompile(device: str) -> None:
     # Warm both integer classes of every runtime scalar.
     for rows, start in ((16, 0), (7, 3 * _SHARD)):
         vocab_shard_topk(
-            logits[:rows], k, 0.5, start, out[:rows], softcap=20.0, vocab_mask=None
+            logits[:rows],
+            k,
+            0.5,
+            start,
+            out[:rows],
+            softcap=20.0,
+            softcap_form="sigmoid",
+            vocab_mask=None,
+            values_out=None,
+            halo_out=None,
         )
         vocab_topk_merge(pairs[:, :rows], k, 20.0, ids_out[:rows], values_out[:rows])
     with assert_no_triton_compile(_vocab_shard_topk_kernel, _vocab_topk_merge_kernel):
@@ -134,7 +233,10 @@ def test_row_counts_and_shard_offsets_never_recompile(device: str) -> None:
                 start,
                 out[:rows],
                 softcap=30.0,
+                softcap_form="sigmoid",
                 vocab_mask=None,
+                values_out=None,
+                halo_out=None,
             )
             vocab_topk_merge(
                 pairs[:, :rows], k, 30.0, ids_out[:rows], values_out[:rows]

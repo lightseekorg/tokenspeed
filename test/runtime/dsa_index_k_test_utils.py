@@ -26,6 +26,8 @@ the read side (``gather_index_k_rows``, the history gather) round-trips the
 layout the pool actually stores rather than a hand-rolled copy of it. The
 ``fp8_scaled`` write is a Triton kernel: those planes are built on CUDA and
 moved back to the host, and a host without CUDA skips them.
+
+Also tie-aware checks of top-k selections against the scores a kernel ranked.
 """
 
 from __future__ import annotations
@@ -121,3 +123,94 @@ def _write_device(index_k_format: str) -> str:
     if not torch.cuda.is_available():
         pytest.skip("the fp8_scaled index-K write path is a Triton kernel")
     return "cuda"
+
+
+def index_candidate_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    plane: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    causal: torch.Tensor,
+    *,
+    page_size: int,
+    softmax_scale: float,
+    q_scales: torch.Tensor | None,
+) -> torch.Tensor:
+    """The FP32 index scores of query rows, by logical position.
+
+    Every visible token is a candidate of ``dsa_index_candidates``, so each
+    carries the score a top-k over the same plane ranks, bit for bit. Pages
+    of ``table`` must not be the reserved null page 0, which it never scores.
+
+    Returns:
+        ``[rows, longest causal length]`` scores, -inf past each row's
+        causal length.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+
+    width = int(causal.max().clamp_min(1))
+    positions, values = dsa_index_candidates(
+        q,
+        weights,
+        plane,
+        table,
+        requests,
+        causal,
+        page_size=page_size,
+        # A power of two no smaller than any row's visible tokens.
+        topk=1 << (width - 1).bit_length(),
+        softmax_scale=softmax_scale,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=None,
+        q_scales=q_scales,
+    )
+    scores = values.new_full((q.shape[0], width + 1), -float("inf"))
+    # Invalid candidates (-1, -inf) land in the spare last column.
+    scores.scatter_(1, torch.where(positions >= 0, positions, width).long(), values)
+    return scores[:, :width]
+
+
+def assert_top_k_up_to_ties(
+    row: int,
+    selections: tuple[torch.Tensor, torch.Tensor],
+    length: int,
+    scores: torch.Tensor,
+    topk: int,
+) -> None:
+    """Both ``selections`` (one row's positions, padding -1) are exact top-k
+    selections of the row's ``length`` visible tokens under ``scores`` and
+    differ only in tokens that score the k-th score T bit for bit."""
+    visible = scores[:length]
+    k = min(length, topk)
+    assert k > 0, f"row {row}: no visible tokens, yet the selections differ"
+    # The k-th score, as a one-element tensor to compare bit patterns.
+    threshold = visible.topk(k).values[-1:]
+    above = int((visible > threshold).sum())
+    chosen = []
+    for selection in selections:
+        positions = selection[selection >= 0].long()
+        count = positions.numel()
+        assert count == k, f"row {row}: {count} tokens selected, expected {k}"
+        assert positions.unique().numel() == k, f"row {row}: a token selected twice"
+        past = positions[positions >= length].tolist()
+        assert not past, f"row {row}: tokens {past[:8]} past causal length {length}"
+        picked = visible[positions]
+        below = positions[picked < threshold].tolist()
+        assert not below, (
+            f"row {row}: tokens {below[:8]} score below the k-th score "
+            f"{float(threshold).hex()}"
+        )
+        missed = above - int((picked > threshold).sum())
+        assert not missed, (
+            f"row {row}: {missed} tokens above the k-th score "
+            f"{float(threshold).hex()} not selected"
+        )
+        chosen.append(set(positions.tolist()))
+    differ = sorted(chosen[0] ^ chosen[1])
+    tied = visible[differ].view(torch.int32) == threshold.view(torch.int32)
+    assert bool(tied.all()), (
+        f"row {row}: tokens {differ[:8]} differ but do not all score the k-th "
+        f"score {float(threshold).hex()} exactly"
+    )

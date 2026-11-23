@@ -35,9 +35,9 @@ record a one-hot ``q``, so their verify stays exactly greedy. Everything here
 is tensor-only (``torch.where`` over rows, pool-indexed gathers), so the
 captured decode graph records one path for every request mix.
 
-The proposal is drawn with the in-tree Triton Gumbel-max kernel keyed per
-request by the verifier's seed pool and a salted position, so the draft
-stream is run- and batch-invariant like the per-slot verify coins.
+The proposal is drawn with the in-tree Triton Gumbel-max kernel from the
+request's seed and a salted round offset. Per-request sampling keys the
+round by the accepted frontier the next draft extends.
 
 When ``draft_probs`` holds each rank's vocabulary columns only (the target's
 rows stay sharded and the verifier reads q per shard), the draft head hands
@@ -87,6 +87,7 @@ class DraftProposalSampler:
         runtime_states: RuntimeStates,
         input_buffers: InputBuffers,
         spec_num_tokens: int,
+        sampling_stream: str,
         vocab_map: torch.Tensor | None,
         device: torch.device | str,
     ) -> None:
@@ -98,6 +99,8 @@ class DraftProposalSampler:
                 ``draft_probs_vocab_start``) and ``valid_cache_lengths``.
             input_buffers: The executor's batch-ordered pool index buffers.
             spec_num_tokens: Verify chain width N; steps ``0..N-2`` record.
+            sampling_stream: The backend's stream policy. ``per-request``
+                anchors proposals to the round's accepted frontier.
             vocab_map: ``[V_draft]`` full-vocab id of each draft logit column
                 (Eagle3 hot tokens), or None when the draft vocab is the
                 target's. Bound once: the recorded rows scatter through it,
@@ -119,6 +122,11 @@ class DraftProposalSampler:
         )
         self._spec_num_tokens = spec_num_tokens
         max_bs = input_buffers.max_bs
+        self._round_offsets: torch.Tensor | None = None
+        self._seq_lens_buf: torch.Tensor | None = None
+        if sampling_stream == "per-request":
+            self._round_offsets = torch.zeros(max_bs, dtype=torch.int64, device=device)
+            self._seq_lens_buf = input_buffers.seq_lens_buf
         pool_rows = self._valid_cache_lengths.shape[0]
         vocab_size = self._draft_probs.shape[2]
         # Per-slot Philox offsets for this step, refreshed in place.
@@ -145,7 +153,8 @@ class DraftProposalSampler:
             )
         if shard_table and vocab_map is None:
             self._shard_ranks = runtime_states.vocab_size // vocab_size
-            width = vocab_shard_draft_stats_width(vocab_size)
+            # Rows of whole 64-float groups (128 16-bit words) ride the lamport gather.
+            width = -(-vocab_shard_draft_stats_width(vocab_size) // 64) * 64
             self._shard_stats = torch.empty(
                 (max_bs, width), dtype=torch.float32, device=device
             )
@@ -195,8 +204,37 @@ class DraftProposalSampler:
                 f"{self._spec_num_tokens} tokens"
             )
 
-    def _refresh_offsets(self, step: int) -> None:
+    def prepare_round(self, accept_lengths: torch.Tensor, *, num_extends: int) -> None:
+        """Key drafts by the accepted frontier after the target forward.
+
+        For leading extend rows this is the end of the chunk, including the
+        cached prefix. For decode it's the previous frontier plus the accepted
+        length. The executor publishes that new frontier after drafting.
+        """
+        round_offsets = self._round_offsets
+        if round_offsets is None:
+            return
+        seq_lens = self._seq_lens_buf
+        assert seq_lens is not None
+        bs = accept_lengths.numel()
+        offsets = round_offsets[:bs]
+        offsets[:num_extends].copy_(seq_lens[:num_extends])
+        decode_slots = self._req_pool_indices_buf[num_extends:bs]
+        offsets[num_extends:].copy_(self._valid_cache_lengths[decode_slots])
+        offsets[num_extends:].add_(accept_lengths[num_extends:])
+        offsets.mul_(self._spec_num_tokens).add_(DRAFT_SAMPLE_OFFSET_SALT)
+
+    def _refresh_offsets(self, step: int, bs: int) -> None:
         """This step's Philox offset per slot: its round's position and the salted step."""
+        if self._round_offsets is not None:
+            # The write indices send padded rows to a separate sink. Readers
+            # of the padding slot (0) see its fixed offset.
+            self._offsets_pool.index_copy_(
+                0,
+                self._state_write_req_pool_indices_buf[:bs],
+                self._round_offsets[:bs] + step,
+            )
+            return
         torch.add(
             self._valid_cache_lengths.to(torch.int64) * self._spec_num_tokens,
             DRAFT_SAMPLE_OFFSET_SALT + step,
@@ -252,7 +290,7 @@ class DraftProposalSampler:
 
         # Gumbel-max over logits / T draws exactly Categorical(q); the noise is
         # keyed by the request's seed and this (round, step) offset.
-        self._refresh_offsets(step)
+        self._refresh_offsets(step, bs)
         sampled = gumbel_sample_from_pools(
             logits,
             pool_indices_i32,
@@ -316,7 +354,7 @@ class DraftProposalSampler:
         bs = logits.shape[0]
         slots = self._req_pool_indices_buf[:bs]
         stats = self._shard_stats[:bs]
-        self._refresh_offsets(step)
+        self._refresh_offsets(step, bs)
         vocab_shard_draft_stats(
             logits,
             shard.vocab_start,

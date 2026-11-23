@@ -209,7 +209,7 @@ impl PendingFrontend {
 /// One output of one request: its chunk, or why its stream ended early.
 type Delivery = (String, Result<OutputChunk, StreamError>);
 
-/// The gateway's load snapshot view, in native LCM allocator blocks.
+/// The gateway's per-rank request, token, and LCM allocator load snapshot.
 #[pyclass(frozen, get_all, module = "tokenspeed_engine._native")]
 struct LoadSnapshot {
     dp_rank: i64,
@@ -218,6 +218,8 @@ struct LoadSnapshot {
     num_used_pages: i64,
     num_active_pages: i64,
     max_total_pages: i64,
+    num_resident_tokens: Option<i64>,
+    num_waiting_uncached_tokens: Option<i64>,
 }
 
 /// The connected engines.
@@ -283,6 +285,8 @@ impl Frontend {
                 num_used_pages: load.kv_used_pages,
                 num_active_pages: load.kv_active_pages,
                 max_total_pages: load.kv_total_pages,
+                num_resident_tokens: load.num_resident_tokens,
+                num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
             })
             .collect()
     }

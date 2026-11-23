@@ -126,6 +126,7 @@ def _backend(
     backend._prefill_page_table = None
     backend._history_workspace = None
     backend._dense_backend = SimpleNamespace(
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         init_forward_metadata=lambda *args, **kwargs: None,
         chunked_prefill_metadata=None,
         forward_decode_metadata=None,
@@ -175,8 +176,8 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     )  # two groups: balance 6 + 5, 5 into 6, 5 + 5
     plan = _plan(rank)
     delegate_calls = []
-    backend._dense_backend.init_forward_metadata = (
-        lambda *a, **kw: delegate_calls.append(kw)
+    backend._dense_backend.init_forward_metadata = lambda *a, **kw: (
+        delegate_calls.append(kw)
     )
     _init(backend, plan)
     # The dense delegate sees the whole span and no shard.
@@ -834,6 +835,7 @@ def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend.num_local_heads = num_attention_heads // attn_tp_size
     # configure_runtime's probe verdicts on a BF16 cache.
     backend._dcp_decode_records_core = False
+    backend._kvp_decode_solution = None
     backend._owned_decode_topk = False
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
@@ -1071,6 +1073,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         kvp_group=tuple(range(WORLD)),
         context_len=max_model_len,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kernel_page_size=PAGE,
@@ -1142,10 +1145,11 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     target = _history_backend(0)
     staged = []
     linear = SimpleNamespace(
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         preallocate_verify_workspace=lambda max_bs, width: staged.append(
             (max_bs, width)
         )
-        or 64
+        or 64,
     )
     _prepare_fixed_workspaces(
         server_args=SimpleNamespace(speculative_num_draft_tokens=2),
