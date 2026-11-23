@@ -571,7 +571,7 @@ them once a later request's checkpoint extends the prompt, ahead of every
 entry used since within the retention window, unless a fork that resumed
 there published a checkpoint of its own past it, which makes it a junction
 at its own rank. Only with `checkpoint_retention_requests = 0` does it age
-under plain LRU like any entry, a fork's hit dating it forward. An engine
+under plain LRU like any entry, a fork's hit dating it forward. Engines
 without prefix caching and restricted State groups
 (`checkpoint_granularity > 1`) publish none.
 
