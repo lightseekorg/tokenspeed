@@ -139,18 +139,12 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
-    defer_recurrent_state: bool,
 ) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
         Role::Decode => "D",
-    };
-    let defer_recurrent_state = if defer_recurrent_state {
-        "True"
-    } else {
-        "False"
     };
     let tiers = match tiers {
         Tiers::DeviceOnly => "",
@@ -203,12 +197,6 @@ cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granula
                                         total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
-cfg.defer_recurrent_state = {defer_recurrent_state}
-if cfg.defer_recurrent_state:
-    cfg.cache_groups = cfg.cache_groups + [ts.CacheGroupConfig(
-        group_id="recurrent_state", block_granularity=0, total_pages={device_pages},
-        attn_kind=ts.AttnKind.State, cache_blocks_per_lcm_block={kv_shard_count},
-        shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
@@ -315,6 +303,10 @@ struct FakeDevice {
     /// The polls a cache op waits after the first one before it is
     /// acknowledged.
     ack_polls: usize,
+    /// The replay polls a retirement waits after the first, or disabled.
+    replay_ack_polls: Option<usize>,
+    replay_pending: VecDeque<(u64, usize)>,
+    replay_completed: u64,
     /// Cache-event polls so far.
     polls: usize,
     /// While closed, a poll acknowledges nothing.
@@ -692,6 +684,10 @@ impl DataPlane for FakeDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if let Some(id) = dispatch.retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let forward = dispatch.forward;
         if let Some(windows) = dispatch.ngram {
             let mut seen = self.ngram.lock().unwrap();
@@ -806,7 +802,6 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
-                CacheOpKind::StateMaterialize => CacheEventKind::StateMaterialized,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged
@@ -821,7 +816,33 @@ impl DataPlane for FakeDevice {
         Ok(events)
     }
 
-    fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        self.replay_ack_polls.is_some()
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        for (_, polls_left) in &mut self.replay_pending {
+            *polls_left = polls_left.saturating_sub(1);
+        }
+        while self
+            .replay_pending
+            .front()
+            .is_some_and(|(_, polls)| *polls == 0)
+        {
+            self.replay_completed = self.replay_pending.pop_front().unwrap().0;
+        }
+        Ok(self.replay_completed)
+    }
+
+    fn release(
+        &mut self,
+        rids: &[String],
+        retirement_id: Option<u64>,
+    ) -> Result<(), DataPlaneError> {
+        if let Some(id) = retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let mut released = self.released.lock().unwrap();
         for rid in rids {
             let generated = self
@@ -1305,8 +1326,8 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
-    /// Requests retire recurrent State before the scheduler releases their pages.
-    defer_recurrent_state: bool,
+    /// Polls each rank waits to complete recurrent State retirement.
+    replay_ack_polls: Option<fn(usize) -> usize>,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
@@ -1437,7 +1458,6 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let Setup {
         device_pages,
-        defer_recurrent_state,
         pd,
         eplb,
         grammar,
@@ -1492,7 +1512,6 @@ fn run_rank<F: Frontend>(
         role,
         kv_shard_count,
         device_pages.unwrap_or(513),
-        defer_recurrent_state,
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -1547,6 +1566,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
+        replay_ack_polls: setup.replay_ack_polls.map(|polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
             Gate::closed()
         } else {
@@ -5194,18 +5214,17 @@ fn memory_release_waits_for_the_retirement_batch_queued_by_the_last_forward() {
             tags: Some(vec!["weights".to_owned()]),
         }),
     )));
-    // The last forward queues both exits at the tail of round 1. A single
-    // batch reaches the device in round 2 and blocks release through two polls.
+    // The last forward queues both exits at the tail of round 1. The
+    // slower rank completes retirement in round 5.
     script[2].push(sleeping());
     script[4].push(sleeping());
     script[6].push(sleeping());
     let ranks = run_scripted(
-        Layout::Single,
+        Layout::Tp(2),
         0,
         Tiers::DeviceOnly,
         Setup {
-            defer_recurrent_state: true,
-            cache_ack_polls: Some(|_| 2),
+            replay_ack_polls: Some(|rank| 1 + 3 * rank),
             ..Setup::default()
         },
         vec![script],
@@ -5214,7 +5233,7 @@ fn memory_release_waits_for_the_retirement_batch_queued_by_the_last_forward() {
     let rank = &ranks[0];
     assert_scripted_tokens(rank, "r", 2);
     assert_scripted_tokens(rank, "s", 2);
-    assert_eq!(rank.cache_ops, [CacheOpKind::StateMaterialize]);
+    assert!(rank.cache_ops.is_empty());
     assert_eq!(rank.device_ops, ["release weights"]);
     assert_eq!(
         outcome(rank.replies.clone()),

@@ -223,8 +223,18 @@ pub trait DataPlane {
     /// landed; never waits on the device.
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError>;
 
+    /// Whether this data plane defers replay across forwards.
+    fn replay_retirement_enabled(&self) -> bool;
+
+    /// Latest completed replay fence in host queue order. Never waits.
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError>;
+
     /// Forget requests that ended.
-    fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError>;
+    fn release(
+        &mut self,
+        rids: &[String],
+        retirement_id: Option<u64>,
+    ) -> Result<(), DataPlaneError>;
 
     /// D role: apply a landed remote prefill's device-side effects before
     /// the request's first decode: the prefill node's drafter candidates
@@ -306,6 +316,8 @@ pub trait DataPlane {
 /// What a round hands the data plane besides its plan.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Dispatch<'a> {
+    /// Completion fence for replay handled before this plan's cache work.
+    pub retirement_id: Option<u64>,
     /// The model batch, if one runs.
     pub forward: Option<&'a ForwardBatchView>,
     /// With attention DP, every rank's batch this round.
@@ -558,6 +570,14 @@ pub struct Subsystems {
     pub peer: Option<Peer>,
 }
 
+/// Fences issued through the forward queue, and the prefix every replica
+/// member has completed. IDs start at one.
+#[derive(Default)]
+struct ReplayRetirements {
+    issued: u64,
+    completed: u64,
+}
+
 /// One rank's scheduling loop.
 pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Held for the whole round. A peer holder's endpoint answers from the
@@ -592,6 +612,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
     cache_ops: CacheOps,
+    replay_retirements: Option<ReplayRetirements>,
     controls: Controls,
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
@@ -633,6 +654,8 @@ struct Relayed {
     /// With peer sharing, every member's peer report, in member order;
     /// empty without.
     peer_reports: Vec<Vec<u8>>,
+    /// Most recent replay fence every replica member has completed.
+    replay_completed: Option<u64>,
 }
 
 impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
@@ -653,6 +676,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if let Some(delay) = &config.prefill_delay {
             tracing::info!(?delay, "prefill delay gate on");
         }
+        let replay_retirements = data_plane
+            .replay_retirement_enabled()
+            .then(ReplayRetirements::default);
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
@@ -665,6 +691,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             peer_now_us: 0,
             scheduler: scheduler.lock_arc(),
             data_plane,
+            replay_retirements,
             frontend,
             outputs,
             config,
@@ -761,6 +788,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // for them only once the loop's own state says nothing runs.
         if !self.in_flight.is_empty()
             || self.cache_ops.open() != 0
+            || self.replay_retirements_pending()
             || self.outputs.num_running() != 0
         {
             return false;
@@ -770,8 +798,63 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
-            && !self.scheduler.has_state_retirements()
             && !self.scheduler.storage_pending()
+    }
+
+    fn replay_retirements_pending(&self) -> bool {
+        self.replay_retirements
+            .as_ref()
+            .is_some_and(|fences| fences.issued != fences.completed)
+    }
+
+    /// Set the gate while the scheduler mutex still hides the batch's new
+    /// publications from the peer servicer.
+    fn issue_replay_retirement(&mut self) -> Option<u64> {
+        let fences = self.replay_retirements.as_mut()?;
+        if fences.issued == fences.completed {
+            if let Some(peer) = self.peer.as_ref() {
+                peer.block_device_pins(true);
+            }
+        }
+        fences.issued = fences
+            .issued
+            .checked_add(1)
+            .expect("replay retirement ID overflow");
+        Some(fences.issued)
+    }
+
+    fn poll_replay_retirements(&mut self) -> Result<Option<u64>, LoopError> {
+        let Some(fences) = self
+            .replay_retirements
+            .as_ref()
+            .filter(|fences| fences.issued != fences.completed)
+        else {
+            return Ok(None);
+        };
+        let local = self.data_plane.poll_replay_retirement()?;
+        if local < fences.completed || local > fences.issued {
+            return Err(LoopError::Control(format!(
+                "replay retirement {local} is outside {}..={}",
+                fences.completed, fences.issued
+            )));
+        }
+        Ok(Some(local))
+    }
+
+    fn agree_replay_retirements(&mut self, completed: Option<u64>) -> bool {
+        let Some((fences, completed)) = self.replay_retirements.as_mut().zip(completed) else {
+            return false;
+        };
+        if completed == fences.completed {
+            return false;
+        }
+        fences.completed = completed;
+        if completed == fences.issued {
+            if let Some(peer) = self.peer.as_ref() {
+                peer.block_device_pins(false);
+            }
+        }
+        true
     }
 
     /// One round, with this rank's stop request. Returns whether the ranks
@@ -820,13 +903,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let stop_requested = stop_requested || self.frontend.closed();
         let l3_report = self.l3.as_ref().map(Tier::report);
         let peer_report = self.peer.as_mut().map(Peer::report);
+        let replay_completed = self.poll_replay_retirements()?;
         let Relayed {
             mut stop,
             messages,
             l3_reports,
             peer_reports,
-        } = self.relay(stop_requested, received, l3_report, peer_report)?;
-        let mut busy = !messages.is_empty();
+            replay_completed,
+        } = self.relay(
+            stop_requested,
+            received,
+            l3_report,
+            peer_report,
+            replay_completed,
+        )?;
+        let mut busy = self.agree_replay_retirements(replay_completed) || !messages.is_empty();
         // First at the head: the holder's changes since the last round, as
         // its replica agreed on them, then the landings' progress.
         busy |= self.peer_round(&peer_reports)?;
@@ -884,11 +975,29 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if let Some(l3) = &self.l3 {
                 busy |= l3.submit(&plan)?;
             }
-            self.cache_ops.dispatched(&plan.cache_ops());
+            let cache_ops = plan.cache_ops();
+            self.cache_ops.dispatched(&cache_ops);
+            let retirement_id = if self.replay_retirements.is_some()
+                && (cache_ops
+                    .iter()
+                    .any(|op| op.kind == CacheOpKind::SnapshotStore)
+                    || !plan.aborts().is_empty())
+            {
+                self.issue_replay_retirement()
+            } else {
+                None
+            };
             self.dispatch_peer(&plan);
-            busy |= plan.needs_device();
-            if plan.needs_device() {
-                self.data_plane.execute(plan, &Dispatch::default())?;
+            let device_work = plan.needs_device() || retirement_id.is_some();
+            busy |= device_work;
+            if device_work {
+                self.data_plane.execute(
+                    plan,
+                    &Dispatch {
+                        retirement_id,
+                        ..Dispatch::default()
+                    },
+                )?;
             }
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
@@ -943,7 +1052,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             || !outputs.is_empty()
             || !released.is_empty();
         if !released.is_empty() {
-            self.data_plane.release(&released)?;
+            let retirement_id = self.issue_replay_retirement();
+            self.data_plane.release(&released, retirement_id)?;
         }
         if self.owns_frontend() {
             let sizes = self.scheduler.sizes();
@@ -1027,7 +1137,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
         self.dispatch_peer(&plan);
-        let aborted = self.outputs.finish_scheduler_aborts(&plan.aborts());
+        let aborts = plan.aborts();
+        let retirement_id = if self.replay_retirements.is_some()
+            && (!aborts.is_empty()
+                || cache_ops
+                    .iter()
+                    .any(|op| op.kind == CacheOpKind::SnapshotStore))
+        {
+            self.issue_replay_retirement()
+        } else {
+            None
+        };
+        let aborted = self.outputs.finish_scheduler_aborts(&aborts);
         outputs.extend(aborted.outputs);
         released.extend(aborted.released);
         let mut forward = plan
@@ -1160,6 +1281,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.commit_down_to(0, events, outputs, released)?;
         }
         let dispatch = Dispatch {
+            retirement_id,
             forward: forward.as_ref(),
             dp: dp.as_ref(),
             ngram: ngram.as_ref(),
@@ -1188,7 +1310,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
-        let device_work = plan.needs_device() || idle_forward;
+        let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
                 // The batch itself waits for its commit: nothing below reads it.
@@ -1902,7 +2024,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// Drop the prefix caches on every rank or on none: the ranks agree the
     /// flush can happen before any of them clears.
     fn clear_cache(&mut self) -> Result<bool, LoopError> {
-        let can_clear = self.scheduler.can_clear_cache();
+        let can_clear = !self.replay_retirements_pending() && self.scheduler.can_clear_cache();
         if !self.converge(can_clear)? {
             return Ok(false);
         }
@@ -2176,9 +2298,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         {
             return false;
         }
-        // The last forward can queue a retirement after this round's plan
-        // dispatched, before cache_ops counts it.
-        if !self.in_flight.is_empty() || self.scheduler.has_state_retirements() {
+        if !self.in_flight.is_empty() || self.replay_retirements_pending() {
             return false;
         }
         // EPD: a request the drain cancelled (or its client aborted) ends
@@ -2388,13 +2508,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
     /// The round's frontend messages, from the replica's first member, and
     /// its stop request; with L3, every member's storage report, which this
-    /// rank's `l3_report` joins.
+    /// rank's `l3_report` joins. Peer reports and outstanding replay fence
+    /// completion also ride this exchange.
     fn relay(
         &mut self,
         stop_requested: bool,
         received: Vec<EngineRequest>,
         l3_report: Option<Vec<u8>>,
         peer_report: Option<Vec<u8>>,
+        mut replay_completed: Option<u64>,
     ) -> Result<Relayed, LoopError> {
         let replica = &self.ranks.replica;
         if replica.size() == 1 {
@@ -2403,6 +2525,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 messages: received,
                 l3_reports: l3_report.into_iter().collect(),
                 peer_reports: peer_report.into_iter().collect(),
+                replay_completed,
             });
         }
         let _span = profile::span("EventLoop::relay");
@@ -2415,7 +2538,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every member's reports ride the relay: one exchange a round for
         // all of them, in the same order on every member.
         let (has_l3, has_peer) = (l3_report.is_some(), peer_report.is_some());
-        let reports: Vec<Vec<u8>> = l3_report.into_iter().chain(peer_report).collect();
+        let reports: Vec<Vec<u8>> = l3_report
+            .into_iter()
+            .chain(peer_report)
+            .chain(replay_completed.map(|id| id.to_le_bytes().to_vec()))
+            .collect();
         let (mut l3_reports, mut peer_reports) = (Vec::new(), Vec::new());
         let relayed = if reports.is_empty() {
             self.ranks.mesh.broadcast(replica, 0, payload)?
@@ -2440,6 +2567,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if has_peer {
                     peer_reports.extend(parts.next().map(<[u8]>::to_vec));
                 }
+                if let Some(completed) = replay_completed.as_mut() {
+                    let id = parts
+                        .next()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u64::from_le_bytes)
+                        .ok_or(RelayError::Truncated)?;
+                    *completed = (*completed).min(id);
+                }
             }
             relayed
         };
@@ -2453,6 +2588,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             messages,
             l3_reports,
             peer_reports,
+            replay_completed,
         })
     }
 

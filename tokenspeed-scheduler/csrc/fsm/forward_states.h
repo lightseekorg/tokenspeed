@@ -380,18 +380,14 @@ struct Restoring {
 // retraction victim. Cancellation with queued forwards uses the same state
 // to retain their resources, but releases them without publishing a frontier.
 struct Finishing {
-    Finishing(ForwardResources resources, bool publish_completed_pages, bool retire_decode_state)
-        : resources{std::move(resources)},
-          publish_completed_pages{publish_completed_pages},
-          retire_decode_state{retire_decode_state} {}
+    Finishing(ForwardResources resources, bool publish_completed_pages)
+        : resources{std::move(resources)}, publish_completed_pages{publish_completed_pages} {}
 
     void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
     ForwardResources resources;
     // A cancelled request waits for its forwards too, but publishes nothing.
     bool publish_completed_pages;
-    // An exit from decode retires this slot after its forwards land.
-    bool retire_decode_state;
 };
 
 struct Finished {};

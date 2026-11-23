@@ -205,7 +205,6 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
         "WriteBackDoneEvent",
         "SnapshotDoneEvent",
         "RestoreDoneEvent",
-        "StateMaterializedEvent",
     ],
 )
 def test_cache_acks_become_the_payload_the_host_reads(kind):

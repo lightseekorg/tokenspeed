@@ -284,9 +284,11 @@ def test_graph_target_with_eager_acceptance_reenables_deferral_after_prefill():
     )
 
 
-def test_device_retirement_batches_preserve_and_discard_without_kvstore():
+def test_runtime_release_materializes_replay_on_the_execution_stream():
     from dataclasses import dataclass
+    from test.runtime.test_rust_host import _data_plane, _resolved
 
+    import msgspec
     from tokenspeed_engine.scheduler import (
         AttnKind,
         CacheGroupConfig,
@@ -298,6 +300,7 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
     )
 
     from tokenspeed.runtime.execution.device import DeviceHandle
+    from tokenspeed.runtime.execution.types import ModelExecutionResult
     from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
 
     config = SchedulerConfig()
@@ -309,7 +312,6 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
     config.num_snapshot_pages = 1
     config.overlap_schedule_depth = 0
     config.decode_input_tokens = 4
-    config.defer_recurrent_state = True
     config.disable_l2_cache = True
     config.cache_groups = [
         CacheGroupConfig(
@@ -320,16 +322,14 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
         )
     ]
     scheduler = Scheduler(config)
-    preserve = RequestSpec()
-    preserve.request_id = "preserve"
-    preserve.tokens = [1, 2, 3]
-    preserve.max_new_tokens = 32
-    discard = RequestSpec()
-    discard.request_id = "discard"
-    discard.tokens = [7, 8, 9]
-    discard.max_new_tokens = 32
-    requests = (preserve, discard)
-    scheduler.submit_requests(list(requests))
+    requests = []
+    for rid, prompt in (("finished", [1, 2, 3]), ("aborted", [7, 8, 9])):
+        request = RequestSpec()
+        request.request_id = rid
+        request.tokens = prompt
+        request.max_new_tokens = 32
+        requests.append(request)
+    scheduler.submit_requests(requests)
     scheduler.next_execution_plan()
     prefill_results = ExecutionEvent()
     for request in requests:
@@ -337,33 +337,27 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
         result.request_id, result.tokens = request.request_id, [4]
         prefill_results.add_event(result)
     scheduler.advance(prefill_results)
-    scheduler.next_execution_plan()
+    decode = scheduler.next_execution_plan()
     decode_results = ExecutionEvent()
     for request in requests:
         result = ForwardEvent.ExtendResult()
         result.request_id, result.tokens = request.request_id, [5, 6, 7, 8]
         decode_results.add_event(result)
     finish = ForwardEvent.Finish()
-    finish.request_id = preserve.request_id
+    finish.request_id = requests[0].request_id
     abort = ForwardEvent.Abort()
-    abort.request_id = discard.request_id
+    abort.request_id = requests[1].request_id
     scheduler.advance(decode_results.add_event(finish).add_event(abort))
-    plan = scheduler.next_execution_plan()
-    retirement = plan.state_materialization
-    assert retirement.materialize_slots == [1]
-    assert retirement.discard_slots == [2]
     assert scheduler.active_lcm_blocks() == 0
-    assert scheduler.has_state_retirements()
 
     value, reference = case(True), case(False)
-    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    request_slots = decode.forward[0].request_pool_indices
+    slots = torch.tensor(request_slots, device="cuda", dtype=torch.int32)
     frontier = torch.zeros(10, device="cuda", dtype=torch.int32)
     stopped = torch.zeros(10, device="cuda", dtype=torch.bool)
     accepted = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
-    before = value.state.clone()
-    for current in (value, reference):
-        refresh(current, [1, 2])
-        run(current, slots, frontier, stopped, accepted)
+    refresh(reference, request_slots)
+    run(reference, slots, frontier, stopped, accepted)
 
     @dataclass
     class Executor:
@@ -377,23 +371,58 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
         def complete_pending_drafting(self):
             pass
 
+        def copy_cache_pages(self, copies):
+            # The scheduler's full-attention fixture does not supply model KV.
+            assert set(copies) == {"full"}
+
+        def zero_cache_pages(self, pages):
+            assert set(pages) == {"full"}
+
+        def execute_forward_op(self, *_args, **_kwargs):
+            with torch.cuda.stream(self.execution_stream):
+                refresh(value, request_slots)
+                run(value, slots, frontier, stopped, accepted)
+            return ModelExecutionResult(torch.ones(2, dtype=torch.int32))
+
     executor = Executor(value.backend, torch.cuda.Stream(), torch.cuda.current_stream())
     executor.execution_stream.wait_stream(executor.default_stream)
     handle = DeviceHandle(executor)
+    plane = _data_plane(handle, defer_recurrent_state=True)
+    rids = [request.request_id for request in requests]
+    plane.admit(
+        [
+            (rid, index, msgspec.msgpack.encode(_resolved(rid)), [], 128, None)
+            for index, rid in enumerate(rids, 1)
+        ]
+    )
+    plane.execute(decode, None, None, None, (None, 0), None)
     previous_debug = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        handle.execute(plan, None, cache_ops=())
+        plane.release(rids, retirement_id=1)
+        # An unscheduled admission can exit without acquiring a slot. Its
+        # fence still follows the earlier batch's materialization.
+        plane.admit(
+            [
+                (
+                    "waiting",
+                    3,
+                    msgspec.msgpack.encode(_resolved("waiting")),
+                    [],
+                    128,
+                    None,
+                )
+            ]
+        )
+        plane.release(["waiting"], retirement_id=2)
     finally:
         torch.cuda.set_sync_debug_mode(previous_debug)
     executor.default_stream.synchronize()
-    torch.testing.assert_close(value.state[5], reference.state[5], rtol=2e-2, atol=1e-3)
-    torch.testing.assert_close(value.state[6], before[6], rtol=0, atol=0)
+    torch.testing.assert_close(
+        value.state[5:7], reference.state[5:7], rtol=2e-2, atol=1e-3
+    )
     assert not value.backend._pending_state.valid.any().item()
-    (ack,) = handle.poll_cache_results()
-    assert ack.op_id == retirement.op_id
-    scheduler.advance(ExecutionEvent().add_event(ack))
-    assert not scheduler.has_state_retirements()
+    assert plane.poll_replay_retirement() == 2
     assert handle.poll_cache_results() == []
 
 

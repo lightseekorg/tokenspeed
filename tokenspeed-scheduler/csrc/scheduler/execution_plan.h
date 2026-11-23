@@ -36,7 +36,7 @@ namespace tokenspeed {
 enum class AbortReason : std::uint8_t {
     // A capacity retraction chose it and its KV image did not fit the host
     // budgets (snapshot pool, blob slots or Host L2), so its pages were freed
-    // by aborting it instead of imaging it; or
+    // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
     // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
     // On the fused role, alone (or beside requests holding no pages) and
@@ -48,21 +48,16 @@ enum class AbortReason : std::uint8_t {
     kNoProgress = 1,
 };
 
-// A request the scheduler aborted this round. The runtime fails it toward
-// the client with `detail` as the message. A later Abort/Finish is harmless.
+// A request the scheduler finished this round: already Finished on every
+// rank (the plan is built identically), so the runtime only has to fail it
+// toward the client with `detail` as the message. A later Abort/Finish for
+// the id is harmless.
 struct SchedulerAbort {
     std::string request_id;
     AbortReason reason{AbortReason::kImageDoesNotFit};
     std::string detail;
 
     bool operator==(const SchedulerAbort&) const = default;
-};
-
-struct StateMaterialization {
-    std::uint32_t op_id{};
-    std::vector<std::int32_t> materialize_slots;
-    std::vector<std::int32_t> discard_slots;
-    bool operator==(const StateMaterialization&) const = default;
 };
 
 class ExecutionPlan {
@@ -127,9 +122,6 @@ public:
     // rounds): the last resort of a retraction whose victim could not be
     // imaged.
     std::vector<SchedulerAbort> aborts;
-    // These slots belong to the old owners. The device retires their replay
-    // before the plan's stores or any work that reuses their blocks or slots.
-    std::optional<StateMaterialization> state_materialization;
 
     bool operator==(const ExecutionPlan&) const = default;
 

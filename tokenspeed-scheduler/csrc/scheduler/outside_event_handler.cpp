@@ -81,7 +81,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
         handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
-    if (!request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
+    if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
     // The transfer is done and the request leaves this engine: its computed
@@ -135,13 +135,10 @@ void Scheduler::settleFinishedRequests() {
             request->Apply(fsm::TransferStoppedEvent{&coordinator_});
             continue;
         }
-        const auto* finishing = request->GetIf<fsm::Finishing>();
-        if (finishing == nullptr || request->ResultsInFlight() > 0) {
+        if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
-        const bool publish = finishing->publish_completed_pages;
-        queueStateRetirement(*request, /*discard_replay=*/!publish);
-        if (publish) {
+        if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
             }
@@ -423,27 +420,7 @@ void Scheduler::abortRequest(Request& request) {
     } else if (request.ResultsInFlight() > 0) {
         request.Apply(fsm::AbortInFlightEvent{});
     } else {
-        queueStateRetirement(request, /*discard_replay=*/true);
         request.Apply(fsm::AbortEvent{&coordinator_});
-    }
-}
-
-void Scheduler::queueStateRetirement(const Request& request, bool discard_replay) {
-    if (!config_.defer_recurrent_state || config_.role == Role::kP) return;
-    const auto* finishing = request.GetIf<fsm::Finishing>();
-    if (!request.Is<fsm::Decoding>() && (finishing == nullptr || !finishing->retire_decode_state)) return;
-    _assert(request.ResultsInFlight() == 0, "state retirement requires landed forwards");
-    if (!pending_state_materialization_) pending_state_materialization_.emplace();
-    auto& batch = *pending_state_materialization_;
-    auto& slots = discard_replay ? batch.discard_slots : batch.materialize_slots;
-    slots.push_back(request.RequestPoolIndex());
-}
-
-void Scheduler::handleEvent(const cache::StateMaterialized& event) {
-    // A batch's fence also covers every earlier batch on the execution
-    // stream. Ignore stale or unissued IDs.
-    if (event.op_id > completed_state_materialization_id_ && event.op_id <= issued_state_materialization_id_) {
-        completed_state_materialization_id_ = event.op_id;
     }
 }
 

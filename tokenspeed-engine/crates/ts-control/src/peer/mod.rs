@@ -287,6 +287,14 @@ impl Peer {
         self.endpoint.as_ref().map(|endpoint| endpoint.net.port())
     }
 
+    /// Gate new Device pins on the replica's holder while its host drains a
+    /// replay fence.
+    pub fn block_device_pins(&self, blocked: bool) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.holder.lock().block_device_pins(blocked);
+        }
+    }
+
     /// This member's report for the round.
     pub fn report(&mut self) -> Vec<u8> {
         let mut outcomes = std::mem::take(&mut self.unplaced);

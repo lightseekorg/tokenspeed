@@ -167,8 +167,6 @@ public:
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
-    // Includes slots still waiting for a plan and batches issued to the device.
-    bool HasStateRetirements() const;
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
@@ -455,8 +453,6 @@ private:
     // and one whose finish overtook an overlapped decode settles with that
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
-    void queueStateRetirement(const Request& request, bool discard_replay);
-    void handleEvent(const cache::StateMaterialized& event);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
     // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
@@ -726,11 +722,18 @@ private:
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
-    // Images the victim, ordering the device store after state retirement.
-    // Past the blob-slot check its completed pages stay published even if
-    // the image does not fit and the victim is aborted (see forward.cpp).
-    void retractVictim(Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations);
-    void reportImageShortfall(const Request& victim, ImageShortfall shortfall, PlanBuild& build);
+    // Images the victim and suspends it, or returns the shortfall before
+    // anything is acquired or evicted for the image; past the blob-slot check
+    // its completed pages stay published (see forward.cpp).
+    std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
+                                                std::vector<WriteBackOperation>& write_back_operations);
+    // The one site of the last-resort policy: a capacity retraction whose
+    // victim cannot be imaged aborts that victim instead -- its pages and
+    // slot return in this very round and the blocked grant proceeds as after
+    // a retraction -- and records it on the plan for the runtime to fail the
+    // request toward its client. A forced victim refused after its
+    // publication is aborted here too.
+    void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
     // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
@@ -802,9 +805,6 @@ private:
     std::uint64_t storage_pressure_bypasses_{0};
     bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
-    std::optional<StateMaterialization> pending_state_materialization_;
-    std::uint32_t issued_state_materialization_id_{0};
-    std::uint32_t completed_state_materialization_id_{0};
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.

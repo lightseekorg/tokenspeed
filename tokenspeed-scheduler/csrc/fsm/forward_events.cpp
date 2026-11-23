@@ -112,15 +112,15 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 }
 
 Finishing FinishEvent::operator()(PrefillDone&& state) {
-    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true, /*retire_decode_state=*/false};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finishing FinishEvent::operator()(PrefillAwaitingResult&& state) {
-    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true, /*retire_decode_state=*/false};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finishing FinishEvent::operator()(Decoding&& state) {
-    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true, /*retire_decode_state=*/true};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finished FinishEvent::operator()(Retracted&&) {

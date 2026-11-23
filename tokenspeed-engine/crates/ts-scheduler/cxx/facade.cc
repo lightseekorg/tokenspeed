@@ -337,9 +337,6 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
             case CacheEventKind::SnapshotDone:
                 execution_event.With(tokenspeed::cache::SnapshotDone{.op_id = event.op_id});
                 break;
-            case CacheEventKind::StateMaterialized:
-                execution_event.With(tokenspeed::cache::StateMaterialized{.op_id = event.op_id});
-                break;
             case CacheEventKind::RestoreDone:
                 execution_event.With(tokenspeed::cache::RestoreDone{.op_id = event.op_id});
                 break;
@@ -543,8 +540,6 @@ bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1
 
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearCache(); }
 
-bool has_state_retirements(const tokenspeed::Scheduler& scheduler) { return scheduler.HasStateRetirements(); }
-
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {
     return scheduler.MaxSingleRequestTokens();
 }
@@ -631,7 +626,6 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
-    if (plan.state_materialization) return true;
     // A peer landing's reads start from the fence the data plane reports for
     // its plan, which may have no other device work: a prefill replica's
     // landing prepays no decode room, so it zeroes nothing.
@@ -705,9 +699,6 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<CacheOpView> out;
-    if (plan.state_materialization) {
-        out.push_back(CacheOpView{.kind = CacheOpKind::StateMaterialize, .op_id = plan.state_materialization->op_id});
-    }
     // One acknowledgment per op id, whatever the batch kind: an L2 batch
     // lists its ops, and a snapshot or restore batch has one op per request.
     // Storage operations are the L3 executor's, completed through the

@@ -348,7 +348,6 @@ def _plan(
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
         has_peer_fetches=has_peer_fetches,
-        state_materialization=None,
     )
 
 
@@ -1491,7 +1490,6 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             self.pages_to_zero = {}
             self.remote_decode = None
             self.remote_prefill = None
-            self.state_materialization = None
             self.reads = 0
 
         def pages_to_copy_arrays(self):

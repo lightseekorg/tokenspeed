@@ -202,7 +202,7 @@ fn plane() -> (Py<PyAny>, Scheduler) {
 }
 
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, false).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -320,7 +320,7 @@ fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
     assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
     let polled = data_plane.poll_cache_events().unwrap();
     assert_eq!(polled.len(), 1);
-    data_plane.release(&["r".to_owned()]).unwrap();
+    data_plane.release(&["r".to_owned()], None).unwrap();
     // Answered once everything queued before it ran.
     data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
     drop(data_plane);
@@ -457,7 +457,7 @@ fn a_failed_launch_fails_the_commit_waiting_for_it() {
     assert!(error.0.contains("the launch failed"), "{}", error.0);
     // Every later call reports the failure, on either thread's side.
     assert!(data_plane.poll_cache_events().is_err());
-    assert!(data_plane.release(&["r".to_owned()]).is_err());
+    assert!(data_plane.release(&["r".to_owned()], None).is_err());
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn a_failed_completion_notifies_the_launcher_before_logging() {
                 ..Dispatch::default()
             };
             LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
-            let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+            let mut data_plane = PythonDataPlane::start(plane, None, false).unwrap();
             let forward = data_plane
                 .execute(scheduler.next_execution_plan(true, false), &dispatch)
                 .unwrap()

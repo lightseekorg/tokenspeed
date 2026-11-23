@@ -182,7 +182,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("max_resident_requests", &tokenspeed::SchedulerConfig::max_resident_requests)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
-        .def_rw("defer_recurrent_state", &tokenspeed::SchedulerConfig::defer_recurrent_state)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         .def_prop_rw(
@@ -463,9 +462,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
     // The tail pages and slot-state blob of a retraction image landed.
-    nb::class_<tokenspeed::cache::StateMaterialized>(cache, "StateMaterializedEvent")
-        .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::StateMaterialized::op_id);
     nb::class_<tokenspeed::cache::SnapshotDone>(cache, "SnapshotDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::SnapshotDone::op_id);
@@ -656,8 +652,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
     // fit the host budgets, or a lone request on the fused role that made no
-    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. The
-    // runtime fails it toward the client with `detail` as the message.
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
+    // Finished on every rank; the runtime fails it toward the client with
+    // `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
         .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
         .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
@@ -666,16 +663,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
         .def_ro("detail", &tokenspeed::SchedulerAbort::detail);
 
-    nb::class_<tokenspeed::StateMaterialization>(m, "StateMaterialization")
-        .def_ro("op_id", &tokenspeed::StateMaterialization::op_id)
-        .def_ro("materialize_slots", &tokenspeed::StateMaterialization::materialize_slots)
-        .def_ro("discard_slots", &tokenspeed::StateMaterialization::discard_slots);
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
-        .def_ro("state_materialization", &tokenspeed::ExecutionPlan::state_materialization)
         .def_prop_ro("remote_decode",
                      [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
                          if (!plan.remote_decode) {
@@ -796,7 +788,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
-        .def("has_state_retirements", &tokenspeed::Scheduler::HasStateRetirements)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
         .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks,
              "Empty Host L2 pool parents; a parent with any occupied slot counts as used.")

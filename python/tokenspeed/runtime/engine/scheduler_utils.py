@@ -49,15 +49,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     scheduler_role,
 )
 
-# The scheduler's cache ACKs cover L2 transfers, retraction snapshots and
-# recurrent state retirement. The data plane reports them as ``(kind, op_id)``.
+# The data plane reports L2 and retraction ACKs as ``(kind, op_id)``.
 _CACHE_EVENT_TYPES = frozenset(
     {
         "WriteBackDoneEvent",
         "LoadBackDoneEvent",
         "SnapshotDoneEvent",
         "RestoreDoneEvent",
-        "StateMaterializedEvent",
     }
 )
 # make_config's host_write_policy names; ServerArgs validates the flag.

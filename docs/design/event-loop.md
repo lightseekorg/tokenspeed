@@ -1286,10 +1286,9 @@ the data plane; see [distributed immutable weights](distributed-weights.md).
 
 ## Recurrent-state materialization feedback
 
-Each plan with recurrent-state exits begins by materializing or discarding
-their replay on the execution stream. The plan's existing stream dependencies
-order consumers and reuse of the slots behind those operations. The data
-plane reports one `StateMaterializedEvent` per batch after its stream event
-completes, using the same replica agreement as cache-copy acknowledgments.
-Peer export, cache clear and drain check for both dispatched batches and
-exits queued after the preceding plan was dispatched.
+The data plane retires replay for snapshot and abort slots before running
+the corresponding plan. Releases use the same forward queue and retire any
+remaining replay ahead of later plans. The control plane tracks retirement
+fences separately from scheduler cache operations. Peer export, cache clear
+and drain wait for replica completion, including releases queued after the
+last forward's results.

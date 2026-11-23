@@ -2917,12 +2917,12 @@ rotation with distinct source/destination blocks commits immediately, as do
 stopped rows. Mixed, prefill, tree verification and other unsupported
 forwards materialize existing pending rows before execution. Monokernels
 keep the immediate path. Pending work is not flushed from ordinary `settle()`;
-that would remove the opportunity to share the next WY state read. Scheduler
-materialization operations explicitly fence consumers of the live state
+that would remove the opportunity to share the next WY state read. The runtime
+retires replay before consumers use the live state
 ([scheduler](scheduler.md#deferred-recurrent-state)).
 
-At a scheduler-requested exit, the device looks up the affected slots in the
-same records to select replay for writeback or discard. The pinned slot
+At a request exit, the device looks up the affected slots in the same records
+to select replay for writeback. The pinned slot
 uploads remain alive through the completion event. All metadata stages,
 including acceptance and exit operations outside target capture, are warmed
 before serving. Pipeline-parallel execution commits immediately.

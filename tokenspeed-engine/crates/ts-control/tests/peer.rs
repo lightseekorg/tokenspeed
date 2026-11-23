@@ -394,6 +394,53 @@ fn a_prefill_replica_lands_a_prefix_from_a_plan_with_no_other_device_work() {
 }
 
 #[test]
+fn a_reader_cannot_pin_device_pages_during_replay_retirement() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+
+    let mut longer = tokens;
+    longer.extend(1000..1000 + PAGE);
+    holder.peer.block_device_pins(true);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("blocked", longer.clone(), &holder_name)])
+        .unwrap();
+    let (prefix, fetches) = rounds_until_prefill(&mut reader, Some(&mut holder), "blocked");
+    // A reader reserves the landing before it asks the holder to pin.
+    assert_eq!(fetches.len(), 1);
+    assert_eq!(prefix, 0);
+    assert_eq!(reader.scheduler.lock().peer_stats().landed_tokens, 0);
+    for destination in &fetches[0].destinations {
+        let page = arena.read_bytes(
+            READER_BASE + destination.block_id as u64 * PAGE_BYTES,
+            PAGE_BYTES as usize,
+        );
+        assert!(page.iter().all(|&byte| byte == 0));
+    }
+
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "blocked", vec![7]),
+        event(ForwardEventKind::Abort, "blocked", Vec::new()),
+    ]);
+    holder.peer.block_device_pins(false);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("ready", longer, &holder_name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "ready");
+    assert_eq!(landings.len(), 1);
+    assert!(prefix >= 5 * PAGE);
+    assert_eq!(prefix, landings[0].end_tokens);
+}
+
+#[test]
 fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
     let arena = Arena::new(200_000);
     let silent = format!("127.0.0.1:{}", free_port());

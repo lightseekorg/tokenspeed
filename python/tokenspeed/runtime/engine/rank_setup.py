@@ -327,6 +327,5 @@ def scheduler_config_from_args(
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )
-    config.defer_recurrent_state = server_args.enable_deferred_gdn_state
     config.peer_config = peer_config
     return config

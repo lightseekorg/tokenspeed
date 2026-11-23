@@ -20,8 +20,9 @@
 
 //! Cache-op accounting and rank-synchronized acknowledgment.
 //!
-//! The data plane runs a plan's Host L2 copies, retraction snapshot copies
-//! and recurrent State retirements. Each operation has its own ACK. While any is open,
+//! A plan's cache ops -- the Host L2 tier's write-backs and load-backs and
+//! the retraction snapshot's stores and restores -- run on the data plane
+//! from the same plan; each is acknowledged on its own. While any is open,
 //! the loop polls the data plane at the head of every round and advances the
 //! acknowledgments before it plans, so a cache-gated admission waits no
 //! extra round.
@@ -69,17 +70,15 @@ fn kind_name(kind: CacheEventKind) -> &'static str {
         CacheEventKind::LoadBackDone => "LoadBackDoneEvent",
         CacheEventKind::SnapshotDone => "SnapshotDoneEvent",
         CacheEventKind::RestoreDone => "RestoreDoneEvent",
-        CacheEventKind::StateMaterialized => "StateMaterializedEvent",
         _ => unreachable!("a cache event kind the bridge does not define"),
     }
 }
 
-const KINDS: [CacheEventKind; 5] = [
+const KINDS: [CacheEventKind; 4] = [
     CacheEventKind::WriteBackDone,
     CacheEventKind::LoadBackDone,
     CacheEventKind::SnapshotDone,
     CacheEventKind::RestoreDone,
-    CacheEventKind::StateMaterialized,
 ];
 
 type Key = (u32, &'static str);
@@ -292,13 +291,13 @@ mod tests {
             vec![
                 vec![
                     ack(CacheEventKind::WriteBackDone, 2),
-                    ack(CacheEventKind::StateMaterialized, 1),
+                    ack(CacheEventKind::SnapshotDone, 1),
                 ],
                 vec![],
                 vec![ack(CacheEventKind::RestoreDone, 4)],
             ],
             vec![
-                vec![ack(CacheEventKind::StateMaterialized, 1)],
+                vec![ack(CacheEventKind::SnapshotDone, 1)],
                 vec![
                     ack(CacheEventKind::RestoreDone, 4),
                     ack(CacheEventKind::WriteBackDone, 2),
@@ -318,7 +317,7 @@ mod tests {
                     let replica = Group::new(0, vec![0, 1], rank).unwrap();
                     let mut ops = CacheOps::new();
                     ops.dispatched(&[
-                        op(CacheOpKind::StateMaterialize, 1),
+                        op(CacheOpKind::SnapshotStore, 1),
                         op(CacheOpKind::WriteBack, 2),
                         op(CacheOpKind::SnapshotRestore, 4),
                     ]);
@@ -335,7 +334,7 @@ mod tests {
             assert_eq!(
                 rounds,
                 [
-                    vec![ack(CacheEventKind::StateMaterialized, 1)],
+                    vec![ack(CacheEventKind::SnapshotDone, 1)],
                     vec![ack(CacheEventKind::WriteBackDone, 2)],
                     vec![ack(CacheEventKind::RestoreDone, 4)],
                 ]

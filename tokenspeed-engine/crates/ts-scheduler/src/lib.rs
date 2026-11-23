@@ -191,8 +191,6 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
-        /// A plan's recurrent State retirements, ordered before its cache and forward work.
-        StateMaterialize,
     }
 
     /// The kind of a plan's storage operation.
@@ -253,8 +251,6 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
-        /// A plan's recurrent State retirements finished (`cache::StateMaterialized`).
-        StateMaterialized,
     }
 
     /// A cache op's acknowledgment, fed back to the scheduler.
@@ -676,7 +672,6 @@ mod ffi {
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
-        fn has_state_retirements(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -1033,11 +1028,6 @@ impl Scheduler {
     /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.
     pub fn can_clear_cache(&self) -> bool {
         ffi::can_clear_cache(self.get())
-    }
-
-    /// Whether a recurrent State retirement batch is queued or still in flight.
-    pub fn has_state_retirements(&self) -> bool {
-        ffi::has_state_retirements(self.get())
     }
 
     /// The most tokens one request can hold in the cache.

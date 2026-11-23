@@ -2186,21 +2186,21 @@ an old abort.
 ## Deferred recurrent state
 
 With deferred recurrent replay enabled, ordinary decode completion advances
-the token frontier and retires the forward as usual. The GPU owns the replay
-record. When the scheduler is about to finish, abort or retract a request
-whose local state may still have replay, it waits for all outstanding forward
-results before recording the old request slot. Finish and retraction write
-back replay for publication or a snapshot. An abort that leaves no reader
-discards replay. If a retraction publishes a checkpoint before finding that
-its image cannot fit, that checkpoint still needs its writeback.
+the token frontier as usual. The GPU owns the replay record. The runtime
+uses the request slots already carried by snapshot operations and tracks the
+last decode slot for request releases and scheduler aborts. It materializes
+replay for an ending request because its State may already be in the prefix
+index, including when retraction published a checkpoint before finding that
+its image could not fit.
 
-The exit releases its slot and blocks by the ordinary request state
-transitions. A single batch in the execution plan handles the old slot
-records before the plan's store, copy, zero, load and forward operations
-can consume or reuse them. A cache-only plan also carries the batch, including
-exits queued by the preceding round's forward results.
+The scheduler releases slots and blocks by the ordinary request state
+transitions. The runtime orders replay writeback before the plan's snapshot,
+store, copy, zero, load and forward operations consume or reuse them. Host
+retirement fences also cover releases queued by the preceding round's
+results, even when no subsequent forward runs.
 
-The replica acknowledges each batch through cache-op feedback. Peer PINs
-that would expose Device State wait until all queued and dispatched batches
-have completed, since the source execution stream cannot order a remote RDMA
-read. The same outstanding-work check protects cache clear and drain.
+The peer holder declines new Device page PINs until retirement fences have
+completed on the replica, since the source execution stream cannot order an
+incoming RDMA read. The reader can use local compute. Host-only PINs and
+existing leases continue independently. The same completion tracking protects
+cache clear and drain.
