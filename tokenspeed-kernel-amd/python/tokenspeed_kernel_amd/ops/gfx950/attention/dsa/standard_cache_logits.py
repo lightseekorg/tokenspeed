@@ -1594,6 +1594,8 @@ def _multi_row_index_k_scores_body(
     ROW_RUNS: gl.constexpr = False,
     work_target=0,
     BATCH_PAD: gl.constexpr = 0,
+    RUN_CHUNK_N: gl.constexpr = 0,
+    RUN_NUM_STAGES: gl.constexpr = 0,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
     # BATCH_PAD (decode rows with explicit lengths): programs take the runs of
@@ -1702,11 +1704,18 @@ def _multi_row_index_k_scores_body(
     ends = gl.where(row_valid, ends, 0)
     starts = gl.where(row_valid, starts, num_candidates)
     span_end = gl.max(ends, axis=0)
+    balanced = False
     if BATCH_PAD:
         tl.static_assert(IS_DECODE)
     elif CHUNK_LOOP:
         # Program j scans chunk run j, so the grid tracks the GPU, not max-model-len.
         run = tl.cdiv(tl.cdiv(span_end, CHUNK_N), gl.num_programs(1)) * CHUNK_N
+        if RUN_CHUNK_N:
+            # Past one chunk per program every program would scan a second
+            # whole chunk, so the programs split the span in BLOCK_N tiles.
+            balanced = run > CHUNK_N
+            if balanced:
+                run = tl.cdiv(tl.cdiv(span_end, BLOCK_N), gl.num_programs(1)) * BLOCK_N
     else:
         run = CHUNK_N
     # Scan the union of the rows' spans inside this program's chunks.
@@ -1852,47 +1861,90 @@ def _multi_row_index_k_scores_body(
                 )
             previous = request
     elif CHUNK_LOOP:
-        for chunk in range(candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)):
-            _score_candidate_chunk(
-                index_k,
-                index_k_scale,
-                kv_workspace_slots,
-                block_table,
-                logits,
-                query_0,
-                weight_0,
-                query_1,
-                weight_1,
-                starts,
-                ends,
-                row_offsets,
-                request_id,
-                block_table_stride,
-                model_scale,
-                gl.maximum(candidate_start, chunk * CHUNK_N),
-                gl.minimum(candidate_end, (chunk + 1) * CHUNK_N),
-                mfma_layout,
-                dot_b_layout,
-                out_layout,
-                col_layout,
-                PAGE_SIZE,
-                NUM_HEADS,
-                HEAD_DIM,
-                ROWS,
-                BLOCK_N,
-                CHUNK_N,
-                NUM_WARPS,
-                NUM_STAGES,
-                IS_DECODE,
-                PAGE_STRIDE_BYTES,
-                KEY_FP8,
-                Q_FORMAT,
-                USE_BUFFER_LOAD,
-                USE_BUFFER_STORE,
-                NONFINITE_TO_NEG_INF,
-                query_scale_0,
-                query_scale_1,
-            )
+        if balanced:
+            for chunk_start in range(candidate_start, candidate_end, RUN_CHUNK_N):
+                _score_candidate_chunk(
+                    index_k,
+                    index_k_scale,
+                    kv_workspace_slots,
+                    block_table,
+                    logits,
+                    query_0,
+                    weight_0,
+                    query_1,
+                    weight_1,
+                    starts,
+                    ends,
+                    row_offsets,
+                    request_id,
+                    block_table_stride,
+                    model_scale,
+                    chunk_start,
+                    gl.minimum(candidate_end, chunk_start + RUN_CHUNK_N),
+                    mfma_layout,
+                    dot_b_layout,
+                    out_layout,
+                    col_layout,
+                    PAGE_SIZE,
+                    NUM_HEADS,
+                    HEAD_DIM,
+                    ROWS,
+                    BLOCK_N,
+                    RUN_CHUNK_N,
+                    NUM_WARPS,
+                    RUN_NUM_STAGES,
+                    IS_DECODE,
+                    PAGE_STRIDE_BYTES,
+                    KEY_FP8,
+                    Q_FORMAT,
+                    USE_BUFFER_LOAD,
+                    USE_BUFFER_STORE,
+                    NONFINITE_TO_NEG_INF,
+                    query_scale_0,
+                    query_scale_1,
+                )
+        else:
+            for chunk in range(candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)):
+                _score_candidate_chunk(
+                    index_k,
+                    index_k_scale,
+                    kv_workspace_slots,
+                    block_table,
+                    logits,
+                    query_0,
+                    weight_0,
+                    query_1,
+                    weight_1,
+                    starts,
+                    ends,
+                    row_offsets,
+                    request_id,
+                    block_table_stride,
+                    model_scale,
+                    gl.maximum(candidate_start, chunk * CHUNK_N),
+                    gl.minimum(candidate_end, (chunk + 1) * CHUNK_N),
+                    mfma_layout,
+                    dot_b_layout,
+                    out_layout,
+                    col_layout,
+                    PAGE_SIZE,
+                    NUM_HEADS,
+                    HEAD_DIM,
+                    ROWS,
+                    BLOCK_N,
+                    CHUNK_N,
+                    NUM_WARPS,
+                    NUM_STAGES,
+                    IS_DECODE,
+                    PAGE_STRIDE_BYTES,
+                    KEY_FP8,
+                    Q_FORMAT,
+                    USE_BUFFER_LOAD,
+                    USE_BUFFER_STORE,
+                    NONFINITE_TO_NEG_INF,
+                    query_scale_0,
+                    query_scale_1,
+                )
     else:
         _score_candidate_chunk(
             index_k,
@@ -2374,6 +2426,8 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
     work_target=0,
     BATCH_PAD: gl.constexpr = 0,
+    RUN_CHUNK_N: gl.constexpr = 0,
+    RUN_NUM_STAGES: gl.constexpr = 0,
 ):
     """Decode scorer over a scaled (fp8_scaled or mxfp4) paged plane.
 
@@ -2381,7 +2435,10 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     are ``PAGE_STRIDE_BYTES`` apart, each its FP8 rows then their fp32
     scales. With ``CHUNK_LOOP`` the grid may have fewer programs per request
     than chunks: program ``(i, j)`` then scores the ``j``-th equal run of the
-    chunks request ``i``'s rows fill. With ``BATCH_PAD`` (at least the
+    chunks request ``i``'s rows fill; with ``RUN_CHUNK_N`` too, once a run
+    would span a second chunk, the ``j``-th equal run of ``BLOCK_N`` tiles,
+    scanned ``RUN_CHUNK_N`` slots a pass at ``RUN_NUM_STAGES``. With
+    ``BATCH_PAD`` (at least the
     request count, ``explicit_row_lens`` given) the runs are one length over
     the batch, about ``work_target`` of them, taken in program order.
 
@@ -2437,4 +2494,6 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         NONFINITE_TO_NEG_INF,
         work_target=work_target,
         BATCH_PAD=BATCH_PAD,
+        RUN_CHUNK_N=RUN_CHUNK_N,
+        RUN_NUM_STAGES=RUN_NUM_STAGES,
     )
