@@ -2846,14 +2846,17 @@ send buffer large enough for unequal page ownership.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 
-Kimi-K3.1 keeps the `kimi_k3` family: a DSA target config adds one index-K
-field per MLA layer to the full-attention group, in a plane of its own (the
-latent plane's page stride must stay its payload) that KDA state never
-shares, so the K3 packing is unchanged. Its pool
-(`HybridKDADSATokenToKVPool`) writes, gathers and scores those planes in the
-DSA leaf's kernel pages (`index_k_page_size`), which subdivide the 128-token
-cache blocks exactly as the router's page tables do; the ordinary DSA family
-runs its kernel page at the arena page.
+Kimi-K3.1 keeps the `kimi_k3` family and the 128-token prefix identity grain,
+while its full-attention group uses 64-token DSA pages. Sliding drafts keep
+their 128-token pages. Each target MLA layer's latent KV and index-K fields
+share one plane and the same cache
+blocks. KDA and sliding-draft parents can therefore reuse the index-K space
+as well. Packing is recomputed from the combined page payload. Page strides
+align to whole latent rows, so token-sparse attention can read a flat physical
+row view without copying KV. Selected row indices include page padding;
+the KVP Prims-TS path fuses that translation into owned selection or ownership
+compaction. The scheduler still owns logical cache-block IDs. Kimi-K3 keeps
+its existing 128-token layout.
 
 Qwen4-Exp selects its cache recipe by model family, including targets with
 only full-attention layers. PLE and QSA fields and their verify budget do

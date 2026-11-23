@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import remap_cache_slots
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -75,8 +77,8 @@ def _attention(
         raise ValueError("Prims-TS DSA requires 1..128 query heads of dimension 576")
     if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != q.dtype:
         raise TypeError("Prims-TS DSA requires native E4M3 queries and KV cache")
-    if kv_cache.device != q.device or not kv_cache.is_contiguous():
-        raise ValueError("KV cache must be contiguous on the query device")
+    if kv_cache.device != q.device:
+        raise ValueError("KV cache must be on the query device")
     cache_shape = tuple(kv_cache.shape)
     if not (
         (kv_cache.ndim == 2 and cache_shape[-1] == 576)
@@ -118,9 +120,16 @@ def _attention(
         )
     # The indexer enforces causality; the selected slots alone define this core's reads.
     del max_seqlen_k, kv_seq_lens
+    cache, cache_page_size, cache_page_stride = flatten_paged_latent_cache(kv_cache)
+    topk_slots = remap_cache_slots(
+        topk_slots,
+        page_size=cache_page_size,
+        page_stride=cache_page_stride,
+        lengths=None,
+    )
     return sparse_attention(
         query,
-        kv_cache.view(-1, 576),
+        cache,
         topk_slots,
         topk_lens,
         mode=mode,

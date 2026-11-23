@@ -205,6 +205,10 @@ class CachePoolBinding:
         selection as scheduler slots."""
         return False
 
+    def decode_topk_page_stride(self, layer: PagedAttention, kv_cache) -> int | None:
+        """Output rows per page for owned decode selections; None keeps cache slots."""
+        return None
+
     def dcp_decode_query_rider(
         self, layer: PagedAttention, q: torch.Tensor
     ) -> torch.Tensor | None:

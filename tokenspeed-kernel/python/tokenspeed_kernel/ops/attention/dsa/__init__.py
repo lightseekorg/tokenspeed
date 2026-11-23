@@ -256,8 +256,8 @@ def _index_k_plane_traits(
     elements (``"fp8_scaled"``, encoded per ``kvcache/index_k_scale.py``):
     ``"packed"`` as ``[slots, head_dim + 4 *
     head_dim / 128]`` rows, otherwise ``"page_planar"``. ``bfloat16`` planes
-    hold the keys unquantized (``"bf16"``) and are only ever ``"packed"``
-    ``[slots, head_dim]``. A ``uint8`` plane holds ``"mxfp4"`` keys (E2M1
+    hold the keys unquantized (``"bf16"``), either packed ``[slots, head_dim]``
+    or paged ``[pages, page_size, head_dim]``. A ``uint8`` plane holds ``"mxfp4"`` keys (E2M1
     codes and one UE8M0 scale per 32 elements, ``[slots, head_dim / 2 +
     head_dim / 8]`` packed) only when the caller says so: the dtype alone
     never selects it.
@@ -287,14 +287,17 @@ def _index_k_plane_traits(
             "index_k_layout": "packed" if packed else "page_planar",
         }
     if index_k_cache.dtype == torch.bfloat16:
-        if index_k_cache.ndim != 2 or index_k_cache.shape[1] != head_dim:
+        if index_k_cache.ndim not in (2, 3) or index_k_cache.shape[-1] != head_dim:
             raise ValueError(
                 "a bf16 index-K plane must be packed [slots, head_dim] = "
                 f"[slots, {head_dim}], got {tuple(index_k_cache.shape)}"
             )
         if index_k_format not in (None, "bf16"):
             raise TypeError(f"a bf16 index-K plane is not {index_k_format!r}")
-        return {"index_k_format": "bf16", "index_k_layout": "packed"}
+        return {
+            "index_k_format": "bf16",
+            "index_k_layout": "packed" if index_k_cache.ndim == 2 else "page_planar",
+        }
     raise TypeError(
         f"index-K plane dtype {index_k_cache.dtype} has no registered format: "
         "uint8 holds FP8 keys with scales (fp8_scaled), bfloat16 holds the keys "
@@ -1617,6 +1620,7 @@ def dsa_select_owned_candidates(
     solution: str | None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    output_page_stride: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """This KVP rank's share of a global top-k, from every rank's gathered
     candidate scores, as local cache slots.
@@ -1639,6 +1643,8 @@ def dsa_select_owned_candidates(
         rank: This rank's index in ``scores``.
         topk: Entries selected per row over all ranks.
         page_size: Tokens per page of ``local_page_table``.
+        output_page_stride: Rows between output pages, including padding;
+            None uses ``page_size``.
         solution: None selects the best supported kernel; a name forces one.
         out: Optional contiguous int32 ``[rows, topk]`` output.
         lens_out: Optional int32 ``[rows]`` output.
@@ -1682,6 +1688,9 @@ def dsa_select_owned_candidates(
             page_size=page_size,
             out=out,
             lens_out=lens_out,
+            output_page_stride=(
+                page_size if output_page_stride is None else output_page_stride
+            ),
         )
 
 

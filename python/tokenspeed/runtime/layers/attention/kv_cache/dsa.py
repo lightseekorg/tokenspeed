@@ -165,16 +165,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"{plane_dtype} of index_k_format={index_k_format!r}"
             )
         head_dim = self.index_head_dim
+        page_size = self.index_k_page_size
         if index_k_format not in ("fp8_scaled", "mxfp4"):
             # A plain plane: the row is the key's bytes.
-            return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
-        page_size = self.index_k_page_size
+            pages = buf.view(-1, page_size, head_dim)
+            return pages[slots // page_size, slots % page_size].view(torch.uint8)
         row_bytes = index_k_row_bytes(head_dim, index_k_format)
         code_bytes = head_dim if index_k_format == "fp8_scaled" else head_dim // 2
         scale_bytes = row_bytes - code_bytes
         page_bytes = page_size * row_bytes
-        num_pages = buf.numel() // page_bytes
-        pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
+        pages = buf.view(-1, page_bytes)
+        num_pages = pages.shape[0]
         codes = pages[:, : page_size * code_bytes].view(
             num_pages, page_size, code_bytes
         )
@@ -256,11 +257,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if buf.dtype == torch.bfloat16:
             rows = index_k.to(buf.dtype)
             slots = loc.to(torch.int64)
+            page_size = self.index_k_page_size
+            pages = buf.view(-1, page_size, self.index_head_dim)
+            positions = (slots // page_size, slots % page_size)
             if write_mask is not None:
                 # Rows this rank does not own keep what the plane holds; the
                 # gather keeps the shapes static for graph capture.
-                rows = torch.where(write_mask.unsqueeze(1), rows, buf[slots])
-            buf[slots] = rows
+                rows = torch.where(write_mask.unsqueeze(1), rows, pages[positions])
+            pages[positions] = rows
             return
         if buf.dtype != torch.uint8:
             raise TypeError(

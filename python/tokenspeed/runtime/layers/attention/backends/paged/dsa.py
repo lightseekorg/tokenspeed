@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     trtllm_sparse_mla_query_heads,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
+from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
@@ -1062,6 +1063,12 @@ class DSABackend(PagedAttentionBackend):
     def takes_owned_decode_topk(self, layer) -> bool:
         return self._owned_decode_topk
 
+    def decode_topk_page_stride(self, layer, kv_cache) -> int | None:
+        if self._kvp_decode_solution != "flashinfer_prims":
+            return None
+        _, page_size, page_stride = flatten_paged_latent_cache(kv_cache)
+        return page_stride * self.kernel_page_size // page_size
+
     def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
         """This rank's decode query heads as the bytes an owned top-k's
         score gather can carry (``select_owned_dsa_topk``), when
@@ -1645,11 +1652,8 @@ class DSABackend(PagedAttentionBackend):
         ``slots`` name. A collective over the page owners: every rank calls
         it for every group.
         """
-        if not cache.is_contiguous():
-            raise RuntimeError("the history gather reads a contiguous cache plane")
         page_bytes = self.kernel_page_size * row_bytes
-        raw = cache.reshape(-1).view(torch.uint8)
-        pages = raw[: raw.numel() // page_bytes * page_bytes].view(-1, page_bytes)
+        pages = cache.view(torch.uint8).view(-1, page_bytes)
         send = pages.index_select(0, group.fetch_pages)
         size = len(self.kvp_group) * send.numel()
         landing = workspace.reshape(-1).view(torch.uint8)
@@ -1691,7 +1695,7 @@ class DSABackend(PagedAttentionBackend):
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         return self._gather_history_pages(
             kv_cache,
-            kv_cache[0].numel() * kv_cache.element_size(),
+            kv_cache.shape[-1] * kv_cache.element_size(),
             group,
             self._history_workspace.kv,
         )
@@ -1807,9 +1811,10 @@ class DSABackend(PagedAttentionBackend):
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
-        local = kv_flat.index_select(0, group.gather.send_slots)
         page = self.kernel_page_size
+        kv_pages = kv_cache.view(-1, page, kv_cache.shape[-1])
+        slots = group.gather.send_slots
+        local = kv_pages[slots // page, slots % page]
         rows = len(group.gather.group) * group.gather.send_rows
         paged_rows = -(-rows // page) * page
         out = self._history_workspace.kv
@@ -2662,8 +2667,16 @@ class DSABackend(PagedAttentionBackend):
             # Owned slots first, counted as length (full width without topk_lens).
             # An owned top-k already is.
             if not topk_owned:
+                output_block_stride = self.decode_topk_page_stride(layer, kv_cache)
+                if output_block_stride is not None:
+                    output_block_stride *= (
+                        self.kvp_block_granularity // self.kernel_page_size
+                    )
                 topk_slots, topk_lens = compact_owned_cache_slots(
-                    topk_slots, topk_lens, self.cache_placement(layer)
+                    topk_slots,
+                    topk_lens,
+                    self.cache_placement(layer),
+                    output_page_stride=output_block_stride,
                 )
             # Decided before the query gather, from boot configuration and
             # host sizes every rank of the group shares.
@@ -2694,6 +2707,9 @@ class DSABackend(PagedAttentionBackend):
                 )
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
+        if use_dcp and self._kvp_decode_solution == "flashinfer_prims":
+            # The selection already includes page padding in its physical row IDs.
+            kv_cache, _, _ = flatten_paged_latent_cache(kv_cache)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,

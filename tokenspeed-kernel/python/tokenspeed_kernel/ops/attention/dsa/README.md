@@ -34,6 +34,10 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
+Paged KV may have whole-row padding between pages. The adapter maps logical
+slots to physical rows without copying KV. A caller that already mapped the
+indices passes the flat physical-row view to avoid a separate mapping launch.
+
 The pinned FlashInfer 0.7.5 provides the Prims-TS sparse MLA wrapper. Select
 `solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
@@ -240,7 +244,7 @@ scale rounded up to a power of two as four equal UE8M0 bytes
 the MX scales of the row's four 32-element groups, and every Blackwell
 writer and reader of the plane uses that encoding. A
 leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
-and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
+and `index_k_layout={"packed", "page_planar"}` for flat or strided pages.
 A leaf that must reproduce an RL trainer's selection order also declares the
 `batch_invariant` and `forced_initial_local` features; the gfx950 ones below
 do not. A plane of any other dtype is a `TypeError`.

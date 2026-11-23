@@ -156,6 +156,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def dcp_decode_query_rider(self, layer, q):
         return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
 
+    def decode_topk_page_stride(self, layer, kv_cache):
+        return self._backend_for_layer(layer.layer_id).decode_topk_page_stride(
+            layer, kv_cache
+        )
+
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
 

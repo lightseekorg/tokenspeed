@@ -195,8 +195,8 @@ class GlmDsaDecodeTopK:
     dcp_q_len: int = 0
     dcp_capturing: bool = False
     # Under a cache placement whose ranks each selected their own share: that
-    # placement. ``topk_indices`` then holds this rank's local cache slots,
-    # its share first, and ``topk_lens`` their counts.
+    # placement. ``topk_indices`` then holds this rank's cache-read indices
+    # in its backend's page stride, its share first, and ``topk_lens`` their counts.
     owned_placement: Any = None
     # Every rank's decode query rows, uint8 [ranks, rows, bytes], carried by
     # the selecting layer's score gather; only that layer's core reads them.
@@ -816,6 +816,10 @@ class GlmDsaSparseAttentionMixin:
                     query_group_size=q_len_per_req,
                     out=topk_slice,
                     lens_out=topk_lens_slice,
+                    output_page_stride=ctx.attn_backend.decode_topk_page_stride(
+                        self.attn_mqa,
+                        ctx.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),
+                    ),
                 )
                 owned_placement = placement
             else:

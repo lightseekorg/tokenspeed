@@ -652,7 +652,7 @@ class DecodeFront:
             slot = ((block - 1) // degree + 1) * rows + slot % rows
         if owned != Int32(0):
             page, offset = slot >> 6, slot & (PAGE - 1)
-            base = cache.iterator + page * (PAGE * ROW_BYTES)
+            base = cache.iterator + Int64(page) * Int64(cache.stride[0])
             store_words(base + offset * DIM + 4 * lane, (codes,))
             if lane == 0:
                 store_words(base + PAGE * DIM + offset * 4, (exponent * 0x01010101,))
@@ -697,7 +697,7 @@ def compile_front(
         _fake(BFloat16, (width, K), (K, 1), 16),  # [q_b; wq_b]
         _fake(norm, (DIM,), (1,), 16),  # index-key LayerNorm weight
         _fake(norm, (DIM,), (1,), 16),  # index-key LayerNorm bias
-        _fake(Uint8, (sym(), ROW_BYTES), (ROW_BYTES, 1), 16),  # index-K plane
+        _fake(Uint8, (sym(), PAGE * ROW_BYTES), (sym64(divisibility=16), 1), 16),
         _fake(Int64 if wide_slots else Int32, (rows,), (1,), 8 if wide_slots else 4),
         _fake(BFloat16, (rows, K), (K, 1), 16),  # q_norm
         _fake(BFloat16, (rows, width), (width, 1), 16),  # projected

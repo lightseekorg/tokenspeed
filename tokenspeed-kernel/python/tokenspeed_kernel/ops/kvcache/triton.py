@@ -3762,7 +3762,9 @@ def _index_k_layernorm_scatter_kernel(
     write_mask_ptr,
     x_row_stride,
     buf_row_stride,
+    buf_page_stride,
     eps,
+    PAGE_SIZE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     HD: tl.constexpr,
     BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
@@ -3783,7 +3785,10 @@ def _index_k_layernorm_scatter_kernel(
         store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
     loc = tl.load(loc_ptr + t).to(tl.int64)
     tl.store(
-        buf_ptr + loc * buf_row_stride + d,
+        buf_ptr
+        + (loc // PAGE_SIZE) * buf_page_stride
+        + (loc % PAGE_SIZE) * buf_row_stride
+        + d,
         y.to(buf_ptr.dtype.element_ty),
         mask=store_mask,
     )
@@ -3806,7 +3811,8 @@ def index_k_layernorm_scatter(
     normalized row is rounded.
 
     Args:
-        buf: ``[slots, head_dim]`` bf16 plane with unit inner stride.
+        buf: BF16 ``[slots, head_dim]`` or ``[pages, page_size, head_dim]``
+            cache with unit inner stride; pages may be padded.
         index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride;
             the row stride may be padded (a view of a wider projection).
         weight: ``[head_dim]`` LayerNorm weight.
@@ -3821,9 +3827,9 @@ def index_k_layernorm_scatter(
         None; ``buf`` is written in place.
     """
     tokens = index_k.shape[0]
-    if buf.dtype != torch.bfloat16 or buf.ndim != 2 or buf.stride(-1) != 1:
-        raise ValueError("Index-K plane must be a bf16 [slots, head_dim] matrix")
-    head_dim = buf.shape[1]
+    if buf.dtype != torch.bfloat16 or buf.ndim not in (2, 3) or buf.stride(-1) != 1:
+        raise ValueError("Index-K cache must be bf16 with unit inner stride")
+    head_dim = buf.shape[-1]
     if index_k.ndim != 2 or index_k.shape[1] != head_dim or index_k.stride(-1) != 1:
         raise ValueError(
             f"index_k must be [tokens, {head_dim}] with unit inner stride, got "
@@ -3849,8 +3855,10 @@ def index_k_layernorm_scatter(
         loc.reshape(-1),
         write_mask,
         index_k.stride(0),
+        buf.stride(-2),
         buf.stride(0),
         float(eps),
+        PAGE_SIZE=buf.shape[1] if buf.ndim == 3 else 1,
         HAS_WRITE_MASK=write_mask is not None,
         HD=head_dim,
         BLOCK_HD=_next_power_of_two(head_dim),

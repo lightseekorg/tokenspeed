@@ -430,12 +430,12 @@ def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> N
         draft_attn="mha",
         draft_window=2048,
     )
-    _, layout = kimi_layout(recipe)
+    groups, layout = kimi_layout(recipe)
     assert layout.plane_bytes == target.plane_bytes
     assert layout.lcm_block_bytes == target.lcm_block_bytes
 
-    assert len(layout.plane_bytes) == 48
-    assert layout.lcm_block_bytes == 100_048_896
+    assert len(layout.plane_bytes) == 24
+    assert layout.lcm_block_bytes == 81_838_080
 
     plan = layout.bind(3)
     draft_packing = dict(layout.group_packing)[DRAFT_SLIDING_ATTENTION]
@@ -449,9 +449,9 @@ def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> N
         assert field.plane_id == f"slot.{index}"
         assert field.page_stride_bytes == plane_bytes[field.plane_id] // draft_packing
         assert field.payload_bytes == 262_144
-        assert field.page_stride_bytes == 282_624
+        assert field.page_stride_bytes == 284_160
 
-    arena = make_arena(plan)
+    arena = make_arena(plan, cache_group_specs=tuple(spec for spec, _ in groups))
     for field in draft_fields:
         view = arena.field(field.field_id)
         assert view.shape[0] >= 3 * draft_packing

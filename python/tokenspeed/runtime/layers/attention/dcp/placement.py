@@ -109,6 +109,8 @@ def compact_owned_cache_slots(
     slots: torch.Tensor,
     lengths: torch.Tensor | None,
     placement: CachePlacement | None,
+    *,
+    output_page_stride: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Move each row's owned slots, as local slots, to the row's front.
 
@@ -120,6 +122,8 @@ def compact_owned_cache_slots(
     both: every slot is local.
     """
     if placement is None:
+        if output_page_stride is not None:
+            raise ValueError("output page stride requires cache placement geometry")
         return slots, lengths
     return compact_owned_slots(
         slots,
@@ -128,6 +132,7 @@ def compact_owned_cache_slots(
         virtual_block_count=placement.virtual_block_count,
         degree=len(placement.group),
         rank=placement.rank,
+        output_page_stride=output_page_stride,
     )
 
 

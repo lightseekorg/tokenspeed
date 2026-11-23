@@ -356,18 +356,16 @@ def _layer_fields(layout, layer_id: int) -> dict[str, object]:
 def test_k3_layout_keeps_one_plane_per_mla_layer() -> None:
     recipe, _, layout = kimi_tp8_layout()
 
-    assert recipe.num_index_k_planes == 0
     assert len(layout.plane_bytes) == 24
     assert layout.lcm_block_bytes == 24 * 884_736
     assert not any(field.field_id.endswith(".index_k") for field in layout.fields)
 
 
 @pytest.mark.parametrize("draft_layers", [0, 1])
-def test_k31_layout_adds_one_index_k_plane_per_dsa_layer(draft_layers) -> None:
+def test_k31_layout_shares_each_dsa_plane_with_its_index_keys(draft_layers) -> None:
     recipe, _, layout = kimi_tp8_layout(
         dsa_index_k_format="fp8_scaled", draft_layers=draft_layers
     )
-    k3, _, k3_layout = kimi_tp8_layout(draft_layers=draft_layers)
     row_bytes = dsa_index_k_row_bytes(128)
     mla_layers = [
         layer
@@ -375,23 +373,21 @@ def test_k31_layout_adds_one_index_k_plane_per_dsa_layer(draft_layers) -> None:
         if group == FULL_ATTENTION
     ]
 
-    # The index planes leave the K3 packing (12 MLA pages per parent) alone.
-    assert dict(layout.group_packing) == dict(k3_layout.group_packing)
-    assert recipe.num_index_k_planes == 24
-    assert len(layout.plane_bytes) == 24 + draft_layers + 24
+    assert layout.prefix_granularity == 128
+    assert recipe.history_page_size == 64
+    assert len(layout.plane_bytes) == 24 + draft_layers
     index_k = [field for field in layout.fields if field.field_id.endswith(".index_k")]
     assert sorted(int(field.field_id.split(".")[1]) for field in index_k) == mla_layers
     for field in index_k:
         assert field.group_id == FULL_ATTENTION
-        assert field.shape == (128, row_bytes)
-        # 128-token page strides make the plane a contiguous [slots, row_bytes] matrix.
-        assert field.page_stride_bytes == 128 * row_bytes
-    assert dict(layout.plane_bytes)[f"layer.{mla_layers[0]}.index_k"] == (
-        12 * 128 * row_bytes
-    )
-    assert layout.lcm_block_bytes == k3_layout.lcm_block_bytes + 24 * 12 * 128 * (
-        row_bytes
-    )
+        assert field.shape == (64, row_bytes)
+        layer_id = int(field.field_id.split(".")[1])
+        latent = _layer_fields(layout, layer_id)["latent_kv"]
+        assert field.plane_id == latent.plane_id
+        assert field.page_stride_bytes == latent.page_stride_bytes
+        latent_row_bytes = latent.payload_bytes // 64
+        assert field.page_stride_bytes >= latent.payload_bytes + field.payload_bytes
+        assert field.page_stride_bytes % latent_row_bytes == 0
     if draft_layers:
         draft = _layer_fields(layout, recipe.num_target_layers)
         assert set(draft) == {"latent_kv"}
@@ -401,7 +397,7 @@ def test_k31_layout_plans_a_bf16_plane_in_its_own_dtype() -> None:
     _, _, layout = kimi_tp8_layout(dsa_index_k_format="bf16")
     field = _layer_fields(layout, 3)["index_k"]
 
-    assert (field.shape, field.dtype) == ((128, 128), "bfloat16")
+    assert (field.shape, field.dtype) == ((64, 128), "bfloat16")
 
 
 # ---------------------------------------------------------------- pool + top-k
@@ -410,7 +406,7 @@ def test_k31_layout_plans_a_bf16_plane_in_its_own_dtype() -> None:
 def _k31_pool(
     device: str,
     *,
-    num_lcm_blocks: int,
+    token_capacity: int,
     draft_layers: int = 0,
     index_k_format: str = "fp8_scaled",
 ):
@@ -426,13 +422,17 @@ def _k31_pool(
     _, groups, layout = kimi_tp8_layout(
         dsa_index_k_format=index_k_format, draft_layers=draft_layers
     )
+    tokens_per_parent = (
+        dict(layout.group_packing)[FULL_ATTENTION] * recipe.history_page_size
+    )
+    num_lcm_blocks = -(-token_capacity // tokens_per_parent)
     plan = layout.bind(num_lcm_blocks)
     spec = CachePoolSpec(
         family="kimi_k3",
         memory_plan=plan,
         layer_types=recipe.layer_types,
         cache_group_specs=tuple(group for group, _ in groups),
-        token_capacity=num_lcm_blocks * 12 * 128,
+        token_capacity=num_lcm_blocks * tokens_per_parent,
     )
     arena = create_cache_arena(spec, device=device, enable_memory_saver=False)
     target = create_cache_pool(
@@ -483,7 +483,7 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
     torch.manual_seed(0)
-    pool, draft = _k31_pool("cuda", num_lcm_blocks=1, draft_layers=1)
+    pool, draft = _k31_pool("cuda", token_capacity=1536, draft_layers=1)
     assert isinstance(pool, HybridKDADSATokenToKVPool)
     assert type(draft) is MLATokenToKVPool
     assert pool.index_k_page_size == 64
@@ -492,6 +492,8 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
 
     slots = _slots([5, 2], 200, "cuda")
     keys = torch.randn(200, 128, device="cuda", dtype=torch.bfloat16)
+    latent = pool.get_key_buffer(3)
+    latent.fill_(3)
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
     fp8, scale = split_index_k_rows(
         pool.gather_index_k_rows(3, slots, index_k_format="fp8_scaled"),
@@ -502,6 +504,7 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
 
     assert torch.equal(fp8, expected_fp8.view(torch.uint8))
     assert torch.equal(scale, expected_scale)
+    assert (latent == 3).all()
     # The next DSA layer's plane is untouched.
     assert not pool.get_index_k_buffer(7).any()
 
@@ -509,14 +512,14 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
 @requires_gpu
 def test_bf16_index_k_plane_keeps_the_keys_unquantized() -> None:
     torch.manual_seed(0)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format="bf16")
+    pool, _ = _k31_pool("cuda", token_capacity=1536, index_k_format="bf16")
     slots = _slots([5, 2], 200, "cuda")
     keys = torch.randn(200, 128, device="cuda", dtype=torch.bfloat16)
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
 
     plane = pool.get_index_k_buffer(3)
-    assert plane.dtype == torch.bfloat16 and plane.shape[1] == 128
-    assert torch.equal(plane[slots.long()], keys)
+    assert plane.dtype == torch.bfloat16 and plane.shape[-1] == 128
+    assert torch.equal(plane[slots // 64, slots % 64], keys)
     assert not pool.get_index_k_buffer(7).any()
 
 
@@ -551,8 +554,8 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) 
     wide = torch.randn(200, width, device="cuda") * 3 + 1
     keys = wide.to(torch.bfloat16)[:, width - 160 : width - 32]
     owned = torch.rand(200, device="cuda") < 0.75
-    deferred, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)
-    eager, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)
+    deferred, _ = _k31_pool("cuda", token_capacity=1536, index_k_format=index_k_format)
+    eager, _ = _k31_pool("cuda", token_capacity=1536, index_k_format=index_k_format)
 
     deferred.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
     if index_k_format == "fp8_scaled" and not current_platform().is_amd:
@@ -580,12 +583,12 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) 
             keys.float(), (128,), norm.weight, norm.bias, 1e-6
         )
         torch.testing.assert_close(
-            written[slots[owned].long()].float(),
+            written[slots[owned] // 64, slots[owned] % 64].float(),
             reference[owned],
             rtol=2**-7,
             atol=1e-5,
         )
-        assert not written[slots[~owned].long()].any()
+        assert not written[slots[~owned] // 64, slots[~owned] % 64].any()
     assert not deferred.get_index_k_buffer(7).any()
 
 
@@ -617,8 +620,8 @@ def test_the_index_k_write_can_quantize_the_index_query_in_its_launch(width) -> 
     magnitudes = torch.logspace(-3, 3, 32, device="cuda").unsqueeze(-1)
     query = (torch.randn(200, 32, 128, device="cuda") * magnitudes).to(torch.bfloat16)
     owned = torch.rand(200, device="cuda") < 0.75
-    fused, _ = _k31_pool("cuda", num_lcm_blocks=1)
-    separate, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    fused, _ = _k31_pool("cuda", token_capacity=1536)
+    separate, _ = _k31_pool("cuda", token_capacity=1536)
 
     q_fp8, folded = fused.set_index_k_buffer_and_quantize_query(
         3,
@@ -723,7 +726,7 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     page = 64
     # The workspace starts past the reserved null page 0, as in serving.
     kv_slots = torch.arange(page, page + slots, device="cuda", dtype=torch.int64)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=(page + slots + 1535) // 1536)
+    pool, _ = _k31_pool("cuda", token_capacity=page + slots)
     pool.set_index_k_buffer(
         3,
         kv_slots,
@@ -813,7 +816,7 @@ def test_prefill_topk_splits_from_384_rows(
     attention = _indexer_attention(index_topk=2048)
     attention.prefill_topk_tp_split = True
     slots = 6144
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool, _ = _k31_pool("cuda", token_capacity=6144)
     pool.set_index_k_buffer(
         3,
         torch.arange(slots, device="cuda", dtype=torch.int64),
@@ -983,7 +986,7 @@ def test_prefill_topk_split_reuses_rank_zero_kernels_on_other_ranks(
     # Over two ranks, rank 1's int32 row offset (1251 * 4 bytes) is not 16-byte aligned.
     num_rows, prefix, slots = 2502, 3000, 6144
     row_ends_cpu = prefix + torch.arange(1, num_rows + 1, dtype=torch.int64)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool, _ = _k31_pool("cuda", token_capacity=6144)
     pool.set_index_k_buffer(
         3,
         torch.arange(slots, device="cuda", dtype=torch.int64),
@@ -1029,7 +1032,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     indexer = attention.indexer
     with torch.no_grad():
         indexer.wq_b.weight.normal_(0.0, 0.05)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    pool, _ = _k31_pool("cuda", token_capacity=3072)
     num_rows = 1100
     # Behind a 1000-token prefix the last rows see more than topk keys: scored.
     prefix = 1000
@@ -1416,7 +1419,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
     torch.manual_seed(4)
     model_config = _load_k31_model_config(tmp_path)
     pool, _ = _k31_pool(
-        "cuda", num_lcm_blocks=2, index_k_format=model_config.index_k_format
+        "cuda", token_capacity=3072, index_k_format=model_config.index_k_format
     )
     seq_len, topk = 2200, model_config.index_topk
     block_ids = list(range(23, 5, -1))
@@ -1494,7 +1497,7 @@ def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
-    plane = _k31_pool("cuda", num_lcm_blocks=1)[0].get_index_k_buffer(3)
+    plane = _k31_pool("cuda", token_capacity=1536)[0].get_index_k_buffer(3)
     # Head magnitudes six decades apart: each head needs its own scale.
     magnitudes = torch.logspace(-3, 3, 32, device="cuda").unsqueeze(-1)
     q = (torch.randn(37, 32, 128, device="cuda") * magnitudes).to(torch.bfloat16)
@@ -1516,7 +1519,7 @@ def test_index_query_stays_bf16_outside_k31_fp8_scaled_planes(
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     index_k_format = "bf16" if case == "bf16_plane" else "fp8_scaled"
-    plane = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)[
+    plane = _k31_pool("cuda", token_capacity=1536, index_k_format=index_k_format)[
         0
     ].get_index_k_buffer(3)
     if case == "glm_dsa_host":
@@ -1547,7 +1550,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)
+    pool, _ = _k31_pool("cuda", token_capacity=1536, index_k_format=index_k_format)
     block_ids = [3, 7, 1]
     seq_len = 300
     slots = _slots(block_ids, seq_len, "cuda")
@@ -1608,7 +1611,7 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
 
     torch.manual_seed(1)
     attention = _indexer_attention(index_topk=2048)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    pool, _ = _k31_pool("cuda", token_capacity=3072)
     block_ids = list(range(23, 5, -1))  # 18 blocks, scattered order
     seq_len = 2200
     slots = _slots(block_ids, seq_len, "cuda")
@@ -1689,7 +1692,7 @@ def test_decode_topk_scores_the_query_the_index_k_write_quantized(
     attention = _indexer_attention(index_topk=2048)
     if not attention.index_k_write_quantizes_query:
         pytest.skip("needs the fused decode top-k (SM100-SM103)")
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    pool, _ = _k31_pool("cuda", token_capacity=3072)
     block_ids = list(range(23, 5, -1))
     seq_len = 2200
     keys = torch.randn(seq_len, 128, device="cuda", dtype=torch.bfloat16)
@@ -1752,7 +1755,7 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
     seq_len = prefix_len + extend_len
     num_blocks = (seq_len + 127) // 128
     # Twelve 128-token blocks per LCM block; blocks 0 and 1 stay unused.
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
+    pool, _ = _k31_pool("cuda", token_capacity=(num_blocks + 2) * 128)
     block_ids = list(range(2, 2 + num_blocks))[::-1]
     slots = _slots(block_ids, seq_len, "cuda")
     # Bad keys lead: a row past topk by the bad count selects exactly the good keys.
@@ -1825,7 +1828,7 @@ def test_a_later_layer_reuses_an_every_candidate_selection(
     torch.manual_seed(5)
     attention = _indexer_attention(index_topk=2048)
     num_blocks = (extend_len + 127) // 128
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
+    pool, _ = _k31_pool("cuda", token_capacity=(num_blocks + 2) * 128)
     block_ids = list(range(2, 2 + num_blocks))[::-1]
     slots = _slots(block_ids, extend_len, "cuda")
     u, keys = _separable_keys(extend_len, torch.arange(0, device="cuda"), "cuda")
@@ -1890,7 +1893,7 @@ def test_prefill_rows_within_topk_select_every_candidate_unscored(
     torch.manual_seed(3)
     attention = _indexer_attention(index_topk=2048)
     slots = 6144
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool, _ = _k31_pool("cuda", token_capacity=6144)
     pool.set_index_k_buffer(
         3,
         torch.arange(slots, device="cuda", dtype=torch.int64),
@@ -2176,7 +2179,7 @@ def test_dsa_leaf_admits_prefill_graphs_only_under_padded_replay(
     support_logger = "tokenspeed.runtime.layers.attention.backends.support"
     for name in (dsa_logger, support_logger):
         monkeypatch.setattr(logging.getLogger(name), "propagate", True)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", token_capacity=1536)
     caplog.clear()
     with (
         caplog.at_level(logging.INFO, logger=dsa_logger),
@@ -2237,7 +2240,7 @@ def _dense_reference(q, history, scaling, visible):
 def test_sparse_decode_over_k3_latents_matches_dense_attention(q_len) -> None:
     torch.manual_seed(3)
     heads = 16
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", token_capacity=3072)
     layer = _mla_layer(heads)
     block_ids = [6, 2, 9]
     seq_len = 300
@@ -2270,7 +2273,7 @@ def test_sparse_decode_over_k3_latents_matches_dense_attention(q_len) -> None:
         topk_lens=visible.to(torch.int32),
     )
 
-    history = pool.get_key_buffer(3)[slots, 0].float()
+    history = pool.get_key_buffer(3)[slots // 64, slots % 64, 0].float()
     # The FP8 cache runs the query in FP8 too.
     reference = _dense_reference(
         q.to(torch.float8_e4m3fn), history, layer.scaling, visible
@@ -2283,7 +2286,7 @@ def test_sparse_decode_over_k3_latents_matches_dense_attention(q_len) -> None:
 def test_sparse_prefill_over_k3_latents_matches_dense_attention() -> None:
     torch.manual_seed(4)
     heads = 16
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", token_capacity=3072)
     layer = _mla_layer(heads)
     block_ids = [4, 11, 1]
     seq_len = 260
@@ -2310,7 +2313,7 @@ def test_sparse_prefill_over_k3_latents_matches_dense_attention() -> None:
         max_seq_len=seq_len,
     )
 
-    history = pool.get_key_buffer(3)[slots, 0].float()
+    history = pool.get_key_buffer(3)[slots // 64, slots % 64, 0].float()
     reference = _dense_reference(
         q.to(torch.float8_e4m3fn), history, layer.scaling, visible
     )
@@ -2392,7 +2395,7 @@ def _k31_attention_stack(
         memory_plan=layout.bind(num_lcm_blocks),
         layer_types=recipe.layer_types,
         cache_group_specs=tuple(group for group, _ in groups),
-        token_capacity=num_lcm_blocks * packing * 128,
+        token_capacity=num_lcm_blocks * packing * recipe.history_page_size,
     )
     arena = create_cache_arena(spec, device="cuda", enable_memory_saver=False)
     pool = create_cache_pool(
@@ -2847,7 +2850,7 @@ def test_the_decode_chain_entry_attends_like_forward(
         torch.testing.assert_close(got.float(), want.float(), rtol=2**-7, atol=1e-5)
     _assert_close_to_reference(actual, expected.float(), fraction)
     # Only the step's index-K row differs, within FP8 rounding of nearby keys.
-    slot = torch.tensor([5 * 128 + prompt], device="cuda")
+    slot = torch.tensor([5 * 64 + prompt], device="cuda")
     dequantized = []
     for source in (written, plane.clone()):
         plane.copy_(source)
@@ -2882,7 +2885,7 @@ def test_a_decode_round_quantizes_its_query_in_the_index_k_write(
     monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
     torch.manual_seed(5)
     total = prompt + spec_width
-    num_blocks = -(-total // 128)
+    num_blocks = -(-total // 64)
     attention, comm, router, pool = _k31_attention_stack(
         kv_cache_dtype=torch.float8_e4m3fn,
         spec_width=spec_width,
@@ -3093,7 +3096,7 @@ def test_a_decode_chain_round_runs_the_fused_front(
     monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
     torch.manual_seed(5)
     total = prompt + 2 * spec_width
-    num_blocks = -(-total // 128)
+    num_blocks = -(-total // 64)
     attention, comm, router, pool = _k31_attention_stack(
         kv_cache_dtype=torch.float8_e4m3fn,
         spec_width=spec_width,
@@ -3301,7 +3304,7 @@ def test_a_decode_round_selects_top_k_beside_the_query_absorption(
     torch.manual_seed(7)
     prompt = 2300
     total = prompt + 2 * spec_width
-    num_blocks = -(-total // 128)
+    num_blocks = -(-total // 64)
     attention, comm, router, pool = _k31_attention_stack(
         kv_cache_dtype=torch.float8_e4m3fn,
         spec_width=spec_width,
@@ -3458,7 +3461,7 @@ def test_k31_extend_over_a_cached_prefix_matches_one_prefill(
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 8192)
-    num_blocks = -(-history // 128)
+    num_blocks = -(-history // 64)
     stacks = []
     for _ in range(2):
         torch.manual_seed(5)

@@ -1034,6 +1034,9 @@ class CacheGroupRouter(AttentionBackend):
             return None
         return self._leaf_for(layer).dcp_decode_query_rider(layer, q)
 
+    def decode_topk_page_stride(self, layer, kv_cache):
+        return self._leaf_for(layer).decode_topk_page_stride(layer, kv_cache)
+
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 

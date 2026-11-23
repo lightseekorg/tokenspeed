@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from functools import cache
+from math import prod
 from threading import Lock
 from typing import NamedTuple
 
@@ -4196,6 +4197,8 @@ def _scaled_plane_page_stride(
         )
     if index_k_cache.dtype != torch.uint8:
         raise TypeError("index_k_cache must be a uint8 tensor")
+    if index_k_cache.dim() == 3:
+        index_k_cache = index_k_cache.view(index_k_cache.shape[0], -1)
     if index_k_cache.dim() != 2:
         raise ValueError(
             "index_k_cache must be a packed slot matrix or page-planar matrix, "
@@ -4348,15 +4351,15 @@ def _check_bf16_scorer_inputs(
         raise ValueError(f"bf16 index-K scorer requires page_size=64, got {page_size}")
     if (
         index_k_cache.dtype != torch.bfloat16
-        or index_k_cache.dim() != 2
-        or index_k_cache.shape[1] != q.shape[2]
+        or index_k_cache.dim() not in (2, 3)
+        or index_k_cache.shape[-1] != q.shape[2]
     ):
         raise TypeError(
             f"index_k_cache must be a bf16 [slots, {q.shape[2]}] plane, got "
             f"{index_k_cache.dtype} {tuple(index_k_cache.shape)}"
         )
-    if not index_k_cache.is_contiguous():
-        raise ValueError("bf16 index_k_cache must be contiguous")
+    if index_k_cache.stride(-1) != 1 or index_k_cache.stride(-2) != q.shape[2]:
+        raise ValueError("bf16 index_k_cache needs contiguous rows within each page")
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
 
@@ -4447,7 +4450,7 @@ def launch_gluon_dsa_decode_topk_standard_gfx950(
         Q_IS_FP8=q_is_fp8,
         USE_BUFFER_LOAD=(
             (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
-            + index_k_cache.shape[1]
+            + prod(index_k_cache.shape[1:])
             < 2**31
         ),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
@@ -4550,7 +4553,7 @@ def launch_gluon_dsa_prefill_topk_standard_gfx950(
             Q_IS_FP8=q_is_fp8,
             USE_BUFFER_LOAD=(
                 (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
-                + index_k_cache.shape[1]
+                + prod(index_k_cache.shape[1:])
                 < 2**31
             ),
             USE_BUFFER_STORE=logits.nbytes < 2**31,
@@ -4664,6 +4667,12 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
         max_candidates,
         q_len_per_req,
         PAGE_SIZE=int(page_size),
+        PAGE_STRIDE_BYTES=(
+            index_k_cache.stride(0)
+            if index_k_cache.ndim == 3
+            else page_size * q.shape[2]
+        )
+        * 2,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         ROWS=rows,
@@ -4672,7 +4681,12 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_STAGES=_BF16_DECODE_NUM_STAGES,
-        USE_BUFFER_LOAD=index_k_cache.nbytes < 2**31,
+        USE_BUFFER_LOAD=(
+            (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+            + index_k_cache[0].numel()
+        )
+        * 2
+        < 2**31,
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         num_warps=_BF16_DECODE_NUM_WARPS,
         # Eight rows of 64 heads need the registers of a single wave per SIMD.
@@ -4780,6 +4794,13 @@ def launch_gluon_dsa_prefill_topk_bf16_gfx950(
             logits.stride(0),
             float(softmax_scale),
             workspace_rows,
+            PAGE_SIZE=int(page_size),
+            PAGE_STRIDE_BYTES=(
+                index_k_cache.stride(0)
+                if index_k_cache.ndim == 3
+                else page_size * q.shape[2]
+            )
+            * 2,
             NUM_HEADS=q.shape[1],
             HEAD_DIM=q.shape[2],
             ROWS=rows_per_program,
@@ -4788,7 +4809,12 @@ def launch_gluon_dsa_prefill_topk_bf16_gfx950(
             WARPS_M=_BF16_PREFILL_NUM_WARPS,
             WARPS_N=1,
             NUM_STAGES=_BF16_PREFILL_NUM_STAGES,
-            USE_BUFFER_LOAD=index_k_cache.nbytes < 2**31,
+            USE_BUFFER_LOAD=(
+                (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+                + index_k_cache[0].numel()
+            )
+            * 2
+            < 2**31,
             USE_BUFFER_STORE=logits.nbytes < 2**31,
             num_warps=_BF16_PREFILL_NUM_WARPS,
             waves_per_eu=_BF16_PREFILL_WAVES_PER_EU,
@@ -4886,9 +4912,9 @@ def _scaled_index_k_views(
 
 
 def _fp8_rows_buffer_load(index_k_cache: torch.Tensor) -> bool:
-    return (index_k_cache.shape[0] - 1) * index_k_cache.stride(0) + index_k_cache.shape[
-        1
-    ] < 2**31
+    return (index_k_cache.shape[0] - 1) * index_k_cache.stride(0) + prod(
+        index_k_cache.shape[1:]
+    ) < 2**31
 
 
 def _fp8_rows_decode_splits(

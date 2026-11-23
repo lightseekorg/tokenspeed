@@ -236,6 +236,20 @@ _FUSED_HEADS = 32
 _FUSED_TILE = 128
 
 
+def _fused_index_pages(cache: torch.Tensor) -> torch.Tensor:
+    """View the packed index keys as TMA pages without copying their padding."""
+    if cache is None or cache.dtype != torch.uint8 or cache.stride(-1) != 1:
+        raise ValueError("index-K cache must hold packed uint8 pages")
+    pages = cache.view(-1, _FUSED_PAGE * _FUSED_ROW_BYTES)
+    if (
+        pages.data_ptr() % 16
+        or pages.stride(0) % 16
+        or pages.stride(0) < pages.shape[1]
+    ):
+        raise ValueError("index-K pages require 16-byte aligned storage and strides")
+    return pages
+
+
 def _fused_outputs(
     out: torch.Tensor | None,
     lens_out: torch.Tensor | None,
@@ -298,7 +312,7 @@ def fused_decode_topk_scores(
         seq_lens: int32 ``[requests]`` request lengths, unit stride
             (``requests = tokens / q_len_per_req``).
         block_table: int32 ``[requests, pages]`` page table, unit column stride.
-        index_k_cache: contiguous packed uint8 index-K plane ``[slots, 132]``.
+        index_k_cache: Packed uint8 keys/scales, flat or in strided 64-token pages.
         q_len_per_req: Query rows per request (1-8).
         topk: Keys selected per row.
         out: int32 ``[tokens, topk]`` slot rows, unit column stride; written.
@@ -309,6 +323,7 @@ def fused_decode_topk_scores(
         int32 8-key maxima (indexer.py describes the layout). Rows of requests
         no longer than ``topk`` are not scored.
     """
+    index_k_cache = _fused_index_pages(index_k_cache)
     tokens = q_fp8.shape[0]
     device = q_fp8.device
     width = block_table.shape[1]
@@ -378,7 +393,7 @@ if _fused_indexer is not None:
             "page_size": frozenset({_FUSED_PAGE}),
             "topk": frozenset({2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
             "slot_order": frozenset({"selection", "sorted"}),
         },
         # Opt-in: below every other leaf, so only solution="cute_dsl" selects it.
@@ -427,7 +442,7 @@ if _fused_indexer is not None:
             q_len_per_req: Query rows per request (1-8).
             slot_order: ``"selection"`` or ``"sorted"``; both emit ascending
                 positions, which is this leaf's selection order.
-            index_k_cache: Contiguous packed uint8 index-K plane ``[slots, 132]``.
+            index_k_cache: Packed uint8 keys/scales, flat or in strided 64-token pages.
             seq_lens_2d: The DeepGEMM scoring extent of other leaves; unused, the
                 scorer schedules from ``seq_lens`` on the device.
             plan: The DeepGEMM schedule of other leaves; unused, as above.
@@ -461,19 +476,6 @@ if _fused_indexer is not None:
             raise ValueError(
                 "the fused DSA decode top-k takes [tokens, 32, 128] queries over "
                 f"64-key pages, got {tuple(q.shape)} and page_size={page_size}"
-            )
-        if (
-            index_k_cache is None
-            or index_k_cache.dtype != torch.uint8
-            or index_k_cache.dim() != 2
-            or index_k_cache.shape[1] != _FUSED_ROW_BYTES
-            or index_k_cache.shape[0] % _FUSED_PAGE
-            or not index_k_cache.is_contiguous()
-            or index_k_cache.data_ptr() % 16
-        ):
-            raise ValueError(
-                "the fused DSA decode top-k reads a contiguous, 16-byte aligned "
-                "packed uint8 index-K plane [slots, 132] of whole pages"
             )
         if (
             seq_lens.dtype != torch.int32
@@ -618,7 +620,7 @@ if _decode_front is not None:
             "head_dim": frozenset({128}),
             "page_size": frozenset({_FUSED_PAGE}),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -671,8 +673,8 @@ if _decode_front is not None:
             key_norm_weight: ``[128]`` FP32 or BF16 index-key LayerNorm weight.
             key_norm_bias: ``[128]`` index-key LayerNorm bias, same dtype.
             key_norm_eps: The index-key LayerNorm epsilon.
-            index_k_cache: Contiguous packed uint8 ``fp8_scaled`` plane
-                ``[slots, 132]`` of whole pages, 16-byte aligned.
+            index_k_cache: Packed uint8 ``fp8_scaled`` plane ``[slots, 132]``
+                or ``[pages, 64, 132]``, with 16-byte aligned page strides.
             slots: Contiguous int64 or int32 ``[rows]`` non-negative plane
                 slots, or virtual slots under ``slot_owner``.
             slot_owner: None, or ``virtual_slots_to_local``'s ``(rows_per_page,
@@ -735,19 +737,9 @@ if _decode_front is not None:
                 "the index-key LayerNorm weight and bias must be contiguous [128] "
                 "FP32 or BF16 of one dtype"
             )
-        if (
-            int(page_size) != _FUSED_PAGE
-            or index_k_cache.dtype != torch.uint8
-            or index_k_cache.dim() != 2
-            or index_k_cache.shape[1] != _FUSED_ROW_BYTES
-            or index_k_cache.shape[0] % _FUSED_PAGE
-            or not index_k_cache.is_contiguous()
-            or index_k_cache.data_ptr() % 16
-        ):
-            raise ValueError(
-                "the fused decode front writes a contiguous, 16-byte aligned packed "
-                "uint8 index-K plane [slots, 132] of whole 64-slot pages"
-            )
+        if int(page_size) != _FUSED_PAGE:
+            raise ValueError("the fused decode front writes 64-slot index-K pages")
+        index_k_cache = _fused_index_pages(index_k_cache)
         if (
             slots.shape != (rows,)
             or slots.dtype not in (torch.int64, torch.int32)
@@ -861,6 +853,7 @@ if _fused_indexer is not None:
         rank: int,
         topk: int,
         page_size: int,
+        output_page_stride: int,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -934,6 +927,7 @@ if _fused_indexer is not None:
             rank=rank,
             topk=topk,
             page_size=page_size,
+            output_page_stride=output_page_stride,
             out=out,
             lens_out=lens_out,
         )
@@ -964,7 +958,7 @@ if _fused_indexer is not None:
             "topk": frozenset({1024, 2048, 3072, 4096}),
             "query_group_size": frozenset(range(1, 9)),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -1008,19 +1002,9 @@ if _fused_indexer is not None:
         """
         rows, device = q.shape[0], q.device
         group = int(query_group_size)
-        if (
-            int(page_size) != _FUSED_PAGE
-            or index_k_cache.dtype != torch.uint8
-            or index_k_cache.dim() != 2
-            or index_k_cache.shape[1] != _FUSED_ROW_BYTES
-            or index_k_cache.shape[0] % _FUSED_PAGE
-            or not index_k_cache.is_contiguous()
-            or index_k_cache.data_ptr() % 16
-        ):
-            raise ValueError(
-                "KVP decode candidates read a contiguous, 16-byte aligned packed "
-                "uint8 index-K plane [slots, 132] of whole 64-slot pages"
-            )
+        if int(page_size) != _FUSED_PAGE:
+            raise ValueError("KVP decode candidates read 64-slot index-K pages")
+        index_k_cache = _fused_index_pages(index_k_cache)
         if rows % group or pages.lengths.shape != (rows, 1):
             raise ValueError(
                 f"{rows} decode rows need {group}-row request groups and their "

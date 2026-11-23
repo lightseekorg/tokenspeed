@@ -25,10 +25,10 @@ are dense and pin the smallest packing whose plane width covers one per-layer
 KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
 groups pack to match the MLA plane's byte width so no parent is wasted.
 
-Kimi-K3.1 (a DSA target config) adds one index-K plane per MLA target layer
-in the full-attention group, beside its latent plane: the index keys share
-the latent rows' pages, prefix matches, transfers and lifetime. Index-K
-planes hold no KDA state, so they do not change the packing.
+Kimi-K3.1 combines each MLA layer's latent KV and index keys in one plane,
+using native 64-token DSA pages. Packing covers both fields, so KDA state
+can reuse the whole plane. Whole-row page alignment lets token-sparse
+attention address the latent rows without copying the cache.
 
 A draft's layers join the full-attention group: MLA latent planes for an MLA
 draft, K and V planes for a GQA (MHA) block draft. A GQA block draft whose
@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_bytes,
+    dsa_kernel_page_size,
     dsa_kvp_history_prefill,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
@@ -270,7 +271,11 @@ class KimiK3Recipe(CacheRecipe):
         return tuple(
             (
                 (
-                    replace(spec, shard_count=shard_count)
+                    replace(
+                        spec,
+                        rows_per_page=self.history_page_size,
+                        shard_count=shard_count,
+                    )
                     if spec.group_id == FULL_ATTENTION
                     else spec
                 ),
@@ -287,22 +292,20 @@ class KimiK3Recipe(CacheRecipe):
         return _KIMI_K3_PREFIX_GRANULARITY
 
     @property
+    def history_page_size(self) -> int:
+        if self.attn_config.component(DSAConfig) is not None:
+            return dsa_kernel_page_size(self.attn_config)
+        return _KIMI_K3_PREFIX_GRANULARITY
+
+    @property
     @override
     def max_padding_fraction(self) -> float:
-        # Draft MLA and K3.1 index-K planes widen the arena past the target-only bound.
-        if self.num_draft_layers or self.num_index_k_planes:
+        # Draft MLA planes widen the arena past the target-only bound.
+        if self.num_draft_layers:
             return float("inf")
         return 0.25
 
     # ---- fields ----
-
-    @cached_property
-    def num_index_k_planes(self) -> int:
-        """Index-K planes: one per target MLA layer under a DSA target
-        config (Kimi-K3.1), none for Kimi-K3. Draft layers never get one."""
-        if not isinstance(self.attn_config.component(MLAConfig), DSAConfig):
-            return 0
-        return sum(group_id == FULL_ATTENTION for group_id in self.target_group_ids)
 
     @cached_property
     def _kda_shapes(self):
@@ -364,21 +367,31 @@ class KimiK3Recipe(CacheRecipe):
                 # A GQA block draft (the target's layers are always MLA): K
                 # and V pages in planes of their own, at this plan's page size.
                 return mha_layer_fields(
-                    config, self.prefix_granularity, layer_id, occurrence
+                    config, self.history_page_size, layer_id, occurrence
                 )
             spec = config.component(MLAConfig)
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             latent = CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",
                 plane_id,
-                (self.prefix_granularity, 1, latent_width),
+                (self.history_page_size, 1, latent_width),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             )
             if isinstance(spec, DSAConfig):
-                # Own plane (latent stride = payload), same group: moves with latent.
+                # Token-sparse TMA gathers address whole latent rows. Include
+                # the index keys in that row-aligned page stride.
                 return (
-                    latent,
-                    index_k_field(config, self.prefix_granularity, layer_id),
+                    replace(
+                        latent,
+                        exact_page_stride=False,
+                        page_stride_alignment_bytes=latent.payload_bytes
+                        // self.history_page_size,
+                    ),
+                    replace(
+                        index_k_field(config, self.history_page_size, layer_id),
+                        plane_id=plane_id,
+                        exact_page_stride=False,
+                    ),
                 )
             return (latent,)
         conv_shape, recurrent_shape = self._kda_shapes
@@ -404,11 +417,17 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        # First MLA layer's latent page: KDA state rides beside it in plane slot.0.
-        mla_page_bytes = sum(
-            field.payload_bytes
+        full_fields = tuple(
+            field
             for field in fields_by_group[FULL_ATTENTION]
             if field.plane_id == "slot.0"
+        )
+        full_page_alignment = math.lcm(
+            *(field.page_stride_alignment_bytes for field in full_fields)
+        )
+        full_page_bytes = (
+            -(-sum(field.payload_bytes for field in full_fields) // full_page_alignment)
+            * full_page_alignment
         )
         first_state = f"{LINEAR_ATTENTION}_0"
         linear_plane_bytes = sum(
@@ -421,11 +440,11 @@ class KimiK3Recipe(CacheRecipe):
         # parent granularity. Attn tp=8 gives the historical 12; attention-DP
         # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
         # while larger tp shrinks the state and the parent with it.
-        mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
-        linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
+        full_packing = max(1, -(-linear_plane_bytes // full_page_bytes))
+        linear_packing = max(1, full_packing * full_page_bytes // linear_plane_bytes)
         packing = {
             spec.group_id: (
-                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
+                full_packing if spec.group_id == FULL_ATTENTION else linear_packing
             )
             for spec, _ in groups
         }
@@ -434,28 +453,31 @@ class KimiK3Recipe(CacheRecipe):
             # KVP does not shard the group, so a sharded arena holds fewer
             # window tokens per parent than history tokens.
             key = fields_by_group[DRAFT_SLIDING_ATTENTION][0]
-            mla_plane_bytes = mla_packing * mla_page_bytes
+            full_plane_bytes = full_packing * full_page_bytes
+            plane_alignment = math.lcm(
+                self.alignment, full_packing * full_page_alignment
+            )
+            full_plane_bytes = -(-full_plane_bytes // plane_alignment) * plane_alignment
             stride_unit = math.lcm(key.element_size, key.page_stride_alignment_bytes)
             draft_packing = next(
                 (
                     count
-                    for count in range(mla_plane_bytes // key.payload_bytes, 0, -1)
-                    if mla_plane_bytes % (count * stride_unit) == 0
+                    for count in range(full_plane_bytes // key.payload_bytes, 0, -1)
+                    if full_plane_bytes % (count * stride_unit) == 0
                 ),
                 None,
             )
             if draft_packing is None:
                 raise ValueError(
                     f"a draft K page of {key.payload_bytes} bytes does not fit "
-                    f"the {mla_plane_bytes}-byte MLA plane"
+                    f"the {full_plane_bytes}-byte MLA plane"
                 )
             packing[DRAFT_SLIDING_ATTENTION] = draft_packing
         return packing
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        """One plane per MLA layer, the planes of a draft in the MLA group,
-        and one index-K plane per DSA layer -- no more.
+        """One plane per MLA layer, plus a draft's full-attention planes.
 
         The KDA state groups pack to the MLA plane's byte width precisely so
         they ride inside those planes; a plane of their own means the packing
@@ -482,12 +504,11 @@ class KimiK3Recipe(CacheRecipe):
         num_draft_planes = (
             0 if draft_slides else planes_per_draft_layer * self.num_draft_layers
         )
-        expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
+        expected = num_mla_layers + num_draft_planes
         if len(layout.plane_bytes) != expected:
             raise ValueError(
                 f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {num_draft_planes} draft planes and "
-                f"{self.num_index_k_planes} index-K planes, got "
+                f"MLA layer) plus {num_draft_planes} draft planes, got "
                 f"{len(layout.plane_bytes)}"
             )
         if draft_slides:
@@ -552,6 +573,6 @@ class KimiK3Recipe(CacheRecipe):
                 num_lcm_blocks
                 * full_packing
                 * self._shard_counts[FULL_ATTENTION]
-                * layout.prefix_granularity
+                * self.history_page_size
             )
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)

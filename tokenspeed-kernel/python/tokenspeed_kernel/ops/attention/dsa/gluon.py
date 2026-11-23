@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import remap_cache_slots
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -32,6 +34,36 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+
+def _physical_cache_rows(kwargs):
+    cache = kwargs["kv_cache"]
+    if cache is None or cache.is_contiguous():
+        return kwargs
+    pages = cache
+    if pages.ndim == 4:
+        pages = pages.squeeze(1 if pages.shape[1] == 1 else 2)
+    if pages.ndim == 2:
+        pages = pages.unsqueeze(1)
+    # Other strided row layouts retain the Gluon adapter's existing materialization.
+    if (
+        pages.stride(-1) != 1
+        or pages.stride(1) != pages.shape[-1]
+        or pages.stride(0) % pages.shape[-1]
+    ):
+        return kwargs
+    flat, page_size, page_stride = flatten_paged_latent_cache(cache)
+    return {
+        **kwargs,
+        "kv_cache": flat,
+        "topk_slots": remap_cache_slots(
+            kwargs["topk_slots"],
+            page_size=page_size,
+            page_stride=page_stride,
+            lengths=None,
+        ),
+    }
+
 
 if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048, 2049, 2050, 2051})
@@ -325,7 +357,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"bf16"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_decode_topk_bf16_gfx950(*args, **kwargs):
@@ -357,7 +389,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"bf16"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_prefill_topk_bf16_gfx950(*args, **kwargs):
@@ -466,7 +498,9 @@ if current_platform().is_amd:
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_decode_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
+        return _dsa_decode_impl(
+            *args, warm_split_variants=is_warming_up(), **_physical_cache_rows(kwargs)
+        )
 
     @register_kernel(
         "attention",
@@ -514,7 +548,7 @@ if current_platform().is_amd:
     def gluon_dsa_decode_dcp_records_gfx950(**kwargs):
         """``gluon_dsa_decode_gfx950``'s dense core on a rank-major query,
         its split reduction writing the DCP records."""
-        return _dsa_decode_records_impl(**kwargs)
+        return _dsa_decode_records_impl(**_physical_cache_rows(kwargs))
 
     @register_kernel(
         "attention",
@@ -548,7 +582,9 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
+        return _dsa_prefill_impl(
+            *args, warm_split_variants=is_warming_up(), **_physical_cache_rows(kwargs)
+        )
 
     @register_kernel(
         "attention",
@@ -583,7 +619,9 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_impl(*args, warm_split_variants=is_warming_up(), **kwargs)
+        return _dsa_prefill_impl(
+            *args, warm_split_variants=is_warming_up(), **_physical_cache_rows(kwargs)
+        )
 
     @register_kernel(
         "attention",
@@ -755,7 +793,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_decode_gfx1250_impl(*args, **kwargs)
+        return _dsa_decode_gfx1250_impl(*args, **_physical_cache_rows(kwargs))
 
     @register_kernel(
         "attention",
@@ -789,7 +827,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_gfx1250_impl(*args, **kwargs)
+        return _dsa_prefill_gfx1250_impl(*args, **_physical_cache_rows(kwargs))
 
     @register_kernel(
         "attention",
@@ -824,7 +862,7 @@ if current_platform().is_amd:
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         kwargs.pop("kv_seq_lens", None)
-        return _dsa_prefill_gfx1250_impl(*args, **kwargs)
+        return _dsa_prefill_gfx1250_impl(*args, **_physical_cache_rows(kwargs))
 
     from tokenspeed_kernel.ops.attention.dsa import (
         INDEX_CANDIDATE_PAGES_FEATURE,
@@ -1019,6 +1057,7 @@ if current_platform().is_amd:
         rank: int,
         topk: int,
         page_size: int,
+        output_page_stride: int,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1032,6 +1071,7 @@ if current_platform().is_amd:
             rank=rank,
             topk=topk,
             page_size=page_size,
+            output_page_stride=output_page_stride,
             out=out,
             lens_out=lens_out,
         )

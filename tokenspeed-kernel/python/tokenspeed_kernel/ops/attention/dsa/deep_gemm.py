@@ -527,7 +527,7 @@ if _HAS_DEEP_GEMM:
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         priority=Priority.PERFORMANT,
     )
@@ -697,7 +697,7 @@ if _HAS_DEEP_GEMM:
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         priority=Priority.PERFORMANT,
     )
@@ -743,26 +743,14 @@ if _HAS_DEEP_GEMM:
             hd = q.shape[-1]
             num_groups = hd // 128
             row_bytes = hd + num_groups * 4
-            flat = index_k_cache.reshape(-1)
-            fp8_view = torch.as_strided(
-                flat.view(q_fp8.dtype),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    hd,
-                ),
-                (int(page_size) * row_bytes, hd, 1),
+            pages = index_k_cache.view(-1, page_size * row_bytes)
+            fp8_view = (
+                pages[:, : page_size * hd].view(q_fp8.dtype).view(-1, page_size, hd)
             )
-            scale_view = torch.as_strided(
-                flat.view(torch.int32 if _MX_SCORING else torch.float32),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    num_groups,
-                ),
-                ((int(page_size) * row_bytes) // 4, num_groups, 1),
-                # as_strided offsets are storage-absolute; planes can start mid-arena.
-                (flat.storage_offset() + int(page_size) * hd) // 4,
+            scale_view = (
+                pages[:, page_size * hd :]
+                .view(torch.int32 if _MX_SCORING else torch.float32)
+                .view(-1, page_size, num_groups)
             )
             slots = kv_workspace_slots.to(device=q.device, dtype=torch.long)
             index_k_fp8 = fp8_view[slots // int(page_size), slots % int(page_size)]
@@ -876,7 +864,7 @@ if _HAS_DEEP_GEMM:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
-            "index_k_layout": frozenset({"packed"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def deep_gemm_dsa_index_candidates(

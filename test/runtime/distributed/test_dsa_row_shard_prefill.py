@@ -124,7 +124,7 @@ def _worker(rank: int, rendezvous: str) -> None:
         process_group_manager.register_process_group("nccl", (0, 1), dist.group.WORLD)
         set_global_backend(AutoBackend())
         torch.manual_seed(5)
-        pool, _ = k31._k31_pool("cuda", num_lcm_blocks=1)
+        pool, _ = k31._k31_pool("cuda", token_capacity=1536)
         local_heads = _HEADS // 2
         layer = k31._mla_layer(local_heads)
         slots = k31._slots([4, 11, 1], _ROWS, "cuda")
