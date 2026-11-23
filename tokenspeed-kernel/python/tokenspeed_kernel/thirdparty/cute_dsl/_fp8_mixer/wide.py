@@ -46,7 +46,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _make_down_operands,
     _mul_hidden_float_pair,
     _operand_at,
-    _reduce_split_partials,
     _store_private_epoch,
     _wait_residual,
     _x_scale,
@@ -59,6 +58,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.raw_issue import (
 )
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
     MixerOperands,
+    QuantizationConfig,
     ResidentMixer,
     _mixer_cta,
     _mixer_shared,
@@ -146,67 +146,6 @@ def _transpose_store_packet(
                     values[low] = received
                 else:
                     values[high] = received
-
-
-@cute.experimental.jit
-def _largest_magnitude_pair(previous, first, second):
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [previous.ir_value(), first.ir_value(), second.ir_value()],
-            "max.abs.f32 $0, $1, $2, $3;",
-            "=f,f,f,f",
-            has_side_effects=False,
-            asm_dialect=0,
-        )
-    )
-
-
-@cute.experimental.jit
-def _rounded_quant_scales(maximum):
-    """Compute the original FP32 scales for a BF16/FP16 row maximum."""
-    # Clamp the maximum at 1/512. Scale the denominator by 1/64 so the
-    # reciprocal is normal even at the largest finite BF16 maximum.
-    # The residual FMA corrects the starting quotient before its final round.
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32()]),
-        [maximum.ir_value()],
-        "{ .reg .f32 x, a, a_err, den, rec, m, m_err, neg_den; .reg .pred infinite;"
-        "max.f32 x, $2, 0f3B000000;"
-        "setp.eq.f32 infinite, x, 0f7F800000;"
-        "mul.rn.f32 a, x, 0f3B124925;"
-        "fma.rn.f32 a_err, a, 0fC3E00000, x;"
-        "fma.rn.f32 a, a_err, 0f3B124925, a;"
-        "mul.rn.f32 den, x, 0f3C800000;"
-        "rcp.approx.f32 rec, den;"
-        "mul.rn.f32 m, rec, 0f40E00000;"
-        "neg.f32 neg_den, den;"
-        "fma.rn.f32 m_err, neg_den, m, 0f40E00000;"
-        "fma.rn.f32 m, m_err, rec, m;"
-        "selp.f32 $0, x, a, infinite;"
-        "selp.f32 $1, 0f00000000, m, infinite; }",
-        "=f,=f,f",
-        has_side_effects=False,
-        asm_dialect=0,
-    )
-    return (
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [0])),
-        cutlass.Float32(llvm.extractvalue(T.f32(), result, [1])),
-    )
-
-
-@cute.experimental.jit
-def _quant_lower_clamp(value):
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [value.ir_value()],
-            "max.f32 $0, $1, 0fC3E00000;",
-            "=f,f",
-            has_side_effects=False,
-            asm_dialect=0,
-        )
-    )
 
 
 @cute.experimental.jit
@@ -1091,7 +1030,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         ) and token_bucket != 128:
             raise ValueError("The quantization handoff experiment requires wide128")
         self.up_wait_once = up_wait_once
-        self.quant_max_join = quant_max_join
         self.quant_publication = quant_publication
         if len(entry_scale_prefetches) != 3 or any(
             type(item) is not bool for item in entry_scale_prefetches
@@ -1234,12 +1172,24 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         )
         if quant_scale_mode not in ("original", "clamp", "scales", "scales_clamp"):
             raise ValueError("Invalid quantization scale policy")
-        self.quant_scale_mode = quant_scale_mode
         if quant_max_mode not in ("shuffle", "warp", "warp_local"):
             raise ValueError("An explicit quantization maximum policy is required")
         if quant_max_mode == "warp_local" and self.quant_columns % 2:
             raise ValueError("Local magnitude reduction requires complete pairs")
-        self.quant_max_mode = quant_max_mode
+        self.quantization = QuantizationConfig(
+            threads=self.compute_threads,
+            maximum_threads=self.quant_threads,
+            injection_start=self.compute_threads,
+            column_stride=8 if self.native_down_partials else 1,
+            warp_max="pair" if quant_max_mode == "warp_local" else "redux",
+            replicate_maximum=quant_max_join != "native",
+            refined_scales=quant_scale_mode in ("scales", "scales_clamp"),
+            clamp=(
+                "ptx_lower" if quant_scale_mode in ("clamp", "scales_clamp") else "both"
+            ),
+            activation_store="native",
+            release_writes=False,
+        )
         self.up_hidden = 64
         self.up_channels = self.up_hidden * g
         if up_weight_is_packed and (
@@ -1920,22 +1870,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         return phase_base, row, None
 
     @cute.experimental.jit
-    def _quantize_row(self, io, cta, state, quant, phase_base, global_base, row):
-        self._epilogue(
-            io.partials,
-            io.xs,
-            io.ds,
-            io.activation,
-            io.alpha,
-            io.out,
-            io.inject,
-            global_base,
-            row,
-            io.x.shape[0],
-            row + cta.count * self.quant_rows < self.n,
-        )
-
-    @cute.experimental.jit
     def _finish_quantization(self, io, cta, state, phase_base, quant):
         _publish_activation_proxy()
         activation_target = (phase_base + 2) * cta.count
@@ -2023,37 +1957,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         return phase_base
 
     @cute.experimental.jit
-    def _partials(
-        self,
-        partial,
-        row,
-        col,
-        columns: cutlass.Constexpr,
-        injection: cutlass.Constexpr,
-    ):
-        pieces = cute.make_rmem_tensor((columns, self.splits), cutlass.Float32)
-        row = cutlass.Int64(row)
-        stride = cutlass.Int64(partial.shape[1]) * self.p
-        base = partial.iterator + row * self.p + col
-        if cutlass.const_expr(self.native_down_partials):
-            # The quantizer reads one native packet per split and picks its row.
-            even_row = row - row % 2
-            packed_col = 2 * col
-            if cutlass.const_expr(not injection):
-                packed_col += 2 * (col % 8)
-            base = partial.iterator + even_row * self.p + packed_col
-        return _reduce_split_partials(
-            pieces, base, stride, row, self.native_down_partials
-        )
-
-    @cute.experimental.jit
-    def _quant_warp_max(self, value):
-        return cute.arch.warp_redux_sync(
-            value, "fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
-        )
-        return cute.arch.warp_reduction_max(value, threads_in_group=32)
-
-    @cute.experimental.jit
     def _prefetch_scale_line(self, pointer):
         llvm.inline_asm(
             None,
@@ -2083,168 +1986,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
                 offset = lane * 8
                 if (offset < self.n) & (offset < xs.shape[0]):
                     self._prefetch_scale_line(xs.iterator + offset)
-
-    @cute.experimental.jit
-    def _row_maximum(self, shared, group, lane, row_warps: cutlass.Constexpr):
-        maximum = cutlass.Float32(0.0)
-        if lane < row_warps:
-            maximum = shared[group, lane]
-        return self._quant_warp_max(maximum)
-
-    @cute.experimental.jit
-    def _activation_scales(self, maximum):
-        if cutlass.const_expr(self.quant_scale_mode in ("scales", "scales_clamp")):
-            scale, multiplier = _rounded_quant_scales(maximum)
-        else:
-            scale = cute.math.max(
-                maximum / cutlass.Float32(448.0),
-                cutlass.Float32(1.0 / (448.0 * 512.0)),
-            )
-            multiplier = cute.math.min(
-                cutlass.Float32(448.0) / maximum,
-                cutlass.Float32(448.0 * 512.0),
-            )
-        return scale, multiplier
-
-    @cute.experimental.jit
-    def _epilogue(
-        self,
-        partial,
-        xs,
-        ds,
-        activation,
-        alpha,
-        out,
-        inject,
-        global_base,
-        row_base,
-        rows,
-        more_local_rows,
-    ):
-        tid = cute.arch.thread_idx()[0]
-        if cutlass.const_expr(self.p > self.r):
-            if tid >= 512 and tid < 512 + self.quant_rows * (self.g // 2):
-                inject_lane = tid - 512
-                row = row_base
-                if cutlass.const_expr(self.quant_rows > 1):
-                    row = row_base + cutlass.Int64(inject_lane // (self.g // 2))
-                global_row = global_base + row
-                inject_col = (inject_lane % (self.g // 2)) * 2
-                if global_row < rows:
-                    input_scale = _x_scale(xs, global_row)
-                    weight_scales = cute.make_rmem_tensor(2, cutlass.Float32)
-                    for i in cutlass.range_constexpr(2):
-                        weight_scales[i] = ds[
-                            self.r + inject_col + i if self.down_per_channel else 0
-                        ]
-                    values = self._partials(
-                        partial, row, self.r + inject_col, 2, injection=True
-                    )
-                    for i in cutlass.range_constexpr(2):
-                        value = values[i] * input_scale
-                        value = value * weight_scales[i]
-                        inject[global_row, inject_col + i] = (value * self.scale).to(
-                            out.element_type
-                        )
-        if tid < 512:
-            group = cutlass.Int32(0)
-            local_tid = tid
-            row = row_base
-            if cutlass.const_expr(self.quant_rows > 1):
-                group = tid // self.quant_threads
-                local_tid = tid % self.quant_threads
-                row = row_base + cutlass.Int64(group)
-            global_row = global_base + row
-            col = local_tid * self.quant_columns
-            column_stride = 1
-            if cutlass.const_expr(self.native_down_partials):
-                col = (local_tid // 8) * 16 + local_tid % 8
-                column_stride = 8
-            rounded = cute.make_rmem_tensor(self.quant_columns, out.element_type)
-            rounded.fill(0.0)
-            if global_row < rows and col < self.r:
-                input_scale = _x_scale(xs, global_row)
-                weight_scales = cute.make_rmem_tensor(
-                    self.quant_columns, cutlass.Float32
-                )
-                for i in cutlass.range_constexpr(self.quant_columns):
-                    weight_scales[i] = ds[
-                        col + i * column_stride if self.down_per_channel else 0
-                    ]
-                values = self._partials(
-                    partial, row, col, self.quant_columns, injection=False
-                )
-                for i in cutlass.range_constexpr(self.quant_columns):
-                    value = values[i] * input_scale
-                    value = value * weight_scales[i]
-                    value = value * self.scale
-                    value = value * cute.arch.rcp_approx(
-                        1.0 + cute.exp(-value, fastmath=True)
-                    )
-                    rounded[i] = value.to(out.element_type)
-            row_warps = self.quant_threads // 32
-            shared = cute_ext.allocate(
-                cutlass.Float32,
-                cute.AddressSpace.smem,
-                cute.make_layout(
-                    (self.quant_rows, row_warps + 2), stride=(row_warps + 2, 1)
-                ),
-                alignment=32,
-            )
-            maximum = cutlass.Float32(0.0)
-            if cutlass.const_expr(self.quant_max_mode == "warp_local"):
-                for pair in cutlass.range_constexpr(self.quant_columns // 2):
-                    maximum = _largest_magnitude_pair(
-                        maximum,
-                        rounded[2 * pair].to(cutlass.Float32),
-                        rounded[2 * pair + 1].to(cutlass.Float32),
-                    )
-            else:
-                for i in cutlass.range_constexpr(self.quant_columns):
-                    maximum = cute.math.max(
-                        maximum, cute.math.abs(rounded[i].to(cutlass.Float32))
-                    )
-            maximum = self._quant_warp_max(maximum)
-            if local_tid % 32 == 0:
-                shared[group, local_tid // 32] = maximum
-            # Each row group has its own maximum and named barrier.
-            _epilogue_barrier(self.quant_threads, cutlass.Int32(5 + group))
-            multiplier = cutlass.Float32(0.0)
-            if cutlass.const_expr(self.quant_max_join == "native"):
-                if local_tid < 32:
-                    maximum = self._row_maximum(shared, group, local_tid, row_warps)
-                    if local_tid == 0:
-                        scale, multiplier = self._activation_scales(maximum)
-                        alpha[row] = scale
-                        shared[group, row_warps + 1] = multiplier
-                _epilogue_barrier(self.quant_threads, cutlass.Int32(5 + group))
-                if col < self.r:
-                    multiplier = shared[group, row_warps + 1]
-            else:
-                # All quantization warps reuse the same list of published maxima.
-                lane = local_tid % 32
-                maximum = self._row_maximum(shared, group, lane, row_warps)
-                scale = cutlass.Float32(0.0)
-                scale, multiplier = self._activation_scales(maximum)
-                if local_tid == 0:
-                    alpha[row] = scale
-            if col < self.r:
-                for i in cutlass.range_constexpr(self.quant_columns):
-                    value = rounded[i].to(cutlass.Float32) * multiplier
-                    if cutlass.const_expr(
-                        self.quant_scale_mode in ("clamp", "scales_clamp")
-                    ):
-                        # Keep the original bounded NaN choice. Conversion saturates high values.
-                        value = _quant_lower_clamp(value)
-                    else:
-                        value = cute.math.min(
-                            cute.math.max(value, cutlass.Float32(-448.0)),
-                            cutlass.Float32(448.0),
-                        )
-                    activation[row, col + i * column_stride] = value.to(
-                        cutlass.Float8E4M3FN
-                    )
-        cute.arch.sync_threads()
 
     @cute.experimental.jit
     def _load_hidden_pair(self, tensor, offset, dtype: cutlass.Constexpr):

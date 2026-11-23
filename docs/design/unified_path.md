@@ -748,13 +748,15 @@ stage reuse. PDL waits precede reads of producer-owned data.
 The launch plans take model dimensions from the operator. Startup warms
 finite bucket variants with the ordinary dispatch. Actual row counts control
 masks and additional token rounds at runtime. The prequantized schedules
-compile from a shared resident loop for Down, quantization, and Up. They
-also share the TMEM readers and token-major Up epilogue. Each schedule owns
-its operand binding and stage handoff. The compact 16-token injection plan
-publishes epoch-tagged activation records so Up can start on the first K
-plane. The full K128 Up schedule can issue weight loads as Down releases its
-operand stages. At 256 tokens it can share weight stages across both token
-parts.
+compile from a shared resident loop for Down, quantization, and Up. The
+shared quantizer reduces split-K partials, applies SiLU and rounds before
+per-row E4M3 encoding. Each schedule selects its partial layout, row
+reduction and activation publication at compile time. The schedules also
+share the TMEM readers and token-major Up epilogue. The compact 16-token
+injection plan publishes epoch-tagged activation records so Up can start on
+the first K plane. The full K128 Up schedule can issue weight loads as Down
+releases its operand stages. At 256 tokens it can share weight stages across
+both token parts.
 
 The weight preparation helper can build a tiled Up weight for the SM103
 full K128 injection schedule through 128 tokens. The owner refreshes the

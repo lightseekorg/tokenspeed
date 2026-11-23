@@ -36,13 +36,13 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _load_f32,
     _make_down_operands,
     _operand_at,
-    _reduce_split_partials,
     _release,
     _wait_residual,
     _x_scale,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
     MixerOperands,
+    QuantizationConfig,
     ResidentMixer,
     _mixer_cta,
     _mixer_shared,
@@ -343,6 +343,20 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
             0 if self.token_major_up else token_bucket * self.up_channels * 4,
         )
         self.down_token_parts = self.quant_rows = 1
+        self.quant_threads = 512
+        self.quant_columns = 2
+        self.quantization = QuantizationConfig(
+            threads=self.quant_threads,
+            maximum_threads=self.quant_threads,
+            injection_start=0,
+            column_stride=1,
+            warp_max="shuffle",
+            replicate_maximum=False,
+            refined_scales=False,
+            clamp="both",
+            activation_store="native",
+            release_writes=False,
+        )
         self.mma_warp = 17
         self.down_barrier_count = 2 * self.down.stages + 2
         self.barrier_count = max(2 * down_stages + 2, self.up_barrier_count)
@@ -458,21 +472,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         return generation, row, None
 
     @cute.experimental.jit
-    def _quantize_row(self, io, cta, state, quant, generation, global_base, row):
-        self._epilogue(
-            io.partials,
-            io.xs,
-            io.ds,
-            io.activation,
-            io.alpha,
-            io.out,
-            io.inject,
-            global_base,
-            row,
-            io.x.shape[0],
-        )
-
-    @cute.experimental.jit
     def _finish_quantization(self, io, cta, state, generation, quant):
         _publish_activation_proxy()
         _grid_barrier(io.epochs, ((generation - 1) * 3 + 2) * cta.count, True)
@@ -508,90 +507,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         _grid_barrier(io.epochs, generation * 3 * cta.count, more_rounds)
         generation = generation + 1
         return generation
-
-    @cute.experimental.jit
-    def _partials(self, partial, row, col):
-        pieces = cute.make_rmem_tensor((2, self.splits), cutlass.Float32)
-        row = cutlass.Int64(row)
-        stride = cutlass.Int64(partial.shape[1]) * self.p
-        base = partial.iterator + row * self.p + col
-        return _reduce_split_partials(pieces, base, stride, row, False)
-
-    @cute.experimental.jit
-    def _epilogue(
-        self, partial, xs, ds, activation, alpha, out, inject, global_base, row, rows
-    ):
-        tid = cute.arch.thread_idx()[0]
-        if tid < 512:
-            col = tid * 2
-            global_row = global_base + row
-            rounded = cute.make_rmem_tensor(2, out.element_type)
-            rounded.fill(0.0)
-            if global_row < rows:
-                if cutlass.const_expr(self.p > self.r):
-                    if tid < self.g // 2:
-                        values = self._partials(partial, row, self.r + col)
-                        for i in cutlass.range_constexpr(2):
-                            value = values[i] * _x_scale(xs, global_row)
-                            value = (
-                                value
-                                * ds[self.r + col + i if self.down_per_channel else 0]
-                            )
-                            inject[global_row, col + i] = (value * self.scale).to(
-                                out.element_type
-                            )
-                if col < self.r:
-                    values = self._partials(partial, row, col)
-                    for i in cutlass.range_constexpr(2):
-                        value = values[i] * _x_scale(xs, global_row)
-                        value = value * ds[col + i if self.down_per_channel else 0]
-                        value = value * self.scale
-                        value = value * cute.arch.rcp_approx(
-                            1.0 + cute.exp(-value, fastmath=True)
-                        )
-                        rounded[i] = value.to(out.element_type)
-            shared = cute_ext.allocate(
-                cutlass.Float32,
-                cute.AddressSpace.smem,
-                cute.make_layout(18),
-                alignment=32,
-            )
-            maximum = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(2):
-                maximum = cute.math.max(
-                    maximum, cute.math.abs(rounded[i].to(cutlass.Float32))
-                )
-            maximum = cute.arch.warp_reduction_max(maximum, threads_in_group=32)
-            if tid % 32 == 0:
-                shared[tid // 32] = maximum
-            _epilogue_barrier(512, cutlass.Int32(5))
-            if tid < 32:
-                maximum = cutlass.Float32(0.0)
-                if tid < 16:
-                    maximum = shared[tid]
-                maximum = cute.arch.warp_reduction_max(maximum, threads_in_group=32)
-                if tid == 0:
-                    alpha[row] = cute.math.max(
-                        maximum / cutlass.Float32(448.0),
-                        cutlass.Float32(1.0 / (448.0 * 512.0)),
-                    )
-                    shared[17] = cute.math.min(
-                        cutlass.Float32(448.0) / maximum,
-                        cutlass.Float32(448.0 * 512.0),
-                    )
-            _epilogue_barrier(512, cutlass.Int32(5))
-            if col < self.r:
-                multiplier = shared[17]
-                for i in cutlass.range_constexpr(2):
-                    value = cute.math.min(
-                        cute.math.max(
-                            rounded[i].to(cutlass.Float32) * multiplier,
-                            cutlass.Float32(-448.0),
-                        ),
-                        cutlass.Float32(448.0),
-                    )
-                    activation[row, col + i] = value.to(cutlass.Float8E4M3FN)
-        cute.arch.sync_threads()
 
     @cute.experimental.jit
     def _up(

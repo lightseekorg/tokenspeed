@@ -55,9 +55,12 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
 )
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
     MixerOperands,
+    QuantizationConfig,
     ResidentMixer,
     _mixer_cta,
     _mixer_shared,
+    _quant_scale,
+    _quantized_value,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
     Fp8GatedResidualGemm,
@@ -127,30 +130,6 @@ def _load_relaxed_counter(ptr):
             asm_dialect=0,
         )
     )
-
-
-@cute.experimental.jit
-def _quant_activation_clip(value, mode: cutlass.Constexpr):
-    lower = cutlass.Float32(-448.0)
-    if cutlass.const_expr(mode in ("pack_max", "scalar_max")):
-        # PTX max without .NaN selects the lower bound for NaN, matching the
-        # first operation in the canonical clamp.
-        bounded = cutlass.Float32(
-            llvm.inline_asm(
-                T.f32(),
-                [value.ir_value(), lower.ir_value()],
-                "max.f32 $0, $1, $2;",
-                "=f,f,f",
-                has_side_effects=False,
-                asm_dialect=0,
-            )
-        )
-    else:
-        bounded = cute.math.max(value, lower)
-    if cutlass.const_expr(mode in ("native", "pack")):
-        bounded = cute.math.min(bounded, cutlass.Float32(448.0))
-    # All modes use satfinite, which also handles the upper finite limit.
-    return bounded
 
 
 @cute.experimental.jit
@@ -942,7 +921,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         omit_down_empty,
         up_register_rows,
         omit_up_empty,
-        use_native_warp_max,
         private_epoch_order,
         entry_transport,
         minimum_blocks_per_sm,
@@ -1036,9 +1014,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
             raise TypeError("Down weight cache policy requires an explicit boolean")
         self.evict_down_weights_last = evict_down_weights_last
         self.minimum_blocks_per_sm = minimum_blocks_per_sm
-        if not isinstance(use_native_warp_max, bool):
-            raise TypeError("Warp maximum implementation must be an explicit boolean")
-        self.use_native_warp_max = use_native_warp_max
         if not isinstance(use_cta_reader_handoff, bool):
             raise TypeError("Reader handoff selection must be an explicit boolean")
         self.use_cta_reader_handoff = use_cta_reader_handoff
@@ -1121,7 +1096,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
             raise ValueError(
                 "Single quantization join requires full active warps in every row"
             )
-        self.quant_max_join = quant_max_join
         self.quant_max_threads = (
             r // self.quant_columns
             if quant_max_join == "single_active"
@@ -1639,6 +1613,38 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
             self.up_full_arrivals += self.stamped_prefix_threads // 32
             self.activation_payload_records = self.up_rows * (self.up_k // 64) * 6
             self.up_barrier_count += 1
+        fp8_threads = (
+            self.quant_max_threads if self.quant_warp_handoff else self.compute_threads
+        )
+        packed_store = (
+            up_activation_transport != "native"
+            or quant_activation_store
+            in (
+                "pack",
+                "pack_sat",
+                "pack_max",
+            )
+        )
+        self.quantization = QuantizationConfig(
+            threads=fp8_threads,
+            maximum_threads=self.quant_max_threads,
+            injection_start=fp8_threads,
+            column_stride=1,
+            warp_max="redux",
+            replicate_maximum=quant_max_join != "double",
+            refined_scales=False,
+            clamp=(
+                "ptx_lower"
+                if quant_activation_store in ("pack_max", "scalar_max")
+                else "lower" if quant_activation_store == "pack_sat" else "both"
+            ),
+            activation_store=(
+                "stamped"
+                if stamped_activation
+                else "packed" if packed_store else "native"
+            ),
+            release_writes=activation_handoff != "grid" and not stamped_activation,
+        )
         if begin_mma_early:
             self.up_barrier_count += 1
             self.up_first_tx_bytes -= self.up_activation_suffix
@@ -2129,24 +2135,66 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
     @cute.experimental.jit
     def _quantize_row(self, io, cta, state, quant, phase_base, global_base, row):
         tag_increment, activation_target = quant
-        down_counter = io.epochs.iterator
-        self._epilogue(
-            io.partials,
-            io.xs,
-            io.ds,
-            io.activation,
-            io.alpha,
-            io.out,
-            io.inject,
+        tid = cta.tid
+        preloaded_scales = None
+        if cutlass.const_expr(self.quant_early_scales):
+            # Entry already orders the external scales, so load them before Down acquire.
+            input_scale = cutlass.Float32(0.0)
+            weight_scales = cute.make_rmem_tensor(2, cutlass.Float32)
+            weight_scales.fill(0.0)
+            first_col = cutlass.Int32(-1)
+            first_inject = self.quantization.injection_start
+            if tid < self.r // 2:
+                first_col = tid * 2
+            elif first_inject <= tid < first_inject + self.g // 2:
+                first_col = self.r + (tid - first_inject) * 2
+            global_row = global_base + row
+            if global_row < io.x.shape[0] and first_col >= 0:
+                input_scale, loaded_pair = self._read_quant_scales(
+                    io.xs, io.ds, global_row, first_col, 2, 1
+                )
+                for i in cutlass.range_constexpr(2):
+                    weight_scales[i] = loaded_pair[i]
+            preloaded_scales = (input_scale, weight_scales)
+        if cutlass.const_expr(self.quant_warp_down):
+            self._wait_quant_down(
+                tid, io.epochs.iterator, phase_base + state.down_arrivals
+            )
+
+        activation_layout = None
+        if cutlass.const_expr(self.up_activation_transport != "native"):
+            activation_layout = sm100_utils.make_smem_layout_b(
+                self._make_up_mma(),
+                (*self.up_mn, self.up_k),
+                cutlass.Float8E4M3FN,
+                self.up_stages,
+            )
+        self._quantize_down_row(
+            io,
+            tid,
             global_base,
             row,
-            io.x.shape[0],
-            state.activation_counter,
-            tag_increment,
-            down_counter,
-            phase_base + state.down_arrivals,
+            preloaded_scales,
+            activation_layout,
             activation_target,
         )
+
+        if cutlass.const_expr(self.quant_warp_handoff):
+            _epilogue_barrier(self.quant_handoff_threads, cutlass.Int32(14))
+        else:
+            cute.arch.sync_threads()
+        if cutlass.const_expr(self.quantization.release_writes):
+            if tid == 0:
+                ready = state.activation_counter
+                if cutlass.const_expr(self.activation_row_gate):
+                    if cutlass.const_expr(self.activation_row_tags):
+                        ready = ready + row
+                    _arrive_activation_row(ready, tag_increment)
+                else:
+                    if cutlass.const_expr(self.split_activation_counter):
+                        # Even and odd rows publish to separate counters.
+                        ready = ready + (row % 2)
+                    _arrive_phase_release(ready, self.async_activation_arrival)
 
     @cute.experimental.jit
     def _finish_quantization(self, io, cta, state, phase_base, quant):
@@ -2342,40 +2390,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         return _reduce_split_partials(pieces, base, stride, row, False)
 
     @cute.experimental.jit
-    def _warp_maximum(self, value):
-        return cute.arch.warp_redux_sync(
-            value, "fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
-        )
-
-    @cute.experimental.jit
-    def _publish_warp_maximum(self, rounded, shared, group, local_tid):
-        maximum = cutlass.Float32(0.0)
-        for index in cutlass.range_constexpr(self.quant_columns):
-            maximum = cute.math.max(
-                maximum, cute.math.abs(rounded[index].to(cutlass.Float32))
-            )
-        maximum = self._warp_maximum(maximum)
-        if local_tid % 32 == 0:
-            shared[group, local_tid // 32] = maximum
-
-    @cute.experimental.jit
-    def _row_maximum(self, shared, group, lane, warp_count: cutlass.Constexpr):
-        maximum = cutlass.Float32(0.0)
-        if lane < warp_count:
-            maximum = shared[group, lane]
-        return self._warp_maximum(maximum)
-
-    @cute.experimental.jit
-    def _read_quant_scale_pair(self, xs, ds, row, col):
-        input_scale = _x_scale(xs, row)
-        pair = cute.make_rmem_tensor(2, cutlass.Float32)
-        vector = cutlass.Boolean(False)
-        if not vector:
-            for i in cutlass.range_constexpr(2):
-                pair[i] = ds[col + i if self.down_per_channel else 0]
-        return input_scale, pair
-
-    @cute.experimental.jit
     def _wait_quant_down(self, tid, root, target):
         warp = cute.arch.make_warp_uniform(tid // 32)
         if warp < self.quant_max_threads // 32 or warp == self.compute_threads // 32:
@@ -2401,264 +2415,75 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
             cute.arch.sync_warp()
 
     @cute.experimental.jit
-    def _epilogue(
+    def _store_packed_quantization(
         self,
-        partial,
-        xs,
-        ds,
-        activation,
-        alpha,
-        out,
-        inject,
-        global_base,
-        row_base,
-        rows,
-        activation_counter,
-        tag_increment,
-        down_counter,
-        down_target,
-        activation_target,
+        io,
+        row,
+        col,
+        local_tid,
+        rounded,
+        multiplier,
+        maximum,
+        preloaded_scales,
+        activation_layout,
+        target,
     ):
-        tid = cute.arch.thread_idx()[0]
-        fp8_threads = self.compute_threads
-        if cutlass.const_expr(self.quant_warp_handoff):
-            fp8_threads = self.quant_max_threads
-        input_preload, weight_preload = None, None
-        if cutlass.const_expr(self.quant_early_scales):
-            # The entry dependency already orders the external inputs and scales.
-            input_preload = cutlass.Float32(0.0)
-            weight_preload = cute.make_rmem_tensor(2, cutlass.Float32)
-            weight_preload.fill(0.0)
-            first_col = cutlass.Int32(-1)
-            if tid < self.r // 2:
-                first_col = tid * 2
-            elif fp8_threads <= tid < fp8_threads + self.g // 2:
-                first_col = self.r + (tid - fp8_threads) * 2
-            if global_base + row_base < rows and first_col >= 0:
-                input_preload, loaded_pair = self._read_quant_scale_pair(
-                    xs,
-                    ds,
-                    global_base + row_base,
-                    first_col,
-                )
-                for i in cutlass.range_constexpr(2):
-                    weight_preload[i] = loaded_pair[i]
-        if cutlass.const_expr(self.quant_warp_down):
-            self._wait_quant_down(tid, down_counter, down_target)
-        activation_layout = None
-        if cutlass.const_expr(self.up_activation_transport != "native"):
-            dtype = cutlass.Float8E4M3FN
-            activation_layout = sm100_utils.make_smem_layout_b(
-                self._make_up_mma(),
-                (*self.up_mn, self.up_k),
-                dtype,
-                self.up_stages,
+        if cutlass.const_expr(self.stamped_activation):
+            packed_scale = cutlass.Float32(0.0)
+            if col == 60:
+                packed_scale = _quant_scale(maximum)
+            input_scale, _ = preloaded_scales
+            row_plane = cutlass.Int32(row) + (col // 64) * self.n
+            word = 6 * row_plane + (col % 64) // 12
+            _store_compact_activation(
+                io.activation.iterator + word * 16,
+                _quantized_value(rounded[0], multiplier, self.quantization.clamp),
+                _quantized_value(rounded[1], multiplier, self.quantization.clamp),
+                target,
+                cute.arch.lane_idx(),
+                col < 64,
+                packed_scale,
+                input_scale,
             )
-        if cutlass.const_expr(self.p > self.r):
-            if tid >= fp8_threads and tid < fp8_threads + self.quant_rows * (
-                self.g // 2
-            ):
-                inject_lane = tid - fp8_threads
-                row = row_base
-                if cutlass.const_expr(self.quant_rows > 1):
-                    row = row_base + cutlass.Int64(inject_lane // (self.g // 2))
-                global_row = global_base + row
-                inject_col = (inject_lane % (self.g // 2)) * 2
-                if global_row < rows:
-                    if cutlass.const_expr(self.quant_early_scales):
-                        input_scale, weight_scales = input_preload, weight_preload
-                    else:
-                        input_scale = _x_scale(xs, global_row)
-                        weight_scales = cute.make_rmem_tensor(2, cutlass.Float32)
-                        for i in cutlass.range_constexpr(2):
-                            weight_scales[i] = ds[
-                                self.r + inject_col + i if self.down_per_channel else 0
-                            ]
-                    values = self._partials(partial, row, self.r + inject_col, 2, True)
-                    for i in cutlass.range_constexpr(2):
-                        value = values[i] * input_scale
-                        value = value * weight_scales[i]
-                        inject[global_row, inject_col + i] = (value * self.scale).to(
-                            out.element_type
-                        )
-        if tid < fp8_threads:
-            group = cutlass.Int32(0)
-            local_tid = tid
-            row = row_base
-            if cutlass.const_expr(self.quant_rows > 1):
-                group = tid // self.quant_threads
-                local_tid = tid % self.quant_threads
-                row = row_base + cutlass.Int64(group)
-            global_row = global_base + row
-            col = local_tid * self.quant_columns
-            rounded = cute.make_rmem_tensor(self.quant_columns, out.element_type)
-            rounded.fill(0.0)
-            if global_row < rows and col < self.r:
-                if cutlass.const_expr(self.quant_early_scales):
-                    input_scale, weight_scales = input_preload, weight_preload
-                else:
-                    input_scale = _x_scale(xs, global_row)
-                    weight_scales = cute.make_rmem_tensor(
-                        self.quant_columns, cutlass.Float32
-                    )
-                    for i in cutlass.range_constexpr(self.quant_columns):
-                        weight_scales[i] = ds[col + i if self.down_per_channel else 0]
-                values = self._partials(partial, row, col, self.quant_columns, False)
-                for i in cutlass.range_constexpr(self.quant_columns):
-                    value = values[i] * input_scale
-                    value = value * weight_scales[i]
-                    value = value * self.scale
-                    value = value * cute.arch.rcp_approx(
-                        1.0 + cute.exp(-value, fastmath=True)
-                    )
-                    rounded[i] = value.to(out.element_type)
-            row_warps = self.quant_threads // 32
-            shared = cute_ext.allocate(
-                cutlass.Float32,
-                cute.AddressSpace.smem,
-                cute.make_layout(
-                    (self.quant_rows, row_warps + 2), stride=(row_warps + 2, 1)
-                ),
-                alignment=32,
-            )
-            if cutlass.const_expr(self.quant_max_join == "single_active"):
-                if local_tid < self.quant_max_threads:
-                    self._publish_warp_maximum(rounded, shared, group, local_tid)
-                    _epilogue_barrier(self.quant_max_threads, cutlass.Int32(5 + group))
-            else:
-                self._publish_warp_maximum(rounded, shared, group, local_tid)
-                _epilogue_barrier(self.quant_threads, cutlass.Int32(5 + group))
-            if cutlass.const_expr(self.quant_max_join == "double"):
-                if local_tid < 32:
-                    maximum = self._row_maximum(shared, group, local_tid, row_warps)
-                    if local_tid == 0:
-                        self._store_row_alpha(
-                            activation, alpha, row, maximum, activation_target
-                        )
-                        shared[group, row_warps + 1] = cute.math.min(
-                            cutlass.Float32(448.0) / maximum,
-                            cutlass.Float32(448.0 * 512.0),
-                        )
-                _epilogue_barrier(self.quant_threads, cutlass.Int32(5 + group))
-            if col < self.r:
-                multiplier = cutlass.Float32(0.0)
-                packed_scale = cutlass.Float32(0.0)
-                if cutlass.const_expr(self.quant_max_join == "double"):
-                    multiplier = shared[group, row_warps + 1]
-                else:
-                    # Every writing warp reads the published partial maxima.
-                    maximum = self._row_maximum(
-                        shared, group, local_tid % 32, self.quant_max_threads // 32
-                    )
-                    multiplier = cute.math.min(
-                        cutlass.Float32(448.0) / maximum, cutlass.Float32(448.0 * 512.0)
-                    )
-                    if cutlass.const_expr(self.stamped_activation):
-                        if col == 60:
-                            packed_scale = self._row_activation_scale(maximum)
-                    elif local_tid == 0:
-                        self._store_row_alpha(
-                            activation, alpha, row, maximum, activation_target
-                        )
-                activation_offset = cutlass.Int64(0)
-                if cutlass.const_expr(self.up_activation_transport != "native"):
-                    # The continuation of each two-code packet stays in the
-                    # same 16-byte swizzle block.
-                    offset = cute.crd2idx(
-                        ((row, col % 32), 0, col // 32, 0), activation_layout
-                    )
-                    activation_offset = cutlass.Int64(offset)
-                if cutlass.const_expr(
-                    self.quant_activation_store in ("pack", "pack_sat", "pack_max")
-                ):
-                    if cutlass.const_expr(self.up_activation_transport == "native"):
-                        activation_offset = row * self.r + col
-                    first = _quant_activation_clip(
-                        rounded[0].to(cutlass.Float32) * multiplier,
-                        self.quant_activation_store,
-                    )
-                    second = _quant_activation_clip(
-                        rounded[1].to(cutlass.Float32) * multiplier,
-                        self.quant_activation_store,
-                    )
-                    if cutlass.const_expr(self.stamped_activation):
-                        row_plane = cutlass.Int32(row) + (col // 64) * self.n
-                        word = 6 * row_plane + (col % 64) // 12
-                        _store_compact_activation(
-                            activation.iterator + word * 16,
-                            first,
-                            second,
-                            activation_target,
-                            cute.arch.lane_idx(),
-                            col < 64,
-                            packed_scale,
-                            input_preload,
-                        )
-                        if local_tid == 0:
-                            # Up already received the scale in its first plane.
-                            self._store_row_alpha(
-                                activation, alpha, row, maximum, activation_target
-                            )
-                    else:
-                        _store_activation_pair(
-                            activation.iterator + activation_offset, first, second
-                        )
-                else:
-                    for i in cutlass.range_constexpr(self.quant_columns):
-                        value = _quant_activation_clip(
-                            rounded[i].to(cutlass.Float32) * multiplier,
-                            self.quant_activation_store,
-                        )
-                        if cutlass.const_expr(self.up_activation_transport == "native"):
-                            activation[row, col + i] = value.to(cutlass.Float8E4M3FN)
-                        else:
-                            target = cute.make_tensor(
-                                activation.iterator + activation_offset + i,
-                                cute.make_layout(1),
-                            )
-                            target[0] = value.to(cutlass.Float8E4M3FN)
-                if cutlass.const_expr(
-                    self.activation_handoff != "grid" and not self.stamped_activation
-                ):
-                    _publish_activation_proxy()
-        if cutlass.const_expr(self.quant_warp_handoff):
-            _epilogue_barrier(self.quant_handoff_threads, cutlass.Int32(14))
+            if local_tid == 0:
+                # Up receives the scale in its first plane as well as in the row header.
+                self._store_quant_alpha(io, row, _quant_scale(maximum), target)
         else:
-            cute.arch.sync_threads()
-        if cutlass.const_expr(
-            self.activation_handoff != "grid" and not self.stamped_activation
-        ):
-            if tid == 0:
-                if cutlass.const_expr(self.activation_row_gate):
-                    # Every row contributes the same positive phase step.
-                    ready = activation_counter
-                    if cutlass.const_expr(self.activation_row_tags):
-                        ready = ready + row_base
-                    _arrive_activation_row(ready, tag_increment)
-                else:
-                    ready = activation_counter
-                    if cutlass.const_expr(self.split_activation_counter):
-                        # Each counter receives one arrival for each even or odd row.
-                        ready = ready + (row_base % 2)
-                    _arrive_phase_release(ready, self.async_activation_arrival)
+            if cutlass.const_expr(activation_layout is None):
+                offset = row * self.r + col
+            else:
+                # Both adjacent codes stay in the same 16-byte swizzle block.
+                offset = cutlass.Int64(
+                    cute.crd2idx(((row, col % 32), 0, col // 32, 0), activation_layout)
+                )
+            destination = io.activation.iterator + offset
+            if cutlass.const_expr(
+                self.quant_activation_store in ("pack", "pack_sat", "pack_max")
+            ):
+                _store_activation_pair(
+                    destination,
+                    _quantized_value(rounded[0], multiplier, self.quantization.clamp),
+                    _quantized_value(rounded[1], multiplier, self.quantization.clamp),
+                )
+            else:
+                codes = cute.make_tensor(
+                    destination, cute.make_layout(self.quant_columns)
+                )
+                for i in cutlass.range_constexpr(self.quant_columns):
+                    value = _quantized_value(
+                        rounded[i], multiplier, self.quantization.clamp
+                    )
+                    codes[i] = value.to(cutlass.Float8E4M3FN)
 
     @cute.experimental.jit
-    def _row_activation_scale(self, maximum):
-        return cute.math.max(
-            maximum / cutlass.Float32(448.0),
-            cutlass.Float32(1.0 / (448.0 * 512.0)),
-        )
-
-    @cute.experimental.jit
-    def _store_row_alpha(self, activation, alpha, row, maximum, target):
-        value = self._row_activation_scale(maximum)
+    def _store_quant_alpha(self, io, row, scale, target):
         if cutlass.const_expr(self.stamped_activation):
             destination = (
-                activation.iterator + self.activation_payload_records * 16 + row * 16
+                io.activation.iterator + self.activation_payload_records * 16 + row * 16
             )
-            _store_stamped_alpha(destination, value, target)
+            _store_stamped_alpha(destination, scale, target)
         else:
-            alpha[row] = value
+            io.alpha[row] = scale
 
     @cute.experimental.jit
     def _init_up_barriers(self, bars, preserve_residual: cutlass.Constexpr):

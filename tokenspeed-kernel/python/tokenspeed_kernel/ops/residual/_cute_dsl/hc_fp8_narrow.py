@@ -219,7 +219,6 @@ def _execute(
         else "private_deferred" if second_bucket else "native"
     )
     omit_up_empty = True
-    use_native_warp_max = True
     private_epoch_order = "coherent"
     entry_transport = "deferred"
     minimum_blocks_per_sm = 1
@@ -248,7 +247,6 @@ def _execute(
         omit_down_empty=omit_down_empty,
         up_register_rows=up_register_rows,
         omit_up_empty=omit_up_empty,
-        use_native_warp_max=use_native_warp_max,
         private_epoch_order=private_epoch_order,
         entry_transport=entry_transport,
         minimum_blocks_per_sm=minimum_blocks_per_sm,

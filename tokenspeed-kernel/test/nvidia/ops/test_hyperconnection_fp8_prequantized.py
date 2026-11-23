@@ -142,6 +142,56 @@ def _check(actual, v, model, dtype):
             )
 
 
+@pytest.mark.parametrize(
+    "model,rows",
+    [
+        ((4, 2560, 320), 13),
+        ((4, 2560, 320), 129),
+        ((4, 8192, 1024), 13),
+        ((4, 8192, 1024), 127),
+    ],
+)
+@torch.inference_mode()
+def test_fused_row_quantization_scale_floor(model, rows):
+    g, h, r = model
+    dtype = torch.float16
+    x_values = torch.tensor([0.0, 0.5, 1.0, 2.0], device="cuda")
+    x_values = x_values.repeat((rows + 3) // 4)[:rows]
+    columns = torch.tensor([0, 9, 65, r - 1], device="cuda")
+    down_codes = torch.tensor([1.0, -0.5, 0.75, 0.25], device="cuda")
+    up_codes = torch.tensor([1.0, -0.5, 0.75, -1.0], device="cuda")
+
+    x = torch.zeros((rows, g * h), device="cuda")
+    x[:, 0] = x_values
+    down = torch.zeros((r + g, g * h), device="cuda")
+    down[columns, 0] = down_codes
+    down[r:, 0] = 1.0
+    ds = torch.ones(r + g, device="cuda")
+    ds[columns] = torch.tensor([0.0007, 0.0012, 0.0034, 0.0009], device="cuda")
+    ds[r:] = 0.25
+    up = torch.zeros((g * h, r), device="cuda")
+    up[0, columns] = up_codes
+    v = Inputs(
+        x.to(torch.float8_e4m3fn),
+        torch.ones(rows, device="cuda"),
+        down.to(torch.float8_e4m3fn),
+        ds,
+        up.to(torch.float8_e4m3fn),
+        torch.full((g * h,), 512.0, device="cuda"),
+    )
+
+    mixed, inject = _run(v, model, dtype, True)
+    projected = x_values[:, None] * down_codes * ds[columns]
+    codes, scale = _quantize(F.silu(projected).to(dtype), False)
+    gate = (codes.float() * up_codes).sum(dim=-1) * scale * v.us[0]
+    expected = torch.zeros_like(mixed)
+    expected[:, 0] = (gate.sigmoid() * x_values / g).to(dtype)
+    torch.testing.assert_close(mixed, expected, atol=0.00025, rtol=0.001)
+    torch.testing.assert_close(
+        inject, (x_values[:, None] * 0.25).expand(-1, g).to(dtype), atol=0, rtol=0
+    )
+
+
 def _nodes(graph):
     _, count = _checked(
         driver.cuGraphGetNodes(driver.CUgraph(graph.raw_cuda_graph()), 0)
