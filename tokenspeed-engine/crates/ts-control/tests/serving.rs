@@ -69,8 +69,8 @@ use ts_pd::{
 };
 use ts_scheduler::{
     profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
-    SharedL2AnswerView, SharedL2KeyView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
-    SharedL2PageView,
+    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+    StorageKeyView,
 };
 use ts_wire::{
     codec::Dict,
@@ -6648,6 +6648,9 @@ struct FakePool {
     /// The client's ping to the owner fails once the device ran this many
     /// plans; every poll from then on reports it.
     ping_fails_after: Option<usize>,
+    /// Every load from the pool fails: the client holds the failure from
+    /// the plan that carries the load on.
+    fail_loads: bool,
     /// The polls a write stays in flight before it is reported finished.
     write_polls: usize,
     /// Writes started and not reported, each with the polls it still waits.
@@ -6694,7 +6697,7 @@ impl PoolClient for FakePoolClient {
             let first_page = pool.pages;
             pool.pages += hit as i32;
             answers.push(SharedL2AnswerView {
-                lookup_id: lookup.lookup_id,
+                request_id: lookup.request_id.clone(),
                 ticket: if hit > 0 { pool.tickets } else { 0 },
                 num_tokens: 16 * hit as i32,
                 kv_tokens: 16 * hit as i32,
@@ -6702,8 +6705,7 @@ impl PoolClient for FakePoolClient {
                 tail_hash: String::new(),
                 keys: lookup.prefix_hashes[..hit]
                     .iter()
-                    .map(|hash| SharedL2KeyView {
-                        namespace_id: 0,
+                    .map(|hash| StorageKeyView {
                         group_id: 0,
                         content_hash: hash.clone(),
                         page_offset: 0,
@@ -6716,7 +6718,7 @@ impl PoolClient for FakePoolClient {
         Ok(answers)
     }
 
-    fn poll(&mut self) -> Result<Vec<u64>, PoolError> {
+    fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError> {
         let plans = self.plans.lock().unwrap().len();
         let mut pool = self.pool.lock().unwrap();
         if pool.ping_fails_after.is_some_and(|after| plans >= after) {
@@ -6732,14 +6734,17 @@ impl PoolClient for FakePoolClient {
             .into_iter()
             .partition(|(polls, _)| *polls == 0);
         pool.writes = open;
-        let finished: Vec<u64> = finished.into_iter().map(|(_, write)| write).collect();
+        let finished: Vec<u32> = finished
+            .into_iter()
+            .map(|(_, write)| u32::try_from(write).unwrap())
+            .collect();
         for _ in &finished {
             pool.log.push(PoolEvent::WriteDone);
         }
         Ok(finished)
     }
 
-    fn map_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
         let mut pool = self.pool.lock().unwrap();
         pool.log.push(PoolEvent::Mapped(pages.len()));
         Ok(())
@@ -6761,6 +6766,19 @@ impl PoolClient for FakePoolClient {
                 SharedL2OpKind::Release => pool.log.push(PoolEvent::Released(command.id)),
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    fn check_failure(&mut self) -> Result<(), PoolError> {
+        let loaded = self
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, ops)| ops.iter().any(|op| op.kind == CacheOpKind::LoadBack));
+        if loaded && self.pool.lock().unwrap().fail_loads {
+            return Err(PoolError("a load from the pool failed".to_owned()));
         }
         Ok(())
     }
@@ -6905,6 +6923,46 @@ fn a_failed_pool_write_stops_the_engine() {
     assert!(error.contains("pool write 1 failed"), "{error}");
     assert!(
         matches!(log[..], [.., PoolEvent::Wrote { blocks: 4, .. }]),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn a_failed_pool_load_fails_the_commit_of_the_forward_it_let_go() {
+    // The prompt's first plan loads its hit from the pool and computes the
+    // rest. The load fails and lets the forward go over pages it never
+    // filled: the client holds the failure, and the commit of that forward
+    // ends serving before its token is streamed.
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("hit", 1, 64, 4)];
+    let failing = || FakePool {
+        held: HashMap::from([("hit".to_owned(), 3)]),
+        fail_loads: true,
+        ..FakePool::default()
+    };
+    let (rank, log) = run_with_pool(failing(), 0, script, no_reaction);
+    let error = rank.outcome.unwrap_err();
+    assert!(error.contains("a load from the pool failed"), "{error}");
+    assert_eq!(
+        (rank.forwards, &rank.cache_ops[..]),
+        (1, &[CacheOpKind::LoadBack][..])
+    );
+    assert!(rank.outputs.is_empty(), "{:?}", rank.outputs);
+    assert!(log.contains(&PoolEvent::Mapped(3)), "{log:?}");
+
+    // One forward ahead of its commit, and a prompt of three chunks: the
+    // second plan carries the write of the pages the first forward computed,
+    // which waits for that forward's commit. The commit ends serving, and
+    // the write never starts.
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("hit", 1, 2 * MAX_SCHEDULED_TOKENS as i32 + 64, 4)];
+    let (rank, log) = run_with_pool(failing(), 1, script, no_reaction);
+    let error = rank.outcome.unwrap_err();
+    assert!(error.contains("a load from the pool failed"), "{error}");
+    assert_eq!(rank.forwards, 2, "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|event| matches!(event, PoolEvent::Wrote { .. })),
         "{log:?}"
     );
 }
@@ -7064,6 +7122,48 @@ fn a_pool_write_pins_its_blocks_until_the_client_reports_it_even_while_frozen() 
         2
     );
     assert_scripted_tokens(&rank, "writer", 2);
+}
+
+#[test]
+fn a_pool_command_planned_while_paused_reaches_the_client() {
+    // The prompt's hit is loaded by its first plan. The device acknowledges
+    // the load-back eight polls later, long after the pause of the third
+    // round: the plan that drops the hit's proxy blocks, and so releases the
+    // owner's ticket, is a frozen round's.
+    let mut script: Script = vec![Vec::new(); 30];
+    script[0] = vec![add("hit", 1, 64, 2)];
+    script[2] = vec![EngineRequest::Control(Box::new(pause("keep")))];
+    let pool = Arc::new(Mutex::new(FakePool {
+        held: HashMap::from([("hit".to_owned(), 3)]),
+        ..FakePool::default()
+    }));
+    let setup = Setup {
+        pool: Some(pool.clone()),
+        cache_ack_polls: Some(|_| 8),
+        ..Setup::default()
+    };
+    let rank = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::SharedL2,
+        setup,
+        vec![script],
+        no_reaction,
+    )
+    .remove(0);
+    let log = pool.lock().unwrap().log.clone();
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [("PauseSchedulerReqOutput", true)]
+    );
+    // The request ran its two forwards before the pause, and no forward ran
+    // after it.
+    assert_scripted_tokens(&rank, "hit", 2);
+    assert_eq!(rank.forwards, 2);
+    assert_eq!(rank.cache_ops, [CacheOpKind::LoadBack]);
+    // The frozen round's release reached the client: the engine never
+    // resumed.
+    assert!(log.contains(&PoolEvent::Released(1)), "{log:?}");
 }
 
 #[test]

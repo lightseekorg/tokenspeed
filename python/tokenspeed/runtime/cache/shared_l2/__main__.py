@@ -36,12 +36,6 @@ def main() -> None:
     services = parser.add_subparsers(dest="service", required=True)
     owner = services.add_parser("owner", help="serve the pool's cache index")
     owner.add_argument("--address", required=True, help="ZMQ bind address")
-    owner.add_argument(
-        "--lcm-bytes",
-        type=int,
-        default=None,
-        help="bytes of one pool LCM block; without it, the first rank's",
-    )
     owner.add_argument("--providers", type=int, required=True)
     owner.add_argument("--headroom-lcm-blocks", type=int, required=True)
     owner.add_argument("--client-timeout-s", type=float, required=True)
@@ -69,7 +63,6 @@ def main() -> None:
 
         service = SharedL2Owner(
             address=args.address,
-            lcm_bytes=args.lcm_bytes,
             num_providers=args.providers,
             client_timeout_s=args.client_timeout_s,
             make_pool=functools.partial(

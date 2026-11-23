@@ -184,6 +184,11 @@ void SchedulerConfig::Validate() const {
         if (HasSnapshotPool()) {
             throw std::invalid_argument("Scheduler: shared L2 ranks do not retract");
         }
+        // A peer holder would export the proxy's Host entries, which hold no
+        // bytes for the reader.
+        if (peer_config) {
+            throw std::invalid_argument("Scheduler: shared L2 excludes peer prefix sharing");
+        }
         for (const CacheGroupConfig& group : cache_groups) {
             if (group.shard_count != 1) {
                 throw std::invalid_argument("Scheduler: shared L2 needs replicated groups");

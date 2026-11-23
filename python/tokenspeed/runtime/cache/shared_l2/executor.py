@@ -218,6 +218,7 @@ class SharedL2LoadExecutor:
         proxy_page: Callable[[int, int], tuple[int, int]],
         pool: SharedL2PoolView,
         load_workers: int,
+        record_failure: Callable[[BaseException], None],
         close: Callable[[], None],
     ):
         """
@@ -234,6 +235,9 @@ class SharedL2LoadExecutor:
                 it stands for (``SharedL2Client.proxy_page``).
             pool: The pool the rank joined (``SharedL2Client.pool``).
             load_workers: Threads reading one load's providers in parallel.
+            record_failure: Takes a load's failure before the forward that
+                waits on the load is let go, for the event loop's check at
+                that forward's commit (``SharedL2Client.record_failure``).
             close: Closes the rank's pool client, once the loads have
                 stopped: its writes share the engine with them
                 (``SharedL2Client.close``).
@@ -259,6 +263,7 @@ class SharedL2LoadExecutor:
         self._num_layers = num_layers
         self._proxy_page = proxy_page
         self._pool = pool
+        self._record_failure = record_failure
         self._close = close
         num_sets = len(self._trackers[0][0].event_sets)
         # Per tracker event set: a start word, then a ready word per layer.
@@ -419,11 +424,13 @@ class SharedL2LoadExecutor:
                 words[base + 1 + layer] = seq
         except BaseException as exc:
             # A failed load stops the engine; the forward waiting on it is
-            # released so the stop is not a hang. The failure is recorded
-            # before the release: the commit of that forward polls once the
-            # forward has landed, finds it and returns no result.
+            # released so the stop is not a hang. The pool's client has the
+            # failure before the release: the event loop checks the client
+            # once that forward has landed, before it commits its results or
+            # starts a pool write of the pages it computed.
             logger.exception("shared L2 load failed")
             self._failure = exc
+            self._record_failure(exc)
             words[base + 1 : base + 1 + self._num_layers] = seq
             return
         with self._done_lock:
@@ -483,5 +490,6 @@ def build_shared_l2_load_executor(
         proxy_page=client.proxy_page,
         pool=client.pool,
         load_workers=client.config.load_workers,
+        record_failure=client.record_failure,
         close=client.close,
     )

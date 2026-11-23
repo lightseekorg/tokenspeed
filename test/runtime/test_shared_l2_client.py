@@ -60,7 +60,6 @@ from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
     OwnerError,
 )
-from tokenspeed.runtime.engine.rust_host import HostSharedL2  # noqa: E402
 
 PROMPT = [1, 2, 3, 4, 5]
 BLOCKS = len(prompt_keys(PROMPT)[2])
@@ -181,15 +180,13 @@ def store(client: SharedL2Client, write_id: int, prompt) -> None:
     assert finished(client, 1) == [write_id]
 
 
-def look_up(client: SharedL2Client, lookup_id: int, prompt) -> tuple:
-    (answer,) = client.lookup(
-        [(lookup_id, f"request-{lookup_id}", *lookup_fields(prompt))]
-    )
+def look_up(client: SharedL2Client, request_id: str, prompt) -> tuple:
+    (answer,) = client.lookup([(request_id, *lookup_fields(prompt))])
     return answer
 
 
-def miss(lookup_id: int) -> tuple:
-    return (lookup_id, 0, 0, 0, None, [])
+def miss(request_id: str) -> tuple:
+    return (request_id, 0, 0, 0, None, [])
 
 
 def test_a_rank_joins_once_the_pool_is_ready(serve, join):
@@ -240,23 +237,23 @@ def test_one_request_looks_up_every_prompt_and_answers_them_in_order(serve, join
 
     hit, cold, same = reader.lookup(
         [
-            (10, "hit", *lookup_fields(PROMPT + [6, 7])),
-            (11, "cold", *lookup_fields([9, 9, 9, 9])),
-            (12, "same", *lookup_fields(PROMPT)),
+            ("hit", *lookup_fields(PROMPT + [6, 7])),
+            ("cold", *lookup_fields([9, 9, 9, 9])),
+            ("same", *lookup_fields(PROMPT)),
         ]
     )
 
     assert connection.sent.count("probe_many") == 1
     # In the shape the event loop takes: tuples for the tail and the keys, a
     # list of slots.
-    lookup_id, ticket, num_tokens, kv_tokens, hit_tail, slots = hit
-    assert (lookup_id, num_tokens, kv_tokens, hit_tail) == (10, 5, 5, tail)
+    request_id, ticket, num_tokens, kv_tokens, hit_tail, slots = hit
+    assert (request_id, num_tokens, kv_tokens, hit_tail) == ("hit", 5, 5, tail)
     assert type(ticket) is int and ticket > 0
     assert isinstance(slots, list)
     assert [(key, bucket) for key, bucket, _ in slots] == [(key, 0) for key in keys]
     # A prompt the pool holds no prefix of is answered like the others: a miss.
-    assert cold == miss(11)
-    assert same[0] == 12 and same[1] not in (0, ticket)
+    assert cold == miss("cold")
+    assert same[0] == "same" and same[1] not in (0, ticket)
     assert owner.stats()["pinned_blocks"] == 2 * BLOCKS
     # Without a lookup there is nothing to ask.
     assert reader.lookup([]) == []
@@ -276,7 +273,7 @@ def test_a_lookup_the_owner_does_not_answer_in_time_raises(serve, join):
     owner.stall()
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="did not answer 'probe_many'"):
-        look_up(reader, 10, PROMPT)
+        look_up(reader, "request", PROMPT)
     assert time.monotonic() - started >= 0.1
     owner.resume()
 
@@ -288,7 +285,7 @@ def test_a_lookup_the_owner_answers_with_an_error_raises(serve, join):
     owner.pool.failing.add("probe")
 
     with pytest.raises(OwnerError, match="probe failed"):
-        look_up(reader, 10, PROMPT)
+        look_up(reader, "request", PROMPT)
 
 
 def test_a_lookup_by_a_rank_the_owner_does_not_know_raises(serve, join):
@@ -299,7 +296,7 @@ def test_a_lookup_by_a_rank_the_owner_does_not_know_raises(serve, join):
     wait_until(lambda: owner.pool.disconnected)
 
     with pytest.raises(OwnerError, match="has not joined the pool"):
-        look_up(rank, 10, PROMPT)
+        look_up(rank, "request", PROMPT)
 
 
 # Hits that are not of the wire's shape, and the error each is refused with.
@@ -358,8 +355,8 @@ def test_an_answer_with_a_malformed_hit_raises(serve, join, spoil, error, messag
     with pytest.raises(error, match=message):
         reader.lookup(
             [
-                (10, "hit", *lookup_fields(PROMPT)),
-                (11, "spoiled", *lookup_fields(PROMPT)),
+                ("hit", *lookup_fields(PROMPT)),
+                ("spoiled", *lookup_fields(PROMPT)),
             ]
         )
 
@@ -387,8 +384,8 @@ def test_an_answer_that_is_not_one_hit_for_each_lookup_raises(
     with pytest.raises(OwnerError, match=message):
         reader.lookup(
             [
-                (10, "hit", *lookup_fields(PROMPT)),
-                (11, "cold", *lookup_fields([9, 9])),
+                ("hit", *lookup_fields(PROMPT)),
+                ("cold", *lookup_fields([9, 9])),
             ]
         )
 
@@ -406,7 +403,7 @@ def test_a_hit_may_name_the_last_page_of_each_group(serve, join):
 
     owner.pool.probe = at_the_end
 
-    assert [page for _, _, page in look_up(reader, 10, PROMPT)[5]] == [16, 16, 8]
+    assert [page for _, _, page in look_up(reader, "request", PROMPT)[5]] == [16, 16, 8]
 
 
 def test_a_write_copies_only_the_blocks_the_owner_placed(serve, join):
@@ -503,7 +500,7 @@ def test_a_notice_the_owner_does_not_answer_fails_the_polls_and_is_sent_once(
     connection = RecordingConnection(owner.address, timeout_ms=100)
     rank = join(owner, connection=connection, request_timeout_ms=100)
     store(rank, 1, PROMPT)
-    ticket = look_up(rank, 10, PROMPT)[1]
+    ticket = look_up(rank, "request", PROMPT)[1]
 
     owner.stall()
     rank.release(ticket)
@@ -521,7 +518,7 @@ def test_an_idle_rank_pings_the_owner_which_keeps_its_pins(serve, join, monkeypa
     connection = RecordingConnection(owner.address, timeout_ms=1000)
     rank = join(owner, connection=connection)
     store(rank, 1, PROMPT)
-    look_up(rank, 10, PROMPT)
+    look_up(rank, "request", PROMPT)
 
     # More than twice the owner's client timeout without a lookup, a write
     # or a notice.
@@ -554,6 +551,23 @@ def test_closing_a_rank_leaves_what_a_thread_that_still_runs_uses(
     assert finished(rank, 1) == [5]
 
 
+def test_a_failure_handed_to_the_rank_fails_its_checks_and_its_polls(serve, join):
+    rank = join(serve())
+    rank.check_failure()
+    assert rank.poll_writes() == []
+
+    # A load's failure is the load executor's to hand over.
+    failed = RuntimeError("shared L2 read from p0 failed")
+    rank.record_failure(failed)
+    # The first failure is the one kept.
+    rank.record_failure(RuntimeError("a later one"))
+
+    for call in (rank.check_failure, rank.poll_writes, rank.check_failure):
+        with pytest.raises(RuntimeError, match="shared L2 operation failed") as raised:
+            call()
+        assert raised.value.__cause__ is failed
+
+
 def test_closing_a_rank_stops_its_threads_and_closes_its_transfer(serve, join):
     rank = join(serve())
     rank.close()
@@ -581,45 +595,29 @@ def test_tokens_leave_the_rank_as_int32_bytes(serve, join):
     rank = join(serve())
     hashes, tokens, max_tokens = lookup_fields(PROMPT)
     with pytest.raises(TypeError, match="int32 bytes"):
-        rank.lookup([(1, "request", hashes, PROMPT, max_tokens)])
+        rank.lookup([("request", hashes, PROMPT, max_tokens)])
     keys, buckets, blocks, _ = write_fields(PROMPT)
     with pytest.raises(TypeError, match="int32 bytes"):
         rank.submit_write(1, keys, buckets, blocks, [(PROMPT, hashes, None, 7)])
 
 
-def test_the_host_adapter_carries_the_loops_calls_to_the_client(serve, join):
+def test_a_plans_commands_reach_the_owner_each_kind_in_plan_order(serve, join):
     owner = serve()
     rank = join(owner)
-    pool = HostSharedL2(rank)
     keys = prompt_keys(PROMPT)[2]
 
-    # A plan's write, and the poll that finds it finished.
-    pool.submit([(31, *write_fields(PROMPT))], [], [])
-    polled = []
-    wait_until(lambda: polled.extend(pool.poll()) or polled)
-    assert polled == [31] and pool.poll() == []
-    # A round's lookups: one answer each, in order.
-    hit, cold = pool.lookup(
-        [(4, "r1", *lookup_fields(PROMPT)), (5, "r2", *lookup_fields([9, 9]))]
+    # A plan's writes, each queued as a write of its own.
+    rank.submit(
+        [(31, *write_fields(PROMPT)), (32, *write_fields(PROMPT + [6]))], [], []
     )
-    assert (hit[0], hit[2], cold) == (4, len(PROMPT), miss(5))
-    ticket, page = hit[1], hit[5][0][2]
-    # The pool page behind a proxy block the scheduler made for the hit.
-    pool.map_pages([(0, 7, 0, page)])
-    assert rank.proxy_page(0, 7) == (0, page)
+    assert sorted(finished(rank, 2)) == [31, 32]
+    ticket = look_up(rank, "request", PROMPT)[1]
+    assert owner.stats()["pinned_blocks"] == BLOCKS
     # A later plan releases the hit and touches two blocks.
-    pool.submit([], [ticket], [keys[:2]])
+    rank.submit([], [ticket], [keys[:2]])
     wait_until(lambda: owner.pool.touched == keys[:2])
     assert owner.stats()["pinned_blocks"] == 0
-
-    # What the pool fails, the adapter raises.
-    owner.pool.failing.update({"probe", "reserve"})
-    with pytest.raises(OwnerError, match="probe failed"):
-        pool.lookup([(6, "r3", *lookup_fields(PROMPT))])
-    pool.submit([(32, *write_fields(PROMPT + [6]))], [], [])
-    assert "reserve failed" in str(failure(rank))
-    with pytest.raises(RuntimeError, match="shared L2 operation failed"):
-        pool.poll()
+    assert rank.poll_writes() == []
 
 
 @pytest.mark.parametrize(

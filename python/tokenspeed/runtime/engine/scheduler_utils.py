@@ -58,9 +58,6 @@ _CACHE_EVENT_TYPES = {
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
-# A shared L2 pool's commands in a plan's cache ops, by class name: a
-# scheduler wheel released before the pool does not bind the classes.
-_POOL_OPS = frozenset({"SharedL2WriteOp", "SharedL2ReleaseOp", "SharedL2TouchOp"})
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
@@ -678,7 +675,14 @@ def cache_ops_from_plan(
             ),
         ):
             storage.append(op)
-        elif type(op).__name__ not in _POOL_OPS:
+        elif not isinstance(
+            op,
+            (
+                Cache.SharedL2ReleaseOp,
+                Cache.SharedL2WriteOp,
+                Cache.SharedL2TouchOp,
+            ),
+        ):
             # A pool's commands are skipped here; any other kind is unknown.
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
     return CacheOperations(tuple(device), tuple(storage))

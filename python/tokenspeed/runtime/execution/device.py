@@ -63,8 +63,8 @@ hold each piece:
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
 - ``shared_l2`` — the rank's client of a shared L2 pool's owner, or None
-  without a pool. The handle's Host cache executor holds it, and so does
-  the adapter the host's control thread calls (``HostSharedL2``).
+  without a pool. The handle's Host cache executor holds it, and the
+  host's control thread calls it.
 - ``DeviceHandle`` — the running handle: with ``shared_l2``, what the loop
   stores.
 
@@ -137,8 +137,8 @@ The two planes exchange information ONLY through the two channels below.
 
    - Shared L2 proxy pages. With a shared L2 pool the control thread hands
      the pool client the pool page behind each proxy Host block an answer
-     created (``HostSharedL2.map_pages``), and the forward thread reads
-     that map when it starts a plan's load-backs
+     created (``SharedL2Client.map_proxy_pages``), and the forward thread
+     reads that map when it starts a plan's load-backs
      (``SharedL2LoadExecutor.submit_load_backs``). The discipline is
      ordering: the map is written at the head of the round, before the
      plan that may load from those blocks is queued, and the scheduler

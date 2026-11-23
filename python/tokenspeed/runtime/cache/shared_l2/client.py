@@ -27,18 +27,26 @@ carries its lookups, writes and notices to the owner.
   waiting prompt, and waits for the answer. The owner pins each hit's pages,
   which the scheduler mirrors into proxy Host blocks (``map_proxy_pages``
   records the pool page behind each).
+* ``submit`` takes a plan's pool commands, each kind in plan order, to the
+  calls below.
 * ``submit_write`` queues the write of newly published Device blocks: a write
   thread reserves pool pages for them, has the transfer copy them, and commits
   them. ``poll_writes`` returns the writes that finished.
 * ``release`` and ``touch`` are notices, which one thread sends in order; it
   pings the owner when it has had nothing to send for ``_KEEPALIVE_S``.
 
+The host's control thread makes every call. ``lookup`` waits for the owner,
+up to the request timeout, with the interpreter lock released; the other calls
+hand work to the client's threads or read what they finished.
+
 Nothing is sent twice, and every failure stops the rank's engine: a request
 the owner does not answer within ``request_timeout_ms`` or answers with an
 error (an owner that does not know the rank answers so), an answer that is not
 one hit of the wire's shape, on pages the pool has, for each lookup, a copy
 that fails, a commit the owner does not carry out. ``lookup`` raises its
-failure; a write's or a notice's is kept, and ``poll_writes`` raises it.
+failure; a write's or a notice's is kept, and so is a load's, which the load
+executor hands over (``record_failure``). ``check_failure`` raises what is
+kept, and so does ``poll_writes``.
 """
 
 from __future__ import annotations
@@ -250,8 +258,9 @@ class SharedL2Client:
         self._writes: queue.SimpleQueue = queue.SimpleQueue()
         self._notices: queue.SimpleQueue = queue.SimpleQueue()
         self._completions: queue.SimpleQueue = queue.SimpleQueue()
-        # The first failure of a write or a notice; poll_writes raises it.
-        self._failure: Exception | None = None
+        # The first failure of a write, a notice or a load; check_failure
+        # raises it.
+        self._failure: BaseException | None = None
         self._threads = [
             *(
                 threading.Thread(
@@ -279,13 +288,13 @@ class SharedL2Client:
         and wait for the answer.
 
         Args:
-            lookups: ``Scheduler.shared_l2_lookups()`` entries, ``(lookup_id,
-                request_id, prefix_hashes, tokens, max_tokens)``; the tokens
-                are int32 bytes.
+            lookups: ``Scheduler.take_shared_l2_lookups()`` entries,
+                ``(request_id, prefix_hashes, tokens, max_tokens)``; the
+                tokens are int32 bytes.
 
         Returns:
             ``Scheduler.apply_shared_l2_lookups`` entries, one per lookup in
-            their order: ``(lookup_id, ticket, num_tokens, kv_tokens, tail,
+            their order: ``(request_id, ticket, num_tokens, kv_tokens, tail,
             slots)``. A prompt the pool holds no prefix of is a miss: ticket
             0 and no slot.
 
@@ -299,7 +308,7 @@ class SharedL2Client:
         if not lookups:
             return []
         prompts = []
-        for _, _, prefix_hashes, tokens, max_tokens in lookups:
+        for _, prefix_hashes, tokens, max_tokens in lookups:
             if not isinstance(tokens, bytes):
                 raise TypeError("shared L2 tokens travel as int32 bytes")
             prompts.append((prefix_hashes, tokens, max_tokens))
@@ -340,6 +349,28 @@ class SharedL2Client:
         """The ``(bucket, page)`` a proxy Host block stands for."""
         return self._proxy_pages[group, proxy_block]
 
+    def submit(
+        self,
+        writes: Sequence[tuple],
+        releases: Sequence[int],
+        touches: Sequence[Sequence[tuple]],
+    ) -> None:
+        """Queue a plan's pool commands, each kind in plan order.
+
+        Args:
+            writes: Each write as ``submit_write`` takes it: ``(write_id,
+                keys, buckets, blocks, publications)``.
+            releases: The tickets to release.
+            touches: The keys of each touch.
+        """
+        for write in writes:
+            self.submit_write(*write)
+        for ticket in releases:
+            self.release(ticket)
+        for keys in touches:
+            # The command carries no bucket: an unsharded group has one.
+            self.touch(keys, [0] * len(keys))
+
     def submit_write(
         self,
         write_id: int,
@@ -358,15 +389,34 @@ class SharedL2Client:
             (write_id, list(keys), list(buckets), list(blocks), list(publications))
         )
 
+    def record_failure(self, failure: BaseException) -> None:
+        """Keep the first failure of the rank's pool work: a write's or a
+        notice's, from the client's threads, or a load's, from the load
+        executor. The rank's engine is to stop on it."""
+        if self._failure is None:
+            self._failure = failure
+
+    def check_failure(self) -> None:
+        """Raise once a write, a notice or a load has failed.
+
+        The event loop calls it when a forward has landed, before it commits
+        the forward's results: a load that failed let its forward go over
+        pages it never filled.
+
+        Raises:
+            RuntimeError: At this call and at every later one.
+        """
+        if self._failure is not None:
+            raise RuntimeError("shared L2 operation failed") from self._failure
+
     def poll_writes(self) -> list[int]:
         """The ids of the writes finished since the last poll.
 
         Raises:
-            RuntimeError: A write or a notice failed, at this poll and at
-                every later one.
+            RuntimeError: A write, a notice or a load failed
+                (``check_failure``).
         """
-        if self._failure is not None:
-            raise RuntimeError("shared L2 operation failed") from self._failure
+        self.check_failure()
         finished = []
         while True:
             try:
@@ -422,8 +472,7 @@ class SharedL2Client:
                 handler(*item)
             except Exception as exc:
                 logger.exception("shared L2 operation failed")
-                if self._failure is None:
-                    self._failure = exc
+                self.record_failure(exc)
 
     def _write(
         self,

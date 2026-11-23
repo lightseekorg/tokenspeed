@@ -768,30 +768,33 @@ fn assert_failure_is_published_before_logging(
     );
 }
 
-/// A stand-in for the pool adapter (`HostSharedL2`): it records what each
-/// call was given and answers what a pool client would.
-const POOL_ADAPTER: &str = r#"
+/// A stand-in for the rank's Python pool client (`SharedL2Client`): it
+/// records what each call was given and answers what the client would.
+const POOL_CLIENT: &str = r#"
 import struct
 
 
-class Adapter:
+class Client:
     def __init__(self):
         self.calls = []
 
     def lookup(self, lookups):
         self.calls.append(("lookup", lookups))
-        hit = (4, 9, 32, 35, (3, "tail"), [((0, 1, "k1", 0), 0, 17), ((0, 2, "k2", 1), 0, 18)])
-        return [hit, (5, 0, 0, 0, None, [])]
+        hit = ("r1", 9, 32, 35, (3, "tail"), [((0, 1, "k1", 0), 0, 17), ((0, 2, "k2", 1), 0, 18)])
+        return [hit, ("r2", 0, 0, 0, None, [])]
 
-    def poll(self):
-        self.calls.append(("poll",))
+    def poll_writes(self):
+        self.calls.append(("poll_writes",))
         return [21, 22]
 
-    def map_pages(self, pages):
-        self.calls.append(("map_pages", pages))
+    def map_proxy_pages(self, pages):
+        self.calls.append(("map_proxy_pages", pages))
 
     def submit(self, writes, releases, touches):
         self.calls.append(("submit", writes, releases, touches))
+
+    def check_failure(self):
+        self.calls.append(("check_failure",))
 
 
 def int32(*tokens):
@@ -799,9 +802,9 @@ def int32(*tokens):
 
 
 EXPECTED = [
-    ("lookup", [(4, "r1", ["h1", "h2"], int32(7, 8, 9), 3), (5, "r2", [], int32(), 0)]),
-    ("poll",),
-    ("map_pages", [(1, 5, 0, 17), (2, 6, 0, 18)]),
+    ("lookup", [("r1", ["h1", "h2"], int32(7, 8, 9), 3), ("r2", [], int32(), 0)]),
+    ("poll_writes",),
+    ("map_proxy_pages", [(1, 5, 0, 17), (2, 6, 0, 18)]),
     (
         "submit",
         [
@@ -816,29 +819,30 @@ EXPECTED = [
         [9],
         [[(0, 1, "k1", 0)]],
     ),
+    ("check_failure",),
 ]
-result = Adapter()
+result = Client()
 "#;
 
 #[test]
-fn the_pool_client_speaks_the_adapters_shapes() {
+fn the_pool_client_speaks_the_python_clients_shapes() {
     use ts_control::shared_l2::PoolClient;
     use ts_scheduler::{
-        SharedL2KeyView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
-        SharedL2PublicationView,
+        SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+        SharedL2PublicationView, StorageKeyView,
     };
 
     interpreter();
-    let (adapter, globals) = Python::attach(|py| {
+    let (python_client, globals) = Python::attach(|py| {
         let globals = PyDict::new(py);
-        py.run(&CString::new(POOL_ADAPTER).unwrap(), Some(&globals), None)
+        py.run(&CString::new(POOL_CLIENT).unwrap(), Some(&globals), None)
             .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
-        let adapter = globals.get_item("result").unwrap().unwrap().unbind();
-        (adapter, globals.unbind())
+        let python_client = globals.get_item("result").unwrap().unwrap().unbind();
+        (python_client, globals.unbind())
     });
-    let mut client = crate::pool::PythonPoolClient::new(Python::attach(|py| adapter.clone_ref(py)));
-    let key = |group_id: u32, hash: &str, page_offset: i32| SharedL2KeyView {
-        namespace_id: 0,
+    let mut client =
+        crate::pool::PythonPoolClient::new(Python::attach(|py| python_client.clone_ref(py)));
+    let key = |group_id: u32, hash: &str, page_offset: i32| StorageKeyView {
         group_id,
         content_hash: hash.to_owned(),
         page_offset,
@@ -847,14 +851,12 @@ fn the_pool_client_speaks_the_adapters_shapes() {
     let answers = client
         .lookup(&[
             SharedL2LookupView {
-                lookup_id: 4,
                 request_id: "r1".to_owned(),
                 prefix_hashes: vec!["h1".to_owned(), "h2".to_owned()],
                 tokens: vec![7, 8, 9],
                 max_tokens: 3,
             },
             SharedL2LookupView {
-                lookup_id: 5,
                 request_id: "r2".to_owned(),
                 prefix_hashes: Vec::new(),
                 tokens: Vec::new(),
@@ -867,19 +869,27 @@ fn the_pool_client_speaks_the_adapters_shapes() {
         panic!("{answers:?}");
     };
     assert_eq!(
-        (hit.lookup_id, hit.ticket, hit.num_tokens, hit.kv_tokens),
-        (4, 9, 32, 35)
+        (
+            hit.request_id.as_str(),
+            hit.ticket,
+            hit.num_tokens,
+            hit.kv_tokens
+        ),
+        ("r1", 9, 32, 35)
     );
     assert_eq!((hit.tail_tokens, hit.tail_hash.as_str()), (3, "tail"));
     assert_eq!(hit.keys, [key(1, "k1", 0), key(2, "k2", 1)]);
     assert_eq!((&hit.buckets, &hit.pages), (&vec![0, 0], &vec![17, 18]));
-    assert_eq!((miss.lookup_id, miss.ticket, miss.tail_tokens), (5, 0, 0));
+    assert_eq!(
+        (miss.request_id.as_str(), miss.ticket, miss.tail_tokens),
+        ("r2", 0, 0)
+    );
     assert!(miss.keys.is_empty() && miss.tail_hash.is_empty());
     // The finished writes.
-    assert_eq!(client.poll().unwrap(), [21, 22]);
+    assert_eq!(client.poll_writes().unwrap(), [21, 22]);
 
     client
-        .map_pages(&[
+        .map_proxy_pages(&[
             SharedL2PageView {
                 group_id: 1,
                 block: 5,
@@ -930,7 +940,10 @@ fn the_pool_client_speaks_the_adapters_shapes() {
         ])
         .unwrap();
 
-    // What the adapter was given, as its Python client takes it.
+    // Nothing failed so far.
+    client.check_failure().unwrap();
+
+    // What the Python client was given, in its own shapes.
     Python::attach(|py| {
         py.run(
             c"assert result.calls == EXPECTED, f'{result.calls}\\n!=\\n{EXPECTED}'",
@@ -944,7 +957,7 @@ fn the_pool_client_speaks_the_adapters_shapes() {
     // owner's error reply to a lookup, a write that failed.
     Python::attach(|py| {
         py.run(
-            c"def fail(*_):\n    raise RuntimeError('the owner refused')\nresult.lookup = result.poll = fail",
+            c"def fail(*_):\n    raise RuntimeError('the owner refused')\nresult.lookup = result.poll_writes = result.check_failure = fail",
             Some(globals.bind(py)),
             None,
         )
@@ -952,6 +965,21 @@ fn the_pool_client_speaks_the_adapters_shapes() {
     });
     let error = client.lookup(&[]).unwrap_err();
     assert!(error.0.contains("the owner refused"), "{}", error.0);
-    let error = client.poll().unwrap_err();
+    let error = client.poll_writes().unwrap_err();
     assert!(error.0.contains("the owner refused"), "{}", error.0);
+    let error = client.check_failure().unwrap_err();
+    assert!(error.0.contains("the owner refused"), "{}", error.0);
+
+    // A pool holds the default namespace alone, which the scheduler's keys
+    // do not carry: an answer that names another is refused.
+    Python::attach(|py| {
+        py.run(
+            c"result.lookup = lambda lookups: [('r1', 9, 2, 2, None, [((1, 1, 'k1', 0), 0, 17)])]",
+            Some(globals.bind(py)),
+            None,
+        )
+        .unwrap();
+    });
+    let error = client.lookup(&[]).unwrap_err();
+    assert!(error.0.contains("namespace 1"), "{}", error.0);
 }

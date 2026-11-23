@@ -66,19 +66,18 @@ struct SharedL2Publication {
 // A waiting prompt's question to the pool: its full-page hashes and its
 // tokens up to max_tokens (the owner hashes tails from them).
 struct SharedL2Lookup {
-    std::uint64_t lookup_id;
     std::string request_id;
     std::vector<std::string> prefix_hashes;
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens;
 };
 
-// The pool's answer: its longest reusable prefix of the prompt, pinned under
-// `ticket` (0 pins nothing), each key with its bucket and its pool page.
-// kv_tokens is how far the pool's KV reaches, past the checkpoint num_tokens
-// resumes from. A miss is an answer that names no key.
+// The pool's answer to a request's lookup: its longest reusable prefix of the
+// prompt, pinned under `ticket` (0 pins nothing), each key with its bucket
+// and its pool page. kv_tokens is how far the pool's KV reaches, past the
+// checkpoint num_tokens resumes from. A miss is an answer that names no key.
 struct SharedL2LookupResult {
-    std::uint64_t lookup_id;
+    std::string request_id;
     std::uint64_t ticket;
     std::int32_t num_tokens;
     std::int32_t kv_tokens;

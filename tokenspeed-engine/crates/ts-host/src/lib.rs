@@ -738,22 +738,13 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             built.map_err(|error| python_error(py, error))
         })?;
 
-    // With a shared L2 pool as the Host tier, the pool client's adapter.
+    // With a shared L2 pool as the Host tier, the rank's client of its owner.
     let pool = Python::attach(|py| {
         bootstrap
             .getattr(py, "shared_l2")
             .map(|pool| (!pool.is_none(py)).then_some(pool))
             .map_err(|error| python_error(py, error))
     })?;
-    if pool.is_some() && config.replica_ranks.len() != 1 {
-        // The pool's client answers this rank alone: mirrored schedulers
-        // would not hold the same answers.
-        return Err(HostError::Interpreter(format!(
-            "a shared L2 pool needs a replica of one rank (attention TP 1, no pipeline); this \
-             one has {}",
-            config.replica_ranks.len()
-        )));
-    }
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
@@ -935,8 +926,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
-            pool: pool.map(|adapter| {
-                Box::new(PythonPoolClient::new(adapter)) as Box<dyn PoolClient + Send>
+            pool: pool.map(|client| {
+                Box::new(PythonPoolClient::new(client)) as Box<dyn PoolClient + Send>
             }),
             peer,
         },

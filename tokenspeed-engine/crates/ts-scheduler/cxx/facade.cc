@@ -305,11 +305,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
-                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events,
-                  rust::Slice<const std::uint64_t> pool_writes) {
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events) {
     // One batch, in the order the Python hooks built it: the storage clock,
-    // the cancellations, the storage completions, then the Host copies' ACKs;
-    // a shared L2 pool's finished writes come last.
+    // the cancellations, the storage completions, then the Host copies' ACKs.
     tokenspeed::ExecutionEvent execution_event;
     for (const StorageTickView& tick : ticks) {
         execution_event.With(tokenspeed::cache::StorageTick{
@@ -355,12 +353,12 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
             case CacheEventKind::RestoreDone:
                 execution_event.With(tokenspeed::cache::RestoreDone{.op_id = event.op_id});
                 break;
+            case CacheEventKind::SharedL2WriteDone:
+                execution_event.With(tokenspeed::cache::SharedL2WriteDone{.write_id = event.op_id});
+                break;
             default:
                 throw std::invalid_argument("unknown cache event kind");
         }
-    }
-    for (const std::uint64_t write_id : pool_writes) {
-        execution_event.With(tokenspeed::cache::SharedL2WriteDone{.write_id = write_id});
     }
     scheduler.Advance(execution_event);
 }
@@ -574,25 +572,23 @@ rust::Vec<rust::String> to_rust(const std::vector<std::string>& values) {
     return out;
 }
 
-rust::Vec<SharedL2KeyView> to_rust(const std::vector<tokenspeed::CacheKey>& keys) {
-    rust::Vec<SharedL2KeyView> out;
+rust::Vec<StorageKeyView> to_rust(const std::vector<tokenspeed::CacheKey>& keys) {
+    rust::Vec<StorageKeyView> out;
     out.reserve(keys.size());
     for (const tokenspeed::CacheKey& key : keys) {
-        out.push_back(SharedL2KeyView{.namespace_id = key.namespace_id,
-                                      .group_id = key.group_id,
-                                      .content_hash = rust::String(key.content_hash.ToString()),
-                                      .page_offset = key.page_offset});
+        out.push_back(StorageKeyView{.group_id = key.group_id,
+                                     .content_hash = rust::String(key.content_hash.ToString()),
+                                     .page_offset = key.page_offset});
     }
     return out;
 }
 
 }  // namespace
 
-rust::Vec<SharedL2LookupView> shared_l2_lookups(tokenspeed::Scheduler& scheduler) {
+rust::Vec<SharedL2LookupView> take_shared_l2_lookups(tokenspeed::Scheduler& scheduler) {
     rust::Vec<SharedL2LookupView> out;
-    for (const tokenspeed::SharedL2Lookup& lookup : scheduler.SharedL2Lookups()) {
-        out.push_back(SharedL2LookupView{.lookup_id = lookup.lookup_id,
-                                         .request_id = rust::String(lookup.request_id),
+    for (const tokenspeed::SharedL2Lookup& lookup : scheduler.TakeSharedL2Lookups()) {
+        out.push_back(SharedL2LookupView{.request_id = rust::String(lookup.request_id),
                                          .prefix_hashes = to_rust(lookup.prefix_hashes),
                                          .tokens = to_rust(lookup.tokens),
                                          .max_tokens = lookup.max_tokens});
@@ -609,13 +605,12 @@ rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& schedu
     }
     std::vector<tokenspeed::CacheKey> keys;
     keys.reserve(answer.keys.size());
-    for (const SharedL2KeyView& key : answer.keys) {
-        keys.push_back(tokenspeed::CacheKey{.namespace_id = key.namespace_id,
-                                            .group_id = key.group_id,
+    for (const StorageKeyView& key : answer.keys) {
+        keys.push_back(tokenspeed::CacheKey{.group_id = key.group_id,
                                             .content_hash = tokenspeed::ContentHash{std::string(key.content_hash)},
                                             .page_offset = key.page_offset});
     }
-    const tokenspeed::SharedL2LookupResult result{.lookup_id = answer.lookup_id,
+    const tokenspeed::SharedL2LookupResult result{.request_id = std::string(answer.request_id),
                                                   .ticket = answer.ticket,
                                                   .num_tokens = answer.num_tokens,
                                                   .kv_tokens = answer.kv_tokens,

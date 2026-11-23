@@ -453,8 +453,6 @@ class _CpuExecutor:
 
     def __init__(self, *, output_token_cumulative_probs: torch.Tensor | None) -> None:
         self.device = "cpu"
-        # What Host loads order behind; no forward here carries one.
-        self.default_stream = None
         self.output_token_cumulative_probs: torch.Tensor | None = (
             output_token_cumulative_probs
         )
@@ -570,7 +568,7 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle, *, shared_l2_loads=False) -> HostDataPlane:
+def _data_plane(handle: DeviceHandle) -> HostDataPlane:
     """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
@@ -590,7 +588,6 @@ def _data_plane(handle: DeviceHandle, *, shared_l2_loads=False) -> HostDataPlane
         attn_tp_cpu_group=None,
         epd_publisher=None,
         starting=False,
-        shared_l2_loads=shared_l2_loads,
     )
 
 
@@ -755,20 +752,12 @@ def test_a_plan_without_a_batch_runs_no_forward(executor):
 
 
 class _HostCache:
-    """Stands in for the Host cache executor: its acknowledgments, landed,
-    and the failure every poll raises once a shared L2 load failed."""
+    """Stands in for the Host cache executor: its acknowledgments, landed."""
 
     def __init__(self, landed) -> None:
         self.landed = landed
-        self.failure: Exception | None = None
-
-    def submit_load_backs(self, cache_ops, *, prerequisite_stream) -> None:
-        # Every plan is offered; the plans here carry no load.
-        assert not cache_ops
 
     def poll_results(self) -> list:
-        if self.failure is not None:
-            raise self.failure
         landed, self.landed = self.landed, []
         return landed
 
@@ -830,46 +819,6 @@ def test_a_result_without_a_copy_event_cannot_land():
     results = ModelExecutionResult(output_tokens=torch.tensor([7], dtype=torch.int32))
     with pytest.raises(RuntimeError, match="copy_event is required"):
         results.sync()
-
-
-def test_a_failed_pool_load_fails_the_commit_of_the_forward_it_let_go(executor):
-    """With a shared L2 pool the commit polls the Host loads once the forward
-    has landed: a failed load raises before any result is returned; the
-    acknowledgments the commit finds wait for the cache poll."""
-    host_cache = _HostCache([Cache.LoadBackDoneEvent(9)])
-    plane = _data_plane(
-        DeviceHandle(executor, host_cache_executor=host_cache), shared_l2_loads=True
-    )
-    for admission_id, rid in enumerate(("r1", "r2"), 1):
-        plane.admit(
-            [(rid, admission_id, msgspec.msgpack.encode(_resolved(rid)), [], 11, None)]
-        )
-    first, second = (
-        plane.execute(_plan_with_one_request(rid), None, None, None, (None, 0), None)
-        for rid in ("r1", "r2")
-    )
-
-    assert plane.complete(first)[0] == [100]
-    host_cache.landed = [Cache.LoadBackDoneEvent(4)]
-    assert plane.poll_cache_events() == [
-        ("LoadBackDoneEvent", 9),
-        ("LoadBackDoneEvent", 4),
-    ]
-    assert plane.poll_cache_events() == []
-
-    host_cache.failure = RuntimeError("shared L2 load failed")
-    with pytest.raises(RuntimeError, match="shared L2 load failed"):
-        plane.complete(second)
-    # The commit had waited for the forward to land before it looked.
-    assert second.results.copy_event.waits == 1
-
-    # Without a pool a commit does not ask the Host cache executor.
-    plain = _data_plane(DeviceHandle(executor, host_cache_executor=host_cache))
-    plain.admit([("r3", 1, msgspec.msgpack.encode(_resolved("r3")), [], 11, None)])
-    launched = plain.execute(
-        _plan_with_one_request("r3"), None, None, None, (None, 0), None
-    )
-    assert plain.complete(launched)[0] == [100]
 
 
 def test_the_forward_thread_is_named_for_its_role(executor):

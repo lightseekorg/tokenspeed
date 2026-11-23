@@ -21,14 +21,12 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/core/cache_block_ref.h"
 #include "cache/tier/shared_l2.h"
-#include "cache/tier/shared_l2_lookup_hold.h"
 
 namespace tokenspeed {
 
@@ -40,18 +38,13 @@ class SharedL2Proxy {
 public:
     explicit SharedL2Proxy(CacheCoordinator& coordinator);
 
-    // Starts the lookup of a waiting prompt; the runtime sends it and
-    // answers it under the hold's id.
-    SharedL2LookupHold StartLookup(const std::string& request_id);
-    // The request a lookup still waits for; null once it was answered or its
-    // request left.
-    const std::string* PendingRequest(std::uint64_t lookup_id) const;
-    // Mirrors the pool's answer to hold's lookup into proxy Host entries,
-    // which the hold pins; tail_prior precedes the hit's tail. Returns the
-    // entries created -- a key another lookup's proxy already stands for is
-    // shared, and stays under that lookup's ticket.
+    // Mirrors the pool's answer to a waiting prompt's lookup into proxy Host
+    // entries; tail_prior precedes the hit's tail. hit_blocks takes the
+    // references that pin the hit's entries: dropping them lets the entries
+    // go. Returns the entries created -- a key another lookup's proxy already
+    // stands for is shared, and stays under that lookup's ticket.
     std::vector<SharedL2ProxyPage> ApplyAnswer(const SharedL2LookupResult& result, const ContentHash& tail_prior,
-                                               SharedL2LookupHold& hold);
+                                               std::vector<CacheBlockRef>& hit_blocks);
     // The keys Device hits used since the last call go to the owner.
     void Touch(std::vector<CacheKey> keys);
     // Drops proxy entries nothing holds any more -- no waiting prompt, no
@@ -62,11 +55,6 @@ public:
     std::vector<SharedL2Operation> TakeCommands() { return std::exchange(commands_, {}); }
 
 private:
-    friend class SharedL2LookupHold;
-
-    // A hold ended: a lookup still pending waits for no answer any more.
-    void endLookup(std::uint64_t lookup_id) noexcept;
-
     // The proxy entries created under one owner ticket, in the answer's
     // order; the ticket is released once the last one is dropped.
     struct TicketEntries {
@@ -75,12 +63,8 @@ private:
     };
 
     CacheCoordinator& coordinator_;
-    // Lookups not answered yet, with their requests; only a hold adds and
-    // removes them.
-    std::unordered_map<std::uint64_t, std::string> pending_;
     std::vector<TicketEntries> tickets_;
     std::vector<SharedL2Operation> commands_;
-    std::uint64_t next_lookup_id_{0};
 };
 
 }  // namespace tokenspeed

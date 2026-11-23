@@ -166,7 +166,7 @@ def test_the_first_client_sets_the_geometry_and_deployment_later_ones_match(
         owner.admin.request(
             "hello", client=3, geometry=GEOMETRY, deployment_id=deployment_id("def")
         )
-    with pytest.raises(OwnerError, match="LCM block holds 128 bytes"):
+    with pytest.raises(OwnerError, match="geometry differs"):
         owner.admin.request(
             "hello",
             client=3,
@@ -178,10 +178,8 @@ def test_the_first_client_sets_the_geometry_and_deployment_later_ones_match(
     assert owner.admin.request("stats")["clients"] == 2
 
 
-def test_providers_join_before_the_pool_runs_with_whole_lcm_blocks(serve, connect):
+def test_providers_join_before_the_pool_runs(serve, connect):
     owner = serve(num_providers=2, joined_providers=1)
-    with pytest.raises(OwnerError, match="at least one LCM block"):
-        owner.admin.request("provider", session="small", base=0, bytes=LCM_BYTES - 1)
     owner.add_provider("node1", 8)
     with pytest.raises(OwnerError, match="every expected provider"):
         owner.add_provider("node2", 8)
@@ -190,8 +188,8 @@ def test_providers_join_before_the_pool_runs_with_whole_lcm_blocks(serve, connec
         owner.add_provider("node2", 8)
 
 
-def test_without_a_block_size_the_first_client_sets_the_providers_shares(serve):
-    owner = serve(num_providers=2, joined_providers=0, lcm_bytes=None)
+def test_the_first_client_sets_the_providers_shares(serve):
+    owner = serve(num_providers=2, joined_providers=0)
     # Providers join with their bytes, whatever a block will hold.
     owner.admin.request("provider", session="node0", base=4096, bytes=200)
     owner.admin.request("provider", session="node1", base=8192, bytes=LCM_BYTES)
@@ -209,7 +207,7 @@ def test_without_a_block_size_the_first_client_sets_the_providers_shares(serve):
     assert owner.pool.num_lcm_blocks == 4
     assert owner.admin.request("stats")["providers"] == reply["providers"]
     # From then on that block size is the pool's.
-    with pytest.raises(OwnerError, match="LCM block holds 128 bytes, a pool slot 64"):
+    with pytest.raises(OwnerError, match="geometry differs"):
         owner.admin.request(
             "hello",
             client=2,
@@ -222,7 +220,7 @@ def test_without_a_block_size_the_first_client_sets_the_providers_shares(serve):
 
 
 def test_a_provider_smaller_than_a_block_stops_the_pool_from_being_built(serve):
-    owner = serve(num_providers=2, joined_providers=0, lcm_bytes=None)
+    owner = serve(num_providers=2, joined_providers=0)
     owner.admin.request("provider", session="node0", base=4096, bytes=10 * LCM_BYTES)
     owner.admin.request("provider", session="small", base=8192, bytes=LCM_BYTES - 1)
     hello = dict(client=1, geometry=GEOMETRY, deployment_id=deployment_id())
@@ -449,8 +447,7 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
     assert Engine.registered == {}
 
 
-@pytest.mark.parametrize("block_size", [[f"--lcm-bytes={LCM_BYTES}"], []])
-def test_the_owner_service_runs_from_the_command_line(block_size):
+def test_the_owner_service_runs_from_the_command_line():
     address = f"tcp://127.0.0.1:{get_free_port()}"
     service = subprocess.Popen(
         [
@@ -459,7 +456,6 @@ def test_the_owner_service_runs_from_the_command_line(block_size):
             "tokenspeed.runtime.cache.shared_l2",
             "owner",
             f"--address={address}",
-            *block_size,
             "--providers=1",
             "--headroom-lcm-blocks=0",
             "--client-timeout-s=60",
@@ -530,7 +526,6 @@ def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
     # handled here as its service hands them over.
     owner = SharedL2Owner(
         address=f"tcp://127.0.0.1:{get_free_port()}",
-        lcm_bytes=None,
         num_providers=1,
         client_timeout_s=60.0,
         make_pool=functools.partial(

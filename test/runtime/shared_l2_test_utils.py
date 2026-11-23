@@ -254,7 +254,6 @@ class ServedOwner:
         joined_providers: int = 1,
         provider_blocks: int = 8,
         client_timeout_s: float = 60.0,
-        lcm_bytes: int | None = LCM_BYTES,
     ):
         """
         Args:
@@ -263,8 +262,6 @@ class ServedOwner:
             joined_providers: Providers that join right away.
             provider_blocks: LCM blocks of each.
             client_timeout_s: The owner's client timeout.
-            lcm_bytes: The owner's LCM block size; None leaves it to the
-                first client.
         """
         self.address = address or f"tcp://127.0.0.1:{get_free_port()}"
         self.pools: list[FakePool] = []
@@ -274,7 +271,6 @@ class ServedOwner:
             try:
                 self.owner = SharedL2Owner(
                     address=self.address,
-                    lcm_bytes=lcm_bytes,
                     num_providers=num_providers,
                     client_timeout_s=client_timeout_s,
                     make_pool=self._make_pool,

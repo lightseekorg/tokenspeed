@@ -333,6 +333,9 @@ class Rank:
         self.engine = engine if engine is not None else MemoryEngine()
         self.tracker = LayerwiseLoadTracker(len(CONSUMERS))
         self.proxy_pages = {}
+        # Each failure the executor handed the pool client, with the words
+        # as they stood then.
+        self.handed = []
         # What the executor had stopped when it closed the pool client.
         self.closed_after = []
         self.executor = SharedL2LoadExecutor(
@@ -343,6 +346,9 @@ class Rank:
             proxy_page=lambda group, block: self.proxy_pages[group, block],
             pool=self.pool.view,
             load_workers=2,
+            record_failure=lambda failure: self.handed.append(
+                (failure, self.words.words.copy())
+            ),
             close=lambda: self.closed_after.append(
                 [thread.name for thread in threading.enumerate()]
             ),
@@ -476,9 +482,6 @@ def test_a_pool_is_laid_out_as_a_ranks_host_tier(pool):
             layout.page_address(pool.view, STATE, 0, page)
     with pytest.raises(ValueError, match="bucket 0 only"):
         layout.page_address(pool.view, KV, 1, 1)
-    other = SharedL2PoolView(client=1, providers=pool.view.providers, lcm_bytes=56)
-    with pytest.raises(ValueError, match="LCM block holds 56 bytes"):
-        layout.page_address(other, KV, 0, 1)
 
 
 def test_the_geometry_is_the_schedulers_view_of_the_groups():
@@ -813,6 +816,12 @@ def test_a_failed_read_lets_the_forward_go_and_fails_the_next_poll(pool, ranks):
     # It stays failed: the engine is to stop.
     with pytest.raises(RuntimeError, match="shared L2 load failed"):
         reader.executor.poll_results()
+    # The pool's client had the failure before the forward was let go: no
+    # ready word of a layer was set yet. The event loop checks the client
+    # when that forward has landed, before it commits it.
+    ((handed, words),) = reader.handed
+    assert handed is failure.value.__cause__
+    assert not words.reshape(-1, len(CONSUMERS) + 1)[:, 1:].any()
 
 
 def test_a_load_is_refused_during_graph_capture(pool, ranks, monkeypatch):

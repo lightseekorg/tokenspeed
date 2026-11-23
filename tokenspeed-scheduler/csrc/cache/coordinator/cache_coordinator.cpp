@@ -619,6 +619,33 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     recordPublishedTail(completed);
 }
 
+void CacheCoordinator::PublishHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                                         std::span<const CompletedPages> checkpoints,
+                                         std::span<const std::uint64_t> publishers) {
+    _assert(blocks.size() == keys.size(), "a Host publication names a key for every block");
+    _assert(checkpoints.size() == publishers.size(), "a Host publication names a publisher for every checkpoint");
+    // Held while the blocks register under the checkpoints' nodes.
+    std::vector<BoundaryTree::Hold> publications;
+    publications.reserve(checkpoints.size());
+    for (const CompletedPages& completed : checkpoints) {
+        publications.push_back(store_.Boundaries().LinkPublication(completed));
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        host_.CacheHostBlock(blocks[i], keys[i], /*inherited_metadata=*/std::nullopt);
+    }
+    // A boundary nothing registered under leaves again.
+    publications.clear();
+    for (std::size_t i = 0; i < checkpoints.size(); ++i) {
+        const CompletedPages& completed = checkpoints[i];
+        recordCheckpoints(completed, publishers[i]);
+        if (completed.tail) {
+            host_.CacheHostTail(
+                completed.prefix_hashes.empty() ? ContentHash{} : ContentHash{completed.prefix_hashes.back()},
+                *completed.tail);
+        }
+    }
+}
+
 template <CacheTier Tier>
 void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,

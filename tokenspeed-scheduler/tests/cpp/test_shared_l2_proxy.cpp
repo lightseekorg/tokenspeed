@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_sinks.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -122,9 +123,8 @@ struct Rank {
     }
 
     // The pool's answer to a lookup: the prompt's keys at pool pages 100, 101, ...
-    SharedL2LookupResult Answer(const SharedL2LookupHold& hold, const Prompt& prompt, std::uint64_t ticket) const {
-        SharedL2LookupResult result{.lookup_id = hold.LookupId(),
-                                    .ticket = ticket,
+    SharedL2LookupResult Answer(const Prompt& prompt, std::uint64_t ticket) const {
+        SharedL2LookupResult result{.ticket = ticket,
                                     .num_tokens = static_cast<std::int32_t>(prompt.tokens.size()),
                                     .kv_tokens = static_cast<std::int32_t>(prompt.tokens.size()),
                                     .tail = prompt.tail,
@@ -150,13 +150,10 @@ std::vector<Operation> CommandsOf(const std::vector<SharedL2Operation>& commands
 TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     Rank rank(16, 16);
     const Prompt prompt{Sequence(10)};
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    ASSERT_NE(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
-    EXPECT_EQ(*rank.proxy.PendingRequest(hold.LookupId()), "r");
+    std::vector<CacheBlockRef> hold;
 
     const std::vector<SharedL2ProxyPage> created =
-        rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, /*ticket=*/7), rank.TailPrior(prompt), hold);
-    EXPECT_EQ(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
+        rank.proxy.ApplyAnswer(rank.Answer(prompt, /*ticket=*/7), rank.TailPrior(prompt), hold);
     // Each key under a Host block of its group, which stands for its pool page.
     ASSERT_EQ(created.size(), 4u);
     for (std::size_t i = 0; i < created.size(); ++i) {
@@ -177,7 +174,7 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
     // The hold goes (an admission consumed the state): the entries leave at
     // the next pass, then the pool's ticket.
-    hold.reset();
+    hold.clear();
     EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 4);
     rank.proxy.ReleaseUnheld();
     EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
@@ -190,46 +187,18 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
 }
 
-TEST(SharedL2Proxy, ALookupIsPendingWhileItsHoldWaitsForTheAnswer) {
-    Rank rank(16, 16);
-    std::uint64_t lookup_id = 0;
-    {
-        SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-        lookup_id = hold.LookupId();
-        // The lookup moves with its hold.
-        SharedL2LookupHold moved = std::move(hold);
-        EXPECT_FALSE(static_cast<bool>(hold));
-        ASSERT_NE(rank.proxy.PendingRequest(lookup_id), nullptr);
-    }
-    // The hold went before its answer (its request left): no answer is
-    // waited for, and the owner is told nothing.
-    EXPECT_EQ(rank.proxy.PendingRequest(lookup_id), nullptr);
-    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-
-    // A miss settles its lookup: its hold then drops without a command.
-    {
-        SharedL2LookupHold hold = rank.proxy.StartLookup("s");
-        EXPECT_TRUE(
-            rank.proxy.ApplyAnswer(SharedL2LookupResult{.lookup_id = hold.LookupId()}, ContentHash{}, hold).empty());
-        EXPECT_EQ(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
-    }
-    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-}
-
 TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
     Rank rank(16, 16);
     const Prompt shorter{Sequence(8)}, longer{Sequence(12)};
-    SharedL2LookupHold first = rank.proxy.StartLookup("a");
-    SharedL2LookupHold second = rank.proxy.StartLookup("b");
-    SharedL2LookupHold third = rank.proxy.StartLookup("c");
-    EXPECT_EQ(rank.proxy.ApplyAnswer(rank.Answer(first, shorter, 1), ContentHash{}, first).size(), 3u);
+    std::vector<CacheBlockRef> first, second, third;
+    EXPECT_EQ(rank.proxy.ApplyAnswer(rank.Answer(shorter, 1), ContentHash{}, first).size(), 3u);
     // The same pages again: nothing new, and the second ticket goes back.
-    EXPECT_TRUE(rank.proxy.ApplyAnswer(rank.Answer(second, shorter, 2), ContentHash{}, second).empty());
+    EXPECT_TRUE(rank.proxy.ApplyAnswer(rank.Answer(shorter, 2), ContentHash{}, second).empty());
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 2u);
     // A longer hit: only its own page and checkpoint are new, the last two of
     // its four keys. Each is under a Host block that stands for the pool page
     // of its own key.
-    const SharedL2LookupResult extended = rank.Answer(third, longer, 3);
+    const SharedL2LookupResult extended = rank.Answer(longer, 3);
     const std::vector<SharedL2ProxyPage> created = rank.proxy.ApplyAnswer(extended, ContentHash{}, third);
     ASSERT_EQ(created.size(), 2u);
     for (std::size_t j = 0; j < created.size(); ++j) {
@@ -243,16 +212,16 @@ TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
     }
 
     // The first ticket stays while any lookup holds its entries.
-    first.reset();
+    first.clear();
     rank.proxy.ReleaseUnheld();
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    second.reset();
+    second.clear();
     rank.proxy.ReleaseUnheld();
     // The shorter prompt's checkpoint is held by nothing now and leaves; its
     // pages are the longer hit's too.
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
     EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 4);
-    third.reset();
+    third.clear();
     rank.proxy.ReleaseUnheld();
     const std::vector<SharedL2ReleaseOperation> released =
         CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands());
@@ -263,12 +232,12 @@ TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
 TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
     Rank rank(16, 16);
     const Prompt prompt{Sequence(10)};
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold);
+    std::vector<CacheBlockRef> hold;
+    rank.proxy.ApplyAnswer(rank.Answer(prompt, 5), rank.TailPrior(prompt), hold);
     // The load-back's ticket holds its sources as block references.
     std::vector<CacheBlockRef> load;
     for (const CacheKey& key : prompt.Keys()) load.push_back(rank.cache.Store().AcquireHostCachedBlock(key));
-    hold.reset();
+    hold.clear();
     for (std::int32_t plan = 0; plan < 3; ++plan) {
         rank.proxy.ReleaseUnheld();
         EXPECT_TRUE(rank.proxy.TakeCommands().empty());
@@ -285,46 +254,46 @@ TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
     EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
 }
 
-TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
+TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsFatal) {
     Rank rank(16, /*host_blocks=*/3);
     const Prompt prompt{Sequence(10)};
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    EXPECT_TRUE(rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold).empty());
-    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
-    EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 5u);
-    // The ticket went back with the answer: no later pass releases it again.
-    hold.reset();
-    rank.proxy.ReleaseUnheld();
-    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
+    std::vector<CacheBlockRef> hold;
+    EXPECT_DEATH(
+        {
+            // The default logger writes to stdout; the death test reads stderr.
+            spdlog::set_default_logger(spdlog::stderr_logger_mt("fatal-check-test"));
+            (void)rank.proxy.ApplyAnswer(rank.Answer(prompt, 5), rank.TailPrior(prompt), hold);
+        },
+        "the shared L2 proxy Host tier is full");
 }
 
 TEST(SharedL2Proxy, AMalformedAnswerIsRefusedBeforeAnythingOfItIsKept) {
     Rank rank(16, 16);
     const Prompt prompt{Sequence(10)};
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    SharedL2LookupResult unpinned = rank.Answer(hold, prompt, /*ticket=*/0);
+    std::vector<CacheBlockRef> hold;
+    SharedL2LookupResult unpinned = rank.Answer(prompt, /*ticket=*/0);
     EXPECT_THROW(rank.proxy.ApplyAnswer(unpinned, ContentHash{}, hold), std::invalid_argument);
-    SharedL2LookupResult ragged = rank.Answer(hold, prompt, 5);
+    SharedL2LookupResult ragged = rank.Answer(prompt, 5);
     ragged.pages.pop_back();
     EXPECT_THROW(rank.proxy.ApplyAnswer(ragged, ContentHash{}, hold), std::invalid_argument);
-    SharedL2LookupResult unknown_group = rank.Answer(hold, prompt, 5);
+    SharedL2LookupResult unknown_group = rank.Answer(prompt, 5);
     unknown_group.keys.back().group_id = 2;
     EXPECT_THROW(rank.proxy.ApplyAnswer(unknown_group, ContentHash{}, hold), std::invalid_argument);
-    SharedL2LookupResult unknown_bucket = rank.Answer(hold, prompt, 5);
+    SharedL2LookupResult unknown_bucket = rank.Answer(prompt, 5);
     unknown_bucket.buckets.front() = 1;
     EXPECT_THROW(rank.proxy.ApplyAnswer(unknown_bucket, ContentHash{}, hold), std::invalid_argument);
-    SharedL2LookupResult unhashed_key = rank.Answer(hold, prompt, 5);
+    SharedL2LookupResult unhashed_key = rank.Answer(prompt, 5);
     unhashed_key.keys.front().content_hash = ContentHash{};
     EXPECT_THROW(rank.proxy.ApplyAnswer(unhashed_key, rank.TailPrior(prompt), hold), std::invalid_argument);
-    SharedL2LookupResult unhashed_tail = rank.Answer(hold, prompt, 5);
+    SharedL2LookupResult unhashed_tail = rank.Answer(prompt, 5);
     unhashed_tail.tail->hash = ContentHash{};
     EXPECT_THROW(rank.proxy.ApplyAnswer(unhashed_tail, rank.TailPrior(prompt), hold), std::invalid_argument);
     for (const std::int32_t tail_tokens : {0, kPage}) {
-        SharedL2LookupResult misplaced_tail = rank.Answer(hold, prompt, 5);
+        SharedL2LookupResult misplaced_tail = rank.Answer(prompt, 5);
         misplaced_tail.tail->tail_tokens = tail_tokens;
         EXPECT_THROW(rank.proxy.ApplyAnswer(misplaced_tail, rank.TailPrior(prompt), hold), std::invalid_argument);
     }
-    EXPECT_NE(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
+    EXPECT_TRUE(hold.empty());
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
     EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
 }
@@ -424,9 +393,8 @@ TEST(SharedL2Proxy, PoolWritesSkipWhatTheProxyHoldsAndWhatAWriteCarries) {
     Rank rank(16, 16);
     const Prompt prompt{Sequence(10)};
     // The prompt's first page came from the pool.
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    SharedL2LookupResult answer{.lookup_id = hold.LookupId(),
-                                .ticket = 1,
+    std::vector<CacheBlockRef> hold;
+    SharedL2LookupResult answer{.ticket = 1,
                                 .num_tokens = kPage,
                                 .kv_tokens = kPage,
                                 .keys = {prompt.Keys().front()},

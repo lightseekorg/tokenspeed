@@ -79,6 +79,9 @@ def wire(monkeypatch):
             StorageGetOp=ts.Cache.StorageGetOp,
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
+            SharedL2ReleaseOp=ts.Cache.SharedL2ReleaseOp,
+            SharedL2WriteOp=ts.Cache.SharedL2WriteOp,
+            SharedL2TouchOp=ts.Cache.SharedL2TouchOp,
         ),
     )
 
@@ -205,10 +208,10 @@ def test_plan_adapter_leaves_a_shared_l2_pools_commands_to_the_host():
     spec.request_id = "r"
     spec.tokens = list(range(1, 8))
     scheduler.submit_requests([spec])
-    [lookup] = scheduler.shared_l2_lookups()
+    [lookup] = scheduler.take_shared_l2_lookups()
     # The pool holds the prompt's first two pages.
     slots = [
-        ((0, 0, page_hash, 0), 0, 11 + i) for i, page_hash in enumerate(lookup[2][:2])
+        ((0, 0, page_hash, 0), 0, 11 + i) for i, page_hash in enumerate(lookup[1][:2])
     ]
     assert (
         len(scheduler.apply_shared_l2_lookups([(lookup[0], 7, 4, 4, None, slots)])) == 2

@@ -147,13 +147,13 @@ class _Rank(closed_loop._Loop):
 
     def before_plan(self) -> None:
         # Every lookup is answered before the plan, as the event loop does.
-        for lookup in self.real.shared_l2_lookups():
-            lookup_id, request_id, hashes, tokens, max_tokens = lookup
+        for lookup in self.real.take_shared_l2_lookups():
+            request_id, hashes, tokens, max_tokens = lookup
             result = self.pool.probe(self.client, hashes, tokens, max_tokens)
             # The prompt must resume at least where the pool pinned.
             self.pinned_for[request_id] = result[1]
             for group, block, _, page in self.real.apply_shared_l2_lookups(
-                [(lookup_id, *result)]
+                [(request_id, *result)]
             ):
                 self.page_of[(group, block)] = page
 

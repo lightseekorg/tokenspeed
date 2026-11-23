@@ -159,16 +159,15 @@ public:
     //
     // The waiting prompts' lookups not handed out yet, each once. A prompt
     // whose Device prefix already covers what it may reuse asks nothing.
-    std::vector<SharedL2Lookup> SharedL2Lookups();
-    // Mirrors the pool's answers into the proxy Host tier; returns the proxy
-    // blocks created, each with the pool page a load-back from it reads. A
-    // hit the proxy tier has no room for counts as a miss: what it pinned is
-    // released and its prompt computes its prefix. An answer the scheduler
-    // cannot take -- one that names no lookup that waits for it, that lies
-    // outside its prompt, or that does not name, under a ticket, a bucket and
-    // a page for each key of the rank's cache groups and a tail inside a page
-    // -- throws std::invalid_argument, and the runtime stops serving: nothing
-    // of that answer is kept, and the answers after it are not applied.
+    std::vector<SharedL2Lookup> TakeSharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier, each for the
+    // request it names; returns the proxy blocks created, each with the pool
+    // page a load-back from it reads. An answer the scheduler cannot take --
+    // one whose request has no lookup that waits for it, that lies outside
+    // its prompt, or that does not name, under a ticket, a bucket and a page
+    // for each key of the rank's cache groups and a tail inside a page --
+    // throws std::invalid_argument, and the runtime stops serving: nothing of
+    // that answer is kept, and the answers after it are not applied.
     std::vector<SharedL2ProxyPage> ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results);
 
     void Advance(const ExecutionEvent& event);

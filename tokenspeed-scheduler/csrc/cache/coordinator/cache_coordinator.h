@@ -212,15 +212,15 @@ public:
     // also for a probe that hit nothing. Per group the Host hits (holes
     // empty), then the tail's blocks.
     CoordinatorMatch AcquireHostPrefix(PrefixProbe&& probe);
-    // A State checkpoint whose blocks reach the Host with no Device
-    // publication: its boundary is linked before the blocks register
-    // (BoundaryTree::LinkPublication, HostCache::CacheHostBlock), as a Device
-    // publication links its own, and RecordCheckpoint records it once they
-    // have. `publisher` stands for the request that published it, as an
-    // access epoch does on the Device: the retention ranking only compares it.
-    void RecordCheckpoint(const CompletedPages& completed, std::uint64_t publisher) {
-        recordCheckpoints(completed, publisher);
-    }
+    // Publishes `blocks` under `keys` on the Host with no Device publication,
+    // and with them the State checkpoints whose block is among them, in a
+    // Device publication's order (CacheCompletedBlocks): every checkpoint's
+    // boundary is linked, the blocks register, then each checkpoint and its
+    // tail are recorded. publishers[i] stands for the request that published
+    // checkpoints[i], as an access epoch does on the Device: the retention
+    // ranking only compares it.
+    void PublishHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                           std::span<const CompletedPages> checkpoints, std::span<const std::uint64_t> publishers);
     // The keys of the Device entries prefix hits acquire are collected from
     // now on, for the caller to take once per plan: a shared L2 pool refreshes
     // its copies of them, as a rank's own Host tier refreshes its entries.

@@ -255,6 +255,8 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
+        /// A shared L2 pool write finished (`cache::SharedL2WriteDone`).
+        SharedL2WriteDone,
     }
 
     /// A cache op's acknowledgment, fed back to the scheduler.
@@ -610,25 +612,10 @@ mod ffi {
         available: i32,
     }
 
-    /// A cache key as a shared L2 pool's owner names it (`CacheKey`).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SharedL2KeyView {
-        /// The key's namespace.
-        namespace_id: u32,
-        /// The cache group, by index.
-        group_id: u32,
-        /// The prefix page's content hash.
-        content_hash: String,
-        /// The block's ordinal within its prefix page.
-        page_offset: i32,
-    }
-
     /// A waiting prompt's question to the shared L2 pool (`SharedL2Lookup`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SharedL2LookupView {
-        /// The id its answer names.
-        lookup_id: u64,
-        /// The prompt's request.
+        /// The prompt's request, which its answer names.
         request_id: String,
         /// The chain hashes of the prompt's full pages below `max_tokens`.
         prefix_hashes: Vec<String>,
@@ -642,8 +629,8 @@ mod ffi {
     /// reusable prefix of the prompt, pinned under `ticket`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SharedL2AnswerView {
-        /// The lookup it answers.
-        lookup_id: u64,
+        /// The request whose lookup it answers.
+        request_id: String,
         /// What the owner pinned the hit under; 0 pins nothing (a miss).
         ticket: u64,
         /// The tokens the hit resumes from.
@@ -655,7 +642,7 @@ mod ffi {
         /// The partial last page's hash, with `tail_tokens`.
         tail_hash: String,
         /// The hit's keys.
-        keys: Vec<SharedL2KeyView>,
+        keys: Vec<StorageKeyView>,
         /// Each key's shard.
         buckets: Vec<i32>,
         /// Each key's pool page.
@@ -711,7 +698,7 @@ mod ffi {
         /// A write's id, a release's ticket; unused by a touch.
         id: u64,
         /// A write's or a touch's keys.
-        keys: Vec<SharedL2KeyView>,
+        keys: Vec<StorageKeyView>,
         /// A write's shard per key.
         buckets: Vec<i32>,
         /// A write's source Device block per key.
@@ -741,7 +728,6 @@ mod ffi {
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
-            pool_writes: &[u64],
         ) -> Result<()>;
         fn advance_peer(
             scheduler: Pin<&mut Scheduler>,
@@ -806,7 +792,7 @@ mod ffi {
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
-        fn shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
+        fn take_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
         fn apply_shared_l2_lookup(
             scheduler: Pin<&mut Scheduler>,
             answer: &SharedL2AnswerView,
@@ -842,10 +828,10 @@ pub use ffi::{
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
     PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, SharedL2AnswerView, SharedL2KeyView, SharedL2LookupView, SharedL2OpKind,
-    SharedL2OpView, SharedL2PageView, SharedL2PublicationView, StorageCancellationView,
-    StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView,
-    StorageTickView, TransferBatchView,
+    SchedulerSizes, SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
+    SharedL2PageView, SharedL2PublicationView, StorageCancellationView, StorageDoneView,
+    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -995,14 +981,12 @@ impl Scheduler {
         ffi::advance(self.pinned(), events)
     }
 
-    /// Feed the round head's storage events, cache-op acknowledgments and,
-    /// with a shared L2 pool, the ids of its finished writes back, as one
-    /// event batch.
+    /// Feed the round head's storage events and cache-op acknowledgments
+    /// back, as one event batch.
     pub fn advance_head(
         &mut self,
         storage: &StorageRound,
         cache_events: &[CacheEvent],
-        pool_writes: &[u64],
     ) -> Result<(), cxx::Exception> {
         let _span = profile::span("Scheduler::advance_head");
         let ticks: &[StorageTickView] = storage.tick.as_slice();
@@ -1012,7 +996,6 @@ impl Scheduler {
             &storage.cancellations,
             &storage.done,
             cache_events,
-            pool_writes,
         )
     }
 
@@ -1020,9 +1003,9 @@ impl Scheduler {
     /// out yet, each once. A prompt is admitted only once its lookup is
     /// answered; one whose Device prefix covers what it may reuse asks
     /// nothing.
-    pub fn shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
-        let _span = profile::span("Scheduler::shared_l2_lookups");
-        ffi::shared_l2_lookups(self.pinned())
+    pub fn take_shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
+        let _span = profile::span("Scheduler::take_shared_l2_lookups");
+        ffi::take_shared_l2_lookups(self.pinned())
     }
 
     /// Settle a lookup with the pool's answer. Returns the proxy Host blocks

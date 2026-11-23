@@ -1994,9 +1994,13 @@ written when a page is published, so `--kvstore-write-policy` stays at its
 default (`write_back` is refused). It cannot be combined with
 `--kvstore-storage-backend` or KV offloading, and `--enable-memory-saver` is
 refused: the pool's client registers the Device cache memory for RDMA once,
-and nothing registers it again after a memory release and resume. Pool ranks
-never retract: a fused
-instance runs without a retraction snapshot pool and refuses the
+and nothing registers it again after a memory release and resume. Peer
+prefix sharing (`--peer-prefix-port`) is refused: it needs the local Host L2
+(`--enable-kvstore`), and the scheduler's configuration check refuses the
+pair as well. A `DSPARK` draft that needs captured-context replay is refused,
+as it is with the local Host L2: the Host tier cannot restore a
+drafter-private context. Pool ranks never retract: a fused instance runs
+without a retraction snapshot pool and refuses the
 `--retraction-snapshot-*` and `--debug-force-retraction-interval` overrides.
 `--enable-startup-requests` is refused: the flush after the startup requests
 clears the rank's own caches, so their prefixes would stay in the pool.
@@ -2012,13 +2016,12 @@ tokenspeed.runtime.cache.shared_l2`); nothing starts them for you. Start the
 owner, then the providers, then the engines.
 
 * `owner`: one per deployment. It serves the cache index and holds no bytes.
-  Every flag but `--lcm-bytes` is required.
+  Every flag is required.
 
   | Flag | Meaning |
   |---|---|
   | `--address tcp://HOST:PORT` | Where the ranks and providers reach it. There is no authentication: bind it to a cluster-internal address. |
-  | `--lcm-bytes N` | Optional; leave it out. The owner then takes the LCM block size of the first rank that joins and cuts each provider's bytes into whole blocks when it builds the pool (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name). With it, a rank whose LCM block differs is refused with both numbers in the message, and a provider smaller than one block is refused when it joins. |
-  | `--providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry; its size is fixed from then on. |
+  | `--providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
   | `--headroom-lcm-blocks H` | When fewer than `H/2` LCM blocks are empty, a write evicts back up to `H` in one pass. |
   | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations, and the owner answers its next request with an error, which stops the rank's engine. A rank pings the owner whenever it has had no release or touch to send for 5 seconds; a ping fails after at most twice the rank's `request_timeout_ms`, and the engine's loop reads the failure at the head of its next round (an idle rank runs a round about every 10 ms). A running rank that cannot reach the owner therefore stops about 5 seconds plus twice its `request_timeout_ms` after the owner last heard it: keep `S` well above that, so that it stops before the owner drops its pins, and well above any pause a rank process can take (the frozen rank under *Known limits*). |
   | `--checkpoint-retention-requests R` | `--checkpoint-retention-requests` of the scheduler, counted over the lookups of every rank together, hit or miss. A rank sends one lookup for each new prompt its own GPU cache does not cover already; a prompt it covers sends none and is not counted. A rank's own default is 16 x its batch size; for the pool use about 16 x the sum of the ranks' batch sizes. `0` ranks every entry by its own last use. |
@@ -2103,6 +2106,10 @@ another rank is writing it, or the pool has no room) is skipped. A rank tells
 the owner when it is done with a hit (a release) and when it reuses blocks of
 its own GPU cache that the pool holds too (a touch), and pings it whenever it
 has had neither to send for 5 seconds.
+
+With `--kv-events-config`, a pool rank reports the Host entries that stand
+for the pages of a hit with the Host medium (`CPU_PINNED`) for as long as it
+holds the hit, although the bytes are in the pool.
 
 No request is sent twice, and a rank does not serve without its pool. Each of
 these failures stops the rank's engine, as a failed forward does; under

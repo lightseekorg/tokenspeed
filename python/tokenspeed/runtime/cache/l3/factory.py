@@ -128,6 +128,43 @@ def cache_deployment_id(
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
+    host_cache: HostCacheResources,
+    world_cpu_group: ProcessGroup | None,
+) -> str:
+    """The cache namespace's deployment id: everything that shapes a cached
+    page's bytes (``storage_deployment_id``). Pages are shared only under one
+    id -- through the L3 tier, or between peer replicas
+    (``cache/peer.py``).
+
+    Args:
+        server_args: Resolved launch settings; numerical choices are snapshotted.
+        model_config: Target checkpoint configuration, without model weights.
+        draft_model_config: Draft checkpoint configuration, or None.
+        host_cache: Shared Host resources and resolved CPU cache facts.
+        world_cpu_group: The existing Gloo world group for checkpoint agreement;
+            None in a single-process deployment. Every rank calls this.
+
+    Returns:
+        The id; the weight version is not part of it.
+    """
+    return cache_layout_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        cache_layout=host_cache,
+        checkpoint_granularities=host_cache.checkpoint_granularities,
+        group_shard_counts=host_cache.ownership.shard_counts,
+        attention_backend_name=host_cache.attention_backend_name,
+        draft_attention_backend_name=host_cache.draft_attention_backend_name,
+        world_cpu_group=world_cpu_group,
+    )
+
+
+def cache_layout_deployment_id(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    *,
     cache_layout: Any,
     checkpoint_granularities: tuple[tuple[str, int], ...],
     group_shard_counts: Sequence[int],
@@ -135,10 +172,10 @@ def cache_deployment_id(
     draft_attention_backend_name: str,
     world_cpu_group: ProcessGroup | None,
 ) -> str:
-    """The cache namespace's deployment id: everything that shapes a cached
-    page's bytes (``storage_deployment_id``). Pages are shared only under one
-    id -- through the L3 tier, between peer replicas (``cache/peer.py``), or
-    in a shared L2 pool, which admits its ranks by it (``cache/shared_l2``).
+    """``cache_deployment_id`` from the cache facts themselves, for a rank
+    that has no ``HostCacheResources``: a rank of a shared L2 pool, which
+    allocates no Host storage and which the pool admits by this id
+    (``cache/shared_l2``).
 
     Args:
         server_args: Resolved launch settings; numerical choices are snapshotted.
@@ -337,11 +374,7 @@ def l3_settings(
         server_args,
         model_config,
         draft_model_config,
-        cache_layout=host_cache,
-        checkpoint_granularities=host_cache.checkpoint_granularities,
-        group_shard_counts=ownership.shard_counts,
-        attention_backend_name=host_cache.attention_backend_name,
-        draft_attention_backend_name=host_cache.draft_attention_backend_name,
+        host_cache=host_cache,
         world_cpu_group=world_cpu_group,
     )
 

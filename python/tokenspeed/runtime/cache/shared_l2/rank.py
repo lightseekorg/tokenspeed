@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from tokenspeed.runtime.cache.l3.factory import cache_deployment_id
+from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
 from tokenspeed.runtime.cache.shared_l2.client import (
     SharedL2Client,
     SharedL2ClientConfig,
@@ -98,7 +98,7 @@ def join_shared_l2_pool(
     )
     # The identity L3 names its objects under: ranks whose bytes differ never
     # share a pool.
-    deployment_id = cache_deployment_id(
+    deployment_id = cache_layout_deployment_id(
         server_args,
         model_config,
         draft_model_config,

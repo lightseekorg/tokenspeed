@@ -25,11 +25,10 @@ holds no bytes. The pool is built when every expected provider has joined and
 the first client reports its cache geometry; later clients must match that
 geometry and the deployment the pool caches for. A provider joins with its
 bytes; its share of the pool, in LCM blocks, is settled when the pool is built,
-from ``lcm_bytes`` or else the first client's LCM block. Every announcement
-is one provider: one that is started again counts as one more, or is refused
-once every expected provider has joined. A client silent for
-``client_timeout_s`` loses its pins and reservations, and its next request is
-answered with an error.
+from the first client's LCM block. Every announcement is one provider: one
+that is started again counts as one more, or is refused once every expected
+provider has joined. A client silent for ``client_timeout_s`` loses its pins
+and reservations, and its next request is answered with an error.
 
 Requests (``wire``), by ``op``; every reply also carries ``ok``:
 
@@ -80,7 +79,6 @@ class SharedL2Owner:
         self,
         *,
         address: str,
-        lcm_bytes: int | None,
         num_providers: int,
         client_timeout_s: float,
         make_pool: Callable[[dict[str, Any], int], Any],
@@ -88,8 +86,6 @@ class SharedL2Owner:
         """
         Args:
             address: ZMQ bind address.
-            lcm_bytes: Bytes of one pool LCM block, which every client's
-                must equal; None takes the first client's.
             num_providers: Providers to wait for before the pool is built.
             client_timeout_s: Silence after which a client is dropped.
             make_pool: ``(geometry, num_lcm_blocks)`` to an object with
@@ -99,7 +95,6 @@ class SharedL2Owner:
         self._socket = zmq.Context.instance().socket(zmq.ROUTER)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.bind(address)
-        self._lcm_bytes = None if lcm_bytes is None else int(lcm_bytes)
         self._num_providers = int(num_providers)
         self._client_timeout_s = float(client_timeout_s)
         self._make_pool = make_pool
@@ -216,9 +211,6 @@ class SharedL2Owner:
         session, size = str(request["session"]), int(request["bytes"])
         if len(self._joined) == self._num_providers:
             raise RuntimeError("every expected provider has already joined")
-        # Without a block size yet, the pool's creation checks the provider.
-        if self._lcm_bytes is not None and size < self._lcm_bytes:
-            raise ValueError("a provider must hold at least one LCM block")
         self._joined.append(
             {"session": session, "base": int(request["base"]), "bytes": size}
         )
@@ -229,13 +221,8 @@ class SharedL2Owner:
         if len(self._joined) < self._num_providers:
             return {"ok": True, "ready": False}
         geometry, deployment_id = request["geometry"], str(request["deployment_id"])
-        lcm_bytes = int(geometry["lcm_bytes"])
-        if self._lcm_bytes is not None and lcm_bytes != self._lcm_bytes:
-            raise ValueError(
-                f"the client's LCM block holds {lcm_bytes} bytes, "
-                f"a pool slot {self._lcm_bytes}"
-            )
         if self._pool is None:
+            lcm_bytes = int(geometry["lcm_bytes"])
             providers: list[dict[str, Any]] = []
             start = 0
             for provider in self._joined:
@@ -255,7 +242,7 @@ class SharedL2Owner:
                 )
                 start += blocks
             self._pool = self._make_pool(geometry, start)
-            self._providers, self._lcm_bytes = providers, lcm_bytes
+            self._providers = providers
             self._geometry, self._deployment_id = geometry, deployment_id
             logger.info(
                 f"shared L2 pool ready for deployment {deployment_id}: "
@@ -272,7 +259,7 @@ class SharedL2Owner:
             "ok": True,
             "ready": True,
             "providers": self._providers,
-            "lcm_bytes": self._lcm_bytes,
+            "lcm_bytes": int(self._geometry["lcm_bytes"]),
         }
 
 

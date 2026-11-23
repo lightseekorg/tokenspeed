@@ -694,7 +694,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         // With a shared L2 pool a waiting prompt waits for its lookup to be
         // settled, so a prefix the pool holds is not recomputed.
         if (const auto* waiting = request->GetIf<fsm::Submitted>();
-            waiting != nullptr && shared_l2_ && !config_.disable_prefix_cache && !waiting->admission.pool_settled) {
+            waiting != nullptr && shared_l2_ && !config_.disable_prefix_cache && !waiting->admission.pool_prepared) {
             continue;
         }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,

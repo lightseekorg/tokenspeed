@@ -857,21 +857,23 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let forward_allowed = memory_resident && !self.controls.forward_blocked();
 
         // The storage tick and the cache-op acknowledgments advance at the
-        // head of the round, so this round's plan sees them; with a shared
-        // L2 pool, so do its finished writes.
+        // head of the round, so this round's plan sees them.
         let storage = self.storage_round(&l3_reports, forward_allowed)?;
-        let ready = if self.cache_ops.open() > 0 {
+        let mut ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
                 .acknowledged(polled, &mut self.ranks.mesh, &self.ranks.replica)?
         } else {
             Vec::new()
         };
-        let pool_writes = match self.pool.as_mut() {
-            Some(pool) => pool.finished_writes()?,
-            None => Vec::new(),
-        };
-        if storage.tick.is_some() || !ready.is_empty() || !pool_writes.is_empty() {
+        // A shared L2 pool's finished writes are acknowledgments too. Its
+        // client is asked in every round, frozen or not, whether or not a
+        // write is in flight: the poll also raises a failure the client
+        // stored.
+        if let Some(pool) = self.pool.as_mut() {
+            ready.extend(pool.finished_writes()?);
+        }
+        if storage.tick.is_some() || !ready.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
                     ?ready,
@@ -880,7 +882,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 );
             }
             self.scheduler
-                .advance_head(&storage, &ready, &pool_writes)
+                .advance_head(&storage, &ready)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
         }
         self.record_storage_metrics()?;
@@ -925,26 +927,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
             });
         } else {
-            // With a shared L2 pool, the waiting prompts not looked up yet
-            // ask the pool in one request, and the round waits for its
-            // answers: a prompt is in no plan before its answer, so that a
-            // prefix the pool holds is not recomputed. An answer is no event
-            // of the head's batch: the proxy blocks it creates go back to the
-            // pool's client.
-            if let Some(pool) = self.pool.as_mut() {
-                let lookups = self.scheduler.shared_l2_lookups();
-                if !lookups.is_empty() {
-                    let _span = profile::span("Pool::look_up");
-                    for answer in pool.look_up(&lookups)? {
-                        let pages = self
-                            .scheduler
-                            .apply_shared_l2_lookup(&answer)
-                            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
-                        pool.applied(&pages)?;
-                    }
-                    busy = true;
-                }
-            }
+            busy |= self.pool_round()?;
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
                 &mut stop,
@@ -978,11 +961,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 publisher.publish(drained);
             }
         }
-        // A storage operation's outcome is an acknowledgment too, and so is
-        // a shared L2 pool's finished write.
+        // A storage operation's outcome is an acknowledgment too.
         busy |= !ready.is_empty()
             || !storage.done.is_empty()
-            || !pool_writes.is_empty()
             || !events.is_empty()
             || !outputs.is_empty()
             || !released.is_empty();
@@ -1319,6 +1300,31 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let due = controller.note_round(forwarded);
             self.controls.enqueue_internal(due);
         }
+    }
+
+    /// With a shared L2 pool, the waiting prompts not looked up yet ask the
+    /// pool in one request, and the round waits for its answers: a prompt is
+    /// in no plan before its answer, so that a prefix the pool holds is not
+    /// recomputed. An answer is no event of the head's batch: the proxy
+    /// blocks it creates go back to the pool's client. Returns whether any
+    /// prompt was asked about.
+    fn pool_round(&mut self) -> Result<bool, LoopError> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(false);
+        };
+        let lookups = self.scheduler.take_shared_l2_lookups();
+        if lookups.is_empty() {
+            return Ok(false);
+        }
+        let _span = profile::span("Pool::lookup");
+        for answer in pool.lookup(&lookups)? {
+            let pages = self
+                .scheduler
+                .apply_shared_l2_lookup(&answer)
+                .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+            pool.map_proxy_pages(&pages)?;
+        }
+        Ok(true)
     }
 
     /// The round's storage input to the scheduler. With L3, the replica's

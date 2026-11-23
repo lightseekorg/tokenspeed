@@ -27,8 +27,8 @@ use std::{ffi::CString, sync::Once};
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
     profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
-    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2KeyView,
-    SharedL2LookupView, SharedL2OpKind, StorageCancellationView, StorageDoneView, StorageOpKind,
+    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2LookupView,
+    SharedL2OpKind, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
     StorageRound, StorageTickView, TransferBatchView,
 };
 
@@ -507,7 +507,6 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
                 kind: CacheEventKind::SnapshotDone,
                 op_id: store,
             }],
-            &[],
         )
         .unwrap();
 
@@ -528,7 +527,6 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
                         kind: CacheEventKind::RestoreDone,
                         op_id: op.op_id,
                     }],
-                    &[],
                 )
                 .unwrap();
             restored = true;
@@ -585,7 +583,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
-    scheduler.advance_head(&tick(1), &[], &[]).unwrap();
+    scheduler.advance_head(&tick(1), &[]).unwrap();
     scheduler
         .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
         .unwrap();
@@ -620,7 +618,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
         }],
         ..tick(2)
     };
-    scheduler.advance_head(&done, &[], &[]).unwrap();
+    scheduler.advance_head(&done, &[]).unwrap();
     let plan = scheduler.next_execution_plan(true, false);
     assert!(plan
         .forward_batches()
@@ -633,7 +631,7 @@ fn a_detached_request_cancels_its_storage_operation() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
-    scheduler.advance_head(&tick(1), &[], &[]).unwrap();
+    scheduler.advance_head(&tick(1), &[]).unwrap();
     scheduler
         .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
         .unwrap();
@@ -646,7 +644,7 @@ fn a_detached_request_cancels_its_storage_operation() {
         }],
         ..tick(2)
     };
-    scheduler.advance_head(&detach, &[], &[]).unwrap();
+    scheduler.advance_head(&detach, &[]).unwrap();
     scheduler
         .submit_requests(&[spec("next", vec![5, 6, 7, 8])])
         .unwrap();
@@ -1108,7 +1106,7 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
     assert_eq!(first.confirmed_prefix_tokens, 0);
     let mut pressure = tick(1);
     pressure.tick.as_mut().unwrap().queued_operations = 100;
-    scheduler.advance_head(&pressure, &[], &[]).unwrap();
+    scheduler.advance_head(&pressure, &[]).unwrap();
     assert_eq!(
         scheduler
             .shared_prefix_publication(&[1, 2, 3, 4], 4)
@@ -1124,7 +1122,7 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
             .cache_epoch
             > first.cache_epoch
     );
-    scheduler.advance_head(&tick(2), &[], &[]).unwrap();
+    scheduler.advance_head(&tick(2), &[]).unwrap();
     assert_eq!(
         scheduler
             .shared_prefix_publication(&[1, 2, 3, 4], 4)
@@ -1171,7 +1169,7 @@ fn shared_prefix_publication_rejects_in_forward_state_before_waiting() {
             for pressure in [false, true] {
                 let mut round = tick(if pressure { 2 } else { 1 });
                 round.tick.as_mut().unwrap().queued_operations = if pressure { 100 } else { 0 };
-                scheduler.advance_head(&round, &[], &[]).unwrap();
+                scheduler.advance_head(&round, &[]).unwrap();
                 // With page=4 and budget=8, in-forward State can save 20 and
                 // suppress 22. Neither query may start an impossible wait in
                 // that mode; callers need an actual-boundary receipt contract.
@@ -1210,7 +1208,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
             "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
         let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let tokens = vec![1, 2, 3, 4, 5]; // Includes a real partial-page prompt endpoint.
-        scheduler.advance_head(&tick(1), &[], &[]).unwrap();
+        scheduler.advance_head(&tick(1), &[]).unwrap();
         scheduler
             .submit_requests(&[spec("producer", tokens.clone())])
             .unwrap();
@@ -1225,7 +1223,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                 object_failures: vec![0; op.keys.len()],
             });
         }
-        scheduler.advance_head(&initial_done, &[], &[]).unwrap();
+        scheduler.advance_head(&initial_done, &[]).unwrap();
         scheduler
             .advance(&[event(ForwardEventKind::PdBootstrapped, "producer", vec![])])
             .unwrap();
@@ -1290,7 +1288,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                         .unwrap();
                 }
             }
-            scheduler.advance_head(&round, &copies, &[]).unwrap();
+            scheduler.advance_head(&round, &copies).unwrap();
             let receipt = scheduler.shared_prefix_publication(&tokens, 5).unwrap();
             if receipt.status == "published" {
                 assert_eq!(receipt.confirmed_prefix_tokens, 5);
@@ -1322,7 +1320,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
         let mut consumer = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let mut request = spec("consumer", vec![1, 2, 3, 4, 5, 6, 7]);
         request.shared_prefix_tokens = vec![5];
-        consumer.advance_head(&tick(1), &[], &[]).unwrap();
+        consumer.advance_head(&tick(1), &[]).unwrap();
         consumer.submit_requests(&[request]).unwrap();
         let mut initial = Some(consumer.next_execution_plan(true, false));
         consumer
@@ -1366,7 +1364,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                     hit = batch.extend_prefix_lens[0];
                 }
             }
-            consumer.advance_head(&round, &copies, &[]).unwrap();
+            consumer.advance_head(&round, &copies).unwrap();
             if hit > 0 {
                 break;
             }
@@ -1418,7 +1416,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                     object_failures: vec![0; op.keys.len()],
                 });
             }
-            consumer.advance_head(&round, &copies, &[]).unwrap();
+            consumer.advance_head(&round, &copies).unwrap();
             if consumer
                 .shared_prefix_publication(&[1, 2, 3, 4, 5, 6, 7], 7)
                 .unwrap()
@@ -1517,7 +1515,7 @@ fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
         .unwrap();
     let mut frozen = tick(1);
     frozen.tick.as_mut().unwrap().allow_forward = false;
-    scheduler.advance_head(&frozen, &[], &[]).unwrap();
+    scheduler.advance_head(&frozen, &[]).unwrap();
     // Exceed the scheduler's no-progress threshold while forwards are forbidden.
     for _ in 0..8192 {
         let plan = scheduler.next_execution_plan(false, false);
@@ -1525,7 +1523,7 @@ fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
         assert!(plan.aborts().is_empty());
         assert_eq!(scheduler.sizes().waiting, 1);
     }
-    scheduler.advance_head(&tick(2), &[], &[]).unwrap();
+    scheduler.advance_head(&tick(2), &[]).unwrap();
     let plan = scheduler.next_execution_plan(true, false);
     assert!(plan.aborts().is_empty());
     assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
@@ -1555,7 +1553,7 @@ result = ts.Scheduler(cfg)
 /// under `ticket`, at pool pages 11, 12, ...
 fn pool_answer(lookup: &SharedL2LookupView, ticket: u64, pages: usize) -> SharedL2AnswerView {
     SharedL2AnswerView {
-        lookup_id: lookup.lookup_id,
+        request_id: lookup.request_id.clone(),
         ticket,
         num_tokens: 2 * pages as i32,
         kv_tokens: 2 * pages as i32,
@@ -1563,8 +1561,7 @@ fn pool_answer(lookup: &SharedL2LookupView, ticket: u64, pages: usize) -> Shared
         tail_hash: String::new(),
         keys: lookup.prefix_hashes[..pages]
             .iter()
-            .map(|hash| SharedL2KeyView {
-                namespace_id: 0,
+            .map(|hash| StorageKeyView {
                 group_id: 0,
                 content_hash: hash.clone(),
                 page_offset: 0,
@@ -1583,7 +1580,7 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     scheduler
         .submit_requests(&[spec("waiting", (1..=7).collect())])
         .unwrap();
-    let lookups = scheduler.shared_l2_lookups();
+    let lookups = scheduler.take_shared_l2_lookups();
     let [lookup] = &lookups[..] else {
         panic!("one lookup, got {lookups:?}");
     };
@@ -1591,7 +1588,10 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
     assert_eq!(lookup.request_id, "waiting");
     assert_eq!((lookup.max_tokens, lookup.prefix_hashes.len()), (6, 3));
     assert_eq!(lookup.tokens, [1, 2, 3, 4, 5, 6]);
-    assert!(scheduler.shared_l2_lookups().is_empty(), "handed out once");
+    assert!(
+        scheduler.take_shared_l2_lookups().is_empty(),
+        "handed out once"
+    );
 
     // No plan runs the prompt before its answer.
     let plan = scheduler.next_execution_plan(true, false);
@@ -1631,7 +1631,6 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
                 kind: CacheEventKind::LoadBackDone,
                 op_id: ops[0].op_id,
             }],
-            &[],
         )
         .unwrap();
     let ops = scheduler.next_execution_plan(true, false).shared_l2_ops();
@@ -1654,7 +1653,7 @@ fn a_pool_write_ends_with_its_completion() {
     scheduler
         .submit_requests(&[spec("writer", (1..=7).collect())])
         .unwrap();
-    let lookup = scheduler.shared_l2_lookups().remove(0);
+    let lookup = scheduler.take_shared_l2_lookups().remove(0);
     assert!(scheduler
         .apply_shared_l2_lookup(&pool_answer(&lookup, 0, 0))
         .unwrap()
@@ -1683,13 +1682,17 @@ fn a_pool_write_ends_with_its_completion() {
     assert!(write.publications.is_empty(), "no State checkpoint");
     assert!(!scheduler.can_clear_cache());
 
-    // Its completion joins the head batch and lets its blocks go; a
-    // completion of a write that is not in flight is an error.
+    // Its completion joins the head batch as an acknowledgment and lets its
+    // blocks go; a completion of a write that is not in flight is an error.
+    let done = CacheEvent {
+        kind: CacheEventKind::SharedL2WriteDone,
+        op_id: u32::try_from(write.id).unwrap(),
+    };
     scheduler
-        .advance_head(&StorageRound::default(), &[], &[write.id])
+        .advance_head(&StorageRound::default(), std::slice::from_ref(&done))
         .unwrap();
     let error = scheduler
-        .advance_head(&StorageRound::default(), &[], &[write.id])
+        .advance_head(&StorageRound::default(), &[done])
         .unwrap_err();
     assert!(error.what().contains("unknown shared L2 write"), "{error}");
 }
@@ -1705,7 +1708,7 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
             spec("hit", (11..=17).collect()),
         ])
         .unwrap();
-    let lookups = scheduler.shared_l2_lookups();
+    let lookups = scheduler.take_shared_l2_lookups();
     let [missed, hit] = &lookups[..] else {
         panic!("two lookups, got {lookups:?}");
     };
@@ -1735,8 +1738,8 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
     let plan = scheduler.next_execution_plan(true, false);
     assert!(!plan.needs_device() && plan.shared_l2_ops().is_empty());
 
-    // A miss and a hit settle their lookups; a second answer to a lookup
-    // names none that waits.
+    // A miss and a hit settle their lookups; a second answer for a request
+    // names no lookup that waits.
     assert!(scheduler
         .apply_shared_l2_lookup(&pool_answer(missed, 0, 0))
         .unwrap()
@@ -1748,6 +1751,19 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
         .apply_shared_l2_lookup(&pool_answer(hit, 6, 2))
         .unwrap_err();
     assert!(error.what().contains("no lookup that waits"), "{error}");
+    // Neither does an answer for a request whose lookup was not handed out,
+    // or for one the scheduler does not know.
+    scheduler
+        .submit_requests(&[spec("unasked", (21..=27).collect())])
+        .unwrap();
+    for request_id in ["unasked", "unknown"] {
+        let answer = SharedL2AnswerView {
+            request_id: request_id.to_owned(),
+            ..pool_answer(missed, 0, 0)
+        };
+        let error = scheduler.apply_shared_l2_lookup(&answer).unwrap_err();
+        assert!(error.what().contains("no lookup that waits"), "{error}");
+    }
     let plan = scheduler.next_execution_plan(true, false);
     let batch = &plan.forward_batches()[0];
     assert_eq!(batch.request_ids, ["missed", "hit"]);
@@ -1762,7 +1778,7 @@ fn a_plan_of_pool_commands_alone_needs_no_device() {
     scheduler
         .submit_requests(&[spec("gone", (1..=7).collect())])
         .unwrap();
-    let lookup = scheduler.shared_l2_lookups().remove(0);
+    let lookup = scheduler.take_shared_l2_lookups().remove(0);
     scheduler
         .apply_shared_l2_lookup(&pool_answer(&lookup, 7, 2))
         .unwrap();
@@ -1792,9 +1808,9 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
     scheduler
         .submit_requests(&[spec("plain", (1..=40).collect())])
         .unwrap();
-    assert!(scheduler.shared_l2_lookups().is_empty());
+    assert!(scheduler.take_shared_l2_lookups().is_empty());
     let answer = SharedL2AnswerView {
-        lookup_id: 1,
+        request_id: "plain".to_owned(),
         ticket: 0,
         num_tokens: 0,
         kv_tokens: 0,

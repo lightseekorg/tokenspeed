@@ -153,11 +153,6 @@ class SharedL2Layout:
         """
         if bucket != 0:
             raise ValueError("a shared L2 pool holds bucket 0 only")
-        if pool.lcm_bytes != self.lcm_bytes:
-            raise ValueError(
-                f"the pool's LCM block holds {pool.lcm_bytes} bytes, "
-                f"this rank's {self.lcm_bytes}"
-            )
         lcm, slot = divmod(page - 1, self.host_packing[group])
         starts = [provider.start for provider in pool.providers]
         provider = pool.providers[max(bisect.bisect_right(starts, lcm) - 1, 0)]

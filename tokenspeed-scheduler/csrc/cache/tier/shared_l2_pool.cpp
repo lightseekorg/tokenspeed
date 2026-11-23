@@ -201,7 +201,9 @@ void SharedL2Pool::keepHeadroom() {
 
 bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints) {
     std::vector<CompletedPages> completed;
+    std::vector<std::uint64_t> publishers;
     completed.reserve(checkpoints.size());
+    publishers.reserve(checkpoints.size());
     for (const CheckpointTree::Lineage& checkpoint : checkpoints) {
         const std::int32_t tail_tokens = checkpoint.tail ? checkpoint.tail->tail_tokens : 0;
         // A lineage comes off the wire: its token count is held to the int32
@@ -228,6 +230,8 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
                            .tail = checkpoint.tail,
                            .publish_state = true,
                            .boundary_kind = CacheBoundaryKind::kEndpoint});
+        // Two ranks issue the same access epochs: the client tells them apart.
+        publishers.push_back(checkpoint.access_epoch ^ (client * 0x9E3779B97F4A7C15ULL));
     }
     const auto known = clients_.find(client);
     if (known == clients_.end()) {
@@ -238,26 +242,7 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
         return false;
     }
     Write& write = reserved.mapped();
-    std::vector<BoundaryTree::Hold> linked;
-    linked.reserve(completed.size());
-    for (const CompletedPages& checkpoint : completed) {
-        linked.push_back(cache_.Store().Boundaries().LinkPublication(checkpoint));
-    }
-    for (std::size_t i = 0; i < write.Keys().size(); ++i) {
-        cache_.Host().CacheHostBlock(write.Blocks()[i], write.Keys()[i], /*inherited_metadata=*/std::nullopt);
-    }
-    // A boundary nothing registered under leaves again.
-    linked.clear();
-    for (std::size_t i = 0; i < completed.size(); ++i) {
-        const CompletedPages& checkpoint = completed[i];
-        // Two ranks issue the same access epochs: the client tells them apart.
-        cache_.RecordCheckpoint(checkpoint, checkpoints[i].access_epoch ^ (client * 0x9E3779B97F4A7C15ULL));
-        if (checkpoint.tail) {
-            cache_.Host().CacheHostTail(
-                checkpoint.prefix_hashes.empty() ? ContentHash{} : ContentHash{checkpoint.prefix_hashes.back()},
-                *checkpoint.tail);
-        }
-    }
+    cache_.PublishHostBlocks(write.Blocks(), write.Keys(), completed, publishers);
     return true;
 }
 

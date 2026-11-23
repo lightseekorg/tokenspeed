@@ -854,30 +854,30 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
-        .def("shared_l2_lookups",
-             // [(lookup_id, request_id, prefix_hashes, tokens, max_tokens)].
+        .def("take_shared_l2_lookups",
+             // [(request_id, prefix_hashes, tokens, max_tokens)].
              [](tokenspeed::Scheduler& s) {
                  nb::list lookups;
-                 for (const tokenspeed::SharedL2Lookup& lookup : s.SharedL2Lookups()) {
-                     lookups.append(nb::make_tuple(lookup.lookup_id, lookup.request_id, lookup.prefix_hashes,
+                 for (const tokenspeed::SharedL2Lookup& lookup : s.TakeSharedL2Lookups()) {
+                     lookups.append(nb::make_tuple(lookup.request_id, lookup.prefix_hashes,
                                                    SharedL2TokenBytes(lookup.tokens), lookup.max_tokens));
                  }
                  return lookups;
              })
         .def(
             "apply_shared_l2_lookups",
-            // results: [(lookup_id, ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)])], the
-            // tuple SharedL2Pool.probe returns behind its lookup id. Returns the proxy blocks created:
-            // [(group_id, block, bucket, page)].
+            // results: [(request_id, ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)])], the
+            // tuple SharedL2Pool.probe returns behind the id of the request it answers. Returns the proxy
+            // blocks created: [(group_id, block, bucket, page)].
             [](tokenspeed::Scheduler& s,
-               const std::vector<std::tuple<
-                   std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, std::optional<SharedL2TailTuple>,
-                   std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>>>>& results) {
+               const std::vector<
+                   std::tuple<std::string, std::uint64_t, std::int32_t, std::int32_t, std::optional<SharedL2TailTuple>,
+                              std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>>>>& results) {
                 std::vector<tokenspeed::SharedL2LookupResult> converted;
                 converted.reserve(results.size());
-                for (const auto& [lookup_id, ticket, num_tokens, kv_tokens, tail, slots] : results) {
+                for (const auto& [request_id, ticket, num_tokens, kv_tokens, tail, slots] : results) {
                     tokenspeed::SharedL2LookupResult& result =
-                        converted.emplace_back(tokenspeed::SharedL2LookupResult{.lookup_id = lookup_id,
+                        converted.emplace_back(tokenspeed::SharedL2LookupResult{.request_id = request_id,
                                                                                 .ticket = ticket,
                                                                                 .num_tokens = num_tokens,
                                                                                 .kv_tokens = kv_tokens,

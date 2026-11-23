@@ -112,13 +112,11 @@ public:
     // taken for the others: the reservation does not evict them.
     Reservation Reserve(ClientId client, std::span<const CacheKey> keys, std::span<const std::int32_t> buckets);
     // Publishes a reservation's blocks, with the lineage of the checkpoints
-    // whose State block is among them, in a Device publication's order: each
-    // checkpoint's boundary is linked, the blocks are registered, then the
-    // checkpoints and their tails are recorded. A lineage's access epoch
-    // names the request that published the checkpoint on its rank:
-    // checkpoints one request published are no step apart in the retention
-    // ranking (CheckpointTree). False, with no change, for a ticket that
-    // reserves nothing (any more).
+    // whose State block is among them (CacheCoordinator::PublishHostBlocks).
+    // A lineage's access epoch names the request that published the
+    // checkpoint on its rank: checkpoints one request published are no step
+    // apart in the retention ranking (CheckpointTree). False, with no change,
+    // for a ticket that reserves nothing (any more).
     bool Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints);
     void Touch(std::span<const CacheKey> keys);
     // Ends everything the client holds. The pool keeps no list of clients: a

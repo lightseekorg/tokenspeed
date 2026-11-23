@@ -18,21 +18,20 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! A shared L2 pool's client as the loop drives it: the Python adapter
-//! (`HostSharedL2` in `engine/rust_host.py`) over the rank's client of the
-//! pool's owner.
+//! A shared L2 pool's client as the loop drives it: the rank's Python client
+//! of the pool's owner (`SharedL2Client` in `cache/shared_l2/client.py`),
+//! called by its own method names.
 //!
 //! The control thread makes every call, taking the GIL for the call. The
-//! adapter's `lookup` sends one request to the owner and waits for the
-//! reply, without the GIL; its other calls hand work to the client's
-//! threads and read what they finished. A call that raises is the client's
-//! failure.
+//! client's `lookup` sends one request to the owner and waits for the reply,
+//! without the GIL; its other calls hand work to the client's threads and
+//! read what they finished. A call that raises is the client's failure.
 
 use pyo3::{prelude::*, types::PyBytes};
 use ts_control::shared_l2::{PoolClient, PoolError};
 use ts_scheduler::{
-    profile, SharedL2AnswerView, SharedL2KeyView, SharedL2LookupView, SharedL2OpKind,
-    SharedL2OpView, SharedL2PageView,
+    profile, SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
+    SharedL2PageView, StorageKeyView,
 };
 
 use crate::data_plane::describe;
@@ -41,13 +40,24 @@ use crate::data_plane::describe;
 /// hash, page offset.
 type PyKey = (u32, u32, String, i32);
 
+/// The namespace of every pool key. The scheduler's keys do not carry it: a
+/// pool holds the default namespace alone.
+const NAMESPACE: u32 = 0;
+
 /// A partial last page: its tokens and its hash.
 type PyTail = (i32, String);
 
-/// A lookup's answer as the adapter returns it: the lookup, the ticket, the
-/// hit's tokens, the pool's KV reach, the tail, and each key with its
-/// bucket and pool page.
-type PyAnswer = (u64, u64, i32, i32, Option<PyTail>, Vec<(PyKey, i32, i32)>);
+/// A lookup's answer as the client returns it: the request it answers, the
+/// ticket, the hit's tokens, the pool's KV reach, the tail, and each key
+/// with its bucket and pool page.
+type PyAnswer = (
+    String,
+    u64,
+    i32,
+    i32,
+    Option<PyTail>,
+    Vec<(PyKey, i32, i32)>,
+);
 
 /// Tokens as the pool carries them: int32, native byte order. Written in one
 /// pass into the bytes object, which only exists under the GIL: a prompt's
@@ -61,24 +71,24 @@ fn token_bytes<'py>(py: Python<'py>, tokens: &[i32]) -> PyResult<Bound<'py, PyBy
     })
 }
 
-/// The Python adapter, called from the control thread.
+/// The Python client, called from the control thread.
 pub struct PythonPoolClient {
-    adapter: Py<PyAny>,
+    client: Py<PyAny>,
 }
 
 impl PythonPoolClient {
-    /// The client behind a Python `HostSharedL2`.
-    pub fn new(adapter: Py<PyAny>) -> Self {
-        Self { adapter }
+    /// The client behind a Python `SharedL2Client`.
+    pub fn new(client: Py<PyAny>) -> Self {
+        Self { client }
     }
 
-    /// Run one adapter call under the GIL; its failure is the client's.
+    /// Run one client call under the GIL; its failure is the client's.
     fn call<T>(&self, call: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>) -> Result<T, PoolError> {
         // The wait for the GIL, which the forward thread's Python holds.
         let acquiring = profile::span("Pool::acquire_gil");
         Python::attach(|py| {
             drop(acquiring);
-            call(self.adapter.bind(py)).map_err(|error| PoolError(describe(py, &error)))
+            call(self.client.bind(py)).map_err(|error| PoolError(describe(py, &error)))
         })
     }
 }
@@ -88,13 +98,12 @@ impl PoolClient for PythonPoolClient {
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-        let answers: Vec<PyAnswer> = self.call(|adapter| {
-            let py = adapter.py();
+        let answers: Vec<PyAnswer> = self.call(|client| {
+            let py = client.py();
             let lookups = lookups
                 .iter()
                 .map(|lookup| {
                     Ok((
-                        lookup.lookup_id,
                         &lookup.request_id,
                         &lookup.prefix_hashes,
                         token_bytes(py, &lookup.tokens)?,
@@ -102,14 +111,14 @@ impl PoolClient for PythonPoolClient {
                     ))
                 })
                 .collect::<PyResult<Vec<_>>>()?;
-            adapter.call_method1("lookup", (lookups,))?.extract()
+            client.call_method1("lookup", (lookups,))?.extract()
         })?;
-        Ok(answers
+        answers
             .into_iter()
-            .map(|(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)| {
+            .map(|(request_id, ticket, num_tokens, kv_tokens, tail, slots)| {
                 let (tail_tokens, tail_hash) = tail.unwrap_or_default();
-                SharedL2AnswerView {
-                    lookup_id,
+                Ok(SharedL2AnswerView {
+                    request_id,
                     ticket,
                     num_tokens,
                     kv_tokens,
@@ -119,39 +128,42 @@ impl PoolClient for PythonPoolClient {
                     pages: slots.iter().map(|(_, _, page)| *page).collect(),
                     keys: slots
                         .into_iter()
-                        .map(
-                            |((namespace_id, group_id, content_hash, page_offset), _, _)| {
-                                SharedL2KeyView {
-                                    namespace_id,
-                                    group_id,
-                                    content_hash,
-                                    page_offset,
-                                }
-                            },
-                        )
-                        .collect(),
-                }
+                        .map(|((namespace, group_id, content_hash, page_offset), _, _)| {
+                            if namespace != NAMESPACE {
+                                return Err(PoolError(format!(
+                                    "the pool answered a key of namespace {namespace}, not \
+                                     {NAMESPACE}"
+                                )));
+                            }
+                            Ok(StorageKeyView {
+                                group_id,
+                                content_hash,
+                                page_offset,
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                })
             })
-            .collect())
+            .collect()
     }
 
-    fn poll(&mut self) -> Result<Vec<u64>, PoolError> {
-        self.call(|adapter| adapter.call_method0("poll")?.extract())
+    fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError> {
+        self.call(|client| client.call_method0("poll_writes")?.extract())
     }
 
-    fn map_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
-        self.call(|adapter| {
+    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+        self.call(|client| {
             let pages: Vec<_> = pages
                 .iter()
                 .map(|page| (page.group_id, page.block, page.bucket, page.page))
                 .collect();
-            adapter.call_method1("map_pages", (pages,)).map(drop)
+            client.call_method1("map_proxy_pages", (pages,)).map(drop)
         })
     }
 
     fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError> {
-        self.call(|adapter| {
-            let py = adapter.py();
+        self.call(|client| {
+            let py = client.py();
             let (mut writes, mut releases, mut touches) = (Vec::new(), Vec::new(), Vec::new());
             for command in commands {
                 let keys = || -> Vec<PyKey> {
@@ -160,7 +172,7 @@ impl PoolClient for PythonPoolClient {
                         .iter()
                         .map(|key| {
                             (
-                                key.namespace_id,
+                                NAMESPACE,
                                 key.group_id,
                                 key.content_hash.clone(),
                                 key.page_offset,
@@ -196,14 +208,18 @@ impl PoolClient for PythonPoolClient {
                     SharedL2OpKind::Touch => touches.push(keys()),
                     kind => {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "no adapter call for the pool command {kind:?}"
+                            "no client call for the pool command {kind:?}"
                         )))
                     }
                 }
             }
-            adapter
+            client
                 .call_method1("submit", (writes, releases, touches))
                 .map(drop)
         })
+    }
+
+    fn check_failure(&mut self) -> Result<(), PoolError> {
+        self.call(|client| client.call_method0("check_failure").map(drop))
     }
 }

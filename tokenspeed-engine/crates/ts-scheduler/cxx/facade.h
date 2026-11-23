@@ -69,8 +69,7 @@ std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Sched
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
-                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events,
-                  rust::Slice<const std::uint64_t> pool_writes);
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
@@ -114,7 +113,7 @@ bool clear_cache(tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
-rust::Vec<SharedL2LookupView> shared_l2_lookups(tokenspeed::Scheduler& scheduler);
+rust::Vec<SharedL2LookupView> take_shared_l2_lookups(tokenspeed::Scheduler& scheduler);
 rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& scheduler, const SharedL2AnswerView& answer);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);

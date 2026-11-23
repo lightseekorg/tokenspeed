@@ -27,20 +27,17 @@
 namespace tokenspeed {
 
 void Scheduler::handleEvent(const cache::SharedL2WriteDone& event) {
-    if (!shared_l2_) {
-        throw std::invalid_argument("shared L2 completion without a configured pool");
-    }
     tier_transfers_.CompletePoolWrite(event);
 }
 
-std::vector<SharedL2Lookup> Scheduler::SharedL2Lookups() {
+std::vector<SharedL2Lookup> Scheduler::TakeSharedL2Lookups() {
     std::vector<SharedL2Lookup> lookups;
     if (!shared_l2_ || config_.disable_prefix_cache) {
         return lookups;
     }
     for (const auto& request : requests_) {
         auto* admission = request->AdmissionResourcesPtr();
-        if (admission == nullptr || admission->pool_settled || admission->pool_lookup) {
+        if (admission == nullptr || admission->pool_prepared || admission->pool_lookup_asked) {
             continue;
         }
         const std::int32_t max_tokens = cacheablePrefixTokens(*request);
@@ -53,12 +50,11 @@ std::vector<SharedL2Lookup> Scheduler::SharedL2Lookups() {
         // be gone by this prompt's admission.
         if (max_tokens == 0 || coordinator_.Prober().ProbePromptPrefix(prompt).device_only_hit_tokens >= max_tokens) {
             // Nothing the pool could add.
-            admission->pool_settled = true;
+            admission->pool_prepared = true;
             continue;
         }
-        admission->pool_lookup = shared_l2_->StartLookup(request->Id());
-        lookups.push_back(SharedL2Lookup{.lookup_id = admission->pool_lookup.LookupId(),
-                                         .request_id = request->Id(),
+        admission->pool_lookup_asked = true;
+        lookups.push_back(SharedL2Lookup{.request_id = request->Id(),
                                          .prefix_hashes = {hashes.begin(), hashes.end()},
                                          .tokens = {prompt.tokens.begin(), prompt.tokens.end()},
                                          .max_tokens = max_tokens});
@@ -72,15 +68,12 @@ std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector
     }
     std::vector<SharedL2ProxyPage> pages;
     for (const SharedL2LookupResult& result : results) {
-        const std::string* request_id = shared_l2_->PendingRequest(result.lookup_id);
-        if (request_id == nullptr) {
+        // A lookup waits in its request's pre-admission state.
+        Request* request = findRequest(result.request_id);
+        auto* admission = request != nullptr ? request->AdmissionResourcesPtr() : nullptr;
+        if (admission == nullptr || !admission->pool_lookup_asked || admission->pool_prepared) {
             throw std::invalid_argument("a shared L2 answer names no lookup that waits for it");
         }
-        // A pending lookup's hold lives in its request's pre-admission state.
-        Request* request = findRequest(*request_id);
-        auto* admission = request != nullptr ? request->AdmissionResourcesPtr() : nullptr;
-        FatalCheck(admission != nullptr && admission->pool_lookup.LookupId() == result.lookup_id,
-                   "a pending shared L2 lookup lost its waiting request");
         const std::int32_t tail_tokens = result.tail ? result.tail->tail_tokens : 0;
         if (result.num_tokens < 0 || result.num_tokens > cacheablePrefixTokens(*request) || result.kv_tokens < 0 ||
             tail_tokens < 0 || tail_tokens >= config_.prefix_granularity ||
@@ -92,9 +85,10 @@ std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector
             result.tail && full_pages > 0) {
             tail_prior = ContentHash{request->PromptPrefixHashes()[static_cast<std::size_t>(full_pages - 1)]};
         }
-        std::vector<SharedL2ProxyPage> created = shared_l2_->ApplyAnswer(result, tail_prior, admission->pool_lookup);
+        std::vector<SharedL2ProxyPage> created =
+            shared_l2_->ApplyAnswer(result, tail_prior, admission->pool_hit_blocks);
         admission->pool_kv_tokens = result.kv_tokens;
-        admission->pool_settled = true;
+        admission->pool_prepared = true;
         pages.insert(pages.end(), created.begin(), created.end());
     }
     return pages;

@@ -112,9 +112,9 @@ class Runtime:
         self.open_writes = []
 
     def answer(self, lookup):
-        lookup_id, _, hashes, tokens, max_tokens = lookup
+        request_id, hashes, tokens, max_tokens = lookup
         return (
-            lookup_id,
+            request_id,
             *self.pool.probe(self.client, hashes, tokens, max_tokens),
         )
 
@@ -123,7 +123,7 @@ class Runtime:
             self.pages[(group, block)] = page
 
     def lookup(self, s):
-        lookups = s.shared_l2_lookups()
+        lookups = s.take_shared_l2_lookups()
         self.lookups.extend(lookups)
         self.apply(s, [self.answer(lookup) for lookup in lookups])
 
@@ -262,8 +262,8 @@ def test_a_waiting_prompt_is_admitted_only_after_its_lookup():
     reader.submit_requests([_spec("b", prompt + [50, 51])])
     # Not asked yet, then asked and not answered: no plan admits it.
     reader_rt.plan(reader, lookup=False)
-    [lookup] = reader.shared_l2_lookups()
-    assert lookup[1] == "b" and lookup[4] == len(prompt) + 1
+    [lookup] = reader.take_shared_l2_lookups()
+    assert lookup[0] == "b" and lookup[3] == len(prompt) + 1
     for _ in range(3):
         reader_rt.plan(reader, lookup=False)
     assert "b" not in reader_rt.forwarded
@@ -320,10 +320,10 @@ def test_a_request_gone_before_admission_lets_its_hit_go():
     assert settled(reader, pool)
 
     # Gone between its lookup and the answer, which a runtime that answers a
-    # lookup in the call that sent it never sees: the answer names no lookup
-    # that waits, and is refused.
+    # lookup in the call that sent it never sees: the answer names a request
+    # the scheduler no longer knows, so no lookup that waits, and is refused.
     reader.submit_requests([_spec("c", prompt + [60, 61])])
-    [lookup] = reader.shared_l2_lookups()
+    [lookup] = reader.take_shared_l2_lookups()
     late = reader_rt.answer(lookup)
     abort("c")
     reader_rt.plan(reader)
@@ -535,11 +535,11 @@ def test_an_answer_outside_its_prompt_is_refused():
     publish(writer, writer_rt, "a", prompt)
 
     reader.submit_requests([_spec("b", prompt + [50, 51])])
-    [lookup] = reader.shared_l2_lookups()
-    lookup_id, ticket, num_tokens, kv_tokens, tail, slots = reader_rt.answer(lookup)
+    [lookup] = reader.take_shared_l2_lookups()
+    request_id, ticket, num_tokens, kv_tokens, tail, slots = reader_rt.answer(lookup)
     with pytest.raises(ValueError, match="outside the prompt"):
         reader.apply_shared_l2_lookups(
-            [(lookup_id, ticket, 40, kv_tokens, tail, slots)]
+            [(request_id, ticket, 40, kv_tokens, tail, slots)]
         )
     # Nothing of the answer was taken, and no plan runs the prompt.
     assert reader.host_pool_cached_blocks() == 0
@@ -607,6 +607,18 @@ def _without_write_room(cfg):
     cfg.shared_l2_config = ts.SharedL2Config(max_writes=0, max_write_keys=64)
 
 
+def _with_peer_sharing(cfg):
+    cfg.peer_config = ts.PeerConfig(
+        name="rank",
+        incarnation=1,
+        max_leases=8,
+        soft_pin_us=1000,
+        hard_pin_us=1000,
+        lookup_timeout_us=1000,
+        min_fetch_tokens=GRAIN,
+    )
+
+
 @pytest.mark.parametrize(
     "breaks, message",
     [
@@ -617,6 +629,7 @@ def _without_write_room(cfg):
         (_with_sharded_groups, "replicated groups"),
         (_writing_evictions_back, "WriteThrough"),
         (_without_write_room, "positive write limits"),
+        (_with_peer_sharing, "peer prefix sharing"),
     ],
 )
 def test_a_shared_l2_config_refuses_what_its_proxy_cannot_serve(breaks, message):

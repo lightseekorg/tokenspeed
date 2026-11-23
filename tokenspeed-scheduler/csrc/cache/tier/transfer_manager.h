@@ -368,7 +368,9 @@ private:
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
     std::unordered_map<std::uint64_t, InFlightPoolWrite> pool_writes_;
-    std::uint64_t next_pool_write_id_{0};
+    // 32 bits, as next_op_id_: the runtime acknowledges a pool write as it
+    // does every other cache op, by an id of that width.
+    std::uint32_t next_pool_write_id_{0};
     std::uint32_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
     std::array<WriteBackStats, 4> write_back_stats_;

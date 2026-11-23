@@ -28,21 +28,24 @@
 //! what to write to it; the client ([`PoolClient`]) talks to the owner. The
 //! loop only relays. Before a plan, the waiting prompts not looked up yet
 //! ask the owner in one request, which the round waits for
-//! ([`Pool::look_up`]); a plan's pool commands go to the client when the
+//! ([`Pool::lookup`]); a plan's pool commands go to the client when the
 //! plan is dispatched, and the client carries them out on threads of its
 //! own. At the head of every round the loop asks the client for the writes
 //! it finished and for a failure it stored ([`Pool::finished_writes`]).
 //!
 //! A failure of the client or of the owner ends serving, as a failed
-//! load-back does; a miss is an answer of the owner that names no page. The
+//! load-back does; a miss is an answer of the owner that names no page. A
+//! load from the pool that failed lets its forward go over pages it never
+//! filled: the client holds that failure, and the loop asks for it when the
+//! forward has landed, before it commits it ([`Pool::forward_committed`]). The
 //! client answers one rank, so the pool needs a replica of one member
 //! (attention TP 1).
 
 use std::collections::VecDeque;
 
 use ts_scheduler::{
-    ExecutionPlan, SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
-    SharedL2PageView,
+    CacheEvent, CacheEventKind, ExecutionPlan, SharedL2AnswerView, SharedL2LookupView,
+    SharedL2OpKind, SharedL2OpView, SharedL2PageView,
 };
 
 /// The pool's client or its owner failed; serving cannot continue.
@@ -63,17 +66,22 @@ pub trait PoolClient {
     /// The ids of the writes finished since the last poll; never waits.
     /// Fails when a write or a notice to the owner (a release, a touch, a
     /// ping) failed.
-    fn poll(&mut self) -> Result<Vec<u64>, PoolError>;
+    fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError>;
 
     /// The proxy Host blocks an answer created, each with the pool page a
     /// load-back from it reads; before the plan that may plan that load.
-    fn map_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError>;
+    fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError>;
 
     /// Pool commands: writes to start, and releases and touches to tell the
     /// owner. Over all calls, the commands of one kind come in plan order.
     /// Between kinds no order is kept: a plan's writes may come in a later
     /// call than its other commands ([`Pool::dispatch`]).
     fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError>;
+
+    /// Fails once a load from the pool, a write or a notice has failed;
+    /// never waits. A load's failure is there before the forward that waited
+    /// on the load is let go.
+    fn check_failure(&mut self) -> Result<(), PoolError>;
 }
 
 /// The pool on this rank: its client, and the writes in flight there.
@@ -99,7 +107,7 @@ impl Pool {
     /// Ask the owner about the lookups the scheduler handed out, in one
     /// request, and wait for the answers: the client returns one per lookup,
     /// in order.
-    pub fn look_up(
+    pub fn lookup(
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
@@ -108,11 +116,11 @@ impl Pool {
 
     /// The scheduler took an answer: the proxy blocks it created go to the
     /// client.
-    pub fn applied(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+    pub fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
         if pages.is_empty() {
             return Ok(());
         }
-        self.client.map_pages(pages)
+        self.client.map_proxy_pages(pages)
     }
 
     /// Writes not finished: the loop is not idle while there are any.
@@ -120,14 +128,21 @@ impl Pool {
         self.writes.len()
     }
 
-    /// The ids of the writes the client finished since the last call, for
-    /// the head of every round. The client is asked whether or not a write
-    /// is in flight: its poll also raises the failure a write or a notice
-    /// stored, a failed ping of an idle rank among them.
-    pub fn finished_writes(&mut self) -> Result<Vec<u64>, PoolError> {
-        let finished = self.client.poll()?;
-        self.writes.retain(|id| !finished.contains(id));
-        Ok(finished)
+    /// The acknowledgments of the writes the client finished since the last
+    /// call, for the head of every round. The client is asked whether or not
+    /// a write is in flight: its poll also raises the failure a write or a
+    /// notice stored, a failed ping of an idle rank among them.
+    pub fn finished_writes(&mut self) -> Result<Vec<CacheEvent>, PoolError> {
+        let finished = self.client.poll_writes()?;
+        self.writes
+            .retain(|id| !finished.iter().any(|done| u64::from(*done) == *id));
+        Ok(finished
+            .into_iter()
+            .map(|op_id| CacheEvent {
+                kind: CacheEventKind::SharedL2WriteDone,
+                op_id,
+            })
+            .collect())
     }
 
     /// Hand `plan`'s pool commands to the client; none waits for the owner.
@@ -170,9 +185,14 @@ impl Pool {
         Ok(true)
     }
 
-    /// A dispatched forward was committed: the writes that waited for it,
-    /// and for no later one, go to the client.
+    /// A dispatched forward landed and is about to be committed. A load
+    /// that failed let it go over pages it never filled, and the client has
+    /// that failure by now: it ends serving here, before the forward's
+    /// results are committed and before a write of the pages it computed
+    /// starts. Otherwise the writes that waited for the forward, and for no
+    /// later one, go to the client.
     pub fn forward_committed(&mut self) -> Result<(), PoolError> {
+        self.client.check_failure()?;
         for (forwards, _) in &mut self.held_writes {
             *forwards -= 1;
         }
@@ -210,16 +230,20 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn poll(&mut self) -> Result<Vec<u64>, PoolError> {
+        fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError> {
             Ok(Vec::new())
         }
 
-        fn map_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+        fn map_proxy_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
             self.mapped.lock().unwrap().push(pages.len());
             Ok(())
         }
 
         fn submit(&mut self, _: &[SharedL2OpView]) -> Result<(), PoolError> {
+            Ok(())
+        }
+
+        fn check_failure(&mut self) -> Result<(), PoolError> {
             Ok(())
         }
     }
@@ -235,9 +259,9 @@ mod tests {
             bucket: 0,
             page: 9,
         };
-        pool.applied(&[page, page]).unwrap();
+        pool.map_proxy_pages(&[page, page]).unwrap();
         // A miss maps nothing.
-        pool.applied(&[]).unwrap();
+        pool.map_proxy_pages(&[]).unwrap();
         assert_eq!(*mapped.lock().unwrap(), [2]);
     }
 }
