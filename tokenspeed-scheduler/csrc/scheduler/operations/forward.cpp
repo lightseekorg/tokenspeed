@@ -1253,28 +1253,24 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
 // plan, everything else in the snapshot pool, each in its Device block's
 // bucket -- takes it and issues both store legs; the victim's Device pages
 // are released by the retract event and may be granted away in this very
-// round, because the runtime orders both copies on the forward thread's
-// stream ahead of the plan's page reuse. A victim whose image cannot be held,
-// or with no blob slot free, is not retracted: the shortfall is returned
-// before anything is acquired or evicted for the image, and the publication
-// it did stands as its progress. The victim aborts: the publication registered
-// blocks it would write again (a
-// partial page as a tail, and a State group's end state, which a decode step
-// writes in place).
+// round. The device retires replay before copying the image and both finish
+// before the plan reuses those pages. If an image fails to fit after
+// publication, the victim aborts and the published blocks remain cached.
 void Scheduler::retractVictim(Request& victim, PlanBuild& build,
                               std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::retractVictim"};
-    const auto abort = [&](ImageShortfall shortfall) {
-        reportImageShortfall(victim, shortfall, build);
-        // The victim is already retired on the device, so any publication
-        // that stands after a shortfall is safe and its residency can end.
-        victim.Apply(fsm::AbortEvent{&coordinator_});
-    };
     if (snapshot_slots_.AvailableSlots() == 0) {
-        abort(ImageShortfall::kBlobSlot);
+        reportImageShortfall(victim, ImageShortfall::kBlobSlot, build);
+        abortRequest(victim);
         return;
     }
+    queueStateRetirement(victim, /*discard_replay=*/false);
     publishCompletedPrefix(victim);
+    const auto abort = [&](ImageShortfall shortfall) {
+        reportImageShortfall(victim, shortfall, build);
+        // Preserve the replay queued for the publication above.
+        victim.Apply(fsm::AbortEvent{&coordinator_});
+    };
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     TierTransferManager::RetractionImageSplit split = tier_transfers_.SplitRetractionImage(
         victim.BlockTablesRef(), num_computed_tokens,
@@ -1378,8 +1374,8 @@ void Scheduler::reportImageShortfall(const Request& victim, ImageShortfall short
 // published pages the pool cannot -- always, without a pool) the last resort
 // is to ABORT the newest retractable resident offered (below) instead of
 // imaging anyone: its pages free as a retraction's would and the grant
-// proceeds, after retirement if needed. The alternative, waiting, can
-// deadlock once every resident needs a page.
+// proceeds. The alternative, waiting, can deadlock once every resident needs
+// a page.
 //
 // A grant that cannot join its round (a fused prefill beside an already-built
 // decode batch outside mixed mode) still retracts one victim, and the blocker
@@ -1400,12 +1396,12 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     // policy cannot see that write, so no retraction until it lands. A
     // pinned store mid-flight holds pages the ACK is about to release; the
     // blocked admission retries against them next round before anyone is
-    // sacrificed. The same holds for a request retiring on the device.
+    // sacrificed.
     // (Stream-ordered stores -- both legs of an image, and
     // eviction write-backs -- hold nothing and gate nothing; an in-flight
     // restore gates nothing because its request is Restoring, invisible to
     // chooseVictim.)
-    if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight() || HasStateRetirements()) {
+    if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight()) {
         return;
     }
     ProfileSpan profile_span{"Scheduler::maybeRetractForCapacity"};
@@ -1550,12 +1546,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (choice.shortfall) {
             reportImageShortfall(*victim, *choice.shortfall, build);
             abortRequest(*victim);
-        } else if (!tryRetireRecurrentState(*victim, fsm::MaterializationAction::kRetract)) {
+        } else {
             retractVictim(*victim, build, write_back_operations);
-        }
-        if (victim->Is<fsm::StateMaterializing>()) {
-            build.scheduled.insert(victim);
-            return;
         }
 
         if (empty_round) {
@@ -1666,11 +1658,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
         spdlog::info("[Scheduler] forced retraction of request {} refused: its image does not fit", armed->Id());
         return;
     }
-    if (tryRetireRecurrentState(*armed, fsm::MaterializationAction::kRetract)) {
-        build.scheduled.insert(armed);
-    } else {
-        retractVictim(*armed, build, write_back_operations);
-    }
+    retractVictim(*armed, build, write_back_operations);
 }
 
 std::vector<Request*> Scheduler::rankedReadmissions(std::span<Request* const> candidates) {
@@ -2333,13 +2321,6 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
     PlanBuild build{plan, options};
-    if (config_.defer_recurrent_state) {
-        for (Request* request : candidates) {
-            if (!request->TakeMaterializedRetraction()) continue;
-            retractVictim(*request, build, write_back_operations);
-            build.scheduled.insert(request);
-        }
-    }
     build.token_budget = config_.max_scheduled_tokens;
     build.kv_page_budget = config_.max_kv_page_num;
     switch (config_.role) {

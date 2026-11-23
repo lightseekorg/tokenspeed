@@ -631,7 +631,7 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
-    if (!plan.state_materializations.empty()) return true;
+    if (plan.state_materialization) return true;
     // A peer landing's reads start from the fence the data plane reports for
     // its plan, which may have no other device work: a prefill replica's
     // landing prepays no decode room, so it zeroes nothing.
@@ -705,8 +705,8 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<CacheOpView> out;
-    for (const auto& materialization : plan.state_materializations) {
-        out.push_back(CacheOpView{.kind = CacheOpKind::StateMaterialize, .op_id = materialization.op_id});
+    if (plan.state_materialization) {
+        out.push_back(CacheOpView{.kind = CacheOpKind::StateMaterialize, .op_id = plan.state_materialization->op_id});
     }
     // One acknowledgment per op id, whatever the batch kind: an L2 batch
     // lists its ops, and a snapshot or restore batch has one op per request.

@@ -49,8 +49,7 @@ enum class AbortReason : std::uint8_t {
 };
 
 // A request the scheduler aborted this round. The runtime fails it toward
-// the client with `detail` as the message, while the scheduler may still
-// retain resources for a device retirement. A later Abort/Finish is harmless.
+// the client with `detail` as the message. A later Abort/Finish is harmless.
 struct SchedulerAbort {
     std::string request_id;
     AbortReason reason{AbortReason::kImageDoesNotFit};
@@ -60,10 +59,9 @@ struct SchedulerAbort {
 };
 
 struct StateMaterialization {
-    std::uint32_t op_id;
-    std::vector<std::int32_t> request_pool_indices;
-    // Only a cancellation with no consumer can drop replay without committing it.
-    bool discard_replay;
+    std::uint32_t op_id{};
+    std::vector<std::int32_t> materialize_slots;
+    std::vector<std::int32_t> discard_slots;
     bool operator==(const StateMaterialization&) const = default;
 };
 
@@ -129,7 +127,9 @@ public:
     // rounds): the last resort of a retraction whose victim could not be
     // imaged.
     std::vector<SchedulerAbort> aborts;
-    std::vector<StateMaterialization> state_materializations;
+    // These slots belong to the old owners. The device retires their replay
+    // before the plan's stores or any work that reuses their blocks or slots.
+    std::optional<StateMaterialization> state_materialization;
 
     bool operator==(const ExecutionPlan&) const = default;
 

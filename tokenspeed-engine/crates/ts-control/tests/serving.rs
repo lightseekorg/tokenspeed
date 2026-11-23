@@ -5176,7 +5176,7 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
 }
 
 #[test]
-fn memory_release_waits_for_a_state_retirement_queued_by_the_last_forward() {
+fn memory_release_waits_for_the_retirement_batch_queued_by_the_last_forward() {
     let sleeping = || {
         EngineRequest::Control(Box::new(ControlRequest::IsSleeping(IsSleepingReqInput {
             rid: None,
@@ -5185,6 +5185,7 @@ fn memory_release_waits_for_a_state_retirement_queued_by_the_last_forward() {
     };
     let mut script = vec![Vec::new(); 8];
     script[0].push(EngineRequest::Add(Box::new(request("r", 3, budget(2)))));
+    script[0].push(EngineRequest::Add(Box::new(request("s", 3, budget(2)))));
     // A weights-only release exercises drain itself without a cache clear.
     script[0].push(EngineRequest::Control(Box::new(
         ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
@@ -5193,9 +5194,8 @@ fn memory_release_waits_for_a_state_retirement_queued_by_the_last_forward() {
             tags: Some(vec!["weights".to_owned()]),
         }),
     )));
-    // The two forwards have finished at the tail of round 1, which just
-    // queued the retirement. It reaches the device in round 2 and waits two
-    // cache polls before its ACK can release the request's resources.
+    // The last forward queues both exits at the tail of round 1. A single
+    // batch reaches the device in round 2 and blocks release through two polls.
     script[2].push(sleeping());
     script[4].push(sleeping());
     script[6].push(sleeping());
@@ -5213,6 +5213,7 @@ fn memory_release_waits_for_a_state_retirement_queued_by_the_last_forward() {
     );
     let rank = &ranks[0];
     assert_scripted_tokens(rank, "r", 2);
+    assert_scripted_tokens(rank, "s", 2);
     assert_eq!(rank.cache_ops, [CacheOpKind::StateMaterialize]);
     assert_eq!(rank.device_ops, ["release weights"]);
     assert_eq!(

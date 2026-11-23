@@ -191,7 +191,7 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
-        /// Retire recurrent State before its pages can be consumed or reused.
+        /// A plan's recurrent State retirements, ordered before its cache and forward work.
         StateMaterialize,
     }
 
@@ -253,7 +253,7 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
-        /// A recurrent State retirement finished (`cache::StateMaterialized`).
+        /// A plan's recurrent State retirements finished (`cache::StateMaterialized`).
         StateMaterialized,
     }
 
@@ -1035,8 +1035,7 @@ impl Scheduler {
         ffi::can_clear_cache(self.get())
     }
 
-    /// Whether any recurrent State retirement still owns its pages and slot,
-    /// including work queued before the next execution plan.
+    /// Whether a recurrent State retirement batch is queued or still in flight.
     pub fn has_state_retirements(&self) -> bool {
         ffi::has_state_retirements(self.get())
     }

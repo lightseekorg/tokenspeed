@@ -139,7 +139,6 @@ std::int32_t Request::NumComputedTokens() const {
             // token no landed forward consumed.
             [this](const fsm::Decoding&) { return TokenSize() - 1; },
             [this](const fsm::Finishing&) { return TokenSize() - 1; },
-            [](const fsm::StateMaterializing& state) { return state.frontier; },
             [this](const auto&) -> std::int32_t {
                 throw std::logic_error(
                     "Request::NumComputedTokens: expected Prefilling, PrefillDone, Decoding or Finishing; got " +
@@ -147,34 +146,6 @@ std::int32_t Request::NumComputedTokens() const {
             },
         },
         state_);
-}
-
-void Request::StartStateMaterialization(std::uint32_t op_id, fsm::MaterializationAction action) {
-    _assert(ResultsInFlight() == 0, "state materialization requires landed forwards");
-    const auto frontier = NumComputedTokens();
-    if (auto* decoding = GetIf<fsm::Decoding>()) {
-        const auto reserve = decoding->ReserveNumTokensInNextScheduleEvent();
-        state_ = fsm::StateMaterializing{std::move(decoding->resources), action, op_id, frontier, reserve};
-        return;
-    }
-    auto* finishing = GetIf<fsm::Finishing>();
-    _assert(finishing != nullptr && finishing->retire_decode_state && action != fsm::MaterializationAction::kRetract,
-            "only an exit from decode materializes recurrent state");
-    state_ = fsm::StateMaterializing{std::move(finishing->resources), action, op_id, frontier, 0};
-}
-
-bool Request::CompleteStateMaterialization(std::uint32_t op_id) {
-    auto* retiring = GetIf<fsm::StateMaterializing>();
-    if (retiring == nullptr || retiring->op_id != op_id) return false;
-    const auto action = retiring->action;
-    if (action == fsm::MaterializationAction::kRetract) {
-        state_ = fsm::Decoding{std::move(retiring->resources), retiring->reserve_num_tokens_in_next_schedule_event};
-        materialized_retraction_ = true;
-    } else {
-        state_ = fsm::Finishing{std::move(retiring->resources), action == fsm::MaterializationAction::kFinish,
-                                /*retire_decode_state=*/false};
-    }
-    return true;
 }
 
 fsm::ForwardResources& Request::forwardResources(const char* operation) {

@@ -349,12 +349,11 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
     abort.request_id = discard.request_id
     scheduler.advance(decode_results.add_event(finish).add_event(abort))
     plan = scheduler.next_execution_plan()
-    assert len(plan.state_materializations) == 2
-    assert {operation.discard_replay for operation in plan.state_materializations} == {
-        False,
-        True,
-    }
-    assert scheduler.active_lcm_blocks() > 0
+    retirement = plan.state_materialization
+    assert retirement.materialize_slots == [1]
+    assert retirement.discard_slots == [2]
+    assert scheduler.active_lcm_blocks() == 0
+    assert scheduler.has_state_retirements()
 
     value, reference = case(True), case(False)
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
@@ -388,25 +387,13 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
     finally:
         torch.cuda.set_sync_debug_mode(previous_debug)
     executor.default_stream.synchronize()
-    acknowledgments = handle.poll_cache_results()
-    assert len(acknowledgments) == 2
-    assert {ack.op_id for ack in acknowledgments} == {
-        operation.op_id for operation in plan.state_materializations
-    }
-    completion = ExecutionEvent()
-    for ack in acknowledgments:
-        completion.add_event(ack)
-    scheduler.advance(completion)
-    assert scheduler.active_lcm_blocks() == 0
-    for operation in plan.state_materializations:
-        (slot,) = operation.request_pool_indices
-        page = 5 if slot == 1 else 6
-        if operation.discard_replay:
-            torch.testing.assert_close(value.state[page], before[page], rtol=0, atol=0)
-        else:
-            torch.testing.assert_close(
-                value.state[page], reference.state[page], rtol=2e-2, atol=1e-3
-            )
+    torch.testing.assert_close(value.state[5], reference.state[5], rtol=2e-2, atol=1e-3)
+    torch.testing.assert_close(value.state[6], before[6], rtol=0, atol=0)
+    assert not value.backend._pending_state.valid.any().item()
+    (ack,) = handle.poll_cache_results()
+    assert ack.op_id == retirement.op_id
+    scheduler.advance(ExecutionEvent().add_event(ack))
+    assert not scheduler.has_state_retirements()
     assert handle.poll_cache_results() == []
 
 

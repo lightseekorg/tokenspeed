@@ -167,7 +167,7 @@ public:
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
-    // Includes operations still waiting for a plan and those issued to the device.
+    // Includes slots still waiting for a plan and batches issued to the device.
     bool HasStateRetirements() const;
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
@@ -455,7 +455,7 @@ private:
     // and one whose finish overtook an overlapped decode settles with that
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
-    bool tryRetireRecurrentState(Request& request, fsm::MaterializationAction action);
+    void queueStateRetirement(const Request& request, bool discard_replay);
     void handleEvent(const cache::StateMaterialized& event);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
@@ -726,9 +726,9 @@ private:
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
-    // Images the victim once its device state is ready. An image that no
-    // longer fits aborts the victim; past the blob-slot check its completed
-    // pages stay published (see forward.cpp).
+    // Images the victim, ordering the device store after state retirement.
+    // Past the blob-slot check its completed pages stay published even if
+    // the image does not fit and the victim is aborted (see forward.cpp).
     void retractVictim(Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations);
     void reportImageShortfall(const Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
@@ -802,8 +802,9 @@ private:
     std::uint64_t storage_pressure_bypasses_{0};
     bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
-    std::vector<StateMaterialization> pending_state_materializations_;
-    std::uint32_t next_state_materialization_id_{1};
+    std::optional<StateMaterialization> pending_state_materialization_;
+    std::uint32_t issued_state_materialization_id_{0};
+    std::uint32_t completed_state_materialization_id_{0};
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.

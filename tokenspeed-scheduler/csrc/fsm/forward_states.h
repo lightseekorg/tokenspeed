@@ -390,20 +390,8 @@ struct Finishing {
     ForwardResources resources;
     // A cancelled request waits for its forwards too, but publishes nothing.
     bool publish_completed_pages;
-    // Set on exit from decode, and cleared when the device has retired the slot.
+    // An exit from decode retires this slot after its forwards land.
     bool retire_decode_state;
-};
-
-enum class MaterializationAction { kRetract, kFinish, kAbort };
-
-// The original residency is moved here as one RAII bundle. Neither pages nor
-// the request-pool slot can be reclaimed until the execution-stream ACK.
-struct StateMaterializing {
-    ForwardResources resources;
-    MaterializationAction action;
-    std::uint32_t op_id;
-    std::int32_t frontier;
-    std::int32_t reserve_num_tokens_in_next_schedule_event;
 };
 
 struct Finished {};

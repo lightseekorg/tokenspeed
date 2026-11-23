@@ -41,12 +41,13 @@ struct SnapshotDone {
     std::uint32_t op_id{};
 };
 
-// A SnapshotRestoreOperation completed every H2D row and the slot-state
-// import: the restored request is schedulable again.
+// The execution stream retired the old slot owners in this plan.
 struct StateMaterialized {
     std::uint32_t op_id{};
 };
 
+// A SnapshotRestoreOperation completed every H2D row and the slot-state
+// import: the restored request is schedulable again.
 struct RestoreDone {
     std::uint32_t op_id{};
 };

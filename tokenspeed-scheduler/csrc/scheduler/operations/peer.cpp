@@ -42,6 +42,13 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
     if (!PeerExports::Matches(coordinator_, lookup, num_tokens, pages)) {
         return false;
     }
+    // A plan can publish a Device State before its replay has run. The
+    // holder replies to PIN outside the plan's stream ordering.
+    if (HasStateRetirements() && std::ranges::any_of(pages, [this](const PeerPage& page) {
+            return page.tier == CacheTier::kDevice && coordinator_.GroupIsState(page.group_id);
+        })) {
+        return false;
+    }
     if (!tier_transfers_.HasLoadBacksInFlight()) {
         return true;
     }

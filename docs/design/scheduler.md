@@ -2189,24 +2189,18 @@ With deferred recurrent replay enabled, ordinary decode completion advances
 the token frontier and retires the forward as usual. The GPU owns the replay
 record. When the scheduler is about to finish, abort or retract a request
 whose local state may still have replay, it waits for all outstanding forward
-results and requests an exit acknowledgment from the data plane. The device
-writes back replay for state that will be published or snapshotted, discards
-it when the state has no remaining consumer, and acknowledges a request with
-no replay without updating its state.
+results before recording the old request slot. Finish and retraction write
+back replay for publication or a snapshot. An abort that leaves no reader
+discards replay. If a retraction publishes a checkpoint before finding that
+its image cannot fit, that checkpoint still needs its writeback.
 
-`StateMaterializing` owns the original `ForwardResources` and resume shape,
-including their RAII cache-block and request-slot handles. It cannot be
-scheduled or selected as a retraction victim. An abort during this wait
-changes the completion action while keeping the resources. A retraction
-resumes only after the matching acknowledgment and then enters the existing
-image protocol. Capacity recovery waits for the outstanding reclamation
-before selecting another victim. Duplicate or unrelated acknowledgments
-cannot advance the request.
+The exit releases its slot and blocks by the ordinary request state
+transitions. A single batch in the execution plan handles the old slot
+records before the plan's store, copy, zero, load and forward operations
+can consume or reuse them. A cache-only plan also carries the batch, including
+exits queued by the preceding round's forward results.
 
-An execution plan batches the operations with their IDs, request slots and
-disposition. The data plane queues them on the model execution stream and
-orders the plan's store, copy, zero and transfer work behind the completion
-event. Event polling sends `StateMaterializedEvent` through the existing
-cache-op feedback and replica agreement. The scheduler then performs the
-remaining finish, abort or retraction action. Only complete State blocks and
-slot records that no longer reference replay may be published or snapshotted.
+The replica acknowledges each batch through cache-op feedback. Peer PINs
+that would expose Device State wait until all queued and dispatched batches
+have completed, since the source execution stream cannot order a remote RDMA
+read. The same outstanding-work check protects cache clear and drain.

@@ -3440,20 +3440,14 @@ protected:
                     SendForwardDone(id, {301 + round});
                 }
             }
-            if (!plan.state_materializations.empty() || !plan.aborts.empty()) return plan;
+            if (plan.state_materialization || !plan.aborts.empty()) return plan;
         }
         ADD_FAILURE() << "resident decodes never needed capacity recovery";
         return {};
     }
-
-    void Retire(std::uint32_t op_id) {
-        ExecutionEvent event;
-        event.With(cache::StateMaterialized{.op_id = op_id});
-        scheduler_->Advance(event);
-    }
 };
 
-TEST_F(StateRetirementCapacitySuite, WithoutSnapshotPoolAbortDiscardsReplayBeforeReleasingResidency) {
+TEST_F(StateRetirementCapacitySuite, WithoutSnapshotPoolTheGrantPlanDiscardsTheAbortedVictimsReplay) {
     config_.snapshot_allocator.total_pages = 1;
     config_.max_retracted_requests = 0;
     config_.host_group_packing.clear();
@@ -3461,38 +3455,30 @@ TEST_F(StateRetirementCapacitySuite, WithoutSnapshotPoolAbortDiscardsReplayBefor
     const ExecutionPlan retiring = DriveUntilCapacityRetirement();
     ASSERT_EQ(retiring.aborts.size(), 1u);
     EXPECT_EQ(retiring.aborts.front().reason, AbortReason::kImageDoesNotFit);
-    ASSERT_EQ(retiring.state_materializations.size(), 1u);
-    EXPECT_TRUE(retiring.state_materializations.front().discard_replay);
+    ASSERT_TRUE(retiring.state_materialization);
+    EXPECT_TRUE(retiring.state_materialization->materialize_slots.empty());
+    EXPECT_EQ(retiring.state_materialization->discard_slots.size(), 1u);
     EXPECT_EQ(FindSnapshotStore(retiring), nullptr);
-    EXPECT_TRUE(scheduler_->HasStateRetirements());
-    const auto held = scheduler_->ActiveLcmBlocks();
-
-    const ExecutionPlan waiting = PlanOnce();
-    EXPECT_TRUE(waiting.aborts.empty());
-    EXPECT_TRUE(waiting.state_materializations.empty());
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), held);
-    Retire(retiring.state_materializations.front().op_id);
-    EXPECT_FALSE(scheduler_->HasStateRetirements());
-    EXPECT_LT(scheduler_->ActiveLcmBlocks(), held);
-    EXPECT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    const auto* forward = FindForwardBatch(retiring);
+    ASSERT_NE(forward, nullptr);
+    EXPECT_FALSE(forward->request_ids.empty());
+    EXPECT_EQ(std::ranges::find(forward->request_ids, retiring.aborts.front().request_id), forward->request_ids.end());
 }
 
-TEST_F(StateRetirementCapacitySuite, LateAckDoesNotRetireAnotherVictimWhileWaitingForPages) {
+TEST_F(StateRetirementCapacitySuite, RetractionMaterializesAndSnapshotsTheVictimInTheGrantPlan) {
     const ExecutionPlan retiring = DriveUntilCapacityRetirement();
     ASSERT_TRUE(retiring.aborts.empty());
-    ASSERT_EQ(retiring.state_materializations.size(), 1u);
-    EXPECT_FALSE(retiring.state_materializations.front().discard_replay);
-    EXPECT_EQ(FindSnapshotStore(retiring), nullptr);
-
-    const ExecutionPlan waiting = PlanOnce();
-    EXPECT_TRUE(waiting.aborts.empty());
-    EXPECT_TRUE(waiting.state_materializations.empty());
-    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
-    Retire(retiring.state_materializations.front().op_id);
-    const ExecutionPlan image = PlanOnce();
-    EXPECT_TRUE(image.aborts.empty());
+    ASSERT_TRUE(retiring.state_materialization);
+    const auto* store = FindSnapshotStore(retiring);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->request_ids.size(), 1u);
+    EXPECT_EQ(retiring.state_materialization->materialize_slots, store->request_pool_indices);
+    EXPECT_TRUE(retiring.state_materialization->discard_slots.empty());
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
-    EXPECT_NE(FindSnapshotStore(image), nullptr);
+    const auto* forward = FindForwardBatch(retiring);
+    ASSERT_NE(forward, nullptr);
+    EXPECT_FALSE(forward->request_ids.empty());
+    EXPECT_EQ(std::ranges::find(forward->request_ids, store->request_ids.front()), forward->request_ids.end());
 }
 
 TEST_F(NoPoolSuite, WithoutAPoolACapacityBlockAbortsAndNamesThePoolKnobNotTheSlots) {

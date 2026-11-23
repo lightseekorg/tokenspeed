@@ -81,7 +81,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
         handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
-    if (!request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::StateMaterializing>()) {
+    if (!request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
     // The transfer is done and the request leaves this engine: its computed
@@ -108,7 +108,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
-    if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::StateMaterializing, fsm::Finished>()) {
+    if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
         return;
     }
     throw std::logic_error("PD RemotePrefillDoneEvent received before destination admission; state=" +
@@ -135,14 +135,13 @@ void Scheduler::settleFinishedRequests() {
             request->Apply(fsm::TransferStoppedEvent{&coordinator_});
             continue;
         }
-        if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
+        const auto* finishing = request->GetIf<fsm::Finishing>();
+        if (finishing == nullptr || request->ResultsInFlight() > 0) {
             continue;
         }
-        const auto action = request->GetIf<fsm::Finishing>()->publish_completed_pages
-                                ? fsm::MaterializationAction::kFinish
-                                : fsm::MaterializationAction::kAbort;
-        if (tryRetireRecurrentState(*request, action)) continue;
-        if (action == fsm::MaterializationAction::kFinish) {
+        const bool publish = finishing->publish_completed_pages;
+        queueStateRetirement(*request, /*discard_replay=*/!publish);
+        if (publish) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
             }
@@ -423,34 +422,28 @@ void Scheduler::abortRequest(Request& request) {
         request.Apply(fsm::StopPdTransferEvent{});
     } else if (request.ResultsInFlight() > 0) {
         request.Apply(fsm::AbortInFlightEvent{});
-    } else if (!tryRetireRecurrentState(request, fsm::MaterializationAction::kAbort)) {
+    } else {
+        queueStateRetirement(request, /*discard_replay=*/true);
         request.Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 
-bool Scheduler::tryRetireRecurrentState(Request& request, fsm::MaterializationAction action) {
-    if (!config_.defer_recurrent_state || config_.role == Role::kP) return false;
+void Scheduler::queueStateRetirement(const Request& request, bool discard_replay) {
+    if (!config_.defer_recurrent_state || config_.role == Role::kP) return;
     const auto* finishing = request.GetIf<fsm::Finishing>();
-    if (!request.Is<fsm::Decoding>() && (finishing == nullptr || !finishing->retire_decode_state)) return false;
-    // A finish or abort can arrive after the retraction's ACK and before the
-    // plan that would have imaged it. The device already retired this slot.
-    if (request.TakeMaterializedRetraction()) return false;
-
-    const auto op_id = next_state_materialization_id_++;
-    _assert(op_id != 0, "state materialization operation id overflow");
-    const auto slot = request.RequestPoolIndex();
-    request.StartStateMaterialization(op_id, action);
-    pending_state_materializations_.push_back(StateMaterialization{
-        .op_id = op_id,
-        .request_pool_indices = {slot},
-        .discard_replay = action == fsm::MaterializationAction::kAbort,
-    });
-    return true;
+    if (!request.Is<fsm::Decoding>() && (finishing == nullptr || !finishing->retire_decode_state)) return;
+    _assert(request.ResultsInFlight() == 0, "state retirement requires landed forwards");
+    if (!pending_state_materialization_) pending_state_materialization_.emplace();
+    auto& batch = *pending_state_materialization_;
+    auto& slots = discard_replay ? batch.discard_slots : batch.materialize_slots;
+    slots.push_back(request.RequestPoolIndex());
 }
 
 void Scheduler::handleEvent(const cache::StateMaterialized& event) {
-    for (const auto& request : requests_) {
-        if (request->CompleteStateMaterialization(event.op_id)) return;
+    // A batch's fence also covers every earlier batch on the execution
+    // stream. Ignore stale or unissued IDs.
+    if (event.op_id > completed_state_materialization_id_ && event.op_id <= issued_state_materialization_id_) {
+        completed_state_materialization_id_ = event.op_id;
     }
 }
 

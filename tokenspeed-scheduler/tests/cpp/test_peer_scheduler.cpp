@@ -484,6 +484,47 @@ TEST_P(PeerSchedulerTest, AHolderPinsLoadedDevicePagesOnlyAfterTheirLoadAcknowle
     }
 }
 
+TEST(PeerStateRetirementTest, DeviceStatePinWaitsForItsRetirementPlan) {
+    SchedulerConfig config = PeerConfigFor("holder", /*hybrid=*/true);
+    config.defer_recurrent_state = true;
+    config.decode_input_tokens = 4;
+    Scheduler holder{std::move(config)};
+    Scheduler reader{PeerConfigFor("reader", /*hybrid=*/true)};
+    HolderServicer servicer{holder};
+    const std::vector<std::int32_t> prompt = MakeAlignedTokens(4, kP);
+    holder.SubmitRequests({RequestSpec{.request_id = "h", .tokens = prompt, .max_new_tokens = 8}});
+    ASSERT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+    Send(holder, forward::ExtendResult{.request_id = "h", .tokens = {101}});
+    const ExecutionPlan decode = Plan(holder);
+    ASSERT_NE(FindForwardBatch(decode), nullptr);
+    ASSERT_EQ(FindForwardBatch(decode)->request_ids, (std::vector<std::string>{"h"}));
+    Send(holder, forward::ExtendResult{.request_id = "h", .tokens = {102, 103, 104, 105}});
+    Send(holder, forward::Finish{.request_id = "h"});
+
+    std::vector<std::int32_t> longer = prompt;
+    longer.insert(longer.end(), {101, 102, 103, 104, 105, 106});
+    reader.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
+    Plan(reader);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    const PeerLookupRequest& lookup = lookups.front();
+    const PeerAnswer answer = servicer.Lookup(lookup);
+    ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.size()) + 4);
+    ASSERT_TRUE(std::ranges::any_of(answer.pages, [](const PeerPage& page) {
+        return page.tier == CacheTier::kDevice && page.slot == kPeerStateSlot;
+    }));
+    EXPECT_FALSE(servicer.Pin(lookup.lease).held) << "the final State is published while replay is still queued";
+
+    const ExecutionPlan retiring = Plan(holder);
+    ASSERT_TRUE(retiring.state_materialization);
+    EXPECT_FALSE(servicer.Pin(lookup.lease).held) << "dispatch alone does not make Device State safe for RDMA";
+
+    Send(holder, cache::StateMaterialized{.op_id = retiring.state_materialization->op_id});
+    ASSERT_TRUE(servicer.Pin(lookup.lease).held);
+    servicer.Head();
+    EXPECT_TRUE(holder.PeerLeaseHeld(lookup.lease));
+}
+
 // A local hit that ends inside a page (a tail) ends inside a block, which a
 // landing would fill as well as the hit's copy: the landing starts at the
 // page boundary below instead.

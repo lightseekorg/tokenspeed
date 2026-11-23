@@ -668,14 +668,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::StateMaterialization>(m, "StateMaterialization")
         .def_ro("op_id", &tokenspeed::StateMaterialization::op_id)
-        .def_ro("request_pool_indices", &tokenspeed::StateMaterialization::request_pool_indices)
-        .def_ro("discard_replay", &tokenspeed::StateMaterialization::discard_replay);
+        .def_ro("materialize_slots", &tokenspeed::StateMaterialization::materialize_slots)
+        .def_ro("discard_slots", &tokenspeed::StateMaterialization::discard_slots);
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
-        .def_ro("state_materializations", &tokenspeed::ExecutionPlan::state_materializations)
+        .def_ro("state_materialization", &tokenspeed::ExecutionPlan::state_materialization)
         .def_prop_ro("remote_decode",
                      [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
                          if (!plan.remote_decode) {

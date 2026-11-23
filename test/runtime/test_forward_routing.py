@@ -99,7 +99,7 @@ def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
-        state_materializations=(),
+        state_materialization=None,
     )
 
 

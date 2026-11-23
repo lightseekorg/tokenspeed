@@ -424,9 +424,7 @@ class DeviceHandle:
         # with the write-backs and restores with the load-backs; their ACKs
         # ride the cache poll, alongside recurrent-state materialization.
         self._l2 = host_cache_executor
-        self._state_materializations: deque[
-            tuple[Any, tuple[int, ...], torch.Tensor]
-        ] = deque()
+        self._state_materializations: deque[tuple[Any, int, torch.Tensor]] = deque()
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -551,13 +549,13 @@ class DeviceHandle:
         remote_decode = execution_plan.remote_decode
         remote_prefill = execution_plan.remote_prefill
         peer_fetches = self._peer_outbox is not None and execution_plan.has_peer_fetches
-        materializations = execution_plan.state_materializations
+        materialization = execution_plan.state_materialization
         if (
             cache_ops
             or copies
             or pages
             or peer_fetches
-            or materializations
+            or materialization is not None
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -565,19 +563,14 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
-        if materializations:
-            preserve_slots: set[int] = set()
-            discard_slots: set[int] = set()
-            for operation in materializations:
-                slots = discard_slots if operation.discard_replay else preserve_slots
-                slots.update(operation.request_pool_indices)
-            if preserve_slots & discard_slots:
-                raise ValueError("a recurrent state slot has conflicting exit actions")
+        if materialization is not None:
+            preserve_slots = materialization.materialize_slots
+            discard_slots = materialization.discard_slots
             preserve_count = len(preserve_slots)
             # Retain the pinned source until the completion event lands;
             # a pageable tensor's upload would synchronize this thread.
             staged_slots = torch.tensor(
-                sorted(preserve_slots) + sorted(discard_slots),
+                preserve_slots + discard_slots,
                 dtype=torch.int64,
                 pin_memory=True,
             )
@@ -594,7 +587,7 @@ class DeviceHandle:
                 event = executor.device_module.Event()
                 event.record(executor.execution_stream)
             self._state_materializations.append(
-                (event, tuple(int(op.op_id) for op in materializations), staged_slots)
+                (event, materialization.op_id, staged_slots)
             )
             executor.default_stream.wait_event(event)
         l2 = self._l2
@@ -768,14 +761,13 @@ class DeviceHandle:
         """
         results = [] if self._l2 is None else list(self._l2.poll_results())
         while self._state_materializations:
-            event, op_ids, _staged_slots = self._state_materializations[0]
+            event, op_id, _staged_slots = self._state_materializations[0]
             if not event.query():
                 break
             self._state_materializations.popleft()
-            for op_id in op_ids:
-                ack = Cache.StateMaterializedEvent()
-                ack.op_id = op_id
-                results.append(ack)
+            ack = Cache.StateMaterializedEvent()
+            ack.op_id = op_id
+            results.append(ack)
         return results
 
     def shutdown_model(self) -> None:

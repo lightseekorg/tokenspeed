@@ -2176,8 +2176,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         {
             return false;
         }
-        // A retirement can be queued by this round's results, after the plan
-        // dispatched. It owns the State pages even before cache_ops counts it.
+        // The last forward can queue a retirement after this round's plan
+        // dispatched, before cache_ops counts it.
         if !self.in_flight.is_empty() || self.scheduler.has_state_retirements() {
             return false;
         }
