@@ -1676,7 +1676,9 @@ def _dsa_multi_cta_select_kernel(
             cache=".wt",
         )
     gl.store(row_counts + tile, gl.minimum(listed_count, CHUNK), cache_modifier=".wt")
-    row_digits = tile_digits + row * gl.num_programs(1) * (NUM_BUCKETS + 64)
+    row_digits = tile_digits + row.to(gl.int64) * gl.num_programs(1) * (
+        NUM_BUCKETS + 64
+    )
     if listed_total > SIZE:
         # The row's listed keys stream past the last CTA's registers: each tile
         # writes its next-digit histogram + run sums for the last CTA to sum.
