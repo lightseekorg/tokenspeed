@@ -38,6 +38,8 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     pack_index_candidates,
 )
+
+# Cache-placement ops are portable Triton with no registry entry to dispatch through.
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     virtual_pages_to_local_table,
 )
