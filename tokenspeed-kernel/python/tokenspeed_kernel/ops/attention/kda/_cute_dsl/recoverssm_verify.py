@@ -470,6 +470,12 @@ class RecoverSsmVerify:
         # batch-1 layer with records on GB300: the pass's every chunk waited on
         # its loads).
         self.merge_history_pass = self.preload_history_us
+        # Those tiles also store the window's records after the solve, which
+        # then neither waits for their decays' exps nor for the key scales'
+        # extra barrier (2% of a T 4 batch-1 round on GB300); larger tiles
+        # store them on the way, as holding the gate steps to the end slowed
+        # T 8 rounds at batch 4-64 by 2-7%.
+        self.defer_window_records = self.preload_history_us
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
@@ -723,7 +729,7 @@ class RecoverSsmVerify:
                         stamps, stamp_slot, ring_capacity, start, generation, tidx
                     )
             cute.arch.mbarrier_wait(shared.token_barrier, 0)
-            self._project_window(
+            decay_steps = self._project_window(
                 shared,
                 tidx,
                 warp,
@@ -773,6 +779,18 @@ class RecoverSsmVerify:
                         corrections[t],
                         False,
                     )
+            if const_expr(self.defer_window_records):
+                if value_tile == 0:
+                    self._store_window_records(
+                        shared,
+                        retained,
+                        slot,
+                        head,
+                        count,
+                        valid_tokens,
+                        tidx,
+                        decay_steps,
+                    )
 
     @cute.jit
     def _project_window(
@@ -804,7 +822,9 @@ class RecoverSsmVerify:
         without forming S_L: the base rows scaled by the records' total decay
         give part of it and the history rows the rest (``_store_history_rows``).
         A CTA stores the window's normalized keys and decays after the records
-        when ``records_keys`` is set. ``early_keys``, ``early_decays`` and
+        when ``records_keys`` is set, or with ``defer_window_records`` returns
+        each key channel's gate steps for ``_store_window_records`` after the
+        solve. ``early_keys``, ``early_decays`` and
         ``early_us`` hold this thread's channels of the records when the CTA
         started loading them (``_start_early_history``), and with
         ``channel_loaded`` the keys and decays its caller started loading;
@@ -824,6 +844,7 @@ class RecoverSsmVerify:
                 history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
                 history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
             history_us = cute.make_rmem_tensor((self._history_u_count(),), Float32)
+        decay_steps = cute.make_rmem_tensor((W,), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
             if const_expr(late_loads and not channel_loaded):
@@ -839,16 +860,20 @@ class RecoverSsmVerify:
                         history_decays,
                     )
             steps = self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
-            self._store_decay_records(
-                retained,
-                record_slot,
-                record_head,
-                record_start,
-                records_keys,
-                valid_tokens,
-                tidx,
-                steps,
-            )
+            if const_expr(self.defer_window_records):
+                for t in cutlass.range_constexpr(W):
+                    decay_steps[t] = steps[t]
+            else:
+                self._store_decay_records(
+                    retained,
+                    record_slot,
+                    record_head,
+                    record_start,
+                    records_keys,
+                    valid_tokens,
+                    tidx,
+                    steps,
+                )
             if const_expr(has_history):
                 if record_start > 0:
                     self._store_history_rows(
@@ -930,8 +955,75 @@ class RecoverSsmVerify:
             self._finalize_coefficients(shared.sums, tidx)
             cute.arch.barrier()
 
-        # The window's normalized keys need the final key scales.
-        cute.arch.barrier()
+        if const_expr(not self.defer_window_records):
+            # The window's normalized keys need the final key scales.
+            cute.arch.barrier()
+            self._store_key_records(
+                shared,
+                retained,
+                record_slot,
+                record_head,
+                record_start,
+                records_keys,
+                valid_tokens,
+                tidx,
+            )
+        return decay_steps
+
+    @cute.jit
+    def _store_window_records(
+        self,
+        shared: _Shared,
+        retained: tuple,
+        record_slot: Int64,
+        record_head: Int32,
+        record_start: Int32,
+        valid_tokens: Int32,
+        tidx: Int32,
+        decay_steps,
+    ):
+        """Store the window tokens' decays and normalized keys after the records.
+
+        With ``defer_window_records`` the one CTA per (request, head) that keeps
+        the records runs it after its outputs; ``decay_steps`` holds each key
+        channel's gate steps from ``_project_window``.
+        """
+        if tidx < self.key_dim:
+            self._store_decay_records(
+                retained,
+                record_slot,
+                record_head,
+                record_start,
+                Int32(1),
+                valid_tokens,
+                tidx,
+                [decay_steps[t] for t in range(self.window)],
+            )
+        self._store_key_records(
+            shared,
+            retained,
+            record_slot,
+            record_head,
+            record_start,
+            Int32(1),
+            valid_tokens,
+            tidx,
+        )
+
+    @cute.jit
+    def _store_key_records(
+        self,
+        shared: _Shared,
+        retained: tuple,
+        record_slot: Int64,
+        record_head: Int32,
+        record_start: Int32,
+        records_keys: Int32,
+        valid_tokens: Int32,
+        tidx: Int32,
+    ):
+        """Store key channel ``tidx``'s normalized key of each window token."""
+        K = self.key_dim
         if tidx < K:
             key_field = retained[2]
             key_row = key_field.iterator + (
@@ -940,7 +1032,7 @@ class RecoverSsmVerify:
                 + Int64(record_start) * key_field.stride[2]
                 + Int64(tidx) * key_field.stride[3]
             )
-            for t in cutlass.range_constexpr(W):
+            for t in cutlass.range_constexpr(self.window):
                 stored = Int32((records_keys != 0) & (t < valid_tokens))
                 raw_key = shared.tokens[self.token_k + t * K + tidx].to(Float32)
                 _store_if(

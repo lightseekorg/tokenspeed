@@ -614,7 +614,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         self._stamp_position(
                             stamps, stamp_slot, ring_capacity, start, generation, tidx
                         )
-                self._project_window(
+                decay_steps = self._project_window(
                     shared,
                     tidx,
                     warp,
@@ -677,6 +677,18 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         corrections[t],
                         False,
                     )
+                if const_expr(self.defer_window_records):
+                    if value_tile == 0:
+                        self._store_window_records(
+                            shared,
+                            retained,
+                            slot,
+                            head,
+                            count,
+                            valid_tokens,
+                            tidx,
+                            decay_steps,
+                        )
             else:
                 # Padding requests: zero outputs for their tokens, no records.
                 if tidx < VT:
