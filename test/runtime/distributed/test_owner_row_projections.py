@@ -113,6 +113,7 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
                 output_size=_SHARD * world_size,
                 max_tokens=_MAX_ROWS,
                 dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
                 device=device,
             ),
             backend,
