@@ -1013,6 +1013,13 @@ def _decode_records_worker(rank, degree, rendezvous):
 
 
 def _decode_rider_worker(rank, degree, rendezvous):
+    """Run one rank's check that the token-major decode takes the query rider.
+
+    All ``degree`` ranks call it together through ``rendezvous``; ``rank``
+    picks the device. Decoding from the rider that an owned top-k's score
+    gather lands matches decoding from the decode's own query gather, bit for
+    bit, and a query that holds every head offers no rider.
+    """
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     from types import SimpleNamespace
