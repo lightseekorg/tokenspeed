@@ -26,7 +26,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use ts_pd::{PdEvent, TransferPeer};
+use ts_pd::{BootstrapInfo, PdEvent, TransferPeer};
 
 #[path = "../src/tests_support.rs"]
 mod native;
@@ -233,4 +233,330 @@ fn blocked_write_retirement(cancel_decode: bool) {
     );
     transfer_one(&mut pair, "next", 4243, &mut mesh, &group);
     assert!(landed(&destination, &source));
+}
+
+#[test]
+fn a_cancellation_unacknowledged_past_the_receive_budget_is_retired_by_revoking_the_transport() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let mut destination = vec![0u8; BYTES];
+    let budget = Duration::from_secs(3);
+    let mut pair = pair_with_waiting_timeout(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        budget,
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "writing";
+    prepare(&mut pair, rid, &mut mesh, &group);
+    library.block_writes();
+    pair.send(rid, 7, Vec::new()).unwrap();
+    assert!(library.wait_write_entered(Duration::from_secs(5)));
+    // The write is executing, so Prefill withholds its acknowledgment, as
+    // a dead Prefill rank would.
+    pair.decode.cancel(rid);
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+    let failed = Instant::now();
+    // Another request is connected, within its own budget, but not admitted
+    // yet when the transport is replaced.
+    thread::sleep(budget / 2);
+    let queued = BootstrapInfo {
+        room: 4343,
+        ..pair.bootstrap.clone()
+    };
+    pair.decode.register("queued", &queued).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped("queued".to_owned())
+    );
+    let cache_id = pair.decode.cache_id();
+    thread::sleep((failed + budget).saturating_duration_since(Instant::now()));
+    // Past the budget, a poll starts replacing the transfer engine.
+    assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pair.decode.cache_id() == cache_id {
+        assert!(Instant::now() < deadline, "the transport was not replaced");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let fresh = pair.decode.cache_id();
+    // The queued request failed with the replaced transport; admitting it
+    // now must not publish a manifest no Prefill rank could acknowledge
+    // (which would take another revocation to retire).
+    pair.admit("queued");
+    let expected = [
+        PdEvent::Stopped(rid.to_owned()),
+        PdEvent::Failed("queued".to_owned()),
+        PdEvent::Stopped("queued".to_owned()),
+    ];
+    let mut events = Vec::new();
+    while !expected.iter().all(|event| events.contains(event)) {
+        events.extend(pair.decode.poll(&mut mesh, &group).unwrap());
+        assert!(Instant::now() < deadline, "not retired: {events:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events.len(), expected.len(), "{events:?}");
+    assert_eq!(
+        pair.decode.cache_id(),
+        fresh,
+        "the transport was replaced again"
+    );
+    assert!(!pair.decode.has_in_flight());
+    // A sleep and wake replace the engine again while the revoked write is
+    // still blocked: its old session must not resolve to the new engine.
+    pair.decode_outbox.release_registration().unwrap();
+    pair.decode_outbox.restore_registration().unwrap();
+    // The pages hold other data now; the writer, released, cannot reach them.
+    destination.fill(0xa5);
+    library.release_writes();
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        destination.iter().all(|&byte| byte == 0xa5),
+        "a revoked write reached recycled pages"
+    );
+    // The same Prefill rank serves the next request through the fresh engine.
+    destination.fill(0);
+    transfer_one(&mut pair, "next", 4444, &mut mesh, &group);
+    assert!(landed(&destination, &source));
+}
+
+#[test]
+fn a_revocation_whose_deregistration_fails_keeps_waiting_for_acknowledgments() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let budget = Duration::from_secs(2);
+    let mut pair = pair_with_waiting_timeout(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        budget,
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "writing";
+    prepare(&mut pair, rid, &mut mesh, &group);
+    library.block_writes();
+    pair.send(rid, 7, Vec::new()).unwrap();
+    assert!(library.wait_write_entered(Duration::from_secs(5)));
+    pair.decode.cancel(rid);
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+    let cache_id = pair.decode.cache_id();
+    library.fail_unregistrations();
+    thread::sleep(budget);
+    assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pair.decode.cache_id() == cache_id {
+        assert!(Instant::now() < deadline, "the transport was not replaced");
+        thread::sleep(Duration::from_millis(1));
+    }
+    // The replaced engine kept the cache registered, so its writer is not
+    // fenced: the receive keeps waiting, and starts no other revocation.
+    let fresh = pair.decode.cache_id();
+    let waited = Instant::now() + 2 * budget;
+    while Instant::now() < waited {
+        assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(pair.decode.cache_id(), fresh);
+    assert!(pair.decode.has_in_flight());
+    // The write lands in still-pinned pages, then Prefill acknowledges.
+    library.release_writes();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Stopped(rid.to_owned())
+    );
+    // The cache stays registered with the replaced engine: never released.
+    let refused = pair.decode_outbox.release_registration().unwrap_err();
+    assert!(refused.contains("kept it registered"), "{refused}");
+}
+
+fn transfer_counter(directory: &std::path::Path, name: &str) -> f64 {
+    let result = std::process::Command::new("python3")
+        .env("PROMETHEUS_MULTIPROC_DIR", directory)
+        .arg("-c")
+        .arg("import sys; from prometheus_client import CollectorRegistry, multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r); print(sum(s.value for m in r.collect() for s in m.samples if s.name == sys.argv[1]))")
+        .arg(name)
+        .output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
+    let directory =
+        std::env::temp_dir().join(format!("ts-pd-metrics-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let metrics = std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair_on_port_with_metrics(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        None,
+        0,
+        "early",
+        Some(metrics),
+    );
+    let (mut mesh, group) = single_rank();
+    prepare(&mut pair, "r", &mut mesh, &group);
+    match cancel_decode {
+        Some(true) => pair.decode.cancel("r"),
+        Some(false) => pair.prefill.cancel("r"),
+        None => {
+            pair.prefill.abort_room("r", pair.bootstrap.room);
+            pair.prefill.abort_room("r", pair.bootstrap.room);
+        }
+    }
+    expect_cancelled(&mut pair.prefill, "r", &mut mesh, &group);
+    expect_cancelled(&mut pair.decode, "r", &mut mesh, &group);
+    assert_eq!(
+        transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+        if cancel_decode.is_some() { 0.0 } else { 1.0 }
+    );
+}
+
+#[test]
+fn explicit_prefill_cancel_does_not_increment_transfer_failures() {
+    room_end_metrics("prefill-cancel", Some(false));
+}
+
+#[test]
+fn remote_decode_cancel_does_not_increment_transfer_failures() {
+    room_end_metrics("decode-cancel", Some(true));
+}
+
+#[test]
+fn a_failed_room_increments_transfer_failures_once() {
+    room_end_metrics("failure", None);
+}
+
+fn replica_end_metrics(cause: &str) {
+    let library = native::NativeLibrary::new();
+    let listeners: Vec<_> = (0..2)
+        .map(|_| ts_collective::Listener::bind("127.0.0.1").unwrap())
+        .collect();
+    let addresses: Vec<_> = listeners
+        .iter()
+        .map(|l| format!("127.0.0.1:{}", l.port().unwrap()))
+        .collect();
+    let results = thread::scope(|scope| {
+        let workers: Vec<_> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(rank, listener)| {
+                let addresses = &addresses;
+                let library = library.path().to_path_buf();
+                scope.spawn(move || {
+                    let directory = std::env::temp_dir().join(format!(
+                        "ts-pd-replica-{cause}-{rank}-{}",
+                        std::process::id()
+                    ));
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+                        prometheus_dir: Some(directory.clone()),
+                        relay_endpoint: None,
+                    })
+                    .unwrap();
+                    let metrics =
+                        std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
+                    let source = pattern();
+                    let destination = vec![0u8; BYTES];
+                    let timeout = if rank == 0 && cause == "timeout" {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(120)
+                    };
+                    let mut pair = pair_on_port_with_metrics(
+                        library,
+                        &source,
+                        &destination,
+                        timeout,
+                        None,
+                        0,
+                        "early",
+                        Some(metrics),
+                    );
+                    pair.prefill.register("r", &pair.bootstrap).unwrap();
+                    // Only one rank has observed a terminal event when the real
+                    // collective runs; the other still waits for its manifest.
+                    if rank == 0 {
+                        match cause {
+                            "cancel" => pair.prefill.cancel("r"),
+                            "failure" => pair.prefill.abort_room("r", pair.bootstrap.room),
+                            "timeout" => {}
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut mesh = ts_collective::Mesh::connect(
+                        rank,
+                        listener,
+                        addresses,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap();
+                    let replica = ts_collective::Group::new(0, vec![0, 1], rank).unwrap();
+                    let events = pair.prefill.poll(&mut mesh, &replica).unwrap();
+                    assert_eq!(
+                        events,
+                        [PdEvent::Failed("r".into()), PdEvent::Stopped("r".into())]
+                    );
+                    assert!(pair.prefill.poll(&mut mesh, &replica).unwrap().is_empty());
+                    (
+                        transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+                        transfer_counter(&directory, "tokenspeed:kv_transfer_timeouts_total"),
+                    )
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let expected = match cause {
+        "cancel" => vec![(0.0, 0.0), (0.0, 0.0)],
+        "timeout" => vec![(0.0, 1.0), (0.0, 0.0)],
+        "failure" => vec![(1.0, 0.0), (0.0, 0.0)],
+        _ => unreachable!(),
+    };
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn replica_cancel_propagation_does_not_invent_a_transfer_failure() {
+    replica_end_metrics("cancel");
+}
+
+#[test]
+fn replica_timeout_propagation_keeps_timeout_separate_from_failure() {
+    replica_end_metrics("timeout");
+}
+
+#[test]
+fn replica_failure_propagation_counts_only_the_rank_that_detected_it() {
+    replica_end_metrics("failure");
 }

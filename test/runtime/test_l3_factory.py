@@ -129,6 +129,7 @@ def construction(tmp_path):
             ),
         ),
         num_host_lcm_blocks=16,
+        block_alignment=1,
     )
     host_cache = HostCacheResources(
         storage=storage,
@@ -334,7 +335,7 @@ def test_settings_validate_limits_against_actual_host_capacity(construction):
     args.kvstore_storage_backend_extra_config = json.dumps(
         {"async": {"max_host_blocks": storage.num_host_lcm_blocks + 1}}
     )
-    with pytest.raises(ValueError, match="exceeds usable Host parents"):
+    with pytest.raises(ValueError, match="exceeds the Host pool's blocks"):
         l3_settings(args, model, None, **factory_kwargs)
 
 

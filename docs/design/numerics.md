@@ -34,7 +34,16 @@ Two consequences of 3 are enforced at startup, so a model that cannot meet
 them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
 slot-order MoE combine folds over the EP group inside the leaf), and the
 vocabulary must be a whole number of `BLOCKWISE_VOCAB_BLOCK`-wide blocks (the
-trainer's log-softmax folds fixed blocks).
+trainer's log-softmax folds fixed blocks). Switches that trade batch
+invariance for speed are refused too: `--dense-fp8-small-m` (only batches
+inside the FP8 row windows project in FP8, so a row's bits follow the batch's
+row count) under rl-bitwise or `--batch-invariant-collectives`.
+
+`--dense-fp8-small-m` quantizes only decode and verify forwards' rows: prompt
+rows write the K / V that every later token and every prefix-cache reuse
+reads, so prompt K / V stays BF16. Muse Spark decides this with one predicate
+of the forward mode (`_fp8_projections`), and mixed prefill / decode rounds
+never reach it: `MuseSparkDecoderLayer.forward` raises on them.
 
 ## The hierarchy
 
@@ -457,6 +466,11 @@ which backend disabled which graph.
 
 ### Absorbed MLA
 
+A model backend that supplies both attention kernels can use
+`MLAMetadataBackend` for paged request lengths, page tables and graph buffers.
+It follows the launch's numerical policy when preparing these inputs.
+The backend that executes attention selects the numerical kernels.
+
 Under a bitwise envelope, `MLAAttnBackend` plans the standard
 `mla_extend_with_kvcache` and `mla_decode_with_kvcache` operators with the
 `batch_invariant` requirement. Initial prefill and cached extend both prepare
@@ -476,6 +490,9 @@ A model may bind an existing unquantized Linear or LM-head method to a dense
 GEMM plan without changing its weight owner or storage. The logits processor
 uses that method for a registered bitwise envelope, preserving its normal
 input dtype cast and vocabulary communication.
+
+NPU RL alignment compares model logits for a fixed input history. The worker
+keeps the configured sampler and random stream.
 
 Plugins may call `register_numerics_envelope` from the runtime registration
 surface. A policy supplies its name, bitwise classification, launch resolver
@@ -525,6 +542,17 @@ a rollout. The `dtype=float32` form widens bf16 logits inside the kernel (an
 exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
+
+Under TP with a vocabulary-parallel LM head, the triton sampler's top-k
+routes keep the sampled rows as each rank's vocabulary shard
+(`SampledVocabShard`): every rank selects its shard's candidates and gathers
+only those. With output logprobs (`torch` order) each rank also sums the
+1024-column blocks of `selected_token_logprobs`'s denominator that start in
+its shard -- a block running into the next shard reads that shard's leading
+columns, gathered with the candidates -- and every rank adds the gathered
+block sums in block order. A block sum is the whole-row kernel's own
+reduction over rows of the same stride, so the logprob is the whole-row one
+bit for bit (`tokenspeed-kernel/test/ops/test_vocab_shard_logprobs.py`).
 
 This comparison requires identical logits. With an ordinary unplanned GEMM,
 changing the prompt chunk size can change projection rounding; selecting a

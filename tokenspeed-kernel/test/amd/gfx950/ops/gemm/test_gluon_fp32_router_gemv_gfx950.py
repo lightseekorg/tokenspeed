@@ -26,7 +26,13 @@ import re
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4, vmcnt_zero_before_barrier
+from utils import (
+    assert_no_triton_compile,
+    assert_warmup_covers,
+    compiled_kernels,
+    is_cdna4,
+    vmcnt_zero_before_barrier,
+)
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -40,6 +46,7 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     fp32_router_gemv_with_mm_supported,
     mm,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (  # noqa: E402
     MAX_K,
     MAX_ROWS,
@@ -67,8 +74,16 @@ def _counters(x: torch.Tensor, prepared: torch.Tensor) -> torch.Tensor:
 def _launch(x: torch.Tensor, prepared: torch.Tensor, multiplier: float):
     counters = _counters(x, prepared)
     return launch_gluon_fp32_router_gemv_gfx950(
-        x, prepared, multiplier, counters, False
+        x, prepared, multiplier, counters, False, warm_variants=False
     )
+
+
+def _execute_plan(plan, x: torch.Tensor, prepared: torch.Tensor) -> torch.Tensor:
+    """The router through its own plan.
+
+    Serving runs it this way when the router does not share its launch."""
+    counters = fp32_router_gemv_counters(prepared.shape[0], x.device)
+    return fp32_router_gemv_execute(plan, x, prepared, MULTIPLIER, counters, False)
 
 
 def _problem(rows: int, hidden: int, columns: int, seed: int):
@@ -201,7 +216,9 @@ def test_splitk_router_matches_fp64_reference_and_top_k(rows: int) -> None:
     weight *= 0.02
     prepared = transpose_fp32_router_weight_gfx950(weight)
     counters = _counters(x, prepared)
-    out = launch_gluon_fp32_router_gemv_gfx950(x, prepared, MULTIPLIER, counters, False)
+    out = launch_gluon_fp32_router_gemv_gfx950(
+        x, prepared, MULTIPLIER, counters, False, warm_variants=False
+    )
     expected = (x.double() @ weight.double()) * MULTIPLIER
     torch.testing.assert_close(
         out.double(), expected, rtol=0, atol=2e-6 * 0.02 * 8192**0.5
@@ -211,7 +228,7 @@ def test_splitk_router_matches_fp64_reference_and_top_k(rows: int) -> None:
     # next call reuses the buffer and sums the same partials bitwise.
     assert not counters.any()
     again = launch_gluon_fp32_router_gemv_gfx950(
-        x, prepared, MULTIPLIER, counters, False
+        x, prepared, MULTIPLIER, counters, False, warm_variants=False
     )
     assert torch.equal(again, out)
 
@@ -226,6 +243,115 @@ def test_splitk_router_compiles_once_per_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_splitk_gfx950):
         for rows in range(min(SPLITK_ROWS), max(SPLITK_ROWS) + 1):
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
+
+
+# The measured split-K table's shape, and one the table does not list (GEMV
+# up to MAX_ROWS, BLAS above).
+@pytest.mark.parametrize("columns", [256, 128])
+def test_startup_warmup_covers_every_row_count(columns: int) -> None:
+    """One warm call compiles every GEMV and split-K variant of its shape, so
+    no row count up to the last split-K bucket compiles afterwards."""
+    hidden = 8192
+    x, weight = _problem(max(SPLITK_ROWS), hidden, columns, 23)
+    prepared = transpose_fp32_router_weight_gfx950(weight)
+    first = x[:1].contiguous()
+
+    def warm() -> None:
+        launch_gluon_fp32_router_gemv_gfx950(
+            first,
+            prepared,
+            MULTIPLIER,
+            _counters(first, prepared),
+            False,
+            warm_variants=True,
+        )
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950),
+        warm,
+        lambda rows: _launch(x[:rows].contiguous(), prepared, MULTIPLIER),
+        range(1, max(SPLITK_ROWS) + 1),
+    )
+
+
+def test_registered_router_warms_its_variants_under_kernel_warmup() -> None:
+    """The registered op passes warm_variants during kernel warmup: one
+    planned call there covers every served row count."""
+    plan = _router_plan()
+    x, weight = _problem(max(SPLITK_ROWS), 8192, 256, 29)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(256, x.device)
+
+    def execute(rows: int) -> None:
+        fp32_router_gemv_execute(
+            plan, x[:rows].contiguous(), prepared, MULTIPLIER, counters, False
+        )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            execute(1)
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950),
+        warm,
+        execute,
+        range(1, max(SPLITK_ROWS) + 1),
+    )
+
+
+def test_registered_router_with_mm_warms_every_decode_bucket() -> None:
+    """The router + decode GEMM launch compiles every decode GEMM bucket from
+    one call under kernel warmup."""
+    plan = _router_plan()
+    x, weight = _problem(64, 8192, 256, 31)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+
+    def run(rows: int) -> None:
+        mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+        mm_out = torch.empty((rows, 512), dtype=torch.bfloat16, device="cuda")
+        router_rows = x[:rows].contiguous()
+        if fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b):
+            fp32_router_gemv_execute_with_mm(
+                plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+            )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(16)
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_mm_a16w16_gfx950,), warm, run, range(1, 65)
+    )
+
+
+def test_tp4_router_with_mm_warms_two_binaries_and_reuses_them() -> None:
+    """Warmup compiles one shared launch binary per decode GEMM bucket served.
+
+    For TP4's 1024 x 8192 pre-expert projection those buckets are 16 and 32
+    rows, and row counts inside them reuse the binaries."""
+    plan = _router_plan()
+    x, weight = _problem(32, 8192, 256, 7)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    mm_b = torch.randn(1024, 8192, device="cuda").bfloat16()
+
+    def run(rows: int) -> None:
+        mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+        mm_out = torch.empty((rows, 1024), dtype=torch.bfloat16, device="cuda")
+        router_rows = x[:rows].contiguous()
+        assert fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b)
+        fp32_router_gemv_execute_with_mm(
+            plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+        )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(16)
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_mm_a16w16_gfx950,), warm, run, range(9, 33)
+    )
+    assert len(compiled_kernels(gluon_fp32_router_gemv_mm_a16w16_gfx950)) == 2
 
 
 def _compile_splitk(**config):
@@ -322,34 +448,44 @@ def _router_plan():
     )
 
 
-# 8 rows are below the split-K buckets, 16 rows inside the first one.
-@pytest.mark.parametrize("rows", [8, 16])
-def test_router_with_mm_matches_the_split_k_router_and_mm(rows: int) -> None:
+# 8 rows are below the split-K buckets; 16 to 64 rows are the standalone
+# router's 9-64 split-K bucket, whose tile the shared launch uses.
+# The Muse TP8 (512) pre-expert projection at 8-64 rows and the TP4 (1024)
+# one at 9-32, the rows each shares the router's launch at.
+@pytest.mark.parametrize(
+    "rows,mm_n",
+    [(8, 512), (16, 512), (17, 512), (32, 512), (48, 512), (64, 512)]
+    + [(9, 1024), (16, 1024), (17, 1024), (32, 1024)],
+)
+def test_router_with_mm_matches_the_split_k_router_and_mm(rows: int, mm_n: int) -> None:
     """One launch writes mm's bits and the split-K router's logits."""
     plan = _router_plan()
-    x, weight = _problem(16, 8192, 256, 20261103)
+    x, weight = _problem(64, 8192, 256, 20261103)
     weight *= 0.02
     prepared = fp32_router_gemv_process_weight(plan, weight)
     generator = torch.Generator(device="cuda").manual_seed(rows)
     mm_a = torch.randn(rows, 8192, device="cuda", generator=generator).bfloat16()
     mm_b = (
-        torch.randn(512, 8192, device="cuda", generator=generator) * 0.02
+        torch.randn(mm_n, 8192, device="cuda", generator=generator) * 0.02
     ).bfloat16()
     router_rows = x[:rows].contiguous()
     assert fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b)
-    mm_out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    mm_out = torch.full((rows, mm_n), float("nan"), dtype=torch.bfloat16, device="cuda")
     logits = fp32_router_gemv_execute_with_mm(
         plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
     )
     assert torch.equal(mm_out, mm(mm_a, mm_b))
     # A row's split-K logits do not depend on the other rows of its tile, so
-    # the standalone 16-row split-K launch gives the same bits.
+    # the standalone 64-row split-K launch gives the same bits.
     assert torch.equal(logits, _launch(x, prepared, MULTIPLIER)[:rows])
+    if rows > 8:
+        # At 9-64 rows the standalone router plan takes the same split-K tile.
+        assert torch.equal(logits, _execute_plan(plan, router_rows, prepared))
 
 
 # One row has no decode GEMM config, mm sends 2-4 rows of this shape to the
-# rowcta GEMV, and 17 rows exceed the shared router tile.
-@pytest.mark.parametrize("rows", [1, 2, 17])
+# rowcta GEMV, and past 64 rows the standalone router plan changes tile.
+@pytest.mark.parametrize("rows", [1, 2, 65])
 def test_router_with_mm_declines_outside_its_contract(rows: int) -> None:
     plan = _router_plan()
     x = torch.randn(rows, 8192, device="cuda")
@@ -358,11 +494,50 @@ def test_router_with_mm_declines_outside_its_contract(rows: int) -> None:
     assert not fp32_router_gemv_with_mm_supported(plan, x, mm_a, mm_b)
 
 
+def _shares_launch(output_size: int, rows: int, mm_n: int) -> bool:
+    plan = fp32_router_gemv_plan(
+        hidden_size=8192,
+        output_size=output_size,
+        dtype=torch.float32,
+        solution=None,
+        batch_invariant=False,
+    )
+    x = torch.zeros((rows, 8192), device="cuda")
+    mm_a = torch.zeros((rows, 8192), device="cuda", dtype=torch.bfloat16)
+    mm_b = torch.zeros((mm_n, 8192), device="cuda", dtype=torch.bfloat16)
+    return fp32_router_gemv_with_mm_supported(plan, x, mm_a, mm_b)
+
+
+@pytest.mark.parametrize(
+    "rows,shares",
+    # TP4's pre-expert projection: hipBLASLt at 1-8 rows, the shared launch at
+    # 9-32 (its decode GEMM entries); 33 rows and up are not shared.
+    [(8, False), (9, True), (32, True), (33, False)],
+)
+def test_tp4_pre_expert_shares_the_router_launch_at_9_to_32_rows(
+    rows: int, shares: bool
+) -> None:
+    assert _shares_launch(256, rows, 1024) == shares
+
+
+def test_router_with_mm_takes_larger_rows_only_where_the_plan_takes_its_tile() -> None:
+    """Past 16 rows the router keeps its standalone plan's bits.
+
+    The shared launch serves only row counts at which the router's standalone
+    plan takes the shared launch's split-K tile."""
+    # The 8192 x 256 router's plan takes that tile at 9-64 rows.
+    assert _shares_launch(256, 64, 512)
+    assert not _shares_launch(256, 65, 512)
+    # A router shape without a split-K plan: up to 16 rows only.
+    assert _shares_launch(128, 16, 512)
+    assert not _shares_launch(128, 17, 512)
+
+
 def test_router_with_mm_compiles_once_per_row_bucket() -> None:
     """Row counts inside a warmed bucket reuse its binary: the row count is a
     runtime argument, and only the GEMM's row bucket is compiled in."""
     plan = _router_plan()
-    x, weight = _problem(16, 8192, 256, 20261104)
+    x, weight = _problem(64, 8192, 256, 20261104)
     prepared = fp32_router_gemv_process_weight(plan, weight)
     mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
 
@@ -375,8 +550,8 @@ def test_router_with_mm_compiles_once_per_row_bucket() -> None:
             plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
         )
 
-    for rows in (8, 16):
+    for rows in (8, 16, 32, 64):
         run(rows)
     with assert_no_triton_compile(gluon_fp32_router_gemv_mm_a16w16_gfx950):
-        for rows in (5, 7, 9, 12, 15, 16, 8):
+        for rows in (5, 7, 9, 12, 15, 16, 8, 17, 31, 33, 48, 63, 64):
             run(rows)

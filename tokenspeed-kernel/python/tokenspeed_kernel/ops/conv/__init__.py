@@ -740,6 +740,12 @@ def causal_conv1d_qkv_fn(
             "state_layout": _state_layout(conv_states, weight),
             "channels": x.shape[0],
             "channel_contiguous": x.stride(0) == 1,
+            "weight_dtype": weight.dtype,
+            "bias_dtype": bias.dtype if bias is not None else None,
+            "state_dtype": conv_states.dtype,
+            "indexed_state": cache_indices is not None
+            and has_initial_state is not None,
+            "pad_slot_id": pad_slot_id,
             "block_m": prefill_metadata.block_m,
         },
     )

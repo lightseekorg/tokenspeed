@@ -36,7 +36,6 @@ import os
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -67,6 +66,7 @@ from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
     RestoreOp,
+    RestoreTelemetry,
     SnapshotOp,
 )
 from tokenspeed.runtime.cache.transfer.ownership import (  # noqa: E402
@@ -74,6 +74,7 @@ from tokenspeed.runtime.cache.transfer.ownership import (  # noqa: E402
 )
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     cache_event_to_payload,
+    cache_ops_from_plan,
 )
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
     pack_slot_rows,
@@ -346,6 +347,7 @@ def _build(
             kvp_rank=rank,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
     return executor, slot_state, lanes
 
@@ -355,33 +357,149 @@ def _build(
 # ----------------------------------------------------------------------
 
 
-def test_op_dataclasses_carry_the_wire_fields():
-    wire = (
-        "op_id",
-        "request_id",
-        "admission_id",
-        "request_pool_index",
-        "snapshot_slot",
-        "transfers",
-    )
-    assert tuple(f.name for f in fields(SnapshotOp)) == wire
-    assert tuple(f.name for f in fields(RestoreOp)) == wire + ("source_tier",)
-    assert tuple(f.name for f in fields(CacheTransfer)) == (
-        "group_id",
-        "source_page",
-        "destination_page",
-        "content_hash",
-        "page_offset",
-    )
-    assert (int(HostTier.L2), int(HostTier.SNAPSHOT_POOL)) == (0, 1)
-    assert (
-        int(executor_module.Cache.HostTier.L2),
-        int(executor_module.Cache.HostTier.SnapshotPool),
-    ) == (0, 1)
-    for kind, op_id in (("SnapshotDoneEvent", 3), ("RestoreDoneEvent", 4)):
-        event = getattr(executor_module.Cache, kind)()
-        event.op_id = op_id
-        assert cache_event_to_payload(event) == {"kind": kind, "op_id": op_id}
+@pytest.mark.parametrize("record_observations", [False, True])
+def test_native_image_plan_preserves_transfer_rows_and_restore_identity(
+    record_observations,
+):
+    """Only copy completion is supplied: plans, bindings, and adaptation are real."""
+    from tokenspeed_engine import scheduler as ts
+
+    cfg = ts.SchedulerConfig()
+    cfg.role = ts.SchedulerConfig.Role.Fused
+    cfg.prefix_granularity = 2
+    cfg.num_device_pages = cfg.num_host_pages = cfg.num_snapshot_pages = 65
+    cfg.max_batch_size = cfg.max_resident_requests = cfg.max_retracted_requests = 1
+    cfg.max_scheduled_tokens = 32
+    cfg.decode_input_tokens = 1
+    cfg.overlap_schedule_depth = 0
+    cfg.disable_l2_cache = cfg.disable_prefix_cache = cfg.enable_l3_storage = False
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+    cfg.host_group_packing = [1, 1]
+    cfg.debug_force_retraction_interval = 3
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=2,
+            total_pages=65,
+            attn_kind=ts.AttnKind.Full,
+        ),
+        ts.CacheGroupConfig(
+            group_id="private",
+            block_granularity=2,
+            total_pages=65,
+            attn_kind=ts.AttnKind.SlidingWindow,
+            # Keep every restored page live through the first resumed decode.
+            sliding_window_tokens=8,
+            replayable=True,
+        ),
+    ]
+    scheduler = ts.Scheduler(cfg)
+    request = ts.RequestSpec()
+    request.request_id = "image"
+    request.admission_id = 17
+    request.tokens = [1, 2, 3, 4]
+    scheduler.submit_requests([request])
+    admissions = {"image": 17}
+    stored_l2_rows = set()
+
+    def complete_stores(plan):
+        events = ts.ExecutionEvent()
+        for batch in plan.cache:
+            if isinstance(batch, ts.Cache.WriteBackOp):
+                for groups, destinations in zip(batch.group_ids, batch.dst_pages):
+                    stored_l2_rows.update(zip(groups, destinations))
+                done_type = ts.Cache.WriteBackDoneEvent
+            else:
+                assert isinstance(batch, ts.Cache.SnapshotOp)
+                done_type = ts.Cache.SnapshotDoneEvent
+            for op_id in batch.op_ids:
+                done = done_type()
+                done.op_id = op_id
+                assert cache_event_to_payload(done) == {
+                    "kind": done_type.__name__,
+                    "op_id": op_id,
+                }
+                events.add_event(done)
+        scheduler.advance(events)
+
+    # Prefill, then one decode: six accepted tokens, five computed tokens.
+    for token in (42, 43):
+        plan = scheduler.next_execution_plan()
+        (batch,) = plan.forward
+        assert batch.request_ids == ["image"]
+        original_slot = batch.request_pool_indices[0]
+        complete_stores(plan)
+        result = ts.ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = "image", [token]
+        events = ts.ExecutionEvent()
+        events.add_event(result)
+        scheduler.advance(events)
+
+    stored = scheduler.next_execution_plan()
+    snapshot_ops = cache_ops_from_plan(
+        stored,
+        request_admission=admissions.__getitem__,
+    ).device
+    (snapshot,) = [op for op in snapshot_ops if isinstance(op, SnapshotOp)]
+    assert (snapshot.request_id, snapshot.admission_id) == ("image", 17)
+    assert snapshot.request_pool_index == original_slot
+    assert snapshot.transfers and all(t.group_id == 1 for t in snapshot.transfers)
+    assert all((t.content_hash, t.page_offset) == ("", 0) for t in snapshot.transfers)
+    complete_stores(stored)
+
+    plan = scheduler.next_execution_plan()
+    (restored,) = cache_ops_from_plan(
+        plan,
+        request_admission=admissions.__getitem__,
+        record_observations=record_observations,
+    ).device
+    assert isinstance(restored, RestoreOp)
+    assert (restored.request_id, restored.admission_id) == ("image", 17)
+    assert restored.snapshot_slot == snapshot.snapshot_slot
+    rows = tuple(zip(restored.source_tier, restored.transfers, strict=True))
+    assert {tier for tier, _ in rows} == {HostTier.L2, HostTier.SNAPSHOT_POOL}
+    assert {
+        (t.group_id, t.source_page)
+        for tier, t in rows
+        if tier == HostTier.SNAPSHOT_POOL
+    } == {(t.group_id, t.destination_page) for t in snapshot.transfers}
+    assert {
+        (t.group_id, t.source_page) for tier, t in rows if tier == HostTier.L2
+    } <= stored_l2_rows
+    if record_observations:
+        expected_telemetry = RestoreTelemetry(
+            admission_id=17,
+            op_generation=0,
+            previous_slot=original_slot,
+            previous_slot_generation=1,
+            slot_generation=2,
+            slot_previous_admission_id=17,
+            restore_sequence=1,
+            committed_tokens=6,
+            computed_tokens=5,
+            prompt_tokens=4,
+        )
+    else:
+        expected_telemetry = None
+    assert restored.telemetry == expected_telemetry
+    assert all(not batch.request_ids for batch in plan.forward)
+    done = ts.Cache.RestoreDoneEvent()
+    done.op_id = restored.op_id
+    assert cache_event_to_payload(done) == {
+        "kind": "RestoreDoneEvent",
+        "op_id": restored.op_id,
+    }
+    events = ts.ExecutionEvent()
+    events.add_event(done)
+    scheduler.advance(events)
+    (resumed,) = scheduler.next_execution_plan().forward
+    assert resumed.request_ids == ["image"]
+    assert resumed.request_pool_indices == [restored.request_pool_index]
+    assert list(resumed.decode_input_ids) == [43]
+    tables = resumed.block_tables_arrays()
+    for transfer in restored.transfers:
+        group = ("full", "private")[transfer.group_id]
+        assert transfer.destination_page in tables[group][0]
 
 
 def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
@@ -403,6 +521,7 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
         with pytest.raises(ValueError, match="slot-state rows"):
             HostCacheExecutor(
@@ -417,6 +536,7 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
     # Too small a size holds no whole block and is refused, not rounded to none.
     with pytest.raises(ValueError, match="no whole LCM block"):
@@ -1097,6 +1217,7 @@ def _round_trip_two_ranks(io_backend, executors):
                 kvp_rank=rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
     assert (executors[0].num_host_pages, executors[0].num_snapshot_pages) == (4, 4)
     for buffer in buffers.values():

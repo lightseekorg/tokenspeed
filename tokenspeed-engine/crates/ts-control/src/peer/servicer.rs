@@ -30,7 +30,7 @@ use std::{
 
 use ts_scheduler::{
     PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView,
-    Scheduler,
+    PeerTier, Scheduler,
 };
 
 use crate::peer::{
@@ -104,7 +104,7 @@ impl Holder {
         }
     }
 
-    /// Gate new Device pins without affecting existing leases or Host-only hits.
+    /// Gate new Device pins without affecting existing leases or other tiers.
     pub fn block_device_pins(&mut self, blocked: bool) {
         self.device_pins_blocked = blocked;
     }
@@ -153,7 +153,10 @@ impl Holder {
                     answer.pages = looked_up.pages.clone();
                     answer.held = looked_up.num_tokens > 0
                         && (!self.device_pins_blocked
-                            || looked_up.pages.iter().all(|page| page.host))
+                            || looked_up
+                                .pages
+                                .iter()
+                                .all(|page| page.tier != PeerTier::Device))
                         && cache.pages_match(
                             &record.lookup,
                             looked_up.num_tokens,

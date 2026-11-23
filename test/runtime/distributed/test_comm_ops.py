@@ -33,13 +33,15 @@ class TestAutoBackendTopology:
             "mapping",
             SimpleNamespace(nprocs_per_node=4),
         )
-        backend = AutoBackend.__new__(AutoBackend)
+        backend = AutoBackend()
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._iris = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
         backend._trtllm_ar.lamport_all_gather.return_value = None
+        # No group prepared a one-hop exchange.
+        backend._small_exchanges = {}
         # A host-spread group's rsag routing keys on the fabric probe, so pin
         # both the probe and the local device count the tests assume.
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)

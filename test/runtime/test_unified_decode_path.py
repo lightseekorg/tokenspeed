@@ -70,6 +70,8 @@ class _RouterCase(_TorchCase):
     MAX_DECODE_BS (the wrapper passes max_decode_bs to
     init_cuda_graph_state, never the capture-ladder max)."""
 
+    DEVICE = "cpu"
+
     @pytest.fixture(autouse=True)
     def _setup_router(self, _setup_torch):
         try:
@@ -91,19 +93,19 @@ class _RouterCase(_TorchCase):
         leaf.max_num_pages = MAX_NUM_PAGES
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
-        leaf.device = "cpu"
+        leaf.device = self.DEVICE
         leaf.tree_verify = None
         router = CacheGroupRouter(
             lambda gid, grain: leaf,
             is_draft=False,
             spec_num_tokens=1,
-            device="cpu",
+            device=self.DEVICE,
             consumed_group_ids=None,
         )
         router.set_cache_pool(
             make_mha_pool_for_groups(
                 (CacheGroupSpec(FULL, "full_history", 2, 1, replayable=False),),
-                device="cpu",
+                device=self.DEVICE,
             )
         )
         router.init_cuda_graph_state(MAX_DECODE_BS)
@@ -113,14 +115,15 @@ class _RouterCase(_TorchCase):
 
     def _tables(self, rows):
         torch = self.torch
-        return {FULL: torch.arange(1, rows * 2 + 1, dtype=torch.int32).reshape(rows, 2)}
+        table = torch.arange(1, rows * 2 + 1, dtype=torch.int32).reshape(rows, 2)
+        return {FULL: table.to(self.DEVICE)}
 
     def _refresh(self, bs, actual_bs, seq_lens, replay):
         torch = self.torch
         self.router.refresh_decode_metadata(
             bs,
             actual_bs,
-            torch.arange(bs, dtype=torch.int64),
+            torch.arange(bs, dtype=torch.int64, device=self.DEVICE),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(actual_bs) if actual_bs else self._tables(bs),
@@ -349,6 +352,48 @@ class TestDefaultCaptureTest(_RouterCase):
         md = self._default_capture(LADDER_BS, seq)
         padded_seq = torch.tensor([5, 4, 1, 1], dtype=torch.int32)
         assert (self._refresh(LADDER_BS, 2, padded_seq, replay=True)) is (md)
+
+
+class TestCaptureCompilesWhatReplayLaunchesTest(_RouterCase):
+    """On a GPU the decode tables are a Triton kernel: capture runs the
+    refresh's own idle fill, so a replay's refresh compiles nothing new."""
+
+    DEVICE = "cuda"
+
+    @pytest.fixture(autouse=True)
+    def _require_gpu(self, _setup_torch):
+        if not self.torch.cuda.is_available():
+            pytest.skip("the decode tables run as a Triton kernel on a GPU")
+
+    def _default_capture(self, bs, seq_lens):
+        torch = self.torch
+        placeholder = {FULL: torch.zeros((bs, 1), dtype=torch.int32, device="cuda")}
+        self.router.init_forward_metadata_capture_cuda_graph(
+            bs,
+            torch.arange(bs, dtype=torch.int64, device="cuda"),
+            seq_lens.cuda(),
+            ForwardMode.DECODE,
+            block_tables=placeholder,
+        )
+        return self.leaf.forward_decode_metadata
+
+    def test_replay_refresh_compiles_nothing_after_capture(self):
+        import importlib.util
+        from pathlib import Path
+
+        from tokenspeed_kernel.ops.metadata.decode_tables import _decode_tables_kernel
+
+        helper = Path(__file__).resolve().parents[2] / "tokenspeed-kernel/test/utils.py"
+        spec = importlib.util.spec_from_file_location("kernel_test_utils", helper)
+        utils = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(utils)
+
+        torch = self.torch
+        self._default_capture(LADDER_BS, torch.full((LADDER_BS,), 7, dtype=torch.int32))
+        padded_seq = torch.tensor([5, 4, 1, 1], dtype=torch.int32, device="cuda")
+        with utils.assert_no_triton_compile(_decode_tables_kernel):
+            self._refresh(LADDER_BS, 2, padded_seq, replay=True)
+            torch.cuda.synchronize()
 
 
 class TestWrapperForwardsTheExtendBundleTest(_TorchCase):

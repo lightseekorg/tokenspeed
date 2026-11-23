@@ -63,14 +63,15 @@ std::size_t CacheCoordinator::demoteOwners(const SessionRegistry::DemotedOwners&
 }
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                                   bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                                   bool stream_device_cache_to_host, bool write_back_evictions,
-                                   std::int64_t checkpoint_retention_requests,
+                                   bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool,
+                                   BlockPool* snapshot_pool, bool stream_device_cache_to_host,
+                                   bool write_back_evictions, std::int64_t checkpoint_retention_requests,
                                    std::int32_t checkpoint_retention_leaf_distance)
     : store_{std::move(groups),
              prefix_granularity,
              pool,
              host_pool,
+             disk_pool,
              snapshot_pool,
              write_back_evictions,
              checkpoint_retention_leaf_distance},
@@ -115,7 +116,77 @@ bool CacheCoordinator::CacheIsClearable(bool include_host) const {
     if (!include_host) {
         return true;
     }
-    return host_.IsClearable();
+    return host_.IsClearable() && disk_.NumPinnedDiskCachedBlocks() == 0;
+}
+
+bool CacheCoordinator::CacheIsClearableAfterStorageDrain(std::span<const CacheBlockRef* const> storage_refs) const {
+    if (!deviceCacheIsClearable()) return false;
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return storage_refs.empty();
+    std::unordered_map<const CacheBlock*, std::size_t> storage_counts;
+    for (const CacheBlockRef* ref : storage_refs) {
+        if (ref == nullptr || !*ref || !ref->IsOwnedBy(*pool)) return false;
+        ++storage_counts[ref->operator->()];
+    }
+    for (const auto& group : store_.Groups()) {
+        bool clearable = true;
+        group.Index().ForEachBlockRef(*pool, [&](const CacheBlockRef& ref) {
+            const auto it = storage_counts.find(ref.operator->());
+            const auto storage_count = it == storage_counts.end() ? 0 : it->second;
+            if (ref.use_count() != 1 + storage_count) clearable = false;
+        });
+        if (!clearable) return false;
+    }
+    return true;
+}
+
+bool CacheCoordinator::CacheIsClearableRetainingStorage(std::span<const CacheBlockRef* const> storage_refs) const {
+    if (evictor_.HasSegments() || !deviceCacheIsClearable() || store_.ActiveParentGauge().Count() != 0) {
+        return false;
+    }
+    std::size_t device_entries = 0;
+    for (const auto& group : store_.Groups()) device_entries += group.Index().NumEntries(store_.DevicePool());
+    // An active, not-yet-indexed Device block is protected too.
+    if (device_entries != static_cast<std::size_t>(store_.DevicePool().NumOccupiedSlots())) return false;
+
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return storage_refs.empty();
+    struct References {
+        std::size_t storage{0};
+        std::size_t indexed{0};
+        std::uint32_t observed{0};
+    };
+    std::unordered_map<const CacheBlock*, References> counts;
+    for (const CacheBlockRef* ref : storage_refs) {
+        if (ref == nullptr || !*ref || !ref->IsOwnedBy(*pool)) return false;
+        auto& count = counts[ref->operator->()];
+        ++count.storage;
+        count.observed = ref->use_count();
+    }
+    for (const auto& group : store_.Groups()) {
+        group.Index().ForEachBlockRef(*pool, [&](const CacheBlockRef& ref) {
+            auto& count = counts[ref.operator->()];
+            ++count.indexed;
+            count.observed = ref.use_count();
+        });
+    }
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> locations;
+    for (const auto& [block, count] : counts) {
+        if (!block->IsOwnedBy(*pool) || !pool->IsOccupied(block->Location()) || count.indexed > 1 ||
+            count.observed != count.storage + count.indexed || !locations.insert(block->Location()).second) {
+            return false;
+        }
+    }
+    // This catches unindexed, non-storage Host owners as well as pins on an
+    // indexed block shared by storage and an active request or tier transfer.
+    return locations.size() == static_cast<std::size_t>(pool->NumOccupiedSlots());
+}
+
+void CacheCoordinator::ClearCacheRetainingStorage() {
+    FatalCheck(ClearDeviceCache(), "retaining-storage clear keeps its Device preflight valid");
+    evictor_.InvalidateHostEntries();
+    store_.Boundaries().ClearAfterCacheClear();
+    store_.Checkpoints().Clear();
 }
 
 bool CacheCoordinator::ClearDeviceCache() {
@@ -158,28 +229,48 @@ bool CacheCoordinator::ClearCache() {
         return ClearDeviceCache();
     }
 
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> host_locations;
-    for (const CacheGroup& group : store_.Groups()) {
-        const PrefixCacheIndex& index = group.Index();
-        const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries =
-            index.EvictableCandidates(*store_.HostPool());
-        if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(*store_.HostPool())) {
+    // Every entry of a lower tier, or nullopt when one is held.
+    const auto clearable_entries =
+        [&](const BlockPool& pool) -> std::optional<std::vector<std::pair<std::uint32_t, CacheBlockLocation>>> {
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> locations;
+        for (const CacheGroup& group : store_.Groups()) {
+            const PrefixCacheIndex& index = group.Index();
+            const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(pool);
+            if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(pool)) {
+                return std::nullopt;
+            }
+            for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
+                locations.emplace_back(group.Id(), entry.location);
+            }
+        }
+        return locations;
+    };
+    const auto host_locations = clearable_entries(*store_.HostPool());
+    if (!host_locations) {
+        return false;
+    }
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> disk_locations;
+    if (store_.DiskPool() != nullptr) {
+        auto entries = clearable_entries(*store_.DiskPool());
+        if (!entries) {
             return false;
         }
-        for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
-            host_locations.emplace_back(group.Id(), entry.location);
-        }
+        disk_locations = std::move(*entries);
     }
 
     // ClearDeviceCache performs its complete pin check before mutation. Since
-    // Host was checked above, a false return leaves both tiers unchanged.
+    // Host and Disk were checked above, a false return leaves every tier
+    // unchanged.
     if (!ClearDeviceCache()) {
         return false;
     }
-    for (const auto& [group_id, location] : host_locations) {
+    for (const auto& [group_id, location] : *host_locations) {
         evictor_.FlushHostEntry(group_id, location);
     }
-    // With both tiers empty no node is left: no eviction store holds one, as
+    for (const auto& [group_id, location] : disk_locations) {
+        evictor_.FlushDiskEntry(group_id, location);
+    }
+    // With every tier empty no node is left: no eviction store holds one, as
     // the scheduler refuses a clear while a store is in flight. What the Host
     // evictions queued for collection goes, and so do the tail hints.
     store_.Boundaries().ClearAfterCacheClear();
@@ -192,8 +283,13 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
     _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
     _assert(tail_tokens >= 0 && tail_tokens < store_.PrefixGranularity(), "a tail lies strictly inside a prefix page");
     const BoundaryTree::Node* node = store_.Boundaries().Find(boundary.content_hash);
-    if (node == nullptr) return {.device_publishable = false, .host_publishable = false, .retains_descriptor = false};
-    const bool retains_descriptor = node->Entries(BoundaryTree::kDevice) > 0 || node->OnHost();
+    if (node == nullptr) {
+        return {.device_publishable = false,
+                .host_publishable = false,
+                .disk_publishable = false,
+                .retains_descriptor = false};
+    }
+    const bool retains_descriptor = node->Entries(BoundaryTree::kDevice) > 0 || node->OnHost() || node->OnDisk();
     // A continuous history group represents locality without requiring the
     // auxiliary sliding windows or sparse checkpoints at every ancestor.
     if (!store_.RoutingHistoryGroups().empty()) {
@@ -206,14 +302,20 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         }
         const std::int32_t on_device = node->ClosedEntries(BoundaryTree::kDevice);
         const std::int32_t on_host = node->ClosedEntries(BoundaryTree::kHost);
-        _assert(on_device <= expected && on_host <= expected, "a boundary's history entries lie among its keys");
+        const std::int32_t on_disk = node->ClosedEntries(BoundaryTree::kDisk);
+        _assert(on_device <= expected && on_host <= expected && on_disk <= expected,
+                "a boundary's history entries lie among its keys");
         return {.device_publishable = on_device == expected,
                 .host_publishable = on_host == expected,
+                .disk_publishable = on_disk == expected,
                 .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.
     // Scheduler configuration rejects enabling this event stream in that case.
-    return {.device_publishable = false, .host_publishable = false, .retains_descriptor = retains_descriptor};
+    return {.device_publishable = false,
+            .host_publishable = false,
+            .disk_publishable = false,
+            .retains_descriptor = retains_descriptor};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
@@ -394,6 +496,28 @@ CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& prob
         };
         export_tier(device_blocks, CacheTier::kDevice, 0);
         export_tier(host_blocks, CacheTier::kHost, static_cast<std::int32_t>(device_blocks.size()));
+    }
+    return out;
+}
+
+CacheCoordinator::PrefixExport CacheCoordinator::ExportListing(const PrefixProber::PrefixListing& listing) {
+    PrefixExport out{.num_tokens = listing.num_tokens};
+    if (out.num_tokens == 0) {
+        return out;
+    }
+    out.access_epoch = history_.IssueAccessEpoch();
+    for (const PrefixProber::ListedPage& page : listing.pages) {
+        const BlockPool* pool = page.tier == CacheTier::kDevice ? &store_.DevicePool()
+                                : page.tier == CacheTier::kHost ? store_.HostPool()
+                                                                : store_.DiskPool();
+        FatalCheck(pool != nullptr, "a listed page's tier has a pool");
+        PrefixCacheIndex& index = store_.Groups()[page.key.group_id].Index();
+        CacheBlockRef block = index.Find(*pool, page.key);
+        FatalCheck(static_cast<bool>(block), "a listed page is still indexed when it is exported");
+        index.TouchExisting(*pool, std::span{&page.key, 1}, std::span{&block, 1}, out.access_epoch,
+                            SessionForAccess(out.access_epoch));
+        out.blocks.push_back(
+            ExportedBlock{.key = page.key, .slot = page.slot, .tier = page.tier, .block = std::move(block)});
     }
     return out;
 }
@@ -663,16 +787,18 @@ CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) co
 
 void CacheCoordinator::CollectDeadEntries() {
     ProfileSpan profile_span{"CacheCoordinator::CollectDeadEntries"};
-    // A node's entries, the Device's before the Host's.
+    // A node's entries, the Device's before the Host's before the Disk's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
         std::vector<CacheStore::NodeEntry> entries = store_.NodeEntries(store_.DevicePool(), node);
-        if (store_.HostPool() != nullptr) {
-            std::ranges::copy(store_.NodeEntries(*store_.HostPool(), node), std::back_inserter(entries));
+        for (const BlockPool* pool : std::array<const BlockPool*, 2>{store_.HostPool(), store_.DiskPool()}) {
+            if (pool != nullptr) {
+                std::ranges::copy(store_.NodeEntries(*pool, node), std::back_inserter(entries));
+            }
         }
         return entries;
     };
     // Judged on the state at collection, not at queueing. A node no
-    // prefix-closed group holds on either tier is a gap, whatever State
+    // prefix-closed group holds on any tier is a gap, whatever State
     // entries or children it keeps. Nothing is dead while a store is
     // bringing it to the Host: its settlement queues it again.
     const auto dead = [&](const BoundaryTree::Node& node) {
@@ -752,11 +878,17 @@ void CacheCoordinator::CollectDeadEntries() {
                                                       /*write_back_segment=*/nullptr)
                                .has_value(),
                            "a dead Device entry became pinned");
-            } else if (store_.Groups()[entry.group_id].Index().Contains(*store_.HostPool(), entry.location)) {
+            } else if (entry.pool == store_.HostPool()) {
                 // A checkpoint takes the other State groups' at its hash along.
-                FatalCheck(evictor_.EvictHostCachedBlock(entry.group_id, entry.location,
-                                                         &CacheEvictor::HostEvictionStats::dead_entry),
-                           "a dead Host entry became pinned");
+                if (store_.Groups()[entry.group_id].Index().Contains(*store_.HostPool(), entry.location)) {
+                    FatalCheck(evictor_.EvictHostCachedBlock(entry.group_id, entry.location,
+                                                             &CacheEvictor::HostEvictionStats::dead_entry),
+                               "a dead Host entry became pinned");
+                }
+            } else if (store_.Groups()[entry.group_id].Index().Contains(*store_.DiskPool(), entry.location)) {
+                FatalCheck(evictor_.EvictDiskCachedBlock(entry.group_id, entry.location,
+                                                         &CacheEvictor::DiskEvictionStats::dead_entry),
+                           "a dead Disk entry became pinned");
             }
         }
         if (in_use) {
@@ -1352,7 +1484,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
 }
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool,
                                  BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
                                  std::int64_t checkpoint_retention_requests,
                                  std::int32_t checkpoint_retention_leaf_distance) {
@@ -1390,6 +1522,7 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
                             pool,
                             enable_l3_storage,
                             host_pool,
+                            disk_pool,
                             snapshot_pool,
                             stream_device_cache_to_host,
                             write_back_evictions,

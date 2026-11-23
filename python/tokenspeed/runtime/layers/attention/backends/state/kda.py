@@ -205,7 +205,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
     @override
     def _prefill_supports_strided_qkv(self) -> bool:
-        return self.kda_backend == "cudnn"
+        return self.kda_backend in ("cutedsl_kda", "cudnn")
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_graph_enabled and self.kda_backend in (
@@ -1185,8 +1185,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
         Ordinary metadata slices inputs to the real-token prefix. Capacity
         metadata retains the physical packed extent; GPU boundaries determine
-        live work, so that extent is not a live-token count. The adapter clears
-        inputs before full-tile loads; inline output padding is cleared by the
+        live work, so that extent is not a live-token count. The scan masks
+        loads past the live boundaries; inline output padding is cleared by the
         in-graph scrub. Only an ordinary break uses the handoff copy. A
         prefill graph runs a checkpointing forward on ordinary metadata at its
         eager breaks, so the output is zero-padded to ``seq_len`` rows there.

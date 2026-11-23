@@ -56,6 +56,82 @@ void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t e
 
 }  // namespace
 
+namespace {
+
+class RustCacheEventSink final : public tokenspeed::CacheEventSink {
+public:
+    explicit RustCacheEventSink(rust::Box<CacheEventObserver> observer) : observer_(std::move(observer)) {}
+
+    void OnSlotAssigned(const tokenspeed::SlotOwnershipEvent& event) noexcept override {
+        RecordSlot(event, CacheObservationKind::SlotAssigned);
+    }
+
+    void OnSlotReleased(const tokenspeed::SlotOwnershipEvent& event) noexcept override {
+        RecordSlot(event, CacheObservationKind::SlotReleased);
+    }
+
+    void OnPrefixLoadScheduled(const tokenspeed::LoadBackOperation& operation) noexcept override {
+        const auto& metadata = operation.telemetry;
+        CacheObservation value{};
+        value.kind = CacheObservationKind::PrefixLoadScheduled;
+        value.slot = metadata.request_pool_index;
+        value.slot_generation = metadata.slot_generation;
+        value.admission_id = metadata.admission_id;
+        value.op_id = operation.op_id;
+        value.op_generation = metadata.op_generation;
+        Record(value, operation.request_id);
+    }
+
+    void OnRestoreScheduled(const tokenspeed::SnapshotRestoreOperation& operation) noexcept override {
+        const auto& metadata = operation.telemetry;
+        CacheObservation value{};
+        value.kind = CacheObservationKind::RestoreScheduled;
+        value.slot = operation.request_pool_index;
+        value.slot_generation = metadata.slot_generation;
+        value.admission_id = metadata.admission_id;
+        value.slot_previous_admission_id = metadata.slot_previous_admission_id;
+        value.op_id = operation.op_id;
+        value.op_generation = metadata.op_generation;
+        value.previous_slot = metadata.previous_slot;
+        value.previous_slot_generation = metadata.previous_slot_generation;
+        value.restore_sequence = metadata.restore_sequence;
+        value.committed_tokens = metadata.committed_tokens;
+        value.computed_tokens = metadata.computed_tokens;
+        value.prompt_tokens = metadata.prompt_tokens;
+        Record(value, operation.request_id);
+    }
+
+private:
+    void RecordSlot(const tokenspeed::SlotOwnershipEvent& event, CacheObservationKind kind) noexcept {
+        CacheObservation value{};
+        value.kind = kind;
+        value.slot = event.slot;
+        value.slot_generation = event.generation;
+        value.admission_id = event.admission_id;
+        value.slot_previous_admission_id = event.previous_admission_id;
+        Record(value, event.request_id);
+    }
+
+    void Record(CacheObservation value, std::string_view request_id) noexcept {
+        // Borrow bytes rather than manufacturing a Rust string: the receiver
+        // validates the bounded identity before interpreting it as UTF-8.
+        record_cache_observation(*observer_, value,
+            rust::Slice<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(request_id.data()), request_id.size()));
+    }
+
+    rust::Box<CacheEventObserver> observer_;
+};
+
+}  // namespace
+
+std::uint32_t cache_event_protocol_version() {
+    return tokenspeed::kCacheEventProtocolVersion;
+}
+
+void install_cache_event_observer(tokenspeed::Scheduler& scheduler, rust::Box<CacheEventObserver> observer) {
+    scheduler.SetCacheEventSink(std::make_shared<RustCacheEventSink>(std::move(observer)));
+}
+
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
     {
@@ -65,6 +141,7 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
         for (const RequestSpec& spec : specs) {
             converted.push_back(tokenspeed::RequestSpec{
                 .request_id = std::string(spec.request_id),
+                .admission_id = spec.admission_id,
                 .session_id = std::string(spec.session_id),
                 .cache_group_id = std::string(spec.cache_group_id),
                 .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
@@ -88,14 +165,36 @@ PeerLeaseView ToView(const tokenspeed::PeerLeaseId& lease) {
     return PeerLeaseView{.reader = rust::String(lease.reader), .id = lease.id};
 }
 
+PeerTier ToView(tokenspeed::CacheTier tier) {
+    switch (tier) {
+        case tokenspeed::CacheTier::kDevice:
+            return PeerTier::Device;
+        case tokenspeed::CacheTier::kHost:
+            return PeerTier::Host;
+        case tokenspeed::CacheTier::kDisk:
+            return PeerTier::Disk;
+    }
+    throw std::invalid_argument("an unknown cache tier");
+}
+
+tokenspeed::CacheTier FromView(PeerTier tier) {
+    switch (tier) {
+        case PeerTier::Device:
+            return tokenspeed::CacheTier::kDevice;
+        case PeerTier::Host:
+            return tokenspeed::CacheTier::kHost;
+        case PeerTier::Disk:
+            return tokenspeed::CacheTier::kDisk;
+    }
+    throw std::invalid_argument("an unknown peer page tier");
+}
+
 rust::Vec<PeerPageView> ToView(const std::vector<tokenspeed::PeerPage>& pages) {
     rust::Vec<PeerPageView> out;
     out.reserve(pages.size());
     for (const tokenspeed::PeerPage& page : pages) {
-        out.push_back(PeerPageView{.group_id = page.group_id,
-                                   .slot = page.slot,
-                                   .host = page.tier == tokenspeed::CacheTier::kHost,
-                                   .block_id = page.block_id});
+        out.push_back(PeerPageView{
+            .group_id = page.group_id, .slot = page.slot, .tier = ToView(page.tier), .block_id = page.block_id});
     }
     return out;
 }
@@ -114,10 +213,8 @@ std::vector<tokenspeed::PeerPage> FromView(rust::Slice<const PeerPageView> pages
     std::vector<tokenspeed::PeerPage> out;
     out.reserve(pages.size());
     for (const PeerPageView& page : pages) {
-        out.push_back(tokenspeed::PeerPage{.group_id = page.group_id,
-                                           .slot = page.slot,
-                                           .tier = page.host ? tokenspeed::CacheTier::kHost : tokenspeed::CacheTier::kDevice,
-                                           .block_id = page.block_id});
+        out.push_back(tokenspeed::PeerPage{
+            .group_id = page.group_id, .slot = page.slot, .tier = FromView(page.tier), .block_id = page.block_id});
     }
     return out;
 }
@@ -209,11 +306,21 @@ std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler) {
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
     rust::Vec<PeerLookupView> out;
     for (const tokenspeed::PeerLookupRequest& lookup : scheduler.TakePeerLookups()) {
-        out.push_back(PeerLookupView{.lease = ToView(lookup.lease),
+        out.push_back(PeerLookupView{.request_id = rust::String(lookup.request_id),
+                                     .deadline_us = lookup.deadline_us,
+                                     .lease = ToView(lookup.lease),
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
                                      .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<PinSampleView> out;
+    for (const auto& sample : scheduler.TakePeerPinSamples()) {
+        out.push_back(PinSampleView{.held_us = sample.held_us, .remaining_us = sample.remaining_us, .expired = sample.expired});
     }
     return out;
 }
@@ -265,6 +372,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
                 case ForwardEventKind::PdBootstrapped:
                     execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
                     break;
+                case ForwardEventKind::PdDestinationReady:
+                    execution_event.With(tokenspeed::pd::DestinationReadyEvent(std::move(request_id)));
+                    break;
                 case ForwardEventKind::PdFailed:
                     execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
                     break;
@@ -292,9 +402,11 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
-                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events) {
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
+                  rust::Slice<const CacheEvent> cache_events) {
     // One batch, in the order the Python hooks built it: the storage clock,
-    // the cancellations, the storage completions, then the Host copies' ACKs.
+    // the cancellations, the storage and Disk completions, then the Host
+    // copies' ACKs.
     tokenspeed::ExecutionEvent execution_event;
     for (const StorageTickView& tick : ticks) {
         execution_event.With(tokenspeed::cache::StorageTick{
@@ -325,6 +437,9 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
             .object_failures = std::vector<std::uint8_t>(completion.object_failures.begin(),
                                                          completion.object_failures.end()),
         });
+    }
+    for (const DiskDoneView& completion : disk_done) {
+        execution_event.With(tokenspeed::cache::DiskDone{.op_id = completion.op_id, .success = completion.success});
     }
     for (const CacheEvent& event : cache_events) {
         switch (event.kind) {
@@ -404,6 +519,7 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .prefill_inflight = scheduler.PrefillInflightSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
@@ -437,7 +553,8 @@ std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const 
     auto batch = std::make_unique<tokenspeed::KvEventBatch>();
     for (const auto& event : events) {
         const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
-        const auto medium = event.host ? tokenspeed::KvEventMedium::kHost : tokenspeed::KvEventMedium::kDevice;
+        if (event.medium >= tokenspeed::kNumKvEventMedia) throw std::invalid_argument("an unknown KV event medium");
+        const auto medium = static_cast<tokenspeed::KvEventMedium>(event.medium);
         if (event.stored) {
             batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
                          {event.token_ids.data(), event.token_ids.size()}, event.block_size, medium);
@@ -501,12 +618,27 @@ bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::St
 }
 
 bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
+bool storage_current_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageCurrentPending(); }
+bool storage_progress_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageProgressPending(); }
+std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageBlockingQuarantined();
+}
+bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageNonStorageClearable();
+}
+bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanPrepareStorageClear();
+}
 
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::StorageStats stats = scheduler.GetStorageStats();
     return StorageStatsView{
         .operations = stats.operations,
         .held_blocks = stats.held_blocks,
+        .retained_operations = stats.retained_operations,
+        .retained_host_blocks = stats.retained_host_blocks,
+        .retained_capacity_exhausted = stats.retained_capacity_exhausted,
+        .retained_capacity_warnings = stats.retained_capacity_warnings,
         .quarantined = stats.quarantined,
         .negative_keys = stats.negative_keys,
         .backup_candidates = stats.backup_candidates,
@@ -524,6 +656,26 @@ StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
     };
 }
 
+DiskStatsView disk_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::DiskStats stats = scheduler.GetDiskStats();
+    return DiskStatsView{
+        .operations = stats.operations,
+        .held_host_blocks = stats.held_host_blocks,
+        .queued_cleanings = stats.queued_cleanings,
+        .waiting_requests = stats.waiting_requests,
+        .ready_requests = stats.ready_requests,
+        .disk_blocks = stats.disk_blocks,
+        .free_disk_parents = stats.free_disk_parents,
+        .written_blocks = stats.written_blocks,
+        .read_blocks = stats.read_blocks,
+        .failed_reads = stats.failed_reads,
+        .failed_writes = stats.failed_writes,
+        .dropped_cleanings = stats.dropped_cleanings,
+        .wait_timeouts = stats.wait_timeouts,
+        .ready_expirations = stats.ready_expirations,
+    };
+}
+
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
     return PrefixHitView{
@@ -535,6 +687,21 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
 }
 
 bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
+
+void cancel_storage_backups(tokenspeed::Scheduler& scheduler) { scheduler.CancelStorageBackups(); }
+void cancel_storage_for_clear(tokenspeed::Scheduler& scheduler) { scheduler.CancelStorageForClear(); }
+
+bool can_clear_cache_retaining_storage(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanClearCacheRetainingStorage();
+}
+
+bool clear_cache_retaining_storage(tokenspeed::Scheduler& scheduler) {
+    return scheduler.ClearCacheRetainingStorage();
+}
+
+bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageHasRetainedOperations();
+}
 
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
 
@@ -625,6 +792,22 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
     return out;
 }
 
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<rust::String> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (batch->CompletesPrompt(row)) {
+                out.push_back(rust::String(batch->request_ids[row]));
+            }
+        }
+    }
+    return out;
+}
+
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
     // A peer landing's reads start from the fence the data plane reports for
     // its plan, which may have no other device work: a prefill replica's
@@ -649,9 +832,11 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
             }
             continue;
         }
-        // Storage operations run on the host's L3 executor, not the device.
+        // Storage and Disk operations run on the host's executors, not the
+        // device.
         const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
-        if (cache == nullptr || !std::holds_alternative<tokenspeed::StorageOperation>(*cache)) {
+        if (cache == nullptr || (!std::holds_alternative<tokenspeed::StorageOperation>(*cache) &&
+                                 !std::holds_alternative<tokenspeed::DiskOperation>(*cache))) {
             return true;
         }
     }
@@ -701,8 +886,8 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<CacheOpView> out;
     // One acknowledgment per op id, whatever the batch kind: an L2 batch
     // lists its ops, and a snapshot or restore batch has one op per request.
-    // Storage operations are the L3 executor's, completed through the
-    // storage agreement instead.
+    // Storage and Disk operations are the host executors', completed through
+    // their agreements instead.
     auto append = [&out](CacheOpKind kind, const std::vector<std::uint32_t>& op_ids) {
         for (std::uint32_t op_id : op_ids) {
             out.push_back(CacheOpView{.kind = kind, .op_id = op_id});
@@ -725,7 +910,9 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
                 } else if constexpr (std::is_same_v<Batch, tokenspeed::SnapshotRestoreBatch>) {
                     append(CacheOpKind::SnapshotRestore, batch.op_ids);
                 } else {
-                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation>, "a new cache batch kind");
+                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation> ||
+                                      std::is_same_v<Batch, tokenspeed::DiskOperation>,
+                                  "a new cache batch kind");
                 }
             },
             *cache);
@@ -782,6 +969,33 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
                 }
             },
             *storage);
+    }
+    return out;
+}
+
+rust::Vec<DiskOpView> plan_disk_ops(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<DiskOpView> out;
+    const auto copy = [](const auto& values) {
+        rust::Vec<std::decay_t<decltype(values[0])>> out;
+        out.reserve(values.size());
+        for (const auto value : values) {
+            out.push_back(value);
+        }
+        return out;
+    };
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        const auto* disk = cache == nullptr ? nullptr : std::get_if<tokenspeed::DiskOperation>(cache);
+        if (disk == nullptr) {
+            continue;
+        }
+        out.push_back(DiskOpView{
+            .kind = disk->kind == tokenspeed::DiskOpKind::kRead ? DiskOpKind::Read : DiskOpKind::Write,
+            .op_id = disk->op_id,
+            .group_ids = copy(disk->group_ids),
+            .host_blocks = copy(disk->host_blocks),
+            .disk_blocks = copy(disk->disk_blocks),
+        });
     }
     return out;
 }
