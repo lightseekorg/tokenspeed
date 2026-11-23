@@ -22,11 +22,17 @@
 
 ``gemm.mm`` sends 1-16 rows of a dense BF16 weight to the Gluon dense GEMV or
 the row-CTA GEMV only on the ``(N, K)`` entries measured into their tables.
-With ``TOKENSPEED_GEMV_AUTOTUNE=1`` a weight missing from every table is
+With ``TOKENSPEED_GEMV_AUTOTUNE=1``, or ``TOKENSPEED_KERNEL_AUTOTUNE=1`` while
+``TOKENSPEED_GEMV_AUTOTUNE`` is unset, a weight missing from every table is
 measured the first time ``gemm.mm`` meets it during kernel warmup, and the
 winning routing is entered into the tables. Decisions persist in the kernel
 autotune cache (:func:`tokenspeed_kernel.selection.default_autotune_cache`);
 graph capture and later calls only read it. Off by default.
+
+The serving warmup defers the measurements (:func:`deferred_gemv_autotune`):
+it first runs its forwards on the default routing, so online BLAS tuning sees
+every row count, and then measures each weight against the tuned BLAS GEMMs
+(:func:`tune_deferred_gemv_routings`).
 """
 
 from __future__ import annotations
@@ -34,16 +40,18 @@ from __future__ import annotations
 import functools
 import logging
 import math
-import os
 import statistics
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import ContextManager
 
 import torch
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.selection import (
     autotune_decide,
     autotune_key,
+    autotune_switch,
     default_autotune_cache,
     source_digest,
 )
@@ -52,8 +60,10 @@ __all__ = [
     "AUTOTUNE_ENV",
     "GemvRouting",
     "decide_gemv_routing",
+    "deferred_gemv_autotune",
     "gemv_autotune_enabled",
     "maybe_tune_gluon_bf16_gemv_gfx950",
+    "tune_deferred_gemv_routings",
 ]
 
 logger = logging.getLogger(__name__)
@@ -79,12 +89,30 @@ _SINGLE_ROW_MS = (1,)
 _ROWS_BUCKET_MS = {2: (2,), 4: (4,)}
 _GEMV_BUCKET4_MS = (2, 4)
 _GEMV_BUCKET16_MS = (8, 12, 16)
+_TIMED_MS = tuple(
+    sorted(
+        {
+            *_SINGLE_ROW_MS,
+            *(m for ms in _ROWS_BUCKET_MS.values() for m in ms),
+            *_GEMV_BUCKET4_MS,
+            *_GEMV_BUCKET16_MS,
+        }
+    )
+)
+
+# Enters a block in which the BLAS GEMMs launched inside are tuned, such as
+# ``hipblaslt.hipblaslt_online_tuning``.
+BlasTuning = Callable[[], ContextManager[None]]
 
 
 @functools.cache
 def gemv_autotune_enabled() -> bool:
-    """Whether ``TOKENSPEED_GEMV_AUTOTUNE=1`` (read once per process)."""
-    return os.environ.get(AUTOTUNE_ENV, "0") == "1"
+    """``autotune_switch(AUTOTUNE_ENV)``, read once per process.
+
+    ``TOKENSPEED_GEMV_AUTOTUNE`` decides when set; unset, it follows
+    ``TOKENSPEED_KERNEL_AUTOTUNE``.
+    """
+    return autotune_switch(AUTOTUNE_ENV)
 
 
 @dataclass(frozen=True)
@@ -253,6 +281,15 @@ class _ColdWeightTimer:
             )
         return self._x[m]
 
+    def run_default(self) -> None:
+        """Run ``gemm.mm``'s default routing eagerly on every timed row count."""
+        from tokenspeed_kernel.ops.gemm import mm
+
+        _apply(self.n, self.k, DEFAULT_ROUTING)
+        for m in _TIMED_MS:
+            mm(self._rows(m), self.weights[0])
+        torch.cuda.synchronize()
+
     def _capture(self, routing: GemvRouting, m: int) -> torch.cuda.CUDAGraph | None:
         from tokenspeed_kernel.ops.gemm import mm
 
@@ -310,12 +347,21 @@ class _ColdWeightTimer:
 
 _settled: set[tuple[int, int]] = set()
 _tuning: set[tuple[int, int]] = set()
+# Weights met inside deferred_gemv_autotune, in meeting order.
+_deferred: dict[tuple[int, int], torch.device] | None = None
 
 
-def _measure(n: int, k: int, device: torch.device) -> dict[str, object]:
+def _measure(
+    n: int, k: int, device: torch.device, blas_tuning: BlasTuning | None
+) -> dict[str, object]:
     _, decode_gemv = _tables()
     timer = _ColdWeightTimer(n, k, device)
     try:
+        if blas_tuning is not None:
+            # Tune the default routing's BLAS GEMMs on every timed row count
+            # first, so the GEMVs race the tuned solutions.
+            with blas_tuning():
+                timer.run_default()
         routing = decide_gemv_routing(
             timer,
             rows_tile_fits=decode_gemv.gluon_rowcta_bf16_gemv_rows_tile_fits_gfx950(
@@ -330,25 +376,13 @@ def _measure(n: int, k: int, device: torch.device) -> dict[str, object]:
     return routing.to_json()
 
 
-def maybe_tune_gluon_bf16_gemv_gfx950(n: int, k: int, device: torch.device) -> None:
-    """Enter a measured routing for ``[N, K]`` if no table has one.
-
-    Called by ``gemm.mm`` for every BF16 weight on gfx950 while
-    :func:`gemv_autotune_enabled`. Weights in any table keep their entries.
-    A miss measures only inside kernel warmup; elsewhere it keeps the default
-    routing until a cached decision exists.
-    """
+def _tune(n: int, k: int, device: torch.device, blas_tuning: BlasTuning | None) -> None:
     shape = (n, k)
-    if shape in _settled or shape in _tuning:
-        return
-    if _current_routing(n, k) != DEFAULT_ROUTING or n * k * 2 >= _MAX_WEIGHT_BYTES:
-        _settled.add(shape)
-        return
     key = autotune_key(_OP, {"n": n, "k": k}, _sources())
     _tuning.add(shape)
     try:
         decision = autotune_decide(
-            default_autotune_cache(), key, lambda: _measure(n, k, device)
+            default_autotune_cache(), key, lambda: _measure(n, k, device, blas_tuning)
         )
     finally:
         _tuning.discard(shape)
@@ -356,3 +390,72 @@ def maybe_tune_gluon_bf16_gemv_gfx950(n: int, k: int, device: torch.device) -> N
         return
     _apply(n, k, GemvRouting.from_json(decision))
     _settled.add(shape)
+
+
+def maybe_tune_gluon_bf16_gemv_gfx950(n: int, k: int, device: torch.device) -> None:
+    """Enter a measured routing for ``[N, K]`` if no table has one.
+
+    Called by ``gemm.mm`` for every BF16 weight on gfx950 while
+    :func:`gemv_autotune_enabled`. Weights in any table keep their entries.
+    A miss measures only inside kernel warmup; elsewhere it keeps the default
+    routing until a cached decision exists. Inside
+    :func:`deferred_gemv_autotune` a miss is queued instead.
+    """
+    shape = (n, k)
+    if shape in _settled or shape in _tuning:
+        return
+    if _current_routing(n, k) != DEFAULT_ROUTING or n * k * 2 >= _MAX_WEIGHT_BYTES:
+        _settled.add(shape)
+        return
+    if _deferred is not None:
+        _deferred.setdefault(shape, device)
+        return
+    _tune(n, k, device, None)
+
+
+@contextmanager
+def deferred_gemv_autotune() -> Iterator[None]:
+    """Queue the weights ``gemm.mm`` meets in the block instead of measuring them.
+
+    They keep the default routing until :func:`tune_deferred_gemv_routings`
+    decides them, so other tuning run in between (online BLAS tuning) sees
+    their GEMMs on ``gemm.mm``'s default path. Weights still queued at the end
+    of the block are dropped.
+
+    Yields:
+        None.
+    """
+    global _deferred
+    if _deferred is not None:
+        raise RuntimeError("deferred_gemv_autotune blocks do not nest")
+    _deferred = {}
+    try:
+        yield
+    finally:
+        _deferred = None
+
+
+def tune_deferred_gemv_routings(blas_tuning: BlasTuning | None = None) -> None:
+    """Decide the routing of every weight queued so far, in meeting order.
+
+    Call inside :func:`deferred_gemv_autotune` and kernel warmup, outside
+    graph capture; under the autotune process group every rank must call it
+    after the same forwards. Cached decisions are reused.
+
+    Args:
+        blas_tuning: When given, entered before a weight is measured, around
+            eager default-routing GEMMs on every timed row count, so BLAS
+            solutions the loaded files miss are tuned and in effect while
+            the GEMVs are timed against them.
+
+    Raises:
+        RuntimeError: Called outside :func:`deferred_gemv_autotune`.
+    """
+    if _deferred is None:
+        raise RuntimeError(
+            "tune_deferred_gemv_routings runs inside deferred_gemv_autotune"
+        )
+    while _deferred:
+        shape = next(iter(_deferred))
+        device = _deferred.pop(shape)
+        _tune(*shape, device, blas_tuning)

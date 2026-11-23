@@ -52,9 +52,12 @@ __all__ = [
     "AutotuneCache",
     "AutotuneParams",
     "SelectionPolicy",
+    "KERNEL_AUTOTUNE_ENV",
+    "autotune_cache_file",
     "autotune_decide",
     "autotune_environment",
     "autotune_key",
+    "autotune_switch",
     "default_autotune_cache",
     "register_autotune_benchmark",
     "source_digest",
@@ -858,6 +861,22 @@ def select_kernel(
 
 _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR"
 _AUTOTUNE_CACHE_SCHEMA = 1
+# Turns on every online kernel tuning of the startup warmup at once.
+KERNEL_AUTOTUNE_ENV = "TOKENSPEED_KERNEL_AUTOTUNE"
+
+
+def autotune_switch(env: str) -> bool:
+    """Whether the online tuning switched by ``env`` is on.
+
+    ``env`` (such as ``TOKENSPEED_GEMV_AUTOTUNE``) decides when it is set:
+    ``1`` turns the tuning on, any other value off. Unset, the tuning follows
+    ``TOKENSPEED_KERNEL_AUTOTUNE=1``, which turns on every online tuning.
+    """
+    value = os.environ.get(env)
+    if value is None:
+        value = os.environ.get(KERNEL_AUTOTUNE_ENV, "0")
+    return value == "1"
+
 
 # Given a candidate's implementation and the selection traits, return a
 # zero-argument launch of that implementation on representative inputs.
@@ -937,6 +956,11 @@ def autotune_key(op: str, shape: dict[str, Any], sources: str) -> str:
     return f"{op}|{items}|{sources}"
 
 
+def _environment_name(environment: dict[str, object]) -> str:
+    payload = json.dumps(environment, sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 class AutotuneCache:
     """Autotune decisions of one device and toolchain, persisted as JSON.
 
@@ -954,9 +978,7 @@ class AutotuneCache:
     def for_environment(
         cls, directory: Path, environment: dict[str, object]
     ) -> AutotuneCache:
-        payload = json.dumps(environment, sort_keys=True).encode()
-        name = hashlib.sha256(payload).hexdigest()[:16]
-        return cls(directory / f"{name}.json", environment)
+        return cls(directory / f"{_environment_name(environment)}.json", environment)
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -1005,10 +1027,26 @@ def default_autotune_cache() -> AutotuneCache:
 
     Defaults to ``~/.cache/tokenspeed/kernel-autotune``.
     """
-    directory = os.environ.get(_AUTOTUNE_CACHE_DIR_ENV) or str(
-        Path.home() / ".cache" / "tokenspeed" / "kernel-autotune"
+    return AutotuneCache.for_environment(_autotune_cache_dir(), autotune_environment())
+
+
+def _autotune_cache_dir() -> Path:
+    return Path(
+        os.environ.get(_AUTOTUNE_CACHE_DIR_ENV)
+        or Path.home() / ".cache" / "tokenspeed" / "kernel-autotune"
     )
-    return AutotuneCache.for_environment(Path(directory), autotune_environment())
+
+
+def autotune_cache_file(suffix: str) -> Path:
+    """A file next to :func:`default_autotune_cache`'s, for other measurements.
+
+    Named like the decision cache, after :func:`autotune_environment`, with
+    ``suffix`` (such as ``.hipblaslt.csv``) in place of ``.json``, so it is
+    reused only on the same device and toolchain.
+    """
+    return (
+        _autotune_cache_dir() / f"{_environment_name(autotune_environment())}{suffix}"
+    )
 
 
 def _capturing() -> bool:

@@ -381,3 +381,37 @@ def test_online_tuning_without_file(tmp_path):
     )
     # Nothing written, not even TunableOp's default file in the working dir.
     assert list(tmp_path.iterdir()) == []
+
+
+def test_online_tuning_cache_serves_the_next_start(tmp_path):
+    cache = tmp_path / "cache" / "env.hipblaslt.csv"
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+
+    def start(loaded: int) -> None:
+        # The pick saved by an earlier start is loaded before the block, so
+        # the GEMM is not timed again.
+        _run_fresh_process(
+            "import torch\n"
+            "from tokenspeed_kernel.ops.gemm.hipblaslt import (\n"
+            "    hipblaslt_online_tuning, hipblaslt_online_tuning_cache)\n"
+            "tunable = torch.cuda.tunable\n"
+            f"w = torch.randn({N}, {K}, device='cuda', dtype=torch.bfloat16)\n"
+            f"x = torch.randn({UNTUNED_M}, {K}, device='cuda', dtype=torch.bfloat16)\n"
+            f"with hipblaslt_online_tuning_cache({str(cache)!r}, write=True):\n"
+            f"    assert len(tunable.get_results()) == {loaded}\n"
+            "    with hipblaslt_online_tuning():\n"
+            "        torch.mm(x, w.t())\n"
+            "assert len(tunable.get_results()) == 1\n",
+            cwd=workdir,
+        )
+
+    start(loaded=0)
+    rows = cache.read_text().splitlines()
+    key = f"tn_{N}_{UNTUNED_M}_{K}_ld_{K}_{K}_{N}"
+    assert [row.split(",")[1] for row in rows if not row.startswith("Validator,")] == [
+        key
+    ]
+    start(loaded=1)
+    assert cache.read_text().splitlines() == rows
+    assert list(workdir.iterdir()) == []

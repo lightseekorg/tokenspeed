@@ -186,7 +186,7 @@ def test_warmup_tunes_an_untabled_weight_once(untabled: Path) -> None:
     (entry,) = default_autotune_cache()._entries.values()
     assert GemvRouting.from_json(entry) == routing
     # A single row leaves mm's own path only where a GEMV won.
-    assert _use_mv(x, weight) == (routing.single_row or 1 in routing.gemv_buckets)
+    assert _use_mv(x, weight, None) == (routing.single_row or 1 in routing.gemv_buckets)
 
     # A fresh process applies the cached routing without measuring, even
     # outside warmup.
@@ -195,3 +195,60 @@ def test_warmup_tunes_an_untabled_weight_once(untabled: Path) -> None:
     default_autotune_cache.cache_clear()
     mm(x, weight)
     assert autotune._current_routing(_N, _K) == routing
+
+
+@gpu
+def test_deferred_routing_races_the_tuned_blas_gemms(
+    untabled: Path, tmp_path: Path
+) -> None:
+    # The serving warmup's order (TOKENSPEED_KERNEL_AUTOTUNE=1): the weight
+    # is queued on its default path, then its BLAS GEMMs are tuned and the
+    # GEMVs race them.
+    from tokenspeed_kernel.ops.gemm import gluon_gemv_autotune as autotune
+    from tokenspeed_kernel.ops.gemm import mm
+    from tokenspeed_kernel.ops.gemm.hipblaslt import (
+        hipblaslt_online_tuning,
+        hipblaslt_online_tuning_cache,
+    )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.selection import default_autotune_cache
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_gfx950,
+    )
+
+    weight = torch.randn(_N, _K, device="cuda", dtype=torch.bfloat16) / _K**0.5
+    x = torch.randn(1, _K, device="cuda", dtype=torch.bfloat16)
+    blas_cache = tmp_path / "blas.csv"
+    tunable = torch.cuda.tunable
+    try:
+        with (
+            kernel_warmup(enabled=True),
+            hipblaslt_online_tuning_cache(str(blas_cache), write=True),
+            autotune.deferred_gemv_autotune(),
+        ):
+            mm(x, weight)
+            assert autotune._current_routing(_N, _K) == DEFAULT_ROUTING
+            assert (_N, _K) not in autotune._settled
+            autotune.tune_deferred_gemv_routings(hipblaslt_online_tuning)
+        routing = autotune._current_routing(_N, _K)
+        tuned = {result[1] for result in tunable.get_results()}
+        # Tuned picks stay in effect for the timing and after it.
+        assert tunable.is_enabled() and not tunable.tuning_is_enabled()
+    finally:
+        tunable.enable(False)
+        tunable.tuning_enable(True)
+
+    assert (_N, _K) in autotune._settled
+    (entry,) = default_autotune_cache()._entries.values()
+    assert GemvRouting.from_json(entry) == routing
+    # Every timed row count the default routing sends to torch.mm was tuned.
+    blas_rows = [
+        m
+        for m in autotune._TIMED_MS
+        if not supports_gluon_mm_a16w16_decode_gfx950(m, _N, _K)
+    ]
+    for m in blas_rows:
+        assert any(key.startswith(f"tn_{_N}_{m}_{_K}_") for key in tuned), m
+    saved = blas_cache.read_text()
+    for m in blas_rows:
+        assert f",tn_{_N}_{m}_{_K}_" in saved

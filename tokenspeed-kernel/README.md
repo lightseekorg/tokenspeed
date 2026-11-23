@@ -254,7 +254,10 @@ alike. Decisions persist as JSON under `$TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR`
 unit count and Torch/HIP/CUDA/Triton version, keyed by the operator, the shape
 and a hash of the compared kernels' sources. `SelectionStrategy.AUTOTUNE`
 times the candidates of an operator that registered a benchmark with
-`register_autotune_benchmark`.
+`register_autotune_benchmark`. `TOKENSPEED_KERNEL_AUTOTUNE=1` turns on every
+opt-in online tuning of the startup warmup (on ROCm, BLAS solutions and then
+the gfx950 GEMV routing; see `ops/gemm/README.md`); a tuning's own variable,
+when set, overrides it (`selection.autotune_switch`).
 
 Triton operators can register finite launch variants with
 `warmup.register_triton_warmup` for scalar alignment classes and bounded tile
