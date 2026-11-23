@@ -727,6 +727,17 @@ parser option keeps its existing behavior.
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
 
+### Draft graph overlap
+
+Where the configuration supports it (an MTP greedy chain of at least two steps
+on NVIDIA decode graphs with DP1/PP1 and a draft model that declares support;
+today the Qwen4-Exp MTP head), the decode graph releases the execution stream
+after its first draft step, so the verified-state commit, output copies and the
+next round's metadata refresh run beside the rest of the draft chain. Rank 0
+logs whether it is on. `TOKENSPEED_DRAFT_GRAPH_OVERLAP=0` turns it off; `=1`
+requires it and fails at startup when the configuration does not support it.
+See [the design note](../design/unified_path.md#whole-graph-draft-overlap).
+
 ### Synthetic acceptance length
 
 The greedy and sonic sampling backends accept it, and the flashinfer backend

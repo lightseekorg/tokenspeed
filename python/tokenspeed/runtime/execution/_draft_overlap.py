@@ -74,11 +74,14 @@ def draft_overlap_ineligibility(
     Returns:
         The unmet condition, or None when the overlap can be enabled.
     """
-    from tokenspeed.runtime.execution.drafter.eagle import Eagle
-
     if not nvidia_decode_graphs or pp_size != 1 or dp_size != 1:
         return "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
-    if spec_algo != "MTP" or type(drafter) is not Eagle:
+    if spec_algo != "MTP" or drafter is None:
+        return "Draft graph overlap requires the Eagle MTP drafter"
+    # Local: the drafter package loads Eagle only for configurations that draft with it.
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+    if type(drafter) is not Eagle:
         return "Draft graph overlap requires the Eagle MTP drafter"
     reason = drafter.decode_overlap_ineligibility()
     if reason is not None:
@@ -99,16 +102,19 @@ def draft_overlap_ineligibility(
 
 
 def resolve_draft_overlap(
-    setting: str | None, ineligibility: Callable[[], str | None]
+    setting: str | None, ineligibility: Callable[[], str | None], *, log: bool
 ) -> bool:
     """Whether decode graphs overlap their draft tail with the next round's preparation.
 
     Args:
         setting: The ``TOKENSPEED_DRAFT_GRAPH_OVERLAP`` value. Unset (None) turns
-            the overlap on wherever ``ineligibility`` finds no unmet condition
-            and logs the condition otherwise; "1" requires it; "0" turns it off
-            without checking.
+            the overlap on wherever ``ineligibility`` finds no unmet condition;
+            "1" requires it; "0" turns it off without checking.
         ineligibility: Returns the first unmet condition, or None.
+        log: Log the decision (one rank logs for all).
+
+    Returns:
+        True when the decode graphs run with the overlap.
 
     Raises:
         ValueError: A value other than 0 or 1, or "1" on a configuration that
@@ -117,14 +123,19 @@ def resolve_draft_overlap(
     if setting not in (None, "0", "1"):
         raise ValueError(f"{DRAFT_GRAPH_OVERLAP_ENV} must be 0 or 1")
     if setting == "0":
+        if log:
+            logger.info(f"Draft graph overlap off ({DRAFT_GRAPH_OVERLAP_ENV}=0)")
         return False
     reason = ineligibility()
-    if reason is None:
-        return True
-    if setting == "1":
+    if reason is not None and setting == "1":
         raise ValueError(reason)
-    logger.info(f"Draft graph overlap off: {reason}")
-    return False
+    if log:
+        logger.info(
+            "Draft graph overlap on"
+            if reason is None
+            else f"{reason}; decode graphs run without draft graph overlap"
+        )
+    return reason is None
 
 
 @dataclass(frozen=True)

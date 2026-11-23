@@ -35,6 +35,7 @@ from tokenspeed.runtime.execution._draft_overlap import (
     draft_overlap_ineligibility,
     resolve_draft_overlap,
 )
+from tokenspeed.runtime.execution.drafter.eagle import Eagle
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
@@ -47,7 +48,7 @@ class OverlapDraft(nn.Module):
         self.supports_draft_overlap = supports_draft_overlap
 
 
-def _drafter(steps):
+def _drafter(steps: int) -> Eagle:
     drafter, _ = make_eagle(spec_num_steps=steps)
     drafter.draft_model_runner.model = OverlapDraft(supports_draft_overlap=True)
     return drafter
@@ -90,7 +91,45 @@ def test_model_can_decline_overlap():
     assert "does not declare support" in drafter.decode_overlap_ineligibility()
 
 
-def _eligible(**changes):
+GRAPHS = "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+EAGLE = "Draft graph overlap requires the Eagle MTP drafter"
+UNAUDITED = "Draft model does not declare support for draft overlap"
+STEPS = "Draft graph overlap requires at least two draft steps"
+GREEDY = "Draft graph overlap requires a greedy draft chain"
+HISTORY = "Draft graph overlap does not support draft token history"
+GRAMMAR = "Draft graph overlap does not support grammar"
+MASKS = "Draft graph overlap does not support shared MoE row masks"
+LAYERS = "Draft graph overlap requires separate target/draft cache layers and metadata"
+
+
+class EagleSubclass(Eagle):
+    """A drafter derived from Eagle; the overlap was audited for Eagle itself."""
+
+
+def _subclass() -> Eagle:
+    drafter = _drafter(3)
+    drafter.__class__ = EagleSubclass
+    return drafter
+
+
+def _tree_and_history() -> Eagle:
+    drafter = _drafter(3)
+    drafter.tree_spec = object()
+    drafter.draft_reads_token_history = True
+    return drafter
+
+
+def _history() -> Eagle:
+    drafter = _drafter(3)
+    drafter.draft_reads_token_history = True
+    return drafter
+
+
+def _unread() -> tuple[set[int], set[int]]:
+    raise AssertionError("cache layers read before the drafter conditions hold")
+
+
+def _eligible(**changes) -> dict:
     config = dict(
         nvidia_decode_graphs=True,
         pp_size=1,
@@ -111,38 +150,46 @@ def test_an_eagle_mtp_decode_configuration_is_eligible():
 
 
 @pytest.mark.parametrize(
-    ("change", "reason"),
+    ("changes", "first"),
     [
-        ({"nvidia_decode_graphs": False}, "NVIDIA decode graphs"),
-        ({"pp_size": 2}, "DP1/PP1"),
-        ({"dp_size": 2}, "DP1/PP1"),
-        ({"spec_algo": None, "drafter": None}, "Eagle MTP drafter"),
-        ({"spec_algo": "DFLASH"}, "Eagle MTP drafter"),
-        ({"drafter": None}, "Eagle MTP drafter"),
-        ({"drafter": _drafter(1)}, "at least two draft steps"),
-        ({"grammar_backend": "xgrammar"}, "does not support grammar"),
-        ({"shared_moe_row_masks": True}, "shared MoE row masks"),
-        ({"cache_layers": lambda: ({0, 1}, {1})}, "separate target/draft"),
-        ({"cache_layers": lambda: ({0, 1}, set())}, "separate target/draft"),
-        ({"separate_metadata": False}, "separate target/draft"),
+        (dict(nvidia_decode_graphs=False, spec_algo=None, drafter=None), GRAPHS),
+        (dict(pp_size=2), GRAPHS),
+        (dict(dp_size=2), GRAPHS),
+        (dict(spec_algo=None, grammar_backend="xgrammar"), EAGLE),
+        (dict(spec_algo="DFLASH"), EAGLE),
+        (dict(drafter=None), EAGLE),
+        (dict(drafter=_subclass()), EAGLE),
+        (dict(drafter=_drafter(1)), STEPS),
+        (dict(drafter=_tree_and_history()), GREEDY),
+        (dict(drafter=_history(), grammar_backend="xgrammar"), HISTORY),
+        (dict(grammar_backend="xgrammar", shared_moe_row_masks=True), GRAMMAR),
+        (dict(shared_moe_row_masks=True, cache_layers=_unread), MASKS),
+        (dict(cache_layers=lambda: ({0, 1}, {1})), LAYERS),
+        (dict(cache_layers=lambda: ({0, 1}, set())), LAYERS),
+        (dict(cache_layers=lambda: (set(), {3})), LAYERS),
+        (dict(separate_metadata=False), LAYERS),
     ],
 )
-def test_each_unmet_condition_is_named(change, reason):
-    assert reason in draft_overlap_ineligibility(**_eligible(**change))
+def test_the_first_unmet_condition_is_named_exactly(changes, first):
+    """Two broken conditions at once pin the order the startup checks always had."""
+    assert draft_overlap_ineligibility(**_eligible(**changes)) == first
+
+
+def test_the_drafter_is_checked_before_the_cache_layers():
+    drafter = _drafter(3)
+    drafter.draft_model_runner.model = OverlapDraft(supports_draft_overlap=False)
+    config = _eligible(drafter=drafter, cache_layers=_unread)
+    assert draft_overlap_ineligibility(**config) == UNAUDITED
 
 
 def test_a_configuration_without_an_eagle_drafter_never_reads_its_cache_layers():
     """Other models' KV pools are not asked for draft layers they do not have."""
-    reads = []
-    config = _eligible(
-        spec_algo=None, drafter=None, cache_layers=lambda: reads.append(1)
-    )
-    assert draft_overlap_ineligibility(**config) is not None
-    assert reads == []
+    config = _eligible(spec_algo=None, drafter=None, cache_layers=_unread)
+    assert draft_overlap_ineligibility(**config) == EAGLE
 
 
-def _ineligible():
-    return "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+def _ineligible() -> str:
+    return GRAMMAR
 
 
 @pytest.fixture
@@ -150,33 +197,43 @@ def overlap_log(caplog):
     # The runtime's loggers do not propagate to the root logger.
     logger = logging.getLogger("tokenspeed.runtime.execution._draft_overlap")
     logger.addHandler(caplog.handler)
-    yield caplog
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        yield caplog
     logger.removeHandler(caplog.handler)
 
 
-def test_unset_turns_the_overlap_on_where_eligible():
-    assert resolve_draft_overlap(None, lambda: None) is True
+def test_unset_turns_the_overlap_on_where_eligible_and_says_so(overlap_log):
+    assert resolve_draft_overlap(None, lambda: None, log=True) is True
+    assert "Draft graph overlap on" in overlap_log.text
 
 
 def test_unset_leaves_an_ineligible_configuration_off_and_says_why(overlap_log):
-    assert resolve_draft_overlap(None, _ineligible) is False
-    assert _ineligible() in overlap_log.text
+    assert resolve_draft_overlap(None, _ineligible, log=True) is False
+    assert GRAMMAR in overlap_log.text
+
+
+def test_only_the_logging_rank_logs(overlap_log):
+    assert resolve_draft_overlap(None, _ineligible, log=False) is False
+    assert resolve_draft_overlap(None, lambda: None, log=False) is True
+    assert "Draft graph overlap" not in overlap_log.text
 
 
 def test_one_requires_the_overlap():
-    assert resolve_draft_overlap("1", lambda: None) is True
-    with pytest.raises(ValueError, match="NVIDIA decode graphs"):
-        resolve_draft_overlap("1", _ineligible)
+    assert resolve_draft_overlap("1", lambda: None, log=False) is True
+    with pytest.raises(ValueError) as error:
+        resolve_draft_overlap("1", _ineligible, log=False)
+    assert str(error.value) == GRAMMAR
 
 
-def test_zero_turns_the_overlap_off_without_checking():
-    def unchecked():
+def test_zero_turns_the_overlap_off_without_checking(overlap_log):
+    def unchecked() -> str | None:
         raise AssertionError("eligibility must not be checked")
 
-    assert resolve_draft_overlap("0", unchecked) is False
+    assert resolve_draft_overlap("0", unchecked, log=True) is False
+    assert "TOKENSPEED_DRAFT_GRAPH_OVERLAP=0" in overlap_log.text
 
 
 @pytest.mark.parametrize("setting", ["", "2", "true", "on"])
 def test_other_values_are_startup_errors(setting):
     with pytest.raises(ValueError, match="must be 0 or 1"):
-        resolve_draft_overlap(setting, lambda: None)
+        resolve_draft_overlap(setting, lambda: None, log=False)

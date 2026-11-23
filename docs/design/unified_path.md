@@ -165,19 +165,22 @@ tasks use the existing `DeviceHandle.settle` boundary. Graph release drains
 the round before dropping captured resources.
 
 Eligibility is one predicate, `draft_overlap_ineligibility`: NVIDIA decode
-graphs, an MTP greedy chain with at least two draft steps, DP1/PP1, disjoint
-target/draft cache layers and separate metadata owners, and no grammar, draft
-token history, expert-load recording or MegaMoE shared row mask. The draft
-model must declare `supports_draft_overlap`: after step one, its tail cannot
-depend on buffers changed by verified-state commit or next-target preparation.
-Model implementations, including subclasses, own this contract. Eager, extend
-and idle execution retain their normal stream ordering.
+graphs, the `Eagle` drafter itself (not a subclass) running an MTP greedy chain
+with at least two draft steps, DP1/PP1, disjoint target/draft cache layers and
+separate metadata owners, and no grammar, draft token history, expert-load
+recording or MegaMoE shared row mask. The draft model must declare
+`supports_draft_overlap`: after step one, its tail cannot depend on buffers
+changed by verified-state commit or next-target preparation. Model
+implementations, including subclasses, own this contract; today only the
+Qwen4-Exp MTP head (`qwen4_exp_nextn`) declares it. Eager, extend and idle
+execution retain their normal stream ordering.
 
 `TOKENSPEED_DRAFT_GRAPH_OVERLAP` selects the behavior at startup
 (`resolve_draft_overlap`): unset, the overlap is on wherever the configuration
-is eligible, and an ineligible one runs without it and logs the first unmet
-condition; `1` requires it, so an ineligible configuration fails at startup with
-that condition; `0` turns it off. Any other value is a startup error.
+is eligible, and an ineligible one runs without it; `1` requires it, so an
+ineligible configuration fails at startup with the first unmet condition; `0`
+turns it off. Any other value is a startup error. Global rank 0 logs the
+decision, with the unmet condition when the overlap is off.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 

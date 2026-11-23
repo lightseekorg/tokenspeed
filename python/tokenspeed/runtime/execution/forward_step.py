@@ -559,7 +559,9 @@ class ForwardStepRunner:
         self.stream = self.device_module.Stream()
         self.draft_overlap: DecodeGraphOverlap | None = None
         if resolve_draft_overlap(
-            os.environ.get(DRAFT_GRAPH_OVERLAP_ENV), self._draft_overlap_ineligibility
+            os.environ.get(DRAFT_GRAPH_OVERLAP_ENV),
+            self._draft_overlap_ineligibility,
+            log=self.global_rank == 0,
         ):
             self.draft_overlap = DecodeGraphOverlap()
         if self.drafter is not None:

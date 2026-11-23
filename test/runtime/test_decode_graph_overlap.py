@@ -20,12 +20,16 @@
 
 """Exercise real CUDA graph events, overwritten inputs, and result ownership."""
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import pytest
 import torch
 
 from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
 def test_tail_uses_snapshot_and_completion_covers_both_streams():
