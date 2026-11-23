@@ -1,0 +1,30 @@
+--- deep_ep/buffers/elastic.py.orig
++++ deep_ep/buffers/elastic.py
+@@ -805,8 +805,25 @@
+             nvlink_traffic += self.num_nvlink_ranks / self.num_ranks * (1 - 1 / self.num_nvlink_ranks)  # Except local bypass
+             rdma_traffic += (self.num_ranks - self.num_nvlink_ranks) / self.num_ranks
+
+-        # Found the bounded one
+-        if self.num_scaleout_ranks > 1 and (rdma_traffic / rdma_gbs) > (nvlink_traffic / nvlink_gbs):
++        # Direct mode also carries RDMA traffic. Compare active transports
++        # independently of the logical scale-out domain size; absent NVLink
++        # traffic must neither divide by zero nor hide an RDMA bottleneck.
++        def transfer_time(traffic: float, bandwidth: float, transport: str) -> float:
++            if traffic == 0:
++                return 0.0
++            if bandwidth <= 0:
++                raise ValueError(f"{transport} bandwidth must be positive when traffic is nonzero")
++            return traffic / bandwidth
++
++        # LSA may be PCIe P2P rather than NVLink. If its bandwidth is
++        # unknown, retain the previous conservative full-device estimate;
++        # callers can supply nvlink_gbs (LSA bandwidth) or explicit num_sms.
++        if nvlink_traffic > 0 and nvlink_gbs <= 0:
++            return torch.cuda.get_device_properties('cuda').multi_processor_count // 2 * 2
++
++        rdma_time = transfer_time(rdma_traffic, rdma_gbs, "RDMA")
++        nvlink_time = transfer_time(nvlink_traffic, nvlink_gbs, "NVLink")
++        if rdma_time > nvlink_time:
+             bounded_traffic, bounded_gbs = rdma_traffic, rdma_gbs
+         else:
+             bounded_traffic, bounded_gbs = nvlink_traffic, nvlink_gbs

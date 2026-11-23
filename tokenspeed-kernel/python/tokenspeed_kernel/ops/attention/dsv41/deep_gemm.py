@@ -20,6 +20,7 @@
 
 """Bounded packed CSA2 scoring and DeepSelect through existing TS integrations."""
 
+import os
 from functools import lru_cache
 
 import torch
@@ -79,10 +80,30 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
+from tokenspeed_kernel.thirdparty.flashinfer.topk import has_exact_topk
 
 platform = current_platform()
+_SM120_NATIVE = (
+    platform.is_nvidia
+    and platform.arch_version == ArchVersion(12, 0)
+    and has_exact_topk()
+    and os.environ.get("TOKENSPEED_ENABLE_SM120_NATIVE_FP4_INDEXER") == "1"
+)
 
-if platform.is_blackwell and has_optional_package("deep_gemm"):
+_SM120_NATIVE_CANDIDATES = (
+    _SM120_NATIVE
+    and os.environ.get("TOKENSPEED_ENABLE_SM120_FP4_CANDIDATE_INDEXER") == "1"
+)
+
+if _SM120_NATIVE:
+    if not has_optional_package("deep_gemm_sm120"):
+        raise ImportError(
+            "SM120 native FP4 Indexer requires the pinned deep_gemm_sm120 build; "
+            "see .agents/deploy/w4a8/setup/README.md"
+        )
+    prepare_cuda_toolkit_env()
+    from tokenspeed_kernel.thirdparty import deepgemm_sm120 as deep_gemm
+elif platform.is_blackwell and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     import deep_gemm
 
@@ -95,10 +116,42 @@ if platform.is_hopper:
     from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select as row_select
 
 
+def is_sm120_native_indexer_available() -> bool:
+    """Whether dense-only SM120 scoring was explicitly enabled for Prefill."""
+    return _SM120_NATIVE and has_optional_package("deep_gemm_sm120")
+
+
 @lru_cache(maxsize=1)
 def is_native_indexer_available() -> bool:
     """Whether the current platform supports packed DeepGEMM MQA scoring."""
-    return platform.is_blackwell and has_optional_package("deep_gemm")
+    return (
+        platform.is_blackwell and has_optional_package("deep_gemm")
+    ) or is_sm120_native_indexer_available()
+
+
+def _sm120_dense_full_eligible(
+    query_values,
+    page_table,
+    candidate_blocks,
+    candidate_topk,
+    candidate_block_size,
+    topk,
+    process_group,
+):
+    """Broadcast Full Top512, with explicitly enabled FP4 candidate production."""
+    return (
+        _SM120_NATIVE
+        and process_group is None
+        and candidate_blocks is None
+        and (
+            candidate_topk == 0
+            or (_SM120_NATIVE_CANDIDATES and 0 < candidate_topk <= 2048)
+        )
+        and candidate_block_size == 8
+        and topk == 512
+        and query_values.shape[0] > 1
+        and page_table.stride(0) == 0
+    )
 
 
 @lru_cache(maxsize=32)
@@ -107,6 +160,10 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Warm up packed indexer kernels before graph capture")
     deep_gemm.set_pdl(enable_pdl)
+    if _SM120_NATIVE:
+        # This dense-only mode must not compile the unrelated legacy paged API.
+        deep_gemm.warmup_dense_indexer(heads, device)
+        return
     warmup_mqa_logits(
         num_heads=heads,
         index_head_dim=128,
@@ -357,10 +414,12 @@ def _dense_scores(
     },
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
+        max_arch_version=ArchVersion(12, 0) if _SM120_NATIVE else ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
-    priority=Priority.SPECIALIZED,
+    # Explicit native FP4 selection must survive registration of its BF16
+    # fallback, which has SPECIALIZED + 1 priority. Other targets are unchanged.
+    priority=Priority.SPECIALIZED + (2 if _SM120_NATIVE else 0),
 )
 def index_topk(
     index_q,
@@ -383,11 +442,52 @@ def index_topk(
 
     slots is a SelectionSlots for every query row, or None.
     """
+    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
+    if _SM120_NATIVE:
+        if isinstance(index_q, IndexQueryInput):
+            from tokenspeed_kernel.ops.attention.dsv41 import index_query_rope_weights
+
+            index_q, weights = index_query_rope_weights(
+                query_values.clone(),
+                weights,
+                index_q.positions,
+                index_q.cos_sin_cache,
+                index_q.weight_scale,
+            )
+        result = _index_topk_sm120(
+            index_q,
+            weights,
+            index_cache,
+            page_table,
+            visible_lens,
+            candidate_blocks,
+            topk,
+            candidate_topk,
+            candidate_block_size,
+            query_chunk_size,
+            score_chunk_size,
+            process_group,
+            out,
+            index_metadata,
+        )
+        if slots is not None:
+            from tokenspeed_kernel.ops.attention.dsv41 import global_slots
+
+            slots.out.copy_(
+                global_slots(
+                    result[0],
+                    slots.positions,
+                    slots.requests,
+                    slots.table,
+                    slots.ratio,
+                    slots.pages,
+                )
+            )
+        return result
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
         )
-    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
     out = _index_topk_outputs(
         query_values,
         weights,
@@ -1152,3 +1252,127 @@ def merge_index_candidates(packed, rows, lengths):
     logical = packed[:, :, 0].gather(1, selected.clamp_min(0))
     _finish_topk(values, logical, rows, lengths)
     return rows, lengths
+
+
+def _dense_scores_sm120(queries, keys, weights, lengths, table, pages, capacity):
+    """Dense SM120 FP4 scoring with FP32 logits and invalid-page masking."""
+    api = _api(queries)
+    starts, ends = dense_ranges(lengths, capacity)
+    logits = api.fp8_fp4_mqa_logits(
+        q=(queries[0].view(torch.int8), queries[1]),
+        kv=(keys[0].view(torch.int8), keys[1]),
+        weights=weights,
+        cu_seq_len_k_start=starts,
+        cu_seq_len_k_end=ends,
+        max_seqlen_k=capacity,
+        logits_dtype=torch.float32,
+    )
+    return clean_logits(logits, ends, table, pages, capacity, 64)
+
+
+def _index_topk_sm120(
+    index_q,
+    weights,
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    candidate_block_size,
+    query_chunk_size,
+    score_chunk_size,
+    process_group,
+    out,
+    index_metadata,
+):
+    """Use native dense FP4 only for the explicitly supported Prefill shape.
+
+    The existing BF16 implementation owns paged, Reindex, empty and
+    candidate-producing calls unless FP4 candidate production is opted in.
+    """
+    if not _sm120_dense_full_eligible(
+        index_q,
+        page_table,
+        candidate_blocks,
+        candidate_topk,
+        candidate_block_size,
+        topk,
+        process_group,
+    ):
+        from tokenspeed_kernel.ops.attention.dsv41.flashinfer_index_sm120 import (
+            flashinfer_sm120_dsv41_index_topk,
+        )
+
+        return flashinfer_sm120_dsv41_index_topk(
+            index_q,
+            weights,
+            index_cache,
+            page_table,
+            visible_lens,
+            candidate_blocks,
+            topk,
+            candidate_topk,
+            candidate_block_size,
+            query_chunk_size,
+            score_chunk_size,
+            process_group,
+            out,
+            index_metadata,
+        )
+    from tokenspeed_kernel.ops.attention.dsv41.triton import index_block_select
+    from tokenspeed_kernel.thirdparty.flashinfer.topk import exact_topk
+
+    out = _index_topk_outputs(
+        index_q,
+        weights,
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        candidate_block_size,
+        query_chunk_size,
+        score_chunk_size,
+        process_group,
+        out,
+    )
+    rows, lengths, blocks, block_lengths = out
+    block_lengths.zero_()
+    capacity = page_table.shape[1] * 64
+    if capacity == 0:
+        rows.fill_(-1)
+        lengths.zero_()
+        blocks.fill_(-1)
+        return out
+    cache = index_cache.as_strided(
+        (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
+    )
+    queries, folded = pack_index_inputs(index_q, weights, torch.float32)
+    keys = gather_index_pages(cache, page_table[0], 64)
+    tile = min(query_chunk_size, max(1, (128 << 20) // (capacity * 4)))
+    for begin in range(0, index_q.shape[0], tile):
+        end = min(begin + tile, index_q.shape[0])
+        visible = visible_lens[begin:end].clamp(0, capacity).to(torch.int32)
+        logits = _dense_scores_sm120(
+            (queries[0][begin:end], queries[1][begin:end]),
+            keys,
+            folded[begin:end],
+            visible,
+            page_table[begin:end],
+            index_cache.shape[0],
+            capacity,
+        )
+        values, indices = exact_topk(logits, topk)
+        _finish_topk(values, indices, rows[begin:end], lengths[begin:end])
+        if candidate_topk:
+            index_block_select(
+                logits,
+                visible.contiguous(),
+                candidate_topk,
+                blocks[begin:end],
+                block_lengths[begin:end],
+                visible_capacity=capacity,
+            )
+    return out

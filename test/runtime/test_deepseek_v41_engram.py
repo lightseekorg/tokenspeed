@@ -151,6 +151,7 @@ def _config():
         engram_head_dim=32,
         engram_pad_token_id=2,
         engram_compressed_vocab_size=9,
+        engram_embed_quant="mxfp8",
         hc_mult=4,
         hidden_size=32,
         rms_norm_eps=1e-20,
@@ -334,7 +335,15 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     outputs = []
     for rank in range(4, 8):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 8), "cpu", False, "gpu", None, 1
+            rows,
+            width,
+            _mapping(rank, 4, 8),
+            "cpu",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp8",
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             for name in ("weight", "scale"):
@@ -351,7 +360,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
                         calls.append((name, start, end))
                         return source[key]
 
-                embed.load_sharded(name, TrackedSlice(), 2)
+                embed.load_sharded(name, TrackedSlice(), 2, read_workers=1)
         assert embed.weight.dtype == torch.float8_e4m3fn
         assert embed.scale.dtype == torch.uint8
         assert embed.weight.numel() + embed.scale.numel() == 5 * (64 + 2)
@@ -374,7 +383,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
 
 def test_scale_bytes_and_loader_validation():
     embed = RowShardedEngramEmbedding(
-        8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", None, 1
+        8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", None, 1, storage_format="mxfp8"
     )
     codes = torch.ones(8, 256).to(torch.float8_e4m3fn)
     # Includes E8M0 subnormal, extreme finite and NaN encodings.
@@ -389,7 +398,7 @@ def test_scale_bytes_and_loader_validation():
         atol=0,
         equal_nan=True,
     )
-    with pytest.raises(TypeError, match="must stay FP8"):
+    with pytest.raises(TypeError, match="weights must stay"):
         embed.weight_loader(embed.weight, codes.float())
     with pytest.raises(TypeError, match="exponent bytes"):
         embed.weight_loader(embed.scale, scales.float())
@@ -412,7 +421,15 @@ def test_scale_bytes_and_loader_validation():
 @pytest.mark.parametrize("ndim", [1, 2, 3])
 def test_embedding_noncontiguous_ids(device, ndim):
     embed = RowShardedEngramEmbedding(
-        64, 256, _mapping(0, 1, 1), device, False, "gpu", None, 1
+        64,
+        256,
+        _mapping(0, 1, 1),
+        device,
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp8",
     )
     codes = torch.randn(64, 256, device=device).to(torch.float8_e4m3fn)
     scales = torch.randint(120, 132, (64, 8), dtype=torch.uint8, device=device)
@@ -538,7 +555,15 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
     } == set(dict(model.named_parameters()))
     for rank in range(4):
         large = RowShardedEngramEmbedding(
-            384016682, 256, _mapping(rank, 4, 4), "meta", False, "gpu", None, 1
+            384016682,
+            256,
+            _mapping(rank, 4, 4),
+            "meta",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp8",
         )
         assert large.weight.shape == (96004171, 256)
         assert large.scale.shape == (96004171, 8)
@@ -550,7 +575,15 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
 def test_cuda_lookup_hash_and_graph_replay():
     state = EngramHashState(_config(), _Tokenizer(), "cuda:0")
     embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cuda:0",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp8",
     )
     codes, scales = _weights(72, 32)
     embed.weight_loader(embed.weight, codes)
@@ -725,7 +758,7 @@ def test_distributed_four_way_lookup(monkeypatch):
     try:
         codes, scales = _weights(19, 64)
         table = RowShardedEngramEmbedding(
-            19, 64, mapping, device, False, "gpu", None, 1
+            19, 64, mapping, device, False, "gpu", None, 1, storage_format="mxfp8"
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -889,20 +922,36 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
     sharded = []
     for rank in range(4):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
+            rows,
+            width,
+            _mapping(rank, 4, 4),
+            "cpu",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp8",
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            embed.load_sharded("weight", handle.get_slice("weight"), 4)
-            embed.load_sharded("scale", handle.get_slice("scale"), 4)
+            embed.load_sharded("weight", handle.get_slice("weight"), 4, read_workers=1)
+            embed.load_sharded("scale", handle.get_slice("scale"), 4, read_workers=1)
         sharded.append(embed(indices, query_shard=None))
     gpu_path = torch.stack(sharded).sum(0)
     assert reduces
     host = RowShardedEngramEmbedding(
-        rows, width, _mapping(0, 4, 4), "cpu", True, "shared", _MMAP, 1
+        rows,
+        width,
+        _mapping(0, 4, 4),
+        "cpu",
+        True,
+        "shared",
+        _MMAP,
+        1,
+        storage_format="mxfp8",
     )
     with safe_open(str(path), framework="pt", device="cpu") as handle:
-        host.load_sharded("weight", handle.get_slice("weight"), 4)
-        host.load_sharded("scale", handle.get_slice("scale"), 4)
+        host.load_sharded("weight", handle.get_slice("weight"), 4, read_workers=1)
+        host.load_sharded("scale", handle.get_slice("scale"), 4, read_workers=1)
     reduces.clear()
     host_out = host(indices, query_shard=None)
     assert reduces == []
@@ -912,7 +961,15 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
 
 def test_host_table_meta_keeps_full_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(0, 4, 4), "meta", True, "shared", _MMAP, 14
+        384016682,
+        256,
+        _mapping(0, 4, 4),
+        "meta",
+        True,
+        "shared",
+        _MMAP,
+        14,
+        storage_format="mxfp8",
     )
     assert table.weight.shape == (384016682, 256)
     assert table.scale.shape == (384016682, 8)
@@ -1009,16 +1066,24 @@ def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
         gpu = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", False, "gpu", None, 1
+            rows, width, mapping, "cpu", False, "gpu", None, 1, storage_format="mxfp8"
         )
         host = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
+            rows,
+            width,
+            mapping,
+            "cpu",
+            True,
+            "sharded",
+            _MMAP,
+            1,
+            storage_format="mxfp8",
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            gpu.load_sharded("weight", handle.get_slice("weight"), 4)
-            gpu.load_sharded("scale", handle.get_slice("scale"), 4)
-            host.load_sharded("weight", handle.get_slice("weight"), 4)
-            host.load_sharded("scale", handle.get_slice("scale"), 4)
+            gpu.load_sharded("weight", handle.get_slice("weight"), 4, read_workers=1)
+            gpu.load_sharded("scale", handle.get_slice("scale"), 4, read_workers=1)
+            host.load_sharded("weight", handle.get_slice("weight"), 4, read_workers=1)
+            host.load_sharded("scale", handle.get_slice("scale"), 4, read_workers=1)
         assert host.weight.shape == gpu.weight.shape
         assert host.row_start == gpu.row_start
         assert host.weight.engram_row_sharded
@@ -1058,7 +1123,15 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
     expected = _dequant(codes, scales)[ids.clamp(0, rows - 1)]
     for rank in range(tp_size):
         table = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, tp_size, 4), "cpu", True, layout, _MMAP, 1
+            rows,
+            width,
+            _mapping(rank, tp_size, 4),
+            "cpu",
+            True,
+            layout,
+            _MMAP,
+            1,
+            storage_format="mxfp8",
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -1076,7 +1149,15 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
 
 def test_host_sharded_meta_keeps_rank_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(1, 4, 4), "meta", True, "sharded", _MMAP, 14
+        384016682,
+        256,
+        _mapping(1, 4, 4),
+        "meta",
+        True,
+        "sharded",
+        _MMAP,
+        14,
+        storage_format="mxfp8",
     )
     assert table.weight.shape == (96004171, 256)
     assert table.row_start == 96004171
@@ -1163,12 +1244,28 @@ def test_checkpoint_filter_skips_engram_embed_only():
 def test_cuda_host_table_gather_matches_device_shard():
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cuda:0",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp8",
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
     host_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cpu",
+        True,
+        "shared",
+        _MMAP,
+        1,
+        storage_format="mxfp8",
     )
     host_embed.weight_loader(host_embed.weight, codes)
     host_embed.weight_loader(host_embed.scale, scales)
@@ -1208,7 +1305,15 @@ def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeyp
     monkeypatch.setenv("LOCAL_RANK", "0")
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cuda:0",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp8",
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
@@ -1224,7 +1329,15 @@ def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeyp
             patch.setattr(dist, "get_world_size", lambda group=None: 2)
             path = engram._engram_host_table_path(1, "packed", 72 * 33)
             host_embed = RowShardedEngramEmbedding(
-                72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+                72,
+                32,
+                _mapping(0, 1, 1),
+                "cpu",
+                True,
+                "shared",
+                _MMAP,
+                1,
+                storage_format="mxfp8",
             )
     finally:
         dist.destroy_process_group()
@@ -1261,10 +1374,26 @@ def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
         device_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cuda:0", False, "gpu", None, 1
+            rows,
+            width,
+            mapping,
+            "cuda:0",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp8",
         )
         host_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
+            rows,
+            width,
+            mapping,
+            "cpu",
+            True,
+            "sharded",
+            _MMAP,
+            1,
+            storage_format="mxfp8",
         )
         for embed in (device_embed, host_embed):
             embed.weight_loader(embed.weight, codes)
@@ -1291,7 +1420,15 @@ def test_cuda_cumem_host_table_gathers_and_outlives_its_module():
         pytest.skip(host_memory.probe_host_memory(0, False))
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cuda:0",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp8",
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
@@ -1304,6 +1441,7 @@ def test_cuda_cumem_host_table_gathers_and_outlives_its_module():
         "shared",
         EngramHostAlloc("cumem", "interleave"),
         1,
+        storage_format="mxfp8",
     )
     host_embed.weight_loader(host_embed.weight, codes)
     host_embed.weight_loader(host_embed.scale, scales)
@@ -1338,7 +1476,15 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
     monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
     for rank in range(4):
         table = RowShardedEngramEmbedding(
-            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
+            19,
+            64,
+            _mapping(rank, 4, 4),
+            "cpu",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp8",
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -1611,6 +1757,7 @@ def test_cumem_table_of_a_single_rank_is_private_and_matches_the_gpu_path(
         "shared",
         EngramHostAlloc("cumem", "interleave"),
         1,
+        storage_format="mxfp8",
     )
     table.weight_loader(table.weight, codes)
     table.weight_loader(table.scale, scales)
@@ -1640,6 +1787,7 @@ def test_cumem_table_mapping_outlives_the_module(file_chunks):
         "shared",
         EngramHostAlloc("cumem", "writer"),
         1,
+        storage_format="mxfp8",
     )
     table.weight_loader(table.weight, codes)
     table.weight_loader(table.scale, scales)
@@ -1671,10 +1819,19 @@ def test_cumem_mode_raises_and_auto_falls_back_without_a_driver(monkeypatch):
             "shared",
             EngramHostAlloc("cumem", "writer"),
             1,
+            storage_format="mxfp8",
         )
     with _engram_warnings() as warnings:
         table = RowShardedEngramEmbedding(
-            19, 64, mapping, "cpu", True, "shared", EngramHostAlloc("auto", "writer"), 1
+            19,
+            64,
+            mapping,
+            "cpu",
+            True,
+            "shared",
+            EngramHostAlloc("auto", "writer"),
+            1,
+            storage_format="mxfp8",
         )
     assert table.cumem is None
     # The one warning gives the reason.
@@ -1718,6 +1875,7 @@ def test_mmap_sharded_and_non_nvidia_tables_never_touch_the_driver(monkeypatch):
                 layout,
                 EngramHostAlloc(mode, "interleave"),
                 1,
+                storage_format="mxfp8",
             )
         assert table.cumem is None and not warnings
     with pytest.raises(ValueError, match="shared layout"):
@@ -1730,14 +1888,31 @@ def test_mmap_sharded_and_non_nvidia_tables_never_touch_the_driver(monkeypatch):
             "sharded",
             EngramHostAlloc("cumem", "writer"),
             1,
+            storage_format="mxfp8",
         )
     with pytest.raises(TypeError, match="EngramHostAlloc"):
         RowShardedEngramEmbedding(
-            19, 64, _mapping(0, 1, 1), "cpu", True, "shared", None, 1
+            19,
+            64,
+            _mapping(0, 1, 1),
+            "cpu",
+            True,
+            "shared",
+            None,
+            1,
+            storage_format="mxfp8",
         )
     with pytest.raises(ValueError, match="no host allocation"):
         RowShardedEngramEmbedding(
-            19, 64, _mapping(0, 1, 1), "cpu", False, "gpu", _MMAP, 1
+            19,
+            64,
+            _mapping(0, 1, 1),
+            "cpu",
+            False,
+            "gpu",
+            _MMAP,
+            1,
+            storage_format="mxfp8",
         )
     with pytest.raises(ValueError, match="auto, cumem or mmap"):
         EngramHostAlloc("hugetlb", "writer")
@@ -1778,6 +1953,7 @@ def test_cumem_table_keeps_the_numa_reserve_and_says_why_it_falls_back(
             "shared",
             EngramHostAlloc("auto", "writer"),
             1,
+            storage_format="mxfp8",
         )
     assert table.cumem is None
     assert len(warnings) == 1 and expected in warnings[0]
@@ -1797,6 +1973,7 @@ def test_cumem_table_keeps_the_numa_reserve_and_says_why_it_falls_back(
             "shared",
             EngramHostAlloc("cumem", "writer"),
             1,
+            storage_format="mxfp8",
         )
 
 
@@ -1859,13 +2036,14 @@ def _cumem_rank(rank: int, directory: Path, scenario: str) -> None:
                 "shared",
                 EngramHostAlloc("auto", numa),
                 1,
+                storage_format="mxfp8",
             )
         # One warning for the whole job, with every rank's reason.
         assert len(warnings) == int(falls_back and rank == 0), warnings
         path = str(directory / "table.safetensors")
         with safe_open(path, framework="pt", device="cpu") as handle:
-            table.load_sharded("weight", handle.get_slice("weight"), 64)
-            table.load_sharded("scale", handle.get_slice("scale"), 64)
+            table.load_sharded("weight", handle.get_slice("weight"), 64, read_workers=1)
+            table.load_sharded("scale", handle.get_slice("scale"), 64, read_workers=1)
         dist.barrier()
         codes, scales = _weights(_ROWS, 64)
         assert torch.equal(table.weight.view(torch.uint8), codes.view(torch.uint8))
@@ -1971,6 +2149,7 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
             "shared",
             EngramHostAlloc("cumem", "interleave"),
             1,
+            storage_format="mxfp8",
         )
         assert table.cumem is not None
         # Only the writer holds FABRIC handles; the others imported them.
@@ -2001,3 +2180,121 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def test_mxfp4_engram_packed_storage_and_load():
+    rows, dim = 4, 64
+    table = RowShardedEngramEmbedding(
+        rows,
+        dim,
+        _mapping(0, 1, 1),
+        "cpu",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp4",
+    )
+    codes = torch.arange(rows * dim // 2, dtype=torch.uint8).reshape(rows, dim // 2)
+    scales = torch.tensor(
+        [[127, 128], [125, 126], [127, 127], [129, 128]], dtype=torch.uint8
+    )
+    table.weight_loader(table.weight, codes)
+    table.weight_loader(table.scale, scales)
+    assert table.weight.numel() + table.scale.numel() == rows * (dim // 2 + dim // 32)
+    ids = torch.tensor([[2, 0, 2, -1, 4]])
+    got = table(ids, query_shard=None)
+    ref = engram._dequant_fp4_e8m0(codes, scales)
+    torch.testing.assert_close(got[:, :3], ref[ids[:, :3]], atol=0, rtol=0)
+    assert torch.count_nonzero(got[:, 3:]).item() == 0
+    with pytest.raises(TypeError, match="must stay"):
+        table.weight_loader(table.weight, codes.to(torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="shared packed"):
+        RowShardedEngramEmbedding(
+            rows,
+            dim,
+            _mapping(0, 2, 2),
+            "cpu",
+            False,
+            "gpu",
+            None,
+            1,
+            storage_format="mxfp4",
+        )
+
+
+@pytest.mark.parametrize("storage_format", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("read_workers", [1, 4, 32, 128])
+@pytest.mark.parametrize("source_kind", ["mmap", "pread"])
+def test_parallel_engram_safetensors_byte_exact(
+    tmp_path, storage_format, read_workers, source_kind
+):
+    rows, width = 37, 64
+    packed_width = width // 2 if storage_format == "mxfp4" else width
+    codes = torch.arange(rows * packed_width, dtype=torch.int64).remainder(256)
+    codes = codes.to(torch.uint8).reshape(rows, packed_width)
+    if storage_format == "mxfp8":
+        codes = codes.view(torch.float8_e4m3fn)
+    scales = torch.full((rows, width // 32), 127, dtype=torch.uint8)
+    path = tmp_path / "packed-table.safetensors"
+    save_file({"weight": codes, "scale": scales.view(torch.float8_e8m0fnu)}, str(path))
+    table = RowShardedEngramEmbedding(
+        rows,
+        width,
+        _mapping(0, 1, 1),
+        "cpu",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format=storage_format,
+    )
+    table.weight.data.view(torch.uint8).fill_(255)
+    table.scale.data.zero_()
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for name in ("weight", "scale"):
+            source = handle.get_slice(name)
+            if source_kind == "pread":
+                source = engram.EngramFileSlice(str(path), name, source)
+            table.load_sharded(name, source, 7, read_workers=read_workers)
+    assert torch.equal(table.weight.view(torch.uint8), codes.view(torch.uint8))
+    assert torch.equal(table.scale, scales)
+
+
+def test_parallel_engram_propagates_invalid_checkpoint_dtype(tmp_path):
+    table = RowShardedEngramEmbedding(
+        17,
+        64,
+        _mapping(0, 1, 1),
+        "cpu",
+        False,
+        "gpu",
+        None,
+        1,
+        storage_format="mxfp4",
+    )
+    path = tmp_path / "wrong-dtype.safetensors"
+    save_file({"weight": torch.zeros((17, 32), dtype=torch.bfloat16)}, str(path))
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        with pytest.raises(TypeError, match="weights must stay"):
+            table.load_sharded("weight", handle.get_slice("weight"), 3, read_workers=4)
+        with pytest.raises(ValueError, match="positive"):
+            table.load_sharded("weight", handle.get_slice("weight"), 3, read_workers=0)
+
+
+def test_engram_file_reader_detects_truncated_rows(tmp_path):
+    path = tmp_path / "truncated-table.safetensors"
+    save_file(
+        {
+            "weight": torch.arange(17 * 32, dtype=torch.int64)
+            .remainder(256)
+            .to(torch.uint8)
+            .reshape(17, 32)
+        },
+        str(path),
+    )
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        reader = engram.EngramFileSlice(str(path), "weight", handle.get_slice("weight"))
+        os.truncate(path, path.stat().st_size - 1)
+        with pytest.raises(EOFError, match="declared extent"):
+            reader[0:17, :]

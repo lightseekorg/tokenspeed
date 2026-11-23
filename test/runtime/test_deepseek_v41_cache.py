@@ -2113,6 +2113,70 @@ def test_batched_prefill_attention_matches_per_request_batches(monkeypatch):
     torch.cuda.synchronize()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="requires native SM120 attention",
+)
+@pytest.mark.parametrize("layer", [0, 20])
+def test_single_request_paged_prefill_backend(monkeypatch, layer):
+    from tokenspeed_kernel.ops.attention.dsv41 import flashinfer_sm120  # noqa: F401
+
+    torch.manual_seed(47)
+    n = 65
+    q = torch.randn(n, 2, 512, dtype=torch.bfloat16, device="cuda")
+    swa = torch.randn_like(q[:, 0])
+    main = torch.randn_like(swa)
+    ik = torch.randn(n, 128, dtype=q.dtype, device=q.device)
+    iq = torch.randn(n, 2, 128, dtype=q.dtype, device=q.device)
+    iw = torch.rand(n, 2, dtype=q.dtype, device=q.device)
+    tables = _tables("cuda")
+
+    def attend(enabled):
+        monkeypatch.setenv("TOKENSPEED_ENABLE_SM120_PAGED_PREFILL", str(int(enabled)))
+        backend = _backend("cuda", 1)
+        meta = _extend(backend, tables, [n], [0], [0], [n])
+        if layer == 20:
+            backend.write_global(
+                layer,
+                main,
+                ik,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.EXTEND,
+                main_rope_cache=None,
+            )
+        result = backend.forward_v41(
+            q,
+            swa,
+            layer_id=layer,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=iq if layer == 20 else None,
+            index_weights=iw if layer == 20 else None,
+            attn_sink=torch.zeros(2, device=q.device),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=None,
+            key_rows=None,
+        )
+        assert (backend._prefill_kv_batch is None) == enabled
+        return result, dsv41.cache_gather(
+            backend.cache_pool.swa(layer),
+            meta.swa_write_slots,
+            backend.swa_format,
+            None,
+        )
+
+    expected, expected_rows = attend(False)
+    actual, rows = attend(True)
+    torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+    torch.testing.assert_close(rows, expected_rows, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_batched_prefill_reuses_owner_history_until_global_write():
     backend = _backend("cuda", 2)
@@ -2608,7 +2672,7 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
         for_graph_replay=False,
     )
     monkeypatch.setattr(dsv41, "cache_scatter", lambda *args: None)
-    monkeypatch.setattr(dsv41, "new_attention_schedule", object)
+    monkeypatch.setattr(dsv41, "new_attention_schedule", lambda *, previous: object())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     captured = []
 
@@ -4764,7 +4828,7 @@ def test_model_qcp_prefill_config(kvp_size):
     args.speculative_num_steps = 4
     assert DeepseekV41Config.generate(args, model, False).qcp_size == 4
     args.disaggregation_mode = "decode"
-    with pytest.raises(ValueError, match="PD prefill role"):
+    with pytest.raises(ValueError, match="normal or PD prefill engine"):
         DeepseekV41Config.generate(args, model, False)
 
 

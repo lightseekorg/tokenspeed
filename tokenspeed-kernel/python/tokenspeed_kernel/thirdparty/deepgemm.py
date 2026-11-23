@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -160,5 +162,47 @@ def fp8_mm(
 
     deep_gemm.fp8_gemm_nt(
         (x, x_scales), (weight, weight_scales), out, recipe=(1, 1, 32)
+    )
+    return out
+
+
+def pack_mxfp8_ue8m0_scales(scales: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    """Pack canonical group-32 exponents without requantizing their values."""
+    import deep_gemm_sm120 as deep_gemm
+
+    values = torch.exp2(scales.float() - 127)
+    return deep_gemm.transform_sf_into_required_layout(values, rows, k, (1, 32))
+
+
+def mxfp8_mm_sm120(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    packed_b_scales: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Execute group-32 E4M3 GEMM with prepacked UE8M0 weight scales."""
+    import deep_gemm_sm120 as deep_gemm
+
+    fused_pack = os.environ.get("TOKENSPEED_EXPERIMENT_SM120_FUSED_SCALE_PACK")
+    if fused_pack not in (None, "0", "1"):
+        raise ValueError("TOKENSPEED_EXPERIMENT_SM120_FUSED_SCALE_PACK must be 0 or 1")
+    if fused_pack == "1":
+        from tokenspeed_kernel.ops.gemm._triton.ue8m0_pack import pack_ue8m0
+        from tokenspeed_kernel.platform import ArchVersion, Platform
+
+        if Platform.get().arch_version != ArchVersion(12, 0):
+            raise ValueError("Experimental fused scale packing requires SM120")
+        # The vendor preserves transposed FP32 layouts through a different
+        # packer. Keep that path for noncanonical activation scales.
+        packed_a_scales = (
+            pack_ue8m0(a_scales)
+            if a_scales.is_contiguous()
+            else pack_mxfp8_ue8m0_scales(a_scales, a.shape[0], a.shape[1])
+        )
+    else:
+        packed_a_scales = pack_mxfp8_ue8m0_scales(a_scales, a.shape[0], a.shape[1])
+    deep_gemm.fp8_fp4_gemm_nt(
+        (a, packed_a_scales), (b, packed_b_scales), out, recipe=(1, 1, 32)
     )
     return out

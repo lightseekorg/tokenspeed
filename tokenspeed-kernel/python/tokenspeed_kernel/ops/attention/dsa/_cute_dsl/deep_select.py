@@ -22,7 +22,8 @@
 
 This is a from-scratch CuTe DSL rendition of the DeepSeek DeepSelect algorithm
 (https://github.com/deepseek-ai/DeepSelect) for Hopper, where the upstream
-package ships no cubin. One CTA (or one thread-block cluster) selects the
+package ships no cubin. SM120 uses smaller buffers and a single CTA to fit
+its 99 KiB shared-memory limit, without changing the selection algorithm. One CTA (or one thread-block cluster) selects the
 ``topk`` largest entries of one FP32 row:
 
 1. **Init window.** The first round of the row -- the row's last (at most)
@@ -63,20 +64,28 @@ import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
+_platform = current_platform()
+_SMALL_SMEM = _platform.is_nvidia and _platform.arch_version == ArchVersion(12, 0)
+
+# SM120 has 99 KiB per CTA: reduce scan and candidate buffers, and use
+# single-CTA selection. Hopper retains its original geometry and clusters.
 # Geometry shared with DeepSelect's FP32 configuration.
-NUM_THREADS = 512
+NUM_THREADS = 128 if _SMALL_SMEM else 512
 NUM_WARPS = NUM_THREADS // 32
 ELEMS_PER_THREAD = 16
 ROUND_ELEMS = NUM_THREADS * ELEMS_PER_THREAD  # 8192 entries per round
 SEG_ELEMS = 512  # one warp visits one segment per round
 SEGS_PER_ROUND = ROUND_ELEMS // SEG_ELEMS
-TAIL_ELEMS = 4096  # the row suffix that is always visited in order
+TAIL_ELEMS = (
+    2048 if _SMALL_SMEM else 4096
+)  # the row suffix that is always visited in order
 TAIL_SEGS = TAIL_ELEMS // SEG_ELEMS
 # Candidates accumulated before a compaction. DeepSelect uses 4096; the 64
 # fewer slots keep the max_topk=2048 configuration within Hopper's 227 KiB of
 # dynamic shared memory (survivors + candidates + ring + histograms).
-RECONSTRUCT_THRESHOLD = 4032
+RECONSTRUCT_THRESHOLD = 1024 if _SMALL_SMEM else 4032
 # The check runs after a round, so up to a full round of hits may follow.
 INCOMING_SLOTS = RECONSTRUCT_THRESHOLD + ROUND_ELEMS
 RADIX_BUCKETS = 256
@@ -89,10 +98,10 @@ RADIX_SLOTS = RADIX_BUCKETS + 4
 NUM_HISTS = 3
 # Shared-memory ring for the main rounds: NUM_STAGES - 1 rounds are in flight
 # while one is being filtered.
-NUM_STAGES = 3
+NUM_STAGES = 2 if _SMALL_SMEM else 3
 SEG_BYTES = SEG_ELEMS * 4
 SUPPORTED_MAX_TOPK = (512, 1024, 2048)
-SUPPORTED_CLUSTER_SIZES = (1, 2, 4, 8)
+SUPPORTED_CLUSTER_SIZES = (1,) if _SMALL_SMEM else (1, 2, 4, 8)
 
 # Pseudo-random segment permutation, ``perm(i) = (i * (P mod n) + A) mod n``.
 PERM_ADD_BASE = 0x22262226
@@ -933,6 +942,10 @@ class DeepSelectTopK:
                 warp,
                 lane,
             )
+            # A partial init window has no k-th value yet. Keep every finite
+            # score eligible until reconstruction has enough survivors.
+            if eff_k < topk:
+                threshold_bits = cutlass.Uint32(NEG_INF_BITS)
 
             # An underfilled window has no k-th value yet. Keep lower scores
             # eligible until reconstruction has collected enough candidates.

@@ -311,7 +311,7 @@ def validate_context_parallel_roles(
     qcp_size: int,
     disaggregation_mode: str,
 ) -> None:
-    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
+    """Validate KVP/DCP roles and the extend-sharded QCP layout.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
     """
@@ -325,13 +325,10 @@ def validate_context_parallel_roles(
             f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
-        if disaggregation_mode != "prefill":
+        if disaggregation_mode not in ("null", "prefill"):
             raise ValueError(
                 "--query-context-parallel-size > 1 requires --disaggregation-mode "
-                f"prefill (got {disaggregation_mode!r}): the query shard is a "
-                "prefill-role layout whose decode arm runs every row on every "
-                "rank (the drafter's steps only), which no engine serving "
-                "steady-state decode should pay"
+                f"null or prefill (got {disaggregation_mode!r})"
             )
         if kvp_size not in (1, qcp_size):
             raise ValueError(
@@ -389,7 +386,8 @@ def validate_qcp(
     """Reject query-context-parallel layouts the first landing does not serve.
 
     QCP shards an extend forward's rows over the attention TP group; the
-    decode arm serves only the drafter's steps, every row on every rank.
+    decode arm executes every row on every rank, including the short decode
+    tail of a normal engine used for independent prefill measurements.
     These are the layout gaps that rule; the role and size relations live in
     ``validate_context_parallel_roles``, the shard width in ``Mapping``, and
     the backend, device and KV-cache capabilities in ``AttnConfig``, which

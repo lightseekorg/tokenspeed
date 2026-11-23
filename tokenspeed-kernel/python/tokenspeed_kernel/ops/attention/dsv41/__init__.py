@@ -49,6 +49,8 @@ the block's ids, positions, HC mix and workspace addressing.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import (
     IndexKeyInput,
@@ -86,6 +88,7 @@ __all__ = [
     "selected_attention",
     "selected_attention_fp8",
     "prepare_fused_decode_weights",
+    "try_paged_prefill",
     "selected_attention_rope",
     "new_attention_schedule",
     "index_score",
@@ -357,12 +360,28 @@ def index_q_quantize(
     return _kernel("index_q_quantize", q)(q, cache_format, out)
 
 
-def new_attention_schedule() -> object | None:
-    """Create an uninitialized FlashMLA schedule when the optional API is available.
+def new_attention_schedule(previous: object | None = None) -> object | None:
+    """Create native scheduling state, or reuse an SM120 runner across forwards.
 
-    The caller retains it through capture/replay; no request state or global
-    tensor cache is allocated here. Portable selected attention accepts None.
+    FlashMLA needs a fresh length-dependent schedule. FlashInfer retains warmed
+    shape plans and scratch but consumes live lengths on every call. Callers
+    own this state through capture/replay; no global tensor cache is allocated.
     """
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    platform = current_platform()
+    if platform.is_nvidia and platform.arch_version == ArchVersion(12, 0):
+        from tokenspeed_kernel.ops.attention.dsv41.flashinfer import (
+            FlashInferSchedule,
+            new_flashinfer_schedule,
+        )
+
+        return (
+            previous
+            if isinstance(previous, FlashInferSchedule)
+            else new_flashinfer_schedule()
+        )
+
     from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
         is_flash_mla_v41_available,
     )
@@ -518,6 +537,23 @@ def selected_attention(
                 "lse must be contiguous FP32 [tokens, heads] on the query device"
             )
 
+    from tokenspeed_kernel.ops.attention.dsv41.flashinfer import (
+        FlashInferSchedule,
+        supports_cache,
+    )
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    platform = current_platform()
+    flashinfer = (
+        platform.is_nvidia
+        and platform.arch_version == ArchVersion(12, 0)
+        and isinstance(schedule, FlashInferSchedule)
+        and prefill_kv is None
+        and prefill_indices is None
+        and 1 <= q.shape[1] <= 128
+        and supports_cache(swa_cache, 528)
+        and (global_cache is None or supports_cache(global_cache, 288))
+    )
     native = (
         schedule is not None or prefill_kv is not None
     ) and is_flash_mla_v41_available()
@@ -527,7 +563,7 @@ def selected_attention(
         format_signature(x=dense_tensor_format(q.dtype)),
         features=None,
         platform=None,
-        traits={"flashmla_eligible": native},
+        traits={"flashmla_eligible": native, "flashinfer_eligible": flashinfer},
         solution=None,
         override=None,
     )
@@ -547,6 +583,62 @@ def selected_attention(
         prefill_kv,
         prefill_indices,
         **({"lse": lse} if lse is not None else {}),
+    )
+
+
+def try_paged_prefill(
+    q: torch.Tensor,
+    swa_prefix: torch.Tensor,
+    swa_current: torch.Tensor,
+    swa_indices: torch.Tensor,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None,
+    lse: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Attend protected SWA rows plus original FP4 pages when a reader exists.
+
+    q is BF16 [T,H,512]. swa_prefix/current are already codec-rounded BF16
+    [rows,512], concatenated in that order; integer swa_indices[T,K] address
+    that concatenation, with -1 for invalid entries. Global arguments are
+    aligned page-planar uint8 [P,64,288], physical integer slots[T,K] and
+    scan lengths[T], or all None. attn_sink is FP32 [H] (padding is allowed),
+    counted once. softmax_scale scales QK. out is BF16 [T,H,512] and lse is
+    natural-log FP32 [T,H], or explicitly None to allocate/omit.
+
+    Returns BF16 output, or None when no registered implementation serves the
+    platform. Callers retain their existing workspace fallback in that case.
+    Empty/invalid selections produce zero output. This op never writes the
+    persistent SWA ring or changes global FP4 quantization.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsv41_paged_prefill",
+            format_signature(x=dense_tensor_format(q.dtype)),
+            features=None,
+            platform=None,
+            traits=None,
+            solution=None,
+            override=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        q,
+        swa_prefix,
+        swa_current,
+        swa_indices,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        out,
+        lse,
     )
 
 
@@ -891,6 +983,7 @@ def _index_topk_traits(query_heads, query_is_cuda, index_cache, process_group):
     """index_topk's selection traits for its query heads, cache and head group."""
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
+        is_sm120_native_indexer_available,
     )
 
     # Each target scores the index rows its own cache format stores: FP4 with
@@ -910,6 +1003,7 @@ def _index_topk_traits(query_heads, query_is_cuda, index_cache, process_group):
     )
     native = shaped and (
         prefill_indexer_batching_supported(row_bytes)
+        or (row_bytes == 68 and is_sm120_native_indexer_available())
         or (row_bytes == 132 and is_hopper_indexer_available())
     )
     index_k_format = {
@@ -1811,6 +1905,10 @@ import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41.flashinfer  # noqa: E402,F401
+
+if os.environ.get("TOKENSPEED_ENABLE_SM120_PAGED_PREFILL") == "1":
+    import tokenspeed_kernel.ops.attention.dsv41.flashinfer_sm120  # noqa: E402,F401
 
 # isort: on
 
@@ -2053,4 +2151,13 @@ def verify_layout(
         latest_scores=latest_scores,
         request_slots=request_slots,
         active_count=active_count,
+    )
+
+
+# These opt-ins affect the Prefill selector; other platforms keep their
+# existing registry entries and current batch/slot finishing contracts.
+if os.environ.get("TOKENSPEED_ENABLE_SM120_PREFILL_INDEXER") == "1":
+    import tokenspeed_kernel.ops.attention.dsv41.triton_sm120  # noqa: E402,F401
+    from tokenspeed_kernel.ops.attention.dsv41 import (  # noqa: E402,F401
+        flashinfer_index_sm120 as _flashinfer_index_sm120,
     )

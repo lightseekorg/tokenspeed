@@ -85,6 +85,7 @@ def test_off_by_default_everywhere():
         dict(kvp_size=4, dcp_size=1, qcp_size=1, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
         dict(kvp_size=1, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
+        dict(kvp_size=1, dcp_size=1, qcp_size=4, disaggregation_mode="null"),
         dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
         dict(kvp_size=8, dcp_size=8, qcp_size=1, disaggregation_mode="null"),
     ],
@@ -137,7 +138,7 @@ def test_the_roles_that_take_the_flags(kwargs):
         # The query shard is a prefill-role layout over sharded pages.
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=2, disaggregation_mode="decode"),
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "--query-context-parallel-size > 1 requires --disaggregation-mode null or prefill",
         ),
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
@@ -216,11 +217,11 @@ def test_the_prefill_role_shards_its_pages_without_a_query_shard():
         ),
         (
             ["--disaggregation-mode", "null"],
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "requires --decode-context-parallel-size 2",
         ),
         (
             ["--disaggregation-mode", "decode"],
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "--query-context-parallel-size > 1 requires --disaggregation-mode null or prefill",
         ),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
         (["--data-parallel-size", "2"], "attention DP 1"),
@@ -436,18 +437,45 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
     assert not args.mapping.attn.has_qcp
     with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
-    with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):
-        prepare_server_args(
-            argv
-            + [
-                "--decode-context-parallel-size",
-                str(size),
-                "--query-context-parallel-size",
-                str(size),
-            ]
-        )
+    qcp = prepare_server_args(
+        argv
+        + [
+            "--decode-context-parallel-size",
+            str(size),
+            "--query-context-parallel-size",
+            str(size),
+        ]
+    )
+    assert qcp.mapping.attn.qcp_size == qcp.mapping.attn.kvp_size == size
+    assert qcp.decode_context_parallel_size == size
 
 
 def test_dsa_query_sharding_still_requires_sharded_kv():
     with pytest.raises(ValueError, match="KVP equal to QCP"):
         _dsa_attn_config(kvp_size=1, kvp_rank=0, kvp_group=(0,))
+
+
+def test_normal_qcp_replicates_decode_without_sharding_kv():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--attn-tp-size",
+            "2",
+            "--query-context-parallel-size",
+            "2",
+            "--kv-parallel-size",
+            "1",
+            "--dense-tp-size",
+            "1",
+            "--moe-tp-size",
+            "1",
+            "--ep-size",
+            "2",
+            "--disaggregation-mode",
+            "null",
+        ]
+    )
+    assert args.mapping.attn.qcp_size == 2
+    assert args.mapping.attn.kvp_size == 1
+    assert args.disaggregation_mode == "null"

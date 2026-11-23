@@ -639,6 +639,15 @@ class MoELayer(torch.nn.Module):
                 num_local_experts=partition.count,
             )
 
+        from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4PerExpertConfig
+
+        if (
+            isinstance(self.quant_config, Nvfp4PerExpertConfig)
+            and self.plan["apply_kernel_name"] != "flashinfer_sm12x_nvfp4_moe_apply"
+        ):
+            raise ValueError(
+                "Per-expert NVFP4 FC1 scales require the SM12x NVFP4 kernel"
+            )
         create_layer_weights(
             self._storage_spec,
             self,

@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
@@ -858,6 +860,8 @@ def _index_scan_kernel(
     BLOCK_K: tl.constexpr,
     MAKE_BLOCKS: tl.constexpr,
     INDEX_FP8: tl.constexpr,
+    DENSE_OUTPUT: tl.constexpr,
+    DENSE_WIDTH,
 ):
     query, part = tl.program_id(0), tl.program_id(1)
     visible = tl.minimum(tl.maximum(tl.load(Visible + query * VS), 0), TABLE_WIDTH * 64)
@@ -870,7 +874,8 @@ def _index_scan_kernel(
     span = tl.cdiv(width, PARTS * 8) * 8
     begin = part * span
     end = tl.minimum(begin + span, width)
-    row_acc = tl.full((ROW_K,), 0, tl.uint64)
+    if not DENSE_OUTPUT:
+        row_acc = tl.full((ROW_K,), 0, tl.uint64)
     if MAKE_BLOCKS:
         block_acc = tl.full((BLOCK_K,), 0, tl.uint64)
     h = tl.arange(0, H)
@@ -970,7 +975,14 @@ def _index_scan_kernel(
             scores = scores + partial.to(W.dtype.element_ty).to(tl.float32)
         scores = scores.to(W.dtype.element_ty).to(tl.float32)
         scores = tl.where(valid, scores, -float("inf"))
-        row_acc = _index_merge(row_acc, scores, logical, B, ROW_K)
+        if DENSE_OUTPUT:
+            tl.store(
+                RowScores + query * DENSE_WIDTH + col,
+                scores,
+                col < tl.minimum(start + STEP, end),
+            )
+        else:
+            row_acc = _index_merge(row_acc, scores, logical, B, ROW_K)
         if MAKE_BLOCKS:
             block_scores = tl.max(scores.reshape(B // 8, 8), 1)
             block_ids = (start // 8 + tl.arange(0, B // 8)).to(tl.int64)
@@ -982,10 +994,11 @@ def _index_scan_kernel(
             block_acc = _index_merge(
                 block_acc, block_scores, block_ids, B // 8, BLOCK_K
             )
-    offset = (query * PARTS + part) * ROW_K + tl.arange(0, ROW_K)
-    scores, ids = _index_unpack(row_acc)
-    tl.store(RowScores + offset, scores)
-    tl.store(RowIds + offset, ids)
+    if not DENSE_OUTPUT:
+        offset = (query * PARTS + part) * ROW_K + tl.arange(0, ROW_K)
+        scores, ids = _index_unpack(row_acc)
+        tl.store(RowScores + offset, scores)
+        tl.store(RowIds + offset, ids)
     if MAKE_BLOCKS:
         offset = (query * PARTS + part) * BLOCK_K + tl.arange(0, BLOCK_K)
         scores, ids = _index_unpack(block_acc)
@@ -1008,15 +1021,53 @@ def _index_gather_heads(q, weights, process_group):
     return gathered[..., :128].to(torch.bfloat16), gathered[..., 128], shards
 
 
+@triton.jit
+def _index_pack_parts_kernel(
+    Scores,
+    Ids,
+    Packed,
+    WIDTH,
+    S0,
+    S1,
+    I0,
+    I1,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    score = tl.load(Scores + row * S0 + col * S1, col < WIDTH, other=-float("inf"))
+    ident = tl.load(Ids + row * I0 + col * I1, col < WIDTH, other=-1).to(tl.int64)
+    bits = score.to(tl.uint32, bitcast=True)
+    ordered = bits ^ tl.where((bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000)
+    # Signed int64 keys preserve score order, then prefer the smaller row id.
+    packed = ((ordered.to(tl.int64) - 0x80000000) << 32) | (0xFFFFFFFF - ident)
+    packed = tl.where(score == -float("inf"), -9223372036854775808, packed)
+    tl.store(Packed + row * WIDTH + col, packed, col < WIDTH)
+
+
 def _index_finish_parts(scores, ids, k, output, lengths):
-    bits = scores.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    ordered = bits ^ torch.where(
-        bits & 0x80000000 != 0,
-        0xFFFFFFFF,
-        0x80000000,
-    )
-    packed = ((ordered - 0x80000000) << 32) | (0xFFFFFFFF - ids)
-    packed.masked_fill_(scores == -torch.inf, torch.iinfo(torch.int64).min)
+    use_fused = os.environ.get("TOKENSPEED_EXPERIMENT_FUSED_INDEX_PACK")
+    if use_fused not in (None, "0", "1"):
+        raise ValueError("TOKENSPEED_EXPERIMENT_FUSED_INDEX_PACK must be 0 or 1")
+    if use_fused == "1":
+        packed = torch.empty(scores.shape, device=scores.device, dtype=torch.int64)
+        if scores.numel():
+            _index_pack_parts_kernel[
+                (scores.shape[0], triton.cdiv(scores.shape[1], 256))
+            ](
+                scores,
+                ids,
+                packed,
+                scores.shape[1],
+                *scores.stride(),
+                *ids.stride(),
+                256,
+            )
+    else:
+        bits = scores.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        ordered = bits ^ torch.where(bits & 0x80000000 != 0, 0xFFFFFFFF, 0x80000000)
+        packed = ((ordered - 0x80000000) << 32) | (0xFFFFFFFF - ids)
+        packed.masked_fill_(scores == -torch.inf, torch.iinfo(torch.int64).min)
     positions = packed.topk(k, dim=1, sorted=False).indices
     values = scores.gather(1, positions)
     _finish_topk(values, ids.gather(1, positions), output, lengths)
@@ -1184,7 +1235,48 @@ def index_topk(
     out,
     index_metadata,
 ):
+    return _index_topk(
+        index_q,
+        weights,
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        candidate_block_size,
+        query_chunk_size,
+        score_chunk_size,
+        process_group,
+        out,
+        index_metadata,
+        scan_num_warps=4,
+        dense_selector=None,
+    )
+
+
+def _index_topk(
+    index_q,
+    weights,
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    candidate_block_size,
+    query_chunk_size,
+    score_chunk_size,
+    process_group,
+    out,
+    index_metadata,
+    *,
+    scan_num_warps,
+    dense_selector,
+):
     del index_metadata
+    if dense_selector is not None and candidate_topk:
+        raise ValueError("Dense selection cannot produce candidate blocks")
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -1200,6 +1292,47 @@ def index_topk(
         process_group,
         out,
     )
+    # Cover the runtime's complete 256-row query tile, including verify batches
+    # above BS16. Full and candidate scoring partition independent query rows.
+    if (
+        os.environ.get("TOKENSPEED_EXPERIMENT_SM120_DG_INDEXER") == "1"
+        and candidate_blocks is None
+        and process_group is None
+        and index_q.shape[0] <= 256
+        and index_cache.shape[1:] == (64, 68)
+        and index_q.is_cuda
+        and torch.cuda.get_device_capability(index_q.device) == (12, 0)
+    ):
+        from tokenspeed_kernel.thirdparty.deepgemm_sm120_indexer_experiment import (
+            full_index_topk,
+        )
+
+        return full_index_topk(
+            index_q,
+            weights,
+            index_cache,
+            page_table,
+            visible_lens,
+            topk,
+            candidate_topk,
+            out,
+        )
+    from tokenspeed_kernel.ops.attention.dsv41._cute_dsl.selection import (
+        enabled,
+        select_candidates,
+    )
+
+    if (
+        dense_selector is None
+        and enabled()
+        and candidate_blocks is not None
+        and candidate_blocks.shape[1] > 0
+        and not candidate_topk
+        and process_group is None
+        and index_q.shape[0] <= 256
+        and topk <= 2048
+    ):
+        dense_selector = select_candidates
     tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
     row_out.fill_(-1)
@@ -1213,6 +1346,17 @@ def index_topk(
     index_format = _paged_format(index_cache, "index")
     parts = 16
     tile = max(16, min(256, 1 << (score_chunk_size.bit_length() - 1)))
+    tuned_reindex = (
+        dense_selector is select_candidates
+        and index_format == "index"
+        and index_q.shape[1] == 32
+        and tokens <= 256
+        and score_chunk_size >= 128
+    )
+    if tuned_reindex:
+        # Dense scoring has no per-partition Top-K merge. More smaller tiles
+        # improve occupancy without changing per-row dot/reduction arithmetic.
+        parts, tile = 64, 128
     row_k = max(tile, triton.next_power_of_2(topk))
     block_k = max(tile // 8, triton.next_power_of_2(max(1, candidate_topk)))
     query_chunk_size = min(query_chunk_size, 256)
@@ -1224,9 +1368,19 @@ def index_topk(
         q = index_q_quantize(q, index_format, None)
         table, visible = page_table[start:end], visible_lens[start:end]
         candidates = None if candidate_blocks is None else candidate_blocks[start:end]
-        shape = (end - start, parts * row_k)
+        dense_width = (
+            (candidates.shape[1] * 8 if candidates is not None else table.shape[1] * 64)
+            if dense_selector is not None
+            else 0
+        )
+        shape = (end - start, dense_width or parts * row_k)
         row_scores = torch.empty(shape, dtype=torch.float32, device=q.device)
-        row_ids = torch.empty(shape, dtype=torch.int64, device=q.device)
+        if dense_selector is not None:
+            # Scan writes only visible rows. All masked columns still enter
+            # selection, so initialize them to the same -inf sentinel.
+            row_scores.fill_(-torch.inf)
+        id_shape = shape if dense_selector is None else (end - start, 0)
+        row_ids = torch.empty(id_shape, dtype=torch.int64, device=q.device)
         shape = (end - start, parts * block_k if candidate_topk else 0)
         block_scores = torch.empty(shape, dtype=torch.float32, device=q.device)
         block_ids = torch.empty(shape, dtype=torch.int64, device=q.device)
@@ -1261,11 +1415,21 @@ def index_topk(
             block_k,
             bool(candidate_topk),
             index_format == "index_v4",
+            dense_selector is not None,
+            dense_width,
             enable_fp_fusion=False,
+            num_warps=scan_num_warps,
+            num_stages=2 if tuned_reindex else 3,
         )
-        _index_finish_parts(
-            row_scores, row_ids, topk, row_out[start:end], row_lens[start:end]
-        )
+        if dense_selector is None:
+            _index_finish_parts(
+                row_scores, row_ids, topk, row_out[start:end], row_lens[start:end]
+            )
+        else:
+            values, ids = dense_selector(row_scores, topk)
+            _finish_topk(
+                values, ids, row_out[start:end], row_lens[start:end], candidates
+            )
         if candidate_topk:
             _index_finish_parts(
                 block_scores,

@@ -522,6 +522,87 @@ def test_dp_ep_collectives_ci_runs_two_rank_gloo():
     )
 
 
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
+@pytest.mark.skipif(
+    "RANK" not in os.environ or os.environ.get("WORLD_SIZE") != "2",
+    reason="run this regression with torchrun and two ranks",
+)
+def test_qcp_sm120_unsharded_forward_has_startup_count_group(monkeypatch):
+    """Keep construction, group registration and FFN count exchange real.
+
+    Two CPU ranks isolate the communicator lifecycle. Checkpoint-sized GPU
+    experts are replaced; this does not assert SM120 EP2 transport support.
+    """
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    manager = ProcessGroupManager()
+    mapping = Mapping(
+        rank=int(os.environ["RANK"]),
+        world_size=2,
+        attn_tp_size=2,
+        attn_qcp_size=2,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    manager.init_distributed(mapping, backend="gloo", timeout=90)
+    calls = []
+
+    class Expert(_DenseFFN):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.use_sm120_deepep = True
+            self.owns_ep_communication = True
+
+        def forward(self, x, mask, total, maximum, *, ctx, comm_manager):
+            calls.append((total, maximum))
+            return x
+
+    monkeypatch.setattr(v41, "pg_manager", manager)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", Expert)
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    with torch.device("meta"):
+        model = DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+    group = manager.get_process_group("gloo", (0, 1), name="v41_decoder_counts")
+    assert group is not dist.group.WORLD
+    assert dist.get_backend(group) == "gloo"
+    assert not manager.has_process_group("gloo", (0, 1))
+    # Both ranks, including an idle peer, must size each dispatch identically.
+    for counts in ([0, 7], [5, 0], [3, 9]):
+        rows = counts[mapping.rank]
+        x = torch.arange(rows * 128, dtype=torch.float32).reshape(rows, 128)
+        ctx = _ctx(None, rows, ForwardMode.EXTEND)
+        assert ctx.query_shard is None and not ctx.all_decode_or_idle
+        result = model.layers[0]._forward_ffn(x, None, ctx, defer_reduce=False)
+        assert result is x
+        assert calls[-1] == (sum(counts), max(counts))
+    dist.barrier(group=group)
+
+
+@pytest.mark.skipif("RANK" in os.environ, reason="already running under torchrun")
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
+def test_qcp_sm120_count_group_ci_runs_two_rank_gloo():
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        "-m",
+        "pytest",
+        "-q",
+        f"{Path(__file__).resolve()}::test_qcp_sm120_unsharded_forward_has_startup_count_group",
+    ]
+    try:
+        returncode, stdout, stderr = _run_gloo_workers(command, timeout=120)
+    except TimeoutError as error:
+        pytest.fail(str(error))
+    assert returncode == 0, (
+        f"QCP count-group regression exited with {returncode}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+
+
 @pytest.mark.parametrize("launcher_exits_early", [False, True])
 def test_gloo_worker_timeout_kills_detached_descendant(tmp_path, launcher_exits_early):
     marker = tmp_path / "worker.json"

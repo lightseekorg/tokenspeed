@@ -420,6 +420,7 @@ import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton_host_gather  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton_mxfp4  # noqa: E402,F401
 
 
 def mxfp8_embedding(weight, scales, indices, row_start, row_end):
@@ -528,3 +529,66 @@ def vocab_shard_embedding(
         solution=None,
     )
     return kernel(weight, indices, org_range, num_org_padding, added_range)
+
+
+def mxfp4_embedding(weight, scales, indices, row_start, row_end):
+    """Look up packed E2M1/G32 UE8M0 rows, returning BF16; invalid IDs are zero."""
+    if weight.ndim != 2 or weight.dtype != torch.uint8 or weight.shape[1] % 16:
+        raise ValueError("MXFP4 requires packed uint8 [rows,D/2], D divisible by 32")
+    if scales.dtype != torch.uint8 or scales.shape != (
+        weight.shape[0],
+        weight.shape[1] // 16,
+    ):
+        raise ValueError("MXFP4 requires G32 UE8M0 bytes")
+    if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
+        raise ValueError("MXFP4 row range exceeds table capacity")
+    if (
+        not indices.is_cuda
+        or weight.device != indices.device
+        or scales.device != indices.device
+    ):
+        raise ValueError("MXFP4 lookup requires colocated GPU tensors")
+    if (
+        indices.dtype not in (torch.int32, torch.int64)
+        or weight.stride(1) != 1
+        or scales.stride(1) != 1
+    ):
+        raise ValueError(
+            "MXFP4 lookup requires integer IDs and contiguous table columns"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "mxfp4_embedding",
+        format_signature(weight=dense_tensor_format(torch.uint8)),
+        traits=None,
+        solution=None,
+        override=None,
+    )
+    return kernel(weight, scales, indices, row_start, row_end)
+
+
+def mxfp4_embedding_decode(codes, scales):
+    """GPU-decode gathered packed rows [...,D/2] plus UE8M0 [...,D/32] into BF16."""
+    if codes.ndim < 2 or codes.dtype != torch.uint8 or codes.shape[-1] % 16:
+        raise ValueError("MXFP4 codes must be uint8 [...,D/2], D divisible by 32")
+    if scales.dtype != torch.uint8 or scales.shape != (
+        *codes.shape[:-1],
+        codes.shape[-1] // 16,
+    ):
+        raise ValueError("MXFP4 scales must be UE8M0 [...,D/32]")
+    if (
+        not codes.is_cuda
+        or codes.device != scales.device
+        or not codes.is_contiguous()
+        or not scales.is_contiguous()
+    ):
+        raise ValueError("MXFP4 decode requires contiguous colocated GPU tensors")
+    kernel = select_kernel(
+        "embedding",
+        "mxfp4_embedding_decode",
+        format_signature(weight=dense_tensor_format(torch.uint8)),
+        traits=None,
+        solution=None,
+        override=None,
+    )
+    return kernel(codes, scales)

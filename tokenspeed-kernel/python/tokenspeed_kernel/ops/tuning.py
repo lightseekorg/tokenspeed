@@ -48,6 +48,7 @@ __all__ = [
     "is_autotuning",
     "is_warming_up",
     "kernel_warmup",
+    "local_autotune",
     "load_autotune_cache",
     "save_autotune_cache",
     "set_autotune_max_num_tokens",
@@ -397,6 +398,17 @@ def set_autotune_process_group(process_group) -> None:
     _autotune_process_group = process_group
     if _autotuner is not None:
         _autotuner.set_autotune_process_group(process_group)
+
+
+@contextlib.contextmanager
+def local_autotune() -> Generator[None]:
+    """Tune local-only kernels without synchronizing rank-specific profiles."""
+    group = _autotune_process_group
+    set_autotune_process_group(None)
+    try:
+        yield
+    finally:
+        set_autotune_process_group(group)
 
 
 def _install_autotune_cache_bytes(path: str, payload: bytes) -> None:

@@ -35,3 +35,15 @@ Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.
 CPU tests cover equations, boundary transitions, and rounding against an FP64 host reference.
 Shared GPU tests compare the kernels with the CPU equations.
+
+## SM120 mHC selection
+
+Ordinary DeepGEMM mHC pre/mixes are restricted to architecture families 9–10.
+SM120 uses the portable IEEE Triton projection by default.
+
+## Optional SM120 mHC coefficients
+
+`TOKENSPEED_ENABLE_SM120_MHC_MIXES=1` registers the compensated Tensor Core
+projection in `triton_sm120.py`. It preserves FP32 coefficient weights and
+uses compensated multiplication; it is a numerical optimization requiring
+its own kernel and model checks, not a checkpoint format conversion.

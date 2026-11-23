@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
@@ -178,6 +179,10 @@ def _deepseek_v4_routed_expert_quant_config(
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
     # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
     # expert contract so packed FP4 tensors are never allocated as block FP8.
+    if getattr(config, "moe_quant_algo", None) == "NVFP4":
+        from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4PerExpertConfig
+
+        return Nvfp4PerExpertConfig(group_size=16), False
     is_block_fp8 = isinstance(quant_config, Fp8Config) and (
         getattr(config, "expert_dtype", None) != "fp4"
     )
@@ -323,6 +328,12 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             with_bias=False,
             routing_mode="precomputed_topk",
+            internal_activation_dtype_override=(
+                "fp8"
+                if os.environ.get("TOKENSPEED_EXPERIMENT_SM120_DEEPEP") == "1"
+                and isinstance(routed_quant_config, Mxfp4Config)
+                else None
+            ),
             routing_config={
                 "routed_scaling_factor": 1.0,
                 "normalize_topk_weights": config.norm_topk_prob,

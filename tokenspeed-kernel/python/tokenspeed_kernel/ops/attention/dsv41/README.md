@@ -76,3 +76,23 @@ MXFP4 indexer with DeepGEMM and DeepSelect. Hopper and portable scorers retain
 per-request windows and reserve one packed index history; their internal query
 tiling remains responsible for bounding score memory. Cache planning uses the
 same capability check as window merging.
+
+## SM120 adapters
+
+`flashinfer.py` serves selected sparse attention over the existing V4.1
+page-planar caches. A caller-owned schedule retains warmed plans and graph
+scratch while each invocation supplies live lengths and selections.
+`triton_sm120.py` and `flashinfer_index_sm120.py` preserve the BF16 scoring
+contract, with explicit Prefill registration. Native dense FP4 scoring and
+candidate production are separate opt-ins in `deep_gemm.py`; other targets
+retain the current native batched scoring and selection-slot finishing.
+
+- [CuTe DSL selection helpers](_cute_dsl/README.md).
+- [Portable attention helpers](_triton/README.md).
+- [Full-model execution contracts](../../../../../../docs/design/sm120.md).
+
+`TOKENSPEED_ENABLE_SM120_PAGED_PREFILL=1` enables the registered native
+reader for a single contiguous unsharded request with a local query group.
+SWA indices address the protected prefix followed by codec-rounded current
+rows. The reader consumes selected physical global slots directly. Other
+layouts and fused FP8 output use the batched workspace.

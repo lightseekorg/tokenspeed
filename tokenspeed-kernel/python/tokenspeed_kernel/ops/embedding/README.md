@@ -33,3 +33,10 @@ copy fills the rest of the run. Sorting stays on the device, so the launch
 grids do not depend on the ids. Each program of the sorted path reads several
 rows at once to keep more host reads in flight. Smaller lookups keep one
 unsorted row per program, where sorting would cost more than it saves.
+## Packed MXFP4 lookup
+
+`mxfp4_embedding` gathers packed E2M1 codes with G32 UE8M0 scales and returns
+BF16 selected rows. `mxfp4_embedding_decode` decodes rows already gathered
+from host storage. Neither expands the resident table. Invalid row IDs
+produce zero contribution; persistent host allocation and sharding belong
+to the runtime Engram owner.

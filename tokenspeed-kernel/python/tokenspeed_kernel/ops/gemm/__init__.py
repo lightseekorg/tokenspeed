@@ -431,7 +431,7 @@ def _mxfp8_swizzled_scale_count(rows: int, k: int) -> int:
 
 
 def prepare_mxfp8_weight_scales(
-    weight: torch.Tensor, weight_scales: torch.Tensor
+    weight: torch.Tensor, weight_scales: torch.Tensor, *, solution: str | None = None
 ) -> torch.Tensor | None:
     """Swizzle 1x32 UE8M0 weight scales once for ``mm(prepacked_scales=True)``.
 
@@ -445,10 +445,12 @@ def prepare_mxfp8_weight_scales(
         weight: E4M3 weight ``[N, K]`` with unit inner stride.
         weight_scales: Canonical uint8 UE8M0 scales ``[N, K // 32]``; left
             unchanged.
+        solution: Optional backend preference; "deepgemm" enables SM120
+            prepacking. None retains the platform default.
 
     Returns:
-        New 1-D uint8 scales in FlashInfer's F8_128x4 layout, or None when
-        the prepacked path does not apply.
+        New uint8 FlashInfer scales, or int32 DeepGEMM scales when explicitly
+        selected on SM120; None when the weight keeps the canonical path.
     """
     if (
         weight.ndim != 2
@@ -459,6 +461,29 @@ def prepare_mxfp8_weight_scales(
         or weight_scales.device != weight.device
     ):
         raise ValueError("1x32 FP8 weights require canonical UE8M0 [N, K/32] scales")
+    if (
+        current_platform().is_nvidia
+        and current_platform().arch_version.major == 12
+        and current_platform().arch_version.minor == 0
+        and (
+            solution == "deepgemm"
+            or resolve_kernel_override("gemm", "mm", None) == "deepgemm_mm_mxfp8_sm120"
+        )
+    ):
+        if (
+            not weight.is_cuda
+            or weight.stride(-1) != 1
+            or weight.shape[0] % 64
+            or weight.shape[1] % 128
+        ):
+            return None
+        if resolve_kernel_override("quantization", "fp8_with_scale", None) is not None:
+            raise ValueError(
+                "DeepGEMM prepacking requires the canonical group-32 quantizer"
+            )
+        from tokenspeed_kernel.thirdparty.deepgemm import pack_mxfp8_ue8m0_scales
+
+        return pack_mxfp8_ue8m0_scales(weight_scales, *weight.shape)
     if not (
         has_flashinfer_mxfp8()
         and weight.is_cuda
@@ -483,6 +508,24 @@ def _mm_mxfp8_prepacked(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     n, k = B.shape
+    if B_scales is not None and B_scales.dtype == torch.int32:
+        from tokenspeed_kernel.ops.gemm.deepgemm import deepgemm_mm_mxfp8_sm120
+
+        result = deepgemm_mm_mxfp8_sm120(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            block_size=[1, 32],
+            out=out if bias is None else None,
+        )
+        if bias is not None:
+            result = result + bias
+            if out is not None:
+                out.copy_(result)
+                return out
+        return result
     if not has_flashinfer_mxfp8():
         raise ValueError(
             "mm(prepacked_scales=True) with block_size [1, 32] requires "
@@ -951,18 +994,19 @@ def mm(
                 "mm(prepacked_scales=True) requires quant='mxfp8' with block_size"
             )
         if list(block_size) == [1, 32]:
+            prepared_kernel = (
+                "deepgemm_mm_mxfp8_sm120"
+                if B_scales is not None and B_scales.dtype == torch.int32
+                else "flashinfer_mm_mxfp8"
+            )
             if (
                 alpha is not None
                 or solution is not None
-                or override
-                not in (
-                    None,
-                    "flashinfer_mm_mxfp8",
-                )
+                or override not in (None, prepared_kernel)
             ):
                 raise ValueError(
                     "mm(prepacked_scales=True) with block_size [1, 32] runs only "
-                    "flashinfer_mm_mxfp8 and takes no alpha or solution"
+                    "a compatible prepared MXFP8 kernel and takes no alpha or solution"
                 )
             return _mm_mxfp8_prepacked(
                 A, B, A_scales, B_scales, bias=bias, out=out, out_dtype=out_dtype

@@ -144,6 +144,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
@@ -169,6 +170,7 @@ from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.rotary_embedding import (
     yarn_find_correction_range,
     yarn_linear_ramp_mask,
@@ -185,6 +187,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
+    EngramFileSlice,
     EngramHashState,
     EngramHostAlloc,
     is_engram_embed_checkpoint_name,
@@ -193,7 +196,10 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -506,7 +512,10 @@ def _scale_layouts(layer: nn.Module) -> frozenset[str]:
     if not isinstance(method, _ReferenceFp8LinearMethod):
         return frozenset({"canonical"})
     layouts = {"canonical"}
-    if method.prepared_weight_scales is not None:
+    if (
+        method.prepared_weight_scales is not None
+        and method.prepared_weight_scales.dtype == torch.uint8
+    ):
         layouts.add("swizzled")
     if method.projection_weight_scales is not None:
         layouts.add("packed")
@@ -1291,6 +1300,7 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
+    @break_point
     def _write_global_kv(
         self,
         hidden_states,
@@ -1844,6 +1854,21 @@ def _warmup_query_projections(
                 warmed.add(key)
 
 
+def _validate_sm120_deepep_mapping(mapping: Mapping, wire: str) -> None:
+    if wire not in ("elastic_fp8_bf16", "nvfp4_fp8"):
+        raise ValueError(f"Unsupported SM120 DeepEP wire format: {wire}")
+    supported_ep = (4, 8, 16, 32)
+    if not (
+        (mapping.attn.tp_size == 1 or mapping.attn.has_qcp)
+        and mapping.attn.head_tp_size == 1
+        and mapping.dense.tp_size == mapping.moe.tp_size == 1
+        and mapping.moe.ep_size in supported_ep
+    ):
+        raise ValueError(
+            f"SM120 DeepEP {wire} requires head/dense/MoE TP1 and EP in {supported_ep}"
+        )
+
+
 class DeepseekV41MoE(DeepseekV4MoE):
     """V4 expert execution with V4.1 routing and lossless MegaMoE alignment."""
 
@@ -1866,10 +1891,56 @@ class DeepseekV41MoE(DeepseekV4MoE):
                 (config.moe_intermediate_size + alignment - 1) // alignment * alignment
             )
             expert_config.n_shared_experts = None
+        use_sm120_deepep = os.environ.get("TOKENSPEED_EXPERIMENT_SM120_DEEPEP") == "1"
+        if config.moe_quant_algo == "NVFP4":
+            if not use_sm120_deepep or mega_moe:
+                raise ValueError("V4.1 NVFP4 requires the SM120 DeepEP path")
+            if get_global_expert_location_metadata() is not None:
+                raise ValueError(
+                    "NVFP4 expert scale migration is not yet supported by EPLB"
+                )
+        if use_sm120_deepep:
+            # ElasticBuffer returns complete routed outputs. Build the local
+            # shared expert below, without first allocating TPxEP partials.
+            expert_config = copy(expert_config)
+            expert_config.n_shared_experts = None
         super().__init__(
             expert_config, mapping, quant_config, layer_index, prefix, aux_stream
         )
         self.gate.register_parameter("bias_vl", None)
+        # Temporary opt-in experiment; baseline construction remains unchanged.
+        self.use_sm120_deepep = use_sm120_deepep
+        shared_overlap = os.environ.get("TOKENSPEED_EXPERIMENT_SM120_SHARED_OVERLAP")
+        if shared_overlap not in (None, "0", "1"):
+            raise ValueError(
+                "TOKENSPEED_EXPERIMENT_SM120_SHARED_OVERLAP must be 0 or 1"
+            )
+        self.sm120_shared_overlap = shared_overlap == "1"
+        self.sm120_deepep_buffer = None
+        if self.use_sm120_deepep:
+            self.config = config
+            self.n_shared_experts = config.n_shared_experts
+            _validate_sm120_deepep_mapping(
+                mapping,
+                os.environ.get("TOKENSPEED_SM120_DEEPEP_WIRE", "elastic_fp8_bf16"),
+            )
+            if get_moe_backend().value != "flashinfer":
+                raise ValueError("SM120 DeepEP experiment requires FlashInfer")
+            self.owns_ep_communication = True
+            if config.n_shared_experts is not None:
+                self.shared_experts = GatedMLP.tensor_parallel(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size
+                    * config.n_shared_experts,
+                    activation=gated_activation(config.hidden_act, config.swiglu_limit),
+                    tp_rank=mapping.dense.tp_rank,
+                    tp_size=mapping.dense.tp_size,
+                    tp_group=mapping.dense.tp_group,
+                    reduce_results=False,
+                    fusions=(),
+                    quant_config=quant_config,
+                    prefix=add_prefix("shared_experts", prefix),
+                )
         if padded:
             self.config = config
             self.n_shared_experts = config.n_shared_experts
@@ -1887,6 +1958,112 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     quant_config=quant_config,
                     prefix=add_prefix("shared_experts", prefix),
                 )
+
+    def warmup(self):
+        super().warmup()
+        if self.use_sm120_deepep:
+            # Transport preparation owns a persistent distributed buffer, rather
+            # than an operator choice; its kernels remain in tokenspeed-kernel.
+            from tokenspeed_kernel.thirdparty.deepep_sm120_experiment.buffer import (
+                get_buffer,
+            )
+
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+
+            group = process_group_manager.get_process_group(
+                "nccl", self.mapping.moe.ep_group
+            )
+            self.sm120_deepep_buffer = get_buffer(
+                group,
+                self.config.hidden_size,
+                self.config.num_experts_per_tok,
+                self.experts.num_experts,
+            )
+
+    def forward(
+        self,
+        hidden_states,
+        input_ids,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        ctx=None,
+        comm_manager=None,
+        out=None,
+    ):
+        if not self.use_sm120_deepep:
+            return super().forward(
+                hidden_states,
+                input_ids,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                ctx,
+                comm_manager,
+                out,
+            )
+        from tokenspeed_kernel.thirdparty.deepep_sm120_experiment.buffer import (
+            CAPACITY,
+            get_dispatch_capacity,
+        )
+
+        # The outer transport owns dispatch and completion; the selected
+        # FlashInfer expert plan supplies the local weight state it consumes.
+        from tokenspeed_kernel.thirdparty.deepep_sm120_experiment.deepep_flashinfer_fp8_opt import (
+            apply_deepep_flashinfer,
+        )
+
+        if self.sm120_deepep_buffer is None:
+            raise RuntimeError("DeepEP buffer must be initialized before capture")
+        if max_num_tokens_per_gpu < hidden_states.shape[0]:
+            raise ValueError("DeepEP capacity/count contract violated")
+        result = torch.empty_like(hidden_states)
+        # All ranks iterate the same count, including idle ranks and CED tails.
+        # The same chunking applies to eager and graph execution.
+        for start in range(0, max_num_tokens_per_gpu, CAPACITY):
+            capacity = min(CAPACITY, max_num_tokens_per_gpu - start)
+            # Idle and active EP ranks must bucket prefill capacity identically.
+            dispatch_capacity = get_dispatch_capacity(
+                self.sm120_deepep_buffer,
+                max_num_tokens_per_gpu,
+                start,
+                prefill=ctx is not None and not ctx.all_decode_or_idle,
+            )
+            x = hidden_states[start : start + capacity].contiguous()
+            ids = None if input_ids is None else input_ids[start : start + capacity]
+            topk = (
+                self._compute_topk_output(x, ids)
+                if x.shape[0]
+                else super()._compute_topk_output(x, ids)
+            )
+            # The fork event follows routing. Shared experts read the same x
+            # but do not use DeepEP workspace; join before summing or reusing it.
+            with self.stream_fork.scope(
+                enable=self.sm120_shared_overlap and get_is_capture_mode()
+            ) as fork:
+                routed = apply_deepep_flashinfer(
+                    self.sm120_deepep_buffer,
+                    x,
+                    self.experts._moe_backend_state,
+                    topk.topk_ids.to(torch.int64),
+                    topk.topk_weights.float(),
+                    num_experts=self.experts.num_experts,
+                    num_sms=4,
+                    num_qps=4,
+                    num_max_tokens_per_rank=capacity,
+                    communication_capacity=dispatch_capacity,
+                )
+                scale = topk.output_scale
+                if isinstance(scale, torch.Tensor):
+                    scale = scale.to(routed.dtype)
+                if isinstance(scale, torch.Tensor) or scale != 1.0:
+                    routed = routed * scale
+                with fork.branch():
+                    shared = self._forward_shared_experts(x)
+            result[start : start + capacity] = (
+                routed if shared is None else routed + shared
+            )
+        return result if out is None else out.copy_(result)
 
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
@@ -2344,13 +2521,39 @@ class DeepseekV41DecoderLayer(nn.Module):
                 raise ValueError(
                     "Expert-owned communication cannot defer its reduction"
                 )
-            counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            if (
+                self.ffn.use_sm120_deepep
+                and ctx.query_shard is None
+                and not ctx.all_decode_or_idle
+            ):
+                # Chunked dispatch requires identical loop counts, including
+                # idle ranks and rows narrowed by CED. Metadata stays on CPU.
+                counts = _exchange_decoder_counts(
+                    x.shape[0], self.attn.mapping.world_size
+                )
+            else:
+                counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            if (
+                self.ffn.use_sm120_deepep
+                and self.layer_id in (0, 20, 39)
+                and logger.isEnabledFor(logging.DEBUG)
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                logger.debug(
+                    f"DeepEP rows rank={self.attn.mapping.moe.ep_rank} "
+                    f"layer={self.layer_id} local={x.shape[0]} "
+                    f"counts={counts} decode={ctx.all_decode_or_idle}"
+                )
             return self.ffn(
                 x,
                 image_mask,
                 sum(counts),
                 max(counts),
-                ctx=ctx if self.ffn.use_mega_moe else None,
+                ctx=(
+                    ctx
+                    if (self.ffn.use_mega_moe or self.ffn.use_sm120_deepep)
+                    else None
+                ),
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
             )
         # DP ranks may mix image and text rows. Carry the routing mask in
@@ -2448,6 +2651,7 @@ class V41RowState:
     hashes: torch.Tensor | None
     engram_token_mask: torch.Tensor | None
     captured: list[torch.Tensor]
+    collective_counts: list[int] | None = None
 
     @property
     def rows(self) -> int:
@@ -2474,6 +2678,7 @@ class V41RowState:
             hashes,
             mask,
             list(captured),
+            self.collective_counts,
         )
 
     def leading(self, rows: int) -> V41RowState:
@@ -2516,7 +2721,9 @@ class DeepseekV41Model(nn.Module):
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
         local_ep = (
-            mapping.attn.tp_size == mapping.dense.tp_size == mapping.moe.tp_size == 1
+            (mapping.attn.tp_size == 1 or mapping.attn.has_qcp)
+            and mapping.attn.head_tp_size == 1
+            and mapping.dense.tp_size == mapping.moe.tp_size == 1
         )
         if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_ep:
             raise NotImplementedError(
@@ -2607,6 +2814,18 @@ class DeepseekV41Model(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        if mapping.attn.has_qcp and any(
+            layer.ffn.use_sm120_deepep for layer in self.layers
+        ):
+            # QCP may also execute unsharded forwards. Its SM120 expert
+            # path exchanges their row counts, just like ordinary DP/EP.
+            # Create the dedicated communicator at startup on every rank;
+            # forward and scheduler collectives must never share a group.
+            pg_manager.init_process_group(
+                tuple(range(mapping.world_size)),
+                backend="gloo",
+                name="v41_decoder_counts",
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # The decoder view keeps at most a prompt's last window per extend
         # request (and one row per decode request), which bounds the rows the
@@ -2648,12 +2867,8 @@ class DeepseekV41Model(nn.Module):
         invocations are unsupported. The four stages below are the whole
         forward; the prefill graph calls them individually.
         """
-        if ctx.query_shard is not None and (
-            image_mask is not None or input_embeds is not None
-        ):
-            raise NotImplementedError(
-                "V4.1 model QCP currently accepts text token IDs only"
-            )
+        if image_mask is not None and image_mask.shape != input_ids.shape:
+            raise ValueError("V4.1 image mask must describe this rank's input rows")
         if input_ids.numel() == 0 and ctx.query_shard is None:
             if self.mapping.attn.has_dp:
                 hidden = self.embed_tokens.weight.new_empty(
@@ -2951,6 +3166,7 @@ class DeepseekV41Model(nn.Module):
             kept(hashes),
             kept(mask),
             [kept(tap) for tap in captured],
+            counts,
         )
 
     def decoder_forward(
@@ -3195,6 +3411,26 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
     ) -> None:
+        if isinstance(quant_config, ModelOptMixedConfig):
+            # The per-layer NVFP4 map leaves native FP8 dense weights unchanged.
+            raw = config.quantization_config
+            expected = {
+                f"layers.{i}.ffn.experts": "NVFP4"
+                for i in range(config.text_config.num_hidden_layers)
+            }
+            if (
+                config.text_config.moe_quant_algo != "NVFP4"
+                or quant_config.quantized_layers != expected
+                or quant_config.group_size != 16
+                or quant_config.kv_cache_quant_algo is not None
+                or raw.get("quant_method") != "fp8"
+                or raw.get("weight_block_size") != [32, 32]
+                or raw.get("scale_fmt") != "ue8m0"
+            ):
+                raise ValueError(
+                    "Unsupported V4.1 mixed-precision scope or dense format"
+                )
+            quant_config = Fp8Config.from_config(raw)
         super().__init__(
             config=config,
             mapping=mapping,
@@ -3332,19 +3568,36 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             and mm_context.has_extend_inputs()
             and not ctx.forward_mode.is_decode_or_idle()
         ):
+            # Image spans describe the complete packed batch. Assemble with
+            # replicated token IDs (including the TP embedding reduction),
+            # then pass only this rank's rows to the QCP backbone.
+            plan = ctx.query_shard
+            mm_ids = input_ids
+            if plan is not None:
+                mm_ids = token_all_gather_rows(
+                    input_ids.reshape(-1, 1),
+                    self.mapping.attn.qcp_group,
+                    list(plan.row_counts),
+                )
+                mm_ids = plan.to_span_order(mm_ids).flatten()
             if result["image_mask"] is None:
-                result["image_mask"] = _image_mask_from_spans(input_ids, mm_context)
+                mask = _image_mask_from_spans(mm_ids, mm_context)
+                result["image_mask"] = (
+                    mask if plan is None else mask[plan.local_row_ids]
+                )
             # InputBuffers already clamped the hashed placeholder ids into the
             # vocabulary; the embedder overwrites those rows by span.
             embeds, _ = self.vision_embedder.apply(
-                input_ids=input_ids,
+                input_ids=mm_ids,
                 text_embedding=self.get_input_embeddings(),
                 ctx=mm_context,
                 encoders=self.get_multimodal_encoder_specs(),
                 multimodal_model=self,
             )
             if embeds is not None:
-                result["input_embeds"] = embeds
+                result["input_embeds"] = (
+                    embeds if plan is None else embeds[plan.local_row_ids]
+                )
         return result
 
     @staticmethod
@@ -3358,6 +3611,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             ".ffn.gate.e_score_correction_bias", ".ffn.gate.bias"
         )
 
+    def _local_checkpoint_experts(self, layer_id: int) -> list[int]:
+        """Logical checkpoint experts filling this rank's physical slots."""
+        count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
+        start = self.mapping.moe.ep_rank * count
+        return list(range(start, start + count))
+
     def _checkpoint_targets(self) -> dict[str, tuple[str, int | None]]:
         """Map each required local checkpoint constituent, not just fused parameters.
 
@@ -3367,6 +3626,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         normalization. wo_a.scale is required dynamically for FP8 wo_a weights.
         """
         targets = {}
+        nvfp4 = self.model.config.moe_quant_algo == "NVFP4"
         for name, _ in self.named_parameters():
             if name.startswith("vision."):
                 continue
@@ -3377,15 +3637,18 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 if projection not in ("w13", "w2") or suffix not in (
                     "weight",
                     "weight_scale",
+                    "weight_scale_2",
+                    "input_scale",
                 ):
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
-                count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
-                for expert in range(
-                    self.mapping.moe.ep_rank * count,
-                    (self.mapping.moe.ep_rank + 1) * count,
-                ):
+                layer_id = int(prefix.split(".")[1])
+                for expert in self._local_checkpoint_experts(layer_id):
                     for shard in ("w1", "w3") if projection == "w13" else ("w2",):
-                        field = "scale" if suffix == "weight_scale" else "weight"
+                        field = (
+                            suffix
+                            if nvfp4
+                            else ("scale" if suffix == "weight_scale" else "weight")
+                        )
                         targets[f"{prefix}.experts.{expert}.{shard}.{field}"] = (
                             name,
                             None,
@@ -3540,6 +3803,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         seen, loaded = set(), set()
         skipped = Counter()
         pending = {}
+        paired_scales = {}
         for raw_name, tensor in weights:
             name = self._checkpoint_name(raw_name)
             if name in seen:
@@ -3550,7 +3814,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 skipped[reason] += 1
                 continue
             expert = re.fullmatch(
-                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)", name
+                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale|weight_scale|weight_scale_2|input_scale)",
+                name,
             )
             if expert:
                 layer_id, expert_id = int(expert[1]), int(expert[2])
@@ -3564,27 +3829,74 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     if expert[3] == "w2"
                     else (config.moe_intermediate_size, config.hidden_size)
                 )
-                expected = (n, k // (32 if expert[4] == "scale" else 2))
+                nvfp4 = config.moe_quant_algo == "NVFP4"
+                field = expert[4]
+                if nvfp4:
+                    if field not in (
+                        "weight",
+                        "weight_scale",
+                        "weight_scale_2",
+                        "input_scale",
+                    ):
+                        raise ValueError(f"Unexpected NVFP4 expert field: {raw_name}")
+                    scalar = field in ("weight_scale_2", "input_scale")
+                    expected = (
+                        ()
+                        if scalar
+                        else (n, k // (16 if field == "weight_scale" else 2))
+                    )
+                    allowed = (
+                        (torch.float32,)
+                        if scalar
+                        else (
+                            (torch.float8_e4m3fn,)
+                            if field == "weight_scale"
+                            else (torch.uint8,)
+                        )
+                    )
+                    if scalar and (
+                        not torch.isfinite(tensor).all() or not (tensor > 0).all()
+                    ):
+                        raise ValueError(
+                            f"{raw_name}: NVFP4 scalar scale must be finite and positive"
+                        )
+                else:
+                    if field not in ("weight", "scale"):
+                        raise ValueError(f"Unexpected MXFP4 expert field: {raw_name}")
+                    expected = (n, k // (32 if field == "scale" else 2))
+                    allowed = (
+                        (torch.uint8, torch.float8_e8m0fnu)
+                        if field == "scale"
+                        else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
+                    )
                 if tuple(tensor.shape) != expected:
                     raise ValueError(
                         f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
                     )
-                allowed = (
-                    (torch.uint8, torch.float8_e8m0fnu)
-                    if expert[4] == "scale"
-                    else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
-                )
                 if tensor.dtype not in allowed:
-                    raise TypeError(
-                        f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
+                    description = (
+                        f"packed FP4 {allowed}" if field == "weight" else str(allowed)
                     )
-                local_count = config.n_routed_experts // self.mapping.moe.ep_size
-                if expert_id // local_count != self.mapping.moe.ep_rank:
+                    raise TypeError(
+                        f"{raw_name}: expected {description}, got {tensor.dtype}"
+                    )
+                if expert_id not in self._local_checkpoint_experts(layer_id):
                     skipped["remote_expert"] += 1
                     continue
                 if name not in targets:
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                tensor = tensor.view(torch.uint8)
+                if (
+                    nvfp4
+                    and field in ("input_scale", "weight_scale_2")
+                    and expert[3] in ("w1", "w3")
+                ):
+                    key = (layer_id, expert_id, field)
+                    value = tensor.item()
+                    if key in paired_scales and paired_scales[key] != value:
+                        raise ValueError(f"{raw_name}: fused w1/w3 scales must agree")
+                    paired_scales[key] = value
+                if not nvfp4:
+                    tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn
                 if ffn.use_mega_moe:
                     extra = ffn.experts.intermediate_size - config.moe_intermediate_size
@@ -3600,8 +3912,18 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                             mode="constant",
                             value=127 if expert[4] == "scale" else 0,
                         )
-                mapped = "model." + name.replace(".scale", ".weight_scale")
-                moe_loader.load(mapped, tensor)
+                mapped = "model." + (
+                    name if nvfp4 else name.replace(".scale", ".weight_scale")
+                )
+                if nvfp4 and field == "input_scale":
+                    # Bypass generic cross-expert input-scale aggregation.
+                    param = params[targets[name][0]]
+                    local_expert = self._local_checkpoint_experts(layer_id).index(
+                        expert_id
+                    )
+                    param.weight_loader(param, tensor, expert[3], local_expert)
+                else:
+                    moe_loader.load(mapped, tensor)
             elif name.endswith((".attn.wo_a.weight", ".attn.wo_a.scale")):
                 weight_name = name.rsplit(".", 1)[0] + ".weight"
                 if weight_name not in targets:
@@ -3712,8 +4034,17 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             embed = self.get_submodule(param_name.rsplit(".", 1)[0])
             shard = os.path.join(checkpoint_dir, weight_map[mapped])
             field = param_name.rsplit(".", 1)[1]
+            read_workers = (
+                global_server_args_dict["weight_loader_prefetch_num_threads"]
+                if global_server_args_dict["weight_loader_prefetch_checkpoints"]
+                and embed.weight.device.type == "cpu"
+                else 1
+            )
+            logger.info(f"Loading Engram table {raw} with {read_workers} row readers")
             with safe_open(shard, framework="pt", device="cpu") as handle:
-                embed.load_sharded(field, handle.get_slice(mapped), 65536)
+                source = EngramFileSlice(shard, mapped, handle.get_slice(mapped))
+                embed.load_sharded(field, source, 65536, read_workers=read_workers)
+            logger.info(f"Loaded Engram table {raw}")
             loaded.add(raw)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
