@@ -43,7 +43,25 @@ from tokenspeed.runtime.cache.l3.identity import (
     l3_checkpoint_id,
     share_l3_checkpoint_ids,
     storage_deployment_id,
+    warn_if_unpinned_peer_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("weight_version", "revisions", "warns"),
+    [
+        ("default", [""], True),
+        ("default", ["main"], True),
+        ("default", ["a" * 40], False),
+        ("default", ["a" * 40, ""], True),
+        ("default", ["", "b" * 40], True),
+        ("default", ["a" * 40, "b" * 40], False),
+        ("release-17", ["", ""], False),
+    ],
+)
+def test_live_peer_weight_identity_warning(weight_version, revisions, warns, caplog):
+    warn_if_unpinned_peer_weights(weight_version, revisions)
+    assert ("--weight-version" in caplog.text) == warns
 
 
 @contextmanager
