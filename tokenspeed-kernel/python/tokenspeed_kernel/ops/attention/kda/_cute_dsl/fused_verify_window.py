@@ -514,8 +514,16 @@ class FusedVerifyWindow(RecoverSsmVerify):
         if const_expr(self.gated_norm):
             norm_scale_value = _load(norm_weight, value_start + channel)
         if live:
-            # After this warp's own loads, so its wait for the count overlaps them.
-            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
+            # After this warp's own loads. A 32-row tile prefetches every
+            # position the records can take, so its last warp does not wait
+            # for the count before its row loads; larger tiles prefetch the
+            # counted records, their wait for the count overlapping the loads.
+            prefetched = count
+            if const_expr(self.value_tile_rows == 32):
+                prefetched = Int32(max(self.capacity - W, 0))
+            self._prefetch_records(
+                retained, slot, head, value_start, prefetched, warp, lane
+            )
 
         # The metadata was written before this forward; the previous launch's
         # rows are not, but their addresses need only the batch layout, so
