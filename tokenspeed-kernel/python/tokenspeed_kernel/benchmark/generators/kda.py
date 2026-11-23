@@ -86,8 +86,6 @@ _MODEL_PROFILES = {
     ),
 }
 _IMPLEMENTED_RECURRENT_LAYOUTS = frozenset({"k_major", "v_major"})
-_IMPLEMENTED_STATE_PAGE_RELATIONS = frozenset({"in_place", "distinct"})
-_DISTINCT_WRITE_PAGE_OFFSET = 16
 
 
 def _implemented_value(
@@ -200,29 +198,6 @@ def _packed_beta_logits(
     return beta.view(1, tokens, profile.heads)
 
 
-def _packed_decode_qkv(
-    batch: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
-    *,
-    dtype: torch.dtype,
-    generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    widths = (heads * key_dim, heads * key_dim, heads * value_dim)
-    packed = _randn(
-        (batch, sum(widths)),
-        dtype=dtype,
-        generator=generator,
-    )
-    q_flat, k_flat, v_flat = packed.split(widths, dim=-1)
-    return (
-        q_flat.view(1, batch, heads, key_dim),
-        k_flat.view(1, batch, heads, key_dim),
-        v_flat.view(1, batch, heads, value_dim),
-    )
-
-
 def _packed_prefill_inputs(
     tokens: int,
     profile: _KdaModelProfile,
@@ -264,48 +239,6 @@ def _decay_parameters(
         generator=generator,
     )
     return a_log, dt_bias
-
-
-def _strided_state_pool(
-    state_pages: int,
-    heads: int,
-    value_dim: int,
-    key_dim: int,
-    page_stride: int,
-    *,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    payload = heads * value_dim * key_dim
-    storage_size = (state_pages - 1) * page_stride + payload
-    storage = torch.empty(storage_size, dtype=torch.float32, device=device)
-    return torch.as_strided(
-        storage,
-        (state_pages, heads, value_dim, key_dim),
-        (page_stride, value_dim * key_dim, key_dim, 1),
-    )
-
-
-def _state_page_indices(
-    batch: int,
-    relation: str,
-    *,
-    device: torch.device | str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    read_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
-    write_indices = (
-        read_indices.clone()
-        if relation == "in_place"
-        else read_indices + _DISTINCT_WRITE_PAGE_OFFSET
-    )
-    return read_indices, write_indices
-
-
-def _parse_state_page_relation(parameters: dict[str, Any]) -> str:
-    return _implemented_value(
-        "state_page_relation",
-        parameters["state_page_relation"],
-        _IMPLEMENTED_STATE_PAGE_RELATIONS,
-    )
 
 
 def _normalize_common_parameters(

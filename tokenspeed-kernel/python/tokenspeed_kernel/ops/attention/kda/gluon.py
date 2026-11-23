@@ -41,16 +41,10 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
-        launch_gluon_kda_retained_commit_gfx950 as _retained_commit_gfx950,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         launch_gluon_kda_retained_verify_gfx950 as _retained_verify_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
         launch_gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
-        launch_gluon_kda_retained_commit_gfx1250 as _retained_commit_gfx1250,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         launch_gluon_kda_retained_verify_gfx1250 as _retained_verify_gfx1250,
@@ -361,78 +355,6 @@ def gluon_kda_retained_verify_gfx950(
     )
 
 
-def gluon_kda_retained_commit_gfx950(
-    *,
-    original_qkv: torch.Tensor,
-    conv_states: torch.Tensor,
-    read_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    accepted_length: torch.Tensor,
-    retained_history: KdaRetainedHistory,
-    record_metadata: torch.Tensor | None,
-    record_stamps: torch.Tensor | None,
-    num_heads: int,
-    head_dim: int,
-    draft_token_num: int,
-) -> None:
-    """Commit accepted packed original_qkv rows to live convolution pages.
-
-    conv_states contains source taps. read_indices and query_start_loc map
-    request rows; accepted_length is clamped to each row's actual token count.
-    retained_history identifies private live pages and the request slots
-    whose accepted lengths this publishes.
-    Metadata/stamps must be supplied together; stale accepted records suppress
-    both convolution updates and length publication. num_heads, head_dim and
-    draft_token_num specify fixed geometry. Return None.
-    """
-    _validate_retained_request(
-        retained_history,
-        read_indices,
-        query_start_loc,
-        record_metadata,
-        record_stamps,
-        heads=num_heads,
-        dim=head_dim,
-        window=draft_token_num,
-        device=conv_states.device,
-    )
-    batch = read_indices.numel()
-    if (
-        accepted_length.shape != (batch,)
-        or accepted_length.dtype not in (torch.int32, torch.int64)
-        or accepted_length.device != conv_states.device
-    ):
-        raise ValueError("retained KDA accepted lengths must match the requests")
-    if (
-        head_dim != 128
-        or conv_states.shape[1:] != (3 * num_heads * head_dim, 3)
-        or original_qkv.ndim != 2
-        or original_qkv.shape[1] != 3 * num_heads * head_dim
-        or original_qkv.shape[0] > batch * draft_token_num
-        or original_qkv.stride(-1) != 1
-        or original_qkv.device != conv_states.device
-    ):
-        raise ValueError(
-            "retained KDA commit needs packed pre-convolution QKV and matching taps"
-        )
-    _retained_commit_gfx950(
-        original_qkv=original_qkv,
-        conv_pool=conv_states,
-        read_indices=read_indices,
-        live_indices=retained_history.live_state_indices,
-        query_start_loc=query_start_loc,
-        accepted_length=accepted_length,
-        retained_length=retained_history.length,
-        record_slots=retained_history.record_slots,
-        history_capacity=retained_history.correction.shape[2],
-        record_metadata=record_metadata,
-        record_stamps=record_stamps,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        draft_token_num=draft_token_num,
-    )
-
-
 def gluon_kda_retained_verify_gfx1250(
     *,
     mixed_qkv: torch.Tensor,
@@ -513,78 +435,6 @@ def gluon_kda_retained_verify_gfx1250(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
-    )
-
-
-def gluon_kda_retained_commit_gfx1250(
-    *,
-    original_qkv: torch.Tensor,
-    conv_states: torch.Tensor,
-    read_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    accepted_length: torch.Tensor,
-    retained_history: KdaRetainedHistory,
-    record_metadata: torch.Tensor | None,
-    record_stamps: torch.Tensor | None,
-    num_heads: int,
-    head_dim: int,
-    draft_token_num: int,
-) -> None:
-    """Commit accepted packed original_qkv rows to live convolution pages.
-
-    conv_states contains source taps. read_indices and query_start_loc map
-    request rows; accepted_length is clamped to each row's actual token count.
-    retained_history identifies private live pages and the request slots
-    whose accepted lengths this publishes.
-    Metadata/stamps must be supplied together; stale accepted records suppress
-    both convolution updates and length publication. num_heads, head_dim and
-    draft_token_num specify fixed geometry. Return None.
-    """
-    _validate_retained_request(
-        retained_history,
-        read_indices,
-        query_start_loc,
-        record_metadata,
-        record_stamps,
-        heads=num_heads,
-        dim=head_dim,
-        window=draft_token_num,
-        device=conv_states.device,
-    )
-    batch = read_indices.numel()
-    if (
-        accepted_length.shape != (batch,)
-        or accepted_length.dtype not in (torch.int32, torch.int64)
-        or accepted_length.device != conv_states.device
-    ):
-        raise ValueError("retained KDA accepted lengths must match the requests")
-    if (
-        head_dim != 128
-        or conv_states.shape[1:] != (3 * num_heads * head_dim, 3)
-        or original_qkv.ndim != 2
-        or original_qkv.shape[1] != 3 * num_heads * head_dim
-        or original_qkv.shape[0] > batch * draft_token_num
-        or original_qkv.stride(-1) != 1
-        or original_qkv.device != conv_states.device
-    ):
-        raise ValueError(
-            "retained KDA commit needs packed pre-convolution QKV and matching taps"
-        )
-    _retained_commit_gfx1250(
-        original_qkv=original_qkv,
-        conv_pool=conv_states,
-        read_indices=read_indices,
-        live_indices=retained_history.live_state_indices,
-        query_start_loc=query_start_loc,
-        accepted_length=accepted_length,
-        retained_length=retained_history.length,
-        record_slots=retained_history.record_slots,
-        history_capacity=retained_history.correction.shape[2],
-        record_metadata=record_metadata,
-        record_stamps=record_stamps,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        draft_token_num=draft_token_num,
     )
 
 

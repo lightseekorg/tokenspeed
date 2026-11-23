@@ -1603,12 +1603,6 @@ class MambaAttnBackend(AttentionBackend):
             dtype=dtype,
         )
 
-    def _store_prefill_state(
-        self, layer_id, final_state, recurrent_states, live_indices
-    ):
-        """Publish the final dense checkpoint after the scan finishes."""
-        store_state_rows(final_state, recurrent_states, live_indices)
-
     def layer_state(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2302,12 +2296,9 @@ class MambaAttnBackend(AttentionBackend):
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
             # masked writer drops; it skips unused checkpoint slots alike.
-            self._store_prefill_state(
-                layer_id, last_recurrent_state, ssm_states, state_out_blocks
-            )
+            store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
             if metadata.state_checkpoints is not None:
-                self._store_prefill_state(
-                    layer_id,
+                store_state_rows(
                     metadata.scan_state_checkpoints.states[
                         metadata.scan_checkpoint_rows
                     ],

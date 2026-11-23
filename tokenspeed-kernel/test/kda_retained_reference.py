@@ -186,10 +186,6 @@ def check_fused_retained_append(
     x, records, expected, run_verify, *, width, raw_gate_only
 ):
     """Compare native producers and raw-gate input against the real split path."""
-    from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
-        vllm_triton_kda_recoverssm_commit,
-    )
-
     heads, dim = x["state_pool"].shape[1:3]
     history, reference_history = records.history, expected.history
     pages = x["state_indices"].long()
@@ -268,21 +264,17 @@ def check_fused_retained_append(
     candidates = [
         field.clone() for field in (history.correction, history.key, history.decay)
     ]
-    q, key, value = (
-        part.view(1, -1, heads, dim) for part in convolved.chunk(3, dim=-1)
-    )
-    vllm_triton_kda_recoverssm_commit(
-        q,
-        key,
-        value,
-        checkpoint_state=x["state_pool"],
-        retained_history=history,
-        state_indices=x["state_indices"],
-        query_start_loc=records.query_start_loc,
-        num_accepted_tokens=torch.tensor([0, width], device="cuda", dtype=torch.int32),
-        spec_query_len=width,
+    publish(
+        history,
+        x["state_pool"],
+        x["state_indices"],
+        records.query_start_loc,
+        torch.tensor([0, width], device="cuda", dtype=torch.int32),
+        width=width,
         record_metadata=records.metadata,
         record_stamps=records.stamps,
+        original_qkv=records.original_qkv,
+        conv=x["conv_states"],
     )
     assert history.length[slots, 0].tolist() == [accepted, accepted + width]
     torch.testing.assert_close(x["state_pool"], initial[0], atol=0, rtol=0)
@@ -379,6 +371,73 @@ def verify(case):
     )
 
 
+def _commit_descriptor(qkv, conv, history, state):
+    """One layer's 14-column retained commit descriptor."""
+    return [
+        qkv.data_ptr(),
+        conv.data_ptr(),
+        history.length.data_ptr(),
+        conv.shape[0],
+        qkv.stride(0),
+        conv.stride(0),
+        history.length.stride(0),
+        conv.stride(1),
+        conv.stride(2),
+        state.data_ptr(),
+        *state.stride(),
+    ]
+
+
+def _run_commit(
+    *,
+    descriptors,
+    group_indices,
+    history,
+    state,
+    read_indices,
+    query_start_loc,
+    accepted,
+    width,
+    record_metadata,
+    record_stamps,
+    request_stopped,
+    request_ends,
+    activation_dtype,
+    conv_state_dtype,
+):
+    """Run the production batched retained commit over a single layer."""
+    heads, dim = state.shape[1], state.shape[-1]
+    kernel = kda.resolve_kda_batched_retained_commit(
+        activation_dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
+    )
+    kernel(
+        descriptors=descriptors,
+        group_indices=group_indices,
+        read_indices=read_indices[None],
+        write_indices=history.live_state_indices[None],
+        accepted_length=accepted,
+        query_start_loc=query_start_loc,
+        record_slots=history.record_slots,
+        record_slot_count=history.length.shape[0],
+        record_metadata=record_metadata,
+        record_stamps=record_stamps[None],
+        # One layer: the records gain a unit layer axis.
+        retained_correction=history.correction[:, None],
+        retained_key=history.key[:, None],
+        retained_decay=history.decay[:, None],
+        request_stopped=request_stopped,
+        request_ends=request_ends,
+        draft_token_num=width,
+        history_capacity=history.correction.shape[2],
+        num_heads=heads,
+        head_dim=dim,
+        conv_width=4,
+        activation_dtype=activation_dtype,
+        conv_state_dtype=conv_state_dtype,
+        recurrent_state_dtype=state.dtype,
+    )
+
+
 def commit(case, accepted, *, ended_slots):
     """Commit accepted prefixes; requests in ``ended_slots`` ended this forward.
 
@@ -387,25 +446,6 @@ def commit(case, accepted, *, ended_slots):
     records, conv, state = case["records"], case["conv"], case["state"]
     history = records.history
     qkv = records.original_qkv
-    descriptors = torch.tensor(
-        [
-            [
-                qkv.data_ptr(),
-                conv.data_ptr(),
-                history.length.data_ptr(),
-                conv.shape[0],
-                qkv.stride(0),
-                conv.stride(0),
-                history.length.stride(0),
-                conv.stride(1),
-                conv.stride(2),
-                state.data_ptr(),
-                *state.stride(),
-            ]
-        ],
-        device="cuda",
-        dtype=torch.uint64,
-    )
     request_stopped = torch.zeros(
         history.length.shape[0], device="cuda", dtype=torch.bool
     )
@@ -418,36 +458,124 @@ def commit(case, accepted, *, ended_slots):
         REQUEST_ENDED,
         0,
     ).to(torch.int32)
-    kernel = kda.resolve_kda_batched_retained_commit(
-        qkv.dtype, num_heads=case["heads"], head_dim=128, recurrent_layout="v_major"
-    )
-    kernel(
-        descriptors=descriptors,
+    _run_commit(
+        descriptors=torch.tensor(
+            [_commit_descriptor(qkv, conv, history, state)],
+            device="cuda",
+            dtype=torch.uint64,
+        ),
         group_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
-        read_indices=case["reads"][None],
-        write_indices=history.live_state_indices[None],
-        accepted_length=accepted,
+        history=history,
+        state=state,
+        read_indices=case["reads"],
         query_start_loc=records.query_start_loc,
-        record_slots=history.record_slots,
-        record_slot_count=history.length.shape[0],
+        accepted=accepted,
+        width=case["width"],
         record_metadata=records.metadata,
-        record_stamps=records.stamps[None],
-        # One layer: the records gain a unit layer axis.
-        retained_correction=history.correction[:, None],
-        retained_key=history.key[:, None],
-        retained_decay=history.decay[:, None],
+        record_stamps=records.stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
-        draft_token_num=case["width"],
-        history_capacity=history.correction.shape[2],
-        num_heads=case["heads"],
-        head_dim=128,
-        conv_width=4,
         activation_dtype=qkv.dtype,
         conv_state_dtype=conv.dtype,
-        recurrent_state_dtype=state.dtype,
     )
     return request_ends
+
+
+# Uploads and scratch tensors per published layer layout, kept for graph capture.
+_PUBLISHED_LAYERS: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+
+def publish(
+    history,
+    state,
+    read_indices,
+    query_start_loc,
+    accepted,
+    *,
+    width,
+    record_metadata=None,
+    record_stamps=None,
+    original_qkv=None,
+    conv=None,
+):
+    """Publish one layer's accepted counts through the production batched commit.
+
+    No request ends here, so the commit writes no dense state. A verify run on
+    already-convolved q/k/v leaves no original QKV or convolution pool; the
+    commit then advances zero-filled scratch ones over the state pool's pages.
+    A verify run without stamps gets each row's window stamped as a verify
+    would, so the commit checks acceptance against the row's pages, slot,
+    window and the history capacity only. Uploads and scratch tensors are made
+    on the first, eager call; a CUDA-graph capture of a later call reuses them.
+    """
+    device = state.device
+    heads, dim = state.shape[1], state.shape[-1]
+    batch = accepted.numel()
+    if record_metadata is None:
+        record_metadata = torch.zeros(batch, 3, device=device, dtype=torch.int64)
+        record_metadata[:, 0] = torch.arange(batch, device=device)
+        record_stamps = torch.zeros(batch, width, 2, device=device, dtype=torch.int64)
+        record_stamps[..., 0] = torch.arange(width, device=device)
+    layout = (
+        state.data_ptr(),
+        tuple(state.shape),
+        state.stride(),
+        history.length.data_ptr(),
+        tuple(history.length.shape),
+        history.length.stride(),
+        batch,
+        width,
+        str(device),
+        (
+            None
+            if original_qkv is None
+            else (original_qkv.data_ptr(), original_qkv.stride(), original_qkv.dtype)
+        ),
+        None if conv is None else (conv.data_ptr(), tuple(conv.shape), conv.stride()),
+    )
+    if layout not in _PUBLISHED_LAYERS:
+        # A publishable row's window fits in ``width`` tokens.
+        qkv = original_qkv
+        if qkv is None:
+            qkv = torch.zeros(
+                batch * width, 3 * heads * dim, device=device, dtype=torch.bfloat16
+            )
+        window = conv
+        if window is None:
+            window = torch.zeros(
+                state.shape[0], 3 * heads * dim, 3, device=device, dtype=torch.bfloat16
+            )
+        _PUBLISHED_LAYERS[layout] = (
+            qkv,
+            window,
+            torch.tensor(
+                [_commit_descriptor(qkv, window, history, state)],
+                device=device,
+                dtype=torch.uint64,
+            ),
+            torch.zeros(1, device=device, dtype=torch.int32),
+            torch.zeros(history.length.shape[0], device=device, dtype=torch.bool),
+            torch.zeros(batch, device=device, dtype=torch.int32),
+        )
+    qkv, window, descriptors, group_indices, request_stopped, request_ends = (
+        _PUBLISHED_LAYERS[layout]
+    )
+    _run_commit(
+        descriptors=descriptors,
+        group_indices=group_indices,
+        history=history,
+        state=state,
+        read_indices=read_indices,
+        query_start_loc=query_start_loc,
+        accepted=accepted,
+        width=width,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        request_stopped=request_stopped,
+        request_ends=request_ends,
+        activation_dtype=qkv.dtype,
+        conv_state_dtype=window.dtype,
+    )
 
 
 def check_prefix(case, accepted, expected):

@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kda_retained_reference import endpoint, prepare_history
+from kda_retained_reference import endpoint, prepare_history, publish
 from utils import is_nvidia
 
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     prepare_recoverssm_metadata,
-    vllm_triton_kda_recoverssm_commit,
     vllm_triton_kda_recoverssm_verify,
 )
 
@@ -202,16 +201,13 @@ def test_vllm_retained_verify_and_publish(batch, width, dim, lower_bound):
     for accepted in range(width + 1):
         # Each prefix starts from the unpublished candidate records above.
         history.length.zero_()
-        vllm_triton_kda_recoverssm_commit(
-            *packed[:3],
-            checkpoint_state=state,
-            retained_history=history,
-            state_indices=reads,
-            query_start_loc=starts,
-            num_accepted_tokens=torch.full(
-                (batch,), accepted, device="cuda", dtype=torch.int32
-            ),
-            spec_query_len=width,
+        publish(
+            history,
+            state,
+            reads,
+            starts,
+            torch.full((batch,), accepted, device="cuda", dtype=torch.int32),
+            width=width,
             record_metadata=metadata,
             record_stamps=stamps,
         )

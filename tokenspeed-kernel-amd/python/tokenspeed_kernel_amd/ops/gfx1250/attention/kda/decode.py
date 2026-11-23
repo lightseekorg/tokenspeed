@@ -27,7 +27,6 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops._kda_records import (
     kda_records_launch_metadata,
     kda_retained_panel,
-    launch_kda_retained_commit,
     validate_kda_retained_verify,
 )
 
@@ -788,7 +787,6 @@ def _launch_kda_verify_gfx1250(
 
 __all__ = [
     "launch_gluon_kda_retained_verify_gfx1250",
-    "launch_gluon_kda_retained_commit_gfx1250",
 ]
 
 
@@ -873,41 +871,4 @@ def launch_gluon_kda_retained_verify_gfx1250(
         retained_length=retained_length,
         live_indices=live_indices,
         record_slots=record_slots,
-    )
-
-
-def launch_gluon_kda_retained_commit_gfx1250(
-    *,
-    original_qkv,
-    conv_pool,
-    read_indices,
-    live_indices,
-    query_start_loc,
-    accepted_length,
-    retained_length,
-    record_slots,
-    history_capacity,
-    record_metadata,
-    record_stamps,
-    num_heads,
-    head_dim,
-    draft_token_num,
-):
-    """Update accepted convolution taps, then publish each slot's retained length."""
-    launch_kda_retained_commit(
-        original_qkv=original_qkv,
-        conv_pool=conv_pool,
-        read_indices=read_indices,
-        live_indices=live_indices,
-        query_start_loc=query_start_loc,
-        accepted_length=accepted_length,
-        retained_length=retained_length,
-        record_slots=record_slots,
-        history_capacity=history_capacity,
-        record_metadata=record_metadata,
-        record_stamps=record_stamps,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        draft_token_num=draft_token_num,
-        wave=32,
     )

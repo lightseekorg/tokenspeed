@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 RecoverSSM kernels with stamped retained KDA records.
+"""Kimi-K3 RecoverSSM verify with stamped retained KDA records.
 
 Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Retained records keep
 FP32 U, normalized K, multiplicative decay and the accepted length in resident
-request slots. Ordered consolidation, reset, and verify prepare private live
-pages; commit validates candidate stamps and publishes only the slot's accepted
-length. Verify retains the upstream recurrence, static token loop, and one-warp
-launch.
+request slots. Verify reads each live page's dense base plus the slot's
+accepted records and writes this round's candidate records and stamps; it
+retains the upstream recurrence, static token loop, and one-warp launch. The
+batched prepare before verify and the batched commit after it are TokenSpeed's
+own kernels in ``ops/attention/kda``.
 """
 
 from typing import Any
@@ -67,95 +68,6 @@ def _kda_recurrent_step(
         correction,
         normalized_k,
         decay,
-    )
-
-
-@triton.jit(
-    do_not_specialize=[
-        "length_stride",
-        "source_stride",
-        "live_stride",
-        "slot_stride",
-        "slots",
-        "query_stride",
-        "accepted_stride",
-        "STAMP_SLOTS",
-        "pages",
-    ]
-)
-def _publish_kda_history_kernel(
-    length_ptr,
-    source_ptr,
-    live_ptr,
-    slots_ptr,
-    query_ptr,
-    accepted_ptr,
-    metadata_ptr,
-    stamps_ptr,
-    length_stride,
-    source_stride,
-    live_stride,
-    slot_stride,
-    slots,
-    query_stride,
-    accepted_stride,
-    STAMP_SLOTS,
-    pages,
-    STAMP_CAPACITY: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    SPEC_QUERY_LEN: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    source = tl.load(source_ptr + row * source_stride).to(tl.int64)
-    live = tl.load(live_ptr + row * live_stride).to(tl.int64)
-    begin = tl.load(query_ptr + row * query_stride).to(tl.int64)
-    end = tl.load(query_ptr + (row + 1) * query_stride).to(tl.int64)
-    tokens = end - begin
-    payload_slot = tl.load(slots_ptr + row * slot_stride).to(tl.int64)
-    if (
-        source <= 0
-        or source >= pages
-        or live <= 0
-        or live >= pages
-        or tokens == 0
-        or payload_slot < 0
-        or payload_slot >= slots
-    ):
-        return
-    accepted = tl.load(accepted_ptr + row * accepted_stride)
-    accepted = tl.minimum(tl.minimum(tl.maximum(accepted, 0), tokens), SPEC_QUERY_LEN)
-    length = tl.load(length_ptr + payload_slot * length_stride)
-    valid = (length >= 0) & (length + accepted <= CAPACITY)
-    tl.device_assert(valid, "invalid retained publication interval")
-    if not valid:
-        return
-    if metadata_ptr is not None:
-        slot = tl.load(metadata_ptr + row * 3)
-        generation = tl.load(metadata_ptr + row * 3 + 1)
-        start = tl.load(metadata_ptr + row * 3 + 2)
-        valid = (
-            (slot >= 0)
-            & (slot < STAMP_SLOTS)
-            & (generation >= 0)
-            & (start >= 0)
-            & (accepted <= STAMP_CAPACITY)
-        )
-        tl.device_assert(valid, "invalid retained replay metadata")
-        if not valid:
-            return
-        for offset in range(accepted):
-            position = start + offset
-            stamp = stamps_ptr + (slot * STAMP_CAPACITY + position % STAMP_CAPACITY) * 2
-            valid = (
-                valid
-                & (tl.load(stamp) == position)
-                & (tl.load(stamp + 1) == generation)
-            )
-        tl.device_assert(valid, "stale retained replay record")
-        if not valid:
-            return
-    tl.store(
-        length_ptr + payload_slot * length_stride, (length + accepted).to(tl.int32)
     )
 
 

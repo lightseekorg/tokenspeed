@@ -28,10 +28,7 @@ from tokenspeed_kernel.ops.attention.kda import KdaRetainedHistory
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
-    _publish_kda_history_kernel,
-    kda_recoverssm_verify,
-)
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import kda_recoverssm_verify
 
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
@@ -165,83 +162,7 @@ def vllm_triton_kda_recoverssm_verify(
     )
 
 
-@register_kernel(
-    "attention",
-    "kda_recoverssm_commit",
-    name="vllm_triton_kda_recoverssm_commit",
-    solution="vllm_triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.REFERENCE,
-    traits={
-        "attention_only": frozenset({True}),
-        "paged_state": frozenset({True}),
-        "recurrent_layout": frozenset({"v_major"}),
-    },
-)
-def vllm_triton_kda_recoverssm_commit(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    checkpoint_state: torch.Tensor,
-    retained_history: KdaRetainedHistory,
-    state_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    spec_query_len: int,
-    record_metadata: torch.Tensor | None,
-    record_stamps: torch.Tensor | None,
-) -> None:
-    """Validate accepted stamps and publish slot retained lengths without changing dense state."""
-    del q, k, v
-    batch = state_indices.shape[0]
-    _validate_retained_request(
-        retained_history,
-        checkpoint_state,
-        state_indices,
-        query_start_loc,
-        spec_query_len,
-        record_metadata,
-        record_stamps,
-    )
-    if (
-        num_accepted_tokens.shape != (batch,)
-        or num_accepted_tokens.dtype not in (torch.int32, torch.int64)
-        or num_accepted_tokens.device != checkpoint_state.device
-    ):
-        raise ValueError(
-            "retained accepted counts must be an integer vector on the checkpoint device"
-        )
-    if batch:
-        _publish_kda_history_kernel[batch,](
-            retained_history.length,
-            state_indices,
-            retained_history.live_state_indices,
-            retained_history.record_slots,
-            query_start_loc,
-            num_accepted_tokens,
-            record_metadata,
-            record_stamps,
-            retained_history.length.stride(0),
-            state_indices.stride(0),
-            retained_history.live_state_indices.stride(0),
-            retained_history.record_slots.stride(0),
-            retained_history.correction.shape[0],
-            query_start_loc.stride(0),
-            num_accepted_tokens.stride(0),
-            record_stamps.shape[0] if record_stamps is not None else 0,
-            checkpoint_state.shape[0],
-            STAMP_CAPACITY=(record_stamps.shape[1] if record_stamps is not None else 1),
-            CAPACITY=retained_history.correction.shape[2],
-            SPEC_QUERY_LEN=spec_query_len,
-            num_warps=1,
-            debug=True,
-        )
-    return
-
-
-__all__ = ["vllm_triton_kda_recoverssm_commit", "vllm_triton_kda_recoverssm_verify"]
+__all__ = ["vllm_triton_kda_recoverssm_verify"]
 
 
 @triton.jit(do_not_specialize=["batch", "generation"])

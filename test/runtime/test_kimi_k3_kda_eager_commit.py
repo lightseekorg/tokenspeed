@@ -28,6 +28,8 @@ from test.runtime.conftest import kimi_recipe as _kimi_recipe
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from types import SimpleNamespace  # noqa: E402
 
+from tokenspeed_kernel.ops.kvcache.triton import store_state_rows
+
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -1816,7 +1818,7 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
             pool.get_component(layer, name)[source], snapshot, atol=0, rtol=0
         )
     final = gathered + 0.25
-    harness.backend._store_prefill_state(layer, final, recurrent, writes)
+    store_state_rows(final, recurrent, writes)
     torch.testing.assert_close(
         recurrent[destination], final[0].to(recurrent.dtype), atol=0, rtol=0
     )

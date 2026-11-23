@@ -391,11 +391,9 @@ class RecoverSsmVerify:
         beta: cute.Tensor,
         a_log: cute.Tensor,
         dt_bias: cute.Tensor,
-        state: cute.Tensor,
         retained: tuple,
         ring_capacity: Int64,
         correction: cute.Tensor,
-        normalized_key: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
         state_indices: cute.Tensor,
@@ -417,11 +415,9 @@ class RecoverSsmVerify:
             beta.iterator,
             a_log.iterator,
             dt_bias.iterator,
-            state.iterator,
             retained,
             ring_capacity,
             correction.iterator,
-            normalized_key.iterator,
             out.iterator,
             query_start_loc.iterator,
             state_indices.iterator,
@@ -434,14 +430,9 @@ class RecoverSsmVerify:
             gate.stride[0],
             beta.stride[0],
             out.stride[0],
-            state.stride[0],
-            state.stride[1],
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            normalized_key.stride[0],
-            normalized_key.stride[1],
-            normalized_key.stride[2],
         ).launch(
             grid=[
                 self.value_dim // self.value_tile_rows,
@@ -463,11 +454,9 @@ class RecoverSsmVerify:
         beta,
         a_log,
         dt_bias,
-        state,
         retained: tuple,
         ring_capacity: Int64,
         correction,
-        normalized_key,
         out,
         query_start_loc,
         state_indices,
@@ -480,14 +469,9 @@ class RecoverSsmVerify:
         gate_token_stride: Int64,
         beta_token_stride: Int64,
         out_token_stride: Int64,
-        state_page_stride: Int64,
-        state_head_stride: Int64,
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        normalized_key_slot_stride: Int64,
-        normalized_key_head_stride: Int64,
-        normalized_key_position_stride: Int64,
     ):
         K = self.key_dim
         W = self.window
@@ -614,7 +598,6 @@ class RecoverSsmVerify:
                 retained_length(retained, slot),
                 Int32(value_tile == 0),
                 valid_tokens,
-                ring_start,
             )
 
             # Phase 3, one thread per value channel.
@@ -663,7 +646,6 @@ class RecoverSsmVerify:
         record_start: Int32,
         records_keys: Int32,
         valid_tokens: Int32,
-        ring_start: Int32,
     ):
         """Phases 1 and 2 on the token rows in shared memory.
 
@@ -1229,11 +1211,9 @@ def _compile(
         beta,
         a_log,
         dt_bias,
-        state,
         retained,
         Int64(0),
         correction,
-        normalized_key,
         out,
         query_start_loc,
         state_indices,
@@ -1399,7 +1379,6 @@ def recoverssm_verify(
         raw_beta[0],
         A_log,
         dt_bias.reshape(-1),
-        checkpoint_state,
         retained_arguments(checkpoint_state, retained_history),
         (
             record_stamps.shape[1]
@@ -1407,7 +1386,6 @@ def recoverssm_verify(
             else correction_cache.shape[2]
         ),
         correction_cache,
-        retained_history.key,
         out[0],
         query_start_loc,
         state_indices,

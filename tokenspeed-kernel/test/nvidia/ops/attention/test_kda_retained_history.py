@@ -30,9 +30,8 @@ if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.kda as kda_ops
-from kda_retained_reference import prepare_history
+from kda_retained_reference import prepare_history, publish
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
-    vllm_triton_kda_recoverssm_commit,
     vllm_triton_kda_recoverssm_verify,
 )
 
@@ -248,20 +247,13 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             rtol=2e-5,
         )
         records_before = (u.clone(), key.clone(), decay.clone())
-        vllm_triton_kda_recoverssm_commit(
-            q,
-            k,
-            v,
-            checkpoint_state=state,
-            retained_history=history,
-            state_indices=indices,
-            query_start_loc=starts,
-            num_accepted_tokens=torch.tensor(
-                [accepted], device="cuda", dtype=torch.int32
-            ),
-            spec_query_len=width,
-            record_metadata=None,
-            record_stamps=None,
+        publish(
+            history,
+            state,
+            indices,
+            starts,
+            torch.tensor([accepted], device="cuda", dtype=torch.int32),
+            width=width,
         )
         assert int(length[0, 0]) == old_length + accepted
         torch.testing.assert_close(state, base_before, atol=0, rtol=0)
@@ -281,11 +273,12 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     """Catch source mutation, writes by empty/null rows, and stale GPU metadata."""
     from tokenspeed_kernel.ops.attention.kda._triton.retained import (
         retained_batched_consolidate_kernel,
+        retained_batched_conv_kernel,
+        retained_batched_publish_kernel,
         retained_batched_reset_kernel,
     )
     from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
         _kda_recoverssm_verify_kernel,
-        _publish_kda_history_kernel,
     )
     from utils import assert_no_triton_compile
 
@@ -343,16 +336,13 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
             record_metadata=metadata,
             record_stamps=stamps,
         )
-        vllm_triton_kda_recoverssm_commit(
-            q,
-            k,
-            v,
-            checkpoint_state=state,
-            retained_history=history,
-            state_indices=sources,
-            query_start_loc=starts,
-            num_accepted_tokens=accepted,
-            spec_query_len=width,
+        publish(
+            history,
+            state,
+            sources,
+            starts,
+            accepted,
+            width=width,
             record_metadata=metadata,
             record_stamps=stamps,
         )
@@ -413,7 +403,8 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
             with assert_no_triton_compile(
                 retained_batched_consolidate_kernel,
                 retained_batched_reset_kernel,
-                _publish_kda_history_kernel,
+                retained_batched_conv_kernel,
+                retained_batched_publish_kernel,
                 _kda_recoverssm_verify_kernel.fn,
             ):
                 run()
@@ -537,19 +528,7 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
     torch.testing.assert_close(out.float(), expected_out, atol=2e-3, rtol=5e-3)
     torch.testing.assert_close(state, base_before, atol=0, rtol=0)
     assert bool((length == 2).all())
-    vllm_triton_kda_recoverssm_commit(
-        q,
-        k,
-        v,
-        checkpoint_state=state,
-        retained_history=history,
-        state_indices=indices,
-        query_start_loc=starts,
-        num_accepted_tokens=counts,
-        spec_query_len=width,
-        record_metadata=None,
-        record_stamps=None,
-    )
+    publish(history, state, indices, starts, counts, width=width)
     torch.testing.assert_close(state, base_before, atol=0, rtol=0)
     torch.testing.assert_close(
         length[1:, 0],
@@ -617,19 +596,7 @@ def test_rows_outside_the_page_pool_are_skipped_by_verify_and_commit():
         record_metadata=None,
         record_stamps=None,
     )
-    vllm_triton_kda_recoverssm_commit(
-        q,
-        k,
-        v,
-        checkpoint_state=state,
-        retained_history=history,
-        state_indices=sources,
-        query_start_loc=starts,
-        num_accepted_tokens=accepted,
-        spec_query_len=width,
-        record_metadata=None,
-        record_stamps=None,
-    )
+    publish(history, state, sources, starts, accepted, width=width)
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
     torch.testing.assert_close(state, saved, atol=0, rtol=0)
     assert length.flatten().tolist() == [3, 3]

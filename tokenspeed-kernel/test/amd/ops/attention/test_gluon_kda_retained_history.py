@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaRetainedHistory,
     KdaRetainedRecords,
     kda_fused_paged_verify,
+    resolve_kda_batched_retained_commit,
 )
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
@@ -51,11 +52,10 @@ KERNELS = (
     getattr(DECODE, f"gluon_kda_fused_paged_verify_nostore_vmajor_{ARCH}"),
     prepared.retained_batched_consolidate_kernel,
     prepared.retained_batched_reset_kernel,
-    records.kda_retained_conv_commit,
-    records.kda_retained_publish,
+    records.retained_batched_conv_kernel,
+    records.retained_batched_publish_kernel,
 )
 VERIFY = getattr(api, f"gluon_kda_retained_verify_{ARCH}")
-COMMIT = getattr(api, f"gluon_kda_retained_commit_{ARCH}")
 
 
 def _reconstruct(base, history, slot, length):
@@ -157,12 +157,17 @@ def _case(
     state = (torch.randn(pages, heads, dim, dim, device="cuda") * 0.02).to(state_dtype)
     conv = torch.randn(pages, 3 * heads * dim, 3, device="cuda").bfloat16()
     slots = torch.arange(batch, device="cuda", dtype=torch.int64)
-    u = torch.randn(batch, heads, capacity, dim, device="cuda") * 0.02
+    # Rows index a pool of record slots; the batched prepare and commit need
+    # at least one slot even when the batch is empty.
+    slot_count = max(batch, 1)
+    u = torch.randn(slot_count, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
     # One accepted count per request slot. Rows that share the dense source
     # page start with empty histories.
-    length = torch.full((batch, 1), initial_length, device="cuda", dtype=torch.int32)
+    length = torch.full(
+        (slot_count, 1), initial_length, device="cuda", dtype=torch.int32
+    )
     if cross_page and batch > 1:
         length.zero_()
     if strided:
@@ -396,6 +401,10 @@ def _case(
                 else torch.full_like(mixed[begin:end], 17)
             )
             torch.testing.assert_close(original[begin:end], target, atol=0, rtol=0)
+        if not stamped:
+            # Serving's batched commit always validates accepted stamps; the
+            # unstamped diagnostic covers verify alone.
+            return history
         records_before = [x.clone() for x in (u, key, decay)]
         dense_before = state.clone()
         counts = torch.full((batch,), accepted, device="cuda", dtype=torch.int32)
@@ -413,36 +422,76 @@ def _case(
                 metadata[0, 2] = -1
         length_before = length.clone()
         conv_before = conv.clone()
+        # Serving commits all layers in one batched launch pair; commit this
+        # test's one layer as kda_retained_reference.commit does, building
+        # every argument before a CUDA graph captures the launches.
+        commit = resolve_kda_batched_retained_commit(
+            original.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
+        )
         commit_kwargs = dict(
-            original_qkv=original,
-            conv_states=conv,
-            read_indices=source,
-            query_start_loc=starts,
+            descriptors=torch.tensor(
+                [
+                    [
+                        original.data_ptr(),
+                        conv.data_ptr(),
+                        history.length.data_ptr(),
+                        conv.shape[0],
+                        original.stride(0),
+                        conv.stride(0),
+                        history.length.stride(0),
+                        conv.stride(1),
+                        conv.stride(2),
+                        state.data_ptr(),
+                        *state.stride(),
+                    ]
+                ],
+                device="cuda",
+                dtype=torch.uint64,
+            ),
+            group_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+            read_indices=source[None],
+            write_indices=history.live_state_indices[None],
             accepted_length=counts,
-            retained_history=history,
+            query_start_loc=starts,
+            record_slots=history.record_slots,
+            record_slot_count=history.length.shape[0],
             record_metadata=metadata,
-            record_stamps=stamps,
+            record_stamps=stamps[None],
+            # One layer: the records gain a unit layer axis.
+            retained_correction=history.correction[:, None],
+            retained_key=history.key[:, None],
+            retained_decay=history.decay[:, None],
+            # No request ends in these rounds.
+            request_stopped=torch.zeros(
+                history.length.shape[0], device="cuda", dtype=torch.bool
+            ),
+            request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
+            draft_token_num=width,
+            history_capacity=capacity,
             num_heads=heads,
             head_dim=dim,
-            draft_token_num=width,
+            conv_width=4,
+            activation_dtype=original.dtype,
+            conv_state_dtype=conv.dtype,
+            recurrent_state_dtype=state.dtype,
         )
         if guard:
             # A0 warm-up exercises the same launch geometry without advancing length.
             counts.zero_()
-            COMMIT(**commit_kwargs)
+            commit(**commit_kwargs)
             counts.fill_(accepted)
             with assert_no_triton_compile(*KERNELS[3:]):
-                COMMIT(**commit_kwargs)
+                commit(**commit_kwargs)
         elif graph:
             counts.zero_()
-            COMMIT(**commit_kwargs)
+            commit(**commit_kwargs)
             capture_commit = torch.cuda.CUDAGraph()
             with torch.cuda.graph(capture_commit):
-                COMMIT(**commit_kwargs)
+                commit(**commit_kwargs)
             counts.fill_(accepted)
             capture_commit.replay()
         else:
-            COMMIT(**commit_kwargs)
+            commit(**commit_kwargs)
         if corruption and corruption != "rejected":
             torch.testing.assert_close(conv, conv_before, atol=0, rtol=0)
             torch.testing.assert_close(length, length_before, atol=0, rtol=0)

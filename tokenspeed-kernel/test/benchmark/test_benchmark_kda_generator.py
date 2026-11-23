@@ -72,33 +72,6 @@ def test_kda_generator_rejects_unimplemented_model_profile(
         prepare_kda_paged_prefill(request, mi350_platform)
 
 
-def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
-    def cpu_randn(shape, *, dtype, generator):
-        _ = generator
-        return torch.randn(shape, dtype=dtype)
-
-    monkeypatch.setattr(kda_generator, "_randn", cpu_randn)
-    q, k, v = kda_generator._packed_decode_qkv(
-        4,
-        16,
-        128,
-        128,
-        dtype=torch.bfloat16,
-        generator=None,
-    )
-    beta = kda_generator._packed_beta_logits(
-        4,
-        kda_generator._MODEL_PROFILES["glm53_flash_tp4"],
-        dtype=torch.bfloat16,
-        generator=None,
-    )
-
-    assert q.stride() == (24576, 6144, 128, 1)
-    assert k.stride() == q.stride()
-    assert v.stride() == q.stride()
-    assert beta.stride() == (25664, 6416, 1)
-
-
 @pytest.mark.parametrize(
     ("model_profile", "head_stride", "projection_width"),
     [("glm53_flash_tp4", 2048, 6416), ("kimi_k3_tp8", 1536, 6288)],
@@ -235,38 +208,6 @@ def test_kda_generator_builds_flat_decay_bias() -> None:
 
     assert a_log.shape == (16,)
     assert dt_bias.shape == (2048,)
-
-
-def test_kda_generator_builds_arena_strided_state_pool() -> None:
-    state_pool = kda_generator._strided_state_pool(
-        3,
-        2,
-        4,
-        4,
-        48,
-        device="cpu",
-    )
-
-    assert state_pool.shape == (3, 2, 4, 4)
-    assert state_pool.stride() == (48, 16, 4, 1)
-    assert state_pool.is_contiguous() is False
-
-
-def test_kda_generator_builds_in_place_and_boundary_state_indices() -> None:
-    read_indices, in_place = kda_generator._state_page_indices(
-        4,
-        "in_place",
-        device="cpu",
-    )
-    _, distinct = kda_generator._state_page_indices(
-        4,
-        "distinct",
-        device="cpu",
-    )
-
-    assert read_indices.tolist() == [1, 2, 3, 4]
-    assert in_place.tolist() == [1, 2, 3, 4]
-    assert distinct.tolist() == [17, 18, 19, 20]
 
 
 def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
