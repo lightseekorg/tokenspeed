@@ -1704,7 +1704,8 @@ def _multi_row_index_k_scores_body(
     ends = gl.where(row_valid, ends, 0)
     starts = gl.where(row_valid, starts, num_candidates)
     span_end = gl.max(ends, axis=0)
-    balanced = False
+    # Static unless RUN_CHUNK_N, so launches without it never build the balanced loop.
+    balanced: gl.constexpr = False
     if BATCH_PAD:
         tl.static_assert(IS_DECODE)
     elif CHUNK_LOOP:
