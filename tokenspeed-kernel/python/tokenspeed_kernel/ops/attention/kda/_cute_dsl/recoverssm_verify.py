@@ -482,6 +482,13 @@ class RecoverSsmVerify:
             value_tile_rows < THREADS
             and key_dim * self.padded_columns >= value_tile_rows * window
         )
+        # A 32-row tile of a window of at most 2 (4 columns of M) unrolls the
+        # product's key chunks in pairs, so one chunk's shared loads fly
+        # during the other's FMAs; at T 4 (8 columns) the pairs slowed a
+        # batch-1 round 2% on GB300.
+        self.product_unroll = (
+            2 if value_tile_rows == 32 and self.padded_columns == 4 else 1
+        )
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
@@ -1874,7 +1881,7 @@ class RecoverSsmVerify:
         products.fill(0.0)
         if const_expr(history_products is not None):
             history_products.fill(0.0)
-        for chunk in cutlass.range(K // 32, unroll=1):
+        for chunk in cutlass.range(K // 32, unroll=self.product_unroll):
             key0 = 4 * (split + KEY_SPLITS * chunk)
             decay = None
             if const_expr(decayed):
