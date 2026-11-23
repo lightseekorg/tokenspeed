@@ -19,8 +19,10 @@
 // SOFTWARE.
 
 //! The replica's peer endpoint: one PULL socket every other replica pushes
-//! requests and replies to, and PUSH sockets to them (`ts_pd::Sockets`). Each
-//! message is a kind frame and the encoded request or reply.
+//! requests and replies to, and PUSH sockets to them (`ts_pd::Sockets`). A message to rank 0
+//! has two frames: kind and encoded request or reply. A suffixed endpoint adds
+//! a leading four-byte big-endian destination rank. The public listener removes
+//! this frame before delivery to the destination replica.
 
 use std::sync::mpsc;
 

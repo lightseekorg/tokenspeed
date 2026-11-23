@@ -36,7 +36,7 @@ use ts_control::peer::{
     net::{Inbound, PeerNet},
     push::{PagePusher, PushItem},
     read::Arena,
-    wire::Request,
+    wire::{Reply, Request},
     Peer, PeerListener, PeerSettings,
 };
 use ts_scheduler::{
@@ -441,15 +441,14 @@ fn two_dp_replicas_read_through_one_public_port() {
     }
 }
 
-fn read_through_node_port(public_reads: bool) {
-    let arena = Arena::new(200_000);
+fn node_listeners() -> [PeerListener; 2] {
     use ts_collective::{Listener, Mesh};
 
     let mesh_listeners = [(); 2].map(|_| Listener::bind("127.0.0.1").unwrap());
     let addresses = mesh_listeners
         .each_ref()
         .map(|socket| format!("127.0.0.1:{}", socket.port().unwrap()));
-    let [public, private] = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let addresses = &addresses;
         let spawn = |rank, socket| {
             scope.spawn(move || {
@@ -460,7 +459,49 @@ fn read_through_node_port(public_reads: bool) {
         };
         let [a, b] = mesh_listeners;
         [spawn(0, a), spawn(1, b)].map(|worker| worker.join().unwrap())
-    });
+    })
+}
+
+#[test]
+fn sibling_receives_requests_while_public_scheduler_is_locked() {
+    let arena = Arena::new(200_000);
+    let [public, private] = node_listeners();
+    let address = format!("127.0.0.1:{}", public.port());
+    let replica = |rank, listener, base| {
+        Replica::with_listener(
+            settings(&format!("{address}/{rank}"), "v1"),
+            listener,
+            base,
+            &arena,
+            "Fused",
+        )
+    };
+    let owner = replica(16, public, READER_BASE);
+    let sibling = replica(31, private, HOLDER_BASE);
+    let (incoming, replies) = mpsc::channel();
+    let client = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let layout = Request::Layout {
+        reply_to: format!("127.0.0.1:{}", client.port()),
+    };
+    let receive_holder = || {
+        let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Inbound::Reply(Reply::Layout { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
+            panic!("expected a layout reply");
+        };
+        stamp.name
+    };
+    // Both messages enter the same public socket in FIFO order.
+    let lock = owner.scheduler.lock();
+    client.request(&owner.name, &layout).unwrap();
+    client.request(&sibling.name, &layout).unwrap();
+    assert_eq!(receive_holder(), sibling.name);
+    drop(lock);
+    assert_eq!(receive_holder(), owner.name);
+}
+
+fn read_through_node_port(public_reads: bool) {
+    let arena = Arena::new(200_000);
+    let [public, private] = node_listeners();
     let address = format!("127.0.0.1:{}", public.port());
     let (reader_listener, reader_rank, holder_listener, holder_rank) = if public_reads {
         (public, 16, private, 31)

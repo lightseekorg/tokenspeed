@@ -147,16 +147,18 @@ def _cache_checkpoint_ids(
     for_peer: bool,
 ) -> list[str]:
     if for_peer:
-        # The deployment supplies weight_version. Only persistent L3 objects
-        # need a content fingerprint that survives independent restarts.
-        return [
-            str(model_config.revision or ""),
-            (
-                str(draft_model_config.revision or "")
-                if draft_model_config is not None
-                else ""
-            ),
-        ]
+        from tokenspeed.runtime.cache.l3.identity import warn_if_unpinned_peer_weights
+
+        target = str(model_config.revision or "")
+        draft = (
+            str(draft_model_config.revision or "")
+            if draft_model_config is not None
+            else ""
+        )
+        if server_args.mapping.rank == 0:
+            revisions = [target] if draft_model_config is None else [target, draft]
+            warn_if_unpinned_peer_weights(server_args.weight_version, revisions)
+        return [target, draft]
 
     import torch.distributed as dist
 
@@ -212,8 +214,8 @@ def cache_deployment_id(
         draft_model_config: Draft checkpoint configuration, or None.
         host_cache: Shared Host resources and resolved CPU cache facts.
         for_peer: Apply the live peer cache compatibility rules.
-        world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment. Every rank calls this.
+        world_cpu_group: Gloo group for multi-rank persistent L3 checkpoint
+            agreement. Live peers and single-process L3 pass None.
 
     Returns:
         The id; the weight version is not part of it.

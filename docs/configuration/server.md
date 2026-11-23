@@ -2039,7 +2039,10 @@ scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
 groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
 cache layout and numerical settings are compatible. Deploy the same weights on
-all peers and identify each generation with the same `--weight-version`. A flushed weight update must name its `weight_version`,
+all peers and identify each generation with the same `--weight-version`. At
+startup, rank 0 warns if the version is left at its default and any loaded target
+or draft revision is unpinned. Live peers trust the configured versions.
+A flushed weight update must name its `weight_version`,
 which moves the namespace, as it does for L3.
 
 ### Local Disk tier

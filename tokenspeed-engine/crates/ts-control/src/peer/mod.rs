@@ -205,7 +205,6 @@ struct Layout {
 pub struct PeerListener {
     net: Arc<PeerNet>,
     received: mpsc::Receiver<Vec<Bytes>>,
-    routes: Option<NodeRoutes>,
 }
 
 /// The public listener dispatches both holder requests and reader replies.
@@ -220,11 +219,21 @@ impl NodeRoutes {
             // The original two-frame address names DP rank zero.
             [_, _] => 0,
             [destination, _, _] => {
-                let rank = u32::from_be_bytes(destination.as_ref().try_into().ok()?);
+                let Ok(bytes) = destination.as_ref().try_into() else {
+                    tracing::warn!(
+                        bytes = destination.len(),
+                        "invalid peer destination rank frame"
+                    );
+                    return None;
+                };
+                let rank = u32::from_be_bytes(bytes);
                 frames.remove(0);
                 rank
             }
-            _ => return None,
+            _ => {
+                tracing::warn!(frames = frames.len(), "unexpected peer message frame count");
+                return None;
+            }
         };
         if rank == self.own_rank {
             return Some(frames);
@@ -233,8 +242,37 @@ impl NodeRoutes {
             if let Err(error) = net.forward(*port, frames) {
                 tracing::warn!(rank, %error, "peer message could not be forwarded");
             }
+        } else {
+            tracing::warn!(
+                rank,
+                own_rank = self.own_rank,
+                "peer destination rank is not on this node"
+            );
         }
         None
+    }
+
+    /// Route public traffic independently of the local holder's scheduler lock.
+    fn start(
+        self,
+        net: &Arc<PeerNet>,
+        incoming: mpsc::Receiver<Vec<Bytes>>,
+    ) -> std::io::Result<mpsc::Receiver<Vec<Bytes>>> {
+        let net = Arc::downgrade(net);
+        let (local, received) = mpsc::channel();
+        thread::Builder::new()
+            .name("ts-peer-router".into())
+            .spawn(move || {
+                for frames in incoming {
+                    let Some(net) = net.upgrade() else { break };
+                    if let Some(frames) = self.dispatch(&net, frames) {
+                        if local.send(frames).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(received)
     }
 }
 
@@ -245,11 +283,7 @@ impl PeerListener {
     pub fn bind(host: &str, port: u16) -> Result<Self, PeerError> {
         let (incoming, received) = mpsc::channel();
         let net = Arc::new(PeerNet::start(host, port, incoming)?);
-        Ok(Self {
-            net,
-            received,
-            routes: None,
-        })
+        Ok(Self { net, received })
     }
 
     /// Bind one public control endpoint for the node. Its replica leaders
@@ -276,7 +310,7 @@ impl PeerListener {
         };
         let ports = mesh.all_gather_i64(&group, &[i64::from(listener.port())])?;
         if group.index() == 0 {
-            listener.routes = Some(NodeRoutes {
+            let routes = NodeRoutes {
                 own_rank: leaders[0].1,
                 local_ports: leaders
                     .iter()
@@ -284,7 +318,8 @@ impl PeerListener {
                     .skip(1)
                     .map(|(&(_, rank), row)| (rank, row[0] as u16))
                     .collect(),
-            });
+            };
+            listener.received = routes.start(&listener.net, listener.received)?;
         }
         Ok(listener)
     }
@@ -889,11 +924,7 @@ fn start_endpoint(
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
 ) -> Result<Endpoint, PeerError> {
-    let PeerListener {
-        net,
-        received,
-        routes,
-    } = listener;
+    let PeerListener { net, received } = listener;
     let holder = Arc::new(Mutex::new(Holder::new(
         Stamp {
             name: settings.name.clone(),
@@ -905,18 +936,11 @@ fn start_endpoint(
     )));
     let (replied, replies) = mpsc::channel();
     let servicer = {
-        let (net, holder) = (net.clone(), holder.clone());
+        let (net, holder) = (Arc::downgrade(&net), holder.clone());
         thread::Builder::new()
             .name("ts-peer-servicer".to_owned())
             .spawn(move || {
                 for frames in received {
-                    let frames = match &routes {
-                        Some(routes) => match routes.dispatch(&net, frames) {
-                            Some(local) => local,
-                            None => continue,
-                        },
-                        None => frames,
-                    };
                     match Inbound::decode(&frames) {
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's
@@ -925,6 +949,7 @@ fn start_endpoint(
                                 let scheduler = scheduler.lock();
                                 holder.lock().handle(&*scheduler, request, Instant::now())
                             };
+                            let Some(net) = net.upgrade() else { return };
                             if let Err(error) = net.reply(&to, &reply) {
                                 tracing::warn!(to, %error, "peer reply not sent");
                             }
