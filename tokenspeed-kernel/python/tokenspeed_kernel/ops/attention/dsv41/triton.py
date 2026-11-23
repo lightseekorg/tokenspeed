@@ -23,6 +23,10 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _index_k_layernorm_fp8_scatter_args,
+    _index_k_layernorm_fp8_scatter_row,
+)
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
 from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _e2m1_decode,
@@ -2567,9 +2571,8 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1", "X2"])
-def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
+@triton.jit
+def _pack_index_query_row(X, V, S, X0, X1, X2, row, HEADS: tl.constexpr):
     d = tl.arange(0, 128)
     # Widen before multiplication: large inner strides overflow int32 offsets.
     x = tl.load(X + (row // HEADS) * X0 + (row % HEADS) * X1 + d.to(tl.int64) * X2).to(
@@ -2580,6 +2583,71 @@ def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
     tl.store(V + row * 64 + tl.arange(0, 64), tl.reshape(packed, (64,)))
     tl.store(S + row + tl.arange(0, 1), _ue8m0_word(exponent))
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
+    _pack_index_query_row(X, V, S, X0, X1, X2, tl.program_id(0).to(tl.int64), HEADS)
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _index_k_write_pack_query_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    X,
+    V,
+    S,
+    X0,
+    X1,
+    X2,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
+    HEADS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    _pack_index_query_row(X, V, S, X0, X1, X2, token * HEADS + head, HEADS)
+    # A row's first head also writes its key.
+    if head == 0:
+        _index_k_layernorm_fp8_scatter_row(
+            fp8_buf_ptr,
+            scale_buf_ptr,
+            x_ptr,
+            norm_weight_ptr,
+            norm_bias_ptr,
+            loc_ptr,
+            write_mask_ptr,
+            token,
+            x_row_stride,
+            page_bytes,
+            scale_base_off,
+            eps,
+            HAS_WRITE_MASK,
+            PAGE_SIZE,
+            HD,
+            GROUP,
+            NG,
+            BLOCK_NG,
+            FP8_MAX,
+            MXFP4,
+            UE8M0,
+        )
 
 
 @triton.jit
@@ -2671,6 +2739,80 @@ def pack_index_queries(values):
             HEADS=heads,
             num_warps=4,
             enable_fp_fusion=False,
+        )
+    return data, scales
+
+
+def index_k_layernorm_scatter_and_pack_query(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    loc: torch.Tensor,
+    q: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    write_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write mxfp4 index keys and pack the same rows' index queries in one launch.
+
+    The plane's bytes are exactly those of ``index_k_layernorm_fp8_scatter(buf,
+    index_k, norm_weight, norm_bias, loc, ..., group_size=32,
+    index_k_format="mxfp4")`` and the outputs exactly ``pack_index_queries(q)``:
+    each program packs one query head with that kernel's row function, and a
+    row's first head also writes its key with the key kernel's, the LayerNorm
+    in one warp as there.
+
+    Args:
+        buf: uint8 mxfp4 index-K plane, as for ``index_k_layernorm_fp8_scatter``.
+        index_k: ``[tokens, 128]`` pre-norm keys with unit inner stride.
+        norm_weight: ``[128]`` LayerNorm weight.
+        norm_bias: ``[128]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        q: ``[tokens, heads, 128]`` BF16 index queries; may be strided.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows'
+            keys are not written. None writes every row.
+
+    Returns:
+        uint8 ``[tokens, heads, 64]`` E2M1 codes and int32 ``[tokens, heads]``
+        UE8M0 scale words; ``buf`` is written in place.
+    """
+    key_args, key_constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        norm_weight,
+        norm_bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=32,
+        write_mask=write_mask,
+        index_k_format="mxfp4",
+    )
+    if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16:
+        raise ValueError("mxfp4 index queries pack BF16 [tokens, heads, 128]")
+    tokens, heads = q.shape[:2]
+    if index_k.shape[0] != tokens:
+        raise ValueError(
+            f"index_k has {index_k.shape[0]} rows and q has {tokens}; the "
+            "fused write packs the queries of its own rows"
+        )
+    data = torch.empty((tokens, heads, 64), dtype=torch.uint8, device=q.device)
+    scales = torch.empty((tokens, heads), dtype=torch.int32, device=q.device)
+    if tokens:
+        _index_k_write_pack_query_kernel[(tokens, heads)](
+            *key_args,
+            q,
+            data,
+            scales,
+            *q.stride(),
+            **key_constexprs,
+            HEADS=heads,
+            # One warp: the key's LayerNorm sums in the order of the scatter kernel's.
+            num_warps=1,
         )
     return data, scales
 

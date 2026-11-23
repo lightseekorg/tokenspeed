@@ -184,11 +184,13 @@ def _fma_weight_offsets(
 
 @gluon.jit
 def _fma_load_chunk(w_ptr, offs, mask, k, chunk, K: gl.constexpr, KC: gl.constexpr):
+    # Masked lanes read out of bounds, which the hardware fills with zeros;
+    # an explicit `other` selects on the load right after it is issued, and
+    # loads retire in order, so that wait drained every load ahead of it.
     return cdna4.buffer_load(
         w_ptr,
         offs + chunk * KC,
         mask=mask & (k + chunk * KC < K),
-        other=0.0,
         cache=".cg",
     )
 
@@ -215,7 +217,7 @@ def _fma_tile(
         gl.arange(0, KC // 8, gl.SliceLayout(1, LX))[:, None] * 8
         + gl.arange(0, 8, gl.SliceLayout(0, LX))[None, :]
     )
-    x = cdna4.buffer_load(x_ptr, xk, mask=xk < K, other=0.0)
+    x = cdna4.buffer_load(x_ptr, xk, mask=xk < K)
     acc = gl.zeros((BLOCK_N, KC // 8), gl.float32, LW)
     # Unrolled, so values flow between chunks without loop-carried copies
     # (copying a pending load waits for it). Chunk c + 1 is in flight while
@@ -224,7 +226,7 @@ def _fma_tile(
         if c + 1 < CHUNKS:
             next_w = _fma_load_chunk(w_ptr, offs, mask, k, c + 1, K, KC)
             next_x = cdna4.buffer_load(
-                x_ptr, xk + (c + 1) * KC, mask=xk + (c + 1) * KC < K, other=0.0
+                x_ptr, xk + (c + 1) * KC, mask=xk + (c + 1) * KC < K
             )
         # Keep the scheduler from sinking those loads below the FMAs.
         gl.amd.hint.sched_barrier()
@@ -395,11 +397,11 @@ def _mfma_weight_offsets(
 
 @gluon.jit
 def _mfma_load_iter(w_ptr, offs, mask, k, it, K: gl.constexpr, KITER: gl.constexpr):
+    # Zero-filled out of bounds, without an `other` (see _fma_load_chunk).
     return cdna4.buffer_load(
         w_ptr,
         offs + it * KITER,
         mask=mask & (k + it * KITER < K),
-        other=0.0,
         cache=".cg",
     )
 
@@ -443,7 +445,7 @@ def _mfma_tile(
     ak = a_s[:, None, None] * BLOCK_K + a_k[None, None, :]
     a_offs = a_m[None, :, None] * stride_xm + ak
     a_mask = (a_m < M)[None, :, None] & (ak < K)
-    a = cdna4.buffer_load(x_ptr, a_offs, mask=a_mask, other=0.0)
+    a = cdna4.buffer_load(x_ptr, a_offs, mask=a_mask)
     acc = gl.zeros((KS, BLOCK_M, BLOCK_N), gl.float32, mfma)
     # Unrolled, one K iteration in flight ahead of the MFMAs (see _fma_tile).
     for it in gl.static_range(ITERS):
@@ -453,7 +455,6 @@ def _mfma_tile(
                 x_ptr,
                 a_offs + (it + 1) * KITER,
                 mask=a_mask & (ak + (it + 1) * KITER < K),
-                other=0.0,
             )
         b = gl.convert_layout(w, b_l)
         if W_FP8:

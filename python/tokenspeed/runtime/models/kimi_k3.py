@@ -97,6 +97,7 @@ from tokenspeed_kernel.ops.model.kimi_k3 import (
     KimiK3MoeTailShape,
     KimiK3NextMix,
     kimi_k3_moe_tail,
+    kimi_k3_moe_tail_applies_attn_norm,
     kimi_k3_moe_tail_expert_layout,
     pack_kimi_k3_moe_tail_layer,
     prepare_kimi_k3_moe_tail,
@@ -2075,6 +2076,21 @@ class KimiLinearKDA(nn.Module):
         return self._recurrent_core(
             mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
         )
+
+    def o_proj_input_and_norm(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        *,
+        projection,
+    ) -> tuple[torch.Tensor, KdaOutputNorm]:
+        """``o_proj_input``'s rows before the gated output norm, and that
+        norm, for a consumer that applies it."""
+        mixed_qkv, out_gate, f_a_out, beta = self._split_qkvfab(
+            projection(hidden_states)
+        )
+        core = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+        return core.contiguous(), self._output_norm(out_gate)
 
     def decode_weights(self) -> tuple[torch.Tensor, ...]:
         """The weights one decode step reads, in reading order.
@@ -4716,13 +4732,22 @@ class KimiLinearDecoderLayer(nn.Module):
             h, stream = self._mix_into_attention(
                 hidden_states, block_residual, premixed
             )
-        attn_output = self.self_attn.o_proj_input(
-            positions,
-            h,
-            ctx,
-            self.comm_manager,
-            projection=self._moe_tail_projection(hidden_states, block_residual, h, ctx),
-        )
+        projection = self._moe_tail_projection(hidden_states, block_residual, h, ctx)
+        attn_norm = None
+        if isinstance(
+            self.self_attn, KimiLinearKDA
+        ) and kimi_k3_moe_tail_applies_attn_norm(tail.layer):
+            attn_output, attn_norm = self.self_attn.o_proj_input_and_norm(
+                h, ctx, projection=projection
+            )
+        else:
+            attn_output = self.self_attn.o_proj_input(
+                positions,
+                h,
+                ctx,
+                self.comm_manager,
+                projection=projection,
+            )
         next_layer = tail.next_layer
         next_mix = None
         if next_layer is not None:
@@ -4742,6 +4767,7 @@ class KimiLinearDecoderLayer(nn.Module):
             block_residual,
             torch.empty_like(hidden_states),
             next_mix=next_mix,
+            attn_norm=attn_norm,
         )
         return out, block_residual
 

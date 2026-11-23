@@ -26,6 +26,9 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     index_k_layernorm_fp8_scatter_and_quantize_query,
 )
+from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    index_k_layernorm_scatter_and_pack_query,
+)
 from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_block_split_scatter,
@@ -338,4 +341,52 @@ class DSATokenToKVPool(MLATokenToKVPool):
             group_size=_INDEX_K_FP8_GROUP_SIZE,
             write_mask=write_mask,
             softmax_scale=softmax_scale,
+        )
+
+    def set_index_k_buffer_and_pack_query(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
+        key_norm: LayerNorm,
+        query: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write pre-norm index keys into an mxfp4 plane and pack the same rows'
+        queries to mxfp4 in one launch.
+
+        The plane receives exactly the bytes ``set_index_k_buffer(...,
+        key_norm=key_norm)`` writes, and the query comes back exactly as
+        ``dsa_quantize_index_query_mxfp4`` returns it.
+
+        Args:
+            layer_id: The indexer layer whose plane to write.
+            loc: ``[rows]`` cache slots of the keys.
+            index_k: ``[rows, index_head_dim]`` pre-norm keys in the model dtype.
+            write_mask: Optional bool ``[rows]`` ownership mask of the keys.
+            key_norm: The LayerNorm the keys still need.
+            query: ``[rows, heads, index_head_dim]`` BF16 index queries.
+
+        Returns:
+            uint8 ``[rows, heads, index_head_dim / 2]`` E2M1 codes and int32
+            ``[rows, heads]`` UE8M0 scale words.
+        """
+        if self.index_k_format != "mxfp4":
+            raise ValueError("the fused index-K write and query pack takes an mxfp4 plane")
+        if index_k.dtype != self.model_dtype:
+            raise ValueError(
+                f"the fused index-K write takes {self.model_dtype} keys, got "
+                f"{index_k.dtype}"
+            )
+        return index_k_layernorm_scatter_and_pack_query(
+            self.get_index_k_buffer(layer_id),
+            index_k.view(-1, self.index_head_dim),
+            key_norm.weight,
+            key_norm.bias,
+            loc,
+            query,
+            eps=key_norm.variance_epsilon,
+            page_size=self.index_k_page_size,
+            write_mask=write_mask,
         )

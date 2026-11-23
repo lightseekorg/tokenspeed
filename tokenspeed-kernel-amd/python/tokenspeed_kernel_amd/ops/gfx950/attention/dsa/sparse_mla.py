@@ -114,6 +114,9 @@ _BF16_DECODE_NUM_WARPS = 4
 # FP8-query scorers: small chunks even the last wave; 4 waves/SIMD suit 32 heads only.
 _FP8_ROWS_PREFILL_TILES = {32: (128, 2048)}
 _FP8_ROWS_DECODE_NUM_STAGES = 2
+# Slots and stages a decode program takes per pass over a balanced run.
+_FP8_ROWS_DECODE_RUN_CHUNK_N = 512
+_FP8_ROWS_DECODE_RUN_NUM_STAGES = 3
 _FP8_ROWS_DECODE_WAVES_PER_EU = 4
 _FP8_ROWS_DECODE_PROGRAMS_PER_CU = 16
 
@@ -5024,6 +5027,8 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=grid[1] < chunks,
+        RUN_CHUNK_N=_FP8_ROWS_DECODE_RUN_CHUNK_N if grid[1] < chunks else 0,
+        RUN_NUM_STAGES=_FP8_ROWS_DECODE_RUN_NUM_STAGES,
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves_per_eu,
     )

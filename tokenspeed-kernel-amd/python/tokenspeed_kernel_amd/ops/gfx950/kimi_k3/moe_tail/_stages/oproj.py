@@ -55,6 +55,7 @@ from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.sentinel import (
     sent_sum,
 )
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.staging import (
+    gated_rows_to_lds,
     rows_to_lds,
 )
 
@@ -98,6 +99,11 @@ def _stage_oproj_role(
     first_group,
     S: gl.constexpr,
     PREFETCH_THIRD: gl.constexpr,
+    gate,
+    norm_w,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
 ):
     # Load all three groups' weights, clamped to the last valid group,
     # before the attention rows are staged or any matrix instruction runs.
@@ -109,7 +115,10 @@ def _stage_oproj_role(
         weights2 = gemv_loads(
             w_o, gl.minimum(first_group + 400, 447) * 16, 1536, True, False
         )
-    rows_to_lds(core, xl, 1536, S, 1536, 0, None)
+    if GATED_NORM:
+        gated_rows_to_lds(core, gate, norm_w, xl, S, GATE_STRIDE, NORM_EPS)
+    else:
+        rows_to_lds(core, xl, 1536, S, 1536, 0, None)
     stage_o(xl, red, peer_regions, rank, first_group, weights0, S)
     stage_o(xl, red, peer_regions, rank, first_group + 200, weights1, S)
     if PREFETCH_THIRD:
@@ -118,14 +127,34 @@ def _stage_oproj_role(
 
 
 @gluon.jit
-def stage_oproj(core, w_o, xl, red, peer_regions, rank, first_group, S: gl.constexpr):
+def stage_oproj(
+    core,
+    w_o,
+    xl,
+    red,
+    peer_regions,
+    rank,
+    first_group,
+    S: gl.constexpr,
+    gate,
+    norm_w,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
+):
     # The workgroups that later run the router and latent projections take
     # a separate path. Each path consumes its loaded weights before the
     # paths join, so no loaded tensor stays live across the join.
     if (first_group >= 104) & (first_group < 188):
-        _stage_oproj_role(core, w_o, xl, red, peer_regions, rank, first_group, S, False)
+        _stage_oproj_role(
+            core, w_o, xl, red, peer_regions, rank, first_group, S, False,
+            gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+        )
     else:
-        _stage_oproj_role(core, w_o, xl, red, peer_regions, rank, first_group, S, True)
+        _stage_oproj_role(
+            core, w_o, xl, red, peer_regions, rank, first_group, S, True,
+            gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+        )
 
 
 @gluon.jit
