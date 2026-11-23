@@ -241,7 +241,9 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
 
 
-from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+# Re-exported: the runtime's state backends plan their verify and commit pages
+# through the Triton solution (mamba, KDA and Qwen4 PLE backends).
+from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402, F401
     commit_state_groups,
     commit_state_pages,
     verify_state_blocks,

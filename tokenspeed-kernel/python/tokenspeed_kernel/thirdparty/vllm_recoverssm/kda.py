@@ -431,10 +431,6 @@ def kda_recoverssm_verify(
         return out
     block_k = triton.next_power_of_2(key_dim)
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]), batch, num_heads * 1)
-    value_block = min(
-        triton.next_power_of_2(value_dim),
-        4 if batch <= 4 else 8 if batch <= 8 else 16,
-    )
     stamp_capacity = record_stamps.shape[1] if record_stamps is not None else capacity
     stamp_slots = (
         record_stamps.shape[0]
