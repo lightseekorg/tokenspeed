@@ -34,8 +34,12 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _MUSE_SPARK_PROFILE,
     _get_workspace,
     _GluonPetitState,
+    _import_petit_kernel,
+    _megamoe_config,
     _Profile,
     _validate_layer,
+    gluon_petit_largest_max_tokens_per_rank,
+    gluon_petit_max_tokens_per_rank,
     gluon_petit_mxfp4_megamoe_apply,
     gluon_petit_mxfp4_megamoe_weights,
 )
@@ -395,6 +399,8 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
 
     state = module._moe_backend_state
     assert state.profile == profile
+    # A plan without a server capacity keeps Petit's default 1024 rows.
+    assert state.max_tokens_per_rank == 1024
     assert state.w13_weight.shape == (2, 64, 256)
     assert state.w13_scale.shape == (2, 64, 16)
     assert state.w2_weight.shape == (2, 512, 16)
@@ -467,3 +473,137 @@ def test_apply_keeps_zero_token_rank_in_collective() -> None:
     config.run.assert_called_once()
     assert config.run.call_args.args[5] == 0
     overlap.assert_called_once_with()
+
+
+# One rank's VMM heap (reserved, physical) bytes at Petit's default 1024-row
+# capacity, as TokenSpeed a0792eef builds it; a raised capacity must not move
+# them.
+_DEFAULT_CAPACITY_HEAP_BYTES = {
+    (_DSV41_FLASH_PROFILE.name, 4): (595546112, 180875264),
+    (_DSV41_FLASH_DSPARK_PROFILE.name, 4): (294031360, 90726400),
+    (_DSV41_FLASH_PROFILE.name, 8): (1686024192, 276680704),
+    (_DSV41_FLASH_DSPARK_PROFILE.name, 8): (838574080, 138260480),
+}
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_default_capacity_keeps_solution_and_heap(profile, world_size) -> None:
+    petit_kernel = _import_petit_kernel()
+    default = _megamoe_config(petit_kernel, profile, world_size, 1024)
+    # The capacity field (solution-id bits 52-59) is zero at 1024 rows, so the
+    # solution id, kernel constants and caches are today's.
+    assert default._solution_id >> 52 == 0
+    assert default.max_tokens_per_rank == 1024
+    assert (
+        default.heap_bytes() == _DEFAULT_CAPACITY_HEAP_BYTES[(profile.name, world_size)]
+    )
+    assert gluon_petit_max_tokens_per_rank(world_size, 1) == 1024
+    assert gluon_petit_max_tokens_per_rank(world_size, 1024) == 1024
+
+
+def test_largest_capacity_per_world_size() -> None:
+    # EP4: the DSv4.1 Flash target's heap reaches 2**32 above 7808 rows; the
+    # DSpark draft fits every encodable capacity. EP8 keeps 1024 rows.
+    assert gluon_petit_largest_max_tokens_per_rank(4) == 7808
+    assert gluon_petit_largest_max_tokens_per_rank(8) == 1024
+    petit_kernel = _import_petit_kernel()
+    reserved, _ = _megamoe_config(
+        petit_kernel, _DSV41_FLASH_PROFILE, 4, 7808
+    ).heap_bytes()
+    assert reserved < 1 << 32
+    with pytest.raises(ValueError, match="32-bit offsets"):
+        _megamoe_config(petit_kernel, _DSV41_FLASH_PROFILE, 4, 7840)
+
+
+@pytest.mark.parametrize(
+    "world_size,rows,capacity",
+    [
+        (4, 1025, 1056),
+        (4, 2048, 2048),
+        (4, 4000, 4000),
+        (4, 4096, 4096),
+        (4, 7808, 7808),
+        (4, 7809, None),
+        (8, 1025, None),
+        (8, 2048, None),
+    ],
+)
+def test_capacity_rounds_to_sorted_blocks_and_refuses_above_heap_limit(
+    world_size, rows, capacity
+) -> None:
+    if capacity is None:
+        largest = 7808 if world_size == 4 else 1024
+        with pytest.raises(ValueError, match=f"at most {largest} tokens per rank"):
+            gluon_petit_max_tokens_per_rank(world_size, rows)
+    else:
+        assert gluon_petit_max_tokens_per_rank(world_size, rows) == capacity
+
+
+@pytest.mark.parametrize(
+    "profile,rows,expected",
+    [
+        # Stage-1 thresholds were tuned to 1024 rows; above them every count
+        # keeps the 8-warp 64-row tile and the 56-CTA producer.
+        (_DSV41_FLASH_PROFILE, 1024, ("cta56", "m64_w8")),
+        (_DSV41_FLASH_PROFILE, 2048, ("cta56", "m64_w8")),
+        (_DSV41_FLASH_PROFILE, 4096, ("cta56", "m64_w8")),
+        (_DSV41_FLASH_DSPARK_PROFILE, 1024, ("cta56", "m64_w8")),
+        (_DSV41_FLASH_DSPARK_PROFILE, 2048, ("cta56", "m64_w8")),
+        (_DSV41_FLASH_DSPARK_PROFILE, 4096, ("cta56", "m64_w8")),
+    ],
+)
+def test_ep4_launch_choice_above_1024_rows(profile, rows, expected) -> None:
+    petit_kernel = _import_petit_kernel()
+    config = _megamoe_config(petit_kernel, profile, 4, 4096)
+    assert config.launch_choice(rows) == expected
+    # The same count at the default capacity launches the same tile.
+    if rows <= 1024:
+        assert _megamoe_config(petit_kernel, profile, 4, 1024).launch_choice(
+            rows
+        ) == config.launch_choice(rows)
+
+
+def test_raised_capacity_is_carried_into_state_and_apply() -> None:
+    profile = _Profile(
+        name="test",
+        num_experts=8,
+        top_k=1,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+    layer = SimpleNamespace(
+        _moe_backend_state=_GluonPetitState(
+            profile=profile,
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_scale=torch.empty(0),
+            w2_scale=torch.empty(0),
+            w13_bias=None,
+            w2_bias=None,
+            max_tokens_per_rank=2048,
+        )
+    )
+    x = torch.empty((2049, profile.model_dim), dtype=torch.bfloat16)
+    for kwargs, error in (
+        ({"max_num_tokens_per_gpu": 2049}, "its 2048-token capacity"),
+        ({"max_num_tokens_per_gpu": None}, "more than 2048 tokens on one rank"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            gluon_petit_mxfp4_megamoe_apply(
+                plan={},
+                x=x,
+                w=layer,
+                router_logits=torch.empty((0, 0), dtype=torch.bfloat16),
+                topk_weights=torch.empty((2049, 1), dtype=torch.float32),
+                topk_ids=torch.empty((2049, 1), dtype=torch.int32),
+                num_tokens_global=2049,
+                do_finalize=True,
+                enable_pdl=False,
+                low_latency=None,
+                overlap_fn=None,
+                **kwargs,
+            )

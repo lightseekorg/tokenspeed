@@ -115,7 +115,7 @@ class MegaMoEConfigSelector(DeviceTemplate):
         )
         self.kProducerBlocks = min(Solution.ProducerBlocks(), self.kNumExperts)
         self.kMaxTokensPerRank, self.kSortedTokenBlock, self.kWeightScaleBlockSize = (
-            1024,
+            Solution.MaxTokensPerRank(),
             32,
             128,
         )

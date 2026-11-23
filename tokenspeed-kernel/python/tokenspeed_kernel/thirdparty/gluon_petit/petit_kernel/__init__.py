@@ -86,6 +86,17 @@ class _MegaMoeTileShape(enum.IntEnum):
     n128 = 1
 
 
+# Per-rank token capacity: the default sizes every buffer for 1024 rows; a
+# larger capacity is encoded in solution-id bits 52-59 as extra 32-row
+# sorted-token blocks, so the default keeps today's solution ids.
+MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK = 1024
+MEGA_MOE_SORTED_TOKEN_BLOCK = 32
+MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK = (
+    MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK + 0xFF * MEGA_MOE_SORTED_TOKEN_BLOCK
+)
+MEGA_MOE_HEAP_OFFSET_LIMIT = 1 << 32
+
+
 class _MegaMoeProducerGeometry(enum.IntEnum):
     cta56 = 0
     cta64 = 1
@@ -134,6 +145,7 @@ def _make_mega_moe_solution_id(
         _FusedMoeActivationFunction.openai_swiglu
     ),
     has_bias: bool = True,
+    max_tokens_per_rank: int = 1024,
 ) -> int:
     activation_type = _FusedMoeDataType(activation_type)
     stages = _FusedMoeStages(stages)
@@ -160,6 +172,19 @@ def _make_mega_moe_solution_id(
     if inter_dim <= 0 or inter_dim % 512 or inter_dim // 512 > 32:
         raise ValueError(
             "MegaMoE inter_dim must be a positive 512 multiple at most 16384"
+        )
+    max_tokens_per_rank = int(max_tokens_per_rank)
+    if (
+        max_tokens_per_rank < MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK
+        or max_tokens_per_rank > MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK
+        or max_tokens_per_rank % MEGA_MOE_SORTED_TOKEN_BLOCK
+    ):
+        raise ValueError(
+            "MegaMoE max_tokens_per_rank must be a multiple of "
+            f"{MEGA_MOE_SORTED_TOKEN_BLOCK} in "
+            f"[{MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK}, "
+            f"{MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK}]; "
+            f"got {max_tokens_per_rank}"
         )
     activation_function = _FusedMoeActivationFunction(activation_function)
     mfma = (
@@ -188,6 +213,11 @@ def _make_mega_moe_solution_id(
         | (int(w2_tile_shape) << 42)
         | ((inter_dim // 512 - 1) << 43)
         | (int(producer_geometry) << 48)
+        | (
+            (max_tokens_per_rank - MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK)
+            // MEGA_MOE_SORTED_TOKEN_BLOCK
+            << 52
+        )
     )
 
 
@@ -248,7 +278,9 @@ class MegaMoeConfig:
     stages: MegaMoeStages = MegaMoeStages.two_stage
     inter_dim: int = 3072
     has_bias: bool = True
-    max_tokens_per_rank: int = field(init=False, default=1024)
+    # Rows each rank may send per call; sizes the symmetric heap. Values above
+    # the default must keep the heap below 32-bit offsets.
+    max_tokens_per_rank: int = MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK
     _solution_id: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -368,7 +400,32 @@ class MegaMoeConfig:
                     )
                 ),
                 has_bias=self.has_bias,
+                max_tokens_per_rank=self.max_tokens_per_rank,
             ),
+        )
+        object.__setattr__(self, "max_tokens_per_rank", int(self.max_tokens_per_rank))
+        if self.max_tokens_per_rank != MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK:
+            reserved, _ = self.heap_bytes()
+            if reserved >= MEGA_MOE_HEAP_OFFSET_LIMIT:
+                raise ValueError(
+                    f"MegaMoE max_tokens_per_rank={self.max_tokens_per_rank} "
+                    f"needs a {reserved}-byte symmetric heap at world_size="
+                    f"{self.world_size} with {self.num_experts} experts, "
+                    "exceeding 32-bit offsets"
+                )
+
+    def heap_bytes(self) -> tuple[int, int]:
+        """Return one rank's VMM heap ``(reserved, physical)`` bytes."""
+        return ops.mega_moe_heap_bytes(self._solution_id)
+
+    def launch_choice(self, num_tokens: int) -> tuple[str, str]:
+        """Return ``(producer geometry, stage-1 tile)`` launched for a count."""
+        solution_id = self._solution_id_for_tokens(int(num_tokens))
+        return (
+            _select_mega_moe_producer_geometry(
+                self.num_experts, self.activation_function, int(num_tokens)
+            ).name,
+            ops.mega_moe_stage1_tile(solution_id, num_tokens),
         )
 
     @property

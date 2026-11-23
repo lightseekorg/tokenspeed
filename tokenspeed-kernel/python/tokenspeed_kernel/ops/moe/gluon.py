@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -3053,7 +3054,13 @@ if platform.is_amd:
 
 # TokenSpeed adapter for the vendored Gluon Petit MegaMoE kernels.
 
+# Default per-rank token capacity; every buffer, heap and kernel constant at
+# this capacity is the one Petit has always built.
 _MAX_TOKENS_PER_RANK = 1024
+_SORTED_TOKEN_BLOCK = 32
+# World sizes whose capacity may rise above the default, up to what keeps the
+# symmetric heap below 32-bit offsets. EP8 stays at the default.
+_RAISED_CAPACITY_WORLD_SIZES = frozenset({4})
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
 _GPT_OSS_SWIGLU_BETA = 1.0
@@ -3169,6 +3176,100 @@ class _GluonPetitState:
     w2_scale: torch.Tensor
     w13_bias: torch.Tensor | None
     w2_bias: torch.Tensor | None
+    max_tokens_per_rank: int = _MAX_TOKENS_PER_RANK
+
+
+def _megamoe_config(
+    petit_kernel: Any, profile: _Profile, world_size: int, max_tokens_per_rank: int
+) -> Any:
+    return petit_kernel.MegaMoeConfig(
+        world_size=world_size,
+        num_experts=profile.num_experts,
+        topk=profile.top_k,
+        model_dim=profile.model_dim,
+        activation=petit_kernel.MegaMoeActivation.mxfp4,
+        # Petit's SiTU variant hard-codes Kimi K3's beta=4 and linear_beta=25.
+        activation_function=(
+            petit_kernel.MegaMoeActivationFunction.kimi_situ
+            if profile.name == _KIMI_K3_PROFILE.name
+            else petit_kernel.MegaMoeActivationFunction(profile.activation)
+        ),
+        stages=petit_kernel.MegaMoeStages.two_stage,
+        inter_dim=profile.inter_dim,
+        has_bias=profile.has_bias,
+        max_tokens_per_rank=max_tokens_per_rank,
+    )
+
+
+@functools.cache
+def gluon_petit_largest_max_tokens_per_rank(world_size: int) -> int:
+    """Return the largest per-rank token capacity Petit admits at ``world_size``.
+
+    EP8 (and any world size Petit does not serve, which MoELayer refuses)
+    keeps the default 1024 rows. A world size in
+    ``_RAISED_CAPACITY_WORLD_SIZES`` admits the largest 32-row multiple whose
+    symmetric heap stays below 32-bit offsets for every profile registered at
+    that world size (the DSv4.1 Flash target and DSpark draft at EP4).
+    """
+    world_size = int(world_size)
+    if world_size not in _RAISED_CAPACITY_WORLD_SIZES:
+        return _MAX_TOKENS_PER_RANK
+    petit_kernel = _import_petit_kernel()
+    largest = petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK
+    for profile in _PROFILES:
+        if world_size not in profile.world_sizes:
+            continue
+
+        def fits(rows: int) -> bool:
+            try:
+                _megamoe_config(petit_kernel, profile, world_size, rows)
+            except ValueError:
+                return False
+            return True
+
+        low, high = _MAX_TOKENS_PER_RANK, largest
+        if not fits(high):
+            # Invariant: low fits, high does not; both are 32-row multiples.
+            while high - low > _SORTED_TOKEN_BLOCK:
+                middle = (low + high) // 2 // _SORTED_TOKEN_BLOCK * _SORTED_TOKEN_BLOCK
+                low, high = (middle, high) if fits(middle) else (low, middle)
+            largest = low
+    return largest
+
+
+def gluon_petit_max_tokens_per_rank(world_size: int, rows_per_rank: int) -> int:
+    """Size Petit's per-rank capacity for a server's largest per-rank batch.
+
+    Args:
+        world_size: Petit (MoE EP) world size.
+        rows_per_rank: Largest number of tokens one rank sends in one call.
+
+    Returns:
+        ``rows_per_rank`` rounded up to the 32-row sorted-token block, at least
+        1024; every server with at most 1024 rows per rank keeps 1024.
+
+    Raises:
+        ValueError: if the capacity exceeds the largest one admitted at
+            ``world_size`` (its heap would exceed 32-bit offsets, or EP8).
+    """
+    rows_per_rank = int(rows_per_rank)
+    capacity = max(
+        _MAX_TOKENS_PER_RANK,
+        -(-rows_per_rank // _SORTED_TOKEN_BLOCK) * _SORTED_TOKEN_BLOCK,
+    )
+    largest = gluon_petit_largest_max_tokens_per_rank(world_size)
+    if capacity > largest:
+        raise ValueError(
+            f"Gluon Petit MegaMoE supports at most {largest} tokens per rank at "
+            f"world size {world_size}; got {rows_per_rank}"
+            + (
+                " (a larger capacity would exceed the symmetric heap's "
+                "32-bit offsets)"
+                if world_size in _RAISED_CAPACITY_WORLD_SIZES
+                else f" (EP{world_size} keeps the default capacity)"
+            )
+        )
+    return capacity
 
 
 def _release_parameter(module: torch.nn.Module, name: str) -> None:
@@ -3336,13 +3437,19 @@ class _Workspace:
 _workspace_cache: dict[tuple[int, _Profile], _Workspace] = {}
 
 
-def _workspace_key(device: torch.device, profile: _Profile) -> tuple[int, _Profile]:
+def _workspace_key(
+    device: torch.device, profile: _Profile, max_tokens_per_rank: int
+) -> tuple[int, _Profile, int]:
     index = torch.cuda.current_device() if device.index is None else int(device.index)
-    return index, profile
+    return index, profile, max_tokens_per_rank
 
 
-def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
-    key = _workspace_key(device, profile)
+def _get_workspace(
+    device: torch.device,
+    profile: _Profile,
+    max_tokens_per_rank: int = _MAX_TOKENS_PER_RANK,
+) -> _Workspace:
+    key = _workspace_key(device, profile, max_tokens_per_rank)
     workspace = _workspace_cache.get(key)
     if workspace is not None:
         return workspace
@@ -3357,25 +3464,18 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
             f"{_join_sizes(profile.world_sizes)} for {profile.name}; got {world_size}"
         )
 
+    if max_tokens_per_rank != gluon_petit_max_tokens_per_rank(
+        world_size, max_tokens_per_rank
+    ):
+        raise ValueError(
+            "Gluon Petit MegaMoE capacity must be a multiple of "
+            f"{_SORTED_TOKEN_BLOCK} of at least {_MAX_TOKENS_PER_RANK} tokens; "
+            f"got {max_tokens_per_rank}"
+        )
     petit_kernel = _import_petit_kernel()
-    config = petit_kernel.MegaMoeConfig(
-        world_size=world_size,
-        num_experts=profile.num_experts,
-        topk=profile.top_k,
-        model_dim=profile.model_dim,
-        activation=petit_kernel.MegaMoeActivation.mxfp4,
-        # Petit's SiTU variant hard-codes Kimi K3's beta=4 and linear_beta=25.
-        activation_function=(
-            petit_kernel.MegaMoeActivationFunction.kimi_situ
-            if profile.name == _KIMI_K3_PROFILE.name
-            else petit_kernel.MegaMoeActivationFunction(profile.activation)
-        ),
-        stages=petit_kernel.MegaMoeStages.two_stage,
-        inter_dim=profile.inter_dim,
-        has_bias=profile.has_bias,
-    )
+    config = _megamoe_config(petit_kernel, profile, world_size, max_tokens_per_rank)
     heap = petit_kernel.create_vmm_symmetric_heap(world_size)
-    inputs = config.input_views(heap, _MAX_TOKENS_PER_RANK)
+    inputs = config.input_views(heap, max_tokens_per_rank)
     workspace = _Workspace(config=config, heap=heap, inputs=inputs)
     _workspace_cache[key] = workspace
     return workspace
@@ -3398,9 +3498,13 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         plan: Selected TokenSpeed MoE plan. Petit needs no extra plan fields.
         w: MoE layer whose loaded weights are replaced with Petit layouts.
     """
-    del plan
+    # The runtime sizes Petit for its largest per-rank batch
+    # (ServerArgs.gluon_petit_max_tokens_per_rank); plans without it keep 1024.
+    max_tokens_per_rank = int(
+        plan.get("gluon_petit_max_tokens_per_rank") or _MAX_TOKENS_PER_RANK
+    )
     profile = _validate_layer(w)
-    _get_workspace(w.w13_weight.device, profile)
+    _get_workspace(w.w13_weight.device, profile, max_tokens_per_rank)
     petit_kernel = _import_petit_kernel()
 
     w13 = w.w13_weight.detach().contiguous()
@@ -3463,6 +3567,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         w2_scale=s2.contiguous(),
         w13_bias=None if b13 is None else b13.contiguous(),
         w2_bias=None if b2 is None else b2.contiguous(),
+        max_tokens_per_rank=max_tokens_per_rank,
     )
     for name in (
         "w13_weight",
@@ -3547,22 +3652,21 @@ def gluon_petit_mxfp4_megamoe_apply(
         raise ValueError(
             "Gluon Petit MegaMoE requires precomputed top-k ids and weights"
         )
-    if (
-        max_num_tokens_per_gpu is not None
-        and max_num_tokens_per_gpu > _MAX_TOKENS_PER_RANK
-    ):
+    state = w._moe_backend_state
+    capacity = state.max_tokens_per_rank
+    if max_num_tokens_per_gpu is not None and max_num_tokens_per_gpu > capacity:
         raise ValueError(
-            "Gluon Petit MegaMoE per-rank token count exceeds its 1024-token capacity"
+            "Gluon Petit MegaMoE per-rank token count exceeds its "
+            f"{capacity}-token capacity"
         )
     num_tokens = int(x.shape[0])
-    if num_tokens > _MAX_TOKENS_PER_RANK:
+    if num_tokens > capacity:
         raise ValueError(
-            "Gluon Petit MegaMoE received more than 1024 tokens on one rank"
+            f"Gluon Petit MegaMoE received more than {capacity} tokens on one rank"
         )
 
-    state = w._moe_backend_state
     profile = state.profile
-    workspace = _get_workspace(x.device, profile)
+    workspace = _get_workspace(x.device, profile, capacity)
     inputs = _slice_inputs(workspace.inputs, num_tokens)
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)

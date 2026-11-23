@@ -583,6 +583,12 @@ class MoELayer(torch.nn.Module):
         self.plan["cutlass_fused_finalize"] = global_server_args_dict[
             "moe_cutlass_fused_finalize"
         ]
+        if self._spec.use_gluon_petit:
+            # Size Petit's heap for the server's largest per-rank batch; the
+            # target and draft MoE layers share it. None keeps 1024 rows.
+            self.plan["gluon_petit_max_tokens_per_rank"] = global_server_args_dict.get(
+                "gluon_petit_max_tokens_per_rank"
+            )
         if precision_policy == "bf16_route_accum_fp32":
             if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
                 raise ValueError(

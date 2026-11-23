@@ -3063,14 +3063,7 @@ class ServerArgs:
                 raise ValueError(
                     "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
                 )
-            decode_tokens_per_request = (
-                self.speculative_num_draft_tokens
-                if self.speculative_algorithm is not None
-                else 1
-            )
-            decode_tokens_per_rank = (
-                self.max_num_seqs // self.mapping.attn.dp_size
-            ) * decode_tokens_per_request
+            decode_tokens_per_rank = _gluon_petit_decode_tokens_per_rank(self)
             if decode_tokens_per_rank > 1024:
                 raise ValueError(
                     "Gluon Petit MegaMoE supports at most 1024 decode tokens "
@@ -3078,17 +3071,52 @@ class ServerArgs:
                     f"token count (configured {decode_tokens_per_rank} tokens "
                     "per rank)"
                 )
+            # Petit's buffers are sized for the largest per-rank batch; above
+            # 1024 rows its heap grows up to the 32-bit offset limit (EP4).
+            from tokenspeed_kernel.ops.moe.gluon import (
+                gluon_petit_largest_max_tokens_per_rank,
+            )
+
+            world_size = self.mapping.moe.ep_size
+            largest = gluon_petit_largest_max_tokens_per_rank(world_size)
             if (
                 self.chunked_prefill_size <= 0
-                or self.chunked_prefill_size > 1024
-                or self.max_prefill_tokens > 1024
+                or self.chunked_prefill_size > largest
+                or self.max_prefill_tokens > largest
             ):
                 raise ValueError(
-                    "Gluon Petit MegaMoE supports at most 1024 prefill tokens "
-                    "per rank; set --chunked-prefill-size to a positive value "
-                    "no greater than 1024 and --max-prefill-tokens no greater "
-                    "than 1024"
+                    f"Gluon Petit MegaMoE supports at most {largest} prefill "
+                    f"tokens per rank at EP{world_size}; set "
+                    "--chunked-prefill-size to a positive value no greater "
+                    f"than {largest} and --max-prefill-tokens no greater than "
+                    f"{largest}"
+                    + (
+                        "; a larger per-rank capacity would exceed the Petit "
+                        "symmetric heap's 32-bit offsets"
+                        if largest > 1024
+                        else f"; EP{world_size} keeps Petit's 1024-token capacity"
+                    )
                 )
+
+    def gluon_petit_max_tokens_per_rank(self) -> int | None:
+        """Petit's per-rank token capacity for this server, or None without Petit.
+
+        The largest per-rank batch (prefill chunk, prefill budget or decode
+        tokens) rounded up to 32 rows with a floor of 1024, so servers with at
+        most 1024 tokens per rank keep today's buffers.
+        """
+        if self.all2all_backend != "gluon_petit":
+            return None
+        from tokenspeed_kernel.ops.moe.gluon import gluon_petit_max_tokens_per_rank
+
+        return gluon_petit_max_tokens_per_rank(
+            self.mapping.moe.ep_size,
+            max(
+                self.chunked_prefill_size,
+                self.max_prefill_tokens,
+                _gluon_petit_decode_tokens_per_rank(self),
+            ),
+        )
 
     def validate_rank_emulation(self):
         """Reject layouts ``--emulate-rank-zero`` cannot stand in for.
@@ -6066,3 +6094,13 @@ class PortArgs:
             metrics_ipc_name=f"tcp://{join_host_port(dist_init_host, metrics_ipc_port)}",
             tokenizer_worker_ipc_name=None,
         )
+
+
+def _gluon_petit_decode_tokens_per_rank(args) -> int:
+    """Decode tokens one attention-DP rank sends to Petit in one step."""
+    decode_tokens_per_request = (
+        args.speculative_num_draft_tokens
+        if args.speculative_algorithm is not None
+        else 1
+    )
+    return (args.max_num_seqs // args.mapping.attn.dp_size) * decode_tokens_per_request

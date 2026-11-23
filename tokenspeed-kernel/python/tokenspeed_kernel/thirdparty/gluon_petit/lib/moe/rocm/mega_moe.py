@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import cache
 
 from lib.moe.rocm.fused_moe import (
+    FusedMoESolutionId,
     IsGfx950,
     MegaMoEProducerGeometry,
     MegaMoETileShape,
@@ -163,6 +164,11 @@ class MegaMoESolutionAdapter:
             MegaMoECombineKernel(Config, reduce_routes),
         )
 
+    def Stage1Tile(self, num_tokens):
+        """Return the stage-1 tile flags ``(m64, w8)`` for a per-rank count."""
+        C = self.Config
+        return num_tokens >= C.kM64MinTokens, num_tokens >= C.kM64W8MinTokens
+
     def GetWorkspaceInfo(self, rank):
         W, C = self.Workspace, self.Config
         return MegaMoEWorkspaceInfo(
@@ -201,11 +207,9 @@ class MegaMoESolutionAdapter:
             or external_input_count not in (0, 3)
         ):
             return kFusedMoEErrorInvalidArgument
+        m64, w8 = self.Stage1Tile(p.num_tokens)
         stage1, stage2, combine = self.Kernels(
-            external_input_count == 3,
-            p.num_tokens >= C.kM64MinTokens,
-            p.num_tokens >= C.kM64W8MinTokens,
-            p.reduce_routes,
+            external_input_count == 3, m64, w8, p.reduce_routes
         )
         import torch
         from lib.streams import native_stream
@@ -248,8 +252,38 @@ class MegaMoESolutionAdapter:
         return 0
 
 
+@cache
+def _MegaMoESolution(solution_id):
+    """Return the adapter of a registered solution at any admitted capacity.
+
+    The registry holds each solution at the default per-rank token capacity;
+    a larger capacity (FusedMoESolutionId.MaxTokensPerRank) reuses the
+    registered solution with buffers sized for it. Returns None for an
+    unregistered solution and raises ValueError when the capacity's
+    workspace does not fit 32-bit offsets.
+    """
+    solutions = _MegaMoESolutions()
+    adapter = solutions.get(solution_id)
+    if adapter is not None:
+        return adapter
+    solution = FusedMoESolutionId.FromRepr(solution_id)
+    default = solution.WithMaxTokensPerRank(
+        FusedMoESolutionId.kDefaultMegaMaxTokensPerRank
+    )
+    if default.Repr() == solution_id or default.Repr() not in solutions:
+        return None
+    try:
+        return MegaMoESolutionAdapter(solution)
+    except AssertionError as exc:
+        raise ValueError(
+            f"MegaMoE workspace for {solution.MaxTokensPerRank()} tokens per rank "
+            f"at {1 << solution.NumRanksLog2()} ranks and "
+            f"{solution.NumExperts()} experts exceeds 32-bit offsets"
+        ) from exc
+
+
 def MegaMoECompute(params, solution_id):
-    adapter = _MegaMoESolutions().get(int(solution_id))
+    adapter = _MegaMoESolution(int(solution_id))
     if adapter is None:
         return kFusedMoEErrorInvalidSolution
     if not IsGfx950(params.stream, params.workspace.device):
@@ -258,10 +292,43 @@ def MegaMoECompute(params, solution_id):
 
 
 def GetMegaMoEWorkspaceInfo(rank, solution_id):
-    adapter = _MegaMoESolutions().get(int(solution_id))
+    adapter = _MegaMoESolution(int(solution_id))
     if adapter is None:
         raise ValueError("unsupported MegaMoE solution_id")
     return adapter.GetWorkspaceInfo(rank)
+
+
+def MegaMoEStage1Tile(solution_id, num_tokens):
+    """Name the stage-1 tile one rank launches for ``num_tokens`` rows."""
+    adapter = _MegaMoESolution(int(solution_id))
+    if adapter is None:
+        raise ValueError("unsupported MegaMoE solution_id")
+    m64, w8 = adapter.Stage1Tile(int(num_tokens))
+    return "m64_w8" if w8 else "m64_w4" if m64 else "m32"
+
+
+def MegaMoEHeapBytes(solution_id):
+    """Return one rank's VMM heap ``(reserved, physical)`` bytes.
+
+    Mirrors VmmSymmetricHeap::Allocate: every region is 4 KiB aligned, the
+    reserved range is ``local_offset + local_bytes`` (which must stay below
+    2**32), and one rank backs its barrier record, its rank slot, the padding
+    up to ``local_offset`` and its local data with physical memory.
+    """
+    info = GetMegaMoEWorkspaceInfo(0, solution_id)
+
+    def page(value):
+        return (value + 4095) // 4096 * 4096
+
+    barrier, slot, local = (
+        page(info.barrier_record_bytes),
+        page(info.rank_slot_bytes),
+        page(info.local_bytes),
+    )
+    shared_end = info.rank_sym_buffer_base + info.num_ranks * slot
+    reserved = info.local_offset + local
+    physical = barrier + slot + (info.local_offset - shared_end) + local
+    return reserved, physical
 
 
 @g.jit

@@ -291,9 +291,14 @@ def test_validate_calls_petit_validation() -> None:
             },
             "1024 decode tokens per rank",
         ),
-        ({"chunked_prefill_size": 0}, "1024 prefill tokens per rank"),
-        ({"chunked_prefill_size": 1025}, "1024 prefill tokens per rank"),
-        ({"max_prefill_tokens": 1025}, "1024 prefill tokens per rank"),
+        ({"chunked_prefill_size": 0}, "1024 prefill tokens per rank at EP8"),
+        ({"chunked_prefill_size": 1025}, "1024 prefill tokens per rank at EP8"),
+        ({"max_prefill_tokens": 1025}, "1024 prefill tokens per rank at EP8"),
+        # EP8 keeps Petit's 1024-row capacity.
+        (
+            {"chunked_prefill_size": 2048, "max_prefill_tokens": 2048},
+            "EP8 keeps Petit's 1024-token capacity",
+        ),
     ],
 )
 def test_petit_shared_options(petit_args, overrides, error) -> None:
@@ -475,3 +480,66 @@ def test_petit_layer_constraints(
                 "activation", "silu"
             )
             weights.assert_called_once()
+
+
+def _ep4_mapping() -> SimpleNamespace:
+    mapping = _mapping()
+    mapping.world_size = 4
+    mapping.moe.ep_size = 4
+    mapping.attn.dp_size = 4
+    return mapping
+
+
+@pytest.mark.parametrize(
+    "overrides,error,capacity",
+    [
+        ({}, None, 1024),
+        ({"chunked_prefill_size": 512, "max_prefill_tokens": 512}, None, 1024),
+        ({"chunked_prefill_size": 2048, "max_prefill_tokens": 2048}, None, 2048),
+        ({"chunked_prefill_size": 2048, "max_prefill_tokens": 1024}, None, 2048),
+        ({"chunked_prefill_size": 3000, "max_prefill_tokens": 3000}, None, 3008),
+        ({"chunked_prefill_size": 4096, "max_prefill_tokens": 4096}, None, 4096),
+        # The DSpark draft shares the target's capacity.
+        (
+            {
+                "chunked_prefill_size": 4096,
+                "max_prefill_tokens": 4096,
+                "speculative_algorithm": "DSPARK",
+                "draft_moe_backend": "gluon_petit",
+                "speculative_num_draft_tokens": 6,
+                "max_num_seqs": 64,
+            },
+            None,
+            4096,
+        ),
+        ({"chunked_prefill_size": 7808, "max_prefill_tokens": 7808}, None, 7808),
+        (
+            {"chunked_prefill_size": 7809, "max_prefill_tokens": 1024},
+            "at most 7808 prefill tokens per rank at EP4",
+            None,
+        ),
+        (
+            {"chunked_prefill_size": 4096, "max_prefill_tokens": 8192},
+            "at most 7808 prefill tokens per rank at EP4",
+            None,
+        ),
+        ({"chunked_prefill_size": 0}, "at most 7808 prefill tokens per rank", None),
+        # The decode limit stays at 1024 tokens per rank.
+        ({"max_num_seqs": 4100}, "1024 decode tokens per rank", None),
+    ],
+)
+def test_petit_ep4_prefill_capacity(petit_args, overrides, error, capacity) -> None:
+    petit_args.mapping = _ep4_mapping()
+    petit_args.max_num_seqs = 4096
+    vars(petit_args).update(overrides)
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        ServerArgs.validate_petit_moe_options(petit_args)
+    if capacity is not None:
+        assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == capacity
+
+
+def test_petit_capacity_is_none_without_petit(petit_args) -> None:
+    petit_args.all2all_backend = "none"
+    assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) is None
+    petit_args.all2all_backend = "gluon_petit"
+    assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == 1024

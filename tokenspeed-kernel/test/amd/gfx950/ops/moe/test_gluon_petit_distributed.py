@@ -387,12 +387,15 @@ _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
     _WORLD_SIZE not in (4, 8) or not is_cdna4(),
     reason="requires torchrun with four or eight gfx950 GPUs",
 )
+@pytest.mark.parametrize("capacity", (1024, 4096))
 @pytest.mark.parametrize("profile_name", tuple(_PROFILES))
-def test_distributed_petit_reference(profile_name):
+def test_distributed_petit_reference(profile_name, capacity):
     profile = _PROFILES[profile_name]
     if _WORLD_SIZE not in profile.world_sizes:
         sizes = "/".join(map(str, profile.world_sizes))
         pytest.skip(f"{profile_name} is registered for EP{sizes} only")
+    if capacity != 1024 and _WORLD_SIZE != 4:
+        pytest.skip("Petit admits a per-rank capacity above 1024 rows at EP4 only")
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
         assert (
@@ -410,7 +413,11 @@ def test_distributed_petit_reference(profile_name):
     layer = _TestMoeLayer(profile, ws, device)
     _weights(layer, profile, rank, ws)
     plan = _make_plan(profile, ws)
+    if capacity != 1024:
+        # The runtime passes ServerArgs.gluon_petit_max_tokens_per_rank here.
+        plan["gluon_petit_max_tokens_per_rank"] = capacity
     kernel_moe_process_weights(plan, layer)
+    assert layer._moe_backend_state.max_tokens_per_rank == capacity
     output_dir = os.environ.get("PETIT_OUTPUT_DIR")
     # Exercise empty source ranks, padding/tile boundaries and capacity, then
     # refresh both hidden states and destinations within the same captured graph.
@@ -418,15 +425,26 @@ def test_distributed_petit_reference(profile_name):
     # DSpark draft it switches at 12 and 24 tokens. EP4 keeps the empty and
     # single-token ranks and starts one rank at each switch, so one call still
     # mixes all three geometries, as the EP8 counts do.
-    for case, counts in (
-        ("balanced", [16] * ws),
-        ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws]),
-        ("partial_scales", [256] * ws),
-        # For both DSv4.1 profiles, 640 tokens take the 4-warp 64-row stage-1 tile
-        # (Flash 480-1,007 tokens, DSpark 352-703).
-        ("stage1_m64_w4", [640] * ws),
-        ("capacity", [1024] + [1] * (ws - 1)),
-    ):
+    cases = (
+        (
+            ("balanced", [16] * ws),
+            ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws]),
+            ("partial_scales", [256] * ws),
+            # For both DSv4.1 profiles, 640 tokens take the 4-warp 64-row stage-1
+            # tile (Flash 480-1,007 tokens, DSpark 352-703).
+            ("stage1_m64_w4", [640] * ws),
+        )
+        if capacity == 1024
+        else (
+            # A raised capacity still serves small and uneven calls.
+            ("uneven", [0, 1, 12, 24]),
+            # Every rank above the old 1024-row cap at once (EP4 2048-row chunks).
+            ("above_1024", [2048] * ws),
+            # Every rank at the raised capacity fills each destination's pool.
+            ("full", [capacity] * ws),
+        )
+    ) + (("capacity", [capacity] + [1] * (ws - 1)),)
+    for case, counts in cases:
         count = counts[rank]
         x = torch.empty((count, profile.hidden), device=device, dtype=torch.bfloat16)
         ids, weights = _routing(count, rank, profile, ws, device)
@@ -494,7 +512,12 @@ def test_distributed_petit_reference(profile_name):
                 directory.mkdir(parents=True, exist_ok=True)
                 torch.save(
                     actual.cpu(),
-                    directory / f"{profile_name}-{case}-{step}-rank{rank}.pt",
+                    directory
+                    / (
+                        f"{profile_name}-{case}-{step}-rank{rank}.pt"
+                        if capacity == 1024
+                        else f"{profile_name}-cap{capacity}-{case}-{step}-rank{rank}.pt"
+                    ),
                 )
             dist.barrier()
 
