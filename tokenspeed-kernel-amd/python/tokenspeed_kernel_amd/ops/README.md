@@ -398,6 +398,53 @@ buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
 launch several programs per CU. Weights pass through LDS in E4M3 and upcast
 (`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout.
 
+### gfx950 skinny FP8 projection
+
+`gluon_mm_fp8_skinny_gfx950` (`gfx950/gemm/fp8/skinny.py`) multiplies a few
+FP8 rows by an FP8 weight whose read dominates the launch: `gemm.mm` selects
+it for an FP8 call with row and channel scales at the measured weight
+shape and 17-128 rows. It quantizes nothing; callers decide which rows are
+FP8.
+
+#### Contract
+
+- `A`: `[M, K]` FP8 E4M3 codes with unit inner stride; `A_scales`: FP32, one
+  per row. `B`: contiguous `[N, K]` FP8 E4M3 codes; `B_scales`: FP32, one per
+  output channel. Returns BF16 `(A * A_scales) @ (B * B_scales).T`.
+- Codes and scales follow one per-row definition
+  (`tokenspeed_kernel/ops/quantization/_triton_fp8_rows.py`): scale
+  `max(amax / 448, 1e-12)` and codes `x / scale` rounded once to nearest even,
+  both by IEEE FP32 division. The token quantizer, the weight conversion
+  (`prepare_fp8_channel_weight`) and the layer boundary's FP8 copy share it.
+- A config exists for `[4608, 8192]` at 17-128 rows; it is the problem
+  filter. It offers the `weight_streaming` feature. Offset, strided or
+  unaligned operands decline it through the traits. One split count per
+  weight shape, so a row's bits do not depend on `M` or on the other rows;
+  results are deterministic.
+
+#### Algorithm
+
+- A program owns one 64-column weight slab of one K slice (`SPLIT_K` 2 for
+  `[4608, 8192]`) and streams it once from HBM through
+  a three-buffer LDS ring of direct-to-LDS loads, two 256-byte K tiles ahead.
+  It multiplies all rows of its row tile by the unscaled
+  `v_mfma_f32_32x32x64_f8f6f4` (zero scale operands to the scaled MFMA
+  intrinsic select it; a test checks the ISA).
+- Row tiles: 64 rows on 4 waves (a 2 x 2 grid of 32 x 32 MFMA tiles) and 128
+  rows on 8 waves (4 x 2), one output tile a wave. Three K tiles of A and B
+  take 144 KB of LDS at 128 rows, 96 KB at 64 (checked at import). With
+  128-144 programs on 256 CUs the launch is bound by the loads in flight: at
+  128 rows each iteration issues tile t + 2 before it reads tile t and waits
+  for tile t + 1 at its end; at 64 rows the wait comes first, the faster
+  order at that tile.
+- Each split stores an FP32 partial; a second launch sums them in split order
+  and only then applies `A_scales[row] * B_scales[column]`.
+- The A tile's load layout lists its row lane bases in the order of the
+  padded LDS layout's row bases, so each wave writes contiguous padded runs.
+  Direct-to-LDS loads refuse other orders. B tiles are swizzled `[N, K]`, so
+  the transposed reads spread over the LDS banks while each row's 16-byte
+  runs stay whole for the direct-to-LDS loads.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
