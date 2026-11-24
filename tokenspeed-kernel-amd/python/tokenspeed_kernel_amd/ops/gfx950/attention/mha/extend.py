@@ -312,7 +312,7 @@ class ExtendConfig:
         KV_DTYPE,
         q_strides,
     ):
-        assert HEAD_DIM in (64, 128)
+        assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         assert N_HEADS % N_KV_HEADS == 0
         padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
@@ -547,7 +547,7 @@ class ExtendProgram:
         # the arena's size), so its _CACHE_ALIGN_BYTES alignment, which the direct-to-LDS
         # copy needs (buffer_load_to_local has no lowering without it), is
         # stated here: the launcher checks the arena's base, and a page is a
-        # whole number of 16-byte rows (HEAD_DIM is 64 or 128, see
+        # whole number of 16-byte rows (HEAD_DIM is 64, 128 or 256, see
         # ExtendConfig).
         page = buffer.make_buffer_descriptor(
             gl.multiple_of(
