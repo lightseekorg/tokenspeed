@@ -370,6 +370,12 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         from tokenspeed_mla.utils import get_num_sm
         from utils import assert_no_triton_compile
 
+        # M64 FP8 launches one CTA per query tile, every other kernel two.
+        assert _split_wave(4, 152, torch.float8_e4m3fn, (64, 128)) == 38
+        assert _split_wave(4, 152, torch.float8_e4m3fn, (128, 128)) == 19
+        assert _split_wave(4, 152, torch.bfloat16, (64, 128)) == 19
+        assert _split_wave(8, 4, torch.bfloat16, (128, 128)) == 1
+
         def check(lengths, out, max_seq_len, heads=128, q_len=1):
             batch = lengths.numel()
             sms = get_num_sm(lengths.device)

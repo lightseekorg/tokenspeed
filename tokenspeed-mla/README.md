@@ -115,10 +115,11 @@ FP8, BF16 and FP16 decode can instead take per-request split counts
 (`block_split_kvs`). `tokenspeed_mla_decode_split_kvs` takes the decode dtype
 and uses the uniform split's chunk budget, subject to rounding and caps, to
 give requests chunks of about the same length, at least one KV tile each.
-Counts round up while the whole plan fits one wave of the decode grid, and to
-the nearest count otherwise; a request shorter than two chunks always rounds
-to the nearest count. Past one wave, or on a short request, an added split
-costs more in reduction than it saves in KV work. One Triton launch reduces
+Counts round up while the whole plan fits one wave of the decode grid, or the
+uniform budget where that is larger, and to the nearest count otherwise; a
+request shorter than two chunks always rounds to the nearest count. Past that,
+or on a short request, an added split costs more in reduction than it saves in
+KV work. One Triton launch reduces
 the lengths in int64 and writes counts, exclusive split offsets and a chunk
 map into the caller's buffers. Reserve map entries with
 `tokenspeed_mla_decode_task_capacity(B, H, q_len, min_split_kv, num_sms)` and

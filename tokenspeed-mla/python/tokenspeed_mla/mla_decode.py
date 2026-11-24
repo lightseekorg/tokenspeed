@@ -250,14 +250,14 @@ def tokenspeed_mla_decode_split_kvs(
     """Write per-request KV split counts for per-request split decode.
 
     The counts feed ``tokenspeed_mla_decode(block_split_kvs=...)``. A uniform
-    split cuts every request into the same number of chunks, so the
-    longest request of a mixed batch sets the kernel time. This divides the
-    uniform split's chunk budget into chunks of about the same length, at
-    least one KV tile each. Counts round up while the whole plan fits one
-    wave of the decode grid and to the nearest count otherwise; a request
-    shorter than two chunks always rounds to the nearest count, since its
-    reduction costs more than the split saves. For one request, a uniform
-    budget of one proves there is no need for partials or reduction.
+    split cuts every request into the same number of chunks, so the longest
+    request of a mixed batch sets the kernel time. This divides the uniform
+    split's chunk budget into chunks of about the same length, at least one KV
+    tile each. Counts round up while the whole plan fits one wave of the decode
+    grid, or the uniform budget where that is larger, and to the nearest count
+    otherwise; a request shorter than two chunks always rounds to the nearest
+    count, since its reduction costs more than the split saves. For one request,
+    a uniform budget of one proves there is no need for partials or reduction.
     One Triton launch refreshes counts, offsets and the chunk map in place,
     including inside a CUDA graph. The map is shared by all attention layers
     using this plan.
