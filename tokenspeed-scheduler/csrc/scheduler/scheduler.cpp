@@ -94,6 +94,7 @@ CacheKey eventKey(const CacheKey& key) {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
+      checkpoints_{config_.ResolveCheckpoints()},
       req_pool_allocator_{config_.max_resident_requests},
       decode_slots_{config_.role == Role::kD ? config_.max_batch_size : 0},
       snapshot_slots_{config_.max_retracted_requests},
@@ -119,6 +120,7 @@ Scheduler::Scheduler(SchedulerConfig config)
           config_.peer_config && config_.peer_config->landing_tier == PeerLandingTier::kHost
               ? std::make_unique<PeerHostLandings>(coordinator_, config_.peer_config->max_host_landing_blocks)
               : nullptr} {
+    coordinator_.ConfigureEviction(config_.ResolveEvictionConfig());
     // config_.Validate() already ran; the body only derives state from it.
     if (shared_l2_proxy_) {
         coordinator_.SetDeviceHitCollection(true);
@@ -148,7 +150,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
         has_state_group = has_state_group || coordinator_.GroupIsState(static_cast<std::size_t>(i));
     }
-    if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
+    if (checkpoints_.retention.demote_superseded && has_state_group) {
         checkpoint_lineage_.emplace();
     }
     // A peer's complete read demotes the holder's copy (PeerExports::Release)
@@ -684,6 +686,17 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
 }
 
 HostCacheStats Scheduler::GetHostCacheStats() const {
+    auto policy_stats = coordinator_.GdsStats();
+    policy_stats.checkpoint_planned = checkpoint_stats_->planned;
+    policy_stats.checkpoint_allocated = checkpoint_stats_->allocated;
+    policy_stats.checkpoint_materialized = checkpoint_stats_->materialized;
+    policy_stats.checkpoint_published = checkpoint_stats_->published;
+    policy_stats.checkpoint_cancelled = checkpoint_stats_->cancelled;
+    policy_stats.checkpoint_extra_blocks = checkpoint_stats_->extra_blocks;
+    policy_stats.checkpoint_chunk_end_fallbacks = checkpoint_stats_->chunk_end_fallbacks;
+    policy_stats.checkpoint_fresh_rejected = checkpoint_stats_->fresh_rejected;
+    policy_stats.checkpoint_rejected_extra_blocks = checkpoint_stats_->rejected_extra_blocks;
+    policy_stats.checkpoint_rejected_unmeasured = checkpoint_stats_->rejected_unmeasured;
     return HostCacheStats{
         .prefix_hits = prefix_hit_stats_,
         .storage_query_hit_tokens = storage_transfers_ ? storage_transfers_->QueryHitTokens() : std::uint64_t{0},
@@ -698,6 +711,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .gds_evictions = policy_stats,
         .lone_compactions = lone_requests_.Compactions(),
         .lone_compaction_moves = lone_requests_.CompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.History().CheckpointResumeGaps(),

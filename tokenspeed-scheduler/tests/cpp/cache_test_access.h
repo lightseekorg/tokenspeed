@@ -38,6 +38,16 @@
 namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
+    static CacheStore& Store(CacheCoordinator& coordinator) { return coordinator.store_; }
+    static void CommitVictims(CacheCoordinator& coordinator, std::span<const VictimSet> victims) {
+        const CacheEvictor::VictimReasons reasons{
+            .victim = &CacheEvictor::DeviceEvictionStats::admission,
+            .stranded_suffix = &CacheEvictor::DeviceEvictionStats::admission,
+            .request_reclaim = &CacheEvictor::DeviceEvictionStats::request_reclaim};
+        const auto left = coordinator.evictor_.EvictPlanned(victims, coordinator.WritesBackEvictions(), reasons);
+        _assert(left.empty(), "test commits only idle victims");
+    }
+
     static std::size_t CacheGroupRegistrySize(const CacheCoordinator& coordinator) {
         return coordinator.sessions_.NumCacheGroupTags();
     }

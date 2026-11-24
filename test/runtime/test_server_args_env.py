@@ -24,7 +24,7 @@ from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
     global_server_args_dict_update,
 )
-from tokenspeed.runtime.utils.server_args import prepare_server_args
+from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 
 def test_head_tp_exchange_max_rows_reaches_model_initialization():
@@ -354,3 +354,108 @@ def test_dp_local_cuda_graph_cli_reaches_runtime_and_resets():
     finally:
         global_server_args_dict.clear()
         global_server_args_dict.update(original)
+
+
+@pytest.mark.parametrize("policy", ["lru", "gds"])
+def test_prefix_cache_eviction_keeps_explicit_cost(policy):
+    flags = ["--model", "x", "--prefix-cache-evict-policy", policy]
+    if policy == "gds":
+        flags += ["--prefix-cache-gds-prefill-cost", "0.25", "0.5"]
+    args = prepare_server_args(flags)
+    assert args.prefix_cache_evict_policy == policy
+    assert args.prefix_cache_gds_prefill_cost == (
+        [0.25, 0.5] if policy == "gds" else None
+    )
+
+
+@pytest.mark.parametrize(
+    "cost", [None, (0, 0), (-1, 0), (1, -1), ("nan", 0), (1, "inf")]
+)
+def test_gds_requires_valid_explicit_cost(cost):
+    flags = ["--model", "x", "--prefix-cache-evict-policy", "gds"]
+    if cost is not None:
+        flags += ["--prefix-cache-gds-prefill-cost", *map(str, cost)]
+    with pytest.raises(ValueError, match="[Gg][Dd][Ss]"):
+        prepare_server_args(flags)
+
+
+def test_lru_refuses_unused_gds_cost():
+    with pytest.raises(ValueError, match="gds policy"):
+        prepare_server_args(
+            ["--model", "x", "--prefix-cache-gds-prefill-cost", "1", "0"]
+        )
+
+
+@pytest.mark.parametrize("cost", [None, [0, 0], [-1, 1], [0, float("nan")]])
+def test_gds_disk_requires_valid_explicit_read_cost(cost):
+    with pytest.raises(ValueError, match="Disk"):
+        ServerArgs(
+            model="x",
+            prefix_cache_evict_policy="gds",
+            prefix_cache_gds_prefill_cost=[1, 0],
+            prefix_cache_gds_disk_read_cost=cost,
+            disk_tier_paths=["/tmp/ts-disk-config-test"],
+            disk_tier_size_gb=1,
+            disk_tier_io="psync",
+            disk_tier_write_mbps=100,
+            kvstore_write_policy="write_back",
+        )
+
+
+def test_gds_disk_read_cost_survives_cli_resolution():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--prefix-cache-evict-policy",
+            "gds",
+            "--prefix-cache-gds-prefill-cost",
+            "1",
+            "0",
+            "--prefix-cache-gds-disk-read-cost",
+            "0.1",
+            "0.000001",
+            "--disk-tier-paths",
+            "/tmp/ts-disk-config-test",
+            "--disk-tier-size-gb",
+            "1",
+            "--disk-tier-io",
+            "psync",
+            "--disk-tier-write-mbps",
+            "100",
+            "--kvstore-write-policy",
+            "write_back",
+        ]
+    )
+    assert args.prefix_cache_gds_disk_read_cost == [0.1, 0.000001]
+
+
+@pytest.mark.parametrize("policy", ["lru", "gds"])
+def test_unused_disk_cost_is_rejected(policy):
+    with pytest.raises(ValueError, match="requires gds with a Disk tier"):
+        ServerArgs(
+            model="x",
+            prefix_cache_evict_policy=policy,
+            prefix_cache_gds_prefill_cost=[1, 0] if policy == "gds" else None,
+            prefix_cache_gds_disk_read_cost=[0, 1],
+        )
+
+
+def test_gds_refuses_disabled_prefix_cache():
+    with pytest.raises(ValueError, match="gds requires prefix caching"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--disable-prefix-caching",
+                "--prefix-cache-evict-policy",
+                "gds",
+                "--prefix-cache-gds-prefill-cost",
+                "1",
+                "0",
+            ]
+        )
+    args = prepare_server_args(
+        ["--model", "x", "--disable-prefix-caching", "--disable-kvstore"]
+    )
+    assert not args.enable_prefix_caching

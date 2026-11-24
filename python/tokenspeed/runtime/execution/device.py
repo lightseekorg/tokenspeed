@@ -334,6 +334,7 @@ class DeviceSpecs:
     num_host_pages: int
     num_snapshot_pages: int
     host_group_packing: tuple[int, ...]
+    host_cache_block_bytes: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
     cache_observation_capacity: int = 0
@@ -2306,6 +2307,12 @@ def build_device_side(
         host_group_packing=(
             host_cache_executor.host_group_packing
             if host_cache_executor is not None
+            else ()
+        ),
+        host_cache_block_bytes=(
+            tuple(host_cache_executor.host_storage.host_cache_block_bytes)
+            if host_cache_executor is not None
+            and host_cache_executor.host_storage is not None
             else ()
         ),
         max_retracted_requests=(

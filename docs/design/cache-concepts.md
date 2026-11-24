@@ -1763,13 +1763,13 @@ Its responsibilities:
     destinations until every owner finished it, then publishes the Disk
     entries with the Host entries' metadata; a Host placement can then drop
     the Host copy without loss. The write-back segment plan
-    (`AcquireHostSegments`) drops clean entries before dirty ones; the
-    block-by-block placement (`AcquireHostBlocks`: prefetch and peer landing,
-    a retraction leg's fallback) still ranks them by recency alone. Cleaning
-    never removes a Host entry.
+    (`AcquireHostSegments`) ranks a victim as clean only when Disk holds
+    every entry its expansion takes, and counts these evictions separately.
+    Block-by-block Host placement also reclaims safe Disk-backed copies
+    before ordinary dirty candidates. Cleaning never removes a Host entry.
   * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
     admission: the Disk's keys of the prompt stand in as Host hits for
-    `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the
+    `ReserveDiskPrefix` (the Host-suffix rule picks the boundary and the
     keys Host lacks), the request waits in `Prefetching` holding no Device
     pages, and the read's Host entries are published when every owner
     finished it and held for the request as its Ready hold, as an L3 GET's
@@ -3575,3 +3575,179 @@ The runtime retires replay before reading or reusing its old State block or
 request slot. It materializes the state at a request exit to cover published
 checkpoints and snapshots. Until then the bank and live block together
 describe the logical frontier. This adds no State slot or cache span.
+
+## Hybrid recovery eviction
+
+Under pressure, `PublicationPreview` describes the completed components that
+the admission will publish. It reuses `CompletedBlockRanges` and the recovery
+resolver, and augments plan-local lineage and coverage. A new intermediate
+State can shorten a descendant's fallback and reduce its exclusive suffix
+before the next victim is chosen. The preview changes no live registration,
+stamp, watermark or reference count.
+
+Producer-owned preview points cannot fund capacity. Their exact component
+locations, canonical duplicates and required route dependencies are excluded
+before building request-reclaim candidates. Admission and compaction share
+that exclusion; a failed plan discards the preview. Publication commit remains
+the only operation that creates readable cache identities.
+
+Typed residency, reserved-promise and checkpoint-use events connect existing
+RAII owners to dependency metadata. Peer use and last-use release retain
+distinct causes, and precise demotion results identify the keys and tiers
+actually changed. They do not introduce a second event queue or allocator.
+
+Recovery availability counters update with the index and are sampled in O(1).
+Metrics distinguish Host-loaded KV suffix tokens from the additional resume
+tokens supplied by Host State. Neither is a historical-compute missed-token
+oracle. Selection time counts committed plans; failed attempts leave retention
+statistics unchanged.
+
+Physical release counters belong to the pools: dropping a cache reference
+does not increment them while a request or transfer still owns the slot.
+The last child owner increments its group's slot count; emptying the parent
+also increments that group's parent count, before the parent can bind to a
+different group. These counters include all release paths, not only GDS, and
+are exposed by group and tier without scanning the cache.
+
+At native debug log level, pressure plans keep transient GDS score
+observations (stamp, fallback, relief and cause) and emit them only on commit.
+Rolled-back trials discard their observations. This trace and the existing
+peer estimation-error histogram support attribution without introducing
+per-prefix Prometheus labels or a permanent decision journal.
+
+`--prefix-cache-evict-policy lru` retains legacy Device and Host retention and
+segment policies. `gds` requires State groups and explicit finite prefill
+cost coefficients D > 0, E >= 0. It shares logical retention across Device
+and Host. Published Disk data participates in recovery, but future Disk
+capacity and unfinished cleaning do not guarantee retention. Retention rejection never
+rejects the producing request.
+
+`CheckpointTree` owns lineage, freshness and reuse stamps. Its non-owning
+`RecoveryIndex` registrations describe history, sliding windows, sinks and
+partial tails with shared binary ranges. Canonical residency handles update
+shared ancestors and affected cached routes. Destroy registrations before
+cache groups so callbacks cannot query destroyed matchers. LRU does not
+register ranges. Matching and planning share the exact-boundary resolver:
+one Device-prefix/Host-suffix split, whole tails on one tier, independent
+State groups and required windows. Arbitrary per-key tier unions are invalid.
+
+With Host, a pressure plan overlays hypothetical residency changes without
+mutating the index. Overlay mutations refresh only routes watching changed
+ranges; untouched ordinary routes read the resident result. Copy alternatives
+are resolved separately. A plan reuses its coverage until residency or logical
+survivors change, and rollback restores coverage with the route overlay.
+Placement may remove a duplicate or reserve a migration;
+only the joint logical choice may lose a recovery identity. Every originally
+ready, Disk-recoverable or guaranteed-pending survivor must have a legal final route. Physical
+eligibility, heavy-path coordinates, coverage and selection remain plan-local.
+The no-Host planner retains its versioned heap and explicit block fallback.
+There is no persistent selection heap or constant-time pressure guarantee.
+
+Necessary preservation is attempted before reclaiming Device addresses, but
+failure to preserve cache content is not itself an admission failure. If the
+joint heuristic stalls, discard its tentative Host victims and reservations,
+then retry without migration. Ordinary Device losses use Device scores. If
+held State or shared dependencies leave no eligible whole unit, reclaim the
+complete eligible Device census through the same physical ownership and
+protected-input constraints. Record every route actually lost by that fallback;
+a held State does not pin otherwise unowned history. Only actual insufficient
+group/bucket capacity may fail this retry. Exceptional block fallback has no
+finite single-unit exclusive score and does not advance either watermark.
+Failed attempts leave both tiers and committed statistics unchanged.
+
+For pressure in tier t, rank an eligible point by
+`stamp_t + C(fallback, position) / relief_t`, where
+`C(a,b) = D*(b-a) + E*(b-a)*(b+a)/200000`. The joint fallback is the nearest
+surviving usable ancestor without Disk. With Disk, subtract the point's read
+cost from the cheapest surviving ancestor's read-plus-prefill cost, including
+cold recomputation, and clamp the benefit at zero. Relief counts exclusive eligible slots in tier t,
+weighted by `1 / packing(group)`; cancelling proposed Host copies also
+relieves Host demand. Group/bucket `Fits` remains authoritative. State copies
+identify a logical point, but its KV stays when another survivor needs it.
+
+Device and Host have independent watermarks. Only committed normal logical
+choices advance the pressure domain's watermark. Strictly cheaper fresh
+points may be rejected without advancing it. Pure migration, duplicate
+removal, copy ACK and optional-copy rejection do not age logical retention.
+Committed use and last State-owner release refresh both domain stamps;
+read-only probes do not. A failed preview changes neither residency nor stats.
+
+Write-back first reserves all required Host destinations and holds existing
+Host dependencies, then removes Device copies in dependency order. Required
+pending registrations are owned by `PendingHostStore`; an unreserved optional
+record is not a promise. The drain consumes reservations and publishes after
+ACK. Sources keep the existing unpinned, stream-ordered eviction contract.
+Extra dependencies may be copied while their Device copies remain. Physical
+releases, reserved copies and logical losses therefore have separate counts.
+
+Write-through publication uses optional Host admission: free or safely
+reclaimable copies only. Skipping a replica preserves Device publication.
+Sources stay pinned until ACK; pending copies cannot supply Device capacity.
+After ACK, Device duplicate removal can use the legal Host route. This mode
+does not implicitly enable eviction write-back. Host-only allocation also
+uses the joint policy. Fixed-slot compaction clears only a safe duplicate or
+orphan rather than bypassing logical selection. Explicit lifecycle cleanup
+remains separate from pressure ranking.
+
+Superseded-checkpoint hints do not override GDS on either tier or in-flight
+stores. Explicit peer handoff keeps its no-write-back disposition and access
+epoch race checks. Imports hold metadata through their owning transfer;
+metadata alone makes no recovery point readable.
+
+Disk is a source for the existing logical Host suffix, not a third GDS domain.
+The range index tracks published Disk residency and distinguishes a ready
+memory route from one requiring prefetch. Read cost is the explicit per-block
+fixed cost plus the aligned Host block bytes times the byte coefficient;
+unique logical blocks across groups are summed consistently by every scheduler.
+Ordinary admission still requires Device/Host data. Disk replacement remains
+LRU/retention; losing a Disk-only dependency invalidates affected routes without
+advancing either GDS watermark.
+
+Host placement releases safe same-key Disk copies before dirty logical losses.
+GDS trials these removals through the resolver and ranks clean copies by added
+read cost per Host relief. Legacy placement uses clean-first classification as
+well. A Disk prefetch checks credits before planning, pins exact Disk sources,
+and reserves a complete Host boundary transactionally. A failed boundary evicts
+nothing. Existing warm Host dependencies are protected during allocation;
+admission probes again after I/O. Arrival alone is not checkpoint reuse.
+
+GDS cleaning derives useful dirty closures from the current Host policy order,
+then writes their history before State. It maintains a free-plus-clean reserve
+bounded by Host parents and the configured write credits. Candidate selection
+is plan-local; each cleaning pass rediscovers copies made dirty by Disk loss.
+Both policies respect the write-operation limit and reserve foreground read
+capacity. Cleaning length and reuse gates apply to the candidate tip, never
+to its required ancestors. GDS rediscovers a gated candidate on a later pass;
+the queue-based policy keeps cold entries in its bounded reuse queue.
+Rank compressed paths before expanding candidate keys, and stop visiting
+candidates when the write credits are filled. A selected closure can still be
+long; this does not bound all cleaning CPU work by the number of writes.
+Published Disk prerequisites remain held during placement and I/O. Pending
+writes do not count as prerequisites, and failed placement keeps only the
+dependency-ordered prefix. Maintenance source handles let peer no-write-back
+demotion reach queued and issued cleaning; issued buffers retire at ACK and
+demoted results are not published. A newer real use cancels an older demotion.
+Failed reads invalidate only their exact source incarnation, even if another
+I/O owner still holds its bytes.
+
+`host_cache_stats().gds_evictions` and serving metrics distinguish logical
+loss, fresh rejection, Device releases, Host reservations and optional-copy
+rejection. `tokenspeed:gds_watermark` and `tokenspeed:gds_host_watermark` report
+the pressure-domain watermarks. These diagnostics do not drive scheduling.
+
+
+An in-forward checkpoint may carry one CPU production receipt with its extra
+State block count. It owns no cache blocks. Committing fresh logical rejection
+charges that receipt once, before removing the checkpoint. Preview failure,
+replica rejection and migration do not charge it; natural checkpoints never
+inherit whole-forward cost. Runtime producer bytes and GPU cost are currently
+unmeasured and reported explicitly, rather than assumed to be zero.
+
+Optional prefix-load telemetry records one copy-stream event interval per local
+batch after prerequisites and transfer-table preparation. Normal completion
+polling retires it without a new synchronization. Request records share a batch
+ID and carry its duration only once, together with resolved transport, group
+row counts and payload bytes. Unsupported timing devices report no duration.
+These observations do not alter admission or retention. Full planning-attempt,
+cleaning and dependency-mutation profile spans include failed attempts; the
+committed-plan time counter alone is not total cache or scheduler CPU time.

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "cache/coordinator/admission_planner.h"
+#include "cache/coordinator/gds_tiered.h"
 #include "cache/core/block_placement_demand.h"
 #include "core/profile_span.h"
 #include "utils.h"
@@ -98,6 +99,10 @@ public:
             constraints.protected_locations.contains(location) ||
             constraints.request_reclaim_locations.contains(location)) {
             return std::nullopt;
+        }
+        if (store_.UsesGds() && store_.HostPool()) {
+            return PlanTieredCompaction(store_, constraints, *groups_[group_id].Index().UnpinnedKeyAt(pool_, location),
+                                        selection.member_resource);
         }
         std::optional<ExpandedVictimSet> expanded = expandCandidatePastSegments(
             CacheEvictionCandidates::MakeCandidate(groups_[group_id], location,
@@ -193,7 +198,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         return planAdmissionWith<LoneRequestPlanner>(
                    store, coordinator_.History().CheckpointAgingFor(CacheTier::kDevice), PrefixProbe{prefix}, demands,
                    progress.num_computed_tokens, reserve_point, /*shapes=*/{},
-                   /*planned_claim_locations=*/{}, write_back)
+                   /*planned_claim_locations=*/{}, write_back,
+                   progress.completed_pages ? &*progress.completed_pages : nullptr)
             .has_value();
     };
 
@@ -368,7 +374,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                                      demands,       progress.num_computed_tokens,
                                      reserve_point, prefix,
                                      /*shapes=*/{}, /*planned_claim_locations=*/{},
-                                     write_back};
+                                     write_back,    progress.completed_pages ? &*progress.completed_pages : nullptr};
     // Not fragmentation: the bound's own caveats, which compacting would
     // only churn at. The request waits as before. The count covers the
     // groups compaction gathers and the demand, not the parents the probe
@@ -381,7 +387,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
 
     AdmissionSelectionState selection{store, member_resource.get()};
     const AdmissionCandidateConstraints constraints = BuildAdmissionCandidateConstraints(
-        store, demands, progress.num_computed_tokens, prefix, /*planned_claim_locations=*/{}, &selection.scratch);
+        store, demands, progress.num_computed_tokens, prefix, /*planned_claim_locations=*/{}, &selection.scratch,
+        progress.completed_pages ? &*progress.completed_pages : nullptr);
     AdmissionResult result{
         .new_page_ids = std::vector<std::vector<std::int32_t>>(store.Groups().size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(store.Groups().size()),

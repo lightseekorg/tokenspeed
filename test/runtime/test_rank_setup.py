@@ -212,6 +212,9 @@ def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interva
 
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -689,41 +692,23 @@ def test_a_decode_server_demotes_no_checkpoint():
     assert not cfg.demote_superseded_state_checkpoints
 
 
-def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatch):
-    # tokenspeed-scheduler 0.1.49 has neither field, so setting them would
-    # raise AttributeError: a prefill server with in-forward checkpoints on
-    # starts without the demotion and the short prompt-end drop instead.
-    class OldSchedulerConfig:
-        state_checkpoint_in_forward = False
-
-    warnings = []
-    monkeypatch.setattr(rank_setup, "SchedulerConfig", OldSchedulerConfig)
-    monkeypatch.setattr(
-        rank_setup, "logger", SimpleNamespace(warning=lambda *a: warnings.append(a))
-    )
-    args = prepare_server_args(
-        [
-            "--model",
-            "x",
-            "--max-num-seqs",
-            "8",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-transfer-backend",
-            "mooncake",
-            "--enable-state-checkpoint-in-forward",
-        ]
+def test_gds_keeps_production_and_filters_without_superseded_hints():
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+        enable_state_checkpoint_in_forward=True,
+        prefix_cache_evict_policy="gds",
+        prefix_cache_gds_prefill_cost=[1, 0],
+        prefix_cache_gds_disk_read_cost=None,
     )
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
     )
     assert cfg.state_checkpoint_in_forward
-    # Read as such a wheel would hold them: absent, or left at their default.
-    assert not getattr(cfg, "demote_superseded_state_checkpoints", False)
-    assert not getattr(cfg, "drop_short_prompt_end_checkpoints", False)
-    assert len(warnings) == 2
-    assert "SchedulerConfig.demote_superseded_state_checkpoints" in warnings[0][0]
-    assert "SchedulerConfig.drop_short_prompt_end_checkpoints" in warnings[1][0]
+    assert cfg.drop_short_prompt_end_checkpoints
+    assert not cfg.demote_superseded_state_checkpoints
 
 
 @pytest.mark.parametrize(
@@ -1200,6 +1185,9 @@ def test_the_prefill_chunk_yield_is_refused_where_it_cannot_run(flags, match):
 
 def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,

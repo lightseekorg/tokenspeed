@@ -173,7 +173,7 @@ protected:
             return planAdmissionWith<Planner>(
                 Coordinator().Store(), Coordinator().History().CheckpointAgingFor(CacheTier::kDevice),
                 Coordinator().Prober().ProbePrefix(probed), replayed.empty() ? demands : replayed, computed,
-                copy_in_point, /*shapes=*/{}, /*claimed=*/{}, /*evicts_segments=*/false);
+                copy_in_point, /*shapes=*/{}, /*claimed=*/{}, /*evicts_segments=*/false, nullptr);
         };
         const auto expect_same_plan = [&](std::optional<std::int32_t> copy_in_point) {
             const std::optional<AdmissionPlan> shortcut = plan.template operator()<CountingPlanner>(copy_in_point);

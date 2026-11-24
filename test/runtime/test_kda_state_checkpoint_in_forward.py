@@ -131,7 +131,12 @@ class _Server:
     """A real scheduler and a KDA backend over a three-group contract pool."""
 
     def __init__(
-        self, params, *, in_forward: bool, recurrent_dtype: torch.dtype = torch.float32
+        self,
+        params,
+        *,
+        in_forward: bool,
+        eviction_policy: str,
+        recurrent_dtype: torch.dtype = torch.float32,
     ):
         self.params = params
         self.contract = _stub_contract(prefix_granularity=PAGE, usable_pages=32)
@@ -166,6 +171,9 @@ class _Server:
         config.disable_l2_cache = True
         config.cache_groups = pool_to_cache_groups(self.pool)
         config.state_checkpoint_in_forward = in_forward
+        config.prefix_cache_evict_policy = eviction_policy
+        if eviction_policy == "gds":
+            config.prefix_cache_gds_prefill_cost = (1.0, 0.0)
         self.scheduler = ts.Scheduler(config)
 
     def submit(self, request_id: str, tokens: list[int]):
@@ -294,16 +302,27 @@ def _prompt(server, request_id, tokens, streams, *, bucket=None):
     return forwards
 
 
+@pytest.fixture(params=["lru", "gds"])
+def eviction_policy(request):
+    return request.param
+
+
 @requires_cuda
 @pytest.mark.parametrize("recurrent_dtype", [torch.float32, torch.bfloat16])
 def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves(
     recurrent_dtype,
+    eviction_policy,
 ):
     params = _layer_params(11)
     streams = _token_streams(12, PROMPT)
     tokens = list(range(PROMPT))
 
-    server = _Server(params, in_forward=True, recurrent_dtype=recurrent_dtype)
+    server = _Server(
+        params,
+        in_forward=True,
+        eviction_policy=eviction_policy,
+        recurrent_dtype=recurrent_dtype,
+    )
     first, second = _prompt(server, "x", tokens, streams)
     assert first[:3] == (0, BUDGET, [0])
     assert second[:3] == (BUDGET, PROMPT, [BOUNDARY - BUDGET]), "no extra chunk"
@@ -312,7 +331,12 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves(
 
     # A forward that ends at the boundary with the same chunking: its live
     # slot is the reference, bit for bit.
-    reference = _Server(params, in_forward=False, recurrent_dtype=recurrent_dtype)
+    reference = _Server(
+        params,
+        in_forward=False,
+        eviction_policy=eviction_policy,
+        recurrent_dtype=recurrent_dtype,
+    )
     *_, ending = _prompt(reference, "r", tokens[:BOUNDARY], streams)
     expected = reference.states(ending[3], STATE_LIVE_SLOT)
     for key, state in server.states(tables, STATE_CHECKPOINT_SLOT).items():
@@ -320,7 +344,12 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves(
 
     # Storing the checkpoint leaves the spanning forward's own output and
     # final state as they are without it.
-    plain = _Server(params, in_forward=False, recurrent_dtype=recurrent_dtype)
+    plain = _Server(
+        params,
+        in_forward=False,
+        eviction_policy=eviction_policy,
+        recurrent_dtype=recurrent_dtype,
+    )
     *_, unchanged = _prompt(plain, "p", tokens, streams)
     assert unchanged[:3] == (BUDGET, PROMPT, [0])
     for layer in LAYERS:
@@ -353,13 +382,13 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves(
 
 
 @requires_cuda
-def test_a_forward_stores_the_checkpoints_of_several_rows():
+def test_a_forward_stores_the_checkpoints_of_several_rows(eviction_policy):
     # Two fresh rows checkpoint 256 and 128 tokens in. Each checkpoint block
     # holds what a one-row forward of that row ending there leaves.
     params = _layer_params(21)
     lengths, offsets = [300, 200], [256, 128]
     streams = _token_streams(22, sum(lengths))
-    server = _Server(params, in_forward=True)
+    server = _Server(params, in_forward=True, eviction_policy=eviction_policy)
     # A decode-capable engine keeps accepted counts beside its slot records.
     server.backend.preallocate_verify_workspace(4, 1)
     tables = {group: [[0, 1, 2], [0, 3, 4]] for group in KIMI_STATE_GROUPS}
@@ -390,7 +419,7 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
 
     starts = [0, lengths[0]]
     for row, (start, offset) in enumerate(zip(starts, offsets)):
-        alone = _Server(params, in_forward=False)
+        alone = _Server(params, in_forward=False, eviction_policy=eviction_policy)
         row_streams = {
             layer: {
                 name: values[start : start + offset]
@@ -416,16 +445,16 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
 
 
 @requires_cuda
-def test_a_graph_bucket_pads_the_spanning_forward():
+def test_a_graph_bucket_pads_the_spanning_forward(eviction_policy):
     # A prefill graph runs the spanning forward's KDA layers at their eager
     # breaks over the whole bucket: the real rows and every state match the
     # unpadded run, and the padded rows are zero.
     params = _layer_params(41)
     streams = _token_streams(42, PROMPT)
     tokens = list(range(PROMPT))
-    padded = _Server(params, in_forward=True)
+    padded = _Server(params, in_forward=True, eviction_policy=eviction_policy)
     _, spanning = _prompt(padded, "x", tokens, streams, bucket=BUDGET)
-    exact = _Server(params, in_forward=True)
+    exact = _Server(params, in_forward=True, eviction_policy=eviction_policy)
     _, unpadded = _prompt(exact, "x", tokens, streams)
     assert spanning[:3] == unpadded[:3] == (BUDGET, PROMPT, [BOUNDARY - BUDGET])
 
@@ -441,7 +470,7 @@ def test_a_graph_bucket_pads_the_spanning_forward():
 
 
 @requires_cuda
-def test_the_spanning_forward_keeps_the_host_ahead(monkeypatch):
+def test_the_spanning_forward_keeps_the_host_ahead(monkeypatch, eviction_policy):
     # Around its scans the spanning forward stages its checkpoint inputs
     # without a host sync: one per layer would stall the forward thread.
     scan = kda_backend.kda_paged_prefill
@@ -455,7 +484,9 @@ def test_the_spanning_forward_keeps_the_host_ahead(monkeypatch):
             torch.cuda.set_sync_debug_mode(mode)
 
     monkeypatch.setattr(kda_backend, "kda_paged_prefill", unchecked_scan)
-    server = _Server(_layer_params(51), in_forward=True)
+    server = _Server(
+        _layer_params(51), in_forward=True, eviction_policy=eviction_policy
+    )
     streams = _token_streams(52, PROMPT)
     server.submit("x", list(range(PROMPT)))
     server.prefill(streams)
@@ -473,8 +504,10 @@ def test_the_spanning_forward_keeps_the_host_ahead(monkeypatch):
 
 
 @requires_cuda
-def test_startup_accepts_the_option_for_kda_state_groups():
-    server = _Server(_layer_params(31), in_forward=True)
+def test_startup_accepts_the_option_for_kda_state_groups(eviction_policy):
+    server = _Server(
+        _layer_params(31), in_forward=True, eviction_policy=eviction_policy
+    )
     assert server.backend.stores_in_forward_state_checkpoints
     validate_state_checkpoint_in_forward(
         attn_backend=server.backend, kv_pool=server.pool

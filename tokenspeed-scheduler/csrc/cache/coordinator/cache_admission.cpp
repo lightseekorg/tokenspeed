@@ -317,8 +317,11 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
         recordCheckpoints(completed, access_epoch);
         recordPublishedTail(completed);
     }
-    for (const auto& [group_id, location, reason, segment] : prospective_victims) {
-        if (!evictor_.EvictCachedBlock(group_id, location, reason, segment)) {
+    for (const auto& [group_id, location, reason, segment, exact_removal] : prospective_victims) {
+        const bool evicted = exact_removal
+                                 ? evictor_.EvictCachedBlockAlone(group_id, location, reason, segment).has_value()
+                                 : evictor_.EvictCachedBlock(group_id, location, reason, segment);
+        if (!evicted) {
             FatalCheck(!store_.DevicePool().IsOccupied(location), "admission victim changed before acquisition");
         }
     }

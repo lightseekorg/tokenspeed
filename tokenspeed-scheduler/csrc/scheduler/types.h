@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #pragma once
+#include "cache/coordinator/eviction_policy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -36,7 +37,26 @@
 
 namespace tokenspeed {
 
+// Resolved once after startup validation. Legacy binding fields below remain
+// input adapters; production, publication and retention consume these contracts.
+struct CheckpointProductionConfig {
+    bool in_forward;
+};
+struct CheckpointPublicationRules {
+    bool filter_covered_endpoints;
+    bool drop_short_prompt_end;
+};
+struct CheckpointRetentionHints {
+    bool demote_superseded;
+};
+struct CheckpointConfig {
+    CheckpointProductionConfig production;
+    CheckpointPublicationRules publication;
+    CheckpointRetentionHints retention;
+};
+
 struct SchedulerConfig {
+    CheckpointConfig ResolveCheckpoints() const;
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
         // Page 0 is the null placeholder, so usable = total - 1. Validate
@@ -243,6 +263,10 @@ struct SchedulerConfig {
     // unused for longer leave first. 0 ranks every entry by its own use. Unset
     // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
     std::optional<std::int64_t> checkpoint_retention_requests;
+    std::string prefix_cache_evict_policy{"lru"};
+    std::optional<std::array<double, 2>> prefix_cache_gds_prefill_cost;
+    std::vector<double> prefix_cache_gds_disk_block_costs;
+    PrefixCacheEvictionConfig ResolveEvictionConfig() const;
     // Checkpoints within this many later requests of the newest on their
     // branch rank as it does: 0 only the newest request's, 1 the previous
     // turn's too. Below CheckpointTree::kMaxDistance.

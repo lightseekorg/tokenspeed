@@ -42,6 +42,7 @@
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/flat_hash_map.h"
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/gds_planner.h"
 #include "cache/coordinator/shadow_occupancy.h"
 #include "cache/coordinator/victim_set.h"
 #include "cache/core/block_placement_demand.h"
@@ -165,7 +166,7 @@ public:
                      std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> copy_in_point,
                      const PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations,
-                     bool evicts_segments)
+                     bool evicts_segments, const CheckpointPublication* publication)
         : store_{store},
           device_aging_{device_aging},
           groups_{store.Groups()},
@@ -180,7 +181,8 @@ public:
           shapes_{shapes},
           planned_claim_locations_{planned_claim_locations},
           boundary_tree_{store.Boundaries()},
-          evicts_segments_{evicts_segments} {}
+          evicts_segments_{evicts_segments},
+          publication_{publication} {}
 
     // The returned victim members use result_resource, which outlives the result.
     std::optional<AdmissionDecisions> Plan(std::pmr::memory_resource* result_resource) const {
@@ -224,8 +226,16 @@ protected:
             return false;
         }
 
-        const AdmissionCandidateConstraints constraints = BuildAdmissionCandidateConstraints(
-            store_, demands_, num_computed_tokens_, prefix_, planned_claim_locations_, &selection.scratch);
+        AdmissionCandidateConstraints constraints =
+            BuildAdmissionCandidateConstraints(store_, demands_, num_computed_tokens_, prefix_,
+                                               planned_claim_locations_, &selection.scratch, publication_);
+        if (store_.UsesGds() && store_.NumStateGroups() > 0) {
+            auto victims =
+                PlanGdsEviction(store_, constraints, block_demands, selection.eviction_plan, selection.member_resource);
+            if (!victims) return false;
+            selection.victims = std::move(*victims);
+            return true;
+        }
         if (const std::optional<std::vector<VictimCandidate>> through_fit =
                 candidatesThroughParentFit(block_demands, constraints)) {
             selectThroughParentFit(*through_fit, block_demands, constraints, selection);
@@ -1229,6 +1239,7 @@ protected:
     // Whether a victim takes its segment along
     // (CacheCoordinator::WritesBackEvictions).
     const bool evicts_segments_;
+    const CheckpointPublication* const publication_;
 };
 
 // Plans with `Planner` (AdmissionPlanner, or a subclass that goes on past
@@ -1238,14 +1249,15 @@ std::optional<AdmissionPlan> planAdmissionWith(
     const CacheStore& store, CheckpointAging device_aging, PrefixProbe&& prefix, std::span<const GroupDemand> demands,
     std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> copy_in_point,
     std::span<const PlannedShape> shapes,
-    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations, bool evicts_segments) {
+    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations, bool evicts_segments,
+    const CheckpointPublication* publication) {
     ProfileSpan profile_span{"planAdmission"};
     _assert(demands.size() == store.Groups().size(), "demands/groups size mismatch");
 
     auto member_resource = std::make_unique<std::pmr::monotonic_buffer_resource>();
-    const Planner planner{store,          device_aging, demands, num_computed_tokens,
-                          copy_in_point,  prefix,       shapes,  planned_claim_locations,
-                          evicts_segments};
+    const Planner planner{store,           device_aging, demands, num_computed_tokens,
+                          copy_in_point,   prefix,       shapes,  planned_claim_locations,
+                          evicts_segments, publication};
     std::optional<AdmissionDecisions> decisions = planner.Plan(member_resource.get());
     if (!decisions) return std::nullopt;
     return AdmissionPlan{.prefix = std::move(prefix),
@@ -1260,7 +1272,8 @@ inline std::optional<AdmissionPlan> planAdmission(
     std::span<const PlannedShape> shapes,
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations, bool evicts_segments) {
     return planAdmissionWith<AdmissionPlanner>(store, device_aging, std::move(prefix), demands, num_computed_tokens,
-                                               copy_in_point, shapes, planned_claim_locations, evicts_segments);
+                                               copy_in_point, shapes, planned_claim_locations, evicts_segments,
+                                               nullptr);
 }
 
 template <typename Planner>
@@ -1283,7 +1296,8 @@ std::optional<AdmissionResult> CacheCoordinator::AdmitWith(PrefixProbe&& prefix,
         store_, history_.CheckpointAgingFor(CacheTier::kDevice), std::move(prefix), demands,
         progress.num_computed_tokens, copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt,
         /*shapes=*/{},
-        /*planned_claim_locations=*/{}, write_back_evictions_);
+        /*planned_claim_locations=*/{}, write_back_evictions_,
+        progress.completed_pages ? &*progress.completed_pages : nullptr);
     if (!plan) {
         return std::nullopt;
     }

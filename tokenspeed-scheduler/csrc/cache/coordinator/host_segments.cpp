@@ -36,6 +36,8 @@
 #include "cache/core/block_placement_demand.h"
 #include "utils.h"
 
+#include "cache/coordinator/gds_tiered.h"
+
 namespace tokenspeed {
 
 template <typename Visitor>
@@ -284,6 +286,15 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         _assert(buckets[row] >= 0 && buckets[row] < store_.Groups()[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
         ++block_demands[group_ids[row]].blocks_by_bucket[static_cast<std::size_t>(buckets[row])];
+    }
+    if (store_.UsesGds()) {
+        std::vector<std::size_t> ends;
+        for (const auto& segment : segments) ends.push_back(segment.past_end_row);
+        auto selected = PlanTieredHostAllocation(store_, group_ids, buckets, ends, true, true);
+        HostPlacementPlan plan;
+        plan.num_placed = selected.accepted_segments;
+        plan.tiered = std::move(selected.plan);
+        return plan;
     }
     ShadowOccupancy shadow{*store_.HostPool(), store_.Groups()};
     // Nothing is evicted while free capacity fits every segment.
@@ -952,6 +963,17 @@ HostCache::HostAllocationBatch HostCache::acquireHostPlacement(const HostPlaceme
                                                                std::span<const std::uint32_t> group_ids,
                                                                std::span<const std::int32_t> buckets,
                                                                std::span<const HostSegmentRows> segments) {
+    if (plan.tiered) {
+        const auto victims = TieredVictims(plan.tiered, std::pmr::get_default_resource());
+        FatalCheck(evictor_
+                       .EvictPlanned(victims, false,
+                                     CacheEvictor::VictimReasons{
+                                         .victim = &CacheEvictor::DeviceEvictionStats::admission,
+                                         .stranded_suffix = &CacheEvictor::DeviceEvictionStats::stranded_suffix,
+                                         .request_reclaim = &CacheEvictor::DeviceEvictionStats::request_reclaim})
+                       .empty(),
+                   "a joint Host plan cannot reclaim live Device owners");
+    }
     // Evict, then allocate: the fit holds once the victims are gone.
     for (const auto& [group_id, location, reason] : plan.victims) {
         // A checkpoint takes the other State groups' at its hash along.

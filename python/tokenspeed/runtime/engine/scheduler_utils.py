@@ -124,6 +124,9 @@ def make_config(
     enable_l3_storage: bool,
     role: str,
     *,
+    prefix_cache_evict_policy: str,
+    prefix_cache_gds_prefill_cost: Sequence[float] | None,
+    prefix_cache_gds_disk_block_costs: Sequence[float],
     max_resident_requests: int,
     num_snapshot_pages: int,
     host_group_packing: Sequence[int],
@@ -342,18 +345,12 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
-    if state_checkpoint_in_forward:
-        # Set only when on: off is the binding's default, so the runtime keeps
-        # working with a scheduler wheel released before this field, where
-        # turning the option on raises AttributeError here instead of being
-        # ignored.
-        cfg.state_checkpoint_in_forward = True
-    if demote_superseded_state_checkpoints:
-        # Set only when on, as above.
-        cfg.demote_superseded_state_checkpoints = True
-    if drop_short_prompt_end_checkpoints:
-        # Likewise set only when on.
-        cfg.drop_short_prompt_end_checkpoints = True
+    cfg.state_checkpoint_in_forward = state_checkpoint_in_forward
+    cfg.demote_superseded_state_checkpoints = demote_superseded_state_checkpoints
+    cfg.drop_short_prompt_end_checkpoints = drop_short_prompt_end_checkpoints
+    cfg.prefix_cache_evict_policy = prefix_cache_evict_policy
+    cfg.prefix_cache_gds_prefill_cost = prefix_cache_gds_prefill_cost
+    cfg.prefix_cache_gds_disk_block_costs = list(prefix_cache_gds_disk_block_costs)
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.

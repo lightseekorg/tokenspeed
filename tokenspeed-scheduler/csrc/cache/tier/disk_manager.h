@@ -112,7 +112,9 @@ private:
         DiskOpKind kind{DiskOpKind::kRead};
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> host_blocks;
+        std::vector<PrefixCacheIndex::CleaningSource> cleaning_sources;
         std::vector<CacheBlockRef> disk_blocks;
+        std::vector<CacheBlockRef> disk_dependencies;
         // A cleaning write: each key's Host entry metadata, which its Disk
         // entry is published with.
         std::vector<PrefixCacheIndex::CachedBlockMetadata> metadata;
@@ -121,6 +123,7 @@ private:
         std::optional<TailPublication> tail;
         bool detached{false};
         bool completed{false};
+        CacheCoordinator::RecoveryMetadata recovery_metadata;
     };
 
     std::uint64_t nextId();
@@ -131,6 +134,8 @@ private:
     // Moves the entries acquired since the reuse gate turned them away back
     // into the cleaning queue, a bounded number per call.
     void requeueReused();
+    bool mayClean(const CacheKey& key) const;
+    void filterCleaning(Ticket& ticket);
 
     CacheCoordinator& coordinator_;
     const DiskConfig config_;

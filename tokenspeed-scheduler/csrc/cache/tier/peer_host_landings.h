@@ -92,6 +92,7 @@ private:
         std::optional<TailPublication> tail;
         bool detached{false};
         bool completed{false};
+        CacheCoordinator::RecoveryMetadata recovery_metadata;
     };
 
     std::uint64_t nextId();

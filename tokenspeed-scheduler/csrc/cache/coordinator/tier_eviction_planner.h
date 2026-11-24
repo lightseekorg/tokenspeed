@@ -40,6 +40,7 @@
 #include "cache/cache_group.h"
 #include "cache/coordinator/admission_history.h"
 #include "cache/coordinator/cache_store.h"
+#include "cache/coordinator/clean_host_copies.h"
 #include "cache/coordinator/eviction_candidates.h"
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/core/block_placement_demand.h"
@@ -71,6 +72,7 @@ public:
           groups_{store.Groups()},
           pool_{pool},
           plan_{pool, store.Groups()},
+          tier_{tier},
           candidates_{store.Groups(), pool, history.CheckpointAgingFor(tier)} {}
     TierEvictionPlanner(const TierEvictionPlanner&) = delete;
     TierEvictionPlanner& operator=(const TierEvictionPlanner&) = delete;
@@ -87,6 +89,21 @@ public:
     bool Fit(std::span<const BlockPlacementDemand> block_demands) {
         const CacheEvictionCandidates::LocationSet no_request_reclaims{&scratch_};
         return plan_.SelectUntilFits(block_demands, [&] {
+            if (!clean_initialized_) {
+                if (tier_ == CacheTier::kHost) clean_ = DiskCleanHostCopies(store_);
+                clean_initialized_ = true;
+            }
+            while (next_clean_ < clean_.size()) {
+                VictimSet set;
+                for (const auto& [group, location] : clean_[next_clean_++].members) {
+                    if (taken_.contains(location)) continue;
+                    Seed(group, location);
+                    set.members.push_back({group, location});
+                }
+                if (set.members.empty()) continue;
+                victims_.push_back(std::move(set));
+                return true;
+            }
             while (const auto candidate =
                        candidates_.Next({}, taken_, no_request_reclaims,
                                         [&](CacheBlockLocation location) { return taken_.contains(location); })) {
@@ -131,6 +148,10 @@ private:
     const std::vector<CacheGroup>& groups_;
     const BlockPool& pool_;
     CacheEvictionPlan plan_;
+    CacheTier tier_;
+    bool clean_initialized_{false};
+    std::vector<CleanHostCopy> clean_;
+    std::size_t next_clean_{0};
     CacheEvictionCandidates candidates_;
     // Holds taken_'s slots until the planner dies, first in the planner's own
     // raw buffer (left uninitialized: only the arena writes it), so a small

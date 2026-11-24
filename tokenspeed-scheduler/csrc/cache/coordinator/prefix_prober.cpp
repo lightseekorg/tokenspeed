@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "cache/coordinator/prefix_prober.h"
+#include "cache/coordinator/recovery_route.h"
 
 #include <algorithm>
 #include <array>
@@ -673,6 +674,9 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
             .num_common_tokens;
     host = PrefixProbe::Tier{};
     host.per_group.resize(store_.Groups().size());
+    std::vector<ContentHash> recovery_hashes;
+    recovery_hashes.reserve(prompt.prefix_hashes.size());
+    for (const auto& hash : prompt.prefix_hashes) recovery_hashes.emplace_back(hash);
     bool kv_settled = !has_kv;
     const auto visit = [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& published_hash) {
         const std::int32_t boundary = page_tokens + tail_tokens;
@@ -680,39 +684,15 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
                                                      published_hash, /*allow_host=*/true, extra_hits)) {
             return true;
         }
-        std::int32_t split_tokens = std::min(device_kv_tokens, page_tokens);
-        for (const std::size_t i : match_order) {
-            if (store_.GroupIsState(i) || store_.Groups()[i].Matcher().IsPrefixClosed()) {
-                continue;
-            }
-            const std::int32_t block_granularity = store_.Geometry()[i].BlockGranularity();
-            const CacheStore::BlockRange window = store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
-            // Lowest first: a missing sink block lowers the split under the window.
-            for (const CacheStore::BlockRange& needed :
-                 {store_.SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
-                for (std::int32_t block = needed.first;
-                     block < std::min(needed.past_end, split_tokens / block_granularity); ++block) {
-                    if (!store_.Groups()[i].Index().Contains(store_.DevicePool(),
-                                                             group_keys[i][static_cast<std::size_t>(block)])) {
-                        split_tokens =
-                            block * block_granularity - block * block_granularity % store_.PrefixGranularity();
-                        break;
-                    }
-                }
-            }
-        }
-        // C covers the closed pages from L; a split lowered below L needs
-        // the Host's closed pages up to L as well.
-        for (const std::size_t i : closed_order) {
-            const std::int32_t block_granularity = store_.Geometry()[i].BlockGranularity();
-            for (std::int32_t block = split_tokens / block_granularity;
-                 block < std::min(device_kv_tokens, page_tokens) / block_granularity; ++block) {
-                if (!PrefixKeyIsHit(store_.Groups()[i].Index(), *store_.HostPool(),
-                                    group_keys[i][static_cast<std::size_t>(block)], extra_hits)) {
-                    return true;
-                }
-            }
-        }
+        const auto route = ResolveRecoveryRoute(
+            store_, recovery_hashes, published_hash, boundary, /*allow_host=*/true, /*include_state=*/false,
+            [&](const CacheKey& key, CacheTier tier) {
+                const auto& index = store_.Groups()[key.group_id].Index();
+                return tier == CacheTier::kDevice ? index.Contains(store_.DevicePool(), key)
+                                                  : PrefixKeyIsHit(index, *store_.HostPool(), key, extra_hits);
+            });
+        if (!route) return true;
+        const std::int32_t split_tokens = route->split_tokens;
         const auto make_tail = [&] {
             return PrefixProbe::TailHit{.tail_tokens = tail_tokens,
                                         .hash = published_hash,
@@ -724,7 +704,7 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
         std::vector<GroupPrefixProbe> device_hits(store_.Groups().size());
         std::vector<GroupPrefixProbe> host_hits(store_.Groups().size());
         // The KV tail comes whole from one tier.
-        bool kv_tail_on_device = has_kv && tail_tokens > 0 && split_tokens == page_tokens;
+        bool kv_tail_on_device = has_kv && tail_tokens > 0 && route->device_tail;
         for (const std::size_t i : match_order) {
             if (store_.GroupIsState(i) || !kv_tail_on_device) {
                 continue;
