@@ -610,6 +610,13 @@ pub struct Subsystems {
     pub peer: Option<Peer>,
 }
 
+type PendingForward<P> = (
+    ForwardBatchView,
+    Option<InputLogprobPlan>,
+    P,
+    Option<crate::execution_observation::ForwardLease>,
+);
+
 /// One rank's scheduling loop.
 pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Held for the whole round. A peer holder's endpoint answers from the
@@ -645,12 +652,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The token-history rows' owners, for a model that reads them.
     history: Option<HistoryRows>,
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
-    in_flight: VecDeque<(
-        ForwardBatchView,
-        Option<InputLogprobPlan>,
-        D::Pending,
-        Option<crate::execution_observation::ForwardLease>,
-    )>,
+    in_flight: VecDeque<PendingForward<D::Pending>>,
     cache_ops: CacheOps,
     controls: Controls,
     /// Accepted cache clear waiting for native completions between rounds.
