@@ -70,12 +70,25 @@ allowed helpers and checks these rules on the compiled kernels.
 ### gfx950 BF16 projections with FP32 output
 
 `gfx950/gemm/fp16/fp32_output.py` covers measured `[N,K]` pairs `[8,4608]`,
-`[384,4608]`, `[3792,4608]` and `[4608,1536]` and returns genuine FP32 output.
+`[384,4608]`, `[3792,4608]`, `[3808,4608]` and `[4608,1536]`, and the
+Inkling2 projections of half that width (`[2152,2304]`, `[2168,2304]`,
+`[128,2304]`, `[2304,768]`, K slices by analogy, not timed yet) with the
+QKV rows a looped layer's separate K or V source projects (`[256,2304]`,
+`[264,2304]` with a full layer's taps, on the QKV split), and returns
+genuine FP32 output.
 The narrow path widens BF16 products exactly and uses a fixed row-local tree.
 The wide path reuses the existing MFMA/LDS kernel with fixed 16x64x64 tiles.
-The QKV shape uses twelve fixed K partitions with FP32 partials folded in
+The QKV shapes (a local layer's, and a full layer's with its projected
+convolution taps) use twelve fixed K partitions with FP32 partials folded in
 split order, not arrival order. Neither reduction depends on the batch size.
 The caller supplies zeroed arrival counters, which each launch resets.
+Past a measured row count per shape (decode sizes keep the split programs),
+one program walks all of K for its 64x64 or 128x128 tile instead: it runs
+each split as its own MFMA chain from zero, with the split kernel's
+instruction and operand layouts, and adds the splits' sums in split order.
+That gives every output the split kernel's bits without FP32 partials in
+memory. At prefill sizes this is several times faster than a program a split
+and close to hipBLASLt.
 Each view must span at most 4 GiB from its base pointer, and split-K
 partial-tile element offsets must fit signed int32; larger inputs raise
 before launch rather than wrap a raw-buffer offset. The wide path copies
@@ -151,6 +164,64 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 skinny BF16 GEMM
+
+`gluon_mm_a16w16_skinny_gfx950` (`gemm/fp16/skinny.py`) computes `A @ B.T` for
+a few BF16 rows against a cold `[N, K]` weight whose read dominates.
+
+#### Contract
+
+- `A` is a contiguous `[M, K]` BF16 activation, `B` a contiguous `[N, K]` BF16
+  weight, the output a contiguous `[M, N]` BF16 tensor, all on one GPU and
+  each at a 16-byte aligned address. The launcher refuses strided and
+  unaligned tensors (the direct-to-LDS loads have no lowering without the
+  alignment).
+- It runs only the `(N, K)` shapes and row counts in `_SKINNY_CONFIGS`, each
+  measured faster than the other `gemm.mm` solutions with cold weights;
+  `supports_gluon_mm_a16w16_skinny_gfx950` answers for a problem.
+- M is a runtime argument. A launch runs the smaller of two row tiles, 64 or
+  128 rows, that covers M. The binaries (one per row tile, and the reduce)
+  depend only on the weight's shape: the kernels specialize no pointer, so
+  neither a tensor's alignment class nor whether its storage fits in 2 GB
+  keys a binary, and they state the 16-byte alignment instead.
+  `compile_gluon_mm_a16w16_skinny_gfx950(B)` compiles them without a launch,
+  whatever row count startup runs and wherever the served activation and
+  output live.
+- Nothing here compiles at import. A caller compiles at startup with
+  `compile_gluon_mm_a16w16_skinny_gfx950`; one that does not compiles each
+  row tile at its first launch.
+- A row's bits depend only on that row and the weight: not on M, on the row
+  tile, or on the other rows of the launch.
+- The first launch writes FP32 partials to scratch laid out
+  `[SPLIT_K, 128, N]` row-major: split `s`, row `m`, column `n` is element
+  `(s * 128 + m) * N + n`. Split `s` covers
+  `K[s * K / SPLIT_K : (s + 1) * K / SPLIT_K]`; rows at and past M are not
+  written. `_SKINNY_CONFIGS[(N, K)]` gives `SPLIT_K`.
+
+#### Algorithm
+
+- Each program owns one 64-column weight slab of one K slice
+  (`N / 64 * SPLIT_K` programs) and reads it from HBM once. All M rows form one
+  row tile, so the weight traffic does not grow with M.
+- A and B tiles go straight to LDS two K tiles ahead of the MFMA
+  (`32x32x16`) that reads them, through a ring of three LDS buffers. The K
+  loop is a real loop: unrolling it keeps every tile's offsets live, and the
+  VGPR count that follows costs the wave occupancy that hides HBM latency.
+  The K tile is 128 for the 64-row tile and 64 for the 128-row tile, so three
+  tiles fit LDS; it does not change the result.
+- B tiles sit in LDS as `[K, N]` with K contiguous, the weight's own order
+  and the MFMA operand's. One wave's direct-to-LDS load writes a contiguous
+  span of 512 elements (64 lanes of 16 bytes), so the layout pads between
+  spans; a shorter padding interval has no direct-to-LDS lowering.
+- `gluon_mm_a16w16_skinny_reduce_gfx950` then sums the partials in split order
+  (`((p0 + p1) + p2) + ...` in FP32) and rounds once to BF16. One program is
+  four waves of 16-byte loads: 16 rows of 64 columns. The alignment is
+  stated for the first split's base only; the other splits sit at constant
+  offsets from it, and a test asserts that every buffer load of the compiled
+  reduce is `buffer_load_dwordx4`, 16 bytes a lane.
+- The K split, the MFMA order inside a split, and the split summation order
+  depend only on `K` and `SPLIT_K`, which gives the row invariance above.
+
 ### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
@@ -207,7 +278,10 @@ it on gfx950 and transposes the router weight once to `[N, K]`.
   row's logits depend only on the M bucket, and repeat calls are bitwise
   stable.
 - One binary per (shape, multiplier, M bucket): power-of-two buckets up to 16,
-  then one per split-K config. `M` is a runtime argument.
+  then one per split-K config. `M` is a runtime argument. With
+  `warm_variants` (the registered op passes it during kernel warmup), the
+  launcher compiles every bucket's binary for its shape without launching,
+  so a batch in a bucket startup never ran does not compile while serving.
 
 #### Algorithm
 
@@ -237,11 +311,15 @@ the router's split-K GEMM and an independent BF16 decode GEMM
 
 - Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
   `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
-- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
-  four-wave decode GEMM config for `(M, N', K')`.
+- `N` a multiple of 16, `K` a multiple of 512, a measured four-wave decode
+  GEMM config for `(M, N', K')`, and `1 <= M <= 16`, or a larger `M` at which
+  the router's standalone plan takes the shared launch's router tile.
 - `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
-  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
-  rows and differ from the GEMV's in the last bits at 1-8 rows.
+  16 x 16 split-K-by-8 tile, so its logits equal the standalone router's
+  wherever that plan takes the same tile, and differ from it in the last bits
+  elsewhere.
+- One binary per decode GEMM M bucket; `warm_variants` compiles each of them
+  at startup, as for the router GEMV.
 
 #### Algorithm
 
@@ -319,6 +397,53 @@ step shrinks with `BLOCK_M` to keep the activation tile within 32 VGPRs a
 buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
 launch several programs per CU. Weights pass through LDS in E4M3 and upcast
 (`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout.
+
+### gfx950 skinny FP8 projection
+
+`gluon_mm_fp8_skinny_gfx950` (`gfx950/gemm/fp8/skinny.py`) multiplies a few
+FP8 rows by an FP8 weight whose read dominates the launch: `gemm.mm` selects
+it for an FP8 call with row and channel scales at the measured weight
+shape and 17-128 rows. It quantizes nothing; callers decide which rows are
+FP8.
+
+#### Contract
+
+- `A`: `[M, K]` FP8 E4M3 codes with unit inner stride; `A_scales`: FP32, one
+  per row. `B`: contiguous `[N, K]` FP8 E4M3 codes; `B_scales`: FP32, one per
+  output channel. Returns BF16 `(A * A_scales) @ (B * B_scales).T`.
+- Codes and scales follow one per-row definition
+  (`tokenspeed_kernel/ops/quantization/_triton_fp8_rows.py`): scale
+  `max(amax / 448, 1e-12)` and codes `x / scale` rounded once to nearest even,
+  both by IEEE FP32 division. The token quantizer, the weight conversion
+  (`prepare_fp8_channel_weight`) and the layer boundary's FP8 copy share it.
+- A config exists for `[4608, 8192]` at 17-128 rows; it is the problem
+  filter. It offers the `weight_streaming` feature. Offset, strided or
+  unaligned operands decline it through the traits. One split count per
+  weight shape, so a row's bits do not depend on `M` or on the other rows;
+  results are deterministic.
+
+#### Algorithm
+
+- A program owns one 64-column weight slab of one K slice (`SPLIT_K` 2 for
+  `[4608, 8192]`) and streams it once from HBM through
+  a three-buffer LDS ring of direct-to-LDS loads, two 256-byte K tiles ahead.
+  It multiplies all rows of its row tile by the unscaled
+  `v_mfma_f32_32x32x64_f8f6f4` (zero scale operands to the scaled MFMA
+  intrinsic select it; a test checks the ISA).
+- Row tiles: 64 rows on 4 waves (a 2 x 2 grid of 32 x 32 MFMA tiles) and 128
+  rows on 8 waves (4 x 2), one output tile a wave. Three K tiles of A and B
+  take 144 KB of LDS at 128 rows, 96 KB at 64 (checked at import). With
+  128-144 programs on 256 CUs the launch is bound by the loads in flight: at
+  128 rows each iteration issues tile t + 2 before it reads tile t and waits
+  for tile t + 1 at its end; at 64 rows the wait comes first, the faster
+  order at that tile.
+- Each split stores an FP32 partial; a second launch sums them in split order
+  and only then applies `A_scales[row] * B_scales[column]`.
+- The A tile's load layout lists its row lane bases in the order of the
+  padded LDS layout's row bases, so each wave writes contiguous padded runs.
+  Direct-to-LDS loads refuse other orders. B tiles are swizzled `[N, K]`, so
+  the transposed reads spread over the LDS banks while each row's 16-byte
+  runs stay whole for the direct-to-LDS loads.
 
 ### gfx950 MXFP8 projection
 
@@ -1681,14 +1806,20 @@ the partials by LSE.
   sliding-window layers).
   `warmup_gluon_mha_extend_gfx950` compiles every variant without running,
   for startup.
+- K and V are contiguous `[pages, page, kv_heads, head_dim]` arenas whose
+  base addresses are 16-byte aligned; the launcher refuses any other cache
+  (the direct-to-LDS page copy has no lowering without that alignment). The
+  cache pointers are not specialized, so one binary serves startup's small
+  probe arena and the full arena sized after it, whichever side of 2 GB
+  each falls on; the kernels state the alignment instead.
 
 #### Algorithm
 
 Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
-With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
-over when each workgroup streams many cached keys: under full attention a
+With head dim 64 and 16-bit or FP8 K/V, 256-row tiles on eight waves (below)
+take over when each workgroup streams many cached keys: under full attention a
 cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
 window of at least 2047 keys a prefix of at least the window and one to four
 workgroups per CU over the launch. `max_seqlen_k` should be the longest
@@ -1714,11 +1845,25 @@ V and copy K; PV MFMAs with the next page's row maxima). The two waves on a
 SIMD run one cluster apart, and the copy clusters raise their priority with
 `s_setprio`, so one wave's MFMAs and softmax overlap the other's LDS reads and
 copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
-The running maximum moves only when a page raises it by more than 8 (base 2),
-so most pages skip the accumulator rescale, and a wave whose 32 rows all kept
-their maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so
-one 8-wave workgroup runs per CU; the split count therefore counts each as
-two 4-wave workgroups.
+With 16-bit K/V the running maximum moves only when a page raises it by more
+than 8 (base 2), so most pages skip the accumulator rescale. With FP8 K/V the
+maximum moves on every page that raises it, as in the 4-wave loop, because FP8
+P is quantized against it. Either way a wave whose 32 rows all kept their
+maximum skips the rescale with one scalar branch. A wave uses about 196 VGPRs,
+so one 8-wave workgroup runs per CU and the split count counts each as two
+4-wave workgroups. With FP8 K/V under full attention, a one-request launch
+compiles at four waves per SIMD (128 VGPRs), so two workgroups share a CU.
+The FP8 split count starts from the 4-wave grid's, since split boundaries
+change FP8 bits; where the 8-wave grid would leave a partial round of the CUs
+it takes the count, up to twice that, that finishes soonest.
+
+The unsplit kernel places its workgroups by KV head when the head count
+divides the eight XCDs: workgroup `i` lands on XCD `i % 8`, each head gets its own
+`8 / heads` XCDs, and a head's blocks alternate over them, so the workgroups
+sharing an XCD's L2 stream one head's pages. Workgroups left over when the
+launch is not a multiple of eight take each head's last blocks. Blocks then run
+last to first, so the shortest work ends the launch. Every (query block, KV
+head) pair still runs once, so placement does not change the output.
 
 ### gfx950 MLA extend
 
@@ -2307,6 +2452,36 @@ column-first workgroup order distributes concurrent updates across the output.
 This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
+
+### Wide E2M1 prefill tiles
+
+A grouped configuration whose `wide_tiles` is set (in the gfx950 MXFP4
+`fused/tuning.py` table: 4096 x 4096 experts, 32 or 64 of 256 local, from 192 rows)
+runs
+E2M1 package prefill on 64-row sort blocks and both GEMMs on their wide tiles.
+Other shapes keep the general tiles. So does that shape under expert tensor
+parallelism, whose sorted gate/up holds every expert locally (no table row
+yet: the wide tiles are unmeasured there).
+
+The gate/up GEMM's wide tile is 64 rows by 256 interleaved gate/up weight rows
+(128 outputs) on four waves, each wave owning 64 weight rows for all 64 rows,
+so it reads the activation tile from shared memory once per K tile.
+Activations are copied two K tiles ahead through three shared-memory slots,
+and weights and scales load one K tile ahead. The epilogue splits gate from up
+in registers and quantizes the 64 x 128 output in one pass. A 128-row sort
+block is two such tiles with the block's expert. Every output element sees the
+same MFMAs in the same K order as the general tile, so the bits are the same.
+
+The down GEMM's wide tile serves reduce mode: 64 rows by 256 columns on four
+waves through the same K loop as the gate/up tile (256-wide K tiles,
+activations two ahead). Each element accumulates the same 128-wide MFMA steps
+in the same order as the general 128-wide K tile, then rounds once to BF16;
+the 64 x 256 tile is redistributed once and each route's row stored as one
+contiguous span. Both tiles take row, route and token counts at run time, and
+address an expert's weights and the sorted intermediate past 2^31 bytes in
+64-bit offsets. Measured on MI355X (one EP4 rank, served EP facade) they are
+faster than the general tiles from 3k to 24k rows; the table row spans 192
+rows up to the stage-1 launcher's 2^31-byte activation bound.
 
 ### gfx950 BF16 expert routes
 
@@ -3099,24 +3274,37 @@ complete dot reduction. This is not the CDNA4-swizzled MXFP4 scale layout.
 Only the expert GEMMs differ: routing, quantization, capped SwiGLU and the
 BF16 boundaries use the shared portable pipeline, and each route keeps its
 flattened token/top-k slot, so the EP reduction and slot-fold order are
-unchanged. The common package selects this solution for NVFP4 only.
+unchanged. The quantizers also store the exact BF16 values of their codes,
+which the GEMMs read as activations instead of decoding the codes for every
+output tile.
 
-Whole tiles of NVFP4 weights with BF16 activations (every model shape) stream
-through an LDS ring. Direct-to-LDS copies bring each K block's packed weights,
-group scales and activation rows up to three blocks ahead of the MFMA. They
-hold no registers, so a program keeps more bytes in flight than register loads
-allow. That matters at decode, where each program walks one tile's K blocks
-back to back. The weights are read as int32 words in the MFMA B-operand order,
-a word of 8 values a lane and K step. `v_cvt_scalef32_pk_f32_fp4` upcasts each
-byte to an FP32 pair, the E4M3 group scale multiplies in FP32, and one
-rounding gives BF16. Both steps are exact, so the values, and the K order of
-the 16x16x32 MFMAs, equal the masked loop's: results are bit-identical. Rows
-past an expert's count are not copied and feed only MFMA rows that are never
-stored. Ragged shapes and MXFP8 keep the masked register loop.
+Whole tiles (every model shape) stream through an LDS ring. Direct-to-LDS
+copies bring each K block's weights, group scales and activation rows ahead
+of the MFMA. They hold no registers, so a program keeps more bytes in flight
+than register loads allow. That matters at decode, where each program walks
+one tile's K blocks back to back. Each lane reads its weights in the MFMA
+B-operand order and upcasts them in registers:
 
-Prefill uses 64-row NVFP4 tiles, so each weight tile is upcast once per 64
-route rows. A 2048-token chunk routes about 43 rows to an expert at top-8 over
-384 experts.
+- NVFP4: int32 words, a word of 8 values a lane and K step.
+  `v_cvt_scalef32_pk_f32_fp4` upcasts each byte to an FP32 pair, the E4M3
+  group scale multiplies in FP32, and one rounding gives BF16. The ring has
+  up to 4 stages.
+- MXFP8: 8 E4M3 bytes a lane and K step (one 8-byte LDS read). Each value
+  converts to FP32, multiplies by its UE8M0 scale `2^(e - 127)` as the
+  masked loop does, and rounds once to BF16. The ring has 2 stages, so two
+  programs fit a CU at every tile: deeper rings measured slower. A stage's
+  scales fill only half the lanes of one 4-byte copy, so the copy repeats
+  the tile's rows into rows that are never read.
+
+Both upcasts are exact, so the values, and the K order of the 16x16x32
+MFMAs, equal the masked loop's: results are bit-identical. Rows past an
+expert's count are not copied and feed only MFMA rows that are never stored.
+Ragged shapes keep the masked register loop.
+
+Prefill uses 64-row tiles, so each weight tile is upcast once per 64 route
+rows. A 2048-token chunk routes about 43 rows to an expert at top-8 over 384
+experts. The ring shortens both expert GEMMs at decode sizes and at a
+2048-token prefill chunk.
 
 ### gfx950 group-32 UE8M0 FP8 activations
 

@@ -41,6 +41,9 @@ from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _is_nvidia = current_platform().is_nvidia
 _SCORE_MAX_WAVES = 3
+# Locations of prepare_metadata: compressed slots pass int32 on large FlatKV pools.
+QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE = torch.int64
+QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE = torch.int32
 LOG2E = math.log2(math.e)
 
 
@@ -125,11 +128,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         ).to(tl.int64)
         qsa_values = qsa_pages * qsa_page_size + safe_logical % qsa_page_size
         qsa_valid = valid & (qsa_pages > 0)
-        tl.store(
-            qsa_locs + rows,
-            tl.where(qsa_valid, qsa_values, 0).to(tl.int32),
-            mask=mask,
-        )
+        tl.store(qsa_locs + rows, tl.where(qsa_valid, qsa_values, 0), mask=mask)
 
         recent_columns = safe_logical // recent_page_size
         recent_pages = tl.load(
@@ -198,8 +197,14 @@ def qwen4_exp_qsa_prepare_metadata(
     outputs = (
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
-        torch.empty((total_tokens,), dtype=torch.int32, device=device),
-        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+        torch.empty(
+            (total_tokens,),
+            dtype=QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE,
+            device=device,
+        ),
+        torch.empty(
+            (total_tokens,), dtype=QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE, device=device
+        ),
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
     )
     if not total_tokens or not batch:
@@ -2627,6 +2632,8 @@ register_kernel(
 
 
 __all__ = [
+    "QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE",
+    "QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE",
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",

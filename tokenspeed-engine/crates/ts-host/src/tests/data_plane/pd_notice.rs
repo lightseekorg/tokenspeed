@@ -83,7 +83,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
     let (mut mesh, group) = support::single_rank();
     let streams = Streams::Prefill(pair.prefill_outbox.clone());
     let (plane, _) = plane();
-    let mut data_plane = PythonDataPlane::start(plane, Some(streams.clone())).unwrap();
+    let mut data_plane = PythonDataPlane::start(plane, Some(streams.clone()), None).unwrap();
     let mut scheduler = Python::attach(|py| {
         let globals = PyDict::new(py);
         py.run(
@@ -123,7 +123,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
     };
 
     // A one-page prompt and a ten-page one arrive on both nodes: the Decode
-    // peer announces each and the Prefill peer admits it.
+    // peer announces each while the Prefill scheduler admits it locally.
     for (rid, room, tokens) in [("short", 1, 16), ("long", 2, 160)] {
         let bootstrap = BootstrapInfo {
             room,
@@ -133,6 +133,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
         pair.prefill.register(rid, &bootstrap).unwrap();
         scheduler
             .submit_requests(&[RequestSpec {
+                admission_id: 0,
                 session_id: String::new(),
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
@@ -142,13 +143,6 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
                 max_new_tokens: 4,
                 max_cached_prefix_tokens: i32::MAX,
             }])
-            .unwrap();
-        assert_eq!(
-            support::next_event(&mut pair.prefill, &mut mesh, &group),
-            PdEvent::Bootstrapped(rid.to_owned())
-        );
-        scheduler
-            .advance(&[event(ForwardEventKind::PdBootstrapped, rid, vec![])])
             .unwrap();
     }
     // What the Decode peer reports first, within `wait`.

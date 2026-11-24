@@ -20,42 +20,61 @@
 
 # -*- coding: utf-8 -*-
 
+import weakref
+from collections.abc import Callable
+
 import numpy as np
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.gdn._triton.utils import tensor_cache
 
-# Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) and
-# cleared at the start of every set_*() call.
-_total_chunks_hint: dict[tuple[int, int], int] = {}
+# Host-side chunk counting for the cu_seqlens tensor of the next chunked scan,
+# so prepare_chunk_indices sizes its grid without reading the device prefix
+# sum back (a stream sync). The scan picks its chunk sizes itself (chunk_fwd_o
+# narrows 64 to 16 or 32 for batches of at most 32 tokens), so the hint keeps
+# the sequence lengths and counts chunks for whichever size is asked. Every
+# set_*() call replaces it; the weak reference binds it to that exact tensor,
+# since a bare id() can be reused by a later allocation.
+_chunks_hint: (
+    tuple[weakref.ReferenceType[torch.Tensor], Callable[[int], int]] | None
+) = None
 
 
-def set_total_chunks_hint(
-    seq_lens_cpu,
-    cu_seqlens: torch.Tensor,
-    chunk_sizes: tuple[int, ...] = (16, 64),
+def _bind_chunks_hint(
+    cu_seqlens: torch.Tensor, total_chunks: Callable[[int], int]
 ) -> None:
-    """Pre-compute total chunk counts on CPU and bind them to a specific
-    cu_seqlens tensor (by id), avoiding cross-batch hint pollution."""
-    lens = np.asarray(seq_lens_cpu, dtype=np.int64)
-    key_id = id(cu_seqlens)
-    _total_chunks_hint.clear()
-    for cs in chunk_sizes:
-        _total_chunks_hint[(cs, key_id)] = int(np.sum(-(-lens // cs)))
+    global _chunks_hint
+    _chunks_hint = (weakref.ref(cu_seqlens), total_chunks)
+
+
+def _hinted_total_chunks(cu_seqlens: torch.Tensor, chunk_size: int) -> int | None:
+    if _chunks_hint is None:
+        return None
+    hinted_cu_seqlens, total_chunks = _chunks_hint
+    if hinted_cu_seqlens() is not cu_seqlens:
+        return None
+    return total_chunks(chunk_size)
+
+
+def set_total_chunks_hint(seq_lens_cpu, cu_seqlens: torch.Tensor) -> None:
+    """Bind the host lengths of the sequences ``cu_seqlens`` delimits to it,
+    so chunk indices for any chunk size are planned without a device read."""
+    lens = np.array(seq_lens_cpu, dtype=np.int64)
+    _bind_chunks_hint(
+        cu_seqlens, lambda chunk_size: int(np.sum(-(-lens // chunk_size)))
+    )
 
 
 def set_total_chunks_hint_uniform(
     bs: int,
     tokens_per_seq: int,
     cu_seqlens: torch.Tensor,
-    chunk_sizes: tuple[int, ...] = (16, 64),
 ) -> None:
     """Fast path for spec verify / draft-extend where every sequence has the
     same length (tokens_per_seq). Avoids allocating a per-seq numpy array."""
-    key_id = id(cu_seqlens)
-    _total_chunks_hint.clear()
-    for cs in chunk_sizes:
-        _total_chunks_hint[(cs, key_id)] = bs * (-(-tokens_per_seq // cs))
+    _bind_chunks_hint(
+        cu_seqlens, lambda chunk_size: bs * (-(-tokens_per_seq // chunk_size))
+    )
 
 
 @tensor_cache
@@ -70,7 +89,7 @@ def prepare_chunk_indices(
     nums = triton.cdiv(prepare_lens(cu_seqlens), chunk_size)
     offsets = torch.zeros(nums.shape[0] + 1, dtype=nums.dtype, device=nums.device)
     torch.cumsum(nums, dim=0, out=offsets[1:])
-    total_int = _total_chunks_hint.pop((chunk_size, id(cu_seqlens)), None)
+    total_int = _hinted_total_chunks(cu_seqlens, chunk_size)
     if total_int is None:
         total_int = offsets[-1].item()
     chunk_global = torch.arange(total_int, device=nums.device)

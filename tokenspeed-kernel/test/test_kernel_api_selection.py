@@ -322,7 +322,9 @@ def test_residual_family_exports_and_modes():
         "pad_gated_residual_projection_weight",
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
+        "post_norm_residual_pre_norm_bf16_fp8",
         "residual_gate_coefficients",
+        "set_gated_residual_workspace_region",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
     }
@@ -7621,6 +7623,68 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
         assert plan["support_routing"] is False
         assert plan["supports_deferred_finalize"] is True
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+
+
+@pytest.mark.parametrize(
+    ("activation", "routing_mode", "trtllm_kernel"),
+    [
+        ("silu", None, "flashinfer_trtllm_fp8_moe_apply"),
+        ("swiglu", "precomputed_topk", "flashinfer_trtllm_fp8_routed_moe_apply"),
+    ],
+)
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "b200_platform"])
+def test_fp8_block_moe_selects_a_kernel_that_runs_the_input(
+    request: pytest.FixtureRequest,
+    platform_fixture: str,
+    input_dtype: torch.dtype,
+    activation: str,
+    routing_mode: str | None,
+    trtllm_kernel: str,
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer MoE kernels are registered only on NVIDIA")
+
+    # CUTLASS block-scaled FP8 runs on SM90 only; the TRT-LLM quantizer reads BF16 only.
+    if platform_fixture == "h100_platform":
+        expected = "flashinfer_cutlass_fp8_moe_apply"
+    else:
+        expected = trtllm_kernel if input_dtype == torch.bfloat16 else None
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        KernelRegistry.reset()
+        importlib.reload(_moe_flashinfer)
+
+        routing = {} if routing_mode is None else {"routing_mode": routing_mode}
+        select = partial(
+            kernel_moe_plan,
+            "fp8",
+            input_dtype=input_dtype,
+            activation=activation,
+            ep_size=4,
+            ispp=2048,
+            fp8_scale_block_shape=(128, 128),
+            internal_activation_dtype="input",
+            hidden=None,
+            swiglu_form="standard" if activation == "swiglu" else None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+            features=frozenset(),
+            **routing,
+        )
+        if expected is None:
+            with pytest.raises(kernel_NoKernelFoundError):
+                select()
+        else:
+            assert select()["apply_kernel_name"] == expected
     finally:
         Platform.override(real_platform)
         KernelRegistry._instance = real_registry

@@ -37,6 +37,13 @@ and encode ranks. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
 an output stream can remain stalled.
 
+[Cache observations](cache-observations.md) use the same nonblocking writer
+when explicitly enabled. Native callbacks report immutable ownership metadata;
+the ordinary ACK poll is followed by a drain of completed CPU copy metadata.
+Neither sideband feeds the scheduler or establishes replica-wide completion.
+The protocol makes rank scope, operation/admission joins, and diagnostic loss
+explicit; incomplete or lossy traces cannot qualify recovery.
+
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
 groups (`Ranks`): the replica, the pipeline (one rank per stage), the
@@ -81,6 +88,9 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+EPD encode-mode metric ownership and units are documented in
+[encoder-metrics.md](encoder-metrics.md).
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new
@@ -98,6 +108,20 @@ An id in that interval receives a 409 refusal before data-plane admission.
 The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
+
+On disaggregated engines, `bootstrap_room` carries the same one-active-request
+rule across distinct request IDs. Peer state is keyed by room, so every new
+request — including fan-out children and retries — must use a fresh room. At
+admission, before data-plane registration or scheduling, the loop refuses with
+409 any request whose room is already reserved by an unscheduled request (same
+round, grammar queue, EPD staging, or pause withholding) or tracked by
+`TransferPeer` (including draining rooms awaiting `Stopped`). Both checks read
+only replica-identical loop state, never worker-thread state such as a prefill
+peer's cancellation tombstones, so every replica member makes the same decision;
+reusing a previously failed or cancelled room after retirement still fails in
+the prefill peer under its tombstone contract. `TransferPeer::register` enforces
+the same uniqueness invariant at the peer boundary, and `abort_room` ignores
+rooms owned by another active request.
 
 Each accepted request gets a monotonically increasing admission identity
 before data-plane registration. The output processor allocates it once;
@@ -478,7 +502,10 @@ data-plane calls and their waits for the GIL on the control thread, and each
 operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
-category, the rest under `host`. The recording follows the torch profiler's window and
+category, the rest under `host`. Work that overlaps on one thread, as Disk
+operations in flight and peer landings do, records on lane rows instead
+(`profile::Lanes`): each piece holds the lowest free row of its family until
+it ends. The recording follows the torch profiler's window and
 costs one atomic load per span outside it; it keeps only the spans that began
 inside the window, so an operation open as a by-stage profile switches stages
 stays out of the next stage's trace. A trace the merge fails on is written
@@ -822,6 +849,12 @@ discardable under the separate `cuda_graph` tag.
 
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
+For engines with DP projections, the NCCL release drops captured graphs before
+closing the projection workspaces they reference. Each workspace owns its
+symmetric storage so it can release it at sleep. Full reclamation on CUDA
+requires a PyTorch build that frees symmetric-memory rendezvous pointer tables.
+The head gate waits for all memory regions on all ranks to resume, then rebuilds
+those workspaces and recaptures graphs before it permits a forward.
 Other regions still resume locally. A pending collective resume refuses a
 second memory resume until it finishes.
 
@@ -858,6 +891,26 @@ until deployment restart. Discard requires both the model and its resolved
 quantization configuration to opt in; quantized post-load derivation must
 rebuild codes and scales in place from the complete new checkpoint, never
 reuse discarded values or mark remapped storage usable on its own.
+
+An L3 full-clear separates logical invalidation from native memory lifetime.
+After the non-storage preflight, healthy I/O is given
+`async.clear_cache_drain_timeout_ms` (default 500 ms) through ordinary rounds;
+the pending flush replies and weight-operation head are preserved while no new
+forward/storage plan starts. Polling, completion agreement and control queries
+continue. The budget does not bound the normal synchronous remote purge.
+An unsafe active namespace skips that healthy wait; a timeout or unsafe scope
+selects retaining clear on every rank. Old tickets detach and keep their exact
+Host addresses, while local indexes clear and new L3 work uses a fresh agreed
+generation. This path performs no remote purge and proves no native retirement.
+A slow healthy timeout still selects this private scope; it does not restore
+cross-Prefill sharing with independent services outside the rank agreement.
+
+Retained memory alone does not keep the serving loop busy. Request/Device-copy
+readiness and progress-pending storage determine frontend idle waiting and
+stall diagnostics; every round still polls and agrees old completions. Metrics
+keep historical `l3_io_quarantined` separate from active-namespace
+`l3_io_blocked`, backend health and capacity pressure. The historical flag guards
+shutdown deregistration; it is not a reason to reject all new-generation I/O.
 The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
@@ -872,11 +925,16 @@ all-to-all EP, broadcasting the committed placement), which the profile's
 is a frontend operation on the first queue that starts the same internal
 sequence. The loop refuses a memory release while a rebalance is in progress
 and, once drained, the release waits while chunk steps still write the
-weights. A cache clear MIN-reduces the scheduler's non-mutating
-`can_clear_cache` across the replica and then across attention DP — DP
-replicas share Mooncake objects — then MIN-reduces an error-returning L3
-namespace deletion, before any rank mutates Device/Host. The frontend
-combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+weights. A cache clear agrees its selected non-mutating preflight across the
+replica and attention DP. Without storage it retains ordinary
+`can_clear_cache` semantics. With healthy storage, preparation checks normal
+indexed Device pins and indexed Host owners after accounting for the storage
+references that draining can release. Exact physical-block reference counts,
+active parents and occupied-slot coverage are required when local invalidation
+must retain old storage references, not for every ordinary clear. The strict
+path agrees remote namespace deletion before local mutation; retaining recovery
+instead agrees isolation and performs no remote deletion. The frontend combines
+every engine's reply. Independent TokenSpeed jobs that share a tenant are not
 in those groups.
 
 **The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the
@@ -946,7 +1004,13 @@ is needed only in rounds with a terminal status.
 **PD output completion.** A prefill's computed finish is not its client's
 final output: the output waits for the transfer's result. A transfer failure
 must publish an abort even after computation finished, unless the client
-already cancelled its stream or a final output was sent. A pause abort still
+already cancelled its stream or a final output was sent. A numerical error
+detected by the NaN guard in the prefill role ends the request when the
+prompt's final chunk commits instead of waiting for the transfer; an error
+detected in an earlier prompt chunk is remembered until that final chunk
+commits. When the final chunk commits, the request's `Abort` event cancels the
+transfer to stop the remote decode, and the output processor emits the
+terminal abort output unless the client already cancelled. A pause abort still
 notifies the client; repeated transfer events do not repeat the final output.
 This output fence does not retire source pages.
 
@@ -1118,10 +1182,9 @@ order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
 room's prefill ranks once connected, again with every heartbeat until each
 answered (at most 256 per endpoint and beat; a beat resumes in room order at
-the first room the previous one left out, whichever endpoint's). The prefill
-peer admits a registered request (`Bootstrapped`) once its decode ranks
-announced it: every attention-TP rank of the decode replica that holds it. The
-pages-held marks and the clocks that start at them are local to a rank and
+the first room the previous one left out, whichever endpoint's). Prefill
+requests are schedulable on submission, without waiting for an announcement.
+The pages-held marks and the clocks that start at them are local to a rank and
 time-based; the members of a replica would have to agree on them, and
 `deferred` requires single-member replicas. When the plan carrying a
 request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
@@ -1137,9 +1200,9 @@ request does not hold its pages yet, fails the room, so a decode rank that
 does not follow the order fails at once. The decode scheduler sees every
 noticed request and may allocate them in any order. Timeouts: on the prefill
 side the bootstrap timeout bounds what a request waits for from its decode
-node. Not announced, it runs from registration. Admitted, it runs from the
-pages-held mark to the manifests, with none while the prompt is queued or
-computes: the decode node's waiting timeout bounds that wait. On the decode
+node. It runs from the pages-held mark to the manifests, whether or not the
+request was announced; queueing and computation before that mark consume no budget.
+A late announcement receives the pages-held notice immediately. On the decode
 side the waiting timeout runs from registration to the notice, restarted at
 the notice. A request that fails on the prefill side tells its announcing
 ranks as well as those that pre-allocated.
@@ -1309,6 +1372,8 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+In particular, a signal can interrupt a buffered stderr write. Logging again
+can raise before the callback records a failure or requests shutdown.
 
 While serving generation, a fatal control-loop or forward-thread error
 signals the owning launcher once from the thread that detects it. The

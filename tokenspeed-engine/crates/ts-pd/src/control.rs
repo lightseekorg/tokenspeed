@@ -106,9 +106,8 @@ pub enum PdEvent {
     /// The request may be admitted. D role: its peers are connected and,
     /// when the prefill node defers the decode allocation, that node holds every
     /// page of the prompt. P role under early decode allocation: every
-    /// decode rank allocated its destination. P role under deferred
-    /// decode allocation: its decode node announced it; the destination has
-    /// its own event.
+    /// decode rank allocated its destination. Deferred P requests are
+    /// schedulable on submission and do not receive this event.
     Bootstrapped(String),
     /// P role, deferred decode allocation: every decode rank allocated
     /// the request's destination.
@@ -159,6 +158,11 @@ pub trait TransferPeer {
     /// A transfer is still tracked or stopping: it may yet read or write
     /// the cache.
     fn has_in_flight(&self) -> bool;
+
+    /// Whether a tracked (including draining) request already owns `room`.
+    /// Decided solely from replica-identical loop state, never from worker
+    /// threads.
+    fn has_room(&self, room: u64) -> bool;
 
     /// EPD, P role: tell the decode node waiting on room `room` that the
     /// request failed before it could register (its embeddings never

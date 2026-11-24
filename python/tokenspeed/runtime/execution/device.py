@@ -147,10 +147,14 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.cache.disk import host_block_alignment
 from tokenspeed.runtime.cache.l2.sizing import (
     NO_POOL,
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
+)
+from tokenspeed.runtime.cache.transfer.observations import (
+    cache_observation_capacity_from_env,
 )
 from tokenspeed.runtime.distributed.cuda_stack import (
     restore_cuda_stack,
@@ -188,6 +192,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.registry import AttentionBuild
@@ -291,6 +296,8 @@ class DeviceSpecs:
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
+        cache_observation_capacity: Startup capacity of optional completed
+            CPU copy observations; zero when diagnostics are disabled.
     """
 
     cache_geometry: Any
@@ -310,6 +317,7 @@ class DeviceSpecs:
     host_group_packing: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
+    cache_observation_capacity: int = 0
 
 
 def speculative_widths(
@@ -415,6 +423,7 @@ class DeviceHandle:
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
         self._awake_cuda_stack_limit: int | None = None
+        self._released_dp_projections: tuple[tuple[ModelRunner, int], ...] | None = None
         # The compact Host cache -- the L2 prefix tier, the retraction
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
@@ -747,6 +756,12 @@ class DeviceHandle:
             )
         return l2.poll_results()
 
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """Drain completed CPU diagnostics only; no event query or device work."""
+        if self._l2 is None:
+            return [], 0
+        return self._l2.poll_cache_observations()
+
     def shutdown_model(self) -> None:
         """Drain local readers, then release shared model weights
         collectively. Called by the forward thread as its last task, after
@@ -807,7 +822,10 @@ class DeviceHandle:
 
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
-        if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
+        if self._forward_device.type == "cuda" and (
+            self._executor.config.enforce_eager
+            or self._released_dp_projections is not None
+        ):
             # Graphs may retain these addresses; eager GEMMs acquire new workspaces lazily.
             with allow_host_sync(
                 "release eager cuBLAS workspaces after device work drains"
@@ -872,8 +890,37 @@ class DeviceHandle:
             self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
-        """Drain GPU work and release NCCL buffers, allocator cache and the CUDA stack."""
+        """Drain GPU work and release projection workspaces and NCCL buffers."""
         self.synchronize()
+        if self._released_dp_projections is None:
+            executor = self._executor
+            projections = tuple(
+                (runner, capacity)
+                for runner in (executor.model_runner, executor.draft_model_runner)
+                if runner is not None
+                if (capacity := runner.dp_linear_max_tokens) is not None
+            )
+            rebuild_graphs = bool(projections)
+            if torch.distributed.is_initialized():
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                # Some ranks may lack a local projection, but graph capture
+                # uses the whole world. All ranks agree before dropping graphs.
+                world = tuple(range(torch.distributed.get_world_size()))
+                process_group_manager.init_process_group(world, backend="gloo")
+                group = process_group_manager.get_process_group("gloo", world)
+                needs_rebuild = torch.tensor(int(rebuild_graphs), device="cpu")
+                torch.distributed.all_reduce(
+                    needs_rebuild, op=torch.distributed.ReduceOp.MAX, group=group
+                )
+                rebuild_graphs = bool(needs_rebuild.item())
+            if rebuild_graphs:
+                executor.release_graphs()
+                for runner, _ in projections:
+                    runner.release_dp_linear_communication()
+                self._released_dp_projections = projections
         suspend_nccl_communicators()
         self.empty_cache()
         if self._forward_device.type == "cuda" and torch.version.hip is None:
@@ -886,6 +933,22 @@ class DeviceHandle:
             restore_cuda_stack(self._awake_cuda_stack_limit)
             self._awake_cuda_stack_limit = None
         resume_nccl_communicators()
+
+    def finish_memory_resume(self) -> None:
+        """Rebind projection workspaces and capture graphs on fully awake ranks."""
+        if self._released_dp_projections is None:
+            return
+        from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+
+        with allow_host_sync("restore DP projection workspaces and CUDA graphs"):
+            for runner, capacity in self._released_dp_projections:
+                runner.prepare_dp_linear_communication(capacity)
+            with torch.random.fork_rng(devices=[self._forward_device.index]):
+                self._executor.forget_served_inputs()
+                self._executor.capture_graphs(
+                    entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
+                )
+        self._released_dp_projections = None
 
     def run_remote_prefill_landing(
         self,
@@ -1581,6 +1644,7 @@ def build_device_side(
         A ``DeviceBuild``. No device object escapes except inside the
         handle; the specs hold none at all.
     """
+    cache_observation_capacity = cache_observation_capacity_from_env(os.environ)
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
@@ -1646,14 +1710,16 @@ def build_device_side(
         if server_args.mapping.attn.has_kvp:
             # A fused decode value tail for the attentions that project as they merge.
             value_heads = set()
+            # The DSA attentions' owned decode top-k gathers float words.
+            float_words = False
             for runner in (target, draft):
                 if runner is None:
                     continue
                 for module in runner.model.modules():
-                    if (
-                        isinstance(module, GlmDsaSparseAttentionMixin)
-                        and module.owned_decode_value_weight() is not None
-                    ):
+                    if not isinstance(module, GlmDsaSparseAttentionMixin):
+                        continue
+                    float_words = True
+                    if module.owned_decode_value_weight() is not None:
                         value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
@@ -1664,6 +1730,7 @@ def build_device_side(
                 ),
                 value_heads=value_heads.pop() if len(value_heads) == 1 else None,
                 decode_rows=max_batch_size * decode_input_tokens,
+                float_words=float_words,
             )
         # Large startup batches can select RCCL while a later prefix hit selects
         # Iris. Prepare that small-batch route before the serving sync guard.
@@ -1799,6 +1866,23 @@ def build_device_side(
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
         _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
+        if current_platform().is_amd:
+            # Kernels warmed above read the probe's small KV arena. On AMD,
+            # Triton keys a compilation on whether each tensor's storage fits
+            # in 2 GB (buffer ops address it with 32-bit offsets), so a kernel
+            # that specializes the arena's pointers does not serve the
+            # full-size arena: without this, it compiles on its first live
+            # batch instead, mid-serve. Kernels that do not specialize the
+            # arena's pointers compile once and are not affected. Other
+            # platforms' kernels do not key on the arena's size and skip the
+            # second warm-up. Warm again on the final pools with the tactics
+            # tuned above; tuning now would allocate workspaces outside the
+            # reserve the rebind sized.
+            with (
+                startup_phase("kernels.rewarm"),
+                current_platform().restore_stack_limit(),
+            ):
+                executor.warm_kernels()
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or
@@ -1833,7 +1917,11 @@ def build_device_side(
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
                 layout.groups,
-                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                compute_host_group_packing(
+                    layout,
+                    group_specs=contract.group_specs,
+                    block_alignment=host_block_alignment(server_args),
+                ),
                 strict=True,
             )
         }
@@ -1853,23 +1941,42 @@ def build_device_side(
             process_group_manager as pg_manager,
         )
 
+        cpu_group = (
+            pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+            if server_args.mapping.world_size > 1
+            else None
+        )
+        if server_args.kvstore_release_checkpoint_cache:
+            from tokenspeed.runtime.cache.l2.executor import (
+                release_checkpoint_file_cache,
+            )
+
+            configs = (
+                [model_config]
+                if draft_model_config is None
+                else [model_config, draft_model_config]
+            )
+            release_checkpoint_file_cache(
+                [config.model_path for config in configs],
+                node_leader=(global_rank % server_args.mapping.nprocs_per_node == 0),
+                cpu_group=cpu_group,
+            )
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
             draft_pool=views.draft_token_to_kv_pool,
             l2_tier=server_args.enable_kvstore,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_headroom_bytes=server_args.kvstore_host_headroom_gib * 1024**3,
             snapshot_pool=snapshot_pool,
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
+            block_alignment=host_block_alignment(server_args),
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,
-            world_cpu_group=(
-                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
-                if server_args.mapping.world_size > 1
-                else None
-            ),
+            cache_observation_capacity=cache_observation_capacity,
+            world_cpu_group=cpu_group,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1915,6 +2022,7 @@ def build_device_side(
     peer_geometry = None
     if peer_outbox is not None:
         from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
         if host_cache is None:
             raise ValueError(
@@ -1933,6 +2041,7 @@ def build_device_side(
             },
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
+            host_region_planner=get_peer_host_region_planner(server_args.device),
         )
 
     kv_transfer = kv_transfer_builder(
@@ -1954,6 +2063,7 @@ def build_device_side(
         executor.config.spec_num_tokens,
     )
     specs = DeviceSpecs(
+        cache_observation_capacity=cache_observation_capacity,
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,

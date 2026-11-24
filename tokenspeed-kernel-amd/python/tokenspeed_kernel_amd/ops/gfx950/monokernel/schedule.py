@@ -64,6 +64,12 @@ def chain(plan):
 
 
 @gluon.constexpr_function
+def dims(plan):
+    """The model's dimensions of the plan (``Plan.dims``)."""
+    return plan.plan.dims
+
+
+@gluon.constexpr_function
 def row_pairs(plan):
     """Mailbox pairs between two rows' copies of a region."""
     return plan.plan.row_pairs
@@ -190,6 +196,7 @@ def head_sleep(
 
 __all__ = [
     "chain",
+    "dims",
     "grid",
     "has_stage",
     "head_sleep",

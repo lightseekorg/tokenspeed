@@ -322,6 +322,27 @@ served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
 
+## Hopper BF16 paged scoring
+
+`dsa_paged_score` takes consecutive `q_len_per_req` query rows per request and
+one page-table row per request. `context_lens` gives each query's visible token
+count. The output columns follow logical token order. The TMA inputs
+require 16-byte aligned Q and K addresses, non-overlapping outer strides
+that are multiples of 16 bytes, and unit stride in the head dimension.
+The context lengths use unit stride.
+
+For H200 batches with 16 or 32 index heads, 64- or 128-token pages and
+32K–256K history, the paged scorer estimates the K tile count from the total
+query rows and the history width rounded down to a power of two. It targets
+eight tiles per CTA and caps the budget at three CTA waves when the estimate
+is at most 8,192 tiles. Larger estimates use the default partition policy.
+Fewer partitions reduce CTA setup and repeated Q loads.
+
+The 78-SM Hopper configuration uses the same wave estimate for power-of-two
+batches with one query per request and 64-token pages. Its 8,192-tile limit
+uses the actual history width, so batch 8 at 96K uses the default partition
+policy.
+
 ## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
 
 On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
@@ -362,8 +383,8 @@ its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
 `index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
 same order) and of `quantize_index_query_weights`, so the plane's bytes and
 the query and weights are bit-identical to the two separate launches. Mixed
-rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
-of the K3 decode chain run the fused decode front below instead.
+rounds and prefill keep the separate write; decode rounds of the K3 decode
+chain, KV-parallel or not, run the fused decode front below instead.
 
 ## KVP decode candidates (`cute_dsl_dsa_decode_index_candidates`)
 
@@ -444,9 +465,11 @@ compile per 16-row tile and slot / LayerNorm dtype.
 
 Kimi-K3.1 selects the front at construction only with the fused decode top-k
 (`index_k_write_quantizes_query`) and takes it for decode rounds of the decode
-chain without KV placement or a breakable capture; the front runs inside the
-layer's eager break, and `forward_dsa_core` takes its outputs as
-`written_index_query`. Prefill, mixed and KV-parallel rounds, the non-chain
+chain without a breakable capture; the front runs inside the layer's eager
+break, and `forward_dsa_core` takes its outputs as `written_index_query`. Under
+a KVP placement the round's slots are virtual: `slot_owner` hands the front
+`virtual_slots_to_local`'s geometry, and the front writes only this rank's
+index keys, at their local slots. Prefill and mixed rounds, the non-chain
 forward and bitwise numerics keep the separate launches.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)

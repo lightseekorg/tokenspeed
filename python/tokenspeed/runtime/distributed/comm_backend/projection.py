@@ -45,12 +45,19 @@ if TYPE_CHECKING:
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_COL_TP_SIZES = (2, 4)
-_FUSED_COL_MIN_ROWS = 64
-# Smaller output projections retain the ordinary path.
+_FUSED_BF16_COL_MIN_ROWS = 32
+_FUSED_FP8_COL_MIN_ROWS = 64
 _FUSED_ROW_TP_SIZES = (2, 4)
-_FUSED_ROW_MIN_ROWS = 64
+_FUSED_BF16_ROW_MIN_ROWS = 64
+_FUSED_FP8_ROW_MIN_ROWS = 64
 
 logger = logging.getLogger(__name__)
+
+
+def _fused_min_rows(kind: Literal["column", "row"], bf16: bool) -> int:
+    if kind == "row":
+        return _FUSED_BF16_ROW_MIN_ROWS if bf16 else _FUSED_FP8_ROW_MIN_ROWS
+    return _FUSED_BF16_COL_MIN_ROWS if bf16 else _FUSED_FP8_COL_MIN_ROWS
 
 
 @dataclass(frozen=True)
@@ -60,38 +67,40 @@ class ProjectionSpec:
     Sequential layers may share a prepared object with the same spec. Separate
     streams or concurrently executing models must prepare separate objects.
     Sizes are full (unsharded) widths; max_tokens is physical rows per owner.
+    Weight dtype fixes native GEMM preparation and is part of the sharing key.
+
     Column and row projections take owner rows and return them complete. A
     gather projection returns every owner's rows through this rank's output
-    shard, and a scatter projection reduces every rank's partial of all rows
-    into owner rows.
+    shard, a scatter projection reduces every rank's partial of all rows into
+    owner rows, and a transpose projection returns owner rows complete from
+    every rank's output shard of all rows.
     """
 
     group: Group
-    kind: Literal["column", "row", "gather", "scatter"]
+    kind: Literal["column", "row", "gather", "scatter", "transpose"]
     input_size: int
     output_size: int
     max_tokens: int
     dtype: torch.dtype
+    weight_dtype: torch.dtype
     device: torch.device
 
     @property
     def scratch_specs(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         """Simultaneously live send, receive and GEMM buffers for this layout."""
-        rows = self.max_tokens
-        # Gathers and scatters exchange no channel shards around their GEMM.
-        sent = 0 if self.kind == "scatter" else rows * self.input_size
-        received = {"column": self.output_size, "row": self.input_size}
-        reduced = self.kind in ("row", "scatter")
+        rows, size = self.max_tokens, len(self.group)
+        # Send, receive and GEMM row widths; a transpose returns its send buffer.
+        sent, received, projected = {
+            "column": (self.input_size, self.output_size, self.input_size),
+            "row": (self.input_size, self.input_size, self.output_size),
+            "gather": (self.input_size, 0, self.input_size),
+            "scatter": (0, 0, self.output_size),
+            "transpose": (self.output_size, self.output_size, 0),
+        }[self.kind]
         return (
-            ((sent,), self.dtype),
-            ((rows * received.get(self.kind, 0),), self.dtype),
-            (
-                (
-                    len(self.group) * rows,
-                    self.output_size if reduced else self.input_size,
-                ),
-                self.dtype,
-            ),
+            ((rows * sent,), self.dtype),
+            ((rows * received,), self.dtype),
+            ((size * rows, projected), self.dtype),
         )
 
 
@@ -163,6 +172,69 @@ class CopyEngineGather:
         return out
 
 
+class OwnerRowStores:
+    """Every owner's complete output rows in symmetric memory, which every
+    rank's projection fills with its output shard.
+
+    A projection waits, behind the GEMM of this rank's own rows, until every
+    peer has reached it, so no peer still reads its previous rows; it then
+    stores each owner's block straight into that owner's rows and passes a
+    second barrier before returning this owner's rows.
+    """
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        max_rows: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        self.rank = group.rank()
+        self.rows = symm_mem.empty((max_rows, width), dtype=dtype, device=device)
+        self.handle = symm_mem.rendezvous(self.rows, group.group_name)
+        self.peer_rows = [
+            self.handle.get_buffer(peer, self.rows.shape, dtype)
+            for peer in range(group.size())
+        ]
+        self.stream = torch.cuda.Stream(device)
+
+    def mm_to_owners(
+        self, inputs: torch.Tensor, rows: int, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """``projection_mm_to_owners`` with no exchange after the GEMMs.
+
+        Returns this owner's rows, borrowed until the next projection.
+        """
+        from tokenspeed_kernel.ops.gemm import mm
+
+        size, shard = len(self.peer_rows), weight.shape[0]
+        columns = slice(self.rank * shard, (self.rank + 1) * shard)
+        main = torch.cuda.current_stream()
+        self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            self.handle.barrier(channel=0)
+        for step in range(size):
+            owner = (self.rank + step) % size
+            first = owner * rows
+            valid = max(0, min(rows, inputs.shape[0] - first))
+            if step == 1:
+                main.wait_stream(self.stream)
+            if valid:
+                mm(
+                    inputs[first : first + valid],
+                    weight,
+                    out=self.peer_rows[owner][:valid, columns],
+                )
+        self.handle.barrier(channel=1)
+        owned = self.rows[:rows]
+        valid = max(0, min(rows, inputs.shape[0] - self.rank * rows))
+        owned[valid:].zero_()
+        return owned
+
+
 class ProjectionWorkspace:
     """Own scratch tensors and native resources for one prepared projection.
 
@@ -173,7 +245,8 @@ class ProjectionWorkspace:
     Intermediate tensors borrow storage only for the current projection;
     consumers finish on the same stream before another projection reuses it.
     Independent preparations own separate allocations. Final inverse-A2A/RS
-    outputs are caller-owned. Destroy referencing CUDA graphs before close().
+    outputs are caller-owned, but a transpose's owner rows are borrowed until
+    the next projection. Destroy referencing CUDA graphs before close().
     """
 
     def __init__(
@@ -183,7 +256,7 @@ class ProjectionWorkspace:
         scratch_pool: "WorkspacePool | None" = None,
     ):
         if (
-            spec.kind not in ("column", "row", "gather", "scatter")
+            spec.kind not in ("column", "row", "gather", "scatter", "transpose")
             or len(spec.group) < 2
             or min(spec.input_size, spec.output_size, spec.max_tokens) <= 0
         ):
@@ -210,7 +283,7 @@ class ProjectionWorkspace:
         # and grown during reconfiguration.
         self.scratch_pool: "WorkspacePool | None" = scratch_pool
         self.send, self.received, gemm = scratch_pool.allocate(*spec.scratch_specs)
-        self.gathered = None if reduced else gemm
+        self.gathered = gemm if spec.kind in ("column", "gather") else None
         self.partial = gemm if reduced else None
         self.gather = None
         self.gather_quant = None
@@ -220,6 +293,7 @@ class ProjectionWorkspace:
         self.fused_row = None
         self.copy_engine: CopyEngineGather | None = None
         self.gemm_reduce_scatter: "GemmReduceScatterState | None" = None
+        self.owner_rows: OwnerRowStores | None = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -243,6 +317,7 @@ class ProjectionWorkspace:
         self.a2a = None
         self.copy_engine = None
         self.gemm_reduce_scatter = None
+        self.owner_rows = None
         if self.gather is not None:
             self.gather.close()
             self.gather = self.gather_quant = None
@@ -270,14 +345,18 @@ def _warmup_projection(workspace: ProjectionWorkspace) -> None:
     backend = workspace.backend
     # Exercise the selected paths before capture, including optional fusion.
     # Generic backends use ordinary collectives; Auto may use native resources.
-    # A scatter sends nothing ahead of its GEMM, so it probes with a partial row.
-    probe = (
-        workspace.partial[:1]
-        if spec.kind == "scatter"
-        else workspace.send[: spec.input_size].view(1, spec.input_size)
-    )
+    # Scatters and transposes send nothing ahead of their GEMM.
+    if spec.kind == "scatter":
+        probe = workspace.partial[:1]
+    elif spec.kind == "transpose":
+        probe = workspace.send[: spec.output_size].view(1, spec.output_size)
+    else:
+        probe = workspace.send[: spec.input_size].view(1, spec.input_size)
     probe.zero_()
-    if spec.kind == "gather":
+    if spec.kind == "transpose":
+        local = probe.new_zeros(len(spec.group), spec.output_size // len(spec.group))
+        backend.projection_all_to_all(local, 1, True, False, probe, workspace)
+    elif spec.kind == "gather":
         backend.projection_all_gather(probe, 1, False, workspace)
     elif spec.kind == "scatter":
         partial = backend.acquire_projection_output(1, workspace)
@@ -433,6 +512,48 @@ def projection_mm_reduce_scatter(
     mm(inputs, weight, out=partial[: inputs.shape[0]])
     partial[inputs.shape[0] :].zero_()
     return backend.projection_reduce_scatter(partial, rows, workspace)
+
+
+def _check_transpose(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+) -> None:
+    spec = workspace.spec
+    # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
+    if (
+        spec.kind != "transpose"
+        or inputs.shape[0] > len(spec.group) * rows
+        or weight.shape != (spec.output_size // len(spec.group), spec.input_size)
+        or weight.shape[0] == weight.shape[1]
+    ):
+        raise ValueError(
+            "A transpose GEMM takes at most TP * rows rows and its transpose "
+            "workspace's non-square [N / TP, K] shard"
+        )
+
+
+def projection_mm_to_owners(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> torch.Tensor:
+    """Project all rows through this rank's shard; return owner rows through backend."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    _check_workspace(rows, workspace, backend)
+    _check_transpose(inputs, rows, weight, workspace)
+    # The exchange's output must not share storage with its input.
+    projected = inputs.new_empty((len(workspace.spec.group) * rows, weight.shape[0]))
+    mm(inputs, weight, out=projected[: inputs.shape[0]])
+    projected[inputs.shape[0] :].zero_()
+    width = workspace.spec.output_size
+    owned = workspace.send[: rows * width].view(rows, width)
+    backend.projection_all_to_all(projected, rows, True, False, owned, workspace)
+    return owned
 
 
 def projection_all_to_all(
@@ -607,49 +728,52 @@ class ProjectionBackend:
                 host_identity,
             )
 
-            supported = (
-                fused_tp_row_projection_supported
-                if spec.kind == "row"
-                else fused_tp_column_projection_supported
-            )
-            fused_tp_sizes = (
-                _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
-            )
-            min_fused_rows = (
-                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
-            )
-            if spec.kind == "gather":
-                fused_disabled_reason = "a gather has no fused projection"
+            kind = spec.kind
+            if kind in ("gather", "transpose"):
+                fused_disabled_reason = f"a {kind} has no fused projection"
             elif batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
-            elif spec.kind == "scatter":
+            elif kind == "scatter":
                 fused_disabled_reason = (
                     None
                     if _gemm_reduce_scatter_supported(spec)
                     else "unsupported device or dimensions for the GEMM reduce-scatter"
                 )
-            elif len(spec.group) not in fused_tp_sizes:
-                fused_disabled_reason = (
-                    f"automatic TP{len(spec.group)} fusion is disabled"
-                )
-            elif spec.max_tokens < min_fused_rows:
-                fused_disabled_reason = (
-                    f"prepared capacity {spec.max_tokens} is below the "
-                    f"TP{len(spec.group)} minimum of {min_fused_rows} rows"
-                )
-            elif not supported(
-                len(spec.group),
-                spec.input_size,
-                spec.output_size,
-                spec.max_tokens,
-                spec.dtype,
-                spec.device,
-            ):
-                fused_disabled_reason = (
-                    "unsupported device, activation dtype, or projection dimensions"
-                )
             else:
-                fused_disabled_reason = None
+                supported = (
+                    fused_tp_row_projection_supported
+                    if kind == "row"
+                    else fused_tp_column_projection_supported
+                )
+                fused_tp_sizes = (
+                    _FUSED_ROW_TP_SIZES if kind == "row" else _FUSED_COL_TP_SIZES
+                )
+                min_fused_rows = _fused_min_rows(
+                    kind, spec.weight_dtype == torch.bfloat16
+                )
+                if len(spec.group) not in fused_tp_sizes:
+                    fused_disabled_reason = (
+                        f"automatic TP{len(spec.group)} fusion is disabled"
+                    )
+                elif spec.max_tokens < min_fused_rows:
+                    fused_disabled_reason = (
+                        f"prepared capacity {spec.max_tokens} is below the "
+                        f"TP{len(spec.group)} minimum of {min_fused_rows} rows"
+                    )
+                elif not supported(
+                    len(spec.group),
+                    spec.input_size,
+                    spec.output_size,
+                    spec.max_tokens,
+                    spec.dtype,
+                    spec.device,
+                    weight_dtype=spec.weight_dtype,
+                ):
+                    fused_disabled_reason = (
+                        "unsupported device, activation dtype, or projection dimensions"
+                    )
+                else:
+                    fused_disabled_reason = None
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
                 hosts,
@@ -664,13 +788,22 @@ class ProjectionBackend:
                 raise ValueError(
                     "Batch-invariant collective setting differs across ranks"
                 )
-            if len({value[0] for value in hosts}) == 1 or group_has_fabric(spec.group):
+            node_local = len({value[0] for value in hosts}) == 1
+            if node_local or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if spec.kind == "gather":
                     workspace.copy_engine = CopyEngineGather(
                         pg_manager.get_device_process_group(spec.group),
                         spec.max_tokens,
                         spec.input_size,
+                        spec.dtype,
+                        spec.device,
+                    )
+                elif spec.kind == "transpose":
+                    workspace.owner_rows = OwnerRowStores(
+                        pg_manager.get_device_process_group(spec.group),
+                        spec.max_tokens,
+                        spec.output_size,
                         spec.dtype,
                         spec.device,
                     )
@@ -702,6 +835,7 @@ class ProjectionBackend:
                             spec.max_tokens,
                             spec.input_size,
                             spec.output_size,
+                            weight_dtype=spec.weight_dtype,
                         )
                     else:
                         workspace.fused_column = (
@@ -711,6 +845,7 @@ class ProjectionBackend:
                                 spec.max_tokens,
                                 spec.input_size,
                                 spec.output_size,
+                                weight_dtype=spec.weight_dtype,
                             )
                         )
                 elif fused_disabled_reason is None:
@@ -721,7 +856,7 @@ class ProjectionBackend:
                 )
 
         if (
-            spec.kind != "gather"
+            spec.kind not in ("gather", "transpose")
             and workspace.fused_column is None
             and workspace.fused_row is None
             and workspace.gemm_reduce_scatter is None
@@ -746,28 +881,40 @@ class ProjectionBackend:
     ) -> bool:
         """Run fused DP column-linear, or leave out untouched and return False."""
         # Use the subgroup maximum so unequal or empty owners take the same
-        # collective path. TP2 and TP4 share one cutoff across all row buckets.
+        # collective path. Each weight format has one cutoff across row buckets.
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_COL_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_column is None
-            or rows < _FUSED_COL_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < _fused_min_rows("column", bf16)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
-            or not weight_scales.is_contiguous()
         ):
             return False
-        from tokenspeed_kernel.ops.communication.cute_dsl import (
-            cute_dsl_fused_fp8_dp_column_linear,
-        )
+        if bf16:
+            if inputs.dtype != torch.bfloat16 or weight_scales is not None:
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_column_linear as fused,
+            )
+        else:
+            if (
+                weight.dtype != torch.float8_e4m3fn
+                or weight_scales is None
+                or weight_scales.dtype != torch.float32
+                or not weight_scales.is_contiguous()
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_fp8_dp_column_linear as fused,
+            )
 
         _check_workspace(rows, workspace, self._fallback)
-        cute_dsl_fused_fp8_dp_column_linear(
+        fused(
             workspace.fused_column,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
@@ -791,13 +938,39 @@ class ProjectionBackend:
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_ROW_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_row is None
-            or rows < _FUSED_ROW_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < _fused_min_rows("row", bf16)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
+        ):
+            return False
+        if bf16:
+            if (
+                inputs.dtype != torch.bfloat16
+                or input_scales is not None
+                or weight_scales is not None
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_row_linear,
+            )
+
+            _check_workspace(rows, workspace, self._fallback)
+            cute_dsl_fused_bf16_dp_row_linear(
+                workspace.fused_row,
+                inputs,
+                weight,
+                None,
+                owner_rows,
+                out[: inputs.shape[0]],
+            )
+            return True
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or weight_scales is None
+            or weight_scales.dtype != torch.float32
             or not weight_scales.is_contiguous()
         ):
             return False
@@ -808,14 +981,12 @@ class ProjectionBackend:
         _check_workspace(rows, workspace, self._fallback)
         cute_dsl_fused_fp8_dp_row_linear(
             workspace.fused_row,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
             out[: inputs.shape[0]],
-            input_scales=(
-                input_scales.contiguous() if input_scales is not None else None
-            ),
+            input_scales=input_scales,
         )
         return True
 
@@ -859,7 +1030,7 @@ class ProjectionBackend:
             )
         channels = spec.input_size if spec.kind == "row" else spec.output_size
         if (
-            spec.kind in ("column", "row")
+            spec.kind in ("column", "row", "transpose")
             and size in (2, 4, 8)
             and channels % (2 * size) == 0
         ):
@@ -940,6 +1111,24 @@ class ProjectionBackend:
             inputs = torch.nn.functional.pad(inputs, (0, 0, 0, padding))
         # Not through select_kernel: a collective with state prepared before capture.
         return cute_dsl_gemm_reduce_scatter(state, inputs, weight)
+
+    def mm_to_owners(
+        self,
+        inputs: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        # Lamport exchanges the rows it holds; larger blocks go straight to owners.
+        if workspace.owner_rows is None or (
+            workspace.a2a is not None and rows <= workspace.a2a.max_rows
+        ):
+            return projection_mm_to_owners(
+                inputs, rows, weight, workspace, self._fallback
+            )
+        _check_workspace(rows, workspace, self._fallback)
+        _check_transpose(inputs, rows, weight, workspace)
+        return workspace.owner_rows.mm_to_owners(inputs, rows, weight)
 
     def all_to_all(
         self,

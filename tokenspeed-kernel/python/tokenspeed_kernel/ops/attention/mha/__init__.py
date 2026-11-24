@@ -24,6 +24,7 @@ import math
 from collections.abc import Callable
 
 import torch
+from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -458,6 +459,12 @@ def mha_extend_with_kvcache(
 
 # Feature of decode kernels that take a split schedule (mha_decode_schedule).
 _SPLIT_SCHEDULE = frozenset({"split_schedule"})
+# Feature of decode kernels that apply mha_decode_with_kvcache's output_gate
+# where they store the output.
+_RMSNORM_OUTPUT_GATE = frozenset({"rmsnorm_output_gate"})
+# Feature of decode kernels that read mha_decode_with_kvcache's
+# uniform_row_groups and run each group of one-row requests as one request.
+_UNIFORM_ROW_GROUPS = frozenset({"uniform_row_groups"})
 
 # Schedule-reading decode kernel -> whether calls of a shape (num_q_heads,
 # num_kv_heads, max_seqlen_q) should take it; the others keep the default.
@@ -538,6 +545,9 @@ def mha_decode_with_kvcache(
     solution: str | None = None,
     *,
     block_draft: bool,
+    output_gate: torch.Tensor | None = None,
+    output_gate_eps: float | None = None,
+    uniform_row_groups: int = 1,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -571,6 +581,20 @@ def mha_decode_with_kvcache(
         schedule: The split schedule :func:`mha_decode_schedule` returned for
             this call's shape and current lengths, or None. A schedule selects
             only kernels that read one.
+        output_gate: Optional gate logits, [batch * max_seqlen_q,
+            num_q_heads * head_dim] with unit column stride. The output is
+            then ``weightless_rmsnorm_gated_sigmoid`` of the attention output
+            with this gate and ``output_gate_eps``, with the same bits. A
+            kernel with the ``rmsnorm_output_gate`` feature applies it where it
+            stores the output; otherwise the separate op runs after.
+        output_gate_eps: The RMSNorm epsilon; given exactly with output_gate.
+        uniform_row_groups: G > 1 asserts that the call lists one request per
+            query row (``max_seqlen_q`` 1) and that each run of G consecutive
+            rows shares its page-table row and length, as a block
+            drafter's positions do (they see the same keys). A kernel
+            with the ``uniform_row_groups`` feature then reads each run's keys
+            once for its G rows, with the same bits; any other kernel serves
+            the rows as the one-row requests they are. 1 asserts nothing.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
         block_draft: Select noncausal draft-block attention via its trait.
@@ -595,15 +619,67 @@ def mha_decode_with_kvcache(
     schedule_kwargs = {}
     if schedule is not None:
         schedule_kwargs["schedule"] = schedule
-    kernel = select_kernel(
-        "attention",
-        "mha_decode_with_kvcache",
-        signature,
-        features=_SPLIT_SCHEDULE if schedule is not None else None,
-        traits=traits,
-        solution=solution,
-        override=override,
+    if (output_gate is None) != (output_gate_eps is None) or (
+        output_gate is not None and return_lse
+    ):
+        raise ValueError(
+            "output_gate and output_gate_eps come together, without return_lse"
+        )
+    if uniform_row_groups < 1 or (uniform_row_groups > 1 and max_seqlen_q != 1):
+        raise ValueError(
+            f"uniform_row_groups {uniform_row_groups} needs one row per request"
+        )
+    features = _SPLIT_SCHEDULE if schedule is not None else frozenset()
+    gate_kwargs = {}
+    group_kwargs = {}
+    kernel = None
+    # Optional features, preferred in this order; a kernel without them still
+    # serves the call (the gate then runs separately below, and the rows run
+    # as their own one-row requests).
+    optional = []
+    # A kernel gates in its store only where it reduces a head in the separate
+    # op's order: 64-wide heads, BF16 output (FP8 queries give BF16) and a
+    # BF16 gate. Other calls run the separate op below.
+    gate_in_kernel = (
+        output_gate is not None
+        and q.shape[-1] == 64
+        and q.dtype != torch.float16
+        and output_gate.dtype == torch.bfloat16
     )
+    if gate_in_kernel and uniform_row_groups > 1:
+        optional.append(_RMSNORM_OUTPUT_GATE | _UNIFORM_ROW_GROUPS)
+    if uniform_row_groups > 1:
+        optional.append(_UNIFORM_ROW_GROUPS)
+    if gate_in_kernel:
+        optional.append(_RMSNORM_OUTPUT_GATE)
+    for extra in optional:
+        try:
+            kernel = select_kernel(
+                "attention",
+                "mha_decode_with_kvcache",
+                signature,
+                features=features | extra,
+                traits=traits,
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            continue
+        if _RMSNORM_OUTPUT_GATE <= extra:
+            gate_kwargs = dict(output_gate=output_gate, output_gate_eps=output_gate_eps)
+        if _UNIFORM_ROW_GROUPS <= extra:
+            group_kwargs = dict(uniform_row_groups=uniform_row_groups)
+        break
+    if kernel is None:
+        kernel = select_kernel(
+            "attention",
+            "mha_decode_with_kvcache",
+            signature,
+            features=features or None,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
     # Only the leaf the trait selected takes this argument.
     sink_kwargs = {"window_sink": window_sink} if window_sink > 0 else {}
 
@@ -636,7 +712,7 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        output = kernel(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -653,7 +729,20 @@ def mha_decode_with_kvcache(
             **sink_kwargs,
             **scale_kwargs,
             **schedule_kwargs,
+            **gate_kwargs,
+            **group_kwargs,
         )
+    if output_gate is None or gate_kwargs:
+        return output
+    tokens, heads, head_dim = output.shape
+    return weightless_rmsnorm_gated_sigmoid(
+        output.reshape(tokens, heads * head_dim),
+        output_gate,
+        heads,
+        head_dim,
+        output_gate_eps,
+        pdl_enabled(),
+    ).view(tokens, heads, head_dim)
 
 
 def mha_decode_schedule(

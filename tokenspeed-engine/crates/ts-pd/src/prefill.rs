@@ -32,7 +32,7 @@
 //! transfer contract ([`crate::layout`]).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -161,11 +161,8 @@ pub struct PrefillConfig {
     pub bootstrap_url: String,
     /// What this rank registers there, but its control port.
     pub bootstrap_payload: serde_json::Value,
-    /// A request whose Decode ranks have not all pre-allocated this long
-    /// after registration fails. Under deferred decode allocation it
-    /// bounds the wait for the Decode node's announcement and, from the
-    /// moment a request holds its pages, the wait for its allocation
-    /// (`PrefillPeer::poll`).
+    /// Destination allocation timeout, from registration under early
+    /// allocation or from holding all prompt pages under deferred allocation.
     pub bootstrap_timeout: Duration,
     /// After a transfer to a session fails, its later transfers fail fast
     /// for this long; zero disables.
@@ -477,10 +474,8 @@ struct Shared {
     failed_session_ttl: Duration,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
     layerwise: Option<Layerwise>,
-    /// The decode allocation policy this rank registered with the bootstrap
-    /// server is deferred: a request is admitted once its Decode node
-    /// announced it, and that node allocates only after this rank's notice
-    /// that the request holds its pages.
+    /// Decode allocates only after this rank's notice that it holds all
+    /// prompt pages; prefill computation does not wait for Decode.
     deferred: bool,
     /// Layerwise: each transfer interval's fields.
     interval_fields: Vec<Option<BTreeSet<String>>>,
@@ -1868,25 +1863,10 @@ fn same_prompt_window(windows: &[&Manifest]) -> Result<(), String> {
 /// One request's transfer as the scheduling loop tracks it.
 struct Sender {
     room: u64,
-    /// Deferred decode allocation: this rank admitted the request (every
-    /// rank of its Decode node announced it).
-    announced: bool,
-    /// Deferred: the replica agreed on the admission, which the
-    /// scheduler was told.
-    admitted: bool,
     started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
     draining: Option<Draining>,
-}
-
-/// What a request that has not concluded waits for on this rank.
-#[derive(Clone, Copy)]
-enum Wait {
-    /// Deferred decode allocation: its Decode node's announcement.
-    Announcement,
-    /// Its destination's allocation, every Decode rank's manifest.
-    Allocation,
 }
 
 /// A Prefill rank's PD transfer peer.
@@ -1898,10 +1878,12 @@ pub struct PrefillPeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     senders: HashMap<String, Sender>,
+    /// Active (including draining) rooms owned by `senders`, maintained only
+    /// on the scheduling loop thread for replica-identical admission checks.
+    active_rooms: HashMap<u64, String>,
     stall_logged_at: Option<Instant>,
     drain_logged_at: Option<Instant>,
-    /// The timeout stages already warned about.
-    timeouts_logged: HashSet<&'static str>,
+    timeout_logged: bool,
 }
 
 impl PrefillPeer {
@@ -1989,9 +1971,10 @@ impl PrefillPeer {
                 bootstrap_timeout: config.bootstrap_timeout,
                 order: Vec::new(),
                 senders: HashMap::new(),
+                active_rooms: HashMap::new(),
                 stall_logged_at: None,
                 drain_logged_at: None,
-                timeouts_logged: HashSet::new(),
+                timeout_logged: false,
             },
             outbox,
         ))
@@ -2016,12 +1999,9 @@ impl PrefillPeer {
         self.shared.transport.session_id()
     }
 
-    /// Report, at most once per stall interval, the requests that have
-    /// waited that long (`waits`, by `order`): under early allocation the
-    /// ones still bootstrapping, under deferred allocation by what each
-    /// waits for and since when. There a prompt that computes waits for
-    /// nothing.
-    fn log_stalls(&mut self, polls: &[i64], waits: &[(Wait, Option<Instant>)]) {
+    /// Report requests whose destination allocation has stalled. Deferred
+    /// requests start waiting only once they hold all their prompt pages.
+    fn log_stalls(&mut self, polls: &[i64], waits: &[Option<Instant>]) {
         let now = Instant::now();
         if self
             .stall_logged_at
@@ -2029,39 +2009,34 @@ impl PrefillPeer {
         {
             return;
         }
-        // By what the requests wait for.
-        let mut stalled: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-        for ((rid, &poll), &(wait, since)) in self.order.iter().zip(polls).zip(waits) {
+        let mut stalled = Vec::new();
+        for ((rid, &poll), &since) in self.order.iter().zip(polls).zip(waits) {
             if poll != TransferPoll::Bootstrapping as i64 {
                 continue;
             }
-            let sender = &self.senders[rid];
-            let what = match wait {
-                Wait::Allocation if !self.shared.deferred => "requests still bootstrapping",
-                Wait::Allocation => "requests still waiting for their decode allocation",
-                Wait::Announcement => {
-                    "requests still waiting for their decode instance's announcement"
-                }
-            };
             let Some(age) = since
                 .map(|since| now - since)
                 .filter(|&age| age >= BOOTSTRAP_STALL)
             else {
                 continue;
             };
-            let stalled = stalled.entry(what).or_default();
-            if stalled.len() < 8 {
-                stalled.push(format!(
-                    "{rid}(room={}, age={:.0}s)",
-                    sender.room,
-                    age.as_secs_f64()
-                ));
+            let sender = &self.senders[rid];
+            stalled.push(format!(
+                "{rid}(room={}, age={:.0}s)",
+                sender.room,
+                age.as_secs_f64()
+            ));
+            if stalled.len() == 8 {
+                break;
             }
         }
         if !stalled.is_empty() {
             self.stall_logged_at = Some(now);
-        }
-        for (what, stalled) in stalled {
+            let what = if self.shared.deferred {
+                "requests still waiting for their decode allocation"
+            } else {
+                "requests still bootstrapping"
+            };
             tracing::warn!(?stalled, "{what}");
         }
     }
@@ -2070,6 +2045,7 @@ impl PrefillPeer {
         let Some(sender) = self.senders.remove(rid) else {
             return;
         };
+        self.active_rooms.remove(&sender.room);
         self.order.retain(|tracked| tracked != rid);
         let mut state = self.shared.state();
         state.clear(sender.room);
@@ -2086,6 +2062,16 @@ impl Drop for PrefillPeer {
 impl TransferPeer for PrefillPeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
         let room = bootstrap.room;
+        if self.senders.contains_key(rid) {
+            return Err(PdError::Peer(format!(
+                "request {rid} is already registered with the Prefill transfer peer"
+            )));
+        }
+        if let Some(existing) = self.active_rooms.get(&room) {
+            return Err(PdError::Peer(format!(
+                "bootstrap room {room} for request {rid} is already active for request {existing}"
+            )));
+        }
         {
             let mut state = self.shared.state();
             state.cached_tokens.remove(&room);
@@ -2100,24 +2086,18 @@ impl TransferPeer for PrefillPeer {
             state.tracked.insert(room);
             state.rooms_by_rid.insert(rid.to_owned(), room);
         }
-        if self
-            .senders
-            .insert(
-                rid.to_owned(),
-                Sender {
-                    room,
-                    announced: false,
-                    admitted: false,
-                    started: Instant::now(),
-                    local: TransferPoll::Bootstrapping,
-                    concluded: None,
-                    draining: None,
-                },
-            )
-            .is_none()
-        {
-            self.order.push(rid.to_owned());
-        }
+        self.senders.insert(
+            rid.to_owned(),
+            Sender {
+                room,
+                started: Instant::now(),
+                local: TransferPoll::Bootstrapping,
+                concluded: None,
+                draining: None,
+            },
+        );
+        self.order.push(rid.to_owned());
+        self.active_rooms.insert(room, rid.to_owned());
         Ok(())
     }
 
@@ -2133,36 +2113,10 @@ impl TransferPeer for PrefillPeer {
             let mut state = self.shared.state();
             for rid in &self.order {
                 let sender = self.senders.get_mut(rid).expect("tracked");
-                // Deferred: a request is admitted once every rank of its
-                // Decode node announced its room.
-                if deferred && !sender.announced && sender.concluded.is_none() {
-                    sender.announced = state.announced.get(&sender.room).is_some_and(|sessions| {
-                        sessions.iter().all(|session| {
-                            state
-                                .registrations
-                                .get(session)
-                                .is_some_and(|registration| {
-                                    registration.planned.expected_decode_ranks.len()
-                                        == sessions.len()
-                                })
-                        })
-                    });
-                }
-                // What the request waits for and since when; the bootstrap
-                // timeout bounds each wait. Under early allocation that is
-                // its destination, from registration. Under deferred
-                // allocation: its Decode node's announcement, from
-                // registration; once admitted nothing while it computes,
-                // then its destination from the moment it held its pages.
-                let (wait, since) = if !deferred {
-                    (Wait::Allocation, Some(sender.started))
-                } else if sender.announced {
-                    (
-                        Wait::Allocation,
-                        state.pages_held.get(&sender.room).copied(),
-                    )
+                let since = if deferred {
+                    state.pages_held.get(&sender.room).copied()
                 } else {
-                    (Wait::Announcement, Some(sender.started))
+                    Some(sender.started)
                 };
                 let poll = match sender.concluded {
                     Some(poll) => poll,
@@ -2175,24 +2129,12 @@ impl TransferPeer for PrefillPeer {
                             if since.is_some_and(|since| now - since >= self.bootstrap_timeout) =>
                         {
                             let elapsed = since.map_or(0.0, |since| (now - since).as_secs_f64());
-                            let (stage, cause) = match wait {
-                                Wait::Allocation => (
-                                    "bootstrapping",
-                                    "when bootstrapping: the decode instance never sent their \
-                                     cache manifest",
-                                ),
-                                Wait::Announcement => (
-                                    "waiting_for_announcement",
-                                    "before their decode instance announced them to this \
-                                     prefill rank: it cannot reach this rank, or it does not \
-                                     announce (an older build, a stale route)",
-                                ),
-                            };
-                            if self.timeouts_logged.insert(stage) {
+                            if !self.timeout_logged {
+                                self.timeout_logged = true;
                                 tracing::warn!(
-                                    "Some requests timed out {cause}. Raise \
-                                     TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT if a longer \
-                                     TTFT is acceptable."
+                                    "Some requests timed out waiting for their decode cache \
+                                     manifest. Raise TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT \
+                                     if a longer TTFT is acceptable."
                                 );
                             }
                             // The room's abort below replaces this reason.
@@ -2205,7 +2147,7 @@ impl TransferPeer for PrefillPeer {
                                 ),
                             );
                             if let Some(metrics) = &self.shared.metrics {
-                                metrics.record_timeout(stage);
+                                metrics.record_timeout("bootstrapping");
                             }
                             sender.concluded = Some(TransferPoll::Failed);
                             TransferPoll::Failed
@@ -2214,24 +2156,13 @@ impl TransferPeer for PrefillPeer {
                     },
                 };
                 polls.push(poll as i64);
-                waits.push((wait, since));
+                waits.push(since);
             }
         }
         let agreed = if replica.size() > 1 {
             mesh.all_reduce(replica, &polls, Reduce::Min)?
         } else {
             polls
-        };
-        // Every member admits a request in the same round.
-        let admissions: Vec<i64> = self
-            .order
-            .iter()
-            .map(|rid| i64::from(self.senders[rid].announced))
-            .collect();
-        let admissions = if replica.size() > 1 && deferred {
-            mesh.all_reduce(replica, &admissions, Reduce::Min)?
-        } else {
-            admissions
         };
         self.log_stalls(&agreed, &waits);
 
@@ -2274,19 +2205,9 @@ impl TransferPeer for PrefillPeer {
 
         let mut events = Vec::new();
         let mut ended = Vec::new();
-        for (((rid, &poll), &retired), &admission) in self
-            .order
-            .iter()
-            .zip(&agreed)
-            .zip(&retired)
-            .zip(&admissions)
-        {
+        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
-            if deferred && admission != 0 && !sender.admitted && poll != TransferPoll::Failed {
-                sender.admitted = true;
-                events.push(PdEvent::Bootstrapped(rid.clone()));
-            }
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
                 events.push(if deferred {
@@ -2347,6 +2268,10 @@ impl TransferPeer for PrefillPeer {
         !self.order.is_empty()
     }
 
+    fn has_room(&self, room: u64) -> bool {
+        self.active_rooms.contains_key(&room)
+    }
+
     fn cancel(&mut self, rid: &str) {
         if let Some(sender) = self.senders.get_mut(rid) {
             sender.concluded = Some(TransferPoll::Failed);
@@ -2357,6 +2282,19 @@ impl TransferPeer for PrefillPeer {
     }
 
     fn abort_room(&mut self, rid: &str, room: u64) {
+        if let Some(existing) = self
+            .active_rooms
+            .get(&room)
+            .filter(|existing| existing.as_str() != rid)
+        {
+            tracing::warn!(
+                rid,
+                room,
+                existing,
+                "ignoring abort_room for a room owned by another active request"
+            );
+            return;
+        }
         self.shared.abort_room(
             room,
             &format!("EPD: prefill aborted request {rid} (embedding receive timed out)"),

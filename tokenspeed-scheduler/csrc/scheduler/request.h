@@ -44,9 +44,16 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
+    Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap);
 
     const std::string& Id() const { return id_; }
+    std::uint64_t AdmissionId() const { return admission_id_; }
+    std::uint64_t NextRestoreSequence() {
+        if (restore_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("request restore sequence exhausted");
+        }
+        return ++restore_sequence_;
+    }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
     const std::string& PeerHolder() const { return peer_holder_; }
@@ -83,11 +90,30 @@ public:
         }
     }
 
+    // Only successful retractions by the debug entry consume its optional
+    // budget. Capacity retractions keep using the separate counter above.
+    std::int32_t ForcedRetractions() const { return forced_retraction_count_; }
+    void NoteForcedRetracted() {
+        if (forced_retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
+            ++forced_retraction_count_;
+        }
+    }
+
     // Decode rounds in which the prefill/decode interval held this prompt
-    // back (Submitted or Prefilling). Never reset, so the interval's bound
-    // on it spans every chunk.
+    // back (Submitted or Prefilling). Never reset by default, so the
+    // interval's bound on it spans every chunk; with
+    // max_consecutive_prefill_rounds the scheduler restarts it whenever one
+    // of the prompt's chunks runs, so the bound applies per chunk.
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+    void ResetPrefillDeferred() { prefill_deferred_rounds_ = 0; }
+
+    // Rounds in which this prompt's chunk gave way to carried prompts
+    // (prefill_chunk_yield_tokens): it was cut shorter or a carried prompt
+    // ran beside it. Never reset, so prefill_chunk_yield_max_rounds bounds
+    // the prompt across all its chunks.
+    std::int32_t PrefillRoundsGivenWay() const { return prefill_rounds_given_way_; }
+    void NotePrefillGaveWay() { ++prefill_rounds_given_way_; }
 
     // P role, deferred decode allocation: a pd::DestinationReadyEvent
     // arrived, so every Decode rank allocated the destination. Until then a
@@ -148,6 +174,9 @@ public:
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::SchedulePrefillFirstChunkEvent>) {
+            forwardResources("first admission").req_pool_index.BindOwner(id_, admission_id_);
+        }
     }
 
     template <typename State>
@@ -386,6 +415,8 @@ private:
     }
 
     std::string id_;
+    std::uint64_t admission_id_{0};
+    std::uint64_t restore_sequence_{0};
     std::string session_id_;
     std::string cache_group_id_;
     std::string peer_holder_;
@@ -396,7 +427,9 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t forced_retraction_count_{0};
     std::int32_t prefill_deferred_rounds_{0};
+    std::int32_t prefill_rounds_given_way_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;

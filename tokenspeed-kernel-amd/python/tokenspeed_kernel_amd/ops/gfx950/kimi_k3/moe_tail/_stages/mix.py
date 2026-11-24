@@ -62,6 +62,7 @@ def slice_loads(
     blocks,
     ares_nw,
     ares_qk,
+    in_nw,
     task,
     blk_sm,
     blk_sr,
@@ -69,7 +70,8 @@ def slice_loads(
     NB: gl.constexpr,
 ):
     """Issue the slice's block, prefix and weight loads, kept packed until
-    the reduced attention output is ready."""
+    the reduced attention output is ready, and :func:`stage_mix`'s norm
+    weight words."""
     tid = thread_ids()
     blks, pres = (), ()
     for i in gl.static_range(gl.cdiv(S * (NB + 1) * 32, 512)):
@@ -88,7 +90,13 @@ def slice_loads(
         pres += (raw_bf4(prefix_in, t.to(gl.int64) * 7168 + col),)
     first = gl.minimum(tid, S * (NB + 1) * 32 - 1)
     col = task * 128 + first % 32 * 4
-    return blks, pres, raw_bf4(ares_nw, col), raw_bf4(ares_qk, col)
+    return (
+        blks,
+        pres,
+        raw_bf4(ares_nw, col),
+        raw_bf4(ares_qk, col),
+        raw_bf4(in_nw, task * 128 + tid % 32 * 4),
+    )
 
 
 @gluon.jit
@@ -225,7 +233,7 @@ def stage_mix(
     xrdy,
     vals,
     red,
-    in_nw,
+    norm_words,
     xbuf,
     task,
     tag,
@@ -236,8 +244,8 @@ def stage_mix(
     guard,
 ):
     """Mix the slice's columns by the source weights, then apply the
-    post-attention RMS norm; write the rows as BF16 (``xbuf``) and as tagged
-    pairs (``xt``)."""
+    post-attention RMS norm (its weight words from :func:`slice_loads`);
+    write the rows as BF16 (``xbuf``) and as tagged pairs (``xt``)."""
     tid = thread_ids()
     NS: gl.constexpr = NB + 1
     got = poll_pairs(wgt, (tid,), tag, tid < S * (NS + 1), "gpu", guard)[0]
@@ -277,7 +285,7 @@ def stage_mix(
         total = total + red.gather(128 + g * S + token, 0)
     rs = gl.rsqrt(total * (1.0 / 7168) + OUT_EPS)
     xvalues = ()
-    norms = unpack_bf4(raw_bf4(in_nw, task * 128 + col))
+    norms = unpack_bf4(norm_words)
     for j in gl.static_range(4):
         x = mixed[j] * rs * norms[j]
         xvalues += (x.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint32),)

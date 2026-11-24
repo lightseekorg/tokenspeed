@@ -88,6 +88,52 @@ def test_discard_rejects_unsupported_contracts_at_argument_resolution(
         ServerArgs(**discard_args(**overrides))
 
 
+@pytest.mark.parametrize("dense_fp8_small_m", ["qkv"])
+def test_discard_refuses_dense_fp8_weight_copies(dense_fp8_small_m):
+    """--dense-fp8-small-m makes its FP8 weight copies once after loading and
+    refuses weight updates, so under discard a released copy could never be
+    rebuilt: the combination is refused at argument resolution. CPU backup
+    keeps the flag."""
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"--dense-fp8-small-m {dense_fp8_small_m} cannot run with "
+            "--weight-memory-policy discard"
+        ),
+    ):
+        ServerArgs(**discard_args(dense_fp8_small_m=dense_fp8_small_m))
+    assert ServerArgs(**discard_args()).dense_fp8_small_m == "none"
+    cpu_backup = ServerArgs(
+        model="test-model",
+        enable_memory_saver=True,
+        weight_memory_policy="cpu_backup",
+        dense_fp8_small_m=dense_fp8_small_m,
+    )
+    assert cpu_backup.dense_fp8_small_m == dense_fp8_small_m
+
+
+@pytest.mark.parametrize("dense_fp8_small_m", ["qkv"])
+def test_model_updater_refuses_dense_fp8_weight_copies(dense_fp8_small_m):
+    """Every weight update refuses to start while the FP8 weight copies exist,
+    so a Model Updater config is refused with them at argument resolution."""
+    updater = dict(
+        model="test-model",
+        model_update_config="{}",
+        model_update_sdk_module="test_sdk",
+        model_update_engine_type="fluent_llm",
+        model_update_draft_weights="retain",
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"--dense-fp8-small-m {dense_fp8_small_m} cannot run with "
+            "--model-update-config"
+        ),
+    ):
+        ServerArgs(**updater, dense_fp8_small_m=dense_fp8_small_m)
+    assert ServerArgs(**updater).dense_fp8_small_m == "none"
+
+
 def test_quantized_discard_defers_support_check_to_the_resolved_model():
     args = ServerArgs(**discard_args(quantization="fp8"))
     assert args.quantization == "fp8"

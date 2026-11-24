@@ -83,7 +83,23 @@ std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>> Feed(const KvEventBa
 
 constexpr auto kD = KvEventMedium::kDevice;
 constexpr auto kH = KvEventMedium::kHost;
+constexpr auto kK = KvEventMedium::kDisk;
+constexpr std::array<bool, kNumKvEventMedia> kOnDisk{false, false, true};
 }  // namespace
+
+TEST(KvEventPrefixView, ADiskChainContinuesAPrefixFromAnyMedium) {
+    KvEventPrefixView view;
+    // Device, then Host, then Disk: a router continues one prefix down them.
+    const std::array chain{Resident(1, std::nullopt, kOnDevice), Resident(2, 1, kOnHost), Resident(3, 2, kOnDisk)};
+    EXPECT_EQ(Feed(view.ApplyMutations(chain)), (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{
+                                                    {true, kD, 1}, {true, kH, 2}, {true, kK, 3}}));
+    // A Disk boundary whose parent is out nowhere is not out either.
+    const std::array orphan{Resident(5, 4, kOnDisk)};
+    EXPECT_TRUE(view.ApplyMutations(orphan).Empty());
+    const std::array middle_gone{Gone(2)};
+    EXPECT_EQ(Feed(view.ApplyMutations(middle_gone)),
+              (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{{false, kK, 3}, {false, kH, 2}}));
+}
 
 TEST(KvEventPrefixView, AHostBoundaryUnderADeviceParentIsOutOnTheHost) {
     KvEventPrefixView view;

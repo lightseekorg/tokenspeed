@@ -30,7 +30,7 @@ indexer projections and consumes the resulting generic DSA metadata.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -1127,9 +1127,10 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         num_decode_tokens: int,
         topk: int,
         query_rider: torch.Tensor | None = None,
+        rider_ready: Callable[[], None] | None = None,
     ) -> GlmDsaDecodeTopK:
         del topk
-        if query_rider is not None:
+        if query_rider is not None or rider_ready is not None:
             raise ValueError("GLM-5.3-Flash selects no owned decode top-k")
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(

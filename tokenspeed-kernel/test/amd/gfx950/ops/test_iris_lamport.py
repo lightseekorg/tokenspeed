@@ -129,8 +129,9 @@ def test_lamport_buffer_polling_codegen(rank, fused_moe, tmp_path):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_lamport_two_shot_polling_codegen(tmp_path):
-    """Both two-shot exchanges must reread all seven peer mailboxes per retry."""
+@pytest.mark.parametrize("world_size", (4, 8))
+def test_lamport_two_shot_polling_codegen(world_size, tmp_path):
+    """Both two-shot exchanges must reread every peer mailbox per retry."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
@@ -143,14 +144,14 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         "region_sym_ptr": "*bf16",
         "output_ptr": "*bf16",
         "epochs": "*i32",
-        "regions": ("i64",) * 8,
+        "regions": ("i64",) * world_size,
         "total_elements": "i32",
     }
     attrs = {}
     for index, name in enumerate(fn.arg_names):
         if name == "regions":
             attrs.update(
-                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(world_size)}
             )
         elif name in signature:
             attrs[(index,)] = [["tt.divisibility", 16]]
@@ -159,7 +160,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         signature,
         constexprs={
             "RANK": 3,
-            "WORLD_SIZE": 8,
+            "WORLD_SIZE": world_size,
             "MAX_SHARD_ELEMENTS": 131072,
             "NUM_STAGES": 3,
             "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
@@ -174,7 +175,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         options={"num_warps": 1},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / "two-shot.amdgcn").write_text(assembly)
+    (tmp_path / f"two-shot-{world_size}.amdgcn").write_text(assembly)
     # Group system-scope peer loads by the loop that LLVM reports for them.
     loops = {}
     header = None
@@ -189,10 +190,13 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
         for body in loops.values()
         if any("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
     ]
-    assert sorted(
-        sum("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
-        for body in polls
-    ) == [7, 7], "each exchange must poll all seven peers per retry"
+    assert (
+        sorted(
+            sum("buffer_load_dword " in line and "sc0 sc1" in line for line in body)
+            for body in polls
+        )
+        == [world_size - 1] * 2
+    ), "each exchange must poll every peer per retry"
     assert all(
         votes_with_subgroup_mask(body) for body in polls
     ), "each exchange must branch on one subgroup lane mask per retry"

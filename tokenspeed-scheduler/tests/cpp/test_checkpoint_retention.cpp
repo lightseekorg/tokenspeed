@@ -341,7 +341,8 @@ TEST(CheckpointRetention, DeviceEvictsNonLeafCheckpointsBeforeOlderSessions) {
     for (const std::int64_t retention : {std::int64_t{0}, std::int64_t{1000}}) {
         SCOPED_TRACE(retention);
         BlockPool device(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false, retention);
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false,
+                                     false, retention);
         const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
         for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
         const std::vector<bool> kept = AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c});
@@ -355,8 +356,9 @@ TEST(CheckpointRetention, DeviceEvictsNonLeafCheckpointsBeforeOlderSessions) {
 
 TEST(CheckpointRetention, StaleSessionsLeaveFirstAndRecentOnesOutlastNonLeafCheckpoints) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/4);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/4);
     const Checkpoint stale{{90, 91, 92, 93}}, recent{{80, 81, 82, 83}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&stale, &recent, &a, &b, &c}) Publish(cache, *point);
     // The last four admissions began with `recent`'s: `stale` is older, and A
@@ -367,8 +369,9 @@ TEST(CheckpointRetention, StaleSessionsLeaveFirstAndRecentOnesOutlastNonLeafChec
 
 TEST(CheckpointRetention, PlannedRemovalOfTheOnlyDescendantRestoresTheLeafRank) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000);
     const Checkpoint older{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)};
     for (const Checkpoint* point : {&older, &a, &b}) Publish(cache, *point);
     // B ranks first, at epoch 0; once the plan takes it, A is a leaf again
@@ -390,7 +393,8 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
             SCOPED_TRACE(testing::Message() << "retention " << retention << ", placement " << placement);
             BlockPool device(16, {1, 1});
             BlockPool host(16, {1, 1});
-            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false, retention);
+            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr,
+                                         false, false, retention);
             const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
             for (const Checkpoint* point : {&other, &a, &b, &c}) {
                 Publish(cache, *point);
@@ -427,8 +431,9 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
         SCOPED_TRACE(placement);
         BlockPool device(16, {1, 1});
         BlockPool host(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
-                                     /*checkpoint_retention_requests=*/1000);
+        auto cache =
+            MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, false,
+                            /*checkpoint_retention_requests=*/1000);
         // A is older and deeper than B; each has one newer checkpoint after it.
         const Checkpoint a{{10, 11, 12, 13, 14, 15, 16, 17}}, a_next{{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}};
         const Checkpoint b{{50, 51, 52, 53}}, b_next{{50, 51, 52, 53, 54, 55, 56, 57}};
@@ -460,8 +465,9 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
 // leaf, so LRU takes the other session instead.
 TEST(CheckpointRetention, LeafDistanceKeepsThePreviousTurnsCheckpoint) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
     const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
     EXPECT_EQ(AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c}), (std::vector<bool>{false, false, true, true}));
@@ -473,8 +479,9 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
             SCOPED_TRACE(testing::Message() << "leaf distance " << leaf_distance << ", placement " << placement);
             BlockPool device(16, {1, 1});
             BlockPool host(16, {1, 1});
-            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
-                                         /*checkpoint_retention_requests=*/1000, leaf_distance);
+            auto cache =
+                MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, false,
+                                /*checkpoint_retention_requests=*/1000, leaf_distance);
             const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)};
             for (const Checkpoint* point : {&other, &a, &b}) {
                 Publish(cache, *point);
@@ -504,8 +511,9 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
 
 TEST(CheckpointRetention, PlannedRemovalCanBringACheckpointWithinTheLeafDistance) {
     BlockPool device(16, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
     const Checkpoint older{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&older, &a, &b, &c}) Publish(cache, *point);
     // C ranks first, at epoch 0; once the plan takes it, B is the leaf and A
@@ -523,8 +531,9 @@ TEST(CheckpointRetention, PlannedRemovalCanBringACheckpointWithinTheLeafDistance
 
 TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) {
     BlockPool device(32, {1, 1});
-    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                 /*checkpoint_retention_requests=*/0);
+    auto cache =
+        MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false,
+                        /*checkpoint_retention_requests=*/0);
     const Checkpoint a{Sequence(4)};
     Publish(cache, a);
     for (const std::int32_t first : {100, 200, 300})

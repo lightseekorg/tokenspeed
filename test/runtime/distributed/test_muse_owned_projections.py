@@ -20,13 +20,20 @@
 
 """Muse Spark's owned-row projections on real process groups.
 
+Workers record rank/PID/phase logs and Python stack snapshots every five minutes.
+Failures retain these under .ci-artifacts for the existing upload. The suite
+timeout is unchanged.
+
 Usage:
     python -m pytest test/runtime/distributed/test_muse_owned_projections.py -v
 """
 
 import gc
+import shutil
 import socket
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +44,7 @@ import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from ci_system.worker_diagnostics import worker_diagnostics  # noqa: E402
 
 register_cuda_ci(
     est_time=120,
@@ -64,7 +72,10 @@ def _project(x, weight):
     return (x.float() @ weight.float().T).to(torch.bfloat16)
 
 
-def _worker(rank: int, port: int, world_size: int) -> None:
+def _run_worker(
+    rank: int, port: int, world_size: int, phase: Callable[[str], None]
+) -> None:
+    phase("imports")
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
     from tokenspeed.runtime.distributed.process_group_manager import (
@@ -75,6 +86,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
         _prepare_owned_projections,
     )
 
+    phase("default_nccl_group")
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
@@ -83,6 +95,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
         world_size=world_size,
     )
     try:
+        phase("tokenspeed_groups_and_backend")
         group = tuple(range(world_size))
         process_group_manager.init_process_group(group)
         set_global_backend(AutoBackend())
@@ -115,6 +128,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
             ),
         )
         owned = _OwnedRowProjections(group)
+        phase("prepare_owned_projections")
         _prepare_owned_projections(owned, layer, group, owned.local_rows(_MAX_ROWS))
 
         def operands(rows, seed):
@@ -164,6 +178,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
 
         # Odd row counts leave the last owner's padding out.
         for seed, rows in enumerate((4097, 8192, 4099)):
+            phase(f"eager_projections_and_reference rows={rows}")
             values = operands(rows, seed)
             for got, want in zip(
                 layer_projections(rows, values), expected(rows, values)
@@ -173,13 +188,16 @@ def _worker(rank: int, port: int, world_size: int) -> None:
         # Two captured layers replay on new rows.
         rows = 4097
         first, second = operands(rows, 10), operands(rows, 11)
+        phase("pre_capture_projections")
         layer_projections(rows, first)
+        phase("pre_capture_synchronize")
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         # Destructors of discarded CUDA objects can invalidate an active capture.
         gc.collect()
         gc.disable()
         try:
+            phase("capture_two_layers")
             with torch.cuda.graph(graph):
                 layer_projections(rows, first)
                 outputs = layer_projections(rows, second)
@@ -188,14 +206,25 @@ def _worker(rank: int, port: int, world_size: int) -> None:
         for values, seed in ((first, 12), (second, 13)):
             for name, update in operands(rows, seed).items():
                 values[name].copy_(update)
+        phase("graph_replay")
         graph.replay()
+        phase("replay_reference_and_comparison")
         for got, want in zip(outputs, expected(rows, second)):
             torch.testing.assert_close(got, want, atol=0, rtol=0)
         # A live graph holding NCCL work blocks the process group's teardown.
+        phase("graph_reset")
         graph.reset()
+        phase("final_barrier")
         dist.barrier()
     finally:
+        phase("destroy_process_group")
         dist.destroy_process_group()
+
+
+def _worker(rank: int, port: int, world_size: int, diagnostics: str) -> None:
+    with worker_diagnostics(Path(diagnostics), rank, dump_after_seconds=300) as phase:
+        _run_worker(rank, port, world_size, phase)
+        phase("complete")
 
 
 def _spawn(world_size: int) -> None:
@@ -204,7 +233,18 @@ def _spawn(world_size: int) -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_worker, args=(port, world_size), nprocs=world_size, join=True)
+    # The existing CI failure upload retains this directory even if the suite's
+    # unchanged 1800-second file timeout kills this process and its workers.
+    artifacts = Path(__file__).resolve().parents[3] / ".ci-artifacts"
+    artifacts.mkdir(exist_ok=True)
+    diagnostics = tempfile.mkdtemp(
+        prefix=f"muse-owned-projections-tp{world_size}-", dir=artifacts
+    )
+    print(f"Worker phase/stack diagnostics: {diagnostics}", flush=True)
+    mp.spawn(
+        _worker, args=(port, world_size, diagnostics), nprocs=world_size, join=True
+    )
+    shutil.rmtree(diagnostics)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
