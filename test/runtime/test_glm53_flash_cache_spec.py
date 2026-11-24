@@ -397,7 +397,7 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> No
     slots = 26
     expected = (
         layers * batch * width * conv_channels * 2
-        + layers * slots * (3 * heads * max(16, width) * dim * 4 + 4)
+        + layers * slots * (3 * heads * (width + 12) * dim * 4 + 4)
         + layers * (14 * 8 + 4)
         + groups * 4 * 8
         + (2 * groups + 1) * batch * 4

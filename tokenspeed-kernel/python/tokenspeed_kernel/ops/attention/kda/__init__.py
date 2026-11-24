@@ -162,6 +162,12 @@ def apply_kda_output_norm(
     )
 
 
+# Accepted records a request slot keeps beside its verify window by default.
+# The runtime's default history capacity is the window plus this many, so a
+# verify reads at most this many retained records whatever its width.
+KDA_DEFAULT_RETAINED_RECORDS = 12
+
+
 @dataclass(frozen=True)
 class KdaRetainedHistory:
     """Per-request verify records and accepted lengths, outside the cache pages.
@@ -911,4 +917,5 @@ __all__ = [
     "kda_fused_paged_verify",
     "kda_fused_paged_verify_uses_split_producers",
     "kda_verify_conv_update",
+    "KDA_DEFAULT_RETAINED_RECORDS",
 ]

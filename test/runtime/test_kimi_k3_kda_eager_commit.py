@@ -350,7 +350,7 @@ def test_retained_commit_matches_torch_over_multiple_rounds_and_layers(
     windows fold after a round of full acceptance.
     """
     harness = _Harness(draft_tokens=T, seed=17, history_capacity=history_capacity)
-    expected_capacity = 16 if history_capacity is None else history_capacity
+    expected_capacity = T + 12 if history_capacity is None else history_capacity
     assert harness.backend._retained_records.shape[4] == expected_capacity
     rpis = [3, 1, 2]
     pages = {

@@ -91,20 +91,23 @@ def kda_history_capacity(config: AttnConfig, draft_token_num: int) -> int:
     """Retained updates a request slot keeps per layer, counting the verify window.
 
     ``--kda-history-capacity`` (``LinearAttnConfig.kda_history_capacity``)
-    sets it; by default it is max(16, draft_token_num). A smaller capacity
-    shrinks the request-slot workspace but folds the accepted records into
-    the dense state more often: at the window itself, every round that
-    accepts any.
+    sets it; by default it is draft_token_num plus the kernel package's
+    ``KDA_DEFAULT_RETAINED_RECORDS`` (12, so 16 at a 4-token window).
+    A smaller capacity shrinks the request-slot workspace but folds the
+    accepted records into the dense state more often: at the window itself,
+    every round that accepts any.
 
     Raises:
         ValueError: when the configured capacity is below the verify window.
     """
+    from tokenspeed_kernel.ops.attention.kda import KDA_DEFAULT_RETAINED_RECORDS
+
     # Like the state backends' other linear flags, a config without the
     # linear component (a backend built for tests) keeps the default.
     linear = config.component(LinearAttnConfig)
     configured = None if linear is None else linear.kda_history_capacity
     if configured is None:
-        return max(16, draft_token_num)
+        return draft_token_num + KDA_DEFAULT_RETAINED_RECORDS
     if configured < draft_token_num:
         raise ValueError(
             f"kda_history_capacity={configured} must be at least the verify "

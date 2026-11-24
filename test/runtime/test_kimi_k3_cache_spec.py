@@ -191,10 +191,10 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     )
 
     # Four batch rows stage QKV. Twelve resident requests and the two
-    # reserved request slots each hold sixteen FP32 U/K/decay records and
-    # one INT32 accepted count per layer.
+    # reserved request slots each hold twenty (8 draft tokens + 12) FP32
+    # U/K/decay records and one INT32 accepted count per layer.
     qkv_bytes = 69 * 4 * 8 * 4608 * 2
-    retained_bytes = 69 * 14 * (12 * 16 * 128 * 3 * 4 + 4)
+    retained_bytes = 69 * 14 * (12 * 20 * 128 * 3 * 4 + 4)
     descriptor_bytes = 69 * (14 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
     record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
@@ -433,7 +433,7 @@ def test_kimi_checkpoint_is_independent_of_request_history(width):
     # count of that request's slot.
     smaller = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=6)
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * (3 * 12 * max(16, width) * 128 * 4 + 4)
+        69 * (3 * 12 * (width + 12) * 128 * 4 + 4)
     )
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.groups() == schema

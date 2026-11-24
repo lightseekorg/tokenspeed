@@ -161,6 +161,6 @@ compile reuse. AMD uses the same retained
 contract through its registered Gluon kernels and the shared prepare.
 
 The `kda_fused_paged_verify` benchmark accepts `history_length`. It defaults to
-zero and can cover the accepted prefix up to `max(16, draft_token_num) -
-draft_token_num`, so the candidate window fits beside that prefix. Each
-measurement uses the same accepted records.
+zero and can cover an accepted prefix of up to `KDA_DEFAULT_RETAINED_RECORDS`
+(12) records, the room the runtime keeps beside the candidate window by
+default. Each measurement uses the same accepted records.

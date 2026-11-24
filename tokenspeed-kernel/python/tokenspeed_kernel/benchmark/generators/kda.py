@@ -580,6 +580,13 @@ def _require_state_pages(state_pages: int, required: int) -> None:
         )
 
 
+def _history_capacity(window: int) -> int:
+    # The runtime's default history capacity for a verify window.
+    from tokenspeed_kernel.ops.attention.kda import KDA_DEFAULT_RETAINED_RECORDS
+
+    return window + KDA_DEFAULT_RETAINED_RECORDS
+
+
 def _retained_benchmark_layer(common, window, generator, reads, live, metadata, stamps):
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
@@ -598,7 +605,7 @@ def _retained_benchmark_layer(common, window, generator, reads, live, metadata, 
         common["conv_kernel_size"],
     )
     _fill_state_pages(conv, state, reads.long(), generator=generator)
-    capacity = max(16, window)
+    capacity = _history_capacity(window)
     shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
     history = kda_ops.KdaRetainedHistory(
         torch.zeros(shape, device="cuda"),
@@ -695,7 +702,7 @@ def prepare_kda_fused_paged_verify(
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
-    capacity = max(16, window)
+    capacity = _history_capacity(window)
     history_length = request.parameters.get("history_length", 0)
     if type(history_length) is not int or not 0 <= history_length <= capacity - window:
         raise BenchmarkCaseError(
@@ -869,7 +876,7 @@ def prepare_kda_retained_commit(
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,
-            history_capacity=max(16, window),
+            history_capacity=_history_capacity(window),
             num_heads=profile.heads,
             head_dim=profile.head_dim,
             conv_width=common["conv_kernel_size"],
@@ -887,7 +894,7 @@ def prepare_kda_retained_commit(
             "accepted_length": take,
             "layers": layers,
             "state_groups": groups,
-            "history_capacity": max(16, window),
+            "history_capacity": _history_capacity(window),
             "write_page_relation": "distinct",
         },
         validation=None,
