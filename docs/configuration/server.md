@@ -944,7 +944,14 @@ greedily is a measurement, not a given.
 
 - Memory: the same dense rows as the step drafters above,
   `(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes, plus the
-  verifier's gather buffer.
+  verifier's gather buffer. Those rows are persistent; the block's own peak is
+  transient and sits in the drafting round: the one GEMM's whole-vocabulary
+  logits over every block row,
+  `(num_draft_tokens - 1) x batch x vocab_size x 2` bytes, which under tensor
+  parallelism is the gathered vocabulary rather than this rank's shard, plus
+  one `batch x vocab_size` fp32 `q` per row. A greedy block keeps only the
+  shard, so expect the drafting round's logits to grow by the head's TP size
+  when the flag goes on.
 - No proposal: a fresh admission and a PD landing hold the sentinel, so their
   first verify rejects every draft and samples from the full target, as for the
   step drafters. `--spec-reject-draft-prob-threshold` applies. Pass the flag to
@@ -958,8 +965,8 @@ greedily is a measurement, not a given.
 
 `DFLASH` takes the flag with a DFlash2 draft (a checkpoint with candidate
 selector weights) and `--sampling-backend triton` only; a DFlash2 draft with
-any other backend is refused when the server loads it. The DFlash2 walk picks one of the selector's `K`
-candidates per draft step. Under the flag a sampling request draws that
+any other backend is refused when the server loads it. The DFlash2 walk picks
+one of the selector's `K` candidates per draft step. Under the flag a sampling request draws that
 candidate from `q = softmax(scores / T)` over the `K` edges out of the
 previous pick, with noise keyed by the request's seed, the round and the drawn
 token id, so every TP rank draws the same token. Greedy requests keep the best

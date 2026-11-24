@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import os
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -481,17 +480,25 @@ class _HeadlessDraftModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize("drafter_cls", [DFlash, DFlash2])
-def test_block_drafters_never_keep_their_logits_on_a_vocab_shard(drafter_cls):
+@pytest.mark.parametrize(
+    "draft_model_runner",
+    [SimpleNamespace(model=_HeadlessDraftModel()), None],
+    ids=["headless-draft-model", "no-draft-model-runner"],
+)
+def test_block_drafters_never_keep_their_logits_on_a_vocab_shard(
+    drafter_cls, draft_model_runner
+):
     # With a target head sharded over TP and a verifier that reads q per shard
     # (sonic), the executor asks the drafter whether its steps stay sharded.
-    # A block drafter has no per-step shard and no head of its own to inspect:
-    # the base method read ``model.lm_head`` first and raised AttributeError at
-    # startup.
+    # A block drafter has no per-step shard, so it answers before reading the
+    # draft model at all: it has no ``lm_head`` of its own to inspect (it
+    # projects through the target's), and the base method's old order read
+    # ``model.lm_head`` first and raised AttributeError at startup.
     drafter = drafter_cls.__new__(drafter_cls)
     BaseDrafter.__init__(
         drafter,
         spec_num_tokens=N,
-        draft_model_runner=SimpleNamespace(model=_HeadlessDraftModel()),
+        draft_model_runner=draft_model_runner,
     )
     assert drafter.keep_draft_logits_vocab_sharded(lambda *args: True, 0) is False
 
@@ -534,72 +541,6 @@ def test_executor_records_a_base_dflash_q_over_whole_rows_under_a_sharded_target
 
     # One row per pool slot plus the reserved padding slot, over every column.
     assert executor.runtime_states.draft_probs.shape == (POOL + 1, N, VOCAB)
-
-
-class _RecordingSaver:
-    """A memory saver that records which named regions are open as tensors are
-    allocated; only the CPU-backed pool itself is stood in."""
-
-    def __init__(self):
-        self.open_regions: list[str] = []
-        self.seen: list[tuple[str, str]] = []
-
-    @contextmanager
-    def named_region(self, name):
-        self.open_regions.append(name)
-        try:
-            yield
-        finally:
-            self.open_regions.pop()
-
-    def note(self, what):
-        self.seen.append((what, self.open_regions[-1] if self.open_regions else ""))
-
-
-@pytest.mark.parametrize("drafter_cls", [DFlash, DFlash2])
-def test_sampled_drafting_allocates_and_binds_inside_the_runtime_states_region(
-    monkeypatch, drafter_cls
-):
-    # draft_probs (dense q) and the drafter's sampling scratch are read across
-    # rounds and by captured graphs, so they must join the CPU-backed region a
-    # weights release unmaps and a resume restores.
-    saver = _RecordingSaver()
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.memory_saver_adapter = saver
-    executor.runtime_states = RuntimeStates(
-        req_pool_size=POOL,
-        input_vocab_size=VOCAB,
-        vocab_size=VOCAB,
-        output_length=N,
-        device="cpu",
-    )
-    executor._samples_from_vocab_shard = False
-    drafter = drafter_cls.__new__(drafter_cls)
-    bound = []
-    monkeypatch.setattr(
-        drafter_cls,
-        "bind_sampling_backend",
-        lambda self, backend: (saver.note("bind"), bound.append(backend)),
-    )
-    executor.drafter = drafter
-    executor.sampling_backend = object()
-    real_init = RuntimeStates.init_draft_probs
-
-    def init_draft_probs(self, **kwargs):
-        saver.note("draft_probs")
-        return real_init(self, **kwargs)
-
-    monkeypatch.setattr(RuntimeStates, "init_draft_probs", init_draft_probs)
-
-    executor._init_sampled_drafting(_executor_config("DFLASH"), N)
-
-    assert bound == [executor.sampling_backend]
-    # Base DFLASH records the dense rows; DFlash2 records a sparse q instead.
-    expected = [("bind", "runtime_states")]
-    if drafter_cls is DFlash:
-        expected.insert(0, ("draft_probs", "runtime_states"))
-    assert saver.seen == expected
-    assert saver.open_regions == []
 
 
 if __name__ == "__main__":

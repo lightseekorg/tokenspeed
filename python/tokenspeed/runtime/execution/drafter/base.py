@@ -240,11 +240,15 @@ class BaseDrafter:
             ``sample_draft_step`` over a head spanning the target vocabulary,
             whose shard the processor can hand over.
         """
+        # First, before the draft model is read at all: a block drafter has no
+        # per-step shard to keep, and a DFLASH draft has no ``lm_head`` of its
+        # own to inspect (it projects through the target's).
+        if not self.drafts_from_vocab_shard:
+            return False
         model = self.draft_model_runner.model
         lm_head = model.lm_head
         if (
-            not self.drafts_from_vocab_shard
-            or self.draft_vocab_map() is not None
+            self.draft_vocab_map() is not None
             or not isinstance(lm_head, VocabParallelEmbedding)
             or int(lm_head.shard_indices.org_vocab_start_index) != vocab_start
         ):

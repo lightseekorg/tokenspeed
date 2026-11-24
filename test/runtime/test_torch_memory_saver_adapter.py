@@ -808,55 +808,28 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
 def _check_sampled_drafting_on_cuda(sparse: bool):
     """Check the recorded draft q and the sampler's scratch survive a weights release.
 
+    The drafter is the real one and binds through its own
+    ``bind_sampling_backend``: base DFLASH allocating the dense ``draft_probs``
+    rows plus the shared sampler's scratch, or DFlash2 allocating its sparse
+    ``future_draft_q``. Only the verifier is stood in, since constructing one
+    needs the sampling kernels' GPU libraries.
+
     Args:
-        sparse: Record DFlash2's sparse q (``future_draft_q``) instead of the
-            dense ``draft_probs`` rows the other sampled drafters record.
+        sparse: Bind DFlash2 (sparse q) instead of base DFLASH (dense rows).
     """
-    from tokenspeed.runtime.execution.drafter.speculative_sampling import (
-        DraftProposalSampler,
-    )
+    from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
-    vocab, pool, width, max_bs = 64, 6, 4, 4
+    vocab, pool, width, max_bs, top_k = 64, 6, 4, 4, 3
     saver = adapter.TorchMemorySaverAdapter.create(enable=True)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.memory_saver_adapter = saver
-
-    class _Drafter:
-        """Binds what a sampled drafter binds: a real DraftProposalSampler over
-        dense rows, or DFlash2's sparse q."""
-
-        records_sparse_draft_q = sparse
-
-        def __init__(self, states):
-            self.states = states
-            self.draft_sampler = None
-
-        def bind_sampling_backend(self, backend):
-            if sparse:
-                self.states.init_draft_tree_q(
-                    num_nodes=width, num_slots=width - 1, num_candidates=3
-                )
-                return
-            self.draft_sampler = DraftProposalSampler(
-                pools=backend.speculative_sampling_pools(),
-                runtime_states=self.states,
-                input_buffers=SimpleNamespace(
-                    max_bs=max_bs,
-                    req_pool_indices_buf=torch.zeros(
-                        max_bs, dtype=torch.int64, device="cuda"
-                    ),
-                    state_write_req_pool_indices_buf=torch.zeros(
-                        max_bs, dtype=torch.int64, device="cuda"
-                    ),
-                ),
-                spec_num_tokens=width,
-                sampling_stream="batch",
-                vocab_map=None,
-                device="cuda",
-            )
 
     with saver.named_region("runtime_states"):
         executor.runtime_states = RuntimeStates(
@@ -866,15 +839,46 @@ def _check_sampled_drafting_on_cuda(sparse: bool):
             output_length=width,
             device="cuda",
         )
+        buffers = InputBuffers(
+            max_bs=max_bs,
+            max_num_tokens=max_bs * width,
+            state_write_padding_pool_index=pool,
+            device="cuda",
+        )
         pools = SpeculativeSamplingPools(
             temperature=torch.ones(pool + 1, device="cuda"),
             top_k=torch.ones(pool + 1, dtype=torch.int32, device="cuda"),
             top_p=torch.ones(pool + 1, device="cuda"),
             seed=torch.zeros(pool + 1, dtype=torch.int64, device="cuda"),
         )
-    executor.drafter = _Drafter(executor.runtime_states)
+
+    drafter_cls = DFlash2 if sparse else DFlash
+    drafter = drafter_cls.__new__(drafter_cls)
+    BaseDrafter.__init__(
+        drafter,
+        spec_num_tokens=width,
+        runtime_states=executor.runtime_states,
+        input_buffers=buffers,
+    )
+    # wire_target binds the target's head and processor; DFLASH has no head
+    # of its own, and the pairing check only reads the verifier.
+    drafter.logits_processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=vocab),
+        do_argmax=True,
+        dp_lm_head_tp=False,
+        attn_tp_size=1,
+    )
+    if sparse:
+        drafter.selector_top_k = top_k
+    executor.drafter = drafter
+    # Constructing a real verifier needs the sampling kernels' GPU libraries;
+    # the bind path reads only these three members of it.
     executor.sampling_backend = SimpleNamespace(
-        speculative_sampling_pools=lambda: pools
+        config=SimpleNamespace(
+            enable_speculative_sampling=True, sampling_stream="batch"
+        ),
+        reads_sparse_draft_q=lambda: sparse,
+        speculative_sampling_pools=lambda: pools,
     )
     executor._samples_from_vocab_shard = False
     executor._init_sampled_drafting(
@@ -888,10 +892,14 @@ def _check_sampled_drafting_on_cuda(sparse: bool):
     )
     sampler = executor.drafter.draft_sampler
     states = executor.runtime_states
+    # Sampling the dense rows needs whole-vocabulary logits, so the bind turns
+    # the fused argmax off; the DFlash2 walk reads its selector's top-K instead.
+    assert drafter.logits_processor.do_argmax is sparse
     if sparse:
         # DFlash2 records no dense rows; its walk writes the sparse tables.
         assert states.draft_probs is None and sampler is None
         draft_q = states.future_draft_q
+        assert draft_q is executor.drafter._draft_q
         retained = [draft_q.q, draft_q.q_ids, draft_q.slot, draft_q.pos]
         draft_q.q[3, 1, :] = torch.tensor([0.5, 0.25, 0.25], device="cuda")
         draft_q.q_ids[3, 1, :] = torch.tensor(

@@ -271,8 +271,10 @@ class DFlash(BaseDrafter):
                     "--enable-speculative-sampling is not supported by "
                     f"{type(self).__name__}: it proposes a whole block greedily"
                 )
-            # ServerArgs cannot tell base DFLASH from DFlash2 (only the loaded
-            # checkpoint does), so the draft/verifier pairing is checked here.
+            # ServerArgs admits both DFLASH pairings: it validates flags, and
+            # which draft this is follows from the loaded checkpoint. The
+            # pairing is therefore checked here, against the drafter built for
+            # it, rather than guessed from the draft's config.
             if (
                 self.spec_algorithm == "DFLASH"
                 and sampling_backend.reads_sparse_draft_q()
@@ -290,31 +292,13 @@ class DFlash(BaseDrafter):
 
     @override
     def require_full_draft_logits(self) -> None:
-        """DFLASH samples the target's shared head, not a draft-owned processor."""
-        self.logits_processor.require_full_vocab_logits()
+        """DFLASH samples the target's shared head, not a draft-owned processor.
 
-    @override
-    def keep_draft_logits_vocab_sharded(
-        self,
-        supports: Callable[[torch.dtype, int, int], bool],
-        vocab_start: int,
-    ) -> bool:
-        """Never keep the block's logits on this rank's shard.
-
-        The block proposal projects every row in one GEMM and does not go
-        through ``sample_draft_step``, so there is no per-step shard to keep. The
-        base method also reads the draft model's own ``lm_head``, which a DFLASH
-        draft does not have: it projects through the target's head.
-
-        Args:
-            supports: The verifier's ``supports_vocab_shard``.
-            vocab_start: Global token id of the target head's shard column 0.
-
-        Returns:
-            False: the block records q over whole vocabulary rows.
+        The base method reads ``draft_model_runner.model.logits_processor``,
+        which a DFLASH draft model does not have: ``wire_target`` binds the
+        target's head and processor here instead.
         """
-        del supports, vocab_start
-        return False
+        self.logits_processor.require_full_vocab_logits()
 
     @override
     def idle_forward_global_num_tokens(
@@ -1658,6 +1642,16 @@ class DFlash(BaseDrafter):
         Rows do not depend on each other's tokens, so one GEMM projects them
         all. Row ``k`` is verify column ``k``, which ``propose`` calls step
         ``k - 1`` (each step draws its own noise).
+
+        The rows go through the processor rather than a bare matmul, unlike the
+        greedy block: these logits ARE the target head's (``wire_target`` binds
+        the target's head and processor; a DFLASH draft has neither of its
+        own), so the scale and the softcap that standardize them are the
+        target's. The greedy block can skip both because a positive scale and
+        the monotone softcap leave the argmax where it is, but they move a
+        softmax, and a Muse Spark target's scale is 0.18. (DFlash2 instead
+        takes the scale and softcap of its candidate selector's own
+        projection, which the head monokernel bakes in.)
         """
         bs = draft_hidden.shape[0]
         num_steps = self.spec_num_tokens - 1
