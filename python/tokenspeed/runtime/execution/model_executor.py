@@ -83,6 +83,16 @@ from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
+from tokenspeed.runtime.execution.observations import (
+    TargetExecution,
+    VerificationObservations,
+)
+from tokenspeed.runtime.execution.observations import (
+    enabled as execution_observations_enabled,
+)
+from tokenspeed.runtime.execution.observations import (
+    validate_scope,
+)
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import (
     PrefillGraph,
@@ -512,6 +522,7 @@ class ModelExecutorConfig:
     # The scheduler may give extend rows in-forward State checkpoints
     # (--enable-state-checkpoint-in-forward).
     state_checkpoint_in_forward: bool = False
+    execution_observations: bool = False
 
     @property
     def spec_draft_tree(self) -> bool:
@@ -550,6 +561,7 @@ class ModelExecutorConfig:
         disable_prefill_graph = bool(server_args.disable_prefill_graph)
 
         return ModelExecutorConfig(
+            execution_observations=execution_observations_enabled(),
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
@@ -632,6 +644,19 @@ class ModelExecutor:
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
     ):
+        if config.execution_observations:
+            validate_scope(
+                device=config.device,
+                pp_size=config.pp_size,
+                query_shard_size=config.query_shard_size,
+                algorithm=config.spec_algo,
+                tree=config.spec_draft_tree,
+                narrowed=narrowing_prefill_model(model_runner.model) is not None,
+                synthetic=(
+                    sampling_backend.config.synthetic_acceptance_length is not None
+                    or bool(envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get())
+                ),
+            )
         self.device = config.device
         self.config = config
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -695,7 +720,12 @@ class ModelExecutor:
                 ),
                 config.input_vocab_size,
             )
+        self.execution_observations: VerificationObservations | None = None
         with self.memory_saver_adapter.named_region("runtime_states"):
+            if config.execution_observations:
+                self.execution_observations = VerificationObservations(
+                    max_bs=max_bs, device=self.device
+                )
             self.runtime_states = RuntimeStates(
                 req_pool_size=config.max_req_pool_size,
                 input_vocab_size=config.input_vocab_size,
@@ -1640,6 +1670,7 @@ class ModelExecutor:
                 input_ids,
                 self._active_multimodal_context,
                 request_token_history=model_kwargs.get("request_token_history"),
+                observe_execution=self.config.execution_observations,
             )
         if (
             mode is not None
@@ -1651,13 +1682,16 @@ class ModelExecutor:
             self.attn_backend.prepare_prefill_metadata(
                 ctx.input_num_tokens, ctx.bs, mode, capture=False
             )
-        return self.model_runner.forward(
+        output = self.model_runner.forward(
             ctx,
             input_ids,
             positions,
             multimodal_context=self._active_multimodal_context,
             **model_kwargs,
         )
+        if self.config.execution_observations:
+            return output, TargetExecution("eager", 0, ctx.bs, ctx.input_num_tokens, 0)
+        return output
 
     def _model_input_kwargs(
         self, num_tokens: int, bs: int, rows: slice | torch.Tensor
@@ -1732,12 +1766,22 @@ class ModelExecutor:
         row_count: int,
         decode_input_ids: list[int] | None,
     ) -> torch.Tensor:
-        if decode_input_ids is None or row_count <= 0:
+        force_mask = self._force_single_token_verify_mask(
+            row_offset, row_count, decode_input_ids
+        )
+        if force_mask is None:
             return accept_lengths
-        force_mask = self.input_buffers.force_single_token_verify_buf[
+        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
+
+    def _force_single_token_verify_mask(
+        self, row_offset: int, row_count: int, decode_input_ids: list[int] | None
+    ) -> torch.Tensor | None:
+        """The mask this call actually applies; also the observation's source."""
+        if decode_input_ids is None or row_count <= 0:
+            return None
+        return self.input_buffers.force_single_token_verify_buf[
             row_offset : row_offset + row_count
         ]
-        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
     def _decode_candidates(self, ctx: ForwardContext) -> torch.Tensor | None:
         """This step's decode-row candidate window: ``[num_decodes, N]``.
@@ -1779,11 +1823,14 @@ class ModelExecutor:
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
+        *,
+        observations: VerificationObservations | None = None,
     ):
         """Sample and verify, then end each request where the control plane
         ends it: an accepted width is cut at the request's stop token or
-        token limit before anything reads it (the state commit, the accepted
-        frontier, the drafter, the reported tokens)."""
+        token limit before state commit, the accepted frontier, drafting and
+        reported tokens read it. Optional observation snapshots the effective
+        pre-stop length and applied force mask before that in-place cut."""
         drafter = self.drafter
         output_tokens, accept_lengths = sample_with_diagnostics(
             logits_output,
@@ -1805,6 +1852,17 @@ class ModelExecutor:
             ),
         )
         ib = self.input_buffers
+        verification = None
+        if observations is not None:
+            # Same gate and slice as _apply_force_single_token_verify. During
+            # graph replay the captured sampling context owns this decision;
+            # an unconsumed live mask must not be reported as applied.
+            force_single = self._force_single_token_verify_mask(
+                ctx.num_extends, ctx.bs - ctx.num_extends, ctx.decode_input_ids
+            )
+            verification = observations.record(
+                accept_lengths, num_extends=ctx.num_extends, force_single=force_single
+            )
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
             output_tokens,
@@ -1816,7 +1874,8 @@ class ModelExecutor:
             decode_width=ctx.output_layout.decode_width,
             padding_index=ib.state_write_padding_pool_index,
         )
-        return output_tokens, accept_lengths
+        result = (output_tokens, accept_lengths)
+        return result if observations is None else (*result, verification)
 
     def _sample_and_verify(
         self,
@@ -2051,6 +2110,14 @@ class ModelExecutor:
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
             return output_tokens, accept_lengths, None, None
 
+        target_execution = None
+        if self.config.execution_observations:
+            logits_output, target_execution = logits_output
+            if ctx.decode_query_indptr is not None:
+                raise ValueError(
+                    "execution observations v1 do not support packed verification"
+                )
+
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
         if logits_output.input_token_logprobs is not None:
@@ -2077,9 +2144,20 @@ class ModelExecutor:
                 ),
             )
 
-        output_tokens, accept_lengths = self._run_sampling(
-            logits_output, sampling_info, ctx, candidates
+        sampled = self._run_sampling(
+            logits_output,
+            sampling_info,
+            ctx,
+            candidates,
+            observations=self.execution_observations,
         )
+        output_tokens, accept_lengths = sampled[:2]
+        verification_observation = (
+            sampled[2] if self.execution_observations is not None else None
+        )
+
+        if target_execution is not None:
+            target_execution = target_execution.verified(candidates, packed=False)
 
         # Offloading must persist accepted target-input KV before completion
         # can publish prefixes or allow a scheduler request slot to be reused.
@@ -2136,12 +2214,17 @@ class ModelExecutor:
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.join_post_sampler()
-        return (
+        result = (
             output_tokens,
             accept_lengths,
             logits_output.next_token_logprobs,
             logits_output.next_token_cumulative_probs,
             ForwardLogprobs.of(logits_output),
+        )
+        return (
+            result
+            if target_execution is None
+            else (*result, target_execution, verification_observation)
         )
 
     @nvtx_range("update_runtime_state", color="orange")
@@ -2798,6 +2881,12 @@ class ModelExecutor:
             grammar_completion = None
 
             forward_logprobs = None
+            target_execution = (
+                TargetExecution("none", 0, bs, 0, 0)
+                if self.config.execution_observations
+                else None
+            )
+            verification_observation = None
             if total_tokens == 0:
                 settle()
                 # Fully prefix-cached prefill: no tokens to process.
@@ -2941,13 +3030,7 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    (
-                        output_tokens,
-                        output_lengths,
-                        output_logprobs,
-                        output_cumulative_probs,
-                        forward_logprobs,
-                    ) = self.forward_step(
+                    step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -2977,6 +3060,16 @@ class ModelExecutor:
                         block_tables_cpu=block_tables_cpu,
                         settle=settle,
                     )
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        output_cumulative_probs,
+                        forward_logprobs,
+                    ) = step_result[:5]
+                    if self.config.execution_observations:
+                        target_execution = step_result[5]
+                        verification_observation = step_result[6]
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
@@ -3054,6 +3147,12 @@ class ModelExecutor:
                 else:
                     forward_logprobs = ForwardLogprobs()
 
+                if verification_observation is not None:
+                    # Fresh per-result host storage; a later forward may reuse
+                    # the device scratch only after this copy in stream order.
+                    verification_observation = verification_observation.to(
+                        "cpu", non_blocking=True
+                    )
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -3088,6 +3187,12 @@ class ModelExecutor:
                 )
 
         return ModelExecutionResult(
+            execution_observation=(
+                None
+                if target_execution is None
+                else target_execution.payload(tuple(admission_ids))
+            ),
+            verification_observation=verification_observation,
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,

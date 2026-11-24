@@ -228,6 +228,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Rank-wide token counts; None means an older producer did not report them.
     num_resident_tokens: int | None = None
     num_waiting_uncached_tokens: int | None = None
+    # Cumulative rank-local execution evidence; absent on older producers.
+    execution_observations: list[dict | None] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

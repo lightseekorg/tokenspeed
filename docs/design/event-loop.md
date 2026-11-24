@@ -88,6 +88,12 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+Execution observations travel with the ordinary landed forward result. Native
+admission-owned accumulators and pending-forward leases retain identity across
+output termination and restoration; no Python request-slot history is added.
+See [execution observations](execution-observations.md) for W/A/K/C, the applied
+force mask, completion snapshots and loss-aware trace closure.
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new

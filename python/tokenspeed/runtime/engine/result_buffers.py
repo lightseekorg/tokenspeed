@@ -74,7 +74,7 @@ def completed_result(
             top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
             top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
         )
-    return (
+    value = (
         results.output_tokens.tolist(),
         results.output_lengths.tolist(),
         result_buffer(results.output_logprobs),
@@ -93,3 +93,21 @@ def completed_result(
         logprobs,
         result_buffer(results.output_token_cumulative_probs),
     )
+
+    if results.execution_observation is None:
+        return value
+    verification = results.verification_observation
+    if verification is None:
+        if results.execution_observation[1] != "none":
+            raise ValueError(
+                "executed observation requires its fenced verification buffer"
+            )
+        # The fully cached zero-input arm executes no sampler. Its explicit
+        # host sentinel needs neither a device allocation nor a device read.
+        verification_buffer = np.zeros(
+            (len(results.execution_observation[0]), 2), dtype=np.int32
+        )
+        verification_buffer[:, 0] = -1
+    else:
+        verification_buffer = result_buffer(verification)
+    return (*value, (results.execution_observation, verification_buffer))

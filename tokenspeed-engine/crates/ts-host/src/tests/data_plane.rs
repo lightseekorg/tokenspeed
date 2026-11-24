@@ -30,6 +30,8 @@ use super::*;
 
 #[path = "data_plane/cpu_benchmark.rs"]
 mod cpu_benchmark;
+#[path = "data_plane/execution_observation.rs"]
+mod execution_observation;
 #[path = "data_plane/pd_notice.rs"]
 mod pd_notice;
 #[path = "data_plane/result_buffers.rs"]
@@ -863,4 +865,145 @@ fn assert_failure_is_published_before_logging(
         signal_errors,
         "{output}"
     );
+}
+
+#[test]
+fn landed_execution_metadata_crosses_the_completion_boundary() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = pyo3::types::PyDict::new(py);
+        py.run(c"from array import array\nobservations = array('i', [5, 0])\nclass ObservedPlane:\n def complete(self, pending):\n  return ([3,4,5,6,7,8,9,10], [2], None, None, None, None, None, None, None, (((71,), 'decode_graph', 8, 1, 4, 32, 1), memoryview(observations).cast('B').cast('i', shape=[1, 2])))\nplane = ObservedPlane()", Some(&scope), None).unwrap();
+        let plane = scope.get_item("plane").unwrap().unwrap();
+        let result = super::complete(&plane, &py.None()).unwrap();
+        py.run(c"observations[0] = 1", Some(&scope), None).unwrap();
+        assert_eq!(result.output_lengths, [2]);
+        let observation = result.execution_observation.unwrap();
+        assert_eq!(observation.admission_ids, [71]);
+        assert_eq!(observation.verify_width, 8);
+        assert_eq!(observation.request_capacity, 4);
+        assert_eq!(observation.path, "decode_graph");
+        assert_eq!(observation.verification, [[5, 0]]);
+    });
+}
+
+fn completion_diagnostic_fixture(py: Python<'_>) -> Bound<'_, PyDict> {
+    let scope = PyDict::new(py);
+    let code = CString::new(
+        r#"
+from array import array
+from concurrent.futures import Future
+
+class CompletedPlane:
+    def __init__(self, result):
+        self.result = result
+
+    def complete(self, pending):
+        pending.result()
+        return self.result
+
+landed = Future()
+landed.set_result(None)
+ordinary = (
+    [3, 4, 5, 6, 7, 8, 9, 10], [2], array('d', [-0.5] * 8),
+    [0], [[3, 4]], (2, 0.25), [-1],
+    (array('f', [-1.0, -2.0]), None, None), array('f', [0.5] * 8),
+)
+plane = CompletedPlane(ordinary)
+metadata = ((71,), 'decode_graph', 8, 1, 4, 32, 1)
+verification = memoryview(array('i', [5, 0])).cast('B').cast('i', shape=[1, 2])
+malformed = [
+    ('missing diagnostic pair', None),
+    ('short diagnostic pair', (metadata,)),
+    ('long diagnostic pair', (metadata, verification, None)),
+    ('metadata is not a tuple', (None, verification)),
+    ('short metadata', (metadata[:-1], verification)),
+    ('invalid metadata width', (metadata[:2] + (-1,) + metadata[3:], verification)),
+    ('non-buffer verification', (metadata, [[5, 0]])),
+    ('wrong dtype', (metadata, memoryview(array('f', [5, 0])).cast('B').cast('f', shape=[1, 2]))),
+    ('wrong rank', (metadata, array('i', [5, 0]))),
+    ('wrong rows', (metadata, memoryview(array('i', [5, 0, 5, 0])).cast('B').cast('i', shape=[2, 2]))),
+    ('wrong columns', (metadata, memoryview(array('i', [5, 0, 0])).cast('B').cast('i', shape=[1, 3]))),
+]
+malformed_results = [(name, ordinary + (diagnostic,)) for name, diagnostic in malformed]
+invalid_ordinary = [
+    ('invalid tokens', (['not a token'],) + ordinary[1:]),
+    ('invalid lengths', ordinary[:1] + (None,) + ordinary[2:]),
+    ('invalid logprob dtype', ordinary[:2] + (array('i', [0] * 8),) + ordinary[3:]),
+    ('invalid cumulative-probability rank', ordinary[:8] + (verification,)),
+]
+invalid_results = [
+    (name + suffix, result + tail)
+    for name, result in invalid_ordinary
+    for suffix, tail in (
+        (' legacy', ()),
+        (' with valid diagnostic', ((metadata, verification),)),
+        (' with malformed diagnostic', (None,)),
+    )
+] + [('short result', ordinary[:-1]), ('long result', ordinary + (None, None))]
+failed = Future()
+failed.set_exception(RuntimeError('forward result fence failed'))
+"#,
+    )
+    .unwrap();
+    py.run(&code, Some(&scope), None)
+        .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+    scope
+}
+
+#[test]
+fn completion_diagnostic_errors_preserve_the_ordinary_result() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = completion_diagnostic_fixture(py);
+        let plane = scope.get_item("plane").unwrap().unwrap();
+        let landed = scope.get_item("landed").unwrap().unwrap().unbind();
+        let ordinary = super::complete(&plane, &landed).unwrap();
+        assert_eq!(ordinary.output_tokens, [3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(ordinary.output_lengths, [2]);
+        assert_eq!(ordinary.output_logprobs, Some(vec![-0.5; 8]));
+        assert_eq!(ordinary.output_token_cumulative_probs, Some(vec![0.5; 8]));
+        assert!(ordinary.execution_observation.is_none());
+
+        let cases = scope.get_item("malformed_results").unwrap().unwrap();
+        for case in cases.try_iter().unwrap() {
+            let (name, value): (String, Bound<'_, PyAny>) = case.unwrap().extract().unwrap();
+            plane.setattr("result", value).unwrap();
+            let result = super::complete(&plane, &landed)
+                .unwrap_or_else(|error| panic!("{name}: {}", describe(py, &error)));
+            // Compare every ordinary column, including owned Python-buffer copies.
+            assert_eq!(result, ordinary, "{name}");
+            assert!(result.execution_observation.is_none(), "{name}");
+        }
+    });
+}
+
+#[test]
+fn completion_diagnostic_isolation_keeps_ordinary_errors_fatal() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = completion_diagnostic_fixture(py);
+        let plane = scope.get_item("plane").unwrap().unwrap();
+        let landed = scope.get_item("landed").unwrap().unwrap().unbind();
+        let cases = scope.get_item("invalid_results").unwrap().unwrap();
+        for case in cases.try_iter().unwrap() {
+            let (name, value): (String, Bound<'_, PyAny>) = case.unwrap().extract().unwrap();
+            plane.setattr("result", value).unwrap();
+            assert!(super::complete(&plane, &landed).is_err(), "{name}");
+        }
+    });
+}
+
+#[test]
+fn completion_diagnostic_isolation_keeps_fence_errors_fatal() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = completion_diagnostic_fixture(py);
+        let plane = scope.get_item("plane").unwrap().unwrap();
+        let failed = scope.get_item("failed").unwrap().unwrap().unbind();
+        py.run(c"plane.result = ordinary + (None,)", Some(&scope), None)
+            .unwrap();
+        let error = super::complete(&plane, &failed).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        assert!(error.to_string().contains("forward result fence failed"));
+    });
 }

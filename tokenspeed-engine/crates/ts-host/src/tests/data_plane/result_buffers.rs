@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use super::interpreter;
-use crate::data_plane::result_buffers::{float_vector, top_logprobs};
+use crate::data_plane::result_buffers::{float_vector, top_logprobs, verification_observation};
 use pyo3::{prelude::*, types::PyDict};
 
 #[test]
@@ -129,5 +129,30 @@ fn copying_or_rejecting_a_buffer_releases_its_export() {
                 assert_eq!(copied, [1.0, 2.0, 3.0]);
             }
         }
+    });
+}
+
+#[test]
+fn verification_rows_require_native_int32_and_exact_live_shape() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = PyDict::new(py);
+        py.run(c"from array import array\nvalues = array('i', [-1,0,1,1,7,0,8,0])\nview = memoryview(values).cast('B').cast('i', shape=[4,2])", Some(&scope), None).unwrap();
+        let view = scope.get_item("view").unwrap().unwrap();
+        assert_eq!(
+            verification_observation(&view, 4).unwrap(),
+            [[-1, 0], [1, 1], [7, 0], [8, 0]]
+        );
+        assert!(verification_observation(&view, 3).is_err());
+        let floats = py
+            .eval(
+                c"memoryview(array('f', [1,0])).cast('B').cast('f', shape=[1,2])",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+        assert!(verification_observation(&floats, 1).is_err());
+        let vector = py.eval(c"array('i', [1,0])", Some(&scope), None).unwrap();
+        assert!(verification_observation(&vector, 1).is_err());
     });
 }

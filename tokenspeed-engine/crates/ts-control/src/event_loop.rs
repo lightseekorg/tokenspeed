@@ -645,7 +645,12 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The token-history rows' owners, for a model that reads them.
     history: Option<HistoryRows>,
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
-    in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
+    in_flight: VecDeque<(
+        ForwardBatchView,
+        Option<InputLogprobPlan>,
+        D::Pending,
+        Option<crate::execution_observation::ForwardLease>,
+    )>,
     cache_ops: CacheOps,
     controls: Controls,
     /// Accepted cache clear waiting for native completions between rounds.
@@ -789,6 +794,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         phases: Vec<Vec<EngineRequest>>,
         stop: &AtomicBool,
     ) -> Result<bool, LoopError> {
+        self.outputs.execution_startup(true);
         for requests in phases {
             let mut submitted = if self.owns_frontend() {
                 requests
@@ -818,6 +824,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             self.startup_cache_clear = false;
         }
+        self.outputs.execution_startup(false);
         Ok(false)
     }
 
@@ -1175,6 +1182,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             (Some(batch), Some(rows)) => rows.seeds(batch, &self.outputs)?,
             _ => None,
         };
+        let observation = forward
+            .as_ref()
+            .and_then(|batch| self.outputs.observe_dispatch(batch));
         let grammar_advance = forward
             .as_ref()
             .and_then(|batch| self.grammar_advance(batch));
@@ -1217,7 +1227,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
-                self.in_flight.push_back((batch, input_logprobs, pending));
+                self.in_flight
+                    .push_back((batch, input_logprobs, pending, observation));
                 forwarded = true;
             }
         }
@@ -3177,7 +3188,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     ) -> Result<(), LoopError> {
         while self.in_flight.len() > depth {
             let _span = profile::span("EventLoop::commit");
-            let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
+            let (batch, input_logprobs, pending, observation) =
+                self.in_flight.pop_front().expect("non-empty");
             let data_plane = &mut self.data_plane;
             let result =
                 ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
@@ -3188,9 +3200,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 outputs: committed_outputs,
                 released: committed_released,
                 stats,
-            } = self
-                .outputs
-                .commit(&batch, input_logprobs.as_ref(), &result)?;
+            } = self.outputs.commit_observed(
+                &batch,
+                input_logprobs.as_ref(),
+                &result,
+                observation,
+            )?;
             self.record_commit(stats, serving_compiles);
             if batch.num_extends == 0 {
                 self.batch_logger.record_decode(&result.output_lengths);

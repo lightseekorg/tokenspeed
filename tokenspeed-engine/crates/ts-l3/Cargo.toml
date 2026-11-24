@@ -20,8 +20,8 @@ pyo3 = { version = "0.30", optional = true }
 sha2 = "0.10"
 thiserror.workspace = true
 tracing = "0.1"
-ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
-ts-mooncake = { package = "tokenspeed-mooncake", version = "0.1.0", path = "../ts-mooncake" }
+ts-metrics = { package = "tokenspeed-metrics", version = "0.2.0", path = "../ts-metrics" }
+ts-mooncake = { package = "tokenspeed-mooncake", version = "0.2.0", path = "../ts-mooncake" }
 
 [lints]
 workspace = true

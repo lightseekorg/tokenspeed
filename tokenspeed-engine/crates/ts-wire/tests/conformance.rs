@@ -544,6 +544,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         kv_used_pages: 0,
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],
+        execution_observations: Vec::new(),
         input_token_logprobs_val: vec![],
         input_token_logprobs_idx: vec![],
         input_top_logprobs_val: vec![],
@@ -586,6 +587,7 @@ fn output_slim_tail() {
         ],
         spec_verify_ct: vec![2, 0],
         accept_draft_tokens: vec![Some(1.5), None],
+        execution_observations: Vec::new(),
         input_token_logprobs_val: vec![vec![None, Some(-1.0), Some(-2.5)], vec![]],
         input_token_logprobs_idx: vec![vec![1, 2, 3], vec![]],
         input_top_logprobs_val: vec![
@@ -840,4 +842,43 @@ fn shared_prefix_publication_nonce_rank_and_namespace_cross_python_wire() {
             cache_epoch: 7,
         }),
     );
+}
+
+#[test]
+fn execution_snapshot_is_an_optional_append_only_column() {
+    let frames = fixture("output_execution");
+    let EngineOutput::Batch(batch) = EngineOutput::from_frames(&frames).unwrap() else {
+        panic!("batch")
+    };
+    let rows: Vec<_> = batch.requests().unwrap().collect();
+    let observation = rows[0].execution_observations.unwrap();
+    assert_eq!(observation.admission_id, (1u64 << 63) + 13);
+    assert_eq!(observation.bins[0].verify_width, 8);
+    assert_eq!(observation.bins[0].kept_prefix, 1);
+    assert!(rows[1].execution_observations.is_none());
+    assert_eq!(EngineOutput::Batch(batch.clone()).to_frames(), frames);
+    let mut malformed = *batch;
+    malformed.execution_observations.pop();
+    assert!(malformed.requests().is_err());
+    let EngineOutput::Batch(old) =
+        EngineOutput::from_frames(&fixture("output_slim_prefix9")).unwrap()
+    else {
+        panic!("batch")
+    };
+    assert!(old.execution_observations.is_empty());
+}
+
+#[test]
+fn the_complete_pre_observation_producer_has_no_execution_evidence() {
+    let EngineOutput::Batch(batch) =
+        EngineOutput::from_frames(&fixture("output_pre_execution")).unwrap()
+    else {
+        panic!("batch")
+    };
+    assert_eq!(batch.spec_verify_ct, [2, 0]);
+    assert!(batch.execution_observations.is_empty());
+    assert!(batch
+        .requests()
+        .unwrap()
+        .all(|row| row.execution_observations.is_none()));
 }

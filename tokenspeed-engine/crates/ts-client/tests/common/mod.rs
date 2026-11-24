@@ -310,6 +310,7 @@ fn step(
         finish_reason_details: vec![None],
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],
+        execution_observations: Vec::new(),
         input_token_logprobs_val: vec![],
         input_token_logprobs_idx: vec![],
         input_top_logprobs_val: vec![],

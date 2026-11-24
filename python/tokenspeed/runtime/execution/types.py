@@ -327,6 +327,9 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
+    execution_observation: tuple | None = None
+    # Landed int32 [live_bs, 2]: effective acceptance before stop and applied force mask.
+    verification_observation: torch.Tensor | None = None
     copy_event: torch.cuda.Event | RoundFence | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None

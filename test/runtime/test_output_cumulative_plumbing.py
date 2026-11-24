@@ -34,6 +34,30 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.forward_step import live_graph_outputs
 
 
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("live_bs", [0, 1, 3])
+def test_graph_observations_exclude_idle_and_padded_acceptance_rows(width, live_bs):
+    from tokenspeed.runtime.execution.observations import TargetExecution
+
+    tokens = torch.arange(4 * width, dtype=torch.int32)
+    lengths = torch.ones(4, dtype=torch.int32)
+    acceptance = torch.tensor(
+        [[width, 0], [1, 1], [width, 0], [-99, -99]], dtype=torch.int32
+    )
+    receipt = TargetExecution("eager", width, 4, 4 * width, 0)
+    live = live_graph_outputs(
+        (tokens, lengths, None, None, None, receipt, acceptance), live_bs, width
+    )
+    assert live[0].tolist() == list(range(live_bs * width))
+    assert live[1].tolist() == [1] * live_bs
+    assert live[6].tolist() == [[width, 0], [1, 1], [width, 0]][:live_bs]
+    replay = live[5].replayed(request_capacity=4, query_capacity=4 * width)
+    assert replay.path == "decode_graph" and replay.verify_width == width
+    # Fenced consumers get only live acceptance rows even when the graph runs
+    # four rows. In particular an idle peer contributes no acceptance at all.
+    assert live[6].shape == (live_bs, 2)
+
+
 @pytest.mark.parametrize("live_bs", [0, 1, 3])
 def test_graph_replay_slices_cumulative_probabilities_with_the_sampled_tokens(
     live_bs,

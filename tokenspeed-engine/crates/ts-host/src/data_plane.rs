@@ -1016,6 +1016,13 @@ type Completed = (
 
 /// A launched forward's results, once they landed.
 fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardResult> {
+    let value = plane.call_method1("complete", (launched,))?;
+    let tuple = value.cast::<PyTuple>()?;
+    if tuple.len() != 9 && tuple.len() != 10 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "invalid completed result length",
+        ));
+    }
     let (
         output_tokens,
         output_lengths,
@@ -1026,7 +1033,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         grammar_terminated_at,
         logprobs,
         output_token_cumulative_probs,
-    ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
+    ): Completed = tuple.get_slice(0, 9).extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
     let py = plane.py();
@@ -1034,7 +1041,8 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
     let top = |(values, ids): TopLogprobBuffers| {
         result_buffers::top_logprobs(values.bind(py), ids.bind(py))
     };
-    Ok(ForwardResult {
+    let mut result = ForwardResult {
+        execution_observation: None,
         output_tokens,
         output_lengths,
         output_logprobs: output_logprobs.map(floats).transpose()?,
@@ -1046,6 +1054,38 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         input_token_logprobs: input_token_logprobs.map(floats).transpose()?,
         input_top_logprobs: input_top_logprobs.map(top).transpose()?,
         output_top_logprobs: output_top_logprobs.map(top).transpose()?,
+    };
+    if tuple.len() == 10 {
+        // Optional diagnostics cannot fail a valid ordinary result. The frozen
+        // native forward lease marks missing observations as invalid evidence.
+        result.execution_observation = completed_execution_observation(&tuple.get_item(9)?).ok();
+    }
+    Ok(result)
+}
+
+fn completed_execution_observation(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<ts_control::execution_observation::ExecutionResult> {
+    let (metadata, verification): (Bound<'_, PyTuple>, Bound<'_, PyAny>) = value.extract()?;
+    let (
+        admission_ids,
+        path,
+        verify_width,
+        live_requests,
+        request_capacity,
+        query_capacity,
+        graph_segments,
+    ): (Vec<u64>, String, u32, usize, usize, usize, usize) = metadata.extract()?;
+    let verification = result_buffers::verification_observation(&verification, live_requests)?;
+    Ok(ts_control::execution_observation::ExecutionResult {
+        admission_ids,
+        path,
+        verify_width,
+        live_requests,
+        request_capacity,
+        query_capacity,
+        graph_segments,
+        verification,
     })
 }
 

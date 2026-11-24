@@ -1502,6 +1502,15 @@ on NPU. The multicast argmax provider retains its NVIDIA eligibility vote;
 an ineligible group keeps the portable vocabulary-parallel argmax or the
 plain gather, without entering CUDA APIs on another device.
 
+### Optional execution observations
+
+[Execution observations](execution-observations.md) follow the same target and
+sampling path. Optional batch scratch snapshots effective acceptance and the
+applied force-single mask before stop clipping, inside capture/replay too. Its
+named-region storage has no request ownership; live-row CPU copies use the
+existing result fence. Target receipts describe actual calls/replays and never
+credit padding, capture, startup or a drafter-only graph to a measured request.
+
 ## What stays graph-only
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics

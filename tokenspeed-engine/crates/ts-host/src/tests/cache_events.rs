@@ -530,3 +530,64 @@ fn a_contended_publication_handoff_is_bounded_and_reports_overflow() {
     assert_eq!(records.last().unwrap()["lost_observations"], 3);
     assert_eq!(records.last().unwrap()["evidence_valid"], false);
 }
+
+#[test]
+fn execution_leases_share_cache_publication_order_and_close_after_late_results() {
+    use ts_control::execution_observation::{ExecutionResult, ForwardLease, RequestObservation};
+    let mut scheduler = scheduler();
+    let (writer, guard, capture) = writer();
+    let context = install(&mut scheduler, writer);
+    let sink = context.execution_sink();
+    let owner = RequestObservation::new(sink.clone(), "request".into(), 77, false);
+    context
+        .0
+        .emit(json!({"event": "restore_completed", "admission_id": 77,
+        "request_id": "request", "slot": 5, "scope": "local_physical"}));
+    let mut pending = ForwardLease::default();
+    pending.push(owner.clone(), 5, true, 8);
+    owner.terminal("length".into());
+    drop(owner);
+    pending.complete(
+        0,
+        Some(&ExecutionResult {
+            admission_ids: vec![77],
+            path: "decode_graph".into(),
+            verify_width: 8,
+            live_requests: 1,
+            request_capacity: 4,
+            query_capacity: 32,
+            graph_segments: 1,
+            verification: vec![[6, 0]],
+        }),
+        0,
+        0,
+        false,
+        true,
+    );
+    drop(pending);
+    drop(sink);
+    teardown(scheduler, context);
+    drop(guard);
+    let bytes = capture.0.lock().unwrap();
+    let records: Vec<Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line.split_once("] ").unwrap().1).unwrap())
+        .collect();
+    let index = |event| records.iter().position(|r| r["event"] == event).unwrap();
+    assert!(index("restore_completed") < index("target_round_dispatched"));
+    assert!(index("target_round_dispatched") < index("target_round_completed"));
+    assert!(index("target_round_completed") < index("request_closed"));
+    for (order, record) in records.iter().enumerate() {
+        assert_eq!(record["publication_order"], order);
+    }
+    let execution: Vec<_> = records
+        .iter()
+        .filter(|r| r["protocol"] == ts_control::execution_observation::PROTOCOL)
+        .collect();
+    for (sequence, record) in execution.iter().enumerate() {
+        assert_eq!(record["record_sequence"], sequence);
+    }
+    assert_eq!(execution.last().unwrap()["event"], "trace_finished");
+    assert_eq!(execution.last().unwrap()["evidence_valid"], true);
+}

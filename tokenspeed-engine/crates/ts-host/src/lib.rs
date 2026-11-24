@@ -185,6 +185,7 @@ struct Args {
     control_fd: i32,
     enable_async_logging: bool,
     cache_events: Option<cache_events::Settings>,
+    execution_observations: bool,
 }
 
 /// The control and forward threads report to the same launcher.
@@ -841,6 +842,17 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         })
         .transpose()?;
 
+    let execution_sink = if args.execution_observations {
+        Some(
+            cache_events
+                .as_ref()
+                .expect("validated cache observations")
+                .execution_sink(),
+        )
+    } else {
+        None
+    };
+
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
     let listener = Listener::bind(&config.collective_bind_host)?;
@@ -924,7 +936,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 )
             })
         });
-    let outputs = OutputProcessor::new(
+    let mut outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
         Some(config.physical_context_len),
@@ -933,6 +945,9 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         metrics.is_some(),
         trace,
     );
+    if let Some(sink) = execution_sink {
+        outputs.observe_execution(sink);
+    }
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,
@@ -1116,11 +1131,26 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
     // Reject explicit incompatible settings before any Python model bootstrap.
     let cache_events = cache_events::Settings::from_env(enable_async_logging)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let execution_observations = match std::env::var("TOKENSPEED_EXECUTION_EVENT_LOG").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "TOKENSPEED_EXECUTION_EVENT_LOG must be 0 or 1",
+            ))
+        }
+    };
+    if execution_observations && cache_events.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "execution observations require cache observations and async logging",
+        ));
+    }
     py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
             cache_events,
+            execution_observations,
         };
         let log_guard = logging::init(args.enable_async_logging);
         let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
@@ -1156,12 +1186,19 @@ fn cache_event_protocol() -> String {
     cache_events::protocol()
 }
 
+/// Execution observation schema, without model bootstrap or device initialization.
+#[pyfunction]
+fn execution_observation_protocol() -> &'static str {
+    ts_control::execution_observation::PROTOCOL
+}
+
 /// The rank's native control loop and its single scheduler implementation.
 #[pymodule]
 fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
     module.add_function(wrap_pyfunction!(run_host, module)?)?;
     module.add_function(wrap_pyfunction!(cache_event_protocol, module)?)?;
+    module.add_function(wrap_pyfunction!(execution_observation_protocol, module)?)?;
     Ok(())
 }
 

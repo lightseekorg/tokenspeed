@@ -234,6 +234,7 @@ class BreakableCapture:
         self.pool = pool
         self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
+        self._graph_segment_indices: set[int] = set()
         # Per entry of ``segments``, the (wait, layer) calls a replay makes
         # before it: a captured segment's cache accesses hold no layerwise
         # Host-load wait, so the capture notes the highest layer each segment
@@ -321,6 +322,7 @@ class BreakableCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
+        self._graph_segment_indices.add(len(self.segments))
         self.segments.append(self._current_graph.replay)
         self.segment_waits.append(tuple(self._current_waits.items()))
         # All segments share one pool so intermediate addresses stay stable.
@@ -360,7 +362,7 @@ class BreakableCapture:
 
     def replay(
         self, valid_rows: int | None = None, *, noted_waits_done: bool = False
-    ) -> None:
+    ) -> int:
         """Replay all segments in order, each behind the waits its capture noted.
 
         Breaks read the live forward context from the ambient :func:`active_forward`
@@ -374,15 +376,24 @@ class BreakableCapture:
             noted_waits_done: The current stream has already waited for
                 everything the noted waits wait for (a prefill graph's wait
                 for the whole Host load), so the replay skips them.
+
+        Returns the number of captured segment replay calls that completed.
+        Eager breaks do not contribute; completion of GPU work is fenced by
+        the enclosing model result, not this host-side return.
         """
         previous_valid_rows = _replay_valid_rows
         _set_replay_valid_rows(valid_rows)
         try:
-            for waits, run in zip(self.segment_waits, self.segments, strict=True):
+            replayed = 0
+            for index, (waits, run) in enumerate(
+                zip(self.segment_waits, self.segments, strict=True)
+            ):
                 if not noted_waits_done:
                     for wait, layer in waits:
                         wait(layer)
                 run()
+                replayed += index in self._graph_segment_indices
+            return replayed
         finally:
             _set_replay_valid_rows(previous_valid_rows)
 

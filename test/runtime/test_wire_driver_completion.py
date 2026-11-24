@@ -87,3 +87,92 @@ def test_completion_rejects_misaligned_diagnostics_before_adding_tokens(
     assert completion.output_ids == []
     assert completion.output_token_logprobs == []
     assert completion.output_token_cumulative_probs == []
+
+
+def _execution_snapshot(rounds=1, *, admission=7):
+    return dict(
+        version=1,
+        instance_id="fixture",
+        role="fused",
+        dp_rank=0,
+        physical_rank=0,
+        request_id="r",
+        admission_id=admission,
+        origin="serving",
+        assigned_rounds=rounds,
+        completed_rounds=rounds,
+        through_round=rounds,
+        missing_rounds=0,
+        committed_tokens=rounds,
+        evidence_valid=True,
+        pre_stop_bins=[
+            dict(
+                path="decode_graph",
+                verify_width=8,
+                accepted_before_stop=4,
+                force_single=False,
+                count=rounds,
+            )
+        ],
+        bins=[
+            dict(
+                phase="decode",
+                path="decode_graph",
+                verify_width=8,
+                kept_prefix=1,
+                count=rounds,
+            )
+        ],
+    )
+
+
+def test_execution_snapshots_replace_cumulative_counts_and_survive_empty_finish():
+    completion = Completion()
+    for rounds in (1, 2):
+        chunk = _chunk([4], [], [], None)
+        chunk["execution_observations"] = _execution_snapshot(rounds)
+        completion.add(chunk)
+    completion.add(_chunk([], [], [], "length"))
+    assert completion.execution_observations["completed_rounds"] == 2
+    assert completion.execution_observations["bins"][0]["verify_width"] == 8
+    assert completion.execution_observations["bins"][0]["count"] == 2
+
+
+@pytest.mark.parametrize("change", ["identity", "count", "width", "version"])
+def test_bad_execution_snapshot_does_not_mutate_completion(change):
+    completion = Completion()
+    chunk = _chunk([4], [], [], None)
+    chunk["execution_observations"] = _execution_snapshot(2)
+    completion.add(chunk)
+    bad = _execution_snapshot(2)
+    if change == "identity":
+        bad["admission_id"] = 8
+    elif change == "count":
+        bad = _execution_snapshot(1)
+    elif change == "width":
+        bad["bins"][0]["verify_width"] = 0
+    else:
+        bad["version"] = 99
+    chunk["execution_observations"] = bad
+    with pytest.raises(ValueError):
+        completion.add(chunk)
+    assert completion.output_ids == [4]
+    assert completion.execution_observations == _execution_snapshot(2)
+
+
+def test_explicit_budget_omission_keeps_ordinary_tokens_and_invalidates_evidence():
+    completion = Completion()
+    chunk = _chunk([4], [], [], None)
+    chunk["execution_observations"] = _execution_snapshot(1)
+    completion.add(chunk)
+    omitted = _execution_snapshot(2)
+    omitted.update(
+        evidence_valid=False, histograms_omitted=True, bins=[], pre_stop_bins=[]
+    )
+    chunk = _chunk([5], [], [], "length")
+    chunk["execution_observations"] = omitted
+    completion.add(chunk)
+    assert completion.output_ids == [4, 5]
+    assert completion.finish_reason == "length"
+    assert completion.execution_observations == omitted
+    assert not completion.execution_observations["evidence_valid"]

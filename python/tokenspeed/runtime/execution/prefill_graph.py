@@ -87,6 +87,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
 from tokenspeed.runtime.execution.history_embedding import HistoryEmbeddingModel
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+from tokenspeed.runtime.execution.observations import TargetExecution
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
@@ -1397,6 +1398,7 @@ class PrefillGraph:
         multimodal_context=None,
         *,
         request_token_history: RequestTokenHistoryView | None,
+        observe_execution: bool = False,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
@@ -1410,6 +1412,10 @@ class PrefillGraph:
         over the padded bucket and the model's eager logits tail finishes on
         the real-token rows.
         """
+        if observe_execution and self._narrowing is not None:
+            raise ValueError(
+                "execution observations v1 do not support narrowed prefill"
+            )
         bucket = self._replay_bucket(ctx)
         assert bucket is not None, "replay() called without can_run()"
         self._log_engaged_once(bucket, ctx, multimodal_context is not None)
@@ -1467,6 +1473,7 @@ class PrefillGraph:
         else:
             cap, output = self._captures[bucket, None]
             route = "ordinary"
+            request_capacity = ctx.bs
             if self.dp_size == 1 and self.attn_backend.step_counter is None:
                 capture_bs = self._merged_capture_bs(bucket, ctx)
                 ready = self.attn_backend.prepare_prefill_metadata(
@@ -1478,6 +1485,7 @@ class PrefillGraph:
                 if ready and capture_bs is not None:
                     cap, output = self._captures[bucket, capture_bs]
                     route = f"inline@{capture_bs:d}"
+                    request_capacity = capture_bs
             self._count_route(route)
             with self._padded_to(ctx, bucket):
                 if self._expert_load_rows is not None:
@@ -1485,19 +1493,29 @@ class PrefillGraph:
                         padded_global_num_tokens=[bucket] * self.config.world_size,
                         live_global_num_tokens=live_global_num_tokens,
                     )
-                cap.replay(valid_rows=num_tokens, noted_waits_done=whole_load_waited)
+                graph_segments = cap.replay(
+                    valid_rows=num_tokens, noted_waits_done=whole_load_waited
+                )
                 if self._expert_load_rows is not None:
                     self._expert_load_rows.clear()
             hidden_states, aux_hidden_states = output.sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
-        return self.text_model.logits_processor(
+        output = self.text_model.logits_processor(
             input_ids,
             hidden_states,
             self.text_model.lm_head,
             logits_metadata,
             aux_hidden_states,
         )
+        if observe_execution:
+            path = (
+                "prefill_inline" if route.startswith("inline@") else "prefill_breakable"
+            )
+            return output, TargetExecution(
+                path, 0, request_capacity, bucket, graph_segments
+            )
+        return output
 
     def _count_route(self, route: str) -> None:
         """Count a replay of ``route``; global rank 0 logs the route mix every

@@ -46,6 +46,8 @@ const PENDING_ABORT_TTL: Duration = Duration::from_secs(300);
 /// One forward's results, read once its device-to-host copy landed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForwardResult {
+    /// Optional target receipt and pre-stop rows copied after the existing fence.
+    pub execution_observation: Option<crate::execution_observation::ExecutionResult>,
     /// Sampled tokens: each prefill row's kept tokens, then each decode row's
     /// whole verify window (one token without speculation).
     pub output_tokens: Vec<i32>,
@@ -150,6 +152,7 @@ impl ForwardResult {
             output_tokens,
             output_lengths,
             output_logprobs,
+            execution_observation: None,
             // Not shared: the engine refuses the diagnostic under a pipeline.
             output_token_cumulative_probs: None,
             nan_flags,
@@ -276,6 +279,8 @@ impl HistoryRows {
 /// One request's output to the frontend this step.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamedOutput {
+    /// Cumulative native execution evidence through this output, when enabled.
+    pub execution_observations: Option<ts_wire::output::ExecutionSnapshot>,
     /// Request id.
     pub rid: String,
     /// Tokens generated since the last output.
@@ -506,6 +511,8 @@ pub struct RequestMetrics {
 
 /// The admitted requests and their outputs.
 pub struct OutputProcessor {
+    execution_sink: Option<Arc<dyn crate::execution_observation::Sink>>,
+    execution_startup: bool,
     states: HashMap<String, RequestState>,
     /// Aborts for requests not registered yet, oldest first.
     pending_aborts: VecDeque<(String, Instant)>,
@@ -556,6 +563,8 @@ impl OutputProcessor {
     ) -> Self {
         Self {
             states: HashMap::new(),
+            execution_sink: None,
+            execution_startup: false,
             pending_aborts: VecDeque::new(),
             spec_num_tokens,
             stream_interval,
@@ -580,6 +589,39 @@ impl OutputProcessor {
             completion_token_samples: Vec::new(),
             spec_decode_accept_length_samples: Vec::new(),
         }
+    }
+
+    /// Install before admissions; the sink owns no scheduler or device resources.
+    pub fn observe_execution(&mut self, sink: Arc<dyn crate::execution_observation::Sink>) {
+        assert!(self.states.is_empty());
+        self.execution_sink = Some(sink);
+    }
+
+    /// Set the immutable origin assigned to subsequent admissions.
+    pub fn execution_startup(&mut self, startup: bool) {
+        self.execution_startup = startup;
+    }
+
+    /// Freeze real request rows before submission, retaining no scheduler slots.
+    pub fn observe_dispatch(
+        &self,
+        batch: &ForwardBatchView,
+    ) -> Option<crate::execution_observation::ForwardLease> {
+        self.execution_sink.as_ref()?;
+        let mut lease = crate::execution_observation::ForwardLease::default();
+        for (i, rid) in batch.request_ids.iter().enumerate() {
+            let owner = self.states[rid]
+                .execution_observation
+                .as_ref()
+                .expect("observed admission");
+            lease.push(
+                owner.clone(),
+                batch.request_pool_indices[i],
+                i >= batch.num_extends,
+                batch.input_lengths[i],
+            );
+        }
+        Some(lease)
     }
 
     /// Per-request latency samples and token totals since the last drain.
@@ -758,6 +800,15 @@ impl OutputProcessor {
     /// Trace one released request: the span the request's own timestamps
     /// assemble, handed to the export thread when the sample keeps it.
     fn trace_end(&self, rid: &str, state: &RequestState) {
+        if let Some(owner) = &state.execution_observation {
+            owner.terminal(
+                state
+                    .finished_reason
+                    .as_ref()
+                    .map_or("released", FinishReason::wire_type)
+                    .into(),
+            );
+        }
         let Some(trace) = &self.trace else {
             return;
         };
@@ -917,6 +968,14 @@ impl OutputProcessor {
     /// An abort that arrived before it applies now.
     pub fn register(&mut self, rid: String, mut state: RequestState) {
         assert_ne!(state.admission, 0, "assign an identity before registration");
+        state.execution_observation = self.execution_sink.as_ref().map(|sink| {
+            crate::execution_observation::RequestObservation::new(
+                sink.clone(),
+                rid.clone(),
+                state.admission,
+                self.execution_startup,
+            )
+        });
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -1414,7 +1473,23 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        self.commit_observed(batch, input_logprobs, result, None)
+    }
+
+    /// Commit ordinary results and record execution under their frozen lease.
+    pub fn commit_observed(
+        &mut self,
+        batch: &ForwardBatchView,
+        input_logprobs: Option<&InputLogprobPlan>,
+        result: &ForwardResult,
+        mut observations: Option<crate::execution_observation::ForwardLease>,
+    ) -> Result<Committed, CommitError> {
         let _span = profile::span("OutputProcessor::commit");
+        if observations.is_none() {
+            if let Some(sink) = &self.execution_sink {
+                sink.emit(serde_json::json!({"event": "observation_loss", "reason": "missing_dispatch_lease", "dropped_count": 1}));
+            }
+        }
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {
@@ -1488,7 +1563,31 @@ impl OutputProcessor {
             ..Committed::default()
         };
         let mut streamed: Vec<&str> = Vec::with_capacity(rows);
+        let observation_admissions: Option<Vec<_>> = observations.as_ref().map(|_| {
+            batch
+                .request_ids
+                .iter()
+                .enumerate()
+                .map(|(i, rid)| {
+                    self.states.get(rid).is_some_and(|state| {
+                        observations.as_ref().unwrap().matches(i, state.admission)
+                    })
+                })
+                .collect()
+        });
         let mut pt = 0usize;
+        let mut observe = |i: usize, kept: i32, committed: usize, nan: bool, discarded: bool| {
+            if let Some(lease) = observations.as_mut() {
+                lease.complete(
+                    i,
+                    result.execution_observation.as_ref(),
+                    kept,
+                    committed,
+                    nan,
+                    discarded,
+                );
+            }
+        };
         for i in 0..rows {
             let rid = &batch.request_ids[i];
             let output_length = result.output_lengths[i].max(0) as usize;
@@ -1524,7 +1623,12 @@ impl OutputProcessor {
                 && batch.extend_prefix_lens[i] + batch.input_lengths[i] < batch.prefill_lengths[i];
             let nan_flag = result.nan_flags.as_ref().is_some_and(|flags| flags[i] != 0);
 
-            let Some(state) = self.states.get_mut(rid) else {
+            let Some(state) = self.states.get_mut(rid).filter(|_| {
+                observation_admissions
+                    .as_ref()
+                    .is_none_or(|matches| matches[i])
+            }) else {
+                observe(i, result.output_lengths[i], 0, nan_flag, true);
                 // It ended while this forward was in flight. The forward still
                 // landed; its tokens keep the scheduler's frontier exact.
                 committed.events.push(extend_result(
@@ -1552,6 +1656,7 @@ impl OutputProcessor {
                 state.computed_length += i64::from(batch.input_lengths[i]);
             }
             if mid_chunk {
+                observe(i, result.output_lengths[i], 0, nan_flag, false);
                 // The chunk's KV landed: report it so the scheduler stops
                 // counting the forward against the pages.
                 if nan_flag {
@@ -1561,6 +1666,7 @@ impl OutputProcessor {
                 continue;
             }
             if !state.prefill_finished() {
+                observe(i, result.output_lengths[i], 0, nan_flag, false);
                 continue;
             }
             if is_decode && output_length == 0 {
@@ -1707,6 +1813,13 @@ impl OutputProcessor {
                     break;
                 }
             }
+            observe(
+                i,
+                result.output_lengths[i],
+                state.output_ids.len() - before,
+                nan_detected,
+                false,
+            );
             if is_decode && self.metrics_enabled {
                 self.generated_tokens += (state.output_ids.len() - before) as u64;
             }
@@ -1907,6 +2020,10 @@ impl OutputProcessor {
             )
         });
         Some(StreamedOutput {
+            execution_observations: state
+                .execution_observation
+                .as_ref()
+                .and_then(|owner| owner.wire_snapshot()),
             rid: rid.to_owned(),
             output_ids,
             finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
@@ -1985,10 +2102,135 @@ mod tests {
             next_input_ids: None,
             serving_compiles: None,
             grammar_terminated_at: None,
+            execution_observation: None,
             input_token_logprobs: None,
             input_top_logprobs: None,
             output_top_logprobs: None,
         }
+    }
+
+    #[test]
+    fn observed_commit_counts_native_trimming_and_late_zero_prefix() {
+        use crate::execution_observation::{tests::MemorySink, ExecutionResult};
+        let sink = Arc::new(MemorySink::default());
+        let mut p = processor(Some(8));
+        p.observe_execution(sink.clone());
+        register(&mut p, "r", 1, 3, &[]);
+        let admission = p.state("r").unwrap().admission;
+        let prefill = batch(&[("r", 1, 0, 1)], 1);
+        let lease = p.observe_dispatch(&prefill);
+        let mut prefill_result = result(&[10], &[1]);
+        prefill_result.execution_observation = Some(ExecutionResult {
+            admission_ids: vec![admission],
+            path: "prefill_breakable".into(),
+            verify_width: 0,
+            live_requests: 1,
+            request_capacity: 1,
+            query_capacity: 16,
+            graph_segments: 2,
+            verification: vec![[-1, 0]],
+        });
+        p.commit_observed(&prefill, None, &prefill_result, lease)
+            .unwrap();
+        let decode = batch(&[("r", 8, 0, 1)], 0);
+        let lease = p.observe_dispatch(&decode);
+        let late = p.observe_dispatch(&decode);
+        let mut decoded = result(&[20, 21, 22, 23, 24, 25, 26, 27], &[5]);
+        decoded.execution_observation = Some(ExecutionResult {
+            admission_ids: vec![admission],
+            path: "decode_graph".into(),
+            verify_width: 8,
+            live_requests: 1,
+            request_capacity: 4,
+            query_capacity: 32,
+            graph_segments: 1,
+            verification: vec![[7, 0]],
+        });
+        let committed = p.commit_observed(&decode, None, &decoded, lease).unwrap();
+        assert_eq!(committed.outputs[0].output_ids, [20, 21]);
+        let snapshot = committed.outputs[0]
+            .execution_observations
+            .as_ref()
+            .unwrap();
+        assert_eq!(snapshot.completed_rounds, 2);
+        assert_eq!(snapshot.assigned_rounds, 3);
+        assert_eq!(snapshot.committed_tokens, 3);
+        assert!(snapshot
+            .bins
+            .iter()
+            .any(|b| b.verify_width == 8 && b.kept_prefix == 5));
+        decoded.output_lengths[0] = 0;
+        p.commit_observed(&decode, None, &decoded, late).unwrap();
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.last().unwrap()["event"], "request_closed");
+        assert_eq!(events.last().unwrap()["completed_rounds"], 3);
+        assert_eq!(events.last().unwrap()["evidence_valid"], true);
+        assert!(events.iter().any(|v| v["event"] == "target_round_completed"
+            && v["kept_prefix"] == 5
+            && v["committed_tokens"] == 2));
+    }
+
+    #[test]
+    fn mixed_rows_keep_the_actual_shared_target_route_and_omit_idle_padding() {
+        use crate::execution_observation::{tests::MemorySink, ExecutionResult};
+        let sink = Arc::new(MemorySink::default());
+        let mut p = processor(Some(8));
+        p.observe_execution(sink.clone());
+        register(&mut p, "dec", 1, 32, &[]);
+        let aid = p.state("dec").unwrap().admission;
+        let prefill = batch(&[("dec", 1, 0, 1)], 1);
+        let mut first = result(&[9], &[1]);
+        first.execution_observation = Some(ExecutionResult {
+            admission_ids: vec![aid],
+            path: "eager".into(),
+            verify_width: 0,
+            live_requests: 1,
+            request_capacity: 1,
+            query_capacity: 1,
+            graph_segments: 0,
+            verification: vec![[-1, 0]],
+        });
+        let lease = p.observe_dispatch(&prefill);
+        p.commit_observed(&prefill, None, &first, lease).unwrap();
+        register(&mut p, "open", 4, 16, &[]);
+        let open_id = p.state("open").unwrap().admission;
+        let mixed = batch(&[("open", 2, 0, 4), ("dec", 8, 0, 1)], 1);
+        let lease = p.observe_dispatch(&mixed);
+        let mut step = result(&[99, 10, 11, 12, 13, 14, 15, 16, 17], &[1, 3]);
+        step.execution_observation = Some(ExecutionResult {
+            admission_ids: vec![open_id, aid],
+            path: "prefill_inline".into(),
+            verify_width: 8,
+            live_requests: 2,
+            request_capacity: 2,
+            query_capacity: 16,
+            graph_segments: 2,
+            verification: vec![[-1, 0], [5, 0]],
+        });
+        let committed = p.commit_observed(&mixed, None, &step, lease).unwrap();
+        assert_eq!(committed.outputs.len(), 1);
+        assert_eq!(committed.outputs[0].rid, "dec");
+        let snapshot = committed.outputs[0]
+            .execution_observations
+            .as_ref()
+            .unwrap();
+        assert!(snapshot.bins.iter().any(|b| b.phase == "decode"
+            && b.path == "prefill_inline"
+            && b.verify_width == 8
+            && b.kept_prefix == 3));
+        let open = p
+            .state("open")
+            .unwrap()
+            .execution_observation
+            .as_ref()
+            .unwrap()
+            .snapshot();
+        assert_eq!(open.completed_rounds, 1);
+        assert_eq!(open.committed_tokens, 0);
+        assert_eq!(open.bins[0].verify_width, 0);
+        let events_before = sink.0.lock().unwrap().len();
+        drop(p.observe_dispatch(&batch(&[], 0)));
+        assert_eq!(sink.0.lock().unwrap().len(), events_before);
     }
 
     const NO_FINISH_LOG: FinishLog = FinishLog {

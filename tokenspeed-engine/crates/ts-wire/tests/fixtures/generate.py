@@ -441,6 +441,49 @@ def _output_slim_tail() -> list[bytes]:
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
 
+def _output_execution() -> list[bytes]:
+    batch = msgspec.msgpack.decode(_output_slim_tail()[0], type=BatchTokenIDOutSlim)
+    batch.execution_observations = [
+        dict(
+            version=1,
+            instance_id="example",
+            role="fused",
+            dp_rank=0,
+            physical_rank=0,
+            request_id="a",
+            admission_id=2**63 + 13,
+            origin="serving",
+            assigned_rounds=2,
+            completed_rounds=1,
+            through_round=1,
+            missing_rounds=0,
+            committed_tokens=1,
+            evidence_valid=True,
+            bins=[
+                dict(
+                    phase="decode",
+                    path="decode_graph",
+                    verify_width=8,
+                    kept_prefix=1,
+                    count=1,
+                )
+            ],
+            pre_stop_bins=[
+                dict(
+                    path="decode_graph",
+                    verify_width=8,
+                    accepted_before_stop=4,
+                    force_single=False,
+                    count=1,
+                )
+            ],
+            histograms_omitted=False,
+        ),
+        None,
+    ]
+    return [bytes(f) for f in _ENCODER.encode(batch)]
+
+
 def _output_slim_prefix9() -> list[bytes]:
     # An older producer: the tag plus the eight required fields, without the
     # engine index and load tail. Decoders fill the tail with zeros.
@@ -531,6 +574,16 @@ def _handshake_ready_response() -> list[bytes]:
     ]
 
 
+def _output_pre_execution() -> list[bytes]:
+    # Frozen complete pre-observation producer frame; do not regenerate from
+    # the current schema. Its absent column must remain unavailable.
+    return [
+        bytes.fromhex(
+            "dc001cb34261746368546f6b656e49444f7574536c696d92a161a162929107910892a473746f70a561626f72749203029201019200009291cbbfd0000000000000909291079000000000009282a474797065a473746f70a76d6174636865640784a474797065a561626f7274a76d657373616765b9496e76616c696420726571756573743a20746f6f206d616e79a86572725f74797065cd020aab7374617475735f636f6465cd019092020092cb3ff8000000000000c09293c0cbbff0000000000000cbc004000000000000909293010203909293c092cbbfe0000000000000cbbff000000000000092cbbfe8000000000000cbc004000000000000909293c092090292040390929192cbbfd0000000000000cbc00800000000000090929192070190009291cb3fe800000000000090920100c0c0"
+        )
+    ]
+
+
 FIXTURES = {
     "generate_minimal": _generate_minimal,
     "generate_text": _generate_text,
@@ -548,6 +601,8 @@ FIXTURES = {
     "control_output_internal_state": _control_output_internal_state,
     "output_slim": _output_slim,
     "output_slim_tail": _output_slim_tail,
+    "output_execution": _output_execution,
+    "output_pre_execution": _output_pre_execution,
     "output_slim_prefix9": _output_slim_prefix9,
     "handshake_hello": _handshake_hello,
     "handshake_init": _handshake_init,
