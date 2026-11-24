@@ -605,7 +605,8 @@ def fp8_case(queries, prefixes, *, heads, kv_heads):
         # Several requests of unequal cached lengths, two rounds of
         # work-group pairs and more: four waves a SIMD.
         pytest.param([4096] * 4, [49152, 102400, 151552, 200704], id="4-unequal"),
-        # One long request beside short ones, under one round: compiler's.
+        # One long request beside short ones, under two rounds of work-group
+        # pairs: compiler's.
         pytest.param([4096] + [512] * 7, [290816] + [2048] * 7, id="long-and-short"),
     ],
 )
@@ -670,7 +671,7 @@ def test_eight_wave_occupancy_selection(
 
 
 @pytest.mark.parametrize(
-    "batch,workgroups,shares",
+    "batch,num_workgroups,shares",
     [
         # One request always shares CUs.
         (1, 64, True),
@@ -681,14 +682,14 @@ def test_eight_wave_occupancy_selection(
         (8, 516, False),
     ],
 )
-def test_several_requests_share_cus_from_two_rounds(batch, workgroups, shares):
+def test_several_requests_share_cus_from_two_rounds(batch, num_workgroups, shares):
     if not is_amd():
         pytest.importorskip(
             "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
         )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
-    assert extend._shares_cus(batch, workgroups) == shares
+    assert extend._shares_cus(batch, num_workgroups) == shares
 
 
 @pytest.mark.usefixtures("require_gfx950")

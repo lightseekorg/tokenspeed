@@ -226,8 +226,8 @@ def _launch_options(
     return options
 
 
-def _shares_cus(batch: int, workgroups: int) -> bool:
-    """Whether an extend launch of batch requests and workgroups work-groups
+def _shares_cus(batch: int, num_workgroups: int) -> bool:
+    """Whether an extend launch of batch requests and num_workgroups work-groups
     (query blocks x KV heads x KV splits) takes four waves a SIMD (two
     work-groups a CU, _launch_options).
 
@@ -241,7 +241,7 @@ def _shares_cus(batch: int, workgroups: int) -> bool:
     """
     # Two rounds of work-group pairs on every CU.
     min_workgroups_per_cu = 4
-    return batch == 1 or workgroups >= min_workgroups_per_cu * _GFX950_SM_COUNT
+    return batch == 1 or num_workgroups >= min_workgroups_per_cu * _GFX950_SM_COUNT
 
 
 def _extend_tile(
@@ -1934,9 +1934,9 @@ def _extend(
             # soonest: rounds of the CUs per split of the KV stream, fewer
             # splits on a tie. Where it does, the 4-wave count stands.
             # These rounds count one 8-wave work-group a CU, as at the
-            # compiler's occupancy. A one-request launch compiled at four
-            # waves a SIMD fits two, and takes the same split
-            # count so that its bits do not depend on the request count.
+            # compiler's occupancy. A launch compiled at four waves a SIMD
+            # (_shares_cus) fits two, and takes the same split count so that
+            # its bits do not depend on the request count.
             eight_wave_groups = grid_num_q_blocks * n_kv_heads
             if eight_wave_groups * num_kv_splits % _GFX950_SM_COUNT != 0:
                 limit = min(
