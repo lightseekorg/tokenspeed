@@ -26,7 +26,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.ple import ple_host_gather
 from torch import nn
+
+from tokenspeed.runtime.layers.ple_shared_table import PLESharedTable
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
@@ -107,8 +110,6 @@ def host_gather_ngram_rows(
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Gather local host rows and apply the table's FP8 scale when present."""
-
-    from tokenspeed_kernel.ops.ple import ple_host_gather
 
     return ple_host_gather(
         embedding.weight,
@@ -203,8 +204,6 @@ class PLELookup(nn.Module):
                 ),
             )
         if mapped:
-            from tokenspeed.runtime.layers.ple_shared_table import PLESharedTable
-
             self.shared_table = PLESharedTable(
                 mapping, self.ngram_embedding.weight, table_layout
             )
@@ -384,8 +383,6 @@ class PLELookup(nn.Module):
         """
         scale = self._checkpoint_weight_scale if self.embed_store_dtype else None
         if self.peer_ptrs is not None:
-            from tokenspeed_kernel.ops.ple import ple_host_gather
-
             table = self.ngram_embedding
             return ple_host_gather(
                 table.weight,

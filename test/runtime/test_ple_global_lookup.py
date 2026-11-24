@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.layers import ple_lookup
 
 
@@ -159,9 +160,6 @@ def _cached_lookup_worker(rank, rendezvous, tp_size):
     from tokenspeed.runtime.distributed.comm_backend import set_global_backend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager,
-    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -363,9 +361,6 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
 
 
 def _mapped_lookup_worker(rank, rendezvous):
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager,
-    )
 
     torch.cuda.set_device(rank)
     mapping = _mapping_class()(rank=rank, world_size=2, attn_tp_size=1, attn_dp_size=2)
