@@ -23,7 +23,11 @@
 import json
 from dataclasses import replace
 from pathlib import Path
-from test.execution_observation_assets import create_tiny_llama, resolve_qualification
+from test.execution_observation_assets import (
+    create_tiny_llama,
+    create_tiny_qwen35,
+    resolve_qualification,
+)
 
 import pytest
 import torch
@@ -58,6 +62,44 @@ def test_synthetic_checkpoint_and_tokenizer_load_offline(local_args, monkeypatch
     assert torch.count_nonzero(weights["lm_head.weight"]) > 0
 
 
+def test_inline_checkpoint_and_tokenizer_load_offline_without_cuda(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoTokenizer
+
+    def no_cuda():
+        raise AssertionError("asset creation must remain on CPU")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", no_cuda)
+    before = torch.random.get_rng_state().clone()
+    args = create_tiny_qwen35(tmp_path / "target")
+    assert torch.equal(torch.random.get_rng_state(), before)
+    path = Path(args[args.index("--model") + 1])
+    config = AutoConfig.from_pretrained(path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    weights = load_file(str(path / "model.safetensors"), device="cpu")
+    assert config.text_config.layer_types == ["linear_attention", "full_attention"]
+    assert (
+        json.loads((path / "config.json").read_text())["text_config"][
+            "full_attention_interval"
+        ]
+        == 2
+    )
+    assert tokenizer.encode("token17 token31", add_special_tokens=False) == [17, 31]
+    assert weights[
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    ].shape == (1024, 256)
+    assert weights["lm_head.weight"].shape == (256, 256)
+    assert all(
+        value.device.type == "cpu" and value.dtype == torch.bfloat16
+        for value in weights.values()
+    )
+    assert torch.count_nonzero(weights["lm_head.weight"]) > 0
+    with pytest.raises(FileExistsError):
+        create_tiny_qwen35(path)
+
+
 @pytest.mark.parametrize(
     "speculation",
     [[], ["--speculative-algorithm", "DUMMY", "--speculative-num-draft-tokens", "8"]],
@@ -78,6 +120,46 @@ def test_unprofiled_dense_fixture_does_not_claim_rl_bitwise(local_args):
     args = list(local_args)
     args[args.index("--numerics") + 1] = "rl-bitwise"
     with pytest.raises(ValueError, match="has not been verified"):
+        resolve_qualification(args)
+
+
+def test_dflash_shorter_window_keeps_the_declared_checkpoint_block(
+    local_args, tmp_path
+):
+    from transformers import Qwen3Config
+
+    # Configuration admission only; this is not a trained serving checkpoint.
+    draft = tmp_path / "draft"
+    Qwen3Config(
+        architectures=["DFlashDraftModel"],
+        hidden_size=256,
+        intermediate_size=768,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=128,
+        vocab_size=256,
+        block_size=16,
+        dflash_config={"mask_token_id": 3, "target_layer_ids": [0, 1]},
+    ).save_pretrained(draft)
+    before = (draft / "config.json").read_bytes()
+    args = local_args + [
+        "--speculative-algorithm",
+        "DFLASH",
+        "--speculative-draft-model-path",
+        str(draft),
+        "--speculative-num-steps",
+        "7",
+        "--speculative-num-draft-tokens",
+        "8",
+    ]
+    report = resolve_qualification(args)
+    assert report["configured_verify_width"] == 8
+    assert report["checkpoint_block_sizes"] == [None, 16]
+    assert (draft / "config.json").read_bytes() == before
+    args[args.index("--speculative-num-steps") + 1] = "31"
+    args[args.index("--speculative-num-draft-tokens") + 1] = "32"
+    with pytest.raises(ValueError, match="drafts at most"):
         resolve_qualification(args)
 
 

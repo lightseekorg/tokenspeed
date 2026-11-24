@@ -251,6 +251,10 @@ def test_actual_routes_widths_closed_trace_and_noninterference(
         assert all(
             not r["force_single"] or r["accepted_before_stop"] == 1 for r in decode
         )
+        if algorithm == "DFLASH":
+            assert any(
+                r["accepted_before_stop"] > 1 for r in decode
+            ), "each trained-draft target must actually accept multiple tokens"
         assert sum(b["count"] for b in snapshot["pre_stop_bins"]) == sum(
             b["count"] for b in snapshot["bins"] if b["phase"] == "decode"
         )
