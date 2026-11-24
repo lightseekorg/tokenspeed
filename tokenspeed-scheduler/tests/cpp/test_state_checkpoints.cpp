@@ -1382,6 +1382,104 @@ TEST_F(DropDeadCheckpointsSuite, AnUncoveredPromptEndIsCachedButNotTheFinish) {
     }
 }
 
+// The same short-end policy on fused serving must agree at admission, the
+// first decode and finish. It removes only the cache publication, not the
+// working State or the full pages the request computed.
+class DropShortFusedPromptEndsSuite : public DropDeadCheckpointsSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DropDeadCheckpointsSuite::MakeConfig();
+        cfg.decode_input_tokens = 1;
+        cfg.drop_short_prompt_end_checkpoints = true;
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(DropShortFusedPromptEndsSuite, AdmissionAndFirstDecodeKeepWorkingStateThroughRestore) {
+    config_.debug_force_retraction_interval = 4;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit(RequestWithTokens("seed", MakeTokens(6)));
+    const ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(prefill);
+    ASSERT_NE(batch, nullptr);
+    const auto live = StateRow(*batch, "state0", "seed").at(1);
+    EXPECT_EQ(HeldOutsideTables(), 0);
+    SendForwardDone("seed", {900});
+    AckWriteBacks(prefill);
+    const ExecutionPlan first = Decode("seed", 1);
+    ASSERT_NE(FindForwardBatch(first), nullptr);
+    EXPECT_TRUE(first.pages_to_copy.at("full").empty());
+    EXPECT_EQ(StateRow(*FindForwardBatch(first), "state0", "seed").at(1), live);
+    EXPECT_EQ(scheduler_->TailEntries(), 0u);
+    Decode("seed", 1);
+
+    // The dropped prompt end must not remove the working State needed by
+    // this request's retraction at frontier 8 and subsequent decode.
+    const ExecutionPlan retraction = PlanOnce();
+    const SnapshotStoreBatch* store = FindSnapshotStore(retraction);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->request_ids, std::vector<std::string>{"seed"});
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(retraction);
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"seed"});
+    AckRestores(readmit);
+    const ExecutionPlan resumed = PlanOnce();
+    batch = FindForwardBatch(resumed);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"seed"});
+    std::int32_t restored_states = 0;
+    for (std::size_t i = 0; i < restore->group_ids.at(0).size(); ++i) {
+        const auto& group = config_.cache_groups.at(restore->group_ids.at(0)[i]);
+        if (group.attn_kind != AttnKind::kState) {
+            continue;
+        }
+        ++restored_states;
+        const auto row = StateRow(*batch, group.group_id, "seed");
+        EXPECT_GT(row.at(1), 0);
+        EXPECT_EQ(row.at(1), restore->dst_pages.at(0)[i]);
+    }
+    EXPECT_EQ(restored_states, 3);
+    AckWriteBacks(resumed);
+    SendForwardDone("seed", {903});
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), config_.snapshot_allocator.NumUsableBlocks());
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+}
+
+TEST_F(DropShortFusedPromptEndsSuite, OneTokenFinishDropsTheTailAndItsHostStore) {
+    Submit(RequestWithTokens("seed", MakeTokens(6)));
+    RunPrefill("seed", 6);
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(scheduler_->TailEntries(), 0u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 1);
+    EXPECT_EQ(Probe("continued", Extended(MakeTokens(6), {700, 701})).prefix_tokens, 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+}
+
+TEST_F(DropShortFusedPromptEndsSuite, AlignedEndsAndLongCheckpointsStillResume) {
+    for (const std::int32_t prompt : {4, 22}) {
+        SCOPED_TRACE(prompt);
+        Reset(/*host_cache=*/true, /*decode_width=*/1);
+        Submit(RequestWithTokens("seed", MakeTokens(prompt)));
+        RunPrefill("seed", prompt);
+        Decode("seed", 1);
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+        const std::int32_t expected = prompt == 4 ? 4 : 20;
+        EXPECT_EQ(Probe("continued", Extended(MakeTokens(prompt), {700, 701})).prefix_tokens, expected);
+    }
+}
+
 // A request that finishes on its prefill's token publishes its prompt end at
 // the finish: with the in-forward checkpoint, which covers it, the finish
 // publishes the still-pending checkpoint instead; without it the prompt end.

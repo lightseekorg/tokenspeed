@@ -1827,12 +1827,12 @@ class ServerArgs:
     def drops_short_prompt_end_checkpoints(self) -> bool:
         """Whether this engine's scheduler drops short prompts' end checkpoints.
 
-        A prefill server does where it writes in-forward checkpoints; no other
-        role does (a fused server keeps its short prompt ends).
+        Prefill and fused servers do where they write in-forward checkpoints.
+        Decode and encode servers leave this policy off.
         """
         return (
             self.writes_state_checkpoints_in_forward
-            and self.disaggregation_mode == "prefill"
+            and self.disaggregation_mode in ("null", "prefill")
         )
 
     @property

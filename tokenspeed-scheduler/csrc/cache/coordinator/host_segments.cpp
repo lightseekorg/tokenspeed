@@ -613,8 +613,14 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                 // traversal does not keep an unused checkpoint young.
                 candidate.epoch_sort_key = state_epoch;
                 if (aging.tree != nullptr && state_epoch >= aging.cutoff_epoch && !unaged.contains(&node)) {
-                    candidate.aged_distance = aging.tree->AgedDistance(node.hash, CacheTier::kHost);
-                    if (candidate.aged_distance != 0) {
+                    const auto distance = aging.tree->AgedDistance(node.hash, CacheTier::kHost);
+                    // Within N, keep the last actual resume's State recency
+                    // until a deeper checkpoint is used. Demotion still wins.
+                    const bool keep_resume_recency =
+                        distance > 0 && num_demoted_checkpoint_entries != num_checkpoint_entries &&
+                        node.tail_tokens == 0 && store_.Checkpoints().LastResumedOnBranch(node.hash);
+                    if (distance != 0 && !keep_resume_recency) {
+                        candidate.aged_distance = distance;
                         candidate.epoch_sort_key = aging.cutoff_epoch;
                         candidate.aged_epoch = state_epoch;
                     }

@@ -26,11 +26,13 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "cache/tier/peer_exports.h"
 #include "cache_test_access.h"
 #include "scheduler/types.h"
 
@@ -461,6 +463,76 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
     }
 }
 
+TEST(ResumeFrontier, HostEvictionKeepsLastResumeOnlyWithinRetentionWindow) {
+    for (const auto [retention, peer_lookup] : {std::pair{std::int64_t{2048}, false}, {2, false}, {2048, true}}) {
+        SCOPED_TRACE(testing::Message() << "retention " << retention << ", peer lookup " << peer_lookup);
+        BlockPool device(16, {1, 1});
+        BlockPool host(16, {1, 1});
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false,
+                                     false, retention);
+        const Checkpoint resumed{Sequence(32)}, descendant{Sequence(36)}, unused{{90, 91, 92, 93}},
+            unused_descendant{Concat(unused.tokens, {94, 95, 96, 97})};
+        ASSERT_NO_FATAL_FAILURE(Publish(cache, resumed));
+        std::vector<BlockTable> tables(2);
+        auto admission = AdmitForTest(cache, tables,
+                                      cache.Prober().ProbePromptPrefix(PromptPrefix{
+                                          .prefix_hashes = resumed.hashes, .tokens = resumed.tokens, .max_tokens = 32}),
+                                      GroupDemand{.extent = DenseGrowth{0}});
+        ASSERT_TRUE(admission);
+        EXPECT_EQ(admission->device_prefix_tokens, 32);
+        cache.Free(tables);
+        for (const Checkpoint* point : {&descendant, &unused, &unused_descendant}) {
+            ASSERT_NO_FATAL_FAILURE(Publish(cache, *point));
+        }
+        ASSERT_TRUE(cache.Store().Checkpoints().LastResumedOnBranch(resumed.Hash()));
+
+        // Transfer the checkpoints with their actual access epochs to Host.
+        for (std::uint32_t group : {0u, 1u}) {
+            cache.GroupPrefixIndex(group).ForEachEntry(
+                device, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
+                    CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
+                    ASSERT_TRUE(block);
+                    cache.Host().CacheHostBlock(block, key, entry.metadata);
+                });
+        }
+        ASSERT_TRUE(cache.ClearDeviceCache());
+        ASSERT_GT(cache.Store().Checkpoints().AgedDistance(resumed.Hash(), CacheTier::kHost), 0);
+
+        if (peer_lookup) {
+            PeerExports exports{PeerConfig{.name = "holder",
+                                           .incarnation = 1,
+                                           .max_leases = 2,
+                                           .soft_pin_us = 100,
+                                           .hard_pin_us = 1000,
+                                           .lookup_timeout_us = 100,
+                                           .min_fetch_tokens = kPage}};
+            exports.Lookup(cache,
+                           cache::PeerLookup{.lease = {.reader = "reader", .id = 1},
+                                             .prefix_hashes = descendant.hashes,
+                                             .tokens = descendant.tokens,
+                                             .max_tokens = 36},
+                           /*now_us=*/0);
+            ASSERT_EQ(exports.NumLeases(), 1u);
+            EXPECT_EQ(exports.NumPinnedBlocks(), 0u);
+            exports.Expire(/*now_us=*/100);
+            EXPECT_EQ(exports.NumLeases(), 0u);
+            EXPECT_TRUE(cache.Store().Checkpoints().LastResumedOnBranch(resumed.Hash()));
+        }
+
+        // With no empty Host parent, the incoming segment must evict.
+        std::vector<CacheBlockRef> pins;
+        while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
+        const std::array<std::uint32_t, 1> groups{0};
+        const std::array<std::int32_t, 1> buckets{0};
+        const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        const auto result = cache.Host().AcquireHostSegments(groups, buckets, boundaries);
+        ASSERT_EQ(result.stats.allocated, 1u);
+        EXPECT_EQ(Holds(cache, host, resumed), retention == 2048);
+        EXPECT_EQ(Holds(cache, host, unused), retention == 2);
+        EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache).empty());
+    }
+}
+
 // DeviceEvictsNonLeafCheckpointsBeforeOlderSessions with K = 1: B ranks as a
 // leaf, so LRU takes the other session instead.
 TEST(CheckpointRetention, LeafDistanceKeepsThePreviousTurnsCheckpoint) {
@@ -565,6 +637,55 @@ TEST(CheckpointRetention, DefaultIsSixteenBatchesOfNewRequests) {
     config.max_resident_requests = config.max_batch_size;
     config.checkpoint_retention_requests.reset();
     EXPECT_EQ(config.CheckpointRetentionRequests(), kMaxCheckpointRetentionRequests);
+}
+
+TEST(ResumeFrontier, PublicationWaitsForActualDeeperUse) {
+    CheckpointTree tree{kPage, 0};
+    const Checkpoint a{Sequence(4)}, b{Sequence(8)};
+    RecordFor(tree, a, kOnBoth, 1);
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_FALSE(tree.RecordResume(a.Hash(), 1));
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.RecordResume(a.Hash(), 2));
+    tree.Update(a.Hash(), kOnHost);
+    EXPECT_TRUE(tree.LastResumedOnBranch(a.Hash()));
+    RecordFor(tree, b, kOnHost, 2);
+    EXPECT_TRUE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_FALSE(tree.LastResumedOnBranch(b.Hash()));
+    EXPECT_FALSE(tree.RecordResume(b.Hash(), 2));
+    EXPECT_TRUE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.RecordResume(b.Hash(), 3));
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.LastResumedOnBranch(b.Hash()));
+    tree.Update(b.Hash(), kGone);
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.RecordResume(a.Hash(), 4));
+    EXPECT_TRUE(tree.LastResumedOnBranch(a.Hash()));
+    tree.Update(a.Hash(), kGone);
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    RecordFor(tree, a, kOnHost, 5);
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.RecordResume(a.Hash(), 6));
+    tree.Clear();
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    RecordFor(tree, a, kOnHost, 7);
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+}
+
+TEST(ResumeFrontier, BranchUseDoesNotClearSiblingEvidence) {
+    CheckpointTree tree{kPage, 0};
+    const Checkpoint a{Sequence(5)}, b{Sequence(9)}, fork{Concat(Sequence(8), {99})};
+    RecordFor(tree, a, kOnHost, 1);
+    RecordFor(tree, b, kOnHost, 2);
+    RecordFor(tree, fork, kOnHost, 3);
+    EXPECT_TRUE(tree.RecordResume(b.Hash(), 4));
+    EXPECT_TRUE(tree.RecordResume(a.Hash(), 5));
+    EXPECT_TRUE(tree.RecordResume(fork.Hash(), 6));
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
+    EXPECT_TRUE(tree.LastResumedOnBranch(b.Hash()));
+    EXPECT_TRUE(tree.LastResumedOnBranch(fork.Hash()));
+    EXPECT_FALSE(tree.RecordResume(a.Hash(), 5));
+    EXPECT_FALSE(tree.LastResumedOnBranch(a.Hash()));
 }
 
 }  // namespace

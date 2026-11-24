@@ -274,7 +274,7 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
            coordinator_.HoldsStateCheckpoint(ContentHash{progress.prefix_hashes[checkpoint_pages - 1]});
 }
 
-// With drop_short_prompt_end_checkpoints (P role, in-forward checkpoint): a
+// With drop_short_prompt_end_checkpoints (prompt owners, in-forward checkpoint): a
 // prompt too short for a pre-tail checkpoint (PrefillStateCheckpointTokens
 // is 0) that ends inside a page ends in a tail a re-rendered next turn does
 // not resume at, and an identical prompt's probe stops short of its last
@@ -283,14 +283,13 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // prompt resumes from. A model without State groups keeps its tails. Unlike
 // a covered prompt end (promptEndIsCoveredByCheckpoint) it needs no
 // checkpoint to exist: it reads only the prompt, so it holds whatever the
-// cache holds. Nothing before the finish -- the PD ACK -- depends on it: the
-// P role reserves no copy-in block for its prompt end
-// (firstDecodePublishesPromptEnd), its remote decode publishes like a chunk
-// end, and it never retracts.
+// cache holds. The P role publishes at the PD ACK. The fused first decode
+// makes this same decision as every prompt admission, so it neither reserves
+// copy-in blocks nor rotates away from an unpublished prompt end. Retraction
+// still snapshots the request's working State; junction cuts still publish.
 bool Scheduler::shortPromptEndIsDropped(const Request& request) const {
     const std::int32_t prompt = request.PrefillSize();
-    if (!config_.drop_short_prompt_end_checkpoints || request.NumComputedTokens() != prompt ||
-        prompt % coordinator_.PrefixGranularity() == 0 ||
+    if (!config_.drop_short_prompt_end_checkpoints || prompt % coordinator_.PrefixGranularity() == 0 ||
         PrefillStateCheckpointTokens(coordinator_, prompt, config_.max_scheduled_tokens,
                                      config_.prefix_replay_tokens) != 0) {
         return false;

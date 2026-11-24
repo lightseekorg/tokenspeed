@@ -244,11 +244,11 @@ def make_config(
             shares it. Requires ``state_checkpoint_in_forward`` outside the
             decode role.
         drop_short_prompt_end_checkpoints:
-            On a prefill server with ``--enable-state-checkpoint-in-forward``:
+            On a prefill or fused server with ``--enable-state-checkpoint-in-forward``:
             when a prompt is too short for the in-forward checkpoint and
             ends inside a page, no KV tail and no State checkpoint is
             published at its end. Requires ``state_checkpoint_in_forward``
-            and the prefill role.
+            and a prefill or fused role.
         max_kv_page_num: Per-local-prefill-batch budget for the sum of
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
