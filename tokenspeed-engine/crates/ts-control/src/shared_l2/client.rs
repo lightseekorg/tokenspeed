@@ -38,8 +38,9 @@
 //! owner that does not know the rank answers so), an answer that is not one
 //! hit of the wire's shape for each lookup, a reservation that does not
 //! answer each key of the write with a page the pool has or with none, a
-//! copy that fails, a commit the owner does not carry out. A lookup returns its failure; a write's, a notice's and a
-//! load's are kept ([`FailureLatch`]) for the loop's next poll or check.
+//! copy that fails, a commit the owner does not carry out. A lookup returns
+//! its failure; a write's, a notice's and a load's are kept
+//! ([`FailureLatch`]) for the loop's next poll or check.
 
 use std::{
     num::NonZeroUsize,
