@@ -88,6 +88,7 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
     gather_query_heads,
     gather_query_heads_padded,
     gather_query_heads_rank_major,
+    token_major_query_heads,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -1064,25 +1065,37 @@ class DSABackend(PagedAttentionBackend):
 
     def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
         """This rank's decode query heads as the bytes an owned top-k's
-        score gather can carry (``select_owned_dsa_topk``), when
-        the sparse decode of ``q`` over that top-k takes the DCP records
-        core: ``forward_sparse_decode`` then reads every rank's heads where
-        that gather lands them (``gathered_query``) instead of gathering
-        them itself. None otherwise. Decided from host sizes and boot
+        score gather can carry (``select_owned_dsa_topk``), when the sparse
+        decode of ``q`` over that top-k gathers the group's heads:
+        ``forward_sparse_decode`` then reads every rank's heads where that
+        gather lands them (``gathered_query``) instead of gathering them
+        itself. None otherwise. Decided from host sizes and boot
         configuration, the same on every rank."""
         if not self.takes_owned_decode_topk(layer):
             return None
         heads = self._query_heads(q, layer)
-        q_view = self._decode_query_view(q, layer, heads)
-        if not self._takes_dcp_records_decode(
-            tokens=q.shape[0],
-            heads=heads,
-            topk=self.index_topk,
-            q_dtype=q_view.dtype,
-            kv_dtype=self.data_type,
-        ):
+        if self._query_holds_every_head(heads):
             return None
+        q_view = self._decode_query_view(q, layer, heads)
         return q_view.reshape(q.shape[0], -1).contiguous().view(torch.uint8)
+
+    def _rank_major_query(
+        self, gathered_query: torch.Tensor, q_view: torch.Tensor
+    ) -> torch.Tensor:
+        """Every rank's ``q_view`` heads, from the owned top-k's gather.
+
+        ``gathered_query`` holds every rank's :meth:`dcp_decode_query_rider`
+        rows, uint8 ``[ranks, tokens, bytes]``; the result is ``[ranks,
+        tokens, heads, dim]``.
+        """
+        tokens, heads, dim = q_view.shape
+        row_bytes = heads * dim * q_view.element_size()
+        if gathered_query.shape != (len(self.kvp_group), tokens, row_bytes):
+            raise ValueError(
+                f"gathered query {tuple(gathered_query.shape)} does not "
+                f"hold {len(self.kvp_group)} ranks' {tuple(q_view.shape)} heads"
+            )
+        return gathered_query.view(q_view.dtype).view(-1, tokens, heads, dim)
 
     def _decode_query_view(self, q: torch.Tensor, layer, heads: int) -> torch.Tensor:
         """``q`` as the sparse decode cores read it: ``[rows, heads,
@@ -2674,10 +2687,10 @@ class DSABackend(PagedAttentionBackend):
                 q_dtype=q_view.dtype,
                 kv_dtype=kv_cache.dtype,
             )
-            if gathered_query is not None and not records:
+            if gathered_query is not None and keep_all_heads:
                 raise ValueError(
-                    "a gathered query is the records core's; this decode "
-                    "does not take it"
+                    "a gathered query carries the group's heads; this decode "
+                    "keeps its own"
                 )
             if records:
                 out = self._forward_dcp_records_decode(
@@ -2692,7 +2705,13 @@ class DSABackend(PagedAttentionBackend):
                 return _projected(
                     out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
                 )
-            if not keep_all_heads:
+            if gathered_query is not None:
+                # Every rank's heads, from the owned top-k's score gather.
+                q_view = token_major_query_heads(
+                    self._rank_major_query(gathered_query, q_view),
+                    heads * len(self.kvp_group),
+                )
+            elif not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
             q=q_view,
@@ -2757,14 +2776,7 @@ class DSABackend(PagedAttentionBackend):
         if gathered_query is None:
             q = gather_query_heads_rank_major(q_view, self.kvp_group)
         else:
-            tokens, heads, dim = q_view.shape
-            row_bytes = heads * dim * q_view.element_size()
-            if gathered_query.shape != (len(self.kvp_group), tokens, row_bytes):
-                raise ValueError(
-                    f"gathered query {tuple(gathered_query.shape)} does not "
-                    f"hold {len(self.kvp_group)} ranks' {tuple(q_view.shape)} heads"
-                )
-            q = gathered_query.view(q_view.dtype).view(-1, tokens, heads, dim)
+            q = self._rank_major_query(gathered_query, q_view)
         # The records lead the workspace, where an exchange that pulls in
         # place reads them.
         workspace_bytes = dsa_decode_dcp_records_workspace_bytes(

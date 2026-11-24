@@ -316,6 +316,10 @@ impl DataPlane for InstantDevice {
         unreachable!("no control operation in the benchmark")
     }
 
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
     #[allow(clippy::type_complexity)]
     fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError> {
         unreachable!("no expert rebalance in the benchmark")

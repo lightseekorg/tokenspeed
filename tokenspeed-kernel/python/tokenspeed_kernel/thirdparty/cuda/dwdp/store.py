@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication._cuda.peer_copy import (
+    BATCH_COPIES,
     CopyEngineWorker,
     SequenceFlags,
     build_copy_schedule,
@@ -177,7 +178,7 @@ class CudaPeerWeightStore:
         self._published.record(torch.cuda.current_stream(device))
         self._slots = [_Slot(0, 0, 0, None, None) for _ in range(2)]
         self._flags = SequenceFlags(4, device)
-        self._copy_engine = CopyEngineWorker(device, self._stream)
+        self._copy_engine = CopyEngineWorker(device, self._stream, BATCH_COPIES)
         self._layers: dict[int, _Layer] = {}
         self._views: dict[int, dict[str, torch.Tensor]] = {}
         self._mappings: list[tuple[int, int]] = []

@@ -44,7 +44,7 @@ from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
@@ -78,6 +78,48 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+ModelBindingT = TypeVar("ModelBindingT")
+
+
+@dataclass(frozen=True)
+class PrefillRequestLayout:
+    """Host request lengths for the extend prefix of one forward.
+
+    These immutable host integers describe the scheduler's input, before
+    query sharding or graph padding. Decode rows use the forward's explicit
+    decode width. No device-to-host copy is allowed when constructing this view.
+    """
+
+    input_lengths: tuple[int, ...]
+    prefix_lengths: tuple[int, ...]
+
+    @classmethod
+    def from_cpu_lengths(
+        cls,
+        num_extends: int,
+        input_lengths: torch.Tensor,
+        prefix_lengths: torch.Tensor,
+    ) -> PrefillRequestLayout:
+        """Copy the active extend prefix of CPU integer mirrors into a view."""
+        if num_extends < 0:
+            raise ValueError("num_extends must be nonnegative")
+        for lengths in (input_lengths, prefix_lengths):
+            if (
+                lengths.device.type != "cpu"
+                or lengths.ndim != 1
+                or lengths.dtype not in (torch.int32, torch.int64)
+                or lengths.numel() < num_extends
+            ):
+                raise ValueError(
+                    "Prefill request layout requires CPU integer length mirrors"
+                )
+        inputs = tuple(input_lengths[:num_extends].tolist())
+        prefixes = tuple(prefix_lengths[:num_extends].tolist())
+        if any(value < 0 for value in (*inputs, *prefixes)):
+            raise ValueError("Prefill request lengths must be nonnegative")
+        return cls(inputs, prefixes)
 
 
 @dataclass(frozen=True)
@@ -469,11 +511,34 @@ class AttentionBackend(CachePoolBinding, ABC):
         """The binding lifecycle fields; wrappers that skip __init__ call this."""
         super()._init_pool_binding()
         self._sparse_topk = SparseTopKShare()
+        self._prefill_request_layout: PrefillRequestLayout | None = None
+
+    def prefill_request_layout(self) -> PrefillRequestLayout | None:
+        """Return this forward's extend request layout, or None outside an extend.
+
+        Composites delegate to the attention child that receives the scheduler's
+        complete input span. Models must not recover these lengths from a
+        recurrent consumer's private metadata.
+        """
+        return self._prefill_request_layout
+
+    def model_binding(
+        self, layer_id: int, binding_type: type[ModelBindingT]
+    ) -> ModelBindingT | None:
+        """Return an explicitly offered model interface for ``layer_id``.
+
+        The consumer defines the interface type and its owner returns the bound
+        implementation. None means unsupported. Composites route by layer, never
+        search children by Python type. Bindings expose operands or preparation
+        operations; attention forward and lifecycle still go through this backend.
+        """
+        return None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         """Record the pool and clear shared sparse-forward metadata."""
         super()._publish_cache_pool(cache_pool)
         self._sparse_topk.clear()
+        self._prefill_request_layout = None
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (information unavailable at
