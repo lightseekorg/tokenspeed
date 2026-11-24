@@ -701,11 +701,12 @@ The approved-PR and latest-main retry workflows also cover this workflow.
 `Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
 Its default `eval,perf` selection covers the two migrated evaluations.
 
-The `NVIDIA GB300 Tests` workflow selects only multi-node model tasks with
-the `per-commit` trigger and submits them through the same
-`slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
-pushes to `main` and for non-draft pull requests whose head branch belongs to
-this repository. Pull-request runs execute the merge commit's dispatcher, so
+The `NVIDIA GB300 Tests` workflow selects single-node unit tests and
+multi-node model tasks and submits them through the `slurm-dispatch-gb300`
+coordinator pool used by manual dispatch. The BF16 TP projection task runs
+on four GB300 GPUs on one node. The workflow runs for pushes to `main` and
+for non-draft pull requests whose head branch belongs to this repository.
+Pull-request runs execute the merge commit's dispatcher, so
 the run covers dispatcher changes before merge. The workflow skips fork pull
 requests until the coordinator pool uses ephemeral runners with a protected
 approval environment. Use the manual `Slurm Dispatch` workflow after review.
@@ -716,7 +717,7 @@ Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
 switch is separate from `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`: this workflow
 does not pass that variable to its matrix scan, so entries such as `gb300`
-cannot filter the multi-node matrix here. During this workflow's
+cannot filter the matrix here. During this workflow's
 bootstrap only, leave the switch unset. After dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 

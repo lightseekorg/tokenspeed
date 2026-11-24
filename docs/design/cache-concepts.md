@@ -127,6 +127,25 @@ Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
 
+Host allocations follow PyTorch's existing allocator configuration, including
+`PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
+never overrides the registration method or thread count. Without an explicit
+configuration, the original serial allocation policy remains in effect.
+
+An L2 buffer retains a 4 KiB-aligned tensor view when the Disk tier requires
+direct I/O alignment, or on NVIDIA CUDA with the native allocator and
+`pinned_use_cuda_host_register:True`.
+Allocation and the executor's pinned reservation derive their padding from the
+same alignment constant. Other allocation policies and the snapshot pool retain
+their original allocation sizes. Ratio and explicit L2 sizes may lose whole
+LCM blocks to fit alignment padding in their original pinned reservation, when
+at least one block remains. Ratio sizing is also capped to every rank's Host
+memory share; an explicit size that exceeds the Host memory budget is refused.
+When the buffer is aligned, block alignment must divide its 4 KiB alignment;
+unsupported alignments are rejected before allocation.
+Ranks agree on the resulting block count before allocation. Tensor ownership
+and asynchronous-copy lifetime tracking remain with PyTorch.
+
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
@@ -1516,7 +1535,13 @@ Its responsibilities:
   order, with the retention rank, once the usable duplicate capacity is
   exhausted. With superseded checkpoint demotion (`scheduler.md` §1.2), a
   Host-only checkpoint boundary whose checkpoints are all demoted goes after
-  the held copies and before the unheld ones.
+  the held copies and before the unheld ones. With a Disk tier, clean
+  Host-only cache (the Disk holds every entry the victim takes) goes after
+  every Device-covered copy and before any dirty entry, whatever its age:
+  dropping it loses nothing a prefetch cannot read back. A checkpoint ranks
+  clean by its State; one whose victim would also take a dirty page (above it
+  or under it) ranks with the dirty Host-only cache instead. Evictions in the
+  clean class count as `HostEvictionStats::clean`.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree counts each node's closed-group duplicates as entries
@@ -1607,7 +1632,11 @@ Its responsibilities:
     `TierEvictionPlanner`). The write holds its Host sources and Disk
     destinations until every owner finished it, then publishes the Disk
     entries with the Host entries' metadata; a Host placement can then drop
-    the Host copy without loss. Cleaning never removes a Host entry.
+    the Host copy without loss. The write-back segment plan
+    (`AcquireHostSegments`) drops clean entries before dirty ones; the
+    block-by-block placement (`AcquireHostBlocks`: prefetch and peer landing,
+    a retraction leg's fallback) still ranks them by recency alone. Cleaning
+    never removes a Host entry.
   * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
     admission: the Disk's keys of the prompt stand in as Host hits for
     `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the

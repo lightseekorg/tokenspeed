@@ -77,6 +77,7 @@ impl Outbox {
 /// What the bootstrap resolved for this rank.
 pub struct Settings {
     peer: PeerSettings,
+    node_leaders: Vec<(usize, u32)>,
     bind_host: String,
     port: u16,
     /// The host other replicas reach this rank's push endpoint at.
@@ -155,6 +156,7 @@ impl Settings {
                         .max(0.0),
                 ),
             },
+            node_leaders: settings.getattr("node_leaders")?.extract()?,
             bind_host: settings.getattr("bind_host")?.extract()?,
             port: settings.getattr("port")?.extract()?,
             push_host: settings.getattr("push_host")?.extract()?,
@@ -264,8 +266,14 @@ pub fn start(
     );
     let listener = if replica.index() == 0 {
         Some(
-            PeerListener::bind(&settings.bind_host, settings.port)
-                .map_err(|error| error.to_string())?,
+            PeerListener::bind_node(
+                mesh,
+                super::PEER_NODE_GROUP,
+                &settings.node_leaders,
+                &settings.bind_host,
+                settings.port,
+            )
+            .map_err(|error| error.to_string())?,
         )
     } else {
         None

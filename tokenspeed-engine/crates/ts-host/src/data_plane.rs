@@ -140,6 +140,9 @@ enum Op {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    FinishMemoryResume {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     SnapshotExpertLoad {
         reply: mpsc::SyncSender<Result<ExpertLoad, String>>,
     },
@@ -173,6 +176,7 @@ impl Op {
             Op::CheckMemoryTransition { .. } => "Op::CheckMemoryTransition",
             Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
+            Op::FinishMemoryResume { .. } => "Op::FinishMemoryResume",
             Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
             Op::EpdPublish(_) => "Op::EpdPublish",
             Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
@@ -578,6 +582,10 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::ResumeMemory { tags, reply })
     }
 
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        self.ask(|reply| Op::FinishMemoryResume { reply })
+    }
+
     fn attach_grammars(
         &mut self,
         grammars: &[(String, u64, Vec<i32>)],
@@ -708,6 +716,7 @@ fn forward_loop(
                 | Op::CommitWeightUpdate { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
+                | Op::FinishMemoryResume { reply }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
@@ -935,6 +944,13 @@ fn run(
         Op::ResumeMemory { tags, reply } => {
             let done = plane
                 .call_method1("resume_memory", (tags,))
+                .map(drop)
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::FinishMemoryResume { reply } => {
+            let done = plane
+                .call_method0("finish_memory_resume")
                 .map(drop)
                 .map_err(python);
             answer(reply, done)?;

@@ -723,7 +723,6 @@ def test_host_data_plane_drains_completed_cpu_observations(executor_factory):
         epd_publisher=None,
         starting=False,
         record_cache_observations=True,
-        replica_memory_transitions=False,
     )
     executor.submit_load_backs([restore()], prerequisite_stream=device.current_stream())
     assert plane.poll_cache_events() == []

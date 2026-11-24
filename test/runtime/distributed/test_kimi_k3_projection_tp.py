@@ -39,6 +39,18 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
 
+def test_bf16_mla_rejects_invalid_full_weight_shape():
+    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
+    from tokenspeed.runtime.models.kimi_k3_projection import KimiMLAColumnProj
+
+    parallel = DenseLayerMapping(rank=3, world_size=4, tp_size=4, dp_size=1)
+    module = KimiMLAColumnProj(32, 256, parallel, False, "fused_qkv_a_proj_with_mqa")
+    with pytest.raises(ValueError, match="MLA projection weight shape"):
+        module.weight.weight_loader(
+            module.weight, torch.ones((255, 32), dtype=torch.bfloat16)
+        )
+
+
 @pytest.mark.parametrize(
     ("sizes", "mapping_overrides", "message"),
     [
@@ -96,7 +108,9 @@ def test_checkpoint_shards():
     ):
         logical = sum(widths)
         for block_fp8 in (False, True):
-            stored = projection_storage_rows(logical, tp, block_fp8)
+            stored = projection_storage_rows(logical, tp)
+            if kind == "mla" and not block_fp8:
+                stored = 14592
             codes = (torch.arange(stored, device=device) % 31 - 15).to(torch.bfloat16)
             weight = codes[:, None].expand(-1, hidden).contiguous()
             weight[logical:].zero_()
@@ -171,6 +185,17 @@ def test_checkpoint_shards():
                         module.weight_scale_inv, assembled_scales
                     )
                 else:
+                    # A full BF16 checkpoint has logical rows only. The final
+                    # shard also contains storage padding that must remain zero.
+                    module.weight.weight_loader(module.weight, weight[:logical])
+                    width = stored // tp
+                    torch.testing.assert_close(
+                        module.weight,
+                        weight[rank * width : (rank + 1) * width],
+                        rtol=0,
+                        atol=0,
+                    )
+                    module.weight.zero_()
                     # Canonical BF16 order is q_a/kv_a/gate, unlike FP8's private order.
                     start = 0
                     for width in (1536, 576, 12288):

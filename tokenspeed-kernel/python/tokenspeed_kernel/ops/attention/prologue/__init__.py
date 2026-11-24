@@ -265,6 +265,79 @@ def qk_norm_rope(
     return out.q, out.k
 
 
+def _select_mla(
+    query_dtype: torch.dtype,
+    num_tokens: int,
+    num_heads: int,
+    *,
+    expanded: MLAExpandedKV | None,
+    rotary: Rotary | None,
+    cache: LatentKVCache | None,
+    solution: str | None,
+    override: str | None,
+) -> SelectedKernel:
+    if cache is None:
+        # No destination: the cache-derived traits take the native full-write
+        # values and ``store`` selects the solutions that return the latent.
+        traits = {
+            "token_heads": num_tokens * num_heads,
+            "expanded": False,
+            "full_write": True,
+            "kv_format": KVCacheFormat.NATIVE.value,
+            "kv_convert": False,
+            "rope_style": "none" if rotary is None else rotary.style.value,
+            "sanitize": False,
+            "store": False,
+        }
+    else:
+        traits = {
+            "token_heads": num_tokens * num_heads,
+            "expanded": expanded is not None,
+            "full_write": cache.slots.numel() == num_tokens,
+            "kv_format": cache.format.value,
+            "kv_convert": cache.format is KVCacheFormat.NATIVE
+            and cache.kv_cache.dtype is not query_dtype,
+            "rope_style": "none" if rotary is None else rotary.style.value,
+            "sanitize": cache.sanitize,
+            "store": True,
+        }
+    return _select(
+        "mla_prologue",
+        query_dtype,
+        tuple(traits.items()),
+        frozenset(),
+        solution,
+        override,
+    )
+
+
+def mla_prologue_kernel(
+    query_dtype: torch.dtype,
+    num_tokens: int,
+    num_heads: int,
+    *,
+    expanded: MLAExpandedKV | None,
+    rotary: Rotary | None,
+    cache: LatentKVCache | None,
+    solution: str | None,
+    override: str | None,
+) -> str:
+    """Name of the kernel :func:`mla_prologue` selects for ``num_tokens`` rows
+    of ``num_heads`` query heads in ``query_dtype`` and the other arguments as
+    :func:`mla_prologue` takes them, for a caller that fuses its work into
+    another launch only where one solution would run."""
+    return _select_mla(
+        query_dtype,
+        num_tokens,
+        num_heads,
+        expanded=expanded,
+        rotary=rotary,
+        cache=cache,
+        solution=solution,
+        override=override,
+    ).name
+
+
 def mla_prologue(
     query: torch.Tensor,
     q_pe: torch.Tensor,
@@ -313,39 +386,15 @@ def mla_prologue(
     num_tokens, num_heads, width = query.shape
     rope_dim = q_pe.shape[-1]
     kv_lora_rank = latent_cache.shape[-1] - rope_dim
-
-    if cache is None:
-        # No destination: the cache-derived traits take the native full-write
-        # values and ``store`` selects the solutions that return the latent.
-        traits = {
-            "token_heads": num_tokens * num_heads,
-            "expanded": False,
-            "full_write": True,
-            "kv_format": KVCacheFormat.NATIVE.value,
-            "kv_convert": False,
-            "rope_style": "none" if rotary is None else rotary.style.value,
-            "sanitize": False,
-            "store": False,
-        }
-    else:
-        traits = {
-            "token_heads": num_tokens * num_heads,
-            "expanded": expanded is not None,
-            "full_write": cache.slots.numel() == num_tokens,
-            "kv_format": cache.format.value,
-            "kv_convert": cache.format is KVCacheFormat.NATIVE
-            and cache.kv_cache.dtype is not query.dtype,
-            "rope_style": "none" if rotary is None else rotary.style.value,
-            "sanitize": cache.sanitize,
-            "store": True,
-        }
-    kernel = _select(
-        "mla_prologue",
+    kernel = _select_mla(
         query.dtype,
-        tuple(traits.items()),
-        frozenset(),
-        solution,
-        override,
+        num_tokens,
+        num_heads,
+        expanded=expanded,
+        rotary=rotary,
+        cache=cache,
+        solution=solution,
+        override=override,
     )
     shape_params = {
         "num_tokens": num_tokens,
@@ -432,6 +481,7 @@ __all__ = [
     "gqa_prologue",
     "latent_store",
     "mla_prologue",
+    "mla_prologue_kernel",
     "qk_norm_rope",
 ]
 

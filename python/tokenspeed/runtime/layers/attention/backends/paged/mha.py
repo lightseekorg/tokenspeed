@@ -63,7 +63,10 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+    from tokenspeed.runtime.layers.paged_attention import (
+        PagedAttention,
+        RMSNormOutputGate,
+    )
 
 
 _KERNEL_SOLUTION_BY_BACKEND = {
@@ -550,7 +553,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         token_to_kv_pool,
         bs: int,
         *,
-        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
+        rmsnorm_output_gate: RMSNormOutputGate | None = None,
         **kwargs,
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
@@ -568,13 +571,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             if rmsnorm_output_gate is None:
                 return output
-            gate, eps = rmsnorm_output_gate
             return weightless_rmsnorm_gated_sigmoid(
                 output.contiguous(),
-                gate,
+                rmsnorm_output_gate.gate,
                 layer.tp_q_head_num,
                 layer.v_head_dim,
-                eps,
+                rmsnorm_output_gate.eps,
                 pdl_enabled(),
             )
 
@@ -614,9 +616,11 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
             block_draft=self.noncausal_block_draft,
-            output_gate=None if rmsnorm_output_gate is None else rmsnorm_output_gate[0],
+            output_gate=(
+                None if rmsnorm_output_gate is None else rmsnorm_output_gate.gate
+            ),
             output_gate_eps=(
-                None if rmsnorm_output_gate is None else rmsnorm_output_gate[1]
+                None if rmsnorm_output_gate is None else rmsnorm_output_gate.eps
             ),
             # A draft block's positions share their request's page-table row
             # and length (refresh_decode_metadata): one key read per block.

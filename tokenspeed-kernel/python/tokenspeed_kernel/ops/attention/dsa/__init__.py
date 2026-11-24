@@ -674,6 +674,190 @@ def dsa_decode(
         )
 
 
+def _projected_value_traits(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    value_head_dim: int,
+    q_len_per_req: int,
+    gated: bool,
+) -> dict:
+    """The projected decode's traits, its leaves' ``problem_filter`` reading
+    the sizes."""
+    return {
+        "q_len": int(q_len_per_req),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk),
+        "logit_cap": False,
+        "topk_layout": "global_slots",
+        "gate_kind": "sigmoid" if gated else "none",
+        "tokens": int(tokens),
+        "heads": int(heads),
+        "q_dtype": q_dtype,
+        "kv_dtype": kv_dtype,
+        "value_head_dim": int(value_head_dim),
+    }
+
+
+def dsa_decode_projected_value_supported(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    value_head_dim: int,
+    q_len_per_req: int,
+    gated: bool,
+    solution: str | None = None,
+) -> bool:
+    """Whether :func:`dsa_decode_projected_value` serves a decode of this size.
+
+    Host values only: the selection the launch makes for these sizes, whose
+    leaves' ``problem_filter`` refuses sizes they cannot take. Platforms
+    without a leaf are refused.
+
+    Args:
+        tokens: Query rows.
+        heads: Query heads.
+        topk: Selected-slot width.
+        q_dtype: The query's dtype as the core reads it.
+        kv_dtype: The KV cache's dtype.
+        kv_lora_rank: MLA latent rank.
+        qk_rope_head_dim: RoPE q/k dimension.
+        value_head_dim: Projected values per head.
+        q_len_per_req: Query rows per request.
+        gated: Whether the projection applies a sigmoid gate.
+        solution: As for :func:`dsa_decode_projected_value`.
+    """
+    return _selects(
+        "dsa_decode_projected_value",
+        format_signature(q=dense_tensor_format(q_dtype)),
+        _projected_value_traits(
+            tokens=tokens,
+            heads=heads,
+            topk=topk,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            value_head_dim=value_head_dim,
+            q_len_per_req=q_len_per_req,
+            gated=gated,
+        ),
+        solution,
+    )
+
+
+def dsa_decode_projected_value(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    value_weight: torch.Tensor,
+    *,
+    gate: torch.Tensor | None,
+    out: torch.Tensor,
+    q_len_per_req: int = 1,
+    k_scale: float = 1.0,
+    solution: str | None = None,
+    slot_order: str,
+) -> torch.Tensor:
+    """:func:`dsa_decode` with the per-head value projection of its latent,
+    ``mla_project_value(latent, value_weight, gate=gate, out=out)``: the key
+    splits merge straight into the projected rows.
+
+    Args:
+        q: Absorbed MLA query ``[tokens, heads, R + D_rope]``.
+        kv_cache: Regular compressed MLA KV cache, flat ``[slots, dim]`` or
+            paged.
+        value_weight: Per-head projection ``[heads, R, value_head_dim]``.
+        gate: Optional raw sigmoid gate ``[tokens, heads * value_head_dim]``.
+        out: Contiguous ``[tokens, heads * value_head_dim]`` output.
+        Others: As for :func:`dsa_decode`.
+
+    Returns:
+        ``out``, bit for bit what :func:`dsa_decode` then
+        :func:`mla_project_value` give. Raises ``NoKernelFoundError`` for a
+        size :func:`dsa_decode_projected_value_supported` refuses.
+    """
+    tokens, num_heads, head_dim = q.shape
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode_projected_value",
+        _attention_format_signature(q=q),
+        traits={
+            **_projected_value_traits(
+                tokens=tokens,
+                heads=num_heads,
+                topk=topk_slots.shape[-1],
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                value_head_dim=value_weight.shape[2],
+                q_len_per_req=q_len_per_req,
+                gated=gate is not None,
+            ),
+            "qk_nope_head_dim": int(qk_nope_head_dim),
+            "page_size": int(page_size),
+            "slot_order": slot_order,
+        },
+        solution=solution,
+    )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
+    shape_params = {
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "value_head_dim": value_weight.shape[2],
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode_projected_value", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_decode_projected_value",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            value_weight=value_weight,
+            gate=gate,
+            out=out,
+            q_len_per_req=q_len_per_req,
+            k_scale=k_scale,
+            **slot_order_kwargs,
+        )
+
+
 def dsa_prefill(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
@@ -2179,6 +2363,67 @@ def dsa_prefill_topk(
         return kernel(**kernel_kwargs)
 
 
+def dsa_paged_score(
+    q: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+    q_len_per_req: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute FP32 DSA scores in logical token order over paged BF16 keys.
+
+    Args:
+        q: Packed BF16 queries [tokens, index_heads, head_dim].
+        index_k_cache: Packed BF16 index-key plane [physical_slots, head_dim].
+        weights: FP32 head weights [tokens, index_heads], with score scale folded in.
+        block_table: INT32 logical-to-physical page map [requests, max_pages].
+        context_lens: INT32 visible token count [tokens] for each query, including
+            its own position.
+        max_seq_len: Output width in tokens, independent of each row's visibility.
+        page_size: Number of tokens per physical page.
+        q_len_per_req: Consecutive queries per request, 1 for plain decode.
+            Query row r uses block_table[r // q_len_per_req].
+        out: Optional contiguous FP32 output [tokens, max_seq_len].
+
+    Returns:
+        FP32 scores computed as sum_h(weights[h] * relu(dot(q[h], k))).
+        Invisible tokens and invalid pages receive -inf.
+    """
+    if q.ndim != 3 or index_k_cache.ndim != 2:
+        raise ValueError("Expected Q [tokens, heads, dim] and K [physical_slots, dim]")
+    kernel = select_kernel(
+        "attention",
+        "dsa_paged_score",
+        _attention_format_signature(
+            q=q,
+            index_k_cache=index_k_cache,
+            weights=weights,
+            block_table=block_table,
+            context_lens=context_lens,
+        ),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2],
+            "page_size": page_size,
+        },
+    )
+    return kernel(
+        q,
+        index_k_cache,
+        weights,
+        block_table,
+        context_lens,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        out=out,
+    )
+
+
 def dsa_decode_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -2510,10 +2755,13 @@ __all__ = [
     "dsa_decode_dcp_records",
     "dsa_decode_dcp_records_supported",
     "dsa_decode_dcp_records_workspace_bytes",
+    "dsa_decode_projected_value",
+    "dsa_decode_projected_value_supported",
     "dsa_decode_index_candidates",
     "dsa_decode_index_candidates_supported",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
+    "dsa_paged_score",
     "dsa_prefill",
     "dsa_prefill_dcp_records",
     "dsa_prefill_dcp_records_supported",

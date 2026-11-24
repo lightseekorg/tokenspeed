@@ -97,6 +97,7 @@ from tokenspeed_kernel.ops.model.kimi_k3 import (
     KimiK3MoeTailShape,
     KimiK3NextMix,
     kimi_k3_moe_tail,
+    kimi_k3_moe_tail_applies_attn_norm,
     kimi_k3_moe_tail_expert_layout,
     pack_kimi_k3_moe_tail_layer,
     prepare_kimi_k3_moe_tail,
@@ -631,12 +632,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             prequantized = block_scale is not None and not dp_or_empty
             if attnres_partial_args is not None and not prequantized:
                 attnres_partial_dual(*attnres_partial_args)
-            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
-                hidden_states,
-                block_scale,
-                torch.bfloat16 if prequantized else None,
-                ctx=ctx,
-            )
+            if self.qkv_parallel is not None and block_scale is None:
+                # Q, KV, and gate are consumed within this attention layer.
+                qkv_gate = self.fused_qkv_a_proj_with_mqa.forward_intermediate(
+                    hidden_states, ctx=ctx
+                )
+            else:
+                qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
+                    hidden_states,
+                    block_scale,
+                    torch.bfloat16 if prequantized else None,
+                    ctx=ctx,
+                )
             if attnres_partial_args is not None and prequantized:
                 attnres_partial_dual(*attnres_partial_args)
             if dp_or_empty or self._fused_qkv_a_pad_rows:
@@ -2076,6 +2083,21 @@ class KimiLinearKDA(nn.Module):
             mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
         )
 
+    def o_proj_input_and_norm(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        *,
+        projection,
+    ) -> tuple[torch.Tensor, KdaOutputNorm]:
+        """``o_proj_input``'s rows before the gated output norm, and that
+        norm, for a consumer that applies it."""
+        mixed_qkv, out_gate, f_a_out, beta = self._split_qkvfab(
+            projection(hidden_states)
+        )
+        core = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+        return core.contiguous(), self._output_norm(out_gate)
+
     def decode_weights(self) -> tuple[torch.Tensor, ...]:
         """The weights one decode step reads, in reading order.
 
@@ -2699,7 +2721,8 @@ class KimiLinearMoE(nn.Module):
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
             # runs w4a4 with the kernel wrapper quantizing the bf16 input
             # itself, which the registry models as "input". CuTe DSL NVFP4
-            # SiTU quantizes its bf16 input the same way.
+            # SiTU quantizes its bf16 input the same way. MegaMoE follows the
+            # same split by weight dtype.
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native
@@ -2708,6 +2731,7 @@ class KimiLinearMoE(nn.Module):
                 else (
                     _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
                     if self.execution_plan.use_trtllm
+                    or self.execution_plan.use_mega_moe
                     else None
                 )
             ),
@@ -2748,13 +2772,7 @@ class KimiLinearMoE(nn.Module):
                 if self.experts.supports_precomputed_topk
                 else self.experts.topk_output_format
             ),
-            # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
-            # without a cast. This setting is unused by kernel-routing plans.
-            topk_weights_dtype=(
-                torch.bfloat16
-                if plan.use_trtllm or plan.owns_ep_communication
-                else torch.float32
-            ),
+            topk_weights_dtype=self.experts.topk_weights_dtype,
         )
         self.expert_dispatch_info: ExpertLocationDispatchInfo | None = None
         if self.expert_placement is not None:
@@ -3667,12 +3685,7 @@ class KimiLinearMoE(nn.Module):
         quant_out = None
         routing_out = None
         if self.execution_plan.use_mega_moe:
-            from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
-
-            moe_runner = runner.get_runner(
-                self.experts.plan, self.experts, prequantized=True
-            )
-            activation, scales, ids, weights = moe_runner.input_buffers(
+            activation, scales, ids, weights = self.experts.input_buffers(
                 num_tokens, max_tokens
             )
             quant_out = (activation, scales)
@@ -3707,7 +3720,8 @@ class KimiLinearMoE(nn.Module):
             )
 
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
         ) as fork:
             shared_output = None
             if shared_communication is not None:
@@ -3821,12 +3835,25 @@ class KimiLinearMoE(nn.Module):
                             shared_output, num_tokens
                         )
 
+            if shared_communication is None and num_tokens > 0:
+                with fork.branch():
+                    if shared_activated is None:
+                        shared_output = self.shared_experts(
+                            hidden_states, down_out=None
+                        )
+                    else:
+                        shared_output = kimi3_shared_down_projection(
+                            shared_activated, self.shared_experts.down_proj.weight
+                        )
+
             routing = StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 router_logits=None,
             )
             total_tokens = self.mapping.world_size * max_tokens
+            if self.execution_plan.use_mega_moe:
+                fork.join()
             routed_output = self._routed_experts(
                 routed_input,
                 routing,
@@ -3867,18 +3894,6 @@ class KimiLinearMoE(nn.Module):
                 and not self.routed_expert_up_proj.narrowed
             ):
                 projected, _ = self.routed_expert_up_proj(routed_output)
-
-            if shared_communication is None:
-                with fork.branch():
-                    if num_tokens > 0:
-                        if shared_activated is None:
-                            shared_output = self.shared_experts(
-                                hidden_states, down_out=None
-                            )
-                        else:
-                            shared_output = kimi3_shared_down_projection(
-                                shared_activated, self.shared_experts.down_proj.weight
-                            )
 
         if num_tokens == 0:
             return prefix_sum
@@ -3989,8 +4004,7 @@ class KimiLinearMoE(nn.Module):
 
         # Warm the auxiliary stream serially before capture enables overlap.
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(),
-            overlap=get_is_capture_mode(),
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
             with fork.branch():
                 topk_output = self.topk(
@@ -4716,13 +4730,22 @@ class KimiLinearDecoderLayer(nn.Module):
             h, stream = self._mix_into_attention(
                 hidden_states, block_residual, premixed
             )
-        attn_output = self.self_attn.o_proj_input(
-            positions,
-            h,
-            ctx,
-            self.comm_manager,
-            projection=self._moe_tail_projection(hidden_states, block_residual, h, ctx),
-        )
+        projection = self._moe_tail_projection(hidden_states, block_residual, h, ctx)
+        attn_norm = None
+        if isinstance(
+            self.self_attn, KimiLinearKDA
+        ) and kimi_k3_moe_tail_applies_attn_norm(tail.layer):
+            attn_output, attn_norm = self.self_attn.o_proj_input_and_norm(
+                h, ctx, projection=projection
+            )
+        else:
+            attn_output = self.self_attn.o_proj_input(
+                positions,
+                h,
+                ctx,
+                self.comm_manager,
+                projection=projection,
+            )
         next_layer = tail.next_layer
         next_mix = None
         if next_layer is not None:
@@ -4742,6 +4765,7 @@ class KimiLinearDecoderLayer(nn.Module):
             block_residual,
             torch.empty_like(hidden_states),
             next_mix=next_mix,
+            attn_norm=attn_norm,
         )
         return out, block_residual
 

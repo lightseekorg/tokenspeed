@@ -35,6 +35,7 @@ import functools
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -150,6 +151,21 @@ def l3_cache_quantization_id(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def warn_if_unpinned_peer_weights(
+    weight_version: str, revisions: Sequence[str]
+) -> None:
+    """Warn when live peers have no explicit version covering all loaded weights."""
+    if weight_version.strip() in ("", "default") and any(
+        not _HF_COMMIT_HASH_RE.fullmatch(revision) for revision in revisions
+    ):
+        logging.getLogger(__name__).warning(
+            "Peer prefix sharing uses the default weight identity and an unpinned "
+            "model revision. Replicas that load different weights can reuse incorrect KV. "
+            "Set --weight-version for the target and draft weights together, or pin "
+            "each loaded model revision to an immutable commit."
+        )
 
 
 def l3_checkpoint_id(

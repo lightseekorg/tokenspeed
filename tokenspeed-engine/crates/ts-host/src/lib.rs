@@ -94,6 +94,7 @@ const DP_GROUP: u32 = 0;
 const REPLICA_GROUP: u32 = 1;
 const PP_GROUP: u32 = 2;
 const EP_GROUP: u32 = 3;
+const PEER_NODE_GROUP: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
