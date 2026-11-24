@@ -16,6 +16,10 @@ while earlier stages still compute.
 | Vendor kernels | The vendor's kernel package, under `ops/<arch>/monokernel/` | The building blocks that every model's kernels share (plans, mailboxes, GEMVs, trace), and one directory for each model's stages and layer kernels. Its README describes the files, the rules for writing a stage, and the performance workflow. |
 | Runtime seam | `python/tokenspeed/runtime/models/monokernel.py`, and `<model>_monokernel.py` next to it | The shared part: the layer mixin that selects the launch or the regular layer's code, the state that all launches share (the scratch and the step counter), and the startup error. For each model: its monokernel layer classes (subclasses of the regular layers), the packing from the model's modules with the reasons of a layer that cannot be packed, and the launches. |
 
+Model discovery imports the runtime seams on every platform. Keep GPU-only
+communication imports guarded on Ascend, where Triton does not provide Gluon
+dtypes, so discovery does not require an unused monokernel backend.
+
 ## Invariants
 
 **A forward launches every layer or none.** A monokernel layer takes the

@@ -133,7 +133,11 @@ peer's demoted chain and superseded checkpoint inputs are not written.
 
 Cleaning copies; it never removes anything from Host, so a partly cleaned
 segment opens no gap. A Host placement takes, in order: dead entries, entries
-the Device holds, clean entries, then dirty entries by recency.
+the Device holds, clean entries, then dirty entries by recency. The
+write-back segment plan, which places what Device evictions write back,
+follows this order; the block-by-block placement of prefetch and peer
+landings does not yet, and still ranks clean and dirty entries by recency
+alone.
 
 ### Prefetch
 

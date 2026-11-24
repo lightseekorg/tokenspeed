@@ -36,7 +36,7 @@ use ts_control::peer::{
     net::{Inbound, PeerNet},
     push::{PagePusher, PushItem},
     read::Arena,
-    wire::Request,
+    wire::{Reply, Request},
     Peer, PeerListener, PeerSettings,
 };
 use ts_scheduler::{
@@ -432,6 +432,116 @@ fn a_listener_keeps_its_port_reserved_through_peer_startup() {
         std::net::TcpListener::bind(&name).unwrap_err().kind(),
         std::io::ErrorKind::AddrInUse
     );
+}
+
+#[test]
+fn two_dp_replicas_read_through_one_public_port() {
+    for public_reads in [true, false] {
+        read_through_node_port(public_reads);
+    }
+}
+
+fn node_listeners() -> [PeerListener; 2] {
+    use ts_collective::{Listener, Mesh};
+
+    let mesh_listeners = [(); 2].map(|_| Listener::bind("127.0.0.1").unwrap());
+    let addresses = mesh_listeners
+        .each_ref()
+        .map(|socket| format!("127.0.0.1:{}", socket.port().unwrap()));
+    std::thread::scope(|scope| {
+        let addresses = &addresses;
+        let spawn = |rank, socket| {
+            scope.spawn(move || {
+                let mut mesh =
+                    Mesh::connect(rank, socket, addresses, Duration::from_secs(5)).unwrap();
+                PeerListener::bind_node(&mut mesh, 4, &[(0, 16), (1, 31)], "127.0.0.1", 0).unwrap()
+            })
+        };
+        let [a, b] = mesh_listeners;
+        [spawn(0, a), spawn(1, b)].map(|worker| worker.join().unwrap())
+    })
+}
+
+#[test]
+fn sibling_receives_requests_while_public_scheduler_is_locked() {
+    let arena = Arena::new(200_000);
+    let [public, private] = node_listeners();
+    let address = format!("127.0.0.1:{}", public.port());
+    let replica = |rank, listener, base| {
+        Replica::with_listener(
+            settings(&format!("{address}/{rank}"), "v1"),
+            listener,
+            base,
+            &arena,
+            "Fused",
+        )
+    };
+    let owner = replica(16, public, READER_BASE);
+    let sibling = replica(31, private, HOLDER_BASE);
+    let (incoming, replies) = mpsc::channel();
+    let client = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let layout = Request::Layout {
+        reply_to: format!("127.0.0.1:{}", client.port()),
+    };
+    let receive_holder = || {
+        let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Inbound::Reply(Reply::Layout { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
+            panic!("expected a layout reply");
+        };
+        stamp.name
+    };
+    // Both messages enter the same public socket in FIFO order.
+    let lock = owner.scheduler.lock();
+    client.request(&owner.name, &layout).unwrap();
+    client.request(&sibling.name, &layout).unwrap();
+    assert_eq!(receive_holder(), sibling.name);
+    drop(lock);
+    assert_eq!(receive_holder(), owner.name);
+}
+
+fn read_through_node_port(public_reads: bool) {
+    let arena = Arena::new(200_000);
+    let [public, private] = node_listeners();
+    let address = format!("127.0.0.1:{}", public.port());
+    let (reader_listener, reader_rank, holder_listener, holder_rank) = if public_reads {
+        (public, 16, private, 31)
+    } else {
+        (private, 31, public, 16)
+    };
+    let mut reader = Replica::with_listener(
+        settings(&format!("{address}/{reader_rank}"), "v1"),
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+    let mut holder = Replica::with_listener(
+        settings(&format!("{address}/{holder_rank}"), "v1"),
+        holder_listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let mut longer = tokens;
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder.name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!(landings.len(), 1);
+    assert!(prefix >= 5 * PAGE);
+    assert_eq!(landings[0].end_tokens, prefix);
+    for destination in &landings[0].destinations {
+        let page = arena.read_bytes(
+            READER_BASE + destination.block_id as u64 * PAGE_BYTES,
+            PAGE_BYTES as usize,
+        );
+        assert!(page[0] != 0 && page.iter().all(|&byte| byte == page[0]));
+    }
 }
 
 #[test]

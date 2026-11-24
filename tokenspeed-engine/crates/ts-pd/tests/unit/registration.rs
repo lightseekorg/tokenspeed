@@ -341,6 +341,7 @@ fn deferred_allocation_peer(
             bootstrap_timeout,
             order: Vec::new(),
             senders: HashMap::new(),
+            active_rooms: HashMap::new(),
             stall_logged_at: None,
             drain_logged_at: None,
             timeouts_logged: HashSet::new(),

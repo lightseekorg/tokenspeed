@@ -655,7 +655,7 @@ class ServerArgs:
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
     # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
-    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # the node's replica leaders share for external control messages;
     # None turns it off.
     peer_prefix_port: int | None = None
     # The host other replicas and the router reach this replica's endpoint at;
@@ -2793,11 +2793,9 @@ class ServerArgs:
             raise ValueError(
                 "--peer-prefix-port is not supported with " + ", ".join(unsupported)
             )
-        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
-        if self.peer_prefix_port < 1 or last_port > 65535:
+        if not 1 <= self.peer_prefix_port <= 65535:
             raise ValueError(
-                "--peer-prefix-port and one port per attention-DP rank after "
-                f"it must be valid ports; got {self.peer_prefix_port}"
+                f"--peer-prefix-port must be in 1..65535; got {self.peer_prefix_port}"
             )
         if self.peer_prefix_answer_timeout_ms <= 0:
             raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
@@ -3886,7 +3884,7 @@ class ServerArgs:
             "sends with a peer holder reads the prefix that replica caches, in "
             "its Device or Host cache, over RDMA, instead of computing it, and "
             "this replica serves its own cache the same way. Its endpoint binds "
-            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "one port shared by the node's attention-DP replicas. Needs the Host "
             "tier (--enable-kvstore) and prefix caching; refused with "
             "--kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
@@ -3902,7 +3900,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.peer_prefix_host,
             help="The host other replicas and the router reach this replica's peer "
-            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "endpoint at; nonzero DP ranks append /rank to host:port. A holder hint "
             "must name it exactly so. Defaults to this host's detected address.",
         )
         parser.add_argument(

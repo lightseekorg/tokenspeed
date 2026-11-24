@@ -182,6 +182,33 @@ impl ActivePages {
     }
 }
 
+/// Rooms reserved by admitted PD requests that have not yet reached
+/// [`TransferPeer::register`] (same-round admissions, `grammar_queue`, EPD
+/// `staged`, `withheld`). Dropping a [`RoomLease`] releases its room
+/// automatically on any early failure, cancellation, or handoff.
+#[derive(Clone, Default)]
+struct PendingRooms(Arc<Mutex<HashSet<u64>>>);
+
+struct RoomLease {
+    rooms: Arc<Mutex<HashSet<u64>>>,
+    room: u64,
+}
+
+impl Drop for RoomLease {
+    fn drop(&mut self) {
+        self.rooms.lock().remove(&self.room);
+    }
+}
+
+impl PendingRooms {
+    fn try_reserve(&self, room: u64) -> Option<RoomLease> {
+        self.0.lock().insert(room).then(|| RoomLease {
+            rooms: Arc::clone(&self.0),
+            room,
+        })
+    }
+}
+
 /// An admitted request on its way to the scheduler.
 struct Submission {
     rid: String,
@@ -189,6 +216,9 @@ struct Submission {
     bootstrap: Option<ts_pd::BootstrapInfo>,
     /// EPD: the items whose embeddings it waits for.
     embeddings: Vec<EmbeddingItem>,
+    /// Holds the request's PD bootstrap room until `TransferPeer::register`
+    /// takes ownership (or the submission ends before scheduling).
+    _room_lease: Option<RoomLease>,
 }
 
 /// `control::gate_code` of a forward reload.
@@ -290,6 +320,9 @@ pub trait DataPlane {
 
     /// Restore these memory regions, in order.
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
+
+    /// Restore resources that require every rank's memory to be resident.
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError>;
 
     /// EPLB: this rank's route counters since the previous snapshot,
     /// `[layers, physical]`, with the placement they were counted under;
@@ -648,12 +681,17 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// EPD: admissions waiting for their images' embeddings, in staging
     /// order (rank-identical, the order the receiver reports them in).
     staged: Vec<Submission>,
+    /// PD bootstrap rooms reserved by admitted requests not yet registered
+    /// with `transfer`.
+    pending_rooms: PendingRooms,
     /// No attention-DP rank had a batch last round, so an idle rank may wait
     /// for requests without holding the others' collectives back.
     dp_idle: bool,
     /// Without L3, the forward permission the scheduler last received; it
     /// starts allowed. With L3 every round's tick carries it.
     forward_allowed: bool,
+    /// A collective NCCL release may have discarded projection workspaces and graphs.
+    collective_resume_pending: bool,
     /// Last load report on the output wire, including idle heartbeats.
     last_load_report: Option<Instant>,
     /// Last load sent to the frontend, including rounds with no token output.
@@ -742,8 +780,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             deferred_flushes: 0,
             withheld: Vec::new(),
             staged: Vec::new(),
+            pending_rooms: PendingRooms::default(),
             dp_idle: true,
             forward_allowed: true,
+            collective_resume_pending: false,
             last_load_report: None,
             reported_load: None,
             active_pages: ActivePages::default(),
@@ -985,6 +1025,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
+        if memory_resident && self.collective_resume_pending {
+            self.data_plane.finish_memory_resume()?;
+            self.collective_resume_pending = false;
+        }
         let forward_allowed = memory_resident
             && !self.controls.forward_blocked()
             && self.cache_clear_started.is_none();
@@ -1885,13 +1929,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let (specs, requests): (Vec<_>, Vec<_>) = submissions
             .into_iter()
-            .map(|submission| (submission.spec, (submission.rid, submission.bootstrap)))
+            .map(|submission| {
+                (
+                    submission.spec,
+                    (submission.rid, submission.bootstrap, submission._room_lease),
+                )
+            })
             .unzip();
         if let Err(error) = self.scheduler.submit_requests(&specs) {
             // SubmitRequests validates the whole batch before inserting it.
             // No transfer may start for requests the scheduler rejected.
             let reason = format!("Scheduler submission failed: {}", error.what());
-            for (rid, bootstrap) in requests {
+            for (rid, bootstrap, _room_lease) in requests {
                 if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), bootstrap) {
                     transfer.abort_room(&rid, bootstrap.room);
                 }
@@ -1902,7 +1951,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         }
         let now = std::time::Instant::now();
-        for (rid, bootstrap) in requests {
+        for (rid, bootstrap, _room_lease) in requests {
             self.outputs.mark_submitted(&rid, now);
             if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
                 transfer.register(&rid, bootstrap)?;
@@ -2697,6 +2746,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             Drain::Pause => self.controls.finish_pause_drain(),
             Drain::Release(tags) => {
                 self.data_plane.release_memory(&tags)?;
+                self.collective_resume_pending |= tags.iter().any(|tag| tag == "nccl");
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
             }
@@ -3367,6 +3417,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
+    /// Reserve `bootstrap.room` while a disaggregated request moves from
+    /// admission to `TransferPeer::register`, refusing any room already held
+    /// by a pending or tracked (including draining) request.
+    fn reserve_bootstrap_room(
+        &self,
+        bootstrap: Option<&ts_pd::BootstrapInfo>,
+    ) -> Result<Option<RoomLease>, u64> {
+        let (Some(transfer), Some(bootstrap)) = (self.transfer.as_ref(), bootstrap) else {
+            return Ok(None);
+        };
+        if transfer.has_room(bootstrap.room) {
+            return Err(bootstrap.room);
+        }
+        self.pending_rooms
+            .try_reserve(bootstrap.room)
+            .map(Some)
+            .ok_or(bootstrap.room)
+    }
+
     /// Take a round's messages in arrival order. A control operation acts
     /// after the requests that arrived before it are admitted, so a pause
     /// withholds only what came after it.
@@ -3378,6 +3447,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     ) -> Result<(), LoopError> {
         let _span = profile::span("EventLoop::admit");
         let mut admissions = Vec::new();
+        let mut room_leases = Vec::new();
         let mut seen = HashSet::new();
         for message in received {
             match message {
@@ -3431,13 +3501,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                                     admission.state,
                                 ));
                             } else {
-                                if self.owns_frontend() {
-                                    self.outputs.sample_ttft(
-                                        &mut admission.state,
-                                        admission.bootstrap.as_ref(),
-                                    );
+                                match self.reserve_bootstrap_room(admission.bootstrap.as_ref()) {
+                                    Ok(room_lease) => {
+                                        if self.owns_frontend() {
+                                            self.outputs.sample_ttft(
+                                                &mut admission.state,
+                                                admission.bootstrap.as_ref(),
+                                            );
+                                        }
+                                        admissions.push(*admission);
+                                        room_leases.push(room_lease);
+                                    }
+                                    Err(room) => {
+                                        tracing::warn!(
+                                            rid = admission.rid,
+                                            room,
+                                            "refusing request with an active bootstrap room"
+                                        );
+                                        admission.state.abort(
+                                            &format!(
+                                                "Bootstrap room {room} is already active; retry \
+                                                 with a new bootstrap_room"
+                                            ),
+                                            true,
+                                            Some(409),
+                                        );
+                                        outputs.extend(self.outputs.publish_finished_at_admission(
+                                            &admission.rid,
+                                            admission.state,
+                                        ));
+                                    }
                                 }
-                                admissions.push(*admission);
                             }
                         }
                         Some(Admitted::Refused { rid, state }) => {
@@ -3448,7 +3542,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
                 EngineRequest::Control(request) => {
-                    self.register(std::mem::take(&mut admissions), outputs, released)?;
+                    self.register(
+                        std::mem::take(&mut admissions),
+                        std::mem::take(&mut room_leases),
+                        outputs,
+                        released,
+                    )?;
                     self.control(*request)?;
                 }
                 // The transport turns calls into operations and drops encode
@@ -3459,7 +3558,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         self.outputs.sweep_pending_aborts();
-        self.register(admissions, outputs, released)
+        self.register(admissions, room_leases, outputs, released)
     }
 
     /// Register admitted requests with the data plane and the output
@@ -3468,6 +3567,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     fn register(
         &mut self,
         mut admissions: Vec<Admission>,
+        room_leases: Vec<Option<RoomLease>>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
@@ -3483,7 +3583,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;
         let mut submissions = Vec::with_capacity(admissions.len());
-        for admission in admissions {
+        for (admission, room_lease) in admissions.into_iter().zip(room_leases) {
             self.outputs
                 .register(admission.rid.clone(), admission.state);
             let submission = Submission {
@@ -3491,6 +3591,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 spec: admission.spec,
                 bootstrap: admission.bootstrap,
                 embeddings: admission.embeddings,
+                _room_lease: room_lease,
             };
             if let Some(key) = admission.grammar {
                 // A cache hit admits at once, unless the replica must first
