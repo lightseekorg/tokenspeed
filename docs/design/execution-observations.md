@@ -216,5 +216,5 @@ incomplete. Helper replay tests alone do not establish this end-to-end result.
 The wire addition is backward compatible; the public Rust field additions are
 source-breaking, including `OutputChunk` and the wire/control result structs.
 They belong to the coordinated Rust `0.2.0` release; see the
-[migration and publication policy](../../tokenspeed-engine/docs/migration-0.2.md).
+[migration and publication policy](../guides/rust-engine-migration-0.2.md).
 The Python wheel version and cancellation APIs are separate from this change.

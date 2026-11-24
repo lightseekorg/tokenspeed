@@ -216,7 +216,7 @@ This includes `OutputChunk`, `BatchTokenIDOutSlim`, `RequestOutput`, and the
 control-plane result/output structs. The shared minor bump and matching internal
 dependency requirements keep these types in one release family. The Python wheel
 version and the execution-observation protocol version are separate contracts.
-See [the 0.2 migration notes](docs/migration-0.2.md).
+See [the 0.2 migration notes](../docs/guides/rust-engine-migration-0.2.md).
 
 Several unmerged or unreleased changes can share this pending `0.2.0` release.
 Before publication, combine and validate its final contents on `main`. Once a

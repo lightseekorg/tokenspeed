@@ -36,7 +36,7 @@ An old producer's missing column means unavailable, never zero executions.
 Observation snapshots are cumulative: replace the previous snapshot after
 validation, rather than adding its counters again. A terminal output is not
 lifetime closure of outstanding native forwards. See the
-[execution contract](../../docs/design/execution-observations.md) for both
+[execution contract](../design/execution-observations.md) for both
 histograms, invalid/omitted evidence and closed-trace reconciliation.
 
 Unpublished changes may share `0.2.0`, including other pending client API changes.
