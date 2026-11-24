@@ -1574,7 +1574,7 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4/TP8 and Qwen3.8-Flash-Next TP2
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4/TP8 and Qwen3.8-Flash-Next TP1/TP2
 # decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
@@ -1845,6 +1845,26 @@ _DECODE_CONFIGS: dict[
         16: (16, 64, 256, 1, 4, 2, 10, 1),
         32: (32, 32, 512, 2, 2, 2, 5, 1),
         64: (32, 32, 512, 2, 2, 2, 5, 8),
+    },
+    # Qwen3.8-Flash-Next TP1 projections. The GEMV takes out_proj up to 16
+    # rows and the gated QKV at one row; hipBLASLt stays faster past the
+    # listed buckets.
+    # Gated DeltaNet out_proj and attention o_proj.
+    (2560, 6144): {
+        32: (32, 32, 256, 2, 2, 2, 6, 1),
+        64: (64, 32, 256, 2, 2, 3, 3, 8),
+    },
+    # Gated DeltaNet in_proj_qkvzba.
+    (16480, 2560): {
+        4: (16, 32, 64, 2, 2, 3, 1, 1),
+        8: (16, 32, 64, 2, 2, 3, 1, 1),
+        16: (16, 32, 64, 2, 2, 3, 1, 1),
+    },
+    # Attention QKV with the output gate.
+    (13312, 2560): {
+        4: (16, 64, 256, 1, 4, 3, 1, 1),
+        8: (16, 64, 256, 1, 4, 3, 1, 1),
+        16: (16, 64, 256, 1, 4, 3, 1, 1),
     },
     # QSA indexer query/key projection.
     (640, 2560): {
