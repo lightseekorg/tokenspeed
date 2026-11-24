@@ -709,6 +709,82 @@ def test_route_tile_schedules_match_direct_reference(
     _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
 
 
+# The EP4 entries whose tiles hold 32 routes, at every eighth row count of
+# their range and its upper end.
+_EP4_WIDE_CASES = [
+    (rows, config)
+    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS[(4096, 4096, 64, 256, 8)]
+    if config.block_m == 32
+    for rows in [*range(min_rows, max_rows, 8), max_rows]
+]
+
+
+@pytest.mark.parametrize(("rows", "config"), _EP4_WIDE_CASES)
+def test_wide_route_tiles_match_direct_reference_at_every_row_count(
+    rows: int, config: _RouteTileConfig
+) -> None:
+    """32-route tiles keep every route's bits at each row count of their entry.
+
+    Every local expert holds all rows' routes, so each spans several tiles.
+    """
+    _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "config"),
+    [case for case in _EP4_WIDE_CASES if case[0] in (96, 128, 137, 193, 256)],
+)
+def test_route_tile_size_does_not_change_bits(
+    rows: int, config: _RouteTileConfig
+) -> None:
+    """32-route and 16-route tiles of one schedule give the same bits.
+
+    Under random routing, the route map and every route this rank owns match.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(rows + 1)
+    _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
+    packed, scales = _quantize_mxfp4_activation(
+        _exact_mxfp4_activation(rows, HIDDEN, generator)
+    )
+    ids = _random_route_ids(rows, generator)
+
+    def launch(config: _RouteTileConfig) -> tuple[torch.Tensor, torch.Tensor]:
+        output = torch.full(
+            (rows * TOPK, HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        actual, _, mapping = _launch_mxfp4_route_tiles(
+            packed,
+            scales,
+            w13,
+            s13,
+            w2,
+            s2,
+            ids,
+            torch.empty(
+                (rows * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+            ),
+            empty_swizzled_cdna4_mxfp4_scale(
+                rows * TOPK, INTERMEDIATE // 32, device="cuda"
+            ),
+            output,
+            expert_start=NUM_EXPERTS,
+            top_k=TOPK,
+            config=config,
+            stage2_programs=2048,
+            stage2_single_round_jobs=0,
+        )
+        return actual, mapping
+
+    wide, wide_mapping = launch(config)
+    narrow, narrow_mapping = launch(config._replace(block_m=16))
+    torch.testing.assert_close(wide_mapping, narrow_mapping, atol=0, rtol=0)
+    owned = wide_mapping >= 0
+    assert owned.any()
+    torch.testing.assert_close(
+        wide[owned].view(torch.int16), narrow[owned].view(torch.int16), atol=0, rtol=0
+    )
+
+
 def test_route_tile_row_counts_share_their_entry_compile() -> None:
     """Every EP4 route-tile row count compiles nothing beyond its entry's.
 
@@ -784,7 +860,10 @@ def test_route_tile_stage2_programs_cover_every_job(bound_offset: int) -> None:
     )
     # The test routes every token to TOPK experts; the last token's last route
     # belongs to another rank.
-    groups = sum((count + 15) // 16 for count in [rows] * (TOPK - 1) + [rows - 1])
+    groups = sum(
+        (count + config.block_m - 1) // config.block_m
+        for count in [rows] * (TOPK - 1) + [rows - 1]
+    )
     jobs = groups * (HIDDEN // config.stage2.block_n)
     _check_route_tiles_match_direct_reference(rows, config, 4, jobs + bound_offset)
 

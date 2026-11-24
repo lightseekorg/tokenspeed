@@ -202,15 +202,21 @@ class _RouteTileConfig(NamedTuple):
     """Route-tiled A4W4 expert schedule (deferred, token/slot-order outputs).
 
     ``route_capacity`` bounds the call's row count. Stage 1 groups the routes
-    by expert straight from the top-k IDs, in tiles of at most 16 routes (a
-    token's top-k expert IDs are distinct, so an expert gets at most one route
-    per row, and at most ``route_capacity / 16`` tiles). It is a compile-time
-    bound that sizes the grouping, so it is bucketed to powers of two.
+    by expert straight from the top-k IDs, in tiles of at most ``block_m``
+    routes (a token's top-k expert IDs are distinct, so an expert gets at most
+    one route per row, and at most ``route_capacity / block_m`` tiles). It is a
+    compile-time bound that sizes the grouping, so it is bucketed to powers of
+    two. ``block_m`` is the route tile's row count, the MFMA M of both stages
+    (``BLOCK_M``): each tile reads its expert's weight slice once, so larger
+    tiles mean fewer weight reads for experts with many routes. It does not
+    change any row's K order, so results are bitwise identical across values.
+    Both are compile-time parameters, fixed per table entry at server start.
     """
 
     route_capacity: int
     stage1: _RouteTileStage
     stage2: _RouteTileStage
+    block_m: int
 
 
 _WIDE_STAGE1 = _RouteTileStage(128, 256, 1, 4)
@@ -244,7 +250,9 @@ _EP1_ID_STAGE2 = _RouteTileStage(128, 128, 8, 4)
 # EP8 (32 local experts), 4-16 rows: faster than the separate route grouping
 # kernels it replaced, with verify and with plain decode routing. The
 # EP4 4-16 row entries were not re-measured.
-_ID_ROUTE_TILES = ((4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),)
+_ID_ROUTE_TILES = (
+    (4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE, block_m=16)),
+)
 # EP8 (32 local experts), 49-256 rows: faster than the staged package with
 # uniform and Zipf routing, except one very skewed 224-row sample. Zipf
 # samples are slower from 384 rows, so the bound is 256. EP8 17-64 rows:
@@ -252,10 +260,22 @@ _ID_ROUTE_TILES = ((4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STA
 # samples; in the down projection (stage 2), a 256-wide K tile is about as
 # fast as a 128-wide one at 49-64 rows.
 _EP_ROUTE_TILES = _ID_ROUTE_TILES + (
-    (17, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
-    (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, 1, 1))),
+    (
+        17,
+        64,
+        _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1), block_m=16),
+    ),
+    (
+        65,
+        128,
+        _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, 1, 1), block_m=16),
+    ),
     # More routes per expert favor the longer down-projection K tile.
-    (129, 256, _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
+    (
+        129,
+        256,
+        _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1), block_m=16),
+    ),
 )
 # EP4 (64 local experts), 17-256 rows: wider output tiles in both stages. Each
 # program streams one K-tiled weight slice per job and keeps only one or two K
@@ -276,21 +296,45 @@ _EP4_ROUTE_TILES = _ID_ROUTE_TILES + (
         17,
         64,
         _RouteTileConfig(
-            64, _RouteTileStage(256, 256, 1, 4), _RouteTileStage(128, 128, 1, 1)
+            64,
+            _RouteTileStage(256, 256, 1, 4),
+            _RouteTileStage(128, 128, 1, 1),
+            block_m=16,
         ),
     ),
     (
         65,
-        128,
+        95,
         _RouteTileConfig(
-            128, _RouteTileStage(256, 256, 1, 4), _RouteTileStage(64, 128, 1, 1)
+            128,
+            _RouteTileStage(256, 256, 1, 4),
+            _RouteTileStage(64, 128, 1, 1),
+            block_m=16,
         ),
     ),
+    # 96-128 rows: the 32-route schedule of the 129-256 entry below. Fewer rows
+    # keep the 16-route schedule above, which is faster there.
+    (
+        96,
+        128,
+        _RouteTileConfig(
+            128,
+            _RouteTileStage(256, 256, 1, 4),
+            _RouteTileStage(128, 128, 1, 1),
+            block_m=32,
+        ),
+    ),
+    # 129-256 rows: 32-route tiles. A popular expert holds more than 16 routes
+    # at these row counts, and every extra tile reads its weights again; one
+    # 32-route tile reads them once.
     (
         129,
         256,
         _RouteTileConfig(
-            256, _RouteTileStage(256, 128, 2, 4), _RouteTileStage(128, 256, 0, 1)
+            256,
+            _RouteTileStage(256, 256, 1, 4),
+            _RouteTileStage(128, 128, 1, 1),
+            block_m=32,
         ),
     ),
 )
@@ -304,17 +348,18 @@ _ROUTE_TILE_CONFIGS = {
     # them. 17-128 rows: faster than the staged package; with uniform and
     # Zipf routing it breaks even at 160 rows.
     (4096, 512, 256, 256, 8): (
-        (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2)),
+        (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2, block_m=16)),
         # Stage 1's grouping cost grows with the route capacity, so 17-32
         # rows take a 32-route capacity.
-        (17, 32, _RouteTileConfig(32, _EP1_STAGE, _EP1_STAGE2)),
-        (33, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
-        (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2)),
+        (17, 32, _RouteTileConfig(32, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
+        (33, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
+        (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
     ),
 }
 assert all(
     config.route_capacity & (config.route_capacity - 1) == 0
-    and 16 <= config.route_capacity
+    and config.block_m in (16, 32)
+    and config.block_m <= config.route_capacity
     and config.route_capacity >= max_rows
     for entries in _ROUTE_TILE_CONFIGS.values()
     for _, max_rows, config in entries
