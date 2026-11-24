@@ -38,7 +38,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
 from tokenspeed.runtime.cache.peer import (  # noqa: E402
     build_peer_geometry,
+    peer_host_regions,
     peer_incarnation,
+    peer_scheduler_config,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -54,6 +56,41 @@ from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 NUM_LCM_BLOCKS = 6
+
+
+def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
+    assert peer_host_regions(100, 42, 6, None) == ((100, 42),)
+    assert peer_host_regions(100, 42, 6, lambda length, parent: (24, 18)) == (
+        (100, 24),
+        (124, 18),
+    )
+
+
+@pytest.mark.parametrize("lengths", [(12,), (18, 25), (17, 25), (0, 42), (-6, 48)])
+def test_invalid_peer_host_registration_plans_are_refused(lengths):
+    with pytest.raises(ValueError, match="(region|regions)"):
+        peer_host_regions(100, 42, 6, lambda *_: lengths)
+
+
+def test_release_only_loaded_checkpoint_file_pages(tmp_path, monkeypatch):
+    from tokenspeed.runtime.cache.l2.executor import release_checkpoint_file_cache
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"weights")
+    (tmp_path / "config.json").write_text("{}")
+    advised = []
+    monkeypatch.setattr(
+        os,
+        "posix_fadvise",
+        lambda fd, start, length, advice: advised.append(
+            (os.fstat(fd).st_ino, start, length, advice)
+        ),
+    )
+    release_checkpoint_file_cache([str(tmp_path)], node_leader=False, cpu_group=None)
+    assert not advised
+    release_checkpoint_file_cache([str(tmp_path)] * 2, node_leader=True, cpu_group=None)
+    assert advised == [(shard.stat().st_ino, 0, 0, os.POSIX_FADV_DONTNEED)]
+    assert shard.read_bytes() == b"weights"
 
 
 def _spec(group_id: str, attn_kind: str) -> CacheGroupSpec:
@@ -96,6 +133,8 @@ def _setup():
         layout,
         group_specs=(_spec("full", "full_history"), _spec("swa", "full_history")),
         num_host_lcm_blocks=NUM_LCM_BLOCKS,
+        block_alignment=1,
+        align_host_buffer=False,
     )
     field_addresses = {
         field.field_id: device.data_ptr() + field.device_block_zero_offset_bytes
@@ -175,6 +214,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.peer_prefix_port = 7100
     args.peer_prefix_answer_timeout_ms = 50
     args.peer_prefix_min_fetch_tokens = 256
+    args.peer_prefix_landing_tier = "device"
     args.disaggregation_mode = "null"
     args.enable_kvstore = True
     args.enable_prefix_caching = True
@@ -191,10 +231,36 @@ def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
     _peer_args().validate_peer_prefix_options()
     # A decode replica holds the history it decoded (RFC 0005).
     _peer_args(disaggregation_mode="decode").validate_peer_prefix_options()
-    # Off, nothing is checked.
+    # Off, nothing is checked but a stray landing tier.
     _peer_args(
-        peer_prefix_port=None, enable_kvstore=False
+        peer_prefix_port=None, enable_kvstore=False, peer_prefix_landing_tier=None
     ).validate_peer_prefix_options()
+    with pytest.raises(ValueError, match="requires --peer-prefix-port"):
+        _peer_args(peer_prefix_port=None).validate_peer_prefix_options()
+
+
+@pytest.mark.parametrize("tier", [None, "disk"])
+def test_peer_sharing_needs_an_explicit_landing_tier(tier):
+    with pytest.raises(ValueError, match="--peer-prefix-landing-tier"):
+        _peer_args(peer_prefix_landing_tier=tier).validate_peer_prefix_options()
+
+
+def test_host_landings_take_a_share_of_the_host_blocks():
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
+    common = dict(
+        name="10.0.0.2:7100",
+        incarnation=3,
+        answer_timeout_ms=50,
+        min_fetch_tokens=256,
+        num_host_blocks=100,
+    )
+    host = peer_scheduler_config(landing_tier="host", **common)
+    assert host.landing_tier == ts.PeerLandingTier.Host
+    assert host.max_host_landing_blocks == 50
+    assert host.host_ready_timeout_us > 0
+    device = peer_scheduler_config(landing_tier="device", **common)
+    assert device.landing_tier == ts.PeerLandingTier.Device
+    assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
 
 
 @pytest.mark.parametrize(
@@ -212,18 +278,23 @@ def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):
         _peer_args(**overrides).validate_peer_prefix_options()
 
 
-def test_every_attention_dp_rank_needs_a_valid_port():
-    # Rank 1 binds 65535.
-    _peer_args(peer_prefix_port=65534).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=0).validate_peer_prefix_options()
+def test_attention_dp_replicas_share_one_public_port():
+    from tokenspeed.runtime.cache.peer import peer_endpoint_name
+
+    _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
+    assert peer_endpoint_name("::1", 65535, 0) == "[::1]:65535"
+    assert peer_endpoint_name("::1", 65535, 31) == "[::1]:65535/31"
+    for port in (0, 65536):
+        with pytest.raises(ValueError, match="1..65535"):
+            _peer_args(peer_prefix_port=port).validate_peer_prefix_options()
 
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"peer_prefix_answer_timeout_ms": 0}, {"peer_prefix_min_fetch_tokens": 0}],
+    [
+        {"peer_prefix_answer_timeout_ms": 0},
+        {"peer_prefix_min_fetch_tokens": 0},
+    ],
 )
 def test_peer_limits_must_be_positive(overrides):
     with pytest.raises(ValueError, match="must be positive"):

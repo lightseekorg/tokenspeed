@@ -297,8 +297,10 @@ class CacheMemoryPlan:
         atom_pages_per_block: int,
         kernel_subpages: int,
         kernel_page_size: int,
+        max_write_slot: int,
     ) -> None:
-        """Check translated page IDs and token write slots fit signed int32.
+        """Check translated page IDs fit signed int32 and token write slots stay
+        at or below ``max_write_slot``, the largest value their consumer stores.
 
         ``kernel_subpages`` is the logical pages per scheduler block;
         ``atom_pages_per_block`` also includes any physical gaps. Capacity
@@ -317,14 +319,14 @@ class CacheMemoryPlan:
             - 1
         )
         max_slot = max_atom * kernel_page_size + kernel_page_size - 1
-        for name, value in (
-            ("atom page id", max_atom),
-            ("kernel write slot", max_slot),
+        for name, value, limit in (
+            ("atom page id", max_atom, _MAX_KERNEL_PAGE_ID),
+            ("kernel write slot", max_slot, max_write_slot),
         ):
-            if value > _MAX_KERNEL_PAGE_ID:
+            if value > limit:
                 raise ValueError(
                     f"cache group {group_id!r}: {name} {value} exceeds "
-                    f"signed int32 maximum {_MAX_KERNEL_PAGE_ID}"
+                    f"the maximum {limit}"
                 )
 
     def field_page_byte_offset(self, field_id: str, page_id: int) -> int:

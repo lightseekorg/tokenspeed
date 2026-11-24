@@ -56,7 +56,9 @@ def _mxfp4_quantize_blocks(x):
     amax = amax.to(tl.float32, bitcast=True)
     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+    # Add the bias before narrowing: the unbiased exponent is negative for
+    # small blocks, and converting a negative float to uint8 is undefined.
+    scale_byte = (scale_e8m0_unbiased + 127).to(tl.uint8)
     qx = x * tl.expand_dims(tl.exp2(-scale_e8m0_unbiased), 2)
     qx = qx.to(tl.uint32, bitcast=True)
 
@@ -231,7 +233,9 @@ def store_mxfp4_tile_gfx1250(
     amax = amax.to(gl.float32, bitcast=True)
     scale_e8m0_unbiased = gl.floor(gl.log2(amax)) - 2
     scale_e8m0_unbiased = gl.clamp(scale_e8m0_unbiased, -127, 127)
-    scale_byte = scale_e8m0_unbiased.to(gl.uint8) + 127
+    # Add the bias before narrowing: the unbiased exponent is negative for
+    # small blocks, and converting a negative float to uint8 is undefined.
+    scale_byte = (scale_e8m0_unbiased + 127).to(gl.uint8)
     qx = x * gl.expand_dims(gl.exp2(-scale_e8m0_unbiased), 2)
     qx = qx.to(gl.uint32, bitcast=True)
 

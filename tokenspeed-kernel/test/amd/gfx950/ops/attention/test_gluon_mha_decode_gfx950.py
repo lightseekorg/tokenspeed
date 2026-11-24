@@ -192,6 +192,22 @@ def test_full_decode_config_keeps_prefetch_within_vmcnt() -> None:
     assert (config.num_kv_splits, config.num_stages) == (64, 1)
 
 
+def test_full_decode_config_keeps_head_dim_256_pipeline_within_lds() -> None:
+    """Four stages of BF16 head dim 256 K and V pages would take 256 KiB of
+    LDS; 8 x 8 rows give the four-wave work-group whose copies fit vmcnt."""
+    q = torch.empty(8, 16, 256, dtype=torch.bfloat16)
+    k_cache = torch.empty(1, PAGE_SIZE, 2, 256, dtype=torch.bfloat16)
+    config = decode.get_config(
+        q=q,
+        k_cache=k_cache,
+        max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=8,
+        window_left=-1,
+        softmax_scale=None,
+    )
+    assert (config.num_kv_splits, config.num_warps, config.num_stages) == (64, 4, 1)
+
+
 @pytest.mark.parametrize(
     "cache_lens,num_stages",
     [
@@ -435,6 +451,10 @@ def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
         # 16 x 6 rows: under a short window, six one-wave blocks whose rows
         # straddle query positions.
         pytest.param(16, 6, 1, 128, id="96-rows"),
+        # Qwen3.5-style full attention: 24 query over 4 KV heads, head dim
+        # 256, at decode and at an 8-token verify (48 rows, four waves).
+        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
+        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
     ],
 )
 def test_verify_rows_match_reference_and_replay(
@@ -619,8 +639,10 @@ def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> No
         _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)
 
 
-def test_sliding_split_stores_reach_l2_before_arrival() -> None:
-    """Every wave's split partial reaches L2 before the split arrives.
+@pytest.mark.parametrize("uniform_rows", [False, True])
+def test_sliding_split_stores_reach_l2_before_arrival(uniform_rows) -> None:
+    """Every wave's split partial reaches L2 before the split arrives, with
+    causal (verify) and uniform (draft block) rows.
 
     All waves store the partial, and one thread bumps the row block's
     counter, whose release waits only for its own wave. Compile without
@@ -643,6 +665,8 @@ def test_sliding_split_stores_reach_l2_before_arrival() -> None:
         "out_ptr": "*bf16",
         "sink_ptr": "*fp8e4nv",
         "counters_ptr": "*i32",
+        "gate_ptr": "*bf16",
+        "gate_stride": "i32",
     }
     # One TP8 rank of a 2048-token sliding window: 16 query heads over 2 KV
     # heads, 8 verify positions per request, 4 waves.
@@ -664,7 +688,10 @@ def test_sliding_split_stores_reach_l2_before_arrival() -> None:
         "WINDOW_LEFT": 2047,
         "HAS_SINK": False,
         "IS_FP8": True,
+        "UNIFORM_ROWS": uniform_rows,
         "NUM_STAGES": 2,
+        "GATE_EPS": 1e-6,
+        "HAS_GATE": True,
     }
     signature = dict(pointers, **{name: "constexpr" for name in constexprs})
     signature = {name: signature[name] for name in fn.arg_names}
@@ -720,6 +747,8 @@ def _balanced(inputs: dict, sinks=None, schedule=None) -> torch.Tensor:
         pytest.param(3, 12, 2, 64, id="18-rows"),
         pytest.param(16, 8, 1, 64, id="128-rows"),
         pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
+        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
+        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
     ],
 )
 def test_balanced_rows_match_reference_and_replay(
@@ -938,3 +967,152 @@ def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
     _check_verify(
         _balanced(inputs, schedule=buffer), _verify_reference(inputs, -1, None)
     )
+
+
+@pytest.mark.parametrize("schedule", [False, True], ids=["split-grid", "balanced"])
+# A 2-page window runs the sliding decode unsplit; 2047 splits it.
+@pytest.mark.parametrize(
+    "window_left", [-1, 2047, 127], ids=["full", "window-2047", "window-127"]
+)
+@pytest.mark.parametrize("max_seqlen_q", [1, 8], ids=["decode", "verify"])
+@pytest.mark.parametrize("requests", [1, 9, 24])
+def test_output_gate_is_bitwise_to_the_separate_gated_norm(
+    requests: int, max_seqlen_q: int, window_left: int, schedule: bool
+) -> None:
+    """With output_gate, the decode stores weightless_rmsnorm_gated_sigmoid of
+    its output, bit for bit, without launching that op: every final store
+    (sliding single pass, sliding split merge, split-grid reduce, balanced
+    reduce) over FP8 caches of short and long requests, 8-192 rows."""
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_schedule,
+        mha_decode_with_kvcache,
+    )
+    from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+    from torch.profiler import ProfilerActivity, profile
+
+    if schedule and window_left >= 0:
+        pytest.skip("the balanced schedule serves full attention only")
+    cache_lens = [
+        [max_seqlen_q + 3, 40 * PAGE_SIZE + 9, 470 * PAGE_SIZE + 33][i % 3]
+        for i in range(requests)
+    ]
+    inputs = _verify_inputs(cache_lens, max_seqlen_q, Q_HEADS, KV_HEADS, HEAD_DIM, 7)
+    for name in ("q", "k_cache", "v_cache"):
+        inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    rows = inputs["q"].shape[0]
+    generator = torch.Generator(device="cuda").manual_seed(8)
+    # A strided view, as the gate columns of a fused QKV-gate projection.
+    gate = torch.randn(
+        rows, 3 * Q_HEADS * HEAD_DIM, device="cuda", generator=generator
+    ).bfloat16()[:, Q_HEADS * HEAD_DIM : 2 * Q_HEADS * HEAD_DIM]
+    common = dict(
+        q=inputs["q"],
+        k_cache=inputs["k_cache"],
+        v_cache=inputs["v_cache"],
+        page_table=inputs["page_table"],
+        cache_seqlens=inputs["cache_seqlens"],
+        max_seqlen_k=inputs["max_seqlen_k"],
+        max_seqlen_q=max_seqlen_q,
+        window_left=window_left,
+        block_draft=False,
+    )
+    if schedule:
+        common["schedule"] = mha_decode_schedule(
+            inputs["q"],
+            inputs["k_cache"],
+            inputs["v_cache"],
+            inputs["cache_seqlens"],
+            max_seqlen_q,
+            window_left=window_left,
+            block_draft=False,
+        )
+        if common["schedule"] is None:
+            pytest.skip("this shape takes the split grid, not the balanced schedule")
+    expected = weightless_rmsnorm_gated_sigmoid(
+        mha_decode_with_kvcache(**common).view(rows, Q_HEADS * HEAD_DIM),
+        gate,
+        Q_HEADS,
+        HEAD_DIM,
+        1e-6,
+        False,
+    )
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        gated = mha_decode_with_kvcache(
+            **common, output_gate=gate, output_gate_eps=1e-6
+        )
+        torch.cuda.synchronize()
+    assert torch.equal(gated.view(rows, -1), expected)
+    assert not any("gated_sigmoid" in event.name for event in prof.events())
+
+
+@pytest.mark.parametrize("schedule", [False, True], ids=["split-grid", "balanced"])
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.float8_e4m3fn, torch.bfloat16], ids=["fp8", "bf16"]
+)
+# Per-rank heads of a 128-head model over TP16 / TP8 / TP4 / TP2: the separate
+# op's Triton layout holds 2 / 4 / 8 / 8 values of a head a lane.
+@pytest.mark.parametrize("q_heads", [8, 16, 32, 64])
+def test_output_gate_matches_the_separate_gated_norm_at_every_head_count(
+    q_heads: int, kv_dtype: torch.dtype, schedule: bool
+) -> None:
+    """The gated decode stores the separate weightless_rmsnorm_gated_sigmoid's
+    bits at every head count, not only where its Triton layout happens to hold
+    8 values of a head a lane, and stores the same bits on every run. A head's
+    sum of squares rounds differently in another order only rarely, so 8,192
+    verify rows check about 65k to 520k heads."""
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_schedule,
+        mha_decode_with_kvcache,
+    )
+    from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+
+    max_seqlen_q = 8
+    cache_lens = [
+        [max_seqlen_q + 3, 15 * PAGE_SIZE + 9, 2 * PAGE_SIZE][i % 3]
+        for i in range(1024)
+    ]
+    inputs = _verify_inputs(
+        cache_lens, max_seqlen_q, q_heads, q_heads // 8, HEAD_DIM, q_heads
+    )
+    for name in ("q", "k_cache", "v_cache"):
+        inputs[name] = inputs[name].to(kv_dtype)
+    rows = inputs["q"].shape[0]
+    generator = torch.Generator(device="cuda").manual_seed(q_heads + 1)
+    gate = torch.randn(
+        rows, q_heads * HEAD_DIM, device="cuda", generator=generator
+    ).bfloat16()
+    common = dict(
+        q=inputs["q"],
+        k_cache=inputs["k_cache"],
+        v_cache=inputs["v_cache"],
+        page_table=inputs["page_table"],
+        cache_seqlens=inputs["cache_seqlens"],
+        max_seqlen_k=inputs["max_seqlen_k"],
+        max_seqlen_q=max_seqlen_q,
+        window_left=-1,
+        block_draft=False,
+    )
+    if schedule:
+        common["schedule"] = mha_decode_schedule(
+            inputs["q"],
+            inputs["k_cache"],
+            inputs["v_cache"],
+            inputs["cache_seqlens"],
+            max_seqlen_q,
+            window_left=-1,
+            block_draft=False,
+        )
+        if common["schedule"] is None:
+            pytest.skip("this shape takes the split grid, not the balanced schedule")
+    expected = weightless_rmsnorm_gated_sigmoid(
+        mha_decode_with_kvcache(**common).view(rows, q_heads * HEAD_DIM),
+        gate,
+        q_heads,
+        HEAD_DIM,
+        1e-6,
+        False,
+    )
+    gated = mha_decode_with_kvcache(**common, output_gate=gate, output_gate_eps=1e-6)
+    again = mha_decode_with_kvcache(**common, output_gate=gate, output_gate_eps=1e-6)
+    assert torch.equal(gated.view(rows, -1), expected)
+    assert torch.equal(again, gated)

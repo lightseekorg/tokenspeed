@@ -17,7 +17,9 @@
 #   score scale), not with a power-of-two scale into BF16 weights.
 # - The index-K write repeats tokenspeed_triton's instruction sequence for
 #   index_k_layernorm_fp8_scatter (in-thread pairs, butterflies, approximate square
-#   root and full-range divisions) into the packed fp8_scaled plane.
+#   root and full-range divisions) into the packed fp8_scaled plane. Under a KVP
+#   placement the slots are virtual: the write keeps this rank's rows at their
+#   local slots, as virtual_slots_to_local resolves them, and skips the rest.
 # - The weights stream in 64-column K blocks (cp.async, L2 evict_first) with one
 #   barrier per block; the partials overwrite the weight buffer and owners pull them
 #   over DSMEM after a cluster barrier instead of receiving bulk copies.
@@ -356,7 +358,8 @@ class DecodeFront:
     def kernel(self, args):
         q_a, kv_a, key, head_w, q_gamma, kv_gamma, weight, k_gamma, k_beta = args[:9]
         cache, slots, q_norm, projected, q_fp8, w_out = args[9:15]
-        d_q, d_kv, eps, key_eps, fp8_max, amax_floor, softmax_scale = args[15:]
+        d_q, d_kv, eps, key_eps, fp8_max, amax_floor, softmax_scale = args[15:22]
+        owner = args[22:]
         tid, _, _ = cute.arch.thread_idx()
         part, head, _ = cute.arch.block_idx()
         warp, lane = tid // 32, tid % 32
@@ -572,7 +575,9 @@ class DecodeFront:
             cute.arch.griddepcontrol_launch_dependents()
             token = head * CLUSTER + part
             if token < rows:
-                self.insert_key(key, slots, cache, k_w, k_b, key_eps, token, lane)
+                self.insert_key(
+                    key, slots, owner, cache, k_w, k_b, key_eps, token, lane
+                )
                 self.kv_norm(kv_a, kv_lo, kv_hi, d_kv, eps, token, lane)
             cute.arch.cluster_wait()
             cute.arch.cluster_arrive()
@@ -606,11 +611,14 @@ class DecodeFront:
         return k_w, k_b, kv_lo, kv_hi
 
     @cute.jit
-    def insert_key(self, key, slots, cache, k_w, k_b, key_eps, token, lane):
+    def insert_key(self, key, slots, owner, cache, k_w, k_b, key_eps, token, lane):
         """index_k_layernorm_fp8_scatter of row ``token`` (one warp, lane ``lane``
         holding columns [4 lane, 4 lane + 4)): the FP32 LayerNorm rounded to BF16,
         then FP8 E4M3 with the scale max(amax, 1e-10) / 448 rounded up to a
-        power of two."""
+        power of two. ``owner`` is ``virtual_slots_to_local``'s (rows per page,
+        virtual blocks, degree, rank): over one rank, slots are plane slots;
+        over more, virtual slots, and only this rank's rows are written, at
+        their local slots."""
         x = []
         for word in load_words(at(key, token, 4 * lane), count=2, mutable=True):
             x += list(unpack_bf16(word))
@@ -633,11 +641,21 @@ class DecodeFront:
         scale = bits_float(exponent << 23)
         codes = pack_fp8(tuple(clamp_fp8(div_full(v, scale), Float32(448)) for v in y))
         slot = load_slot(at(slots, token), wide=self.wide_slots)
-        page, offset = slot >> 6, slot & (PAGE - 1)
-        base = cache.iterator + page * (PAGE * ROW_BYTES)
-        store_words(base + offset * DIM + 4 * lane, (codes,))
-        if lane == 0:
-            store_words(base + PAGE * DIM + offset * 4, (exponent * 0x01010101,))
+        rows, blocks, degree, rank = (Int64(v) for v in owner)
+        owned = Int32(1)
+        if degree > Int64(1):
+            block = slot // rows
+            owned = Int32(0)
+            if block > Int64(0) and block < blocks:
+                if (block - 1) % degree == rank:
+                    owned = Int32(1)
+            slot = ((block - 1) // degree + 1) * rows + slot % rows
+        if owned != Int32(0):
+            page, offset = slot >> 6, slot & (PAGE - 1)
+            base = cache.iterator + page * (PAGE * ROW_BYTES)
+            store_words(base + offset * DIM + 4 * lane, (codes,))
+            if lane == 0:
+                store_words(base + PAGE * DIM + offset * 4, (exponent * 0x01010101,))
 
     @cute.jit
     def kv_norm(self, kv_a, kv_lo, kv_hi, d_kv, eps, token, lane):
@@ -688,6 +706,7 @@ def compile_front(
         Int32(K),
         Int32(LATENT),
         *(Float32(0) for _ in range(5)),
+        *(Int32(1) for _ in range(4)),  # the slots' owner
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     front = DecodeFront(tiles, query_rows, wide_slots, key_norm_fp32, pdl)

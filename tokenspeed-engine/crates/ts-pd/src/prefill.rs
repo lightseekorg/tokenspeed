@@ -106,6 +106,9 @@ struct PendingRegistration {
     frames: Vec<Bytes>,
     cache_id: String,
     registration: Option<Registration>,
+    /// Acknowledged by this id once installed; `None` from an older Decode
+    /// rank that does not wait for an acknowledgment.
+    id: Option<u64>,
 }
 
 impl PendingRegistration {
@@ -696,7 +699,10 @@ impl Shared {
     }
 
     fn handle_registration(&self, frames: &[Bytes]) {
-        let Ok((_, _, cache_id)) = wire::registration_route(frames) else {
+        let (Ok((_, _, cache_id)), Ok(id)) = (
+            wire::registration_route(frames),
+            wire::registration_id(frames),
+        ) else {
             tracing::error!("rejecting a malformed CachePD registration");
             return;
         };
@@ -706,6 +712,7 @@ impl Shared {
                 frames: frames.to_vec(),
                 cache_id,
                 registration: self.plan_registration(frames).ok(),
+                id,
             });
         self.flush_registrations();
     }
@@ -752,11 +759,15 @@ impl Shared {
                 .registrations
                 .values()
                 .filter(|previous| {
-                    previous.cache_id == pending.cache_id
-                        || pending.registration.as_ref().is_some_and(|next| {
-                            (previous.endpoint == next.endpoint && previous.port == next.port)
-                                || previous.session_id == next.session_id
-                        })
+                    // An identical registration (a resend, or the same cache
+                    // registering again after a route change) replaces
+                    // nothing, so it waits for no writer.
+                    pending.registration.as_ref() != Some(*previous)
+                        && (previous.cache_id == pending.cache_id
+                            || pending.registration.as_ref().is_some_and(|next| {
+                                (previous.endpoint == next.endpoint && previous.port == next.port)
+                                    || previous.session_id == next.session_id
+                            }))
                 })
                 .map(|previous| state.registration_gates[&previous.cache_id].clone())
                 .collect()
@@ -808,20 +819,44 @@ impl Shared {
             for (endpoint, port, old_id) in retired {
                 self.reject_session(endpoint, port, &old_id, "cache instance superseded");
             }
+            let route = (registration.endpoint.clone(), registration.port);
             let mut state = self.state();
             state.failed_sessions.remove(&cache_id);
             state
                 .registration_gates
                 .entry(cache_id.clone())
                 .or_insert_with(|| Arc::new(RwLock::new(())));
-            state.registrations.insert(cache_id, registration);
-            Ok(())
+            state.registrations.insert(cache_id.clone(), registration);
+            Ok((route, cache_id))
         });
         match registered {
-            Ok(()) => {}
+            Ok(((endpoint, port), cache_id)) => {
+                // Only now may the Decode rank publish manifests for this
+                // cache. A lost acknowledgment is resent with the
+                // registration, which reinstalls the same entry.
+                if let Some(id) = pending.id {
+                    let _ = self.transport.sockets.send_coalesced(
+                        &endpoint,
+                        port,
+                        wire::registration_ack_frames(id, &cache_id, self.status_rank),
+                    );
+                }
+            }
             Err(reason) => {
                 tracing::error!(reason, "rejecting a CachePD Decode registration");
                 if let Ok((endpoint, port, cache_id)) = wire::registration_route(frames) {
+                    if let Some(id) = pending.id {
+                        let _ = self.transport.sockets.send_coalesced(
+                            &endpoint,
+                            port,
+                            wire::registration_reject_frames(
+                                id,
+                                &cache_id,
+                                self.status_rank,
+                                &reason,
+                            ),
+                        );
+                    }
                     self.reject_session(endpoint, port, &cache_id, &reason);
                 }
             }
@@ -1863,6 +1898,9 @@ pub struct PrefillPeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     senders: HashMap<String, Sender>,
+    /// Active (including draining) rooms owned by `senders`, maintained only
+    /// on the scheduling loop thread for replica-identical admission checks.
+    active_rooms: HashMap<u64, String>,
     stall_logged_at: Option<Instant>,
     drain_logged_at: Option<Instant>,
     /// The timeout stages already warned about.
@@ -1954,6 +1992,7 @@ impl PrefillPeer {
                 bootstrap_timeout: config.bootstrap_timeout,
                 order: Vec::new(),
                 senders: HashMap::new(),
+                active_rooms: HashMap::new(),
                 stall_logged_at: None,
                 drain_logged_at: None,
                 timeouts_logged: HashSet::new(),
@@ -2035,6 +2074,7 @@ impl PrefillPeer {
         let Some(sender) = self.senders.remove(rid) else {
             return;
         };
+        self.active_rooms.remove(&sender.room);
         self.order.retain(|tracked| tracked != rid);
         let mut state = self.shared.state();
         state.clear(sender.room);
@@ -2051,6 +2091,16 @@ impl Drop for PrefillPeer {
 impl TransferPeer for PrefillPeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
         let room = bootstrap.room;
+        if self.senders.contains_key(rid) {
+            return Err(PdError::Peer(format!(
+                "request {rid} is already registered with the Prefill transfer peer"
+            )));
+        }
+        if let Some(existing) = self.active_rooms.get(&room) {
+            return Err(PdError::Peer(format!(
+                "bootstrap room {room} for request {rid} is already active for request {existing}"
+            )));
+        }
         {
             let mut state = self.shared.state();
             state.cached_tokens.remove(&room);
@@ -2065,24 +2115,20 @@ impl TransferPeer for PrefillPeer {
             state.tracked.insert(room);
             state.rooms_by_rid.insert(rid.to_owned(), room);
         }
-        if self
-            .senders
-            .insert(
-                rid.to_owned(),
-                Sender {
-                    room,
-                    announced: false,
-                    admitted: false,
-                    started: Instant::now(),
-                    local: TransferPoll::Bootstrapping,
-                    concluded: None,
-                    draining: None,
-                },
-            )
-            .is_none()
-        {
-            self.order.push(rid.to_owned());
-        }
+        self.senders.insert(
+            rid.to_owned(),
+            Sender {
+                room,
+                announced: false,
+                admitted: false,
+                started: Instant::now(),
+                local: TransferPoll::Bootstrapping,
+                concluded: None,
+                draining: None,
+            },
+        );
+        self.order.push(rid.to_owned());
+        self.active_rooms.insert(room, rid.to_owned());
         Ok(())
     }
 
@@ -2312,6 +2358,10 @@ impl TransferPeer for PrefillPeer {
         !self.order.is_empty()
     }
 
+    fn has_room(&self, room: u64) -> bool {
+        self.active_rooms.contains_key(&room)
+    }
+
     fn cancel(&mut self, rid: &str) {
         if let Some(sender) = self.senders.get_mut(rid) {
             sender.concluded = Some(TransferPoll::Failed);
@@ -2322,6 +2372,19 @@ impl TransferPeer for PrefillPeer {
     }
 
     fn abort_room(&mut self, rid: &str, room: u64) {
+        if let Some(existing) = self
+            .active_rooms
+            .get(&room)
+            .filter(|existing| existing.as_str() != rid)
+        {
+            tracing::warn!(
+                rid,
+                room,
+                existing,
+                "ignoring abort_room for a room owned by another active request"
+            );
+            return;
+        }
         self.shared.abort_room(
             room,
             &format!("EPD: prefill aborted request {rid} (embedding receive timed out)"),

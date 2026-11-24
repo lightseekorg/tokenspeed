@@ -56,6 +56,9 @@ logger = logging.getLogger(__name__)
 # exchanges up to 64 rows (eight requests of eight tokens) fit; larger ones,
 # and prefill's, keep the generic collectives, which win from about this size.
 DECODE_EXCHANGE_CAP_BYTES = 1 << 20
+# Largest per-rank gather of float words: the owned decode top-k's scores and
+# query rider at 64 requests of eight tokens.
+DECODE_FLOAT_EXCHANGE_CAP_BYTES = 8 << 20
 
 # Each KVP group's fused decode value tail, when prepared.
 _VALUE_TAILS: dict[tuple[int, ...], DcpValueTail] = {}
@@ -80,6 +83,7 @@ def prepare_decode_exchange(
     *,
     value_heads: int | None,
     decode_rows: int,
+    float_words: bool,
 ) -> bool:
     """Collectively prepare the KVP group's one-hop exchange of small payloads.
 
@@ -88,7 +92,8 @@ def prepare_decode_exchange(
     and partial exchanges then take it whenever their payload fits; nothing
     else changes, and every byte arrives as the generic collective delivers it.
     With ``value_heads`` it also prepares the fused decode value tail
-    (:func:`combine_project_attention_partials`).
+    (:func:`combine_project_attention_partials`), and with ``float_words`` the
+    float-word gather of an owned decode top-k (:func:`select_owned_dsa_topk`).
 
     Args:
         group: Global ranks of the KVP group.
@@ -96,6 +101,8 @@ def prepare_decode_exchange(
         value_heads: Local query heads of an MLA model whose decode projects
             512-wide latents to 128-wide values, or None.
         decode_rows: Most rows of one decode forward.
+        float_words: Whether a decode gathers float words; without, no float
+            workspace is allocated.
 
     Returns:
         Whether the group exchanges through it.
@@ -112,7 +119,10 @@ def prepare_decode_exchange(
         )
         if tail is not None:
             _VALUE_TAILS[group] = tail
-    prepared = prepare_small_exchange(group, DECODE_EXCHANGE_CAP_BYTES, timeout_ns)
+    float_cap = DECODE_FLOAT_EXCHANGE_CAP_BYTES if float_words else 0
+    prepared = prepare_small_exchange(
+        group, DECODE_EXCHANGE_CAP_BYTES, float_cap, timeout_ns
+    )
     if torch.distributed.get_rank() == group[0]:
         logger.info(
             f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB "
@@ -225,22 +235,37 @@ def gather_query_heads_padded(
         ``r * heads + h`` at ``[token, r * heads + h]`` as
         :func:`gather_query_heads` places it, zeros after.
     """
-    tokens, heads, dim = query.shape
-    total = heads * len(group)
-    if padded_heads < total:
+    return token_major_query_heads(
+        gather_query_heads_rank_major(query, group), padded_heads
+    )
+
+
+def token_major_query_heads(gathered: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    """Lay a rank-major query gather out token-major, zero-padded.
+
+    Args:
+        gathered: Every rank's ``[ranks, tokens, heads, dim]`` TP heads, as
+            :func:`gather_query_heads_rank_major` lands them.
+        padded_heads: The core's head count, at least the gathered heads.
+
+    Returns:
+        ``[tokens, padded_heads, dim]`` in ``gathered``'s dtype: head ``h`` of
+        rank ``r`` at ``[token, r * heads + h]`` as :func:`gather_query_heads`
+        places it, zeros after; one copy, and a fill only past the heads.
+    """
+    ranks, tokens, heads, dim = gathered.shape
+    if padded_heads < ranks * heads:
         raise ValueError("padded query heads must hold every gathered head")
-    padded = query.new_empty((tokens, padded_heads, dim))
-    gathered = gather_query_heads_rank_major(query, group)
-    rows = padded.view(torch.uint8).view(tokens, padded_heads * dim * query.itemsize)
-    src = gathered.view(torch.uint8).view(len(group), tokens, -1)
+    padded = gathered.new_empty((tokens, padded_heads, dim))
+    rows = padded.view(torch.uint8).view(tokens, -1)
+    src = gathered.view(torch.uint8).view(ranks, tokens, -1)
     width = src.shape[-1]
     if width % 8 == 0 and rows.shape[-1] % 8 == 0:
         # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
         rows, src, width = rows.view(torch.int64), src.view(torch.int64), width // 8
-    rows[:, len(group) * width :].zero_()
-    rows[:, : len(group) * width].view(tokens, len(group), width).copy_(
-        src.transpose(0, 1)
-    )
+    if padded_heads > ranks * heads:
+        rows[:, ranks * width :].zero_()
+    rows[:, : ranks * width].view(tokens, ranks, width).copy_(src.transpose(0, 1))
     return padded
 
 

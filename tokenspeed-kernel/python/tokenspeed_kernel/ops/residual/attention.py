@@ -30,6 +30,9 @@ from tokenspeed_kernel.ops.residual._triton.attention import (
     attnres_mix_queries,
     attnres_query_partials,
 )
+from tokenspeed_kernel.ops.residual._triton.attention import (
+    message_controller_inputs as _message_controller_inputs,
+)
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -441,3 +444,148 @@ def residual_weighted_sum(values: torch.Tensor, weights: torch.Tensor) -> torch.
     for source in range(values.shape[1]):
         total = total + values[:, source].float() * weights[source].float()
     return total
+
+
+def message_gate(
+    destination: torch.Tensor, message: torch.Tensor, gates: torch.Tensor
+) -> torch.Tensor:
+    """Gate a message into a destination row, per channel:
+    ``(1 - tanh(forget)) * destination + tanh(gain) * message`` in FP32, with
+    every product, difference and sum rounded separately (no FMA
+    contraction).
+
+    Args:
+        destination: Contiguous FP32 ``[tokens, width]`` rows.
+        message: Contiguous FP32 ``[tokens, width]`` rows.
+        gates: Contiguous FP32 ``[tokens, 2 * width]`` logits: the gain
+            logits in the first ``width`` columns, the forget logits after.
+
+    Returns:
+        A fresh FP32 ``[tokens, width]`` tensor.
+    """
+    if (
+        destination.ndim != 2
+        or destination.dtype != torch.float32
+        or message.shape != destination.shape
+        or message.dtype != torch.float32
+        or gates.shape != (destination.shape[0], 2 * destination.shape[1])
+        or gates.dtype != torch.float32
+        or not all(x.is_contiguous() for x in (destination, message, gates))
+        or not destination.device == message.device == gates.device
+    ):
+        raise ValueError(
+            "message gate needs contiguous FP32 [T, H] destination and message "
+            "rows and [T, 2H] gate logits on one device"
+        )
+    if destination.is_cuda:
+        kernel = select_kernel(
+            "residual",
+            "message_gate_fp32",
+            format_signature(destination=dense_tensor_format(torch.float32)),
+        )
+        return kernel(destination, message, gates)
+    width = destination.shape[1]
+    gain = torch.tanh(gates[:, :width])
+    forget = torch.tanh(gates[:, width:])
+    return (1.0 - forget) * destination + gain * message
+
+
+def message_controller_inputs(
+    destinations: tuple[torch.Tensor, ...],
+    messages: torch.Tensor,
+    down_weights: tuple[torch.Tensor, ...],
+    gate_weights: tuple[torch.Tensor, ...],
+    norm_weights: tuple[torch.Tensor, ...],
+    eps: float,
+    norm_eps: float,
+) -> torch.Tensor:
+    """Gate a message into each of up to three inputs and RMS-normalize it.
+
+    Per input ``i`` and row: ``h = bf16([bf16(rmsnorm(d)), bf16(rmsnorm(m))]
+    @ down[i].T)`` (FP32 accumulation, ``eps``), ``[gain, forget] = h @
+    gate[i].T`` in FP32, ``x = (1 - tanh(forget)) * d + tanh(gain) * m``
+    (:func:`message_gate`), then ``bf16(rmsnorm(x) * norm[i])`` with
+    ``norm_eps``. The mean squares divide by the width. Every row reduces in
+    an order fixed by its own values, so a row's result does not depend on
+    the other rows.
+
+    Args:
+        destinations: One to three contiguous FP32 ``[tokens, hidden]`` rows
+            (they may be the same tensor).
+        messages: Contiguous FP32 ``[inputs, tokens, hidden]`` messages.
+        down_weights: Contiguous BF16 ``[rank, 2 * hidden]`` per input.
+        gate_weights: Contiguous BF16 ``[2 * hidden, rank]`` per input, the
+            gain rows then the forget rows.
+        norm_weights: BF16 ``[hidden]`` RMSNorm gains per input.
+        eps: Epsilon of the controller's input normalization.
+        norm_eps: Epsilon of the output RMSNorm.
+
+    Returns:
+        A fresh BF16 ``[inputs, tokens, hidden]`` tensor.
+    """
+    count = len(destinations)
+    first = destinations[0]
+    tokens, width = first.shape
+    if not (
+        1 <= count <= 3
+        and len(down_weights) == len(gate_weights) == len(norm_weights) == count
+        and messages.shape == (count, tokens, width)
+    ):
+        raise ValueError("message controller needs one to three matching inputs")
+    rank = down_weights[0].shape[0]
+    if (
+        any(
+            d.shape != first.shape or d.dtype != torch.float32 or not d.is_contiguous()
+            for d in destinations
+        )
+        or messages.dtype != torch.float32
+        or not messages.is_contiguous()
+        or any(
+            w.shape != (rank, 2 * width) or w.dtype != torch.bfloat16
+            for w in down_weights
+        )
+        or any(
+            w.shape != (2 * width, rank) or w.dtype != torch.bfloat16
+            for w in gate_weights
+        )
+        or any(w.shape != (width,) for w in norm_weights)
+        or not all(w.is_contiguous() for w in (*down_weights, *gate_weights))
+    ):
+        raise ValueError(
+            "message controller needs contiguous FP32 rows and BF16 "
+            "[rank, 2H] / [2H, rank] / [H] weights"
+        )
+    if first.is_cuda:
+        if rank not in (16, 32, 64, 128):
+            raise ValueError("message controller rank must be 16, 32, 64 or 128")
+        return _message_controller_inputs(
+            destinations,
+            messages,
+            down_weights,
+            gate_weights,
+            tuple(w.contiguous() for w in norm_weights),
+            eps,
+            norm_eps,
+        )
+
+    def normalized(x: torch.Tensor, e: float) -> torch.Tensor:
+        mean = x.square().sum(-1, keepdim=True) / width
+        return x * torch.rsqrt(mean + e)
+
+    out = []
+    for i, destination in enumerate(destinations):
+        message = messages[i]
+        stacked = torch.cat(
+            (
+                normalized(destination, eps).to(torch.bfloat16),
+                normalized(message, eps).to(torch.bfloat16),
+            ),
+            dim=-1,
+        )
+        hidden = (stacked.float() @ down_weights[i].float().T).to(torch.bfloat16)
+        gates = hidden.float() @ gate_weights[i].float().T
+        gated = message_gate(destination, message, gates.contiguous())
+        out.append(
+            (normalized(gated, norm_eps) * norm_weights[i].float()).to(torch.bfloat16)
+        )
+    return torch.stack(out)

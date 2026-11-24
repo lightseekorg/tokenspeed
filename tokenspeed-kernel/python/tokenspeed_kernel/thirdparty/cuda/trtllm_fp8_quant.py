@@ -20,9 +20,10 @@
 
 """FP8 E4M3 quantizers adapted from TensorRT-LLM.
 
-Both return the same tensors as the TensorRT-LLM ops they replace:
+Both compute the same values as the TensorRT-LLM ops they replace:
 ``fp8_quantize_1x128`` as ``torch.ops.trtllm.fp8_quantize_1x128`` and
 ``quantize_e4m3_activation`` as ``torch.ops.tensorrt_llm.quantize_e4m3_activation``.
+``fp8_quantize_1x128`` writes its scales in the layout the caller asks for.
 """
 
 import functools
@@ -49,26 +50,21 @@ def _load_trtllm_fp8_quant_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-@functools.cache
-def _is_sm100_family(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index)[0] == 10
-
-
 def fp8_quantize_1x128(
-    x: torch.Tensor, use_ue8m0: bool
+    x: torch.Tensor, use_ue8m0: bool, *, mn_major: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize BF16 ``[M, N]`` to FP8 E4M3 with one FP32 scale per 1x128 group.
 
     Args:
         x: Contiguous BF16 CUDA ``[M, N]`` with ``N % 16 == 0``.
         use_ue8m0: Round each dequant scale up to a power of two.
+        mn_major: Store the scales MN-major instead of K-major.
 
     Returns:
         FP8 ``[M, N]`` codes (a row slice of an ``[ceil(M / 4) * 4, N]``
-        buffer) and the FP32 dequant scales. On SM10x the scales are a
-        contiguous ``[ceil(N / 128), M]`` tensor; elsewhere they are the flat
-        MN-major buffer with a row stride of ``ceil(M / 4) * 4``, padded to a
-        128-byte size.
+        buffer) and the FP32 dequant scales as ``[M, ceil(N / 128)]``:
+        contiguous, or with ``mn_major`` the transpose of a contiguous
+        ``[ceil(N / 128), M]``.
     """
     if not x.is_cuda or not x.is_contiguous():
         raise ValueError("fp8_quantize_1x128 requires a contiguous CUDA tensor")
@@ -81,17 +77,14 @@ def fp8_quantize_1x128(
         raise ValueError(f"x.shape[1] must be a multiple of 16, but got {n}")
     m_padded = (m + 3) // 4 * 4
     groups = (n + 127) // 128
-    # getActScaleSize: m_padded * groups FP32 scales, rounded up to 128 bytes.
-    scale_numel = (m_padded * groups * 4 + 127) // 128 * 128 // 4
     values = torch.empty((m_padded, n), dtype=torch.float8_e4m3fn, device=x.device)
-    scales = torch.empty((scale_numel,), dtype=torch.float32, device=x.device)
+    shape = (groups, m) if mn_major else (m, groups)
+    scales = torch.empty(shape, dtype=torch.float32, device=x.device)
+    group_stride, row_stride = (m, 1) if mn_major else (1, groups)
     _load_trtllm_fp8_quant_module().fp8_quantize_1x128(
-        values, scales, x, bool(use_ue8m0)
+        values, scales, x, bool(use_ue8m0), group_stride, row_stride
     )
-    if _is_sm100_family(x.device.index):
-        # The SM10x GEMMs take the scales without the 4-row alignment.
-        scales = scales[: groups * m_padded].view(groups, m_padded)[:, :m].contiguous()
-    return values[:m], scales
+    return values[:m], scales.t() if mn_major else scales
 
 
 def quantize_e4m3_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

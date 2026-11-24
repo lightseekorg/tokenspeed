@@ -54,16 +54,14 @@ def _gathered_reference(inputs, counts, rows, weight):
 
 
 def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
-    from tokenspeed_kernel.ops.gemm import mm
-
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.comm_backend.projection import ProjectionSpec
     from tokenspeed.runtime.distributed.comm_ops import (
-        acquire_projection_output,
         prepare_projection_collectives,
         projection_gather_mm,
-        projection_reduce_scatter,
+        projection_mm_reduce_scatter,
+        projection_mm_to_owners,
     )
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager,
@@ -89,6 +87,7 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
                 output_size=_SHARD * world_size,
                 max_tokens=_MAX_ROWS,
                 dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
                 device=device,
             ),
             backend,
@@ -97,14 +96,52 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
             ProjectionSpec(
                 group=group,
                 kind="scatter",
-                input_size=32 * world_size,
+                input_size=64 * world_size,
                 output_size=_HIDDEN,
                 max_tokens=_MAX_ROWS,
                 dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
                 device=device,
             ),
             backend,
         )
+        transpose = prepare_projection_collectives(
+            ProjectionSpec(
+                group=group,
+                kind="transpose",
+                input_size=128,
+                output_size=_SHARD * world_size,
+                max_tokens=_MAX_ROWS,
+                dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
+                device=device,
+            ),
+            backend,
+        )
+
+        def transposed(rows, seed):
+            # Every rank holds all rows; each projects them through its own shard.
+            inputs = _integers(
+                torch.Generator().manual_seed(200 + seed),
+                (world_size * rows - 1, 128),
+                -1,
+                1,
+                device,
+            )
+            weight = _integers(
+                torch.Generator().manual_seed(300 + seed + rank),
+                (_SHARD, 128),
+                -1,
+                1,
+                device,
+            )
+            weights = [torch.empty_like(weight) for _ in range(world_size)]
+            dist.all_gather(weights, weight)
+            padded = torch.nn.functional.pad(inputs, (0, 0, 0, 1))
+            expected = (padded.float() @ torch.cat(weights).float().T).to(
+                torch.bfloat16
+            )
+            return inputs, weight, expected[rank * rows : (rank + 1) * rows]
 
         def gathered(rows, seed):
             # Owners hold different row counts, as data-parallel owners do.
@@ -126,11 +163,13 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
         for seed, rows in enumerate((1, 100, 700)):
             generator = torch.Generator().manual_seed(100 + seed + rank)
             # Every partial and sum stays an exact BF16 integer, so any order agrees.
-            inputs = _integers(generator, (world_size * rows, 32), -1, 1, device)
-            weight = _integers(generator, (_HIDDEN, 32), -1, 1, device)
-            partial = acquire_projection_output(rows, scatter, backend)
-            mm(inputs, weight, out=partial)
-            reduced = projection_reduce_scatter(partial, rows, scatter, backend)
+            # The last owner's padding rows are left for the projection to fill.
+            inputs = _integers(generator, (world_size * rows - 1, 64), -1, 1, device)
+            weight = _integers(generator, (_HIDDEN, 64), -1, 1, device)
+            reduced = projection_mm_reduce_scatter(
+                inputs, rows, weight, scatter, backend
+            )
+            inputs = torch.nn.functional.pad(inputs, (0, 0, 0, 1))
             parts = [torch.empty_like(inputs) for _ in range(world_size)]
             dist.all_gather(parts, inputs)
             weights = [torch.empty_like(weight) for _ in range(world_size)]
@@ -141,6 +180,56 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
             torch.testing.assert_close(
                 reduced, expected[rank * rows : (rank + 1) * rows], atol=0, rtol=0
             )
+        # Rows beyond the owners' extent fail on every path instead of being dropped.
+        for rows in (100, 700):
+            with pytest.raises(ValueError):
+                projection_mm_reduce_scatter(
+                    inputs.new_zeros(world_size * rows + 1, 64),
+                    rows,
+                    weight,
+                    scatter,
+                    backend,
+                )
+
+        # One row, a Lamport-sized batch and one stored straight into owner rows.
+        for seed, rows in enumerate((1, 100, 700)):
+            inputs, weight, expected = transposed(rows, seed)
+            owned = projection_mm_to_owners(inputs, rows, weight, transpose, backend)
+            torch.testing.assert_close(owned, expected, atol=0, rtol=0)
+        # Rows beyond the owners' extent fail here too.
+        for rows in (100, 700):
+            with pytest.raises(ValueError):
+                projection_mm_to_owners(
+                    inputs.new_zeros(world_size * rows + 1, 128),
+                    rows,
+                    weight,
+                    transpose,
+                    backend,
+                )
+
+        # Two captured transposes replay on new rows; the second one's rows stay.
+        rows = 700
+        first, second = transposed(rows, 10), transposed(rows, 11)
+        projection_mm_to_owners(first[0], rows, first[1], transpose, backend)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        gc.collect()
+        gc.disable()
+        try:
+            with torch.cuda.graph(graph):
+                projection_mm_to_owners(first[0], rows, first[1], transpose, backend)
+                owned = projection_mm_to_owners(
+                    second[0], rows, second[1], transpose, backend
+                )
+        finally:
+            gc.enable()
+        for operands, seed in ((first, 12), (second, 13)):
+            inputs, weight, expected = transposed(rows, seed)
+            operands[0].copy_(inputs)
+            operands[1].copy_(weight)
+        graph.replay()
+        torch.testing.assert_close(owned, expected, atol=0, rtol=0)
+        graph.reset()
 
         # Three captured gathers replay on new rows: no state carries between calls.
         rows = 700
