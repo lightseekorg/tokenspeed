@@ -106,9 +106,11 @@ def mxfp8_row_gather(
             ``[rows, D + D / 32]`` with unit inner stride; D divisible by 32.
         indices: CUDA int32/int64 ``[tokens, columns]`` row ids, any strides.
             Negative or out-of-range ids produce zero rows.
-        codes: Optional contiguous E4M3 ``[tokens, columns * D]`` output.
+        codes: Optional contiguous E4M3 ``[tokens, columns * D]`` output on
+            ``indices.device``.
         scales: Optional contiguous uint8 ``[tokens, columns * D / 32]`` output
-            of canonical UE8M0 scales. Pass both outputs or neither.
+            of canonical UE8M0 scales on ``indices.device``. Pass both outputs
+            or neither.
 
     Returns:
         ``(codes, scales)``, allocated on ``indices.device`` when omitted.
@@ -131,6 +133,10 @@ def mxfp8_row_gather(
         )
         scales = torch.empty(
             tokens, columns * dim // 32, dtype=torch.uint8, device=indices.device
+        )
+    elif codes.device != indices.device or scales.device != indices.device:
+        raise ValueError(
+            "MXFP8 row gather outputs must be on the same device as indices"
         )
     elif (
         codes.shape != (tokens, columns * dim)

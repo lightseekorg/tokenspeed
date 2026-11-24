@@ -793,6 +793,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
     owner._expert_load_rows = None
+    owner._input_model = None
+    owner._model_input_buffers = {}
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, capture_bs): (
@@ -820,6 +822,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner.input_buffers = SimpleNamespace(
         input_ids_buf=torch.ones(8, dtype=torch.int64),
         positions_buf=torch.ones(8, dtype=torch.int64),
+        ngram_model_kwargs=lambda _: {},
     )
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
@@ -842,7 +845,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
             ctx,
             torch.zeros(num_tokens, dtype=torch.int64),
             None,
-            request_token_history=None,
+            positions=owner.input_buffers.positions_buf[: ctx.input_num_tokens],
+            model_kwargs={"request_token_history": None},
         )
     torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
     assert ctx.bs == batch_size
@@ -892,6 +896,8 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     owner = object.__new__(PrefillGraph)
     owner._narrowing = None
     owner._expert_load_rows = None
+    owner._input_model = None
+    owner._model_input_buffers = {}
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, 1): (capture("inline"), CapturedForward(torch.ones(8, 4), None)),
@@ -915,6 +921,7 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     owner.input_buffers = SimpleNamespace(
         input_ids_buf=torch.ones(8, dtype=torch.int64),
         positions_buf=torch.ones(8, dtype=torch.int64),
+        ngram_model_kwargs=lambda _: {},
     )
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
@@ -941,7 +948,11 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
         ),
     ):
         owner.replay(
-            ctx, torch.zeros(8, dtype=torch.int64), None, request_token_history=None
+            ctx,
+            torch.zeros(8, dtype=torch.int64),
+            None,
+            positions=owner.input_buffers.positions_buf[: ctx.input_num_tokens],
+            model_kwargs={"request_token_history": None},
         )
     waits = [f"wait e{index}" for index in consumers or ()]
     assert events == waits + ["refresh", "inline"]
@@ -1107,7 +1118,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
     executor.prefill_graph = SimpleNamespace(
         can_run=lambda *_: use_graph,
-        replay=lambda *_, request_token_history: events.append("graph"),
+        replay=lambda *_, positions, model_kwargs: events.append("graph"),
     )
     executor.model_runner = SimpleNamespace(
         forward=lambda *_, **__: events.append("eager")
@@ -1240,6 +1251,8 @@ def kimi_host_cache():
     owner.num_warmup = 1
     owner._narrowing = None
     owner._expert_load_rows = None
+    owner._input_model = None
+    owner._model_input_buffers = {}
     owner._engaged_logged = set()
     owner._route_counts = {}
     owner._ctx = None
@@ -1265,7 +1278,9 @@ def kimi_host_cache():
         prefill_graph_capture_batch_sizes=None,
     )
     owner.input_buffers = SimpleNamespace(
-        input_ids_buf=torch.ones(_BUCKET, dtype=torch.int64)
+        input_ids_buf=torch.ones(_BUCKET, dtype=torch.int64),
+        positions_buf=torch.zeros(_BUCKET, dtype=torch.int64),
+        ngram_model_kwargs=lambda _: {},
     )
     owner.make_dummy_batch = lambda num_tokens, bs: ctx
     owner._replay_bucket = lambda ctx: _BUCKET
@@ -1412,7 +1427,10 @@ def test_a_replay_writes_a_loaded_tail_page_after_the_load(
             result = owner.replay(
                 cache.ctx,
                 torch.ones(_BUCKET, dtype=torch.int64),
-                request_token_history=None,
+                positions=owner.input_buffers.positions_buf[
+                    : cache.ctx.input_num_tokens
+                ],
+                model_kwargs={"request_token_history": None},
             )
     finally:
         pool.__class__ = kimi_pool_class
@@ -1501,7 +1519,10 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
             results[inline_kda] = owner.replay(
                 cache.ctx,
                 torch.ones(_BUCKET, dtype=torch.int64),
-                request_token_history=None,
+                positions=owner.input_buffers.positions_buf[
+                    : cache.ctx.input_num_tokens
+                ],
+                model_kwargs={"request_token_history": None},
             ).clone()
         assert not cache.executor.load_stream.query()
         torch.cuda.synchronize()
@@ -1599,7 +1620,8 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
         result = owner.replay(
             cache.ctx,
             torch.ones(_BUCKET, dtype=torch.int64),
-            request_token_history=None,
+            positions=owner.input_buffers.positions_buf[: cache.ctx.input_num_tokens],
+            model_kwargs={"request_token_history": None},
         )
     first_segment_done.synchronize()
     assert not load_stream.query()

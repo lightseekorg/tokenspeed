@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_grouped_bf16_projection
 from tokenspeed_kernel.ops.gemm import grouped_bf16_projection
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -48,3 +49,63 @@ def test_torch_projection_matches_einsum_bitwise_in_token_major_rows(groups, tok
     out = torch.full(expected.shape, float("nan"), device="cuda", dtype=torch.bfloat16)
     assert grouped_bf16_projection(x, weight, out, "torch") is out
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [5, 8, 128, 200])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("dispatch", [False, True])
+def test_grouped_projection_matches_exact_dyadic_product(tokens, padded, dispatch):
+    torch.manual_seed(2031)
+    storage = torch.randint(-8, 9, (tokens, 16 if padded else 8, 4096), device="cuda")
+    x = storage.bfloat16().mul_(0.125)[:, :8]
+    weight = torch.nn.Parameter(
+        torch.randint(-8, 9, (8, 128, 4096), device="cuda").bfloat16().mul_(0.125)
+    )
+    # Products and all partial sums are exactly representable in FP32. The
+    # FP64 reference therefore needs no tolerance for GEMM reduction order.
+    expected = (
+        torch.bmm(
+            x.transpose(0, 1).double().contiguous(),
+            weight.transpose(1, 2).double().contiguous(),
+        )
+        .transpose(0, 1)
+        .bfloat16()
+    )
+    for supplied in (False, True):
+        out = (
+            torch.full(expected.shape, float("nan"), dtype=x.dtype, device=x.device)
+            if supplied
+            else None
+        )
+        result = (
+            grouped_bf16_projection(x, weight, out, "torch")
+            if dispatch
+            else torch_grouped_bf16_projection(x, weight, out)
+        )
+        assert result.is_contiguous()
+        if supplied:
+            assert result is out
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dispatch", [False, True])
+def test_grouped_projection_graph_replay_refreshes_rows(dispatch):
+    x = torch.zeros(5, 8, 4096, dtype=torch.bfloat16, device="cuda")
+    weight = torch.ones(8, 128, 4096, dtype=x.dtype, device=x.device)
+    out = torch.empty(5, 8, 128, dtype=x.dtype, device=x.device)
+
+    def project():
+        if dispatch:
+            return grouped_bf16_projection(x, weight, out, "torch")
+        return torch_grouped_bf16_projection(x, weight, out)
+
+    project()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        project()
+    for value in (0.125, -0.25, 0.5):
+        x.fill_(value)
+        graph.replay()
+        torch.testing.assert_close(
+            out, torch.full_like(out, 4096 * value), rtol=0, atol=0
+        )

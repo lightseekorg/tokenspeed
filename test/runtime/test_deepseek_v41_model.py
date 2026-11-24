@@ -1665,7 +1665,7 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
         )
 
         monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
-        cap = BreakableCapture()
+        cap = BreakableCapture(run_segments_while_capturing=True)
         with active_forward(ctx):
             cap.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(cap.stream):
@@ -1675,8 +1675,8 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
             scopes.clear()
             with cap:
                 captured = _complete_layer(*args)
-            # Attention cannot fork across the eager break, and the FFN fork
-            # is also kept out of captured segments: MegaMHC is never captured.
+            # Attention cannot fork across its eager break. MegaMHC joins
+            # also run eagerly and replace both local coefficient forks.
             assert scopes == [False, False]
             for _ in range(3):
                 residual.normal_()
@@ -2304,6 +2304,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
         model.initialize_engram(_Tokenizer())
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
+    adapter.is_multimodal_active = False
     forwarded = adapter.prepare_model_kwargs(
         ctx, ids, {"engram_hash_ids": hashes, "engram_token_mask": mask}
     )
@@ -3082,16 +3083,31 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph", "packed"]
+    ("execution_mode", "attention_geometry"),
+    [
+        pytest.param("eager", "small", id="eager"),
+        pytest.param("decode", "small", id="decode"),
+        pytest.param("prefill", "small", id="prefill"),
+        pytest.param("split_prefill_graph", "small", id="split_prefill_graph"),
+        pytest.param("packed", "small", id="packed"),
+        # This geometry reaches the fused attention FP8 handoff on supported
+        # GPUs. Keep its new coverage focused on staged prefill graph replay.
+        pytest.param("split_prefill_graph", "fused", id="fused_prefill_graph"),
+    ],
 )
-def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
+def test_cuda_40_layer_real_flatkv_and_moe(
+    monkeypatch, tmp_path, execution_mode, attention_geometry
+):
     monkeypatch.setitem(
         global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
     )
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
-    config.num_attention_heads = config.o_groups = config.index_n_heads = 2
+    config.num_attention_heads, config.o_groups = (
+        (64, 8) if attention_geometry == "fused" else (2, 2)
+    )
+    config.index_n_heads = 2
     config.head_dim, config.index_head_dim = 512, 128
     config.qk_rope_head_dim, config.q_lora_rank = 64, 128
     # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
@@ -3145,6 +3161,8 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     tables = _tables("cuda:0")
     meta = _extend(backend, tables, [4], [0], [0], [4])
     ctx = _ctx(backend, 4, ForwardMode.EXTEND)
+    if attention_geometry == "fused" and fp8_wo_a and backend.supports_fused_prefill:
+        assert all(layer.attn._use_fused_attention(ctx, None) for layer in model.layers)
     ids = torch.tensor([0, 3, 4, 6], device="cuda:0")
     previous = torch.tensor(
         [[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]], device="cuda:0"
@@ -3590,11 +3608,13 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         torch.full((bucket, 3), -1, dtype=torch.int64, device=device),
     )
     ctx = context(bucket, 1, [bucket - 1], 1)
+    encoder_capture = BreakableCapture(run_segments_while_capturing=True)
     with active_forward(ctx):
-        for _ in range(2):
-            encoder(ctx)
-        torch.cuda.synchronize()
-        encoder_capture = BreakableCapture()
+        encoder_capture.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(encoder_capture.stream):
+            for _ in range(2):
+                encoder(ctx)
+        encoder_capture.stream.synchronize()
         with encoder_capture:
             encoder_state = encoder(ctx)
         encoder_capture.replay()
@@ -3632,12 +3652,17 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             assert narrowed.rows == decoder_bucket
             narrowed.land_into(statics)
 
-        for _ in range(2):
-            rearm()
-            model.decoder_forward(statics, ctx)
-        torch.cuda.synchronize()
+        decoder_capture = BreakableCapture(
+            pool=encoder_capture.pool,
+            run_segments_while_capturing=True,
+        )
+        decoder_capture.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(decoder_capture.stream):
+            for _ in range(2):
+                rearm()
+                model.decoder_forward(statics, ctx)
+        decoder_capture.stream.synchronize()
         rearm()
-        decoder_capture = BreakableCapture(pool=encoder_capture.pool)
         with decoder_capture:
             decoder_hidden, decoder_taps = model.decoder_forward(statics, ctx)
         rearm()
