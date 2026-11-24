@@ -389,6 +389,30 @@ def test_token_limit_retains_kda_working_set(limit, kvp_size):
     )
 
 
+@pytest.mark.parametrize("capacity", [4, 8, 24])
+def test_kda_history_capacity_sizes_each_request_slot(capacity):
+    """--kda-history-capacity sets the records a request slot keeps per layer."""
+    recipe = kimi_recipe(
+        speculative_num_draft_tokens=4,
+        max_resident_requests=7,
+        kda_history_capacity=capacity,
+    )
+    smaller = kimi_recipe(
+        speculative_num_draft_tokens=4,
+        max_resident_requests=6,
+        kda_history_capacity=capacity,
+    )
+    assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
+        69 * (3 * 12 * capacity * 128 * 4 + 4)
+    )
+
+
+def test_kda_history_capacity_below_the_verify_window_is_refused():
+    recipe = kimi_recipe(speculative_num_draft_tokens=8, kda_history_capacity=4)
+    with pytest.raises(ValueError, match="at least the verify window"):
+        recipe.workspace_bytes()
+
+
 @pytest.mark.parametrize("width", [1, 4, 20])
 def test_kimi_checkpoint_is_independent_of_request_history(width):
     recipe = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=7)

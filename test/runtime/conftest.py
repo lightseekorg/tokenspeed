@@ -46,6 +46,7 @@ def kimi_recipe(
     kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
     mamba_ssm_dtype: str = "float32",
     dsa_index_k_format: str | None = None,
+    kda_history_capacity: int | None = None,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits.
 
@@ -79,6 +80,7 @@ def kimi_recipe(
         conv_kernel_size=int(kda["short_conv_kernel_size"]),
         layer_ids=tuple(text_config.linear_layer_ids),
         tp_size=tp_size,
+        kda_history_capacity=kda_history_capacity,
     )
     mla = MLAConfig(
         backend_name="mla",

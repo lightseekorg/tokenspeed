@@ -215,7 +215,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             config.max_resident_requests
         ).capacity
         self._retained_capacity = kda_history_capacity(
-            self.speculative_num_draft_tokens
+            config, self.speculative_num_draft_tokens
         )
         self._batched_replay_kernel = None
         self._batched_prepare_kernel = None

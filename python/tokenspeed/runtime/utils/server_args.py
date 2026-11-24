@@ -709,6 +709,9 @@ class ServerArgs:
     attention_backend: str | None = None
     min_kv_split: int | None = None
     kda_backend: str = "auto"
+    # Records a request keeps per KDA layer between dense-state folds,
+    # including the verify window; None keeps max(16, draft tokens).
+    kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
@@ -4527,6 +4530,17 @@ class ServerArgs:
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "FlashInfer CuTe DSL KDA prefill kernel on SM100/SM103. 'cudnn' uses FlashInfer's "
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
+        )
+        parser.add_argument(
+            "--kda-history-capacity",
+            type=int,
+            default=ServerArgs.kda_history_capacity,
+            help="Accepted KDA records each request keeps per layer between "
+            "dense-state folds, counting the verify window (the speculative draft "
+            "tokens). Default: max(16, draft tokens); it must be at least the "
+            "draft tokens. A smaller capacity shrinks the per-request verify "
+            "workspace but folds the records into the dense state more often: at "
+            "the draft tokens themselves, every round that accepts any.",
         )
         parser.add_argument(
             "--drafter-attention-backend",

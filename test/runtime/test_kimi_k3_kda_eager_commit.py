@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 _LOWER_BOUND = -5.0
@@ -67,6 +68,7 @@ class _Harness:
         usable_pages: int = 24,
         max_resident_requests: int | None = None,
         mamba_ssm_dtype: str = "float32",
+        history_capacity: int | None = None,
     ):
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(
@@ -84,6 +86,21 @@ class _Harness:
             attn_tp_size=1,
             head_dim=D,
         )
+        components = (spec,)
+        if history_capacity is not None:
+            # --kda-history-capacity reaches the backend through this component.
+            components += (
+                LinearAttnConfig(
+                    num_k_heads=self.H,
+                    num_v_heads=self.H,
+                    head_k_dim=D,
+                    head_v_dim=D,
+                    conv_kernel_size=4,
+                    layer_ids=tuple(sorted(self.pool.state_group_by_layer)),
+                    tp_size=1,
+                    kda_history_capacity=history_capacity,
+                ),
+            )
         config = AttnConfig(
             device=DEV,
             dtype=torch.bfloat16,
@@ -96,7 +113,7 @@ class _Harness:
             max_resident_requests=(
                 max_bs if max_resident_requests is None else max_resident_requests
             ),
-            components=(spec,),
+            components=components,
         )
         self.config = config
         self.backend = KdaAttnBackend(
@@ -321,9 +338,20 @@ def _reference_committed_states(harness, pages, inputs, accepted, slots):
     )[1]
 
 
-def test_retained_commit_matches_torch_over_multiple_rounds_and_layers():
-    """All layer groups commit the accepted prefix of the independent recurrence."""
-    harness = _Harness(draft_tokens=T, seed=17)
+@pytest.mark.parametrize(
+    "history_capacity", [None, T, 2 * T], ids=["default", "window", "two_windows"]
+)
+def test_retained_commit_matches_torch_over_multiple_rounds_and_layers(
+    history_capacity,
+):
+    """All layer groups commit the accepted prefix of the independent recurrence.
+
+    A capacity of one window folds every round that accepts tokens; two
+    windows fold after a round of full acceptance.
+    """
+    harness = _Harness(draft_tokens=T, seed=17, history_capacity=history_capacity)
+    expected_capacity = 16 if history_capacity is None else history_capacity
+    assert harness.backend._retained_records.shape[4] == expected_capacity
     rpis = [3, 1, 2]
     pages = {
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]

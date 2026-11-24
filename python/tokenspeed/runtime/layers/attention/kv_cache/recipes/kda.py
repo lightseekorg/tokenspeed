@@ -87,9 +87,30 @@ def kda_state_fields(
     )
 
 
-def kda_history_capacity(draft_token_num: int) -> int:
-    """Number of retained updates per request, including the current verify window."""
-    return max(16, draft_token_num)
+def kda_history_capacity(config: AttnConfig, draft_token_num: int) -> int:
+    """Retained updates a request slot keeps per layer, counting the verify window.
+
+    ``--kda-history-capacity`` (``LinearAttnConfig.kda_history_capacity``)
+    sets it; by default it is max(16, draft_token_num). A smaller capacity
+    shrinks the request-slot workspace but folds the accepted records into
+    the dense state more often: at the window itself, every round that
+    accepts any.
+
+    Raises:
+        ValueError: when the configured capacity is below the verify window.
+    """
+    # Like the state backends' other linear flags, a config without the
+    # linear component (a backend built for tests) keeps the default.
+    linear = config.component(LinearAttnConfig)
+    configured = None if linear is None else linear.kda_history_capacity
+    if configured is None:
+        return max(16, draft_token_num)
+    if configured < draft_token_num:
+        raise ValueError(
+            f"kda_history_capacity={configured} must be at least the verify "
+            f"window of {draft_token_num} draft tokens"
+        )
+    return configured
 
 
 def kda_retained_supported(config: AttnConfig) -> bool:
@@ -153,7 +174,7 @@ def kda_verify_workspace_bytes(
         * num_slots
         * (
             heads
-            * kda_history_capacity(draft_token_num)
+            * kda_history_capacity(config, draft_token_num)
             * (value_dim + 2 * key_dim)
             * torch.float32.itemsize
             + torch.int32.itemsize
