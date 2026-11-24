@@ -818,9 +818,9 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
         scheduler_->ApplySharedL2Answers(answers);
     };
     // The runtime's round: the last plan's writes are done, then the plan.
-    std::vector<std::uint64_t> writing;
+    std::vector<std::uint32_t> writing;
     const auto next_plan = [&] {
-        for (const std::uint64_t op_id : writing) {
+        for (const std::uint32_t op_id : writing) {
             ExecutionEvent done;
             done.With(cache::SharedL2WriteDone{.op_id = op_id});
             scheduler_->Advance(std::move(done));
@@ -930,9 +930,9 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
         scheduler_->ApplySharedL2Answers(answers);
     };
     // The runtime's round: the last plan's writes are done, then the plan.
-    std::vector<std::uint64_t> writing;
+    std::vector<std::uint32_t> writing;
     const auto next_plan = [&] {
-        for (const std::uint64_t op_id : writing) {
+        for (const std::uint32_t op_id : writing) {
             ExecutionEvent done;
             done.With(cache::SharedL2WriteDone{.op_id = op_id});
             scheduler_->Advance(std::move(done));
