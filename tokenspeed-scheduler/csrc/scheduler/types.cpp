@@ -158,8 +158,9 @@ void SchedulerConfig::Validate() const {
         if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.replayable; })) {
             throw std::invalid_argument("Scheduler: peer prefix sharing excludes replayable cache groups");
         }
-        if (enable_l3_storage) {
-            throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
+        if (enable_l3_storage && storage_config->restore_to_host) {
+            throw std::invalid_argument(
+                "Scheduler: peer prefix sharing requires L3 restoration through peer admission");
         }
         if (peer_config->landing_tier == PeerLandingTier::kHost) {
             if (!HasHostCache()) {
@@ -211,8 +212,8 @@ void SchedulerConfig::Validate() const {
         if (!HasHostCache()) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
         }
-        if (enable_l3_storage) {
-            throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
+        if (enable_l3_storage && storage_config->restore_to_host) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage Host restoration");
         }
         // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
         if (cache_groups.size() > 64) {

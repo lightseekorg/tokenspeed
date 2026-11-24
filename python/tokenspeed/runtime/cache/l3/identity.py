@@ -219,6 +219,28 @@ def l3_checkpoint_id(
     )
     fmt = _normalize_load_format(load_format)
     ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
+    # Preserve the existing content identity unless the deployment explicitly
+    # supplies an immutable publisher release id.
+    mode = os.environ.get("TOKENSPEED_CHECKPOINT_IDENTITY_MODE", "content")
+    if mode not in {"content", "release"}:
+        raise ValueError(f"Unknown checkpoint identity mode: {mode!r}")
+    if mode == "release":
+        releases = json.loads(os.environ["TOKENSPEED_CHECKPOINT_RELEASES"])
+        if not isinstance(releases, dict):
+            raise TypeError("TOKENSPEED_CHECKPOINT_RELEASES must be a JSON object")
+        release = releases[os.path.abspath(model_path)]
+        if not isinstance(release, str) or not release.strip():
+            raise ValueError("The checkpoint release id must be a nonempty string")
+        identity = _checkpoint_id_with_load_format(
+            "release-" + hashlib.sha256(release.encode()).hexdigest(),
+            load_format=fmt,
+            extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
+        )
+        print(
+            f"Checkpoint identity: release={release}, weight scan skipped", flush=True
+        )
+        return identity
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:

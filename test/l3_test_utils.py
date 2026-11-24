@@ -73,7 +73,10 @@ def start_l3_executor(
     return L3Executor(
         L3Settings(
             runtime=StorageRuntimeConfig.from_extra_config(
-                None, host_blocks=num_lcm_blocks, prefix_granularity=1
+                None,
+                host_blocks=num_lcm_blocks,
+                prefix_granularity=1,
+                restore_to_host=True,
             ),
             deployment_id=deployment_id,
             has_draft=False,
@@ -240,6 +243,7 @@ def storage_scheduler():
     cfg.disable_l2_cache = False
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(
+        True,
         8,
         8,
         4,

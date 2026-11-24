@@ -417,6 +417,22 @@ TEST(PeerConfigTest, EveryLimitMustBePositiveAndTheNameSet) {
     EXPECT_THROW(no_pin.Validate(), std::invalid_argument);
 }
 
+TEST(PeerConfigTest, DirectStorageRequiresDeviceLanding) {
+    PeerConfig config = Config();
+    config.storage_min_fetch_tokens = kP;
+    config.storage_max_tokens = 8 * kP;
+    config.storage_lookup_timeout_us = 1000;
+    EXPECT_NO_THROW(config.Validate());
+    config.landing_tier = PeerLandingTier::kHost;
+    config.max_host_landing_blocks = 4;
+    config.host_ready_timeout_us = 1000;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.storage_min_fetch_tokens = 0;
+    config.storage_max_tokens = 0;
+    config.storage_lookup_timeout_us = 0;
+    EXPECT_NO_THROW(config.Validate());
+}
+
 TEST(PeerConfigTest, TheIncarnationIsANonzero32BitValue) {
     PeerConfig widest = Config();
     widest.incarnation = std::numeric_limits<std::uint32_t>::max();

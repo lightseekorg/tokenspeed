@@ -32,6 +32,7 @@
 
 #include "cache/tier/peer.h"
 #include "utils.h"
+#include "cache/tier/peer.h"
 
 namespace tokenspeed {
 
@@ -64,15 +65,24 @@ void StorageQueries::forEachStorageDependency(const PrefixProbe::Tier& probe,
 
 StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::size_t max_keys) const {
     StorageQuery result;
+    auto plan = SharedPrefixObjects(prompt, max_keys);
+    result.max_tokens = plan.max_tokens;
+    result.keys.reserve(plan.objects.size());
+    for (auto& object : plan.objects) result.keys.push_back(std::move(object.key));
+    return result;
+}
+
+StoragePrefixPlan StorageQueries::SharedPrefixObjects(const PromptPrefix& prompt, std::size_t max_keys) const {
+    StoragePrefixPlan result;
     if (prompt.max_tokens <= 0) return result;
     const auto full_tokens = prompt.max_tokens / store_.PrefixGranularity() * store_.PrefixGranularity();
     const auto tail_tokens = prompt.max_tokens - full_tokens;
     if (static_cast<std::size_t>(full_tokens / store_.PrefixGranularity()) > prompt.prefix_hashes.size() ||
         (tail_tokens && (!prompt.tail || prompt.tail->tail_tokens != tail_tokens)))
         return result;
-    const auto add = [&](CacheKey key) {
-        if (result.keys.size() == max_keys) return false;
-        result.keys.push_back(std::move(key));
+    const auto add = [&](CacheKey key, std::int32_t slot) {
+        if (result.objects.size() == max_keys) return false;
+        result.objects.push_back({std::move(key), slot});
         return true;
     };
     for (const auto i : store_.MatchOrder()) {
@@ -82,7 +92,7 @@ StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::s
             const ContentHash hash =
                 tail_tokens ? prompt.tail->hash
                             : ContentHash{prompt.prefix_hashes[full_tokens / store_.PrefixGranularity() - 1]};
-            if (!add(CacheKey{.group_id = group.Id(), .content_hash = hash, .page_offset = 0})) {
+            if (!add(CacheKey{.group_id = group.Id(), .content_hash = hash, .page_offset = 0}, kPeerStateSlot)) {
                 result.max_tokens = -1;
                 return result;
             }
@@ -97,7 +107,8 @@ StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::s
         for (auto block = first; block < full_blocks; ++block) {
             if (!add(CacheKey{.group_id = group.Id(),
                               .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},
-                              .page_offset = block % per_prefix})) {
+                              .page_offset = block % per_prefix},
+                     block)) {
                 result.max_tokens = -1;
                 return result;
             }
@@ -106,7 +117,7 @@ StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::s
             const auto keys = store_.TailKeysForGroup(i, prompt.tail->hash, tail_tokens);
             for (std::size_t j = 0; j < keys.size(); ++j) {
                 if (full_blocks + static_cast<std::int32_t>(j) < first) continue;
-                if (!add(keys[j])) {
+                if (!add(keys[j], full_blocks + static_cast<std::int32_t>(j))) {
                     result.max_tokens = -1;
                     return result;
                 }

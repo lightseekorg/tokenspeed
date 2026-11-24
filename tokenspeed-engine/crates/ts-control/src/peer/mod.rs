@@ -35,9 +35,12 @@
 pub mod geometry;
 pub mod landing;
 pub mod net;
+pub mod prepared;
 pub mod push;
 pub mod read;
 pub mod servicer;
+pub mod storage;
+pub mod storage_servicer;
 pub mod wire;
 
 use std::{
@@ -52,8 +55,8 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use ts_collective::{Group, Mesh};
 use ts_scheduler::{
-    PeerAnswerKind, PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerTier,
-    Scheduler,
+    PeerAnswerKind, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
+    PeerTier, Scheduler,
 };
 
 use crate::{
@@ -63,7 +66,7 @@ use crate::{
         landing::{Action, Landing, Timeouts},
         net::{Inbound, PeerNet},
         push::PagePusher,
-        read::{PageReader, PushJob, ReadJob, Reads},
+        read::{PageReader, PushJob, ReadJob, ReadOutcome, Reads},
         servicer::{empty_event, Holder},
         wire::{read_change, write_change, Prompt, Reply, Request, Stamp},
     },
@@ -115,6 +118,9 @@ pub enum PeerError {
     /// The local replica leaders could not exchange endpoints.
     #[error("peer node listener setup: {0}")]
     Mesh(#[from] ts_collective::Error),
+    /// Every member stops before freeing destinations that may still be written.
+    #[error("native peer read has not retired for {0}; worker restart required")]
+    Unretired(String),
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -129,7 +135,7 @@ struct Report {
     /// The first member's: the replies it received.
     replies: Vec<Reply>,
     /// This member's reads that ended, by landing request.
-    outcomes: Vec<(String, bool)>,
+    outcomes: Vec<(String, ReadOutcome)>,
 }
 
 impl Report {
@@ -145,9 +151,13 @@ impl Report {
             out.bytes(&reply.encode());
         }
         out.count(self.outcomes.len());
-        for (request, ok) in &self.outcomes {
+        for (request, outcome) in &self.outcomes {
             out.bytes(request.as_bytes());
-            out.flag(*ok);
+            out.u8(match outcome {
+                ReadOutcome::Complete => 0,
+                ReadOutcome::FailedRetired => 1,
+                ReadOutcome::Unretired => 2,
+            });
         }
         out.finish()
     }
@@ -169,7 +179,13 @@ impl Report {
         let mut outcomes = Vec::with_capacity(count.min(1 << 16));
         for _ in 0..count {
             let request = String::from_utf8(reader.bytes()?.to_vec()).ok()?;
-            outcomes.push((request, reader.flag()?));
+            let outcome = match reader.u8()? {
+                0 => ReadOutcome::Complete,
+                1 => ReadOutcome::FailedRetired,
+                2 => ReadOutcome::Unretired,
+                _ => return None,
+            };
+            outcomes.push((request, outcome));
         }
         reader.finish(Self {
             now_us,
@@ -199,6 +215,7 @@ pub struct PeerRound {
 struct Layout {
     incarnation: u64,
     ranks: Vec<RankGeometry>,
+    storage: bool,
 }
 
 /// A bound peer endpoint, owned continuously from binding through startup.
@@ -355,6 +372,7 @@ impl PeerFence {
 
 /// One member's peer sharing.
 pub struct Peer {
+    storage_source: Option<storage_servicer::Service>,
     settings: PeerSettings,
     /// The namespace this member reads and serves under; a weight update
     /// moves it.
@@ -368,6 +386,11 @@ pub struct Peer {
     /// Outstanding layout queries and their deadlines on the agreed clock.
     asked: HashMap<String, i64>,
     landings: BTreeMap<String, Landing>,
+    /// One ordinary admission may read disjoint pages from several sources.
+    /// Keys are source lease ids; the scheduler receives one completion only
+    /// after every source is retired and its release acknowledged.
+    landing_groups: BTreeMap<String, Vec<String>>,
+    prepared_sources: HashMap<PeerLeaseView, Vec<Vec<prepared::PreparedObject>>>,
     /// This member's plans with landings, oldest first, whose device work
     /// has not reported done.
     fences: VecDeque<Vec<String>>,
@@ -386,7 +409,7 @@ pub struct Peer {
     next_sample_us: i64,
     previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
-    unplaced: Vec<(String, bool)>,
+    unplaced: Vec<(String, ReadOutcome)>,
 }
 
 impl Peer {
@@ -414,6 +437,7 @@ impl Peer {
             .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
             .transpose()?;
         Ok(Self {
+            storage_source: None,
             identity: settings.identity(),
             settings,
             member,
@@ -424,6 +448,8 @@ impl Peer {
             layouts: HashMap::new(),
             asked: HashMap::new(),
             landings: BTreeMap::new(),
+            landing_groups: BTreeMap::new(),
+            prepared_sources: HashMap::new(),
             fences: VecDeque::new(),
             fence: PeerFence(fence),
             fenced_plans,
@@ -438,6 +464,13 @@ impl Peer {
             reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
+    }
+
+    /// Own the startup-selected storage source broker on member zero. It uses
+    /// ordinary peer admission and owns no scheduler destination memory.
+    pub fn attach_storage_source(&mut self, source: storage_servicer::Service) {
+        assert!(self.member == 0 && self.storage_source.is_none());
+        self.storage_source = Some(source);
     }
 
     /// Enable logical measurements on member zero and physical measurements on every member.
@@ -509,6 +542,9 @@ impl Peer {
             report.changes = endpoint.holder.lock().take_changes();
             report.replies = endpoint.replies.try_iter().collect();
         }
+        if let Some(storage) = &self.storage_source {
+            report.replies.extend(storage.poll());
+        }
         report.encode()
     }
 
@@ -555,26 +591,57 @@ impl Peer {
                 }
             }
         }
-        self.send(actions, now_us);
-        let done: Vec<(String, i32)> = self
+        if let Some((_, landing)) = self
             .landings
             .iter()
-            .filter_map(|(request, landing)| landing.done().map(|tokens| (request.clone(), tokens)))
+            .find(|(_, landing)| landing.unretired())
+        {
+            // Do not send release or FetchDone. C++ still owns the landing's
+            // pages, including after request cancellation. All mirrored ranks
+            // observe the same terminal failure before another plan can run.
+            return Err(PeerError::Unretired(landing.fetch().request_id.clone()));
+        }
+        self.send(actions, now_us);
+        let done: Vec<String> = self
+            .landing_groups
+            .iter()
+            .filter(|(_, keys)| keys.iter().all(|key| self.landings[key].done().is_some()))
+            .map(|(request, _)| request.clone())
             .collect();
         let mut landed = Vec::new();
-        for (request, num_tokens) in done {
+        for request in done {
+            let keys = self
+                .landing_groups
+                .remove(&request)
+                .expect("finished landing group");
+            let begin = keys
+                .iter()
+                .map(|key| self.landings[key].fetch().begin_tokens)
+                .min()
+                .expect("nonempty group");
+            let end = keys
+                .iter()
+                .map(|key| self.landings[key].fetch().end_tokens)
+                .max()
+                .expect("nonempty group");
+            let complete = keys.iter().all(|key| {
+                let landing = &self.landings[key];
+                landing.done() == Some(landing.fetch().end_tokens)
+            });
+            let num_tokens = if complete { end } else { begin };
             tracing::debug!(request, num_tokens, "peer landing done");
-            let landing = self.landings.remove(&request).expect("finished landing");
-            if self.metrics.is_some()
-                && self.member == 0
-                && num_tokens == landing.fetch().end_tokens
-            {
-                landed.push((request.clone(), landing.fetch().begin_tokens, num_tokens));
-            } else if let Some(stage) = landing.failure() {
-                self.decisions.push((request.clone(), stage));
+            if self.metrics.is_some() && self.member == 0 && complete {
+                landed.push((request.clone(), begin, end));
             }
-            self.fenced.remove(&request);
-            self.reading.remove(&request);
+            for key in keys {
+                let landing = self.landings.remove(&key).expect("finished source landing");
+                if let Some(stage) = landing.failure() {
+                    self.decisions.push((request.clone(), stage));
+                }
+                self.prepared_sources.remove(landing.lease());
+                self.fenced.remove(&key);
+                self.reading.remove(&key);
+            }
             events.push(PeerEventView {
                 kind: PeerEventKind::FetchDone,
                 request_id: request,
@@ -608,7 +675,7 @@ impl Peer {
             self.fences.push_back(
                 fetches
                     .iter()
-                    .map(|fetch| fetch.request_id.clone())
+                    .map(|fetch| fetch.lease.id.to_string())
                     .collect(),
             );
         }
@@ -616,6 +683,11 @@ impl Peer {
         for fetch in fetches {
             let known = self.layouts.contains_key(&fetch.holder);
             let request = fetch.request_id.clone();
+            let key = fetch.lease.id.to_string();
+            self.landing_groups
+                .entry(request.clone())
+                .or_default()
+                .push(key.clone());
             tracing::debug!(
                 request,
                 holder = fetch.holder,
@@ -629,8 +701,11 @@ impl Peer {
             if self.member == 0 {
                 landing.observe_with(self.metrics.clone());
             }
-            self.landings.insert(request.clone(), landing);
-            actions.push((request, action));
+            assert!(
+                self.landings.insert(key.clone(), landing).is_none(),
+                "duplicate source lease"
+            );
+            actions.push((key, action));
         }
         self.send(actions, now_us);
         if let Some(endpoint) = &self.endpoint {
@@ -641,15 +716,32 @@ impl Peer {
                         (lookup.request_id, Instant::now(), lookup.deadline_us),
                     );
                 }
-                let request = Request::Lookup {
-                    lease: lookup.lease,
-                    prompt: Prompt {
-                        prefix_hashes: lookup.prefix_hashes,
-                        tokens: lookup.tokens,
-                        max_tokens: lookup.max_tokens,
-                    },
+                let prompt = Prompt {
+                    prefix_hashes: lookup.prefix_hashes,
+                    tokens: lookup.tokens,
+                    max_tokens: lookup.max_tokens,
                 };
-                if let Err(error) = endpoint.net.request(&lookup.holder, &request) {
+                let result = if let Some(storage) = self
+                    .storage_source
+                    .as_ref()
+                    .filter(|s| s.name() == lookup.holder)
+                {
+                    storage
+                        .lookup(lookup.lease, prompt, lookup.reused_pages)
+                        .map_err(|e| e.to_string())
+                } else {
+                    endpoint
+                        .net
+                        .request(
+                            &lookup.holder,
+                            &Request::Lookup {
+                                lease: lookup.lease,
+                                prompt,
+                            },
+                        )
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(error) = result {
                     // The lookup's wait ends at its deadline.
                     tracing::warn!(holder = lookup.holder, %error, "peer lookup not sent");
                 }
@@ -670,6 +762,9 @@ impl Peer {
     pub fn set_weight_version(&mut self, weight_version: &str) {
         self.settings.weight_version = weight_version.to_owned();
         self.identity = self.settings.identity();
+        if let Some(storage) = &self.storage_source {
+            storage.set_namespace(self.identity.clone(), weight_version.to_owned());
+        }
         self.layouts.clear();
         self.asked.clear();
         if let Some(endpoint) = &self.endpoint {
@@ -679,7 +774,7 @@ impl Peer {
 
     /// Landings in flight.
     pub fn num_landings(&self) -> usize {
-        self.landings.len()
+        self.landing_groups.len()
     }
 
     fn take_reply(
@@ -690,6 +785,42 @@ impl Peer {
         actions: &mut Vec<(String, Action)>,
     ) {
         match reply {
+            Reply::StorageLayout { stamp, members } => {
+                self.asked.remove(&stamp.name);
+                if stamp.identity == self.identity && *members as usize == self.members {
+                    self.layouts.insert(
+                        stamp.name.clone(),
+                        Layout {
+                            incarnation: stamp.incarnation,
+                            ranks: Vec::new(),
+                            storage: true,
+                        },
+                    );
+                }
+            }
+            Reply::Prepared {
+                stamp,
+                lease,
+                num_tokens,
+                ranks,
+            } => {
+                let trusted =
+                    self.trust(stamp) && self.layouts.get(&stamp.name).is_some_and(|l| l.storage);
+                if let Some((request, landing)) = self.landings.iter_mut().find(|(_, landing)| {
+                    landing.lease() == lease && landing.fetch().holder == stamp.name
+                }) {
+                    if let Some(action) =
+                        landing.pinned_prepared(*num_tokens, ranks, trusted, now_us)
+                    {
+                        actions.push((request.clone(), action));
+                    } else if trusted
+                        && landing.ready_to_read()
+                        && !self.prepared_sources.contains_key(lease)
+                    {
+                        self.prepared_sources.insert(lease.clone(), ranks.clone());
+                    }
+                }
+            }
             Reply::Layout { stamp, ranks } => {
                 self.asked.remove(&stamp.name);
                 if stamp.identity == self.identity && ranks.len() == self.members {
@@ -698,6 +829,7 @@ impl Peer {
                         Layout {
                             incarnation: stamp.incarnation,
                             ranks: ranks.clone(),
+                            storage: false,
                         },
                     );
                 } else {
@@ -816,8 +948,23 @@ impl Peer {
                 Action::SendPin => Request::Pin { lease },
                 Action::SendRelease { demote } => Request::Release { lease, demote },
             };
-            if let Err(error) = endpoint.net.request(holder, &message) {
-                if matches!(message, Request::Layout { .. }) {
+            let layout = matches!(message, Request::Layout { .. });
+            let result = if let Some(storage) =
+                self.storage_source.as_ref().filter(|s| s.name() == holder)
+            {
+                match message {
+                    Request::Pin { lease } => storage.prepare(lease, &landing.fetch().destinations),
+                    other => storage.request(other),
+                }
+                .map_err(|e| e.to_string())
+            } else {
+                endpoint
+                    .net
+                    .request(holder, &message)
+                    .map_err(|e| e.to_string())
+            };
+            if let Err(error) = result {
+                if layout {
                     self.asked.remove(holder);
                 }
                 // The landing's wait ends at its deadline.
@@ -833,9 +980,9 @@ impl Peer {
             if self.reading.contains(request) || !self.fenced.contains(request) {
                 continue;
             }
-            let Some(pinned) = landing.pages_to_read() else {
+            if !landing.ready_to_read() {
                 continue;
-            };
+            }
             let fetch = landing.fetch();
             if let Some(metrics) = &self.read_metrics {
                 metrics.fence(
@@ -844,64 +991,77 @@ impl Peer {
                     (now_us - landing.phase_started_us()) as f64 / 1e6,
                 );
             }
-            let holder = self
-                .layouts
-                .get(&fetch.holder)
-                .and_then(|layout| layout.ranks.get(self.member));
-            let pages: Vec<_> = fetch
-                .destinations
-                .iter()
-                .filter_map(|destination| {
-                    pinned
-                        .pages
-                        .iter()
-                        .find(|page| {
-                            page.group_id == destination.group_id && page.slot == destination.slot
-                        })
-                        .map(|page| (*page, *destination))
-                })
-                .collect();
-            // The holder's Disk pages are pushed, the rest read.
-            let (disk_pages, read_pages): (Vec<_>, Vec<_>) = pages
-                .into_iter()
-                .partition(|(source, _)| source.tier == PeerTier::Disk);
-            let budget =
-                Duration::from_micros(u64::try_from(self.settings.timeouts.push_us).unwrap_or(0));
-            let job = holder
-                .ok_or_else(|| "no layout of the holder".to_owned())
-                .and_then(|holder| {
-                    let spans = read_spans(holder, &self.geometry, &read_pages)
-                        .map_err(|error| error.to_string())?;
-                    let push = if disk_pages.is_empty() {
-                        None
-                    } else {
-                        Some(PushJob {
-                            endpoint: holder.push.clone().ok_or_else(|| {
-                                "the holder named Disk pages without a push endpoint".to_owned()
-                            })?,
-                            session: self.geometry.session.clone(),
-                            budget,
-                            items: push_items(holder, &self.geometry, &disk_pages)
-                                .map_err(|error| error.to_string())?,
-                        })
-                    };
-                    Ok((holder.session.clone(), spans, push))
-                });
+            let job = if let Some(ranks) = self.prepared_sources.get(landing.lease()) {
+                ranks
+                    .get(self.member)
+                    .ok_or_else(|| "missing prepared owner".to_owned())
+                    .and_then(|objects| {
+                        prepared::read_spans(objects, &self.geometry, &fetch.destinations)
+                            .map(|spans| (spans.into_iter().collect::<Vec<_>>(), None))
+                            .map_err(|error| error.to_string())
+                    })
+            } else {
+                self.layouts
+                    .get(&fetch.holder)
+                    .and_then(|layout| layout.ranks.get(self.member))
+                    .zip(landing.pages_to_read())
+                    .ok_or_else(|| "no cache layout or pinned pages of the holder".to_owned())
+                    .and_then(|(holder, pinned)| {
+                        let pages: Vec<_> = fetch
+                            .destinations
+                            .iter()
+                            .filter_map(|destination| {
+                                pinned
+                                    .pages
+                                    .iter()
+                                    .find(|page| {
+                                        page.group_id == destination.group_id
+                                            && page.slot == destination.slot
+                                    })
+                                    .map(|page| (*page, *destination))
+                            })
+                            .collect();
+                        let (disk_pages, read_pages): (Vec<_>, Vec<_>) = pages
+                            .into_iter()
+                            .partition(|(source, _)| source.tier == PeerTier::Disk);
+                        let spans = read_spans(holder, &self.geometry, &read_pages)
+                            .map_err(|error| error.to_string())?;
+                        let push = if disk_pages.is_empty() {
+                            None
+                        } else {
+                            Some(PushJob {
+                                endpoint: holder.push.clone().ok_or_else(|| {
+                                    "the holder named Disk pages without a push endpoint".to_owned()
+                                })?,
+                                session: self.geometry.session.clone(),
+                                budget: Duration::from_micros(
+                                    u64::try_from(self.settings.timeouts.push_us).unwrap_or(0),
+                                ),
+                                items: push_items(holder, &self.geometry, &disk_pages)
+                                    .map_err(|error| error.to_string())?,
+                            })
+                        };
+                        Ok((vec![(holder.session.clone(), spans)], push))
+                    })
+            };
             self.reading.insert(request.clone());
             match job {
-                Ok((session, spans, push)) => {
+                Ok((sources, push)) => {
                     let observation = self.read_metrics.as_ref().map(|metrics| {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
+                            sources
+                                .iter()
+                                .map(|(_, spans)| spans.total_bytes())
+                                .sum::<u64>()
+                                + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(
                         ReadJob {
                             request_id: request.clone(),
-                            session,
-                            spans,
+                            sources,
                             push,
                         },
                         observation,
@@ -911,7 +1071,8 @@ impl Peer {
                     // Nothing was posted: a failed read with no late writes,
                     // reported with the next round.
                     tracing::warn!(request, %error, "peer read not placed");
-                    self.unplaced.push((request.clone(), false));
+                    self.unplaced
+                        .push((request.clone(), ReadOutcome::FailedRetired));
                 }
             }
         }

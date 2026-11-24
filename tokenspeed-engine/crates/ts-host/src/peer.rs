@@ -23,6 +23,8 @@
 //! bootstrap's `PeerSharingSettings` (`cache/peer.py`), and the outbox the
 //! data plane reports each plan's landing fence through.
 
+mod storage;
+
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -76,6 +78,7 @@ impl Outbox {
 
 /// What the bootstrap resolved for this rank.
 pub struct Settings {
+    storage: Option<storage::Settings>,
     peer: PeerSettings,
     node_leaders: Vec<(usize, u32)>,
     bind_host: String,
@@ -96,6 +99,20 @@ fn micros(seconds: f64) -> i64 {
 }
 
 impl Settings {
+    /// The Store and peer register the same Host allocation. Native transports
+    /// may share exact registrations but reject partially overlapping ones.
+    pub fn use_storage_registrations(&mut self, l3: &ts_l3::Settings) -> Result<(), String> {
+        if matches!(l3.store, ts_l3::StoreSettings::Memory) {
+            return Ok(());
+        }
+        if self.host.address != l3.host.base as u64 {
+            return Err("L3 and peer must share the same Host allocation".into());
+        }
+        let regions = l3.host_registrations().map_err(|e| e.to_string())?;
+        self.regions = replace_host_regions(&self.regions, l3.host, &regions)?;
+        Ok(())
+    }
+
     /// The weight version the cache namespace starts at.
     pub fn weight_version(&self) -> &str {
         &self.peer.weight_version
@@ -139,6 +156,7 @@ impl Settings {
                 .collect::<PyResult<Vec<_>>>()?,
         };
         Ok(Some(Self {
+            storage: storage::Settings::from_python(&settings.getattr("storage")?)?,
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
                 incarnation: settings.getattr("incarnation")?.extract()?,
@@ -168,6 +186,85 @@ impl Settings {
             device,
             host,
         }))
+    }
+}
+
+fn replace_host_regions(
+    existing: &[(usize, usize)],
+    host: ts_l3::HostBuffer,
+    replacements: &[ts_l3::Range],
+) -> Result<Vec<(usize, usize)>, String> {
+    let end = host
+        .base
+        .checked_add(host.len)
+        .ok_or("Host address overflow")?;
+    let mut device = Vec::new();
+    let mut old_host = Vec::new();
+    for &(address, length) in existing {
+        let limit = address.checked_add(length).ok_or("peer address overflow")?;
+        if address < end && limit > host.base {
+            if address < host.base || limit > end {
+                return Err("peer registration partially overlaps the Host pool".into());
+            }
+            old_host.push((address - host.base, length));
+        } else {
+            device.push((address, length));
+        }
+    }
+    old_host.sort_unstable();
+    let covers_pool = |regions: &[(usize, usize)]| {
+        let mut cursor = 0_usize;
+        for &(offset, length) in regions {
+            if offset != cursor || length == 0 {
+                return false;
+            }
+            let Some(next) = cursor.checked_add(length) else {
+                return false;
+            };
+            cursor = next;
+        }
+        cursor == host.len
+    };
+    let replacement_ranges = replacements
+        .iter()
+        .map(|r| (r.offset, r.size))
+        .collect::<Vec<_>>();
+    if !covers_pool(&old_host) || !covers_pool(&replacement_ranges) {
+        return Err("peer and L3 registrations must cover the same complete Host pool".into());
+    }
+    device.extend(replacements.iter().map(|&r| (host.address(r), r.size)));
+    Ok(device)
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::replace_host_regions;
+    use ts_l3::{HostBuffer, Range};
+
+    #[test]
+    fn store_and_peer_share_exact_regions_without_changing_device_registration() {
+        let host = HostBuffer {
+            base: 4096,
+            len: 512,
+        };
+        let old = [(16384, 1024), (4096, 256), (4352, 256)];
+        let new = [
+            Range {
+                offset: 0,
+                size: 128,
+            },
+            Range {
+                offset: 128,
+                size: 384,
+            },
+        ];
+        assert_eq!(
+            replace_host_regions(&old, host, &new).unwrap(),
+            vec![(16384, 1024), (4096, 128), (4224, 384)]
+        );
+        assert!(replace_host_regions(&old, host, &new[..1]).is_err());
+        assert!(replace_host_regions(&[(4095, 513)], host, &new).is_err());
+        assert!(replace_host_regions(&[(4096, 256)], host, &new).is_err());
     }
 }
 
@@ -278,7 +375,15 @@ pub fn start(
     } else {
         None
     };
-    let peer = Peer::start(
+    let storage = if replica.index() == 0 {
+        settings
+            .storage
+            .map(|storage| storage.start(&settings.peer, geometries.len(), scheduler.clone()))
+            .transpose()?
+    } else {
+        None
+    };
+    let mut peer = Peer::start(
         settings.peer,
         replica.index(),
         geometries,
@@ -288,6 +393,9 @@ pub fn start(
         Arc::new(push),
     )
     .map_err(|error| error.to_string())?;
+    if let Some(storage) = storage {
+        peer.attach_storage_source(storage);
+    }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {
         return Err("the host's peer started twice".to_owned());

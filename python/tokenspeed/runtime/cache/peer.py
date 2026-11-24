@@ -41,6 +41,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.cache.l3.direct import DirectSourceSettings
+
 if TYPE_CHECKING:
     from tokenspeed_engine.scheduler import PeerConfig
 
@@ -97,6 +99,7 @@ def peer_scheduler_config(
     min_fetch_tokens: int,
     landing_tier: str,
     num_host_blocks: int,
+    storage: DirectSourceSettings | None = None,
 ) -> PeerConfig:
     """The scheduler's peer sharing limits.
 
@@ -113,6 +116,7 @@ def peer_scheduler_config(
         num_host_blocks: The Host pool's blocks in its densest group (its
             parents, the null block excluded, times that group's packing);
             Host landings hold a share of them.
+        storage: Optional local L3 query bounds; absent keeps storage lookup disabled.
 
     Returns:
         The ``SchedulerConfig.peer_config`` value.
@@ -135,6 +139,7 @@ def peer_scheduler_config(
             max(1, int(num_host_blocks * HOST_LANDING_BLOCKS_FRACTION)) if host else 0
         ),
         host_ready_timeout_us=int(HOST_READY_S * 1e6) if host else 0,
+        **(storage.scheduler_limits if storage else {}),
     )
 
 
@@ -329,3 +334,4 @@ class PeerSharingSettings:
     protocol: str
     ib_device: str
     geometry: PeerGeometry
+    storage: DirectSourceSettings | None

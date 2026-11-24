@@ -35,12 +35,21 @@ namespace tokenspeed::fsm {
 // A lookup is out to the holder the request's hint names. Nothing is held
 // here; the answer, or the deadline, returns the request to Submitted.
 struct PeerLooking {
-    PeerLooking(AdmissionResources admission, PeerLeaseId lease, std::int64_t deadline_us)
-        : admission{std::move(admission)}, lease{std::move(lease)}, deadline_us{deadline_us} {}
+    PeerLooking(AdmissionResources admission, PeerLeaseId lease, std::int64_t deadline_us, std::string holder,
+                std::int32_t minimum_tokens)
+        : admission{std::move(admission)},
+          lease{std::move(lease)},
+          deadline_us{deadline_us},
+          holder{std::move(holder)},
+          minimum_tokens{minimum_tokens} {}
 
     AdmissionResources admission;
     PeerLeaseId lease;
     std::int64_t deadline_us;
+    std::string holder;
+    // A storage lookup must improve on the retained hot hit by its minimum
+    // extension. The old hit owns no pages and remains usable on a miss.
+    std::int32_t minimum_tokens;
 };
 
 // The admitted prompt's prefix, its window, is landing from the holder into

@@ -38,6 +38,7 @@ def config(*, host=32, grain=2, groups=None):
     c.max_resident_requests = c.max_batch_size
     c.enable_l3_storage = True
     c.storage_config = ts.StorageConfig(
+        True,
         8,
         64,
         host - 1,

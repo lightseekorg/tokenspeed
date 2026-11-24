@@ -238,7 +238,14 @@ impl Client {
             base: pool.as_mut_ptr() as usize,
             len: pool.len(),
         };
-        let store = MooncakeStore::connect(library, setup, host).unwrap();
+        let store = MooncakeStore::connect(
+            library,
+            setup,
+            host,
+            layout.lcm_block_bytes,
+            Some(layout.lcm_block_bytes),
+        )
+        .unwrap();
         let executor = Executor::start(
             Box::new(store) as Box<dyn Store>,
             host,

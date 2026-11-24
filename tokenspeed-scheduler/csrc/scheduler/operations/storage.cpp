@@ -71,13 +71,43 @@ bool Scheduler::SharedPrefixStorageEnabled() const {
            storage_transfers_->Config().max_host_blocks >= 2;
 }
 
-Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
-                                                                         std::int32_t max_prefix_tokens) const {
+std::int32_t Scheduler::GetLocalPrefixTokens(std::span<const std::int32_t> tokens,
+                                             std::int32_t max_prefix_tokens) const {
+    if (max_prefix_tokens <= 0 || static_cast<std::size_t>(max_prefix_tokens) > tokens.size() || tokens.size() > 65536)
+        throw std::invalid_argument("invalid bounded local prefix query");
+    if (config_.disable_prefix_cache) return 0;
+    const auto input = tokens.first(static_cast<std::size_t>(max_prefix_tokens));
+    const auto grain = coordinator_.PrefixGranularity();
+    std::vector<std::span<const std::int32_t>> pages;
+    for (std::int32_t i = 0; i + grain <= max_prefix_tokens; i += grain) pages.push_back(input.subspan(i, grain));
+    const auto hashes = ComputePrefixHashes(pages, "");
+    const auto probe = coordinator_.Prober().ProbePromptPrefix(
+        {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = std::nullopt});
+    return std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+}
+
+std::int32_t Scheduler::GetLocalPrefixTokensFromHashes(std::span<const std::int32_t> tokens,
+                                                       std::span<const std::string> hashes,
+                                                       std::int32_t max_prefix_tokens) const {
+    const auto grain = coordinator_.PrefixGranularity();
+    if (max_prefix_tokens <= 0 || max_prefix_tokens > 65536 ||
+        static_cast<std::size_t>(max_prefix_tokens) > tokens.size() ||
+        static_cast<std::size_t>(max_prefix_tokens / grain) > hashes.size())
+        throw std::invalid_argument("invalid bounded prehashed local prefix query");
+    if (config_.disable_prefix_cache) return 0;
+    const auto probe = coordinator_.Prober().ProbePromptPrefix(
+        {.prefix_hashes = hashes.first(static_cast<std::size_t>(max_prefix_tokens / grain)),
+         .tokens = tokens.first(static_cast<std::size_t>(max_prefix_tokens)),
+         .max_tokens = max_prefix_tokens,
+         .tail = std::nullopt});
+    return std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+}
+
+StoragePrefixPlan Scheduler::GetStoragePrefixPlan(std::span<const std::int32_t> tokens, std::int32_t max_prefix_tokens,
+                                                  std::size_t max_keys) const {
     if (max_prefix_tokens <= 0 || static_cast<std::size_t>(max_prefix_tokens) > tokens.size() ||
-        tokens.size() > 1048576)
-        throw std::invalid_argument("invalid bounded shared prefix publication query");
-    if (!SharedPrefixStorageEnabled()) return {.status = "unsupported"};
-    SharedPrefixPublication result{.status = "pending", .cache_epoch = storage_transfers_->PublicationEpoch()};
+        tokens.size() > 1048576 || max_keys > 1048576)
+        throw std::invalid_argument("invalid bounded storage prefix query");
     const auto grain = coordinator_.PrefixGranularity();
     const auto input = tokens.first(static_cast<std::size_t>(max_prefix_tokens));
     std::vector<std::span<const std::int32_t>> pages;
@@ -90,16 +120,41 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
                                 .hash = HashPrefixPage(input.last(tail_tokens),
                                                        hashes.empty() ? ContentHash{} : ContentHash{hashes.back()})}}
                           : std::nullopt;
-    const auto dependencies = coordinator_.Storage().SharedPrefixKeys(
-        {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail},
-        static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
+    return coordinator_.Storage().SharedPrefixObjects(
+        {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail}, max_keys);
+}
+
+StoragePrefixPlan Scheduler::GetStoragePrefixPlanFromHashes(std::span<const std::int32_t> tokens,
+                                                            std::span<const std::string> hashes,
+                                                            std::int32_t max_prefix_tokens,
+                                                            std::size_t max_keys) const {
+    const auto grain = coordinator_.PrefixGranularity();
+    if (max_prefix_tokens <= 0 || max_prefix_tokens % grain != 0 ||
+        static_cast<std::size_t>(max_prefix_tokens) > tokens.size() || tokens.size() > 1048576 || max_keys > 1048576 ||
+        static_cast<std::size_t>(max_prefix_tokens / grain) > hashes.size())
+        throw std::invalid_argument("invalid bounded prehashed storage prefix query");
+    const auto input = tokens.first(static_cast<std::size_t>(max_prefix_tokens));
+    const auto chain = hashes.first(static_cast<std::size_t>(max_prefix_tokens / grain));
+    return coordinator_.Storage().SharedPrefixObjects(
+        {.prefix_hashes = chain, .tokens = input, .max_tokens = max_prefix_tokens, .tail = std::nullopt}, max_keys);
+}
+
+Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
+                                                                         std::int32_t max_prefix_tokens) const {
+    if (max_prefix_tokens <= 0 || static_cast<std::size_t>(max_prefix_tokens) > tokens.size() ||
+        tokens.size() > 1048576)
+        throw std::invalid_argument("invalid bounded shared prefix publication query");
+    if (!SharedPrefixStorageEnabled()) return {.status = "unsupported"};
+    SharedPrefixPublication result{.status = "pending", .cache_epoch = storage_transfers_->PublicationEpoch()};
+    const auto dependencies = GetStoragePrefixPlan(
+        tokens, max_prefix_tokens, static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
     if (dependencies.max_tokens == 0)
         result.status = "unsupported";
     else if (dependencies.max_tokens < 0)
         result.status = "too_large";
-    else if (dependencies.max_tokens > 0 && !dependencies.keys.empty() &&
-             std::ranges::all_of(dependencies.keys,
-                                 [&](const auto& key) { return storage_transfers_->WasPublished(key); })) {
+    else if (dependencies.max_tokens > 0 && !dependencies.objects.empty() &&
+             std::ranges::all_of(dependencies.objects,
+                                 [&](const auto& object) { return storage_transfers_->WasPublished(object.key); })) {
         result.status = "published";
         result.confirmed_prefix_tokens = max_prefix_tokens;
     } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumBlockingQuarantined() > 0) {
@@ -174,6 +229,7 @@ void Scheduler::releaseStorage(Request& request) {
 void Scheduler::prepareStorage(Request& request) {
     if (!storage_transfers_) return;
     const auto& limits = storage_transfers_->Config();
+    if (!limits.restore_to_host) return;
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
         if (!state->lease.IssuedBy(*storage_transfers_)) return;
         const std::uint64_t operation = state->lease.OperationId();

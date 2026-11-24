@@ -336,6 +336,23 @@ TEST_P(PeerSchedulerTest, ALandedPromptEndingInsideAPagePublishesItsEnd) {
     EXPECT_GE(rows.front().second, static_cast<std::int32_t>(tokens.size()));
 }
 
+TEST_P(PeerSchedulerTest, LocalMetadataQueryPreservesTheReadersContentChain) {
+    const auto tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    auto longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    reader_.SubmitRequests({RequestSpec{.request_id = "metadata", .peer_holder = "holder", .tokens = longer}});
+    Plan(reader_);
+    const auto lookups = reader_.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    const auto& lookup = lookups.front();
+    const auto before = holder_.AvailableLcmBlocks();
+    EXPECT_GT(holder_.GetLocalPrefixTokensFromHashes(lookup.tokens, lookup.prefix_hashes, lookup.max_tokens), 0);
+    const std::vector<std::string> different_identity(lookup.prefix_hashes.size(), std::string(64, 'f'));
+    EXPECT_EQ(holder_.GetLocalPrefixTokensFromHashes(lookup.tokens, different_identity, lookup.max_tokens), 0);
+    EXPECT_EQ(holder_.AvailableLcmBlocks(), before);
+}
+
 TEST_P(PeerSchedulerTest, AShortLandingIsAdmittedAgainFromTheLocalHit) {
     const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
     HolderComputes(tokens);
@@ -774,6 +791,316 @@ TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup)
     replayable.cache_groups.front().replayable = true;
     EXPECT_THROW(replayable.Validate(), std::invalid_argument);
     EXPECT_NO_THROW(PeerConfigFor("ok").Validate());
+}
+
+SchedulerConfig DirectStorageConfigFor() {
+    auto cfg = PeerConfigFor("reader");
+    cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    cfg.enable_l3_storage = true;
+    cfg.storage_config = StorageConfig{false, 8, 64, 4, 64, 64, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
+    return cfg;
+}
+
+TEST(PeerStorageSchedulerTest, DirectRestoreUsesPeerAdmissionAndNeverAllocatesHostGetDestinations) {
+    for (const bool hit : {false, true}) {
+        Scheduler reader{DirectStorageConfigFor()};
+        Send(reader, cache::StorageTick{0, true, true, {0, 0, 0}});
+        Send(reader, cache::PeerTick{0});
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "r", .peer_holder = "ssd-source", .tokens = MakeAlignedTokens(5, kP)}});
+        const auto waiting = Plan(reader);
+        EXPECT_TRUE(PrefillRows(waiting).empty());
+        EXPECT_TRUE(waiting.peer_fetches.empty());
+        EXPECT_EQ(reader.GetStorageStats().held_blocks, 0u);
+        EXPECT_EQ(reader.GetStorageStats().operations, 0u);
+        const auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        Send(reader, cache::PeerLookupAnswered{.lease = lookups[0].lease, .num_tokens = hit ? 4 * kP : 0});
+        const auto admitted = Plan(reader);
+        EXPECT_EQ(reader.GetStorageStats().held_blocks, 0u);
+        EXPECT_EQ(reader.GetStorageStats().operations, 0u);
+        if (hit) {
+            ASSERT_EQ(admitted.peer_fetches.size(), 1u);
+            EXPECT_TRUE(PrefillRows(admitted).empty());
+            for (const auto& page : admitted.peer_fetches[0].destinations) EXPECT_EQ(page.tier, CacheTier::kDevice);
+            Send(reader, cache::PeerFetchDone{.request_id = "r", .num_tokens = 4 * kP});
+            EXPECT_EQ(PrefillRows(Plan(reader)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", 4 * kP}}));
+        } else {
+            EXPECT_TRUE(admitted.peer_fetches.empty());
+            EXPECT_EQ(PrefillRows(admitted), (std::vector<std::pair<std::string, std::int32_t>>{{"r", 0}}));
+        }
+    }
+}
+
+TEST(PeerStorageSchedulerTest, DirectStorageKeepsWriteBackPutsAndWaitsForTheirRetirement) {
+    Scheduler reader{DirectStorageConfigFor()};
+    Send(reader, cache::StorageTick{0, true, true, {0, 0, 0}});
+    reader.SubmitRequests({RequestSpec{.request_id = "seed", .tokens = MakeAlignedTokens(4, kP)}});
+    Plan(reader);
+    Send(reader, forward::ExtendResult{.request_id = "seed", .tokens = {42}});
+    Send(reader, forward::Finish{.request_id = "seed"});
+    Plan(reader);
+    // Write-back stores cold segments on eviction, not on every completion.
+    reader.SubmitRequests({RequestSpec{.request_id = "pressure", .tokens = MakeAlignedTokens(28, kP, 500)}});
+    const auto stores = Plan(reader);
+    ASSERT_FALSE(CacheOpIds<WriteBackBatch>(stores).empty());
+    for (const auto id : CacheOpIds<WriteBackBatch>(stores)) Send(reader, cache::WriteBackDone{.op_id = id});
+    const auto backup = Plan(reader);
+    std::vector<StoragePutOperation> puts;
+    for (const auto& operation : backup.Operations()) {
+        if (const auto* cache = std::get_if<CacheOperation>(&operation)) {
+            if (const auto* storage = std::get_if<StorageOperation>(cache)) {
+                ASSERT_TRUE(std::holds_alternative<StoragePutOperation>(*storage));
+                puts.push_back(std::get<StoragePutOperation>(*storage));
+            }
+        }
+    }
+    ASSERT_FALSE(puts.empty());
+    EXPECT_GT(reader.GetStorageStats().held_blocks, 0u);
+    for (const auto& put : puts)
+        Send(reader, cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 1), true,
+                                        std::vector<std::uint8_t>(put.keys.size(), 0)});
+    EXPECT_EQ(reader.GetStorageStats().held_blocks, 0u);
+}
+
+}  // namespace
+}  // namespace tokenspeed::test
+
+namespace tokenspeed::test {
+namespace {
+
+SchedulerConfig StorageReaderConfig(bool hybrid = false) {
+    auto config = PeerConfigFor("reader", hybrid);
+    config.role = Role::kP;
+    config.snapshot_allocator.total_pages = 1;
+    config.max_retracted_requests = 0;
+    for (auto& group : config.cache_groups) {
+        group.transfer_policy =
+            group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+    }
+    return config;
+}
+
+TEST(PeerStorageScheduling, AutonomousLookupHoldsNoPagesAndMissIsNotRetried) {
+    auto config = PeerConfigFor("reader");
+    config.peer_config->storage_min_fetch_tokens = kP;
+    config.peer_config->storage_max_tokens = 4 * kP;
+    config.peer_config->storage_lookup_timeout_us = 500;
+    Scheduler reader(config);
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "storage", .tokens = std::vector<std::int32_t>(5 * kP, 7), .max_new_tokens = 1}});
+    const auto available = reader.AvailableLcmBlocks();
+    EXPECT_TRUE(PrefillRows(Plan(reader)).empty());
+    auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1);
+    EXPECT_EQ(lookups[0].holder, "l3@reader");
+    EXPECT_EQ(lookups[0].max_tokens, 4 * kP);
+    EXPECT_EQ(reader.AvailableLcmBlocks(), available);
+    Send(reader, cache::PeerLookupAnswered{.lease = lookups[0].lease, .num_tokens = 0});
+    EXPECT_FALSE(PrefillRows(Plan(reader)).empty());
+    EXPECT_TRUE(reader.TakePeerLookups().empty());
+}
+
+TEST(PeerStorageScheduling, ShortPromptsBypassStorageAndDecodeNeverQueries) {
+    for (bool decode : {false, true}) {
+        auto config = decode ? DecodePeerConfigFor("reader") : PeerConfigFor("reader");
+        config.peer_config->storage_min_fetch_tokens = 8 * kP;
+        config.peer_config->storage_max_tokens = 16 * kP;
+        config.peer_config->storage_lookup_timeout_us = 500;
+        Scheduler reader(config);
+        reader.SubmitRequests({RequestSpec{.request_id = "short",
+                                           .tokens = std::vector<std::int32_t>((decode ? 12 : 4) * kP, 7),
+                                           .max_new_tokens = 1}});
+        Plan(reader);
+        EXPECT_TRUE(reader.TakePeerLookups().empty());
+    }
+}
+
+TEST(PeerStorageScheduling, TimedOutStorageLookupResumesComputeAndIgnoresLateHit) {
+    auto config = PeerConfigFor("reader");
+    config.peer_config->storage_min_fetch_tokens = kP;
+    config.peer_config->storage_max_tokens = 4 * kP;
+    config.peer_config->storage_lookup_timeout_us = 500;
+    Scheduler reader(config);
+    reader.SubmitRequests({RequestSpec{.request_id = "late-storage", .tokens = std::vector<std::int32_t>(5 * kP, 7)}});
+    Plan(reader);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    Send(reader, cache::PeerTick{.now_us = 500});
+    EXPECT_FALSE(PrefillRows(Plan(reader)).empty());
+    Send(reader, cache::PeerLookupAnswered{.lease = lookups.front().lease, .num_tokens = 4 * kP});
+    EXPECT_TRUE(reader.TakePeerLookups().empty());
+    EXPECT_TRUE(Plan(reader).peer_fetches.empty());
+}
+
+TEST(PeerStorageScheduling, LongerStoragePrefixExtendsHotHitWithDisjointAdmittedDestinations) {
+    for (const bool hybrid : {false, true}) {
+        SCOPED_TRACE(hybrid);
+        auto config = StorageReaderConfig(hybrid);
+        config.peer_config->storage_min_fetch_tokens = 4 * kP;
+        config.peer_config->storage_max_tokens = 8 * kP;
+        config.peer_config->storage_lookup_timeout_us = 500;
+        Scheduler reader(config);
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "extend-hot", .peer_holder = "holder", .tokens = MakeAlignedTokens(10, kP)}});
+        Send(reader, pd::BootstrappedEvent{"extend-hot"});
+        const auto available = reader.AvailableLcmBlocks();
+        Plan(reader);
+        auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        EXPECT_EQ(lookups.front().holder, "holder");
+        Send(reader, cache::PeerLookupAnswered{.lease = lookups.front().lease, .num_tokens = 2 * kP});
+
+        const auto querying = Plan(reader);
+        EXPECT_TRUE(querying.peer_fetches.empty());
+        EXPECT_TRUE(PrefillRows(querying).empty());
+        EXPECT_EQ(reader.AvailableLcmBlocks(), available);
+        lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        EXPECT_EQ(lookups.front().holder, "l3@reader");
+        EXPECT_FALSE(lookups.front().reused_pages.empty());
+        if (hybrid) {
+            EXPECT_TRUE(std::ranges::none_of(lookups.front().reused_pages,
+                                             [](const PeerPageSlot& page) { return page.group_id == 2; }));
+        }
+        Send(reader, cache::PeerLookupAnswered{.lease = lookups.front().lease, .num_tokens = 6 * kP});
+
+        const auto landing = Plan(reader);
+        ASSERT_EQ(landing.peer_fetches.size(), 2u);
+        const auto& hot = landing.peer_fetches.front();
+        EXPECT_EQ(hot.holder, "holder");
+        EXPECT_EQ(hot.end_tokens, 2 * kP);
+        EXPECT_FALSE(hot.destinations.empty());
+        const auto& fetch = landing.peer_fetches.back();
+        EXPECT_EQ(fetch.holder, "l3@reader");
+        EXPECT_EQ(fetch.begin_tokens, 0);
+        EXPECT_EQ(fetch.end_tokens, 6 * kP);
+        for (const auto& page : hot.destinations) {
+            EXPECT_TRUE(std::ranges::none_of(fetch.destinations, [&](const PeerPage& other) {
+                return page.group_id == other.group_id && (page.slot == other.slot || page.block_id == other.block_id);
+            }));
+            EXPECT_LT(page.slot, 2);
+        }
+        EXPECT_EQ(std::ranges::count_if(hot.destinations, [](const PeerPage& page) { return page.group_id == 0; }), 2);
+        EXPECT_EQ(std::ranges::count_if(fetch.destinations, [](const PeerPage& page) { return page.group_id == 0; }),
+                  4);
+        if (hybrid) {
+            EXPECT_TRUE(
+                std::ranges::none_of(hot.destinations, [](const PeerPage& page) { return page.group_id == 2; }));
+            EXPECT_EQ(std::ranges::count_if(
+                          fetch.destinations,
+                          [](const PeerPage& page) { return page.group_id == 2 && page.slot == kPeerStateSlot; }),
+                      1);
+        }
+        Send(reader, cache::PeerFetchDone{.request_id = "extend-hot", .num_tokens = 6 * kP});
+        const auto rows = PrefillRows(Plan(reader));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows.front().second, 6 * kP);
+        EXPECT_TRUE(reader.TakePeerLookups().empty());
+    }
+}
+
+TEST(PeerStorageScheduling, StorageMissShortHitAndTimeoutKeepTheHotCandidate) {
+    // Zero is a miss, shorter prefixes fail the extension threshold; -1
+    // represents a timeout followed by a late, otherwise useful reply.
+    for (const auto storage_tokens : {0, 2 * kP, 4 * kP, -1}) {
+        SCOPED_TRACE(storage_tokens);
+        auto config = StorageReaderConfig();
+        config.peer_config->storage_min_fetch_tokens = 2 * kP;
+        config.peer_config->storage_max_tokens = 8 * kP;
+        config.peer_config->storage_lookup_timeout_us = 500;
+        Scheduler reader(config);
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "keep-hot", .peer_holder = "holder", .tokens = MakeAlignedTokens(10, kP)}});
+        Send(reader, pd::BootstrappedEvent{"keep-hot"});
+        Plan(reader);
+        auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        const auto hot_lease = lookups.front().lease;
+        Send(reader, cache::PeerLookupAnswered{.lease = hot_lease, .num_tokens = 3 * kP});
+        Plan(reader);
+        lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        const auto storage_lease = lookups.front().lease;
+        if (storage_tokens < 0) {
+            Send(reader, cache::PeerTick{.now_us = 500});
+            Send(reader, cache::PeerLookupAnswered{.lease = storage_lease, .num_tokens = 8 * kP});
+        } else {
+            Send(reader, cache::PeerLookupAnswered{.lease = storage_lease, .num_tokens = storage_tokens});
+        }
+        const auto landing = Plan(reader);
+        ASSERT_EQ(landing.peer_fetches.size(), 1u);
+        EXPECT_EQ(landing.peer_fetches.front().holder, "holder");
+        EXPECT_EQ(landing.peer_fetches.front().lease, hot_lease);
+        EXPECT_EQ(landing.peer_fetches.front().end_tokens, 3 * kP);
+        EXPECT_TRUE(reader.TakePeerLookups().empty());
+    }
+}
+
+TEST(PeerStorageScheduling, HotCoverageBelowTheExtensionThresholdBypassesStorage) {
+    for (const auto hot_tokens : {6 * kP, 8 * kP}) {
+        SCOPED_TRACE(hot_tokens);
+        auto config = StorageReaderConfig();
+        config.peer_config->storage_min_fetch_tokens = 4 * kP;
+        config.peer_config->storage_max_tokens = 8 * kP;
+        config.peer_config->storage_lookup_timeout_us = 500;
+        Scheduler reader(config);
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "hot", .peer_holder = "holder", .tokens = MakeAlignedTokens(10, kP)}});
+        Send(reader, pd::BootstrappedEvent{"hot"});
+        Plan(reader);
+        const auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        Send(reader, cache::PeerLookupAnswered{.lease = lookups.front().lease, .num_tokens = hot_tokens});
+        const auto landing = Plan(reader);
+        ASSERT_EQ(landing.peer_fetches.size(), 1u);
+        EXPECT_EQ(landing.peer_fetches.front().holder, "holder");
+        EXPECT_EQ(landing.peer_fetches.front().end_tokens, hot_tokens);
+        EXPECT_TRUE(reader.TakePeerLookups().empty());
+    }
+}
+
+TEST(PeerStorageScheduling, ALongerStorageHitCannotDisplaceAHotHitThatFitsTheBudget) {
+    for (const bool hybrid : {false, true}) {
+        SCOPED_TRACE(hybrid);
+        auto config = StorageReaderConfig(hybrid);
+        config.peer_config->storage_min_fetch_tokens = 2 * kP;
+        config.peer_config->storage_max_tokens = 8 * kP;
+        config.peer_config->storage_lookup_timeout_us = 500;
+        config.device_allocator.total_pages = hybrid ? 24 : 17;
+        config.cache_groups.front().total_pages = config.device_allocator.total_pages;
+        if (hybrid) config.max_scheduled_tokens = 2 * kP;
+        Scheduler reader(config);
+        // Another admitted landing pins most of L1. Each prompt fits alone;
+        // only the longer storage prefix fails beside the in-flight request.
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "inflight", .peer_holder = "holder", .tokens = MakeAlignedTokens(14, kP, 500)}});
+        Send(reader, pd::BootstrappedEvent{"inflight"});
+        Plan(reader);
+        auto pending = reader.TakePeerLookups();
+        ASSERT_EQ(pending.size(), 1u);
+        Send(reader, cache::PeerLookupAnswered{.lease = pending.front().lease, .num_tokens = 11 * kP});
+        ASSERT_EQ(Plan(reader).peer_fetches.size(), 1u);
+        if (!hybrid) ASSERT_EQ(reader.AvailableLcmBlocks(), 5);
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "budget", .peer_holder = "holder", .tokens = MakeAlignedTokens(10, kP)}});
+        Send(reader, pd::BootstrappedEvent{"budget"});
+        Plan(reader);
+        auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        const auto hot_lease = lookups.front().lease;
+        Send(reader, cache::PeerLookupAnswered{.lease = hot_lease, .num_tokens = 2 * kP});
+        Plan(reader);
+        lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        Send(reader, cache::PeerLookupAnswered{.lease = lookups.front().lease, .num_tokens = 6 * kP});
+        const auto landing = Plan(reader);
+        ASSERT_EQ(landing.peer_fetches.size(), 1u);
+        EXPECT_EQ(landing.peer_fetches.front().holder, "holder");
+        EXPECT_EQ(landing.peer_fetches.front().lease, hot_lease);
+        EXPECT_EQ(landing.peer_fetches.front().end_tokens, 2 * kP);
+        EXPECT_TRUE(reader.TakePeerLookups().empty());
+    }
 }
 
 }  // namespace

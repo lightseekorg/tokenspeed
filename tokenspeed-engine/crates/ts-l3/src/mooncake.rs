@@ -49,6 +49,7 @@ pub struct MooncakeStore {
     client: Client,
     host: HostBuffer,
     in_flight_puts: InFlightPuts,
+    registrations: Vec<Range>,
 }
 
 /// One Store client is shared by several workers. Keep its concurrent writes
@@ -109,28 +110,64 @@ impl Drop for PutClaim<'_> {
     }
 }
 
+/// Keep each stored block inside one native memory registration. Some
+/// transports reject large registrations even when the entire pool fits.
+pub(crate) fn registration_regions(
+    host: HostBuffer,
+    lcm_bytes: usize,
+    maximum: Option<usize>,
+) -> Result<Vec<Range>, ts_mooncake::Error> {
+    if lcm_bytes == 0 || host.len % lcm_bytes != 0 || host.base.checked_add(host.len).is_none() {
+        return Err(ts_mooncake::Error::Shape(
+            "invalid Host registration geometry",
+        ));
+    }
+    if host.len == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = maximum.unwrap_or(host.len);
+    let chunk = (limit / lcm_bytes) * lcm_bytes;
+    if chunk == 0 {
+        return Err(ts_mooncake::Error::Shape(
+            "registration limit is smaller than one Host LCM block",
+        ));
+    }
+    Ok((0..host.len)
+        .step_by(chunk)
+        .map(|offset| Range {
+            offset,
+            size: chunk.min(host.len - offset),
+        })
+        .collect())
+}
+
 impl MooncakeStore {
     /// Load `library`, connect as `setup` says and register the Host pool.
     pub fn connect(
         library: &Path,
         setup: &StoreSetup,
         host: HostBuffer,
+        lcm_bytes: usize,
+        registration_max_bytes: Option<usize>,
     ) -> Result<Self, ts_mooncake::Error> {
+        let registrations = registration_regions(host, lcm_bytes, registration_max_bytes)?;
         let library = StoreLibrary::load(library)?;
         let client = Client::connect(Arc::clone(&library), setup)?;
-        if host.len > 0 {
-            client.register_buffer(host.base, host.len)?;
+        for &region in &registrations {
+            client.register_buffer(host.address(region), region.size)?;
         }
         tracing::info!(
             protocol = %setup.protocol,
             master = %setup.master_server_address,
             segment = setup.global_segment_size,
+            registrations = registrations.len(),
             "Mooncake Store L3 ready"
         );
         Ok(Self {
             client,
             host,
             in_flight_puts: InFlightPuts::default(),
+            registrations,
         })
     }
 
@@ -312,8 +349,8 @@ impl Store for MooncakeStore {
     }
 
     fn close(&self) {
-        if self.host.len > 0 {
-            if let Err(error) = self.client.unregister_buffer(self.host.base) {
+        for &region in &self.registrations {
+            if let Err(error) = self.client.unregister_buffer(self.host.address(region)) {
                 tracing::warn!(%error, "deregistering the Host pool from the store failed");
             }
         }
@@ -427,6 +464,45 @@ mod tests {
             .sum::<usize>();
         assert_eq!(shared_writers, 1);
         assert!(registry.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn registrations_cover_the_pool_without_splitting_a_parent() {
+        let host = HostBuffer {
+            base: 4096,
+            len: 12 * 320,
+        };
+        let regions = registration_regions(host, 320, Some(1024)).unwrap();
+        assert_eq!(regions.len(), 4);
+        assert_eq!(regions.iter().map(|r| r.size).sum::<usize>(), host.len);
+        for parent in 0..12 {
+            let start = parent * 320;
+            assert_eq!(
+                regions
+                    .iter()
+                    .filter(|r| r.offset <= start && start + 320 <= r.offset + r.size)
+                    .count(),
+                1
+            );
+        }
+        assert!(regions.iter().all(|r| r.size <= 1024));
+        assert_eq!(
+            registration_regions(host, 320, None).unwrap(),
+            vec![Range {
+                offset: 0,
+                size: host.len
+            }]
+        );
+        assert!(registration_regions(host, 320, Some(319)).is_err());
+        assert!(registration_regions(
+            HostBuffer {
+                base: usize::MAX,
+                len: 320
+            },
+            320,
+            Some(1024)
+        )
+        .is_err());
     }
 
     #[test]

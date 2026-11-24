@@ -79,6 +79,7 @@ def _scheduler(kinds):
     config.max_resident_requests = 8
     config.enable_l3_storage = True
     config.storage_config = ts.StorageConfig(
+        True,
         8,
         64,
         31,

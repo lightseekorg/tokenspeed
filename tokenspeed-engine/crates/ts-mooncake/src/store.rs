@@ -23,7 +23,9 @@
 //! `tokenspeed-mooncake` ships `libmooncake_store.so` beside its Python
 //! module: upstream's store C ABI (`mooncake/include/store_c.h`), built so
 //! it exports only the `mooncake_store_*` functions, plus TokenSpeed's
-//! `mooncake_store_setup_with_tenant`. The calls behave as the Python
+//! `mooncake_store_setup_with_tenant`. Stock SDKs expose only the shared default
+//! tenant through `mooncake_store_setup`; explicit other tenants are rejected.
+//! The calls behave as the Python
 //! `MooncakeDistributedStore` methods of the same names. The library is
 //! loaded at run time, so an engine without the L3 store never loads it.
 
@@ -41,7 +43,7 @@ pub const STORE_LIBRARY_NAME: &str = "libmooncake_store.so";
 
 type Create = unsafe extern "C" fn() -> *mut c_void;
 type Destroy = unsafe extern "C" fn(*mut c_void);
-type Setup = unsafe extern "C" fn(
+type TenantSetup = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
     *const c_char,
@@ -52,6 +54,30 @@ type Setup = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
 ) -> c_int;
+type DefaultSetup = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const c_char,
+    u64,
+    u64,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+) -> c_int;
+
+enum Setup {
+    Tenant(TenantSetup),
+    Default(DefaultSetup),
+}
+
+impl Setup {
+    fn validate_tenant(&self, tenant: &str) -> Result<(), Error> {
+        if matches!(self, Self::Default(_)) && tenant != "default" {
+            return Err(Error::NoTenantSetup(tenant.to_owned()));
+        }
+        Ok(())
+    }
+}
 type RegisterBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> c_int;
 type UnregisterBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type BatchIsExist =
@@ -107,9 +133,12 @@ impl StoreLibrary {
                 path: path.to_owned(),
                 create: *library.get(b"mooncake_store_create").map_err(load_error)?,
                 destroy: *library.get(b"mooncake_store_destroy").map_err(load_error)?,
-                setup: *library
-                    .get(b"mooncake_store_setup_with_tenant")
-                    .map_err(load_error)?,
+                setup: match library.get::<TenantSetup>(b"mooncake_store_setup_with_tenant") {
+                    Ok(setup) => Setup::Tenant(*setup),
+                    Err(_) => {
+                        Setup::Default(*library.get(b"mooncake_store_setup").map_err(load_error)?)
+                    }
+                },
                 register_buffer: *library
                     .get(b"mooncake_store_register_buffer")
                     .map_err(load_error)?,
@@ -198,6 +227,7 @@ impl CKeys {
 impl Store {
     /// Create a client and connect it to the store.
     pub fn connect(library: Arc<StoreLibrary>, setup: &StoreSetup) -> Result<Self, Error> {
+        library.setup.validate_tenant(&setup.tenant_id)?;
         // SAFETY: plain constructor.
         let raw = unsafe { (library.create)() };
         let raw =
@@ -215,17 +245,29 @@ impl Store {
         let tenant = CString::new(setup.tenant_id.as_str()).map_err(|_| Error::Nul("tenant"))?;
         // SAFETY: the strings outlive the call; the client copies them.
         let status = unsafe {
-            (store.library.setup)(
-                store.raw.as_ptr(),
-                hostname.as_ptr(),
-                metadata.as_ptr(),
-                setup.global_segment_size,
-                setup.local_buffer_size,
-                protocol.as_ptr(),
-                device.as_ptr(),
-                master.as_ptr(),
-                tenant.as_ptr(),
-            )
+            match store.library.setup {
+                Setup::Tenant(call) => call(
+                    store.raw.as_ptr(),
+                    hostname.as_ptr(),
+                    metadata.as_ptr(),
+                    setup.global_segment_size,
+                    setup.local_buffer_size,
+                    protocol.as_ptr(),
+                    device.as_ptr(),
+                    master.as_ptr(),
+                    tenant.as_ptr(),
+                ),
+                Setup::Default(call) => call(
+                    store.raw.as_ptr(),
+                    hostname.as_ptr(),
+                    metadata.as_ptr(),
+                    setup.global_segment_size,
+                    setup.local_buffer_size,
+                    protocol.as_ptr(),
+                    device.as_ptr(),
+                    master.as_ptr(),
+                ),
+            }
         };
         if status != 0 {
             // Dropping `store` destroys the half-set-up client.
@@ -397,4 +439,54 @@ pub fn regex_escape(pattern: &str) -> String {
         escaped.push(character);
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn default_setup(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+        _: u64,
+        _: u64,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn tenant_setup(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+        _: u64,
+        _: u64,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> c_int {
+        0
+    }
+
+    #[test]
+    fn standard_sdk_never_silently_joins_another_tenant() {
+        let sdk = Setup::Default(default_setup);
+        assert!(sdk.validate_tenant("default").is_ok());
+        for tenant in ["customer-a", "", "Default", "default "] {
+            assert!(
+                matches!(sdk.validate_tenant(tenant), Err(Error::NoTenantSetup(actual)) if actual == tenant)
+            );
+        }
+    }
+
+    #[test]
+    fn tenant_capable_sdk_preserves_explicit_tenant_selection() {
+        assert!(Setup::Tenant(tenant_setup)
+            .validate_tenant("customer-a")
+            .is_ok());
+    }
 }

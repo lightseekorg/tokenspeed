@@ -208,6 +208,15 @@ holder already, from its local hit. A partial landing is not kept: a State
 group's slots and a sliding window's retained blocks are shaped for the
 admitted boundary. No failure stops the engine.
 
+**Multiple sources.** The L3 extension may partition one ordinarily admitted
+destination set between a hot peer and storage (see `../design/async-l3-cache.md`). The
+hot peer supplies immutable history pages it retains at its shorter boundary;
+storage supplies the other dependencies, including the final State checkpoint.
+Each source has its own lease and disjoint destinations. Reads may overlap,
+but one request completion waits for all sources' retirement and release
+agreement. A failed part does not release destinations still used by another
+part or publish a checkpoint at an intermediate boundary.
+
 ### Faults
 
 **A holder goes down** at any step: a lookup without an answer by its

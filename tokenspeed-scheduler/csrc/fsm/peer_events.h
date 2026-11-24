@@ -34,17 +34,23 @@ namespace tokenspeed::fsm {
 struct StartPeerLookupEvent : InvalidTransitionHandler<StartPeerLookupEvent> {
     using InvalidTransitionHandler<StartPeerLookupEvent>::operator();
 
-    StartPeerLookupEvent(PeerLeaseId lease, std::int64_t deadline_us)
-        : lease_{std::move(lease)}, deadline_us_{deadline_us} {}
+    StartPeerLookupEvent(PeerLeaseId lease, std::int64_t deadline_us, std::string holder, std::int32_t minimum_tokens)
+        : lease_{std::move(lease)},
+          deadline_us_{deadline_us},
+          holder_{std::move(holder)},
+          minimum_tokens_{minimum_tokens} {}
 
     PeerLooking operator()(Submitted&& state) {
         state.admission.peer_prepared = true;
-        return PeerLooking{std::move(state.admission), std::move(lease_), deadline_us_};
+        return PeerLooking{std::move(state.admission), std::move(lease_), deadline_us_, std::move(holder_),
+                           minimum_tokens_};
     }
 
 private:
     PeerLeaseId lease_;
     std::int64_t deadline_us_;
+    std::string holder_;
+    std::int32_t minimum_tokens_;
 };
 
 // The holder answered, or the wait ended: admission takes the hit, if any.
@@ -54,7 +60,10 @@ struct FinishPeerLookupEvent : InvalidTransitionHandler<FinishPeerLookupEvent> {
     explicit FinishPeerLookupEvent(std::optional<PeerHit> hit) : hit_{std::move(hit)} {}
 
     Submitted operator()(PeerLooking&& state) {
-        state.admission.peer_hit = std::move(hit_);
+        if (hit_ && hit_->num_tokens >= state.minimum_tokens) {
+            state.admission.peer_fallback = std::move(state.admission.peer_hit);
+            state.admission.peer_hit = std::move(hit_);
+        }
         return Submitted{std::move(state.admission)};
     }
 

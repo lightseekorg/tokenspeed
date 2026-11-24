@@ -68,6 +68,10 @@ struct PeerConfig {
     // Device landings, which use neither.
     std::int32_t max_host_landing_blocks;
     std::int64_t host_ready_timeout_us;
+    // Optional local storage source; zero disables autonomous L3 queries.
+    std::int32_t storage_min_fetch_tokens{0};
+    std::int32_t storage_max_tokens{0};
+    std::int64_t storage_lookup_timeout_us{0};
     void Validate() const;
 };
 
@@ -101,6 +105,14 @@ struct PeerPage {
 
 inline constexpr std::int32_t kPeerStateSlot = 1;
 
+// A logical history page supplied by a confirmed hot prefix. No pool
+// allocation or source pin is held by this metadata.
+struct PeerPageSlot {
+    std::uint32_t group_id;
+    std::int32_t slot;
+    bool operator==(const PeerPageSlot&) const = default;
+};
+
 // Reader -> holder: a waiting prompt's question, sent once.
 struct PeerLookupRequest {
     std::string request_id;
@@ -113,6 +125,10 @@ struct PeerLookupRequest {
     std::vector<std::string> prefix_hashes;
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
+
+    // Storage need only supply the complement of these hot history pages.
+    // State always comes from the final, longer boundary.
+    std::vector<PeerPageSlot> reused_pages;
 
     bool operator==(const PeerLookupRequest&) const = default;
 };

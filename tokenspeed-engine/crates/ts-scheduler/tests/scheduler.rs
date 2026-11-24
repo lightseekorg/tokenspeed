@@ -666,7 +666,7 @@ cfg.max_batch_size = 4
 cfg.max_resident_requests = 4
 cfg.disable_l2_cache = False
 cfg.enable_l3_storage = True
-cfg.storage_config = ts.StorageConfig(
+cfg.storage_config = ts.StorageConfig(True,
     8, 8, 4, 4, 32, 1, 1000, 1000,
     ts.StoragePressure(8, 65536, 1000),
     ts.StoragePressure(4, 32768, 500),
@@ -1304,6 +1304,122 @@ fn shared_prefix_publication_without_storage_is_explicit_and_bounded() {
 }
 
 #[test]
+fn storage_prefix_metadata_preserves_the_readers_content_chain() {
+    interpreter();
+    let scheduler = Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let tokens: Vec<_> = (1..=32).collect();
+    let before = scheduler.admission_snapshot(16);
+    let raw = scheduler.storage_prefix_plan(&tokens, 32, 4).unwrap();
+    let chain: Vec<_> = raw
+        .objects
+        .iter()
+        .map(|o| o.key.content_hash.clone())
+        .collect();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(
+        scheduler
+            .storage_prefix_plan_from_hashes(&tokens, &chain, 32, 4)
+            .unwrap(),
+        raw
+    );
+    let salted = vec!["a".repeat(64), "b".repeat(64)];
+    let plan = scheduler
+        .storage_prefix_plan_from_hashes(&tokens, &salted, 32, 4)
+        .unwrap();
+    assert_eq!(
+        plan.objects
+            .iter()
+            .map(|o| o.key.content_hash.clone())
+            .collect::<Vec<_>>(),
+        salted
+    );
+    assert_ne!(
+        plan, raw,
+        "equal token IDs need not mean equal cache content"
+    );
+    assert_eq!(
+        scheduler.admission_snapshot(16).available_blocks,
+        before.available_blocks
+    );
+    assert!(scheduler
+        .storage_prefix_plan_from_hashes(&tokens, &[], 32, 4)
+        .is_err());
+    assert!(scheduler
+        .storage_prefix_plan_from_hashes(&tokens, &chain, 31, 4)
+        .is_err());
+}
+
+#[test]
+fn local_prefix_query_matches_admission_without_reserving_cache() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let tokens: Vec<i32> = (1..=40).collect();
+    assert_eq!(scheduler.local_prefix_tokens(&tokens, 39).unwrap(), 0);
+    assert!(scheduler.local_prefix_tokens(&tokens, 41).is_err());
+    scheduler
+        .submit_requests(&[spec("producer", tokens.clone())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "producer", vec![42])])
+        .unwrap();
+    scheduler
+        .advance(&[event(ForwardEventKind::Finish, "producer", vec![])])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    let before = scheduler.admission_snapshot(16);
+    let reusable = scheduler.local_prefix_tokens(&tokens, 39).unwrap();
+    assert!(reusable > 0);
+    assert_eq!(
+        scheduler.local_prefix_tokens(&vec![500; 40], 39).unwrap(),
+        0
+    );
+    assert_eq!(
+        before.available_blocks,
+        scheduler.admission_snapshot(16).available_blocks
+    );
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
+    scheduler
+        .submit_requests(&[spec("replay", tokens)])
+        .unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].extend_prefix_lens[0], reusable);
+}
+
+#[test]
+fn storage_prefix_plan_is_bounded_metadata_without_cache_reservations() {
+    interpreter();
+    let scheduler = Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let tokens: Vec<i32> = (0..35).collect();
+    let before = scheduler.admission_snapshot(16);
+    let plan = scheduler.storage_prefix_plan(&tokens, 35, 3).unwrap();
+    assert_eq!(plan.max_tokens, 35);
+    assert_eq!(
+        plan.objects.iter().map(|o| o.slot).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(plan.objects.iter().all(|o| o.key.group_id == 0));
+    assert_eq!(
+        scheduler
+            .storage_prefix_plan(&tokens, 35, 2)
+            .unwrap()
+            .max_tokens,
+        -1
+    );
+    assert!(scheduler.storage_prefix_plan(&tokens, 36, 3).is_err());
+    assert!(scheduler.storage_prefix_plan(&tokens, 0, 3).is_err());
+    assert!(scheduler
+        .storage_prefix_plan(&tokens, 35, usize::MAX)
+        .is_err());
+    let after = scheduler.admission_snapshot(16);
+    assert_eq!(before.available_blocks, after.available_blocks);
+    assert_eq!(before.host_free_blocks, after.host_free_blocks);
+    assert_eq!(scheduler.sizes().waiting, 0);
+    assert!(!scheduler.storage_pending());
+}
+
+#[test]
 fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
     interpreter();
     let mut scheduler =
@@ -1367,7 +1483,7 @@ fn shared_prefix_publication_rejects_in_forward_state_before_waiting() {
             let code = STORAGE_SCHEDULER.replace(
                 "result = ts.Scheduler(cfg)",
                 &format!(
-                    "cfg.role = ts.SchedulerConfig.Role.{role}\ncfg.prefix_granularity = 4\ncfg.num_host_pages = 32\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.state_checkpoint_in_forward = {enabled}\n{state}result = ts.Scheduler(cfg)"
+                    "cfg.role = ts.SchedulerConfig.Role.{role}\ncfg.prefix_granularity = 4\ncfg.num_host_pages = 32\ncfg.storage_config = ts.StorageConfig(True, 8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.state_checkpoint_in_forward = {enabled}\n{state}result = ts.Scheduler(cfg)"
                 ),
             );
             let mut scheduler =
@@ -1415,7 +1531,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
             ""
         };
         let code = STORAGE_SCHEDULER.replace("result = ts.Scheduler(cfg)", &format!(
-            "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
+            "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(True, 8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
         let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let tokens = vec![1, 2, 3, 4, 5]; // Includes a real partial-page prompt endpoint.
         scheduler.advance_head(&tick(1), &[]).unwrap();

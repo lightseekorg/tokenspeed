@@ -74,6 +74,7 @@ from tokenspeed.runtime.cache.disk import (
 )
 from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import L3Settings
+from tokenspeed.runtime.cache.l3.direct import DirectSourceSettings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
     PUSH_TIMEOUT_S,
@@ -1239,6 +1240,7 @@ def _peer_sharing_settings(
     *,
     host_cache,
     geometry,
+    l3,
 ) -> PeerSharingSettings:
     """Build the live cache namespace and agree on the TP replica's incarnation."""
     mapping = server_args.mapping
@@ -1289,6 +1291,16 @@ def _peer_sharing_settings(
         protocol=mooncake_protocol(),
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
+        storage=(
+            DirectSourceSettings.resolve(
+                server_args.kvstore_storage_direct_config,
+                l3,
+                prefix_granularity=host_cache.memory_plan.prefix_granularity,
+                max_model_len=model_config.context_len,
+            )
+            if server_args.enable_kvstore_storage_direct
+            else None
+        ),
     )
 
 
@@ -1467,6 +1479,7 @@ class HostBootstrap:
                     draft_model_config,
                     host_cache=device.host_cache,
                     geometry=device.peer_geometry,
+                    l3=l3,
                 )
                 peer_config = peer_scheduler_config(
                     name=self.peer_sharing.name,
@@ -1478,6 +1491,7 @@ class HostBootstrap:
                         device.host_cache.storage,
                         device.host_cache.ownership.shard_counts,
                     ),
+                    storage=self.peer_sharing.storage,
                 )
             specs = device.specs
             geometry = specs.cache_geometry

@@ -86,7 +86,10 @@ def _config(args: ServerArgs, specs):
     storage_config = None
     if args.kvstore_storage_backend is not None:
         storage_config = StorageRuntimeConfig.from_extra_config(
-            None, host_blocks=specs.num_host_pages - 1, prefix_granularity=16
+            None,
+            host_blocks=specs.num_host_pages - 1,
+            prefix_granularity=16,
+            restore_to_host=True,
         ).scheduler
     return scheduler_config_from_args(
         args,

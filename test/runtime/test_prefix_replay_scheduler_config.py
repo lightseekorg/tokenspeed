@@ -164,7 +164,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         max_consecutive_prefill_rounds=0,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
-                None, host_blocks=7, prefix_granularity=2
+                None, host_blocks=7, prefix_granularity=2, restore_to_host=True
             ).scheduler
             if enable_l3_storage
             else None

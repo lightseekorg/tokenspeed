@@ -29,6 +29,8 @@ use ts_scheduler::{
     PeerTier,
 };
 
+use crate::peer::prepared::PreparedObject;
+
 use crate::{
     codec::{Reader, Writer},
     peer::geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
@@ -88,6 +90,24 @@ pub struct Stamp {
 /// A holder's reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
+    /// A storage holder has per-object source leases, not a cache pool layout.
+    StorageLayout {
+        /// Source broker identity, independent of individual SSD providers.
+        stamp: Stamp,
+        /// Reader owners whose complete dependencies this broker prepares.
+        members: u32,
+    },
+    /// Prepared, leased sources in member order. Admission already owns L1.
+    Prepared {
+        /// Source broker identity from the layout exchange.
+        stamp: Stamp,
+        /// The requested source lease.
+        lease: PeerLeaseView,
+        /// Exact complete boundary.
+        num_tokens: i32,
+        /// Per-object registered addresses, grouped by reader member.
+        ranks: Vec<Vec<PreparedObject>>,
+    },
     /// The holder's geometry, one entry per rank of its replica.
     Layout {
         /// Who answered.
@@ -114,6 +134,8 @@ const LOOKUP: u8 = 1;
 const PIN: u8 = 2;
 const RELEASE: u8 = 3;
 const ANSWER: u8 = 4;
+const STORAGE_LAYOUT: u8 = 5;
+const PREPARED: u8 = 6;
 
 fn write_str(out: &mut Writer, value: &str) {
     out.bytes(value.as_bytes());
@@ -374,6 +396,33 @@ impl Reply {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Writer::new();
         match self {
+            Reply::StorageLayout { stamp, members } => {
+                out.u8(STORAGE_LAYOUT);
+                write_stamp(&mut out, stamp);
+                out.u32(*members);
+            }
+            Reply::Prepared {
+                stamp,
+                lease,
+                num_tokens,
+                ranks,
+            } => {
+                out.u8(PREPARED);
+                write_stamp(&mut out, stamp);
+                write_lease(&mut out, lease);
+                out.i64(i64::from(*num_tokens));
+                out.count(ranks.len());
+                for objects in ranks {
+                    out.count(objects.len());
+                    for object in objects {
+                        out.u32(object.group_id);
+                        out.i64(i64::from(object.slot));
+                        write_str(&mut out, &object.session);
+                        out.u64(object.address);
+                        out.u64(object.bytes);
+                    }
+                }
+            }
             Reply::Layout { stamp, ranks } => {
                 out.u8(LAYOUT);
                 write_stamp(&mut out, stamp);
@@ -399,6 +448,45 @@ impl Reply {
     pub fn decode(bytes: &[u8]) -> Result<Self, Malformed> {
         let mut reader = Reader::new(bytes);
         let reply = match reader.u8().ok_or(Malformed)? {
+            STORAGE_LAYOUT => Reply::StorageLayout {
+                stamp: read_stamp(&mut reader).ok_or(Malformed)?,
+                members: reader.u32().ok_or(Malformed)?,
+            },
+            PREPARED => {
+                let stamp = read_stamp(&mut reader).ok_or(Malformed)?;
+                let lease = read_lease(&mut reader).ok_or(Malformed)?;
+                let num_tokens = read_i32(&mut reader).ok_or(Malformed)?;
+                let count = reader.count().ok_or(Malformed)?;
+                if count == 0 || count > 1024 {
+                    return Err(Malformed);
+                }
+                let mut ranks = Vec::with_capacity(count);
+                let mut total = 0usize;
+                for _ in 0..count {
+                    let count = reader.count().ok_or(Malformed)?;
+                    total = total.checked_add(count).ok_or(Malformed)?;
+                    if total > 1 << 20 {
+                        return Err(Malformed);
+                    }
+                    let mut objects = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        objects.push(PreparedObject {
+                            group_id: reader.u32().ok_or(Malformed)?,
+                            slot: read_i32(&mut reader).ok_or(Malformed)?,
+                            session: read_str(&mut reader).ok_or(Malformed)?,
+                            address: reader.u64().ok_or(Malformed)?,
+                            bytes: reader.u64().ok_or(Malformed)?,
+                        });
+                    }
+                    ranks.push(objects);
+                }
+                Reply::Prepared {
+                    stamp,
+                    lease,
+                    num_tokens,
+                    ranks,
+                }
+            }
             LAYOUT => {
                 let stamp = read_stamp(&mut reader).ok_or(Malformed)?;
                 let count = reader.count().ok_or(Malformed)?;
@@ -559,6 +647,22 @@ mod tests {
             push: Some("10.0.0.2:7300".into()),
         };
         for reply in [
+            Reply::StorageLayout {
+                stamp: stamp.clone(),
+                members: 2,
+            },
+            Reply::Prepared {
+                stamp: stamp.clone(),
+                lease: lease(),
+                num_tokens: 512,
+                ranks: vec![vec![PreparedObject {
+                    group_id: 0,
+                    slot: 2,
+                    session: "storage-owner".into(),
+                    address: 1 << 40,
+                    bytes: 1024,
+                }]],
+            },
             Reply::Layout {
                 stamp: stamp.clone(),
                 ranks: vec![

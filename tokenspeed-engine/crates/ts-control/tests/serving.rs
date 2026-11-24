@@ -185,7 +185,7 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup)
              cfg.num_host_pages = 1025\n\
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
              cfg.enable_l3_storage = True\n\
-             cfg.storage_config = ts.StorageConfig(\n\
+             cfg.storage_config = ts.StorageConfig(True, \n\
                  8, 8, storage_host_credits, 64, 1024, 1, 10**9, 10**9,\n\
                  storage_pressure_high, storage_pressure_low)"
         }

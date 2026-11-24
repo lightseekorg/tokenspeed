@@ -37,6 +37,7 @@ struct ForwardEvent;
 struct CacheEvent;
 struct CacheOpView;
 struct StorageOpView;
+struct StoragePrefixPlanView;
 struct ForwardBatchView;
 struct TransferBatchView;
 struct SchedulerAbortView;
@@ -88,6 +89,18 @@ std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_i
 std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
 bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler);
+std::int32_t local_prefix_tokens(const tokenspeed::Scheduler& scheduler, rust::Slice<const std::int32_t> input_ids,
+                                 std::int32_t max_prefix_tokens);
+std::int32_t local_prefix_tokens_from_hashes(const tokenspeed::Scheduler& scheduler,
+                                             rust::Slice<const std::int32_t> input_ids,
+                                             rust::Slice<const rust::String> hashes, std::int32_t max_prefix_tokens);
+StoragePrefixPlanView storage_prefix_plan(const tokenspeed::Scheduler& scheduler,
+                                          rust::Slice<const std::int32_t> input_ids, std::int32_t max_prefix_tokens,
+                                          std::size_t max_keys);
+StoragePrefixPlanView storage_prefix_plan_from_hashes(const tokenspeed::Scheduler& scheduler,
+                                                      rust::Slice<const std::int32_t> input_ids,
+                                                      rust::Slice<const rust::String> hashes,
+                                                      std::int32_t max_prefix_tokens, std::size_t max_keys);
 SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
                                                   rust::Slice<const std::int32_t> input_ids,
                                                   std::int32_t max_prefix_tokens);

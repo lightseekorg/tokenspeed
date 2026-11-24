@@ -780,7 +780,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         return result;
     }
 
-    let (bootstrap, mut scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
+    let (bootstrap, mut scheduler, config, data_plane, role, peers, mut peer_sharing, exporter) =
         Python::attach(|py| {
             let built = (|| {
                 let bootstrap = bootstrap.into_bound(py);
@@ -850,6 +850,10 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             .map_err(HostError::Interpreter)
         })
         .transpose()?;
+    if let (Some(l3), Some(peer)) = (&config.l3, &mut peer_sharing) {
+        peer.use_storage_registrations(l3)
+            .map_err(HostError::Peer)?;
+    }
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.

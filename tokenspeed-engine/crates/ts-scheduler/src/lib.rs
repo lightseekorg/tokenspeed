@@ -519,6 +519,24 @@ mod ffi {
         cache_epoch: u64,
     }
 
+    /// One immutable dependency and its logical landing slot; no pool id.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StoragePrefixObjectView {
+        /// Immutable storage identity in the model namespace.
+        key: StorageKeyView,
+        /// Absolute logical block index, or the peer State slot.
+        slot: i32,
+    }
+
+    /// Exact-boundary metadata, not a storage hit or a capacity reservation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StoragePrefixPlanView {
+        /// Complete dependencies for the described boundary.
+        objects: Vec<StoragePrefixObjectView>,
+        /// Positive when complete, zero when illegal, negative over key budget.
+        max_tokens: i32,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -611,6 +629,15 @@ mod ffi {
         Disk,
     }
 
+    /// Logical history page supplied by a confirmed hot prefix, without a pin.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PeerPageSlotView {
+        /// Cache group owning this history page.
+        group_id: u32,
+        /// Logical history slot, without a physical pool address.
+        slot: i32,
+    }
+
     /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerLookupView {
@@ -628,6 +655,8 @@ mod ffi {
         tokens: Vec<i32>,
         /// The bound on the prefix.
         max_tokens: i32,
+        /// Storage restores the complement; State is never included here.
+        reused_pages: Vec<PeerPageSlotView>,
     }
 
     /// What a holder's answer answers.
@@ -810,6 +839,30 @@ mod ffi {
         ) -> usize;
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn shared_prefix_storage_enabled(scheduler: &Scheduler) -> bool;
+        fn local_prefix_tokens(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            max_prefix_tokens: i32,
+        ) -> Result<i32>;
+        fn local_prefix_tokens_from_hashes(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            hashes: &[String],
+            max_prefix_tokens: i32,
+        ) -> Result<i32>;
+        fn storage_prefix_plan(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            max_prefix_tokens: i32,
+            max_keys: usize,
+        ) -> Result<StoragePrefixPlanView>;
+        fn storage_prefix_plan_from_hashes(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            hashes: &[String],
+            max_prefix_tokens: i32,
+            max_keys: usize,
+        ) -> Result<StoragePrefixPlanView>;
         fn shared_prefix_publication(
             scheduler: &Scheduler,
             input_ids: &[i32],
@@ -891,10 +944,10 @@ pub use ffi::{
     CacheObservationKind, CacheOpKind, CacheOpView, DiskDoneView, DiskOpKind, DiskOpView,
     DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind,
     PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
-    PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe, PrefixHitView,
-    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    PeerPageSlotView, PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe,
+    PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView,
+    StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView, StoragePrefixObjectView,
+    StoragePrefixPlanView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 fn record_cache_observation(
@@ -1158,6 +1211,54 @@ impl Scheduler {
     /// Whether this rank has the complete prefix publication path configured.
     pub fn shared_prefix_storage_enabled(&self) -> bool {
         ffi::shared_prefix_storage_enabled(self.get())
+    }
+
+    /// Match local Device/Host data across every required cache group, without
+    /// acquiring blocks or refreshing recency. Text-token identity only.
+    pub fn local_prefix_tokens(
+        &self,
+        input_ids: &[i32],
+        max_prefix_tokens: i32,
+    ) -> Result<i32, cxx::Exception> {
+        ffi::local_prefix_tokens(self.get(), input_ids, max_prefix_tokens)
+    }
+
+    /// Match the actual reader's content identity, including media/salts.
+    pub fn local_prefix_tokens_from_hashes(
+        &self,
+        input_ids: &[i32],
+        hashes: &[String],
+        max_prefix_tokens: i32,
+    ) -> Result<i32, cxx::Exception> {
+        ffi::local_prefix_tokens_from_hashes(self.get(), input_ids, hashes, max_prefix_tokens)
+    }
+
+    /// Describe a complete legal prefix without acquiring L1/L2 references.
+    /// The caller must query storage and admit destinations separately.
+    pub fn storage_prefix_plan(
+        &self,
+        input_ids: &[i32],
+        max_prefix_tokens: i32,
+        max_keys: usize,
+    ) -> Result<ffi::StoragePrefixPlanView, cxx::Exception> {
+        ffi::storage_prefix_plan(self.get(), input_ids, max_prefix_tokens, max_keys)
+    }
+
+    /// Describe full prefix pages using the reader's original content chain.
+    pub fn storage_prefix_plan_from_hashes(
+        &self,
+        input_ids: &[i32],
+        hashes: &[String],
+        max_prefix_tokens: i32,
+        max_keys: usize,
+    ) -> Result<ffi::StoragePrefixPlanView, cxx::Exception> {
+        ffi::storage_prefix_plan_from_hashes(
+            self.get(),
+            input_ids,
+            hashes,
+            max_prefix_tokens,
+            max_keys,
+        )
     }
 
     /// Query exact prefix receipts without waiting or acquiring cache references.
