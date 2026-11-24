@@ -444,6 +444,7 @@ impl Sender {
         Self::start_with_metrics(config, None)
     }
 
+    /// Start the sender with optional per-rank physical embedding transfer metrics.
     pub fn start_with_metrics(
         config: SenderConfig,
         metrics: Option<Arc<ts_metrics::EncoderTransferMetrics>>,

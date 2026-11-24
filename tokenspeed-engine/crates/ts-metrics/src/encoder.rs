@@ -145,24 +145,30 @@ impl EncoderMetrics {
     fn labels(&self) -> [&str; 3] {
         [&self.labels[0], &self.labels[1], &self.labels[2]]
     }
+    /// Record one encode wire call received by TP0.
     pub fn arrival(&self) {
         self.arrivals.inc(&self.labels(), 1.0);
     }
+    /// Record one malformed or invalid encode call.
     pub fn invalid(&self) {
         self.invalid.inc(&self.labels(), 1.0);
     }
+    /// Record one duplicate room call, separately from item success or failure.
     pub fn duplicate(&self) {
         self.duplicates.inc(&self.labels(), 1.0);
     }
+    /// Record a whole-item embedding cache lookup and, when `hit` is true, a hit.
     pub fn cache_lookup(&self, hit: bool) {
         self.cache_lookups.inc(&self.labels(), 1.0);
         if hit {
             self.cache_hits.inc(&self.labels(), 1.0);
         }
     }
+    /// Observe the image item count in a decoded encode request, after any packing.
     pub fn image_count(&self, count: usize) {
         self.images.observe(&self.labels(), count as f64);
     }
+    /// Update queued, running, and sending item counts and the oldest queue age in seconds.
     pub fn snapshot(&self, queued: usize, running: usize, sending: usize, oldest: f64) {
         let labels = self.labels();
         self.queue.set(&labels, queued as f64);
@@ -170,14 +176,20 @@ impl EncoderMetrics {
         self.sending.set(&labels, sending as f64);
         self.oldest.set(&labels, oldest);
     }
+    /// Observe the time in seconds from item admission to data-plane submission.
     pub fn dispatched(&self, seconds: f64) {
         self.queue_time.observe(&self.labels(), seconds);
     }
+    /// Observe dispatched item and visual token counts, clamping negative tokens to zero.
     pub fn batch(&self, items: usize, tokens: i64) {
         let labels = self.labels();
         self.batch_items.observe(&labels, items as f64);
         self.batch_tokens.observe(&labels, tokens.max(0) as f64);
     }
+    /// Record an item outcome at encoding or device-copy completion.
+    ///
+    /// `execution` is seconds since submission and `total` is seconds since admission.
+    /// `success` indicates copy completion; these durations exclude transfer to prefill.
     pub fn finished(&self, execution: f64, total: f64, success: bool) {
         let labels = self.labels();
         self.execution_time.observe(&labels, execution);
@@ -201,6 +213,7 @@ pub struct EncoderTransferMetrics {
     bytes: Metric,
 }
 impl EncoderTransferMetrics {
+    /// Create physical transfer metrics labeled by model, application, and TP rank.
     pub fn new(exporter: &Arc<Exporter>, model_name: &str, app_key: &str, tp_rank: usize) -> Self {
         let labels = [
             model_name.to_owned(),
@@ -238,12 +251,16 @@ impl EncoderTransferMetrics {
     fn labels(&self) -> [&str; 3] {
         [&self.labels[0], &self.labels[1], &self.labels[2]]
     }
+    /// Record a room written to its complete prefill fanout by this TP rank.
+    ///
+    /// `seconds` is write wall time excluding fanout waiting; `bytes` includes fanout.
     pub fn completed(&self, seconds: f64, bytes: u64) {
         let labels = self.labels();
         self.completed.inc(&labels, 1.0);
         self.latency.observe(&labels, seconds);
         self.bytes.inc(&labels, bytes as f64);
     }
+    /// Record a physical room transfer failure, also counting a timeout when `timeout` is true.
     pub fn failed(&self, timeout: bool) {
         let labels = self.labels();
         self.failures.inc(&labels, 1.0);
