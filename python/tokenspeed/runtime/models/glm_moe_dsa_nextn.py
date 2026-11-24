@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
@@ -36,19 +36,15 @@ from tokenspeed.runtime.execution.context import (
 from tokenspeed.runtime.layers.attention.dsa.utils import (
     _prepare_dsa_topk_for_mtp_decode,
 )
-from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.moe import (
-    ExpertCheckpointSchema,
-    build_moe_checkpoint_loader,
-)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.deepseek_nextn import (
+    DeepseekModelNextN,
+    DeepseekNextNWeights,
+)
 from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaDecoderLayer,
@@ -57,54 +53,9 @@ from tokenspeed.runtime.models.glm5 import (
     pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
 )
 
-_NEXTN_SPEC_WEIGHT_NAMES = (
-    "shared_head.norm",
-    "eh_proj",
-    "enorm",
-    "hnorm",
-)
 
-_STACKED_PARAMS_MAPPING = (
-    ("gate_up_proj", "gate_proj", 0),
-    ("gate_up_proj", "up_proj", 1),
-)
-
-
-class GlmMoeDsaModelNextN(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-    ) -> None:
-        super().__init__()
-        self.mapping = mapping
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
-        )
-
-        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-
-        self.alt_stream = torch.cuda.Stream()
-        self.decoder = GlmMoeDsaDecoderLayer(
-            config,
-            0,
-            mapping=self.mapping,
-            quant_config=quant_config,
-            is_nextn=True,
-            alt_stream=self.alt_stream,
-        )
-
-        self.shared_head = nn.Module()
-        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+class GlmMoeDsaModelNextN(DeepseekModelNextN):
+    decoder_cls = GlmMoeDsaDecoderLayer
 
     def forward(
         self,
@@ -145,7 +96,7 @@ class GlmMoeDsaModelNextN(nn.Module):
         return hidden_states, None
 
 
-class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
+class GlmMoeDsaForCausalLMNextN(DeepseekNextNWeights, GlmMoeDsaForCausalLM):
     compute_dsa_topk_first_step = True
 
     def __init__(
@@ -231,29 +182,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
     def get_hot_token_id(self) -> None:
         return None
 
-    def _nextn_layer_prefix(self, name: str) -> str | None:
-        if not hasattr(self.config, "num_nextn_predict_layers"):
-            raise ValueError("num_nextn_predict_layers is not in the config")
-        if self.config.num_nextn_predict_layers != 1:
-            raise ValueError("Only 1 nextn layer is supported")
-
-        if self.config.num_nextn_predict_layers == self.config.num_hidden_layers:
-            prefix = "model.layers.0"
-            return prefix if name.startswith(prefix) else None
-
-        if not name.startswith("model.layers."):
-            return None
-        name_parts = name.split(".")
-        if len(name_parts) < 3:
-            return None
-        try:
-            layer_id = int(name_parts[2])
-        except ValueError:
-            return None
-        if layer_id < self.config.num_hidden_layers:
-            return None
-        return f"model.layers.{layer_id}"
-
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).
 
@@ -262,166 +190,40 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         """
         return self._nextn_layer_prefix(name) is not None
 
-    def _map_checkpoint_name(self, raw_name: str) -> str | None:
-        nextn_layer_prefix = self._nextn_layer_prefix(raw_name)
-        if nextn_layer_prefix is None:
-            return None
-        if "shared_head.head" in raw_name or "embed_tokens" in raw_name:
-            return None
-        if "rotary_emb.inv_freq" in raw_name:
-            return None
-
-        if any(weight_name in raw_name for weight_name in _NEXTN_SPEC_WEIGHT_NAMES):
-            return raw_name.replace(nextn_layer_prefix, "model")
-        return raw_name.replace(nextn_layer_prefix, "model.decoder")
+    def _nextn_param(
+        self, params_dict: dict[str, nn.Parameter], name: str
+    ) -> nn.Parameter | None:
+        return self.get_param(params_dict, name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj: dict[str, torch.Tensor] | None = (
-            self._pending_a_proj if fuse_qkv_a_proj else None
-        )
+        super().load_weights(self._load_indexer_weights(weights))
 
+    def _load_indexer_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Load indexer weights as they stream by; yield every other weight."""
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        pending_fp8_wk = self._pending_fp8_wk
-        loaded_fused_indexer_shards = self._loaded_fused_indexer_shards
-
-        moe_loader = build_moe_checkpoint_loader(
-            params_dict=params_dict,
-            expert_schema=ExpertCheckpointSchema(
-                gate_proj_name="gate_proj",
-                down_proj_name="down_proj",
-                up_proj_name="up_proj",
-            ),
-            num_experts=self.config.n_routed_experts,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
-        )
         for raw_name, loaded_weight in weights:
             name = self._map_checkpoint_name(raw_name)
-            if name is None:
+            if name is None or ".indexer." not in name:
+                yield raw_name, loaded_weight
                 continue
-
-            if ".indexer." in name:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = self.get_param(params_dict, name)
-                if param is not None:
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                load_fused_indexer_projection(
-                    name,
-                    loaded_weight,
-                    params_dict=params_dict,
-                    modules_dict=modules_dict,
-                    pending_fp8_wk=pending_fp8_wk,
-                    loaded_shards=loaded_fused_indexer_shards,
-                    weight_block_size=getattr(
-                        self.quant_config, "weight_block_size", None
-                    ),
-                )
+            if name.endswith(".bias") and name not in params_dict:
                 continue
-
-            for param_name, weight_name, shard_id in _STACKED_PARAMS_MAPPING:
-                if weight_name not in name:
-                    continue
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
-                    continue
-
-                if cached_a_proj is not None and (
-                    "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                ):
-                    cached_a_proj[name] = loaded_weight
-                    q_a_proj_name = (
-                        name
-                        if "q_a_proj" in name
-                        else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                    )
-                    kv_a_proj_name = (
-                        name
-                        if "kv_a_proj_with_mqa" in name
-                        else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                    )
-
-                    if (
-                        q_a_proj_name in cached_a_proj
-                        and kv_a_proj_name in cached_a_proj
-                    ):
-                        q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                        kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                        fused_weight = torch.cat(
-                            [q_a_proj_weight, kv_a_proj_weight], dim=0
-                        )
-
-                        if "q_a_proj" in name:
-                            param_name = name.replace(
-                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                            )
-                        else:
-                            param_name = name.replace(
-                                "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                            )
-                        param = params_dict[param_name]
-
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, fused_weight)
-                        cached_a_proj.pop(q_a_proj_name)
-                        cached_a_proj.pop(kv_a_proj_name)
-                else:
-                    if ".mlp.experts." in name:
-                        continue
-                    param = self.get_param(params_dict, name)
-                    if param is None:
-                        continue
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-        self.post_load_weights()
-
-    def begin_weight_update(self) -> None:
-        super().begin_weight_update()
-        self._pending_a_proj.clear()
-
-    def abort_weight_update(self) -> None:
-        super().abort_weight_update()
-        self._pending_a_proj.clear()
-
-    def end_weight_update(self) -> None:
-        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
-
-        Raises:
-            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
-                pair was streamed without the other, so the fused projection
-                still holds the previous weights.
-        """
-        if self._pending_a_proj:
-            unpaired = sorted(self._pending_a_proj)
-            self.abort_weight_update()
-            raise RuntimeError(
-                f"{type(self).__name__}: the update streamed {unpaired} without "
-                "the partner tensor the fused q/kv a-projection needs"
+            param = self.get_param(params_dict, name)
+            if param is not None:
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            load_fused_indexer_projection(
+                name,
+                loaded_weight,
+                params_dict=params_dict,
+                modules_dict=modules_dict,
+                pending_fp8_wk=self._pending_fp8_wk,
+                loaded_shards=self._loaded_fused_indexer_shards,
+                weight_block_size=getattr(self.quant_config, "weight_block_size", None),
             )
-        super().end_weight_update()
 
     def post_load_weights(self) -> None:
         self_attn = self.model.decoder.self_attn

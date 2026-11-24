@@ -57,6 +57,7 @@ __all__ = [
     "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
+    "moe_prepare_input_buffers",
     "moe_process_weights",
     "moe_warmup",
     "moe_topk",
@@ -238,7 +239,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.5, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -1653,6 +1654,7 @@ def _build_traits(
     expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
+    expert_layout: str | None,
     with_bias: bool,
     combine_order: str,
 ) -> dict[str, Any]:
@@ -1660,6 +1662,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    if expert_layout is not None:
+        # Seller-declared: excludes kernels declaring another bank layout.
+        traits["expert_layout"] = expert_layout
     # Unknown counts must not admit a kernel restricted to particular counts.
     traits["num_experts"] = num_experts
     traits["top_k"] = top_k
@@ -1721,10 +1726,14 @@ def _select_moe_apply(
             static_traits=traits,
             variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
             solution=solution,
-            declared_traits=(
-                frozenset({"combine_order"})
-                if traits["combine_order"] == "slot"
-                else frozenset()
+            # A kernel serves these requests only when it declares them.
+            declared_traits=frozenset(
+                name
+                for name, requested in (
+                    ("combine_order", traits["combine_order"] == "slot"),
+                    ("expert_layout", "expert_layout" in traits),
+                )
+                if requested
             ),
             ignore_layout=True,
         )
@@ -2025,6 +2034,7 @@ def moe_plan(
     top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
+    expert_layout: str | None = None,
     with_bias: bool = False,
     process_group: object | None = None,
     deepep_mode: str | None = None,
@@ -2084,6 +2094,11 @@ def moe_plan(
             "input" is a special value that uses the whatever dtype the input
             activations have. "mxfp4" requests dynamic MXFP4 activation
             quantization. Defaults to "input" if not set.
+        expert_layout: Optional storage layout the selected kernel must read
+            the routed-expert banks in (for example "gdot128" or "n16" for the
+            gfx950 MXFP4 SiTU kernels). The selected kernel must declare it, or
+            planning raises ValueError. None leaves the layout to selection,
+            which keeps the default.
         with_bias: Whether the selected kernel must support expert bias tensors.
         process_group: Runtime-created process group for DeepEP or MegaMoE
             communication. Defaults to None for backends that do not use it.
@@ -2166,6 +2181,7 @@ def moe_plan(
         expert_id_repeats=expert_id_repeats,
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,
+        expert_layout=expert_layout,
         with_bias=with_bias,
         combine_order=combine_order,
     )
@@ -2201,6 +2217,14 @@ def moe_plan(
     ):
         raise ValueError(
             f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
+        )
+    # Selection drops only kernels declaring another layout; one declaring none
+    # still matches, so a requested layout is checked on the selected kernel.
+    declared_layouts = apply_spec.traits.get("expert_layout", frozenset())
+    if expert_layout is not None and expert_layout not in declared_layouts:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not read the requested "
+            f"{expert_layout!r} expert layout"
         )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
@@ -2242,6 +2266,10 @@ def moe_plan(
     supports_fp8_per_tensor_input = True in apply_spec.traits.get(
         "supports_fp8_per_tensor_input", frozenset({False})
     )
+    # The weight preprocessor returns PreparedExpertWeights for DWDP storage.
+    supports_peer_weights = True in apply_spec.traits.get(
+        "supports_peer_weights", frozenset({False})
+    )
     sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
     sorted_route_block_sizes = apply_spec.traits.get(
         "sorted_route_block_size", frozenset()
@@ -2260,6 +2288,9 @@ def moe_plan(
         "features": features,
         "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
+        "prepare_input_buffers": getattr(
+            kernel.impl, "_tokenspeed_prepare_input_buffers", None
+        ),
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "fuse_shared_expert": getattr(
             kernel.impl, "_tokenspeed_fuse_shared_expert", None
@@ -2282,6 +2313,7 @@ def moe_plan(
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         "supports_fp8_per_tensor_input": supports_fp8_per_tensor_input,
+        "supports_peer_weights": supports_peer_weights,
         "sorted_route_rows": sorted_route_rows,
         "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
@@ -2343,6 +2375,25 @@ def moe_process_weights(
         else:
             communication_initializer(initialize)
     return result
+
+
+def moe_prepare_input_buffers(
+    plan: dict, w: torch.nn.Module
+) -> Callable[
+    [int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+]:
+    """Prepare the selected kernel's input storage and return its view factory.
+
+    Args:
+        plan: The selected MoE plan, including its EP process group.
+        w: Processed expert weights used to prepare the runner.
+
+    Returns:
+        A callable taking live rows and the maximum rows over EP ranks. It
+        returns activation, scale, expert-ID and route-weight buffer views.
+        Call collectively before capture, in the runtime's workspace region.
+    """
+    return plan["prepare_input_buffers"](plan, w)
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
@@ -2502,6 +2553,7 @@ import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.flashinfer_cutedsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401

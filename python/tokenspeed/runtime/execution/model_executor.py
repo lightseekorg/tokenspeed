@@ -111,7 +111,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
@@ -125,6 +125,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
     local_pages_by_group,
+)
+from tokenspeed.runtime.layers.hyperconnection import (
+    register_workspace_region as register_hc_workspace_region,
 )
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -157,12 +160,18 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
+
+
+def _last_packed_token_rows(input_lengths: torch.Tensor) -> torch.Tensor:
+    """Locate each request's last row within the scheduler's int32 token budget."""
+    return torch.cumsum(input_lengths, dim=0, dtype=torch.int32).sub_(1)
 
 
 def _sampling_info_for_requests(
@@ -323,6 +332,12 @@ def select_dspark_context_producer(
             "pipeline stages."
         )
     return None
+
+
+@runtime_checkable
+class MoESourceRowsModel(Protocol):
+    @property
+    def moe_source_rows(self) -> MoESourceRows | None: ...
 
 
 @runtime_checkable
@@ -630,6 +645,7 @@ class ModelExecutor:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=config.enable_memory_saver
         )
+        register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -864,7 +880,10 @@ class ModelExecutor:
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
         self._prev_decode_bs: int = 0
-        self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self._sentinel_neg1 = torch.tensor(
+                -1, device=self.device, dtype=torch.int64
+            )
         self.mm_runtime = MultimodalRuntime(
             model_is_mrope=config.model_is_mrope,
             input_buffers=self.input_buffers,
@@ -1048,6 +1067,13 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            moe_source_rows=tuple(
+                rows
+                for runner in (self.model_runner, self._draft_model_runner)
+                if runner is not None
+                and isinstance(runner.model, MoESourceRowsModel)
+                and (rows := runner.model.moe_source_rows) is not None
+            ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -1189,7 +1215,18 @@ class ModelExecutor:
 
         A forward reload keeps the tactics already loaded by this process.
         """
+        self._warm_kernels(keep_loaded_tactics=keep_loaded_tactics, tune=True)
 
+    def warm_kernels(self) -> None:
+        """Warm kernels on the serving stream with the loaded tactics, tuning none.
+
+        For a warm-up after the pools are rebound: it compiles the kernel
+        variants the new pools select, but profiles no tactic, since tuning
+        workspaces would land outside the memory the rebind reserved.
+        """
+        self._warm_kernels(keep_loaded_tactics=True, tune=False)
+
+    def _warm_kernels(self, *, keep_loaded_tactics: bool, tune: bool) -> None:
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
@@ -1241,8 +1278,10 @@ class ModelExecutor:
             # These dummy forwards do not perform pipeline stage transfers.
             logger.info("Kernel warmup and tuning skipped under pipeline parallelism")
             return
-        tune_mode = not self.config.disable_autotune
-        if not tune_mode:
+        tune_mode = tune and not self.config.disable_autotune
+        if not self.config.disable_autotune and not tune:
+            logger.info("Kernel warmup with the loaded tactics, profiling none")
+        elif not tune_mode:
             logger.info("Kernel tactic profiling disabled (--disable-autotune)")
 
         # One traversal discovers each operator. Its dispatch warms finite
@@ -1335,7 +1374,11 @@ class ModelExecutor:
                             ),
                             graph_phase=False,
                         )
-                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                if (
+                    tune
+                    and hipblaslt_autotune_enabled()
+                    and not self.config.prefill_only
+                ):
                     # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
                     # captured batch size tunes the dense GEMMs the tuned file
                     # does not list, so capture records the picks. Tuning ends
@@ -1369,7 +1412,7 @@ class ModelExecutor:
         num_tokens_per_req = self.config.output_length
         logits = torch.zeros(
             (num_tokens_per_req, lm_head.num_embeddings_per_partition),
-            dtype=lm_head.weight.dtype,
+            dtype=processor.sampled_shard_dtype(lm_head),
             device=self.device,
         )
         candidates = torch.zeros(
@@ -2609,6 +2652,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        """Execute one scheduled forward operation."""
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2655,8 +2699,9 @@ class ModelExecutor:
             if bs > 0:
                 # Check the per-group tables' structure and pack them once for
                 # this batch; the page IDs only under the diagnostic.
-                cache_metadata = CacheBatchMetadata.from_forward_op(
+                cache_metadata = build_managed_cache_metadata(
                     forward_op,
+                    memory_saver_adapter=self.memory_saver_adapter,
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
@@ -2784,30 +2829,23 @@ class ModelExecutor:
                         num_prefill_tokens = total_tokens - num_decode_tokens
                         gather_ids = torch.empty(
                             num_extends + num_decode_tokens,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                             device=self.device,
                         )
-                        gather_ids[:num_extends] = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:num_extends],
-                                dim=0,
-                            )
-                            - 1
+                        gather_ids[:num_extends] = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:num_extends]
                         )
                         gather_ids[num_extends:] = torch.arange(
                             num_prefill_tokens,
                             total_tokens,
                             device=self.device,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                         )
                     else:
                         # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request via cumsum.
-                        gather_ids = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:bs], dim=0
-                            )
-                            - 1
+                        # per request.
+                        gather_ids = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:bs]
                         )
 
                 output_layout = ForwardOutputLayout(

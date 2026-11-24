@@ -273,6 +273,10 @@ Kimi-K3 requires
 `attention DP == MoE EP == world size`. By default, shared experts and attention
 projections are replicated. Only the routed experts require dispatch/combine
 communication.
+On this path (any transport but `deepep`, or MegaMoE), an EP size that does
+not divide the 896 routed experts takes redundant slots
+([static expert placement](#static-expert-placement-with-redundant-experts)),
+for example `--ep-num-redundant-experts 4 --ep-dispatch-algorithm static` at EP20.
 
 Select the transport with `--all2all-backend`:
 
@@ -290,9 +294,11 @@ Select the transport with `--all2all-backend`:
   and its projection/shared-expert weight placement in one module.
   See [Kimi-K3 Hopper PD](../guides/kimi-k3-hopper-pd.md) for deployment layouts.
 
-For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
+For NVIDIA NVFP4 and MXFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 `--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+MXFP4 experts run FlashInfer's Kimi K3 MegaMoE, which quantizes the BF16 routed
+rows to MXFP8.
 
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
@@ -325,6 +331,7 @@ requires gated MLA with Q-LoRA. TokenSpeed rejects gated MLA without Q-LoRA
 even with replicated projections. MLA Q-B, KV-B, KDA convolution and
 norms keep their existing mapping. Target-model projection settings do not
 change the draft model.
+Kimi-K3.1 sparse MLA (DSA) supports the same QKV and output projection settings.
 
 Each sharded computation restores complete outputs to the original token owner:
 
@@ -343,6 +350,25 @@ norm and local up-projection. Native collectives cover the configured decode
 batch bound including speculative tokens; larger batches retain NCCL.
 Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
+
+Automatic projection fusion uses TP2 or TP4. Column fusion requires input
+widths and output shard widths aligned to 128 channels. Row fusion requires
+input and output widths aligned to `TP × 128` channels. BF16 TP4 sparse-MLA QKV-A
+can fuse with 96-channel shard alignment on SM100 and SM103. This layout pads
+14400 logical outputs to 14592 stored channels and preserves the original order
+and width of the checkpoint and returned logical outputs. With multicast
+memory, the 512-row bucket can use 192-channel GEMM tiles on both architectures.
+
+Block-FP8 and BF16 fusion support SM100 and SM103. A subgroup can span nodes
+within one NVLink domain when every rank can allocate fabric memory.
+The subgroup maximum must be at least 32 physical rows for BF16 column fusion
+and 64 for BF16 row or block-FP8 fusion.
+BF16 fusion uses BF16 operands directly.
+Row GEMM partials round to BF16, then sum in FP32 rank order before final BF16
+rounding. Unsupported configurations use the ordinary projection collectives.
+
+These projection settings apply to DEP; DWDP still requires them to be `1`.
+Shared-expert TP requires BF16 weights.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
 total model memory or latency. Communication and padding can outweigh GEMM
@@ -491,11 +517,15 @@ rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does, and
 Inkling2 does for static placements (it does not expose its expert weights to
-`--enable-eplb`).
+`--enable-eplb`), and so does Kimi-K3 with attention DP and EP-only MoE
+(MegaMoE, or the all-to-all / all-gather dispatch to the local MoE; static
+dispatch, no load recording or online rebalancing).
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
-replicas live on other ranks.
+replicas live on other ranks. It also serves an EP size that does not divide
+the routed experts: Kimi-K3's 896 experts run at EP20 with
+`--ep-num-redundant-experts 4` (900 slots, 45 per rank).
 
 1. **Record** the load of a representative workload. Serve with
    `--expert-distribution-recorder-mode stat --ep-dispatch-algorithm
@@ -1081,15 +1111,20 @@ Before benchmarking:
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
 
-DWDP requires the CUDA 13 toolkit.
+DWDP supports the CUDA 12.8 and 13 toolkits.
 
-The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
---ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
-`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
-The weight-sharing size must divide the instance size. Shared-expert and
-attention-projection TP overrides must also remain local. The additional
-staging memory is allocated before KV cache sizing. Live checkpoint replacement
-requires restarting these workers.
+The initial K3 configuration (NVFP4 or MXFP4 experts on the FlashInfer TRT-LLM
+kernels; pass `--moe-backend flashinfer_trtllm` for MXFP4, where `auto` may
+select another kernel) requires `--attn-tp-size 1 --moe-tp-size 1
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`, and a
+fixed prefill token budget. Eager execution and ordinary breakable prefill
+graphs are supported.
+The routed experts run on FlashInfer's TRT-LLM-Gen kernels
+(`--moe-backend flashinfer_trtllm`) or, for NVFP4, its CuTe DSL kernels
+(`--moe-backend flashinfer_cutedsl`). The weight-sharing size must divide the
+instance size. Shared-expert and attention-projection TP overrides must also
+remain local. The additional staging memory is allocated before KV cache sizing.
+Live checkpoint replacement requires restarting these workers.
 
 See [distributed immutable weights](../design/distributed-weights.md) for
 storage ownership and stream-ordering invariants.

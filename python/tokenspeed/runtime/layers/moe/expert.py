@@ -28,6 +28,9 @@ import torch
 from tokenspeed_kernel.ops.communication.peer_weights import PreparedExpertWeights
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import (
+    moe_prepare_input_buffers as kernel_moe_prepare_input_buffers,
+)
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
@@ -66,9 +69,36 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+    TorchMemorySaverAdapter,
+    initialize_communication,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _moe_quant_config(quant_config, prefix: str):
+    """The MoE layer at ``prefix``'s quantization config, or None when its
+    experts stay unquantized. ignored_layers (compressed-tensors) keys the MoE
+    block; exclude_modules (ModelOpt) keys the fused experts."""
+    if (
+        quant_config is None
+        or should_ignore_quant_layer(prefix, quant_config.ignored_layers)
+        or should_exclude_quant_module(
+            f"{prefix}.experts", quant_config.exclude_modules
+        )
+    ):
+        return None
+    return quant_config.get_moe_quant_config(prefix)
+
+
+def moe_expert_weight_dtype(quant_config, prefix: str) -> str:
+    """The stored weight format of the routed experts of the MoE layer at
+    ``prefix`` ("unquant", "fp8", "mxfp4", ...), as that layer resolves it."""
+    moe_quant_config = _moe_quant_config(quant_config, prefix)
+    if moe_quant_config is None:
+        return "unquant"
+    return moe_quant_config.moe_weight_dtype(prefix)
 
 
 class MoELayer(torch.nn.Module):
@@ -102,6 +132,9 @@ class MoELayer(torch.nn.Module):
         input_dtype: torch.dtype | None = None,
         peer_weights: MoEPeerWeights | None = None,
         a2a_backend: str | None = None,
+        # The routed-expert bank layout the selected kernel must read
+        # (``moe_plan``'s ``expert_layout``); None leaves it to selection.
+        expert_layout: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -224,17 +257,10 @@ class MoELayer(torch.nn.Module):
         ):
             raise ValueError("fp32_correction_bias requires DeepSeekV3 routing")
 
-        # Quantization config. ignored_layers (compressed-tensors) keys the MoE
-        # block; exclude_modules (ModelOpt) keys the fused experts.
         self._quant_kind = "unquant"
-        if (
-            quant_config is not None
-            and not should_ignore_quant_layer(self.prefix, quant_config.ignored_layers)
-            and not should_exclude_quant_module(
-                f"{self.prefix}.experts", quant_config.exclude_modules
-            )
-        ):
-            self.quant_config = quant_config.get_moe_quant_config(self.prefix)
+        moe_quant_config = _moe_quant_config(quant_config, self.prefix)
+        if moe_quant_config is not None:
+            self.quant_config = moe_quant_config
             self._quant_kind = self.quant_config.moe_weight_dtype(self.prefix)
 
         fp8_scale_block_shape = None
@@ -540,6 +566,7 @@ class MoELayer(torch.nn.Module):
             expert_id_repeats=self.zero_expert_num > 0,
             fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
+            expert_layout=expert_layout,
             with_bias=with_bias,
             process_group=process_group,
             deepep_mode=deepep_mode,
@@ -595,12 +622,21 @@ class MoELayer(torch.nn.Module):
                     "Peer weights require local full-expert TP1/EP1 compute"
                 )
             if not (
-                self._quant_kind == "nvfp4"
-                and self.activation == "situ"
-                and self.plan["solution"] == "flashinfer_trtllm"
+                self.plan["supports_peer_weights"]
+                or (
+                    self.activation == "situ"
+                    and (self.plan["solution"], self._quant_kind)
+                    in {
+                        ("flashinfer_trtllm", "nvfp4"),
+                        ("flashinfer_trtllm", "mxfp4"),
+                        ("flashinfer_cutedsl", "nvfp4"),
+                    }
+                )
             ):
                 raise ValueError(
-                    "Peer weights currently require FlashInfer TRTLLM NVFP4 SiTU"
+                    "Peer weights require a MoE kernel that declares "
+                    "supports_peer_weights, or FlashInfer TRTLLM NVFP4/MXFP4 "
+                    "or CuTe DSL NVFP4 SiTU"
                 )
             self._storage_spec = replace(
                 self._spec,
@@ -619,6 +655,13 @@ class MoELayer(torch.nn.Module):
         )
         self._weights_processed = False
         self._moe_backend_state: object | None = None
+        self._input_buffer_factory: (
+            Callable[
+                [int, int],
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            ]
+            | None
+        ) = None
 
     def _swiglu_form(self) -> str | None:
         """``"standard"`` for silu(gate)*up with an optional clamp, ``"generalized"``
@@ -676,6 +719,20 @@ class MoELayer(torch.nn.Module):
                 )
             self.peer_weights.publish(self.layer_index, module, prepared)
         self._weights_processed = True
+
+    def input_buffers(
+        self, num_tokens: int, max_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The selected kernel's activation, scale, ID and routing-weight views."""
+        if self._input_buffer_factory is None:
+            saver = TorchMemorySaverAdapter.create(
+                enable=global_server_args_dict["enable_memory_saver"]
+            )
+            with saver.named_region("workspace"):
+                self._input_buffer_factory = kernel_moe_prepare_input_buffers(
+                    self.plan, self
+                )
+        return self._input_buffer_factory(num_tokens, max_tokens)
 
     @property
     def support_routing(self) -> bool:

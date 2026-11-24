@@ -61,10 +61,11 @@ engines.
   messages and answers them.
 
 Holder and reader must share the cache namespace: the same deployment
-identity (checkpoint, layout, attention TP, KV parallelism, backends,
-quantization, compatibility epoch) and weight version, as the L3 key prefix
-already defines it. Same namespace implies the same per-rank layout, so rank
-*i* of the reader reads only from rank *i* of the holder. Replicas in
+identity (configured model and revision, layout, attention TP, KV parallelism, backends,
+quantization, compatibility epoch) and weight version. Under `numerics=auto`,
+the live peer identity allows different MoE expert-parallel sizes. Other
+numerical policies and persistent L3 keys retain the expert-parallel size.
+Same namespace implies the same per-rank layout, so rank *i* of the reader reads only from rank *i* of the holder. Replicas in
 different namespaces never share: the two compare identities when they first
 connect and before every read (Faults, below).
 
@@ -178,9 +179,14 @@ releases it and leaves a tombstone.
 cache or Host pool into the reader's Device pages. The holder's data plane
 takes no part. A reader starts its reads only once its own plan's device work
 that precedes page reuse has run -- the write-back stores that still read
-victims' old bytes, the copies, the zeroing -- the point PD's decode role
-starts its receive from: a destination may be a block that plan freed, and
-the device's reads of it are not ordered with the network's writes.
+victims' old bytes, the copies, the zeroing -- and the plan's loads of its
+local Host hit: a destination may be a block that plan freed, and the
+device's reads of it are not ordered with the network's writes; and the
+landing's end releases the request to a later plan's forward, which does not
+wait for this plan's loads. PD's decode role starts its receive from the same
+point. The landing waits on separate completion events for the default and
+load streams after the current forward is launched. The default stream does
+not wait for the entire load, so that forward keeps its layerwise load overlap.
 
 **Release.** The servicer answers whether the pages stayed untouched from the
 pin: either no plan ran on the holder since the pin's answer, or the hard pin
@@ -227,9 +233,8 @@ or a lease the holder kept for the old one.
 **Different models or weights:** every answer carries the holder's namespace
 identity; a reader reads only from a holder whose identity equals its own.
 Equal token hashes under different weights would otherwise land wrong KV. The
-identity is the L3 deployment id (checkpoints, cache layout, numerics,
-parallel layout) and the weight version. A weight update must flush and name
-its `weight_version`, as with L3; once every rank holds the new weights the
+identity includes the deployment facts described above and the weight version. A weight update
+must flush and name its `weight_version`, as with L3; once every rank holds the new weights the
 replica serves and reads under the new identity and forgets the layouts it
 knew, so replicas mid-rollout never read each other.
 
@@ -273,10 +278,13 @@ engine can unregister its memory.
 
 Control messages (lookup, pin, release) travel between the replicas'
 servicers over ZMQ, not through the data plane. A holder's name is its
-servicer's endpoint (`host:port`, one per attention-DP replica), which the
+logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
+The first member owns the bound listener continuously through startup. A
+caller using an OS-selected port binds before constructing the replica's name
+and scheduler, then moves that listener into the peer without rebinding.
 Until the shim's NVLink path is wired, replicas on one node also read over
 RDMA (the NIC's loopback); only the router's cost model tells the two apart.
 
@@ -341,22 +349,28 @@ gain falls below a minimum fetch size.
 
 ### Engine roles and scope
 
-The first version covers what write-back covers: fused and prefill roles, with
+The first version covers every role, with
 attention TP and KV parallelism; replicated cache groups only, no KV-page
 sharding; no pipeline stages and no query context parallelism. It needs the
 Host tier (`--enable-kvstore`): the Host is half of the capacity a holder
 serves, and its layout is the field list both sides read by. A prefill
 replica that reuses a peer's prefix then transfers to its decode peer through
-the ordinary PD path. Hybrid models (sliding window, State checkpoints) are in
-scope through the holder's matchers.
+the ordinary PD path. A decode replica holds and never reads: it serves the
+history it decoded, prompts and replies, so the next turn's prefill replica
+reads a reply instead of computing it, and its own prompts come from its
+prefill peer (RFC 0005, which also gives the decode role a Host tier under
+write-back). Hybrid models (sliding window, State checkpoints) are in scope
+through the holder's matchers.
 
-Out of scope: a storage tier, a central owner, the decode role, sharing across
-namespaces, and moving PD itself onto the new read entry point.
+Out of scope: a storage tier, a central owner, sharing across namespaces, and
+moving PD itself onto the new read entry point.
 
 ### Configuration
 
-`--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
-`port + r`, and a replica's name is `host:port`, with the host from
+`--peer-prefix-port` turns sharing on; each node binds one public port. Rank zero is
+`host:port` and other attention-DP replicas are `host:port/rank`. The first
+local replica leader forwards control frames to the addressed sibling over
+loopback. The host comes from
 `--peer-prefix-host` (the address the worker advertises to the router) or
 else the detected local address. A holder hint must name the holder exactly
 so: a reader matches the holder's answers by that name.
@@ -383,7 +397,8 @@ leases held by tier, demoted and dropped blocks and their returns.
    across two nodes; token-identical output with and without reuse.
 2. Medium in KV events; Dynamo peer credit, link cost models and hints.
 3. Holder demotion of the leaf chain a complete read released.
-4. Larger scopes: KV-page sharding, other roles.
+4. Larger scopes: KV-page sharding. The decode role as a holder came with
+   RFC 0005.
 
 ## Testing
 
@@ -406,3 +421,30 @@ leases held by tier, demoted and dropped blocks and their returns.
 1. Soft-pin and hard-pin deadlines.
 2. Whether a landing should keep a shorter confirmed prefix for groups whose
    tables do not depend on the boundary (full history only).
+
+### Observing peer reuse
+
+With engine metrics enabled, the attention-DP owner records one
+`tokenspeed:peer_consumed_tokens` sample per finished hinted request. Consumption
+is the intersection of the confirmed remote interval with the prefix skipped by
+the first committed prefill. Local prefix tokens and replayed tokens are excluded.
+If the router supplied `peer_expected_tokens`, the same request also contributes
+`expected - consumed` to `tokenspeed:peer_estimation_error_tokens`, labeled by
+outcome. An older hint with no estimate still contributes consumption.
+
+`tokenspeed:peer_stage_seconds_count` counts visits by stage and outcome.
+Inspect lookup, admission, layout, pin, read_agreement, release and quarantine separately.
+The lookup_to_ready and landing timers span multiple stages. hard_pin uses the
+holder's clock, from PIN application until actual release or expiry.
+`tokenspeed:peer_hard_pin_remaining_seconds` measures deadline minus that time.
+`tokenspeed:peer_shard_seconds` measures device-fence wait, read queue delay and
+transport service on each rank. Sum `tokenspeed:peer_outstanding_read_bytes`
+over reader ranks for bytes queued or executing against a holder; count distinct
+reader replicas with a positive sum to obtain concurrency at scrape time.
+Use `tokenspeed:peer_read_bytes_total` for successful physical payload;
+`tokenspeed:peer_read_source_bytes_total` splits it, and the Disk pages a holder
+pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
+`device`, `host` or `disk`.
+Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
+A reader process that dies before terminal observation cannot report a completed
+sample; frontend failures and holder expiry remain independently observable.

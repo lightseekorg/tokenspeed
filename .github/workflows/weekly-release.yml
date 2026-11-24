@@ -84,12 +84,20 @@ jobs:
       previous: amd
     secrets: inherit
 
-  tokenspeed:
+  engine:
     needs: kernel
     uses: ./.github/workflows/weekly-release-stage.yml
     with:
-      stage: tokenspeed
+      stage: engine
       previous: kernel
+    secrets: inherit
+
+  tokenspeed:
+    needs: engine
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: tokenspeed
+      previous: engine
     secrets: inherit
 
   index:
@@ -128,7 +136,7 @@ jobs:
 
   result:
     if: always()
-    needs: [prepare, plan, amd, kernel, tokenspeed, index, docker, release, resume]
+    needs: [prepare, plan, amd, kernel, engine, tokenspeed, index, docker, release, resume]
     runs-on: ubuntu-latest
     steps:
       - name: Report release result
@@ -143,7 +151,7 @@ jobs:
 
           results = json.loads(os.environ['RESULTS'])
           mode = os.environ['MODE']
-          expected = {'normal': ['plan', 'amd', 'kernel', 'tokenspeed', 'index', 'docker', 'release'],
+          expected = {'normal': ['plan', 'amd', 'kernel', 'engine', 'tokenspeed', 'index', 'docker', 'release'],
                       'recovery': ['resume'], 'skip': []}
           if mode not in expected:
               raise SystemExit('Release mode selection failed.')

@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 )
 
 from tokenspeed.runtime.utils import get_device_module
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 device_module = get_device_module()
 
@@ -230,6 +231,18 @@ def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> tuple[int
 
 
 def _pinned_rounding_limit_bytes() -> int | None:
+    if device_module.__name__ in {"torch_npu.npu", "torch.npu"}:
+        getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+        if getter is None:
+            return None
+        config = getter().replace(" ", "")
+        if "pin_memory_expandable_segments:False" not in config.split(","):
+            return None
+        limits_mb = re.findall(
+            r"(?:^|,)pinned_max_(?:round_threshold|cached_size)_mb:(\d+)(?=,|$)",
+            config,
+        )
+        return min((int(mb) * 1024**2 for mb in limits_mb), default=None)
     if device_module.__name__ != "torch.cuda" or (
         torch.version.cuda is None and torch.version.hip is None
     ):
@@ -257,18 +270,22 @@ def pinned_host_bytes(nbytes: int) -> int:
     return 1 << (nbytes - 1).bit_length()
 
 
-def largest_pinned_fit(room_bytes: int, *, block_bytes: int) -> int:
+def largest_pinned_fit(
+    room_bytes: int, *, block_bytes: int, padding_bytes: int = 0
+) -> int:
     """Largest whole-block buffer fitting the configured pinned allocator."""
     if block_bytes <= 0:
         raise ValueError("block_bytes must be positive")
-    if room_bytes <= 0:
+    if padding_bytes < 0:
+        raise ValueError("padding_bytes must be non-negative")
+    if room_bytes <= padding_bytes:
         return 0
-    aligned_bytes = room_bytes // block_bytes * block_bytes
-    if pinned_host_bytes(aligned_bytes) <= room_bytes:
+    aligned_bytes = (room_bytes - padding_bytes) // block_bytes * block_bytes
+    if pinned_host_bytes(aligned_bytes + padding_bytes) <= room_bytes:
         return aligned_bytes
     # Block alignment can cross back below a non-power-of-two rounding limit.
     rounded_room = 1 << (room_bytes.bit_length() - 1)
-    return rounded_room // block_bytes * block_bytes
+    return max(0, (rounded_room - padding_bytes) // block_bytes) * block_bytes
 
 
 def check_host_memory(
@@ -390,13 +407,16 @@ class HostTransferLane:
     workspace's pinned metadata staging. Two submissions that must never wait
     on each other's staging (L2's stream-ordered and pinned write-backs; the
     snapshot executor's stores and restores) take separate lanes.
+    Device metadata uses the arena's CPU-backed pool, including later growth
+    on the transfer stream, so it follows the drained weights sleep/wake.
     """
 
-    __slots__ = ("metadata_done", "workspace")
+    __slots__ = ("metadata_done", "workspace", "_memory_saver_adapter")
 
-    def __init__(self) -> None:
+    def __init__(self, memory_saver_adapter: TorchMemorySaverAdapter) -> None:
         self.workspace = HostTransferWorkspace()
         self.metadata_done = None
+        self._memory_saver_adapter = memory_saver_adapter
 
     def _stage(
         self,
@@ -423,7 +443,10 @@ class HostTransferLane:
         num_blocks, _ = self.workspace.load_block_transfers(
             transfers, geometry=geometry
         )
-        with device_module.stream(stream):
+        with (
+            device_module.stream(stream),
+            self._memory_saver_adapter.named_region("workspace"),
+        ):
             mode = self.workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend
             )

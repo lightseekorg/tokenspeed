@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
+from tokenspeed_kernel.ops.attention.gdn.triton import set_total_chunks_hint
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -331,6 +332,95 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
         cu_seqlens=cu_seqlens,
     )
 
+    torch.testing.assert_close(
+        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        result.final_state.float(),
+        ref_state.float(),
+        rtol=2e-2,
+        atol=3e-2,
+    )
+
+
+# 17-32 token batches make chunk_fwd_o plan 32-token chunks; the rest use 16/64.
+@pytest.mark.parametrize("seq_lens", [[11], [19], [27], [5, 14], [40], [63, 67]])
+def test_gdn_chunk_prefill_with_length_hint_never_syncs(
+    device: str, require, seq_lens: list[int]
+):
+    # With the host length hint bound to cu_seqlens, planning every chunk size
+    # the scan uses must stay on the host: a device read of the chunk count is
+    # a stream sync that a sync-checked serving forward rejects.
+    require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
+
+    torch.manual_seed(2468)
+    total_tokens = sum(seq_lens)
+    num_q_heads = 4
+    num_v_heads = 8
+    head_dim = 128
+    dtype = torch.bfloat16
+    q = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    v = (
+        torch.randn(1, total_tokens, num_v_heads, head_dim, device=device, dtype=dtype)
+        * 0.5
+    )
+    g = F.logsigmoid(
+        torch.randn(1, total_tokens, num_v_heads, device=device, dtype=torch.float32)
+    )
+    beta = torch.rand(
+        1, total_tokens, num_v_heads, device=device, dtype=dtype
+    ).sigmoid()
+    initial_state = (
+        torch.randn(
+            len(seq_lens), num_v_heads, head_dim, head_dim, device=device, dtype=dtype
+        )
+        * 0.01
+    )
+    host_cu_seqlens = [0, *torch.tensor(seq_lens).cumsum(0).tolist()]
+    scale = head_dim**-0.5
+
+    def run(cu_seqlens: torch.Tensor) -> GdnChunkPrefillResult:
+        set_total_chunks_hint(seq_lens, cu_seqlens)
+        return gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_final_state=True,
+            solution="triton",
+        )
+
+    def boundaries() -> torch.Tensor:
+        return torch.tensor(host_cu_seqlens, device=device, dtype=torch.int32)
+
+    run(boundaries())  # Compile and autotune outside the checked region.
+    # A fresh boundary tensor misses the chunk-index caches, as every
+    # forward's metadata does.
+    cu_seqlens = boundaries()
+    torch.cuda.synchronize()
+    previous_debug_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        result = run(cu_seqlens)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_debug_mode)
+
+    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
+        _torch_l2norm(q),
+        _torch_l2norm(k),
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+    )
     torch.testing.assert_close(
         result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
     )
@@ -1417,6 +1507,75 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
     )
     assert actual.dtype == torch.float16
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(("num_v_heads", "batch"), [(8, 1), (8, 3), (32, 8)])
+@pytest.mark.parametrize("scatter", [False, True])
+def test_flashinfer_mtp_reads_conv_rows_and_projection_gates(
+    device: str, num_v_heads: int, batch: int, scatter: bool, require
+) -> None:
+    """FlashInfer's FP32 verify reads q/k/v as sections of dense conv-output rows
+    and a/b as views into the projection row (16-byte aligned at 8 value heads)
+    exactly as contiguous copies. B * HV reaches its inline and warp kernels."""
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
+    steps, dim = 4, 128
+    num_q_heads = num_v_heads // 2
+    key_width, value_width = num_q_heads * dim, num_v_heads * dim
+    rows = batch * steps
+    torch.manual_seed(5)
+    conv_rows = torch.randn(
+        rows, 2 * key_width + value_width, device=device, dtype=torch.bfloat16
+    )
+    # The input projection row: q | k | v | z | b | a.
+    projection = torch.randn(
+        rows,
+        2 * key_width + 2 * value_width + 2 * num_v_heads,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    b, a = projection[:, 2 * key_width + 2 * value_width :].split(num_v_heads, -1)
+    q, k, v = conv_rows.split([key_width, key_width, value_width], dim=-1)
+    views = (
+        q.view(batch, steps, num_q_heads, dim),
+        k.view(batch, steps, num_q_heads, dim),
+        v.view(batch, steps, num_v_heads, dim),
+        a.view(batch, steps, num_v_heads),
+        b.view(batch, steps, num_v_heads),
+    )
+    assert not any(t.is_contiguous() for t in views)
+    A_log = torch.randn(num_v_heads, device=device)
+    dt_bias = torch.randn(num_v_heads, device=device)
+    pool = torch.randn(batch * (steps + 1), num_v_heads, dim, dim, device=device) * 0.02
+    read_rows = torch.arange(batch, dtype=torch.int32, device=device) * (steps + 1)
+    write_rows = (
+        read_rows[:, None] + 1 + torch.arange(steps, dtype=torch.int32, device=device)
+    ).contiguous()
+
+    def verify(q, k, v, a, b):
+        state = pool.clone()
+        out = gdn_decode_mtp(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=state,
+            initial_state_indices=read_rows,
+            scale=None,
+            disable_state_update=not scatter,
+            use_qk_l2norm=True,
+            output_state_indices=write_rows if scatter else None,
+            tree_ancestors=None,
+            solution="flashinfer",
+        )
+        return out, state
+
+    out, state = verify(*views)
+    dense_out, dense_state = verify(*(t.contiguous() for t in views))
+    assert torch.equal(out, dense_out)
+    assert torch.equal(state, dense_state)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])

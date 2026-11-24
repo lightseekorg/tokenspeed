@@ -1398,7 +1398,7 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
         query_shard=None,
-        gather_ids=torch.tensor([2, 4], device=device),
+        gather_ids=torch.tensor([2, 4], dtype=torch.int32, device=device),
         input_logprob_rows=_input_logprob_rows(
             rows, targets, num_input_rows=5, chunk_tokens=chunk_tokens, device=device
         ),
@@ -1444,7 +1444,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.MIXED,
         query_shard=None,
-        gather_ids=torch.tensor([3, 4, 5], device=device),
+        gather_ids=torch.tensor([3, 4, 5], dtype=torch.int32, device=device),
         input_logprob_rows=_input_logprob_rows(
             [0, 1, 2], [1, 2, 3], num_input_rows=6, chunk_tokens=2, device=device
         ),
@@ -1464,7 +1464,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
         torch.arange(3, device=device), torch.tensor([1, 2, 3], device=device)
     ]
     torch.testing.assert_close(out.input_token_logprobs, expected, rtol=0, atol=0)
-    assert out.next_token_logits.shape == (3, vocab)
+    torch.testing.assert_close(out.next_token_logits, logits[[3, 4, 5]])
 
 
 def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
@@ -2114,6 +2114,51 @@ def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
     shard = processor.sampled_vocab_shard(logits, head)
     actual = shard.gather_full(logits)
     torch.testing.assert_close(actual, torch.cat((logits, logits + 100), dim=1))
+
+
+@pytest.mark.parametrize("vocab", [8, 7, 5, 4])
+def test_sampled_rows_stay_sharded_when_the_vocabulary_ends_in_the_last_shard(
+    vocab,
+):
+    """A head padded past the vocabulary keeps its sampled rows sharded while
+    the padding stays inside the last shard; the shard selects from its real
+    columns only, and the sampler is asked about the narrowest one."""
+    from transformers import PretrainedConfig
+
+    asked = []
+
+    def supports(dtype, columns, tp_size):
+        asked.append(columns)
+        return True
+
+    shards = []
+    for rank in (0, 1):
+        processor = LogitsProcessor(
+            PretrainedConfig(vocab_size=vocab),
+            tp_rank=rank,
+            tp_size=2,
+            tp_group=(0, 1),
+            attn_tp_size=1,
+            dp_lm_head_tp=False,
+        )
+        head = ParallelLMHead(
+            8,
+            2,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            tp_rank=rank,
+            tp_size=2,
+            tp_group=(0, 1),
+        )
+        kept = processor.keep_sampled_logits_vocab_sharded(head, supports)
+        # The last shard would hold only padding.
+        assert kept == (vocab > 4)
+        if kept:
+            logits = torch.zeros(3, 4, dtype=torch.bfloat16)
+            shards.append(processor.sampled_vocab_shard(logits, head).columns)
+    if vocab > 4:
+        assert asked == [vocab - 4, vocab - 4]
+        assert shards == [4, vocab - 4]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -494,7 +494,7 @@ controller, the engine core client and pickle IPC, the Python headless
 transport, the Python PD transfer executors, the EPD prefill hooks and the
 Python encode loop are deleted, and `docs/design/event-loop.md` describes the Rust loop. `AsyncLLM`
 and the gRPC servicer path are deleted as well: SMG and Dynamo reach the
-ranks over the wire only. Four deviations from the plan above:
+ranks over the wire only. Five deviations from the plan above:
 
 * The Python `Engine` API is deleted with `AsyncLLM` rather than wrapped
   over `ts-py`, so Python has no serving frontend. `ts-py`
@@ -530,6 +530,15 @@ ranks over the wire only. Four deviations from the plan above:
   startup (`cache/l3/factory.py`) and keeps the Host pool the executor
   reads and writes by address. The store client keeps its own transfer
   engine, apart from PD's.
+* A rank is a CPython process rather than a Rust binary embedding CPython.
+  `ts-host` stays the launch contract but execs the launcher's interpreter
+  into `tokenspeed_engine.host`, which imports the host extension (`_host`)
+  and enters the loop on its main thread with the GIL released; the forward
+  thread runs the data plane in the same interpreter. The scheduler's
+  nanobind module is linked into `_host`, and `tokenspeed_engine.host`
+  installs it as the scheduler wrapper's extension before the data plane
+  imports it. With no libpython linked, one stable-ABI wheel serves CPython
+  3.12 and later.
 
 While Phases 2–3 are open, a change to the Python control plane must land
 with its Rust counterpart, or in the Rust plane's backlog with a test that

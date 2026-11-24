@@ -113,6 +113,11 @@ def _page_table(placed: list[list[int]]) -> torch.Tensor:
 
 def _plane(keys, virtual_blocks, placement, device):
     """This rank's FP8 index-K plane of every virtual slot's key."""
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        encode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
     from tokenspeed_kernel.ops.quantization import quantize_fp8
 
@@ -125,6 +130,12 @@ def _plane(keys, virtual_blocks, placement, device):
     values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
+    if index_k_scale_ue8m0():
+        # A Blackwell plane's keys quantize with the power-of-two scale its
+        # UE8M0 word stores, as the index-K writes do.
+        scales = round_index_k_scale(scales)
+        values = (keys.float() / scales).clamp(-448, 448).to(values.dtype)
+        scales = encode_index_k_scale(scales)
     slots, owned = resolve_cache_slots(
         torch.arange(keys.shape[0], device=device), placement
     )
@@ -351,6 +362,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                     plane,
                     metadata=metadata,
                     rider=None,
+                    rider_ready=None,
                     q_scales=scales,
                     out=out,
                     lens_out=lens_out,
@@ -368,19 +380,34 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 torch.testing.assert_close(total, lens, rtol=0, atol=0)
 
                 # Bytes riding the score gather land as an all-gather would
-                # land them, and leave the selection as it was.
+                # land them, and leave the selection as it was, even while
+                # another stream still writes them until the selection waits.
                 rider = rider_of(rows)
+                late = torch.zeros_like(rider)
+                producer = torch.cuda.Stream()
+                producer.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(producer):
+                    torch.cuda._sleep(1 << 24)
+                    late.copy_(rider)
+                waits = []
+
+                def rider_ready():
+                    waits.append(producer)
+                    torch.cuda.current_stream().wait_stream(producer)
+
                 ridden, ridden_counts, gathered = select_owned_dsa_topk(
                     query,
                     weights,
                     plane,
                     metadata=metadata,
                     q_scales=scales,
-                    rider=rider,
+                    rider=late,
+                    rider_ready=rider_ready,
                     out=torch.empty_like(out),
                     lens_out=torch.empty_like(lens_out),
                     **kwargs,
                 )
+                assert waits == [producer]
                 _assert_same_rows(ridden, expected)
                 torch.testing.assert_close(ridden_counts, counts, rtol=0, atol=0)
                 assert torch.equal(gathered, gathered_riders(rider))
@@ -401,6 +428,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 metadata=metadata_of(query, weights, plane, table, seq_lens, placement),
                 q_scales=scales,
                 rider=rider,
+                rider_ready=None,
                 out=out,
                 lens_out=lens_out,
                 **kwargs,
@@ -446,17 +474,25 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         dist.destroy_process_group()
 
 
-# NCCL and the pull exchange at two ranks; the pull exchange at K3.1's eight.
-@pytest.mark.parametrize("degree,pull_exchange", [(2, False), (2, True), (8, True)])
+# NCCL at two and four ranks, the pull exchange at two and at K3.1's eight.
+@pytest.mark.parametrize(
+    "degree,pull_exchange", [(2, False), (4, False), (2, True), (8, True)]
+)
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
     tmp_path, degree, pull_exchange
 ):
-    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
-    if not current_platform().is_cdna4:
-        pytest.skip("the owned selection and Iris pull exchanges run on CDNA4")
+    platform = current_platform()
+    if pull_exchange and not platform.is_cdna4:
+        pytest.skip("Iris pull exchanges run on CDNA4")
+    if not platform.is_cdna4 and not (
+        platform.is_nvidia
+        and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    ):
+        pytest.skip("the owned selection runs on CDNA4, SM100, and SM103")
     mp.spawn(
         _worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),

@@ -290,9 +290,10 @@ def test_sorted_routing_graph_replay_and_one_binary():
         _assert_scratch_ready(scratch)
 
 
-@pytest.fixture(scope="module")
-def _k3_tp8_experts():
-    """The K3 TP8 rank's A8W4 SiTU experts: 896 x (3584 -> 384 -> 3584)."""
+@pytest.fixture(scope="module", params=(None, "n16"))
+def _k3_tp8_experts(request):
+    """The K3 TP8 rank's A8W4 SiTU experts: 896 x (3584 -> 384 -> 3584), in the
+    default bank layout and in N16."""
     from tokenspeed_kernel.ops.moe import moe_plan, moe_process_weights
     from utils import make_mxfp4_moe_weights
 
@@ -319,6 +320,7 @@ def _k3_tp8_experts():
         ep_size=1,
         ispp=384,
         internal_activation_dtype="input",
+        expert_layout=request.param,
         solution="gluon",
         hidden=None,
         swiglu_form=None,
@@ -328,7 +330,6 @@ def _k3_tp8_experts():
         combine_order="rank",
         features=frozenset(),
     )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
     assert plan["sorted_route_block_size"] == _BLOCK
     moe_process_weights(plan, module)
     return plan, module

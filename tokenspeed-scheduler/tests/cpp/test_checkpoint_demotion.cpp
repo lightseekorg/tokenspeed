@@ -209,6 +209,7 @@ CacheCoordinator MakeTwoGroupCoordinator(BlockPool& device, BlockPool* host, boo
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
     return MakeCoordinator(specs, /*prefix_granularity=*/2, device, /*enable_l3_storage=*/false, host,
+                           /*disk_pool=*/nullptr,
                            /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false, write_back,
                            /*checkpoint_retention_requests=*/0);
 }
@@ -256,6 +257,7 @@ TEST(CheckpointDemotionCoordinatorTest, BoundaryKeysLeaveTheWindowAKeptBoundaryR
     };
     const CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                        /*disk_pool=*/nullptr,
                         /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                         /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> chain{"p0", "p1", "p2", "p3", "p4"};
@@ -392,10 +394,10 @@ protected:
 
     BlockPool device_{32, {4, 1}};
     BlockPool host_{32, {4, 1}};
-    CacheCoordinator coordinator_ =
-        MakeCoordinator(kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
-                        /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator_ = MakeCoordinator(
+        kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+        /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers_{coordinator_};
     // Declared after the coordinator, so released before the pools.
     std::vector<CacheBlockRef> held_;

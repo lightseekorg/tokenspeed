@@ -2970,8 +2970,9 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     """Only decode-chain rounds take the front.
 
     It serves decode rounds whose keys and head weights come from the
-    a-projection and whose index-K write quantizes the query, without KV
-    placement or a breakable capture, over at most 32 rows it addresses.
+    a-projection and whose index-K write quantizes the query, without a
+    breakable capture, over at most 32 rows it addresses, KV placement or
+    not.
     """
     from tokenspeed.runtime.models import kimi_k31
 
@@ -3001,9 +3002,9 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     monkeypatch.setattr(
         kimi_k31, "is_breakable_capture_active", lambda: case == "breakable_capture"
     )
-    takes = case in ("takes", "most_rows")
+    takes = case in ("takes", "placed", "most_rows")
     assert attention._takes_decode_front(ctx, q_a, kv_a, keys) == takes
-    if case in ("takes", "unsupported_rows", "most_rows"):
+    if case in ("takes", "placed", "unsupported_rows", "most_rows"):
         assert supported == [((rows, 1536), (rows, 512), (rows, 128), (rows, 32))]
 
 
@@ -3043,6 +3044,28 @@ def _bf16_step(x: torch.Tensor) -> torch.Tensor:
     """The BF16 spacing at |x| (8 significant bits; the subnormal spacing below)."""
     exponent = torch.floor(torch.log2(x.abs().double().clamp_min(2.0**-126)))
     return torch.exp2(exponent - 7)
+
+
+def test_the_front_writes_index_keys_through_the_kvp_placement() -> None:
+    """The front's ``slot_owner`` is the leaf's KVP placement, or None.
+
+    The placement is the full-attention leaf's, of the round's virtual slots,
+    and an unplaced cache gives None.
+    """
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+    from tokenspeed.runtime.models import kimi_k31
+
+    attention = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    placement = CachePlacement(128, 45, (0, 1, 2, 3), 2)
+    for leaf_placement, owner in ((None, None), (placement, (128, 45, 4, 2))):
+        leaf = SimpleNamespace(cache_placement=lambda layer, p=leaf_placement: p)
+        hybrid = object.__new__(kimi_k31.HybridLinearAttnBackend)
+        hybrid.full_attn_backend = leaf
+        for backend in (leaf, hybrid):
+            ctx = SimpleNamespace(attn_backend=backend)
+            assert attention._index_slot_owner(ctx) == owner
 
 
 @requires_gpu

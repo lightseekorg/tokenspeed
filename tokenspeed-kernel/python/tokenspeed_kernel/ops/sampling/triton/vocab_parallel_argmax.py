@@ -25,6 +25,9 @@ that orders like ``(value, -index)``, so an all-reduce MAX of the keys picks
 the global maximum with ties toward the lowest index, as ``argmax`` over the
 gathered row would. NaN follows the local ``argmax``: a NaN it picks outranks
 every number, and a row it reports as ``-1`` on every shard decodes to ``-1``.
+A shard can also hand over several keys per row (one per column block, as
+``capped_logit_sum`` writes them): gathered, :func:`merge_argmax_keys` takes
+their maximum.
 """
 
 from __future__ import annotations
@@ -34,6 +37,21 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling import argmax
 
 _LOW_WORD = 0xFFFFFFFF
+
+
+@triton.jit
+def argmax_key(value, index):
+    """The int64 key of FP32 ``value`` at global ``index`` (int64): MAX over
+    keys picks the largest value, the lowest index among equal ones."""
+    bits = value.to(tl.int32, bitcast=True)
+    # Canonicalize signed zero explicitly: compilers may fold away x + 0.0.
+    bits = tl.where(value == 0.0, 0, bits)
+    # Flip the magnitude bits of negatives so int32 order matches float order.
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+    # A NaN ranks above every number, as torch.argmax does; any NaN sign bit
+    # is ignored.
+    ordered = tl.where(value != value, 0x7FFFFFFF, ordered).to(tl.int64)
+    return (ordered << 32) | (0xFFFFFFFF - index)
 
 
 @triton.jit
@@ -50,15 +68,7 @@ def _pack_argmax_key_kernel(
     value = tl.load(logits_ptr + row.to(tl.int64) * stride_m + safe_index).to(
         tl.float32
     )
-    bits = value.to(tl.int32, bitcast=True)
-    # Canonicalize signed zero explicitly: compilers may fold away x + 0.0.
-    bits = tl.where(value == 0.0, 0, bits)
-    # Flip the magnitude bits of negatives so int32 order matches float order.
-    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
-    # A local argmax that picks NaN ranks it above every number, as
-    # torch.argmax does; any NaN sign bit is ignored.
-    ordered = tl.where(value != value, 0x7FFFFFFF, ordered).to(tl.int64)
-    key = (ordered << 32) | (0xFFFFFFFF - (safe_index + vocab_offset))
+    key = argmax_key(value, safe_index + vocab_offset)
     # The local argmax returns -1 for an all-NaN row; it never wins.
     key = tl.where(index < 0, -0x7FFFFFFFFFFFFFFF - 1, key)
     tl.store(key_ptr + row, key)
@@ -73,6 +83,65 @@ def _argmax_key_index_kernel(key_ptr, out_ptr):
         key == -0x7FFFFFFFFFFFFFFF - 1, -1, 0xFFFFFFFF - (key & 0xFFFFFFFF)
     )
     tl.store(out_ptr + row, index.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _merge_argmax_keys_kernel(
+    keys_ptr,
+    out_ptr,
+    stride_rank,
+    stride_row,
+    RANKS: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    RANKS_PAD: tl.constexpr,
+    BLOCKS_PAD: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rank = tl.arange(0, RANKS_PAD)[:, None]
+    block = tl.arange(0, BLOCKS_PAD)[None, :]
+    keys = tl.load(
+        keys_ptr + rank * stride_rank + row * stride_row + block,
+        mask=(rank < RANKS) & (block < BLOCKS),
+        other=-0x7FFFFFFFFFFFFFFF - 1,
+    )
+    key = tl.max(tl.max(keys, axis=1), axis=0)
+    tl.store(
+        out_ptr + row, (0xFFFFFFFF - (key & 0xFFFFFFFF)).to(out_ptr.dtype.element_ty)
+    )
+
+
+def merge_argmax_keys(keys: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
+    """Each row's global argmax from every rank's block keys (as
+    ``capped_logit_sum`` writes them with ``keys_out``): the largest value,
+    the lowest global index among equal ones.
+
+    Args:
+        keys: ``[R, M, B]`` int64 view of the gathered keys, rank-major, any
+            rank and row strides, unit block stride.
+        out: ``[M]`` int32 or int64 destination for the global indices.
+
+    Returns:
+        ``out``.
+    """
+    ranks, rows, blocks = keys.shape
+    if keys.dtype != torch.int64 or keys.stride(2) != 1:
+        raise ValueError("keys must be an int64 [R, M, B] view with unit block stride")
+    if out.shape != (rows,) or out.dtype not in (torch.int32, torch.int64):
+        raise ValueError("out must be an int32 or int64 tensor with one index per row")
+    if rows:
+        # The rank and block counts are fixed per server.
+        _merge_argmax_keys_kernel[(rows,)](
+            keys,
+            out,
+            keys.stride(0),
+            keys.stride(1),
+            RANKS=ranks,
+            BLOCKS=blocks,
+            RANKS_PAD=triton.next_power_of_2(ranks),
+            BLOCKS_PAD=triton.next_power_of_2(blocks),
+            num_warps=1,
+        )
+    return out
 
 
 def vocab_parallel_argmax_keys(

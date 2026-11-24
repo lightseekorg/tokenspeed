@@ -6,6 +6,7 @@ members = [
     "crates/ts-collective",
     "crates/ts-scheduler",
     "crates/ts-control",
+    "crates/ts-disk",
     "crates/ts-grammar",
     "crates/ts-host",
     "crates/ts-l3",

@@ -49,9 +49,11 @@ so under KVP each rank copies exactly the blocks it owns.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
@@ -61,7 +63,12 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
     transfer_cache_blocks,
     wait_layer_ready,
 )
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.cache.host_allocation import (
+    HOST_BUFFER_ALIGNMENT_BYTES,
+    host_register_enabled,
+)
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
@@ -86,8 +93,16 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     pinned_host_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
+from tokenspeed.runtime.cache.transfer.observations import (
+    CompletedObservations,
+    CopyCounts,
+    ObservationBatch,
+    count_owned_rows,
+    observe_copy,
+)
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
+    PrefixLoadOp,
     RestoreOp,
     SnapshotOp,
 )
@@ -100,6 +115,33 @@ logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
+
+
+def release_checkpoint_file_cache(
+    model_paths: Sequence[str], *, node_leader: bool, cpu_group
+) -> None:
+    """Offer this model's clean safetensors pages back before large pinned allocations."""
+    if cpu_group is not None:
+        torch.distributed.barrier(group=cpu_group)
+    if node_leader:
+        for directory in set(model_paths):
+            count = 0
+            try:
+                for shard in Path(directory).glob("*.safetensors"):
+                    with shard.open("rb") as file:
+                        os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    count += 1
+            except (AttributeError, OSError) as error:
+                logger.warning(
+                    "Could not release checkpoint file cache for %s: %s",
+                    directory,
+                    error,
+                )
+            logger.info(
+                "Advised release of %d safetensors shards in %s", count, directory
+            )
+    if cpu_group is not None:
+        torch.distributed.barrier(group=cpu_group)
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -116,10 +158,11 @@ class _AckKind(Enum):
 
 
 class _Ack(NamedTuple):
-    """The scheduler ACK kind and IDs of an in-flight Host copy."""
+    """The scheduler ACK and optional CPU observations of one in-flight copy."""
 
     kind: _AckKind
     op_ids: list[int]
+    observations: ObservationBatch = ObservationBatch()
 
 
 def _num_host_lcm_blocks(
@@ -167,13 +210,16 @@ class HostCacheExecutor:
         l2_tier: bool,
         host_ratio: float,
         host_size_gb: float,
+        host_headroom_bytes: int | None = None,
         snapshot_pool: RetractionPoolRequest,
         slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
+        block_alignment: int,
         attn_tp_rank: int,
         kvp_rank: int,
         nprocs_per_node: int,
         world_cpu_group,
+        cache_observation_capacity: int = 0,
     ):
         """
         Args:
@@ -188,8 +234,8 @@ class HostCacheExecutor:
                 ``host_size_gb`` is 0; capped to what fits in every rank's
                 share of its node's Host memory.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
-                when positive and is never capped: one that does not fit is
-                refused.
+                when positive. Alignment may reduce whole blocks to avoid a
+                larger pinned bucket; one that exceeds Host memory is refused.
             snapshot_pool: The retraction snapshot pool's knobs as
                 ``ServerArgs`` resolved them, sized here against this
                 rank's layout (``resolve_retraction_pool``); a disabled
@@ -201,6 +247,9 @@ class HostCacheExecutor:
                 row. May be None only without a pool.
             io_backend: ``"direct"`` (DMA ranges) or ``"kernel"`` (mapped-Host
                 Triton copies).
+            block_alignment: Every Host block's size, in both pools, is a
+                multiple of this (``cache/disk.py``'s
+                ``host_block_alignment``).
             attn_tp_rank: Attention-TP rank; rank 0 logs.
             kvp_rank: This rank in the KVP subgroup; selects the blocks it
                 owns of a sharded group (the identity for replicated groups).
@@ -209,7 +258,11 @@ class HostCacheExecutor:
                 of the Host memory the node has available.
             world_cpu_group: The gloo group of every rank, over which the Host
                 tier sizes are agreed and compared; None with a single rank.
+            cache_observation_capacity: Maximum completed CPU observations
+                retained between polls. Zero disables optional diagnostics;
+                overflow reports a loss without changing scheduler ACKs.
         """
+        self._cache_observations = CompletedObservations(cache_observation_capacity)
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         if not l2_tier and snapshot_pool.disabled:
@@ -220,6 +273,7 @@ class HostCacheExecutor:
             raise ValueError("a snapshot pool needs the slot-state exporters")
         self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
+        self._memory_saver_adapter = device_pool.arena.memory_saver_adapter
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
@@ -232,7 +286,9 @@ class HostCacheExecutor:
             group_ids=scheduler_group_ids or None,
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(
-            self.layout, group_specs=contract.group_specs
+            self.layout,
+            group_specs=contract.group_specs,
+            block_alignment=block_alignment,
         )
         shard_by_id = {
             spec.group_id: int(spec.shard_count) for spec in contract.group_specs
@@ -242,7 +298,9 @@ class HostCacheExecutor:
             for group, packing in zip(
                 self.layout.groups,
                 compute_host_group_packing(
-                    self.layout, group_specs=contract.group_specs
+                    self.layout,
+                    group_specs=contract.group_specs,
+                    block_alignment=block_alignment,
                 ),
                 strict=True,
             )
@@ -275,37 +333,80 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
+        if host_headroom_bytes is None:
+            host_headroom_bytes = _HOST_MEM_HEADROOM_BYTES
+        if host_headroom_bytes < 0:
+            raise ValueError("Host memory headroom must be nonnegative")
         share_bytes, share_source = host_memory_share(
-            nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
+            nprocs_per_node=nprocs_per_node, headroom_bytes=host_headroom_bytes
         )
+        align_host_buffer = l2_tier and (
+            block_alignment > 1
+            or (current_platform().is_nvidia and host_register_enabled())
+        )
+        alignment_padding = HOST_BUFFER_ALIGNMENT_BYTES - 1 if align_host_buffer else 0
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
+        aligned_l2_blocks = host_lcm_blocks
+        if l2_tier and alignment_padding:
+            requested_l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+            reservation = pinned_host_bytes(requested_l2_bytes)
+            padded_reservation = pinned_host_bytes(
+                requested_l2_bytes + alignment_padding
+            )
+            if padded_reservation > max(
+                reservation, requested_l2_bytes + alignment_padding
+            ):
+                aligned_blocks = (
+                    largest_pinned_fit(
+                        reservation,
+                        block_bytes=host_lcm_block_bytes,
+                        padding_bytes=alignment_padding,
+                    )
+                    // host_lcm_block_bytes
+                )
+                if 0 < aligned_blocks < host_lcm_blocks:
+                    aligned_l2_blocks = aligned_blocks
+                    if host_size_gb > 0:
+                        logger.warning(
+                            f"Reduced Host L2 from {host_lcm_blocks} to "
+                            f"{aligned_blocks} LCM blocks to keep alignment padding "
+                            f"within its {reservation / 1e9:.2f} GB pinned reservation"
+                        )
+                        host_lcm_blocks = aligned_blocks
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
-        fitting_l2_blocks = _min_over_ranks(
+        fitting_l2_blocks = (
             largest_pinned_fit(
-                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+                share_bytes - pool_pinned_bytes,
+                block_bytes=host_lcm_block_bytes,
+                padding_bytes=alignment_padding,
             )
-            // host_lcm_block_bytes,
-            world_cpu_group,
+            // host_lcm_block_bytes
         )
+        if host_size_gb <= 0:
+            # PP stages can cross different buckets; agree on the ratio's count.
+            fitting_l2_blocks = min(fitting_l2_blocks, aligned_l2_blocks)
+        fitting_l2_blocks = _min_over_ranks(fitting_l2_blocks, world_cpu_group)
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
             # Only the ratio's size shrinks, to one size on every rank: the
             # mirrored schedulers share one Host page count. An explicit
-            # --kvstore-size that does not fit is refused below instead.
+            # --kvstore-size that does not fit is refused below instead,
+            # after accounting for alignment within its original reservation.
             logger.warning(
                 "Capped the compact Host L2 from "
                 f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "
                 f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
-                "rank, the most every rank's share of its node holds: "
+                "rank, fitting alignment padding within the requested pinned "
+                "reservation and every rank's Host memory share: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
                 "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
                 f"memory, from {share_source}, over its ranks, less "
-                f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
+                f"{host_headroom_bytes / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
         # The ranks' mirrored schedulers share one page count per Host tier,
@@ -339,7 +440,8 @@ class HostCacheExecutor:
         )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
-        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
+        l2_allocation_bytes = l2_bytes + alignment_padding
+        l2_pinned_bytes = pinned_host_bytes(l2_allocation_bytes)
         check_host_memory(
             l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
@@ -361,6 +463,8 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=host_lcm_blocks,
+                block_alignment=block_alignment,
+                align_host_buffer=align_host_buffer,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -385,6 +489,8 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                block_alignment=block_alignment,
+                align_host_buffer=False,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,
@@ -443,23 +549,24 @@ class HostCacheExecutor:
         self.load_stream = new_cache_stream(load_stream_priority())
         # Both streams consume these immutable tables; the kernel backend
         # publishes them to the Device once. One geometry per Host buffer.
-        if l2_tier:
-            self._transfer_geometry = build_transfer_geometry(
-                self.layout, self.host_storage, io_backend=io_backend
-            )
-        if snapshot_lcm_blocks:
-            self._snapshot_geometry = build_transfer_geometry(
-                self.layout, self.snapshot_storage, io_backend=io_backend
-            )
+        with self._memory_saver_adapter.named_region("workspace"):
+            if l2_tier:
+                self._transfer_geometry = build_transfer_geometry(
+                    self.layout, self.host_storage, io_backend=io_backend
+                )
+            if snapshot_lcm_blocks:
+                self._snapshot_geometry = build_transfer_geometry(
+                    self.layout, self.snapshot_storage, io_backend=io_backend
+                )
         # One staging lane per submission kind a round may make, so none
         # waits on another's pinned metadata tables: the stream-ordered and
         # pinned L2 write-backs, the snapshot store, and the restore's two
         # tiers.
-        self._ordered_write_lane = HostTransferLane()
-        self._pinned_write_lane = HostTransferLane()
-        self._snapshot_write_lane = HostTransferLane()
-        self._restore_l2_lane = HostTransferLane()
-        self._restore_pool_lane = HostTransferLane()
+        self._ordered_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._pinned_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._snapshot_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._restore_l2_lane = HostTransferLane(self._memory_saver_adapter)
+        self._restore_pool_lane = HostTransferLane(self._memory_saver_adapter)
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -486,7 +593,7 @@ class HostCacheExecutor:
         self._completions = CompletionQueue()
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
-        self._ready_load_acks: list[int] = []
+        self._ready_load_acks: list[_Ack] = []
 
         # Resolve each buffer binding on its eventual copy stream at startup,
         # so the first serving transfer only uploads its per-operation rows.
@@ -511,7 +618,10 @@ class HostCacheExecutor:
                 (self.write_stream, write_workspaces),
                 (self.load_stream, load_workspaces),
             ):
-                with device_module.stream(stream):
+                with (
+                    device_module.stream(stream),
+                    self._memory_saver_adapter.named_region("workspace"),
+                ):
                     for workspace in workspaces:
                         workspace.prepare_backend(
                             self.layout.buffers,
@@ -670,6 +780,8 @@ class HostCacheExecutor:
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
         restore_ops: list[RestoreOp] = []
+        load_observations = []
+        restore_observations = []
         restore_rows: dict[HostTier, list[tuple[int, int, int]]] = {
             HostTier.L2: [],
             HostTier.SNAPSHOT_POOL: [],
@@ -686,21 +798,72 @@ class HostCacheExecutor:
                     source_is_device=False,
                     tier=HostTier.L2,
                 )
+                if self._cache_observations.enabled:
+                    # An unobserved wire batch has no trustworthy admission
+                    # identity. Keep its ACK and report missing evidence.
+                    load_observations.append(
+                        ObservationBatch(dropped=len(operation.op_ids))
+                    )
+            elif isinstance(operation, PrefixLoadOp):
+                start = len(transfers)
+                self._append_transfers(
+                    [operation.op_id],
+                    [[row.group_id for row in operation.transfers]],
+                    [[row.source_page for row in operation.transfers]],
+                    [[row.destination_page for row in operation.transfers]],
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
+                    source_is_device=False,
+                    tier=HostTier.L2,
+                )
+                if self._cache_observations.enabled:
+                    load_observations.append(
+                        observe_copy(
+                            kind="prefix_load",
+                            op_id=operation.op_id,
+                            request_id=operation.request_id,
+                            request_pool_index=operation.telemetry.request_pool_index,
+                            telemetry=operation.telemetry,
+                            l2=count_owned_rows(transfers[start:], self.layout.groups),
+                            pool=CopyCounts(0, 0),
+                            slot_state_image_bytes=0,
+                        )
+                    )
             elif isinstance(operation, RestoreOp):
                 restore_ops.append(operation)
-                self._append_restore(operation, rows_by_tier=restore_rows)
+                restore_observations.append(
+                    self._append_restore(operation, rows_by_tier=restore_rows)
+                )
         self._check_distinct(restore_ops)
         # Loads first: the forward reads them layer by layer behind the
         # layerwise fences, while a restore is read by nothing this round, so
         # it rides the same stream behind them instead of delaying them.
         load_index = self._start_loading(
-            op_ids, transfers, prerequisite_stream=prerequisite_stream
+            op_ids,
+            transfers,
+            prerequisite_stream=prerequisite_stream,
+            observations=ObservationBatch(
+                tuple(
+                    record for batch in load_observations for record in batch.records
+                ),
+                sum(batch.dropped for batch in load_observations),
+            ),
         )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
         if restore_ops:
             self._start_restore(
-                restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
+                restore_ops,
+                restore_rows,
+                prerequisite_stream=prerequisite_stream,
+                observations=ObservationBatch(
+                    tuple(
+                        record
+                        for batch in restore_observations
+                        for record in batch.records
+                    ),
+                    sum(batch.dropped for batch in restore_observations),
+                ),
             )
 
     def _append_write_backs(
@@ -854,10 +1017,14 @@ class HostCacheExecutor:
 
     def _append_restore(
         self, op: RestoreOp, *, rows_by_tier: dict[HostTier, list[tuple[int, int, int]]]
-    ) -> None:
+    ) -> ObservationBatch:
         """A restore's rows, split by the Host tier each one reads. Empty
         transfers are legal, mirroring the store: the image is its slot state
         alone."""
+        starts = {
+            tier: len(rows_by_tier[tier])
+            for tier in (HostTier.L2, HostTier.SNAPSHOT_POOL)
+        }
         self._check_snapshot_op(op)
         if len(op.source_tier) != len(op.transfers):
             raise ValueError(f"ragged cache operation {op.op_id}")
@@ -880,6 +1047,24 @@ class HostCacheExecutor:
                 source_is_device=False,
                 tier=tier,
             )
+
+        if not self._cache_observations.enabled:
+            return ObservationBatch()
+        return observe_copy(
+            kind="snapshot_restore",
+            op_id=op.op_id,
+            request_id=op.request_id,
+            request_pool_index=op.request_pool_index,
+            telemetry=op.telemetry,
+            l2=count_owned_rows(
+                rows_by_tier[HostTier.L2][starts[HostTier.L2] :], self.layout.groups
+            ),
+            pool=count_owned_rows(
+                rows_by_tier[HostTier.SNAPSHOT_POOL][starts[HostTier.SNAPSHOT_POOL] :],
+                self.layout.groups,
+            ),
+            slot_state_image_bytes=self.blob_bytes,
+        )
 
     @staticmethod
     def _check_distinct(ops: Sequence[SnapshotOp | RestoreOp]) -> None:
@@ -953,6 +1138,7 @@ class HostCacheExecutor:
         rows_by_tier: dict[HostTier, Sequence[tuple[int, int, int]]],
         *,
         prerequisite_stream,
+        observations: ObservationBatch = ObservationBatch(),
     ) -> None:
         """Copy both tiers' rows and the slot state into the restored requests.
 
@@ -1012,6 +1198,7 @@ class HostCacheExecutor:
             _Ack(
                 kind=_AckKind.RESTORE,
                 op_ids=[int(op.op_id) for op in ops],
+                observations=observations,
             ),
         )
 
@@ -1059,6 +1246,7 @@ class HostCacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         *,
         prerequisite_stream,
+        observations: ObservationBatch = ObservationBatch(),
     ) -> int | None:
         if self._load_poisoned:
             raise RuntimeError(
@@ -1075,7 +1263,9 @@ class HostCacheExecutor:
             # is acknowledged from an empty copy -- the hooks' replica
             # intersection completes it once the owners have copied theirs.
             with self._ack_lock:
-                self._ready_load_acks.extend(op_ids)
+                self._ready_load_acks.append(
+                    _Ack(_AckKind.LOAD_BACK, list(op_ids), observations)
+                )
             return None
         if self.attn_tp_rank == 0:
             logger.info(
@@ -1117,7 +1307,10 @@ class HostCacheExecutor:
             )
             layer_slices = self._transfer_geometry.layer_slices
             # Resolve the transport before choosing the consumer wait protocol.
-            with device_module.stream(self.load_stream):
+            with (
+                device_module.stream(self.load_stream),
+                self._memory_saver_adapter.named_region("workspace"),
+            ):
                 mode = workspace.prepare_backend(
                     self.layout.buffers,
                     self.host_storage.host_buffer,
@@ -1191,7 +1384,7 @@ class HostCacheExecutor:
                 raise RuntimeError("cache transfer layout has no layer consumers")
             self._completions.push(
                 finish,
-                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids),
+                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, observations=observations),
             )
             return load_index
         except BaseException as original_error:
@@ -1232,7 +1425,9 @@ class HostCacheExecutor:
         """The completed ops' ACKs, both tiers; event queries only, never blocks."""
         results: list = []
         with self._ack_lock:
-            results.extend(self._load_done(op_id) for op_id in self._ready_load_acks)
+            for ack in self._ready_load_acks:
+                results.extend(self._load_done(op_id) for op_id in ack.op_ids)
+                self._cache_observations.extend(ack.observations)
             self._ready_load_acks.clear()
         for ack in self._completions.pop_ready():
             if ack.kind is _AckKind.WRITE_BACK:
@@ -1243,7 +1438,19 @@ class HostCacheExecutor:
                 results.extend(self._snapshot_done(op_id) for op_id in ack.op_ids)
             else:
                 results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
+            if self._cache_observations.enabled:
+                with self._ack_lock:
+                    self._cache_observations.extend(ack.observations)
         return results
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """Drain bounded CPU completion metadata and losses after the ACK poll.
+
+        No device query, wait, serialization, or request-state lookup occurs
+        here. The host adds engine/rank context and exports records off-loop.
+        """
+        with self._ack_lock:
+            return self._cache_observations.drain()
 
     @staticmethod
     def _write_done(op_id: int):
@@ -1274,3 +1481,4 @@ class HostCacheExecutor:
         self._completions.drop_all()
         with self._ack_lock:
             self._ready_load_acks.clear()
+            self._cache_observations.clear()

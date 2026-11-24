@@ -804,6 +804,7 @@ class TestAttnResTests:
         attention.return_value = object()
         layer = SimpleNamespace(
             _premixed_input=None,
+            moe_tail=None,
             _fused_attnres_graph_available=mock.Mock(return_value=False),
             _mix_into_attention=mock.Mock(return_value=(h, prefix)),
             prev_valid_blocks=1,
@@ -977,6 +978,7 @@ class TestAttnResTests:
                 self_attn.o_proj = object()
                 layer = SimpleNamespace(
                     _premixed_input=None,
+                    moe_tail=None,
                     _fused_attnres_graph_available=mock.Mock(return_value=False),
                     _mix_into_attention=mock.Mock(return_value=(h, prefix)),
                     prev_valid_blocks=1,
@@ -1203,6 +1205,7 @@ class TestAttnResTests:
                 premixed = object()
                 layer = SimpleNamespace(
                     _premixed_input=premixed,
+                    moe_tail=None,
                     _fused_attnres_graph_available=mock.Mock(return_value=False),
                     _mix_into_attention=mock.Mock(return_value=(h, prefix)),
                     prev_valid_blocks=1,

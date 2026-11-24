@@ -1220,15 +1220,20 @@ def mhc_fused_hc(
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._triton.gated_boundary_fp8  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
+from tokenspeed_kernel.ops.residual.cute_fused import (  # noqa: E402
+    set_gated_residual_workspace_region,
+)
 from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
+    post_norm_residual_pre_norm_bf16_fp8,
     residual_gate_coefficients,
 )
 
@@ -1251,7 +1256,9 @@ __all__ = [
     "pad_gated_residual_projection_weight",
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
+    "post_norm_residual_pre_norm_bf16_fp8",
     "residual_gate_coefficients",
+    "set_gated_residual_workspace_region",
     "try_mhc_shifted_post_pre_norm",
     "try_mhc_shifted_post_pre_norm_quantize_fp8",
 ]
