@@ -1628,18 +1628,18 @@ _DECODE_CONFIGS: dict[
         64: (64, 32, 256, 2, 2, 3, 1, 1),
     },
     # Muse TP8 pre-expert projection. Split K four ways to occupy the CUs, and
-    # eight ways with 32-row tiles from 17 rows; past 64 rows the extra row
-    # tiles fill the CUs, so K splits four ways again. The 128 and 256 buckets
-    # serve speculative verify batches of up to 21 requests (172 rows). The 256
-    # bucket only breaks even at 129-136 rows, of which verify sends only 136
-    # (17 requests of 8 rows), and is faster from 144 rows.
+    # eight ways with 32-row tiles from 17 rows. 65-128 rows take the skinny
+    # GEMM (skinny.py), which is faster there. Past 128 rows the extra row
+    # tiles fill the CUs, so K splits four ways again; the 256 bucket serves
+    # speculative verify batches of up to 21 requests (172 rows). It only
+    # breaks even at 129-136 rows, of which verify sends only 136 (17 requests
+    # of 8 rows), and is faster from 144 rows.
     (512, 8192): {
         4: (16, 16, 512, 2, 2, 4, 4, 8),
         8: (16, 16, 512, 2, 2, 4, 4, 8),
         16: (16, 16, 512, 2, 2, 4, 4, 8),
         32: (32, 16, 256, 2, 2, 4, 8, 1),
         64: (32, 32, 256, 2, 2, 4, 8, 8),
-        128: (32, 32, 256, 2, 2, 3, 4, 1),
         256: (64, 32, 256, 2, 2, 3, 4, 1),
     },
     # Muse TP4 pre-expert projection at 9-32 rows.

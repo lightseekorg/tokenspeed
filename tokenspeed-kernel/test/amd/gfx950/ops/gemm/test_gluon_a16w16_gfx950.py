@@ -959,10 +959,12 @@ def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -
 
 def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
     # Speculative verify sends 65-172 rows (9-21 requests of eight) through the
-    # Muse TP8 pre-expert projection; the 128- and 256-row buckets take them,
-    # with rows a runtime argument inside each bucket.
+    # Muse TP8 pre-expert projection; the skinny GEMM takes 65-128 of them and
+    # the 256-row bucket the rest, with rows a runtime argument in the bucket.
     torch.manual_seed(0)
     n, k = 512, 8192
+    for rows in (65, 128):
+        assert not supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
     a = torch.randn((256, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
@@ -972,11 +974,11 @@ def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
         torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
         assert torch.equal(mm(a[:rows], b), out)
 
-    # Warm both integer classes (divisible by 16 or not) of each bucket.
-    for rows in (65, 128, 129, 256):
+    # Warm both integer classes (divisible by 16 or not) of the bucket.
+    for rows in (129, 256):
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (72, 100, 172, 200):
+        for rows in (136, 172, 200):
             run(rows)
 
 
@@ -1428,3 +1430,79 @@ def test_tp4_pre_expert_projection_selects_by_row_count(m: int, kernel: str | No
         else _decode(a, weight, torch.bfloat16)
     )
     assert torch.equal(mm(a, weight).view(torch.int16), expected.view(torch.int16))
+
+
+# The Muse Spark TP8 projections the skinny GEMM takes, by (N, K), with their
+# measured row ranges: the pre-expert columns, the packed Q/K/V/output-gate
+# projection and the post-expert projection.
+_MUSE_TP8_SKINNY = {
+    (512, 8192): (65, 128),
+    (2304, 8192): (31, 63),
+    (8192, 4096): (49, 73),
+}
+
+
+def _muse_tp8_problem(n: int, k: int, rows: int):
+    generator = torch.Generator(device="cuda").manual_seed(n + k)
+    a = torch.randn((rows, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+    weight = 0.02 * torch.randn((n, k), device="cuda", generator=generator)
+    return a, weight.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize(("n", "k"), list(_MUSE_TP8_SKINNY))
+def test_skinny_gemm_muse_tp8_rounds_the_exact_product_once(n: int, k: int):
+    """At each Muse TP8 shape's first and last rows, small integer inputs
+    give the BF16-rounded FP64 product bit for bit: every FP32 partial sum is
+    exact (at most 8192 * 64 < 2**24), so only the final rounding remains."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    weight = torch.randint(-8, 9, (n, k), device="cuda", generator=generator)
+    for m in _MUSE_TP8_SKINNY[(n, k)]:
+        a = torch.randint(-8, 9, (m, k), device="cuda", generator=generator)
+        actual = _skinny(a.to(torch.bfloat16), weight.to(torch.bfloat16))
+        exact = a.double() @ weight.double().T
+        expected = exact.to(torch.bfloat16)
+        assert int((expected.double() != exact).sum()) > exact.numel() // 2
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(("n", "k"), list(_MUSE_TP8_SKINNY))
+def test_mm_selects_the_skinny_gemm_for_muse_tp8_rows(n: int, k: int):
+    """mm takes the skinny GEMM inside each shape's row range and not one
+    row outside it. Inside, mm writes the skinny GEMM's bits, which are the
+    FP64 product rounded once to BF16, and a row's bits do not depend on the
+    other rows of the launch."""
+    first_m, last_m = _MUSE_TP8_SKINNY[(n, k)]
+    a, weight = _muse_tp8_problem(n, k, last_m + 1)
+    for m in (first_m - 1, first_m, last_m, last_m + 1):
+        selected = first_m <= m <= last_m
+        assert supports_gluon_mm_a16w16_skinny_gfx950(m, n, k) == selected
+        name = _select_mv(
+            m, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
+        ).__name__
+        assert (name == "gluon_mm_a16w16_skinny_gfx950") == selected, (m, name)
+    full = _skinny(a[:last_m].contiguous(), weight)
+    expected = a[:last_m].double() @ weight.double().T
+    torch.testing.assert_close(full.double(), expected, atol=_ATOL, rtol=2**-8)
+    for m in sorted({first_m, (first_m + last_m) // 2, last_m}):
+        out = mm(a[:m].contiguous(), weight)
+        assert torch.equal(out.view(torch.int16), full[:m].view(torch.int16)), m
+
+
+@pytest.mark.parametrize(("n", "k"), list(_MUSE_TP8_SKINNY))
+def test_skinny_gemm_warmup_covers_muse_tp8_rows(n: int, k: int):
+    """A two-row GEMM on a Muse TP8 weight inside kernel_warmup compiles
+    every skinny binary its row range launches."""
+    first_m, last_m = _MUSE_TP8_SKINNY[(n, k)]
+    a, weight = _muse_tp8_problem(n, k, last_m)
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(a[:2].contiguous(), weight)
+
+    assert_warmup_covers(
+        kernels,
+        warm,
+        lambda m: mm(a[:m].contiguous(), weight),
+        range(first_m, last_m + 1),
+    )
