@@ -605,13 +605,14 @@ routing.
 
 Each layer has room for `max(16, effective_verify_width)` records per slot.
 When a whole candidate window will no longer fit, the accepted updates are
-folded into the dense base before the slot is reused. A change of live page
-likewise starts from a materialized base. Both folds run before the verify
-forward, in one launch pair for every layer, once the metadata refresh has
-resolved the round's pages (`KdaAttnBackend._prepare_retained_history`):
-verify itself reads only live blocks and writes neither a block nor a count.
-The base uses `--mamba-ssm-dtype` (FP32 or BF16). Replay accumulates in FP32
-and rounds when it writes the dense base.
+folded into the dense base before the slot is reused, even for a request whose
+own window is shorter. A change of live page likewise starts from a
+materialized base. Both folds run before the verify forward, in one launch pair
+for every layer, once the metadata refresh has resolved the round's pages
+(`KdaAttnBackend._prepare_retained_history`): verify itself reads only live
+blocks and writes neither a block nor a count. The base uses `--mamba-ssm-dtype`
+(FP32 or BF16). Replay accumulates in FP32 and rounds when it writes the dense
+base.
 
 Prefill starts from the logical state of its input page, then writes dense
 live and interior checkpoints and clears the rows' counts. A decode commit

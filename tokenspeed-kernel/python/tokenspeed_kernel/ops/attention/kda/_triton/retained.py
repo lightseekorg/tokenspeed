@@ -593,6 +593,7 @@ def retained_prepare_rows(
     record_slot_stride,
     record_slot_count,
     CAPACITY: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Read one layer's request rows (a scalar or a vector) and pick its folds.
 
@@ -600,8 +601,11 @@ def retained_prepare_rows(
     pages lie inside the pool, its window is non-empty and its record slot is
     resident. Its accepted count L and window T are valid when
     0 <= L <= CAPACITY and 0 < T <= CAPACITY. A valid row folds when it moves
-    to a private live page or when L + T exceeds CAPACITY. The consolidation
-    and the length reset decide with this one rule over the same inputs.
+    to a private live page or when L plus the larger of T and the verify's
+    WINDOW exceeds CAPACITY: the verify kernels read at most CAPACITY - WINDOW
+    records, so a row whose window is shorter than the verify's folds no later
+    than a full one. The consolidation and the length reset decide with this
+    one rule over the same inputs.
     """
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     lengths = tl.load(base + 2).to(tl.pointer_type(tl.int32))
@@ -641,7 +645,11 @@ def retained_prepare_rows(
     length = lengths + slot * length_stride
     count = tl.load(length, mask=active, other=0)
     valid = (count >= 0) & (count <= CAPACITY) & (tokens > 0) & (tokens <= CAPACITY)
-    fold = active & valid & ((source != live) | (count + tokens > CAPACITY))
+    fold = (
+        active
+        & valid
+        & ((source != live) | (count + tl.maximum(tokens, WINDOW) > CAPACITY))
+    )
     return source, live, slot, length, count, active, valid, fold
 
 
@@ -669,6 +677,7 @@ def retained_batched_consolidate_kernel(
     key_strides,
     decay_strides,
     CAPACITY: tl.constexpr,
+    WINDOW: tl.constexpr,
     STATE: tl.constexpr,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
@@ -702,6 +711,7 @@ def retained_batched_consolidate_kernel(
         record_slot_stride,
         record_slot_count,
         CAPACITY,
+        WINDOW,
     )
     if not fold:
         return
@@ -781,6 +791,7 @@ def retained_batched_reset_kernel(
     record_slot_stride,
     record_slot_count,
     CAPACITY: tl.constexpr,
+    WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Clear the length of every row the consolidation folded, BLOCK rows a program."""
@@ -805,6 +816,7 @@ def retained_batched_reset_kernel(
         record_slot_stride,
         record_slot_count,
         CAPACITY,
+        WINDOW,
     )
     tl.device_assert(valid | (active == 0), "invalid retained history interval")
     tl.store(length, 0, mask=fold)

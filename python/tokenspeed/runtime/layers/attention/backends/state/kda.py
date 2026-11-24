@@ -783,8 +783,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         Two launches for all layers, ordered after the refresh wrote the
         round's pages, boundaries and record slots and before the forward. A
         request that moves to a private live block, or whose accepted count
-        plus its window exceeds the history capacity, gets its source state
-        with its records applied in its live block, and its count clears.
+        plus the round's window exceeds the history capacity (a shorter row
+        folds like a full one: verify reads at most capacity - window
+        records), gets its source state with its records applied in its live
+        block, and its count clears.
         Verify then reads only live blocks, and never writes a block or count.
         """
         if not self._replay_descriptors.is_cuda:
@@ -819,6 +821,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_key=key,
             retained_decay=decay,
             history_capacity=capacity,
+            draft_token_num=self.speculative_num_draft_tokens,
             num_heads=heads,
             head_dim=dim,
             recurrent_state_dtype=self._retained_state_dtype,

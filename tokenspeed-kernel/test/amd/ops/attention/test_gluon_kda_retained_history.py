@@ -312,6 +312,7 @@ def _case(
                 inputs["retained_history"],
                 inputs["read_indices"],
                 inputs["query_start_loc"],
+                draft_token_num=width,
             )
             return verified(**inputs)
 

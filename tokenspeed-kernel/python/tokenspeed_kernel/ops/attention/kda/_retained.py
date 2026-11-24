@@ -374,6 +374,7 @@ def batched_prepare(
     retained_key,
     retained_decay,
     history_capacity,
+    draft_token_num,
     num_heads,
     head_dim,
     recurrent_state_dtype,
@@ -386,12 +387,16 @@ def batched_prepare(
     columns of each descriptor. source_indices and live_indices are integer
     [groups, requests] tables of the pages verify reads from and the private
     pages it reads its dense base from; query_start_loc is the packed
-    [requests + 1] boundary vector.
+    [requests + 1] boundary vector; draft_token_num is the window the verify
+    that follows was built for.
 
     A request folds when its live page differs from its source or when its
-    accepted count L plus its window T exceeds history_capacity: the first
-    launch writes the source state with records [0, L) applied into the live
-    page, and a second, ordered launch clears L once every tile has read it.
+    accepted count L plus the larger of its window T and draft_token_num
+    exceeds history_capacity: the verify kernels apply at most
+    history_capacity - draft_token_num records, so a request with a shorter
+    window folds as soon as a full one would. The first launch writes the
+    source state with records [0, L) applied into the live page, and a
+    second, ordered launch clears L once every tile has read it.
     Padding rows (a page at or below 0 or at or past the pool, an empty
     window or a slot outside the record slots) keep their pages and lengths;
     an L or T out of range on any other row fails a device assertion.
@@ -399,6 +404,10 @@ def batched_prepare(
     if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
         raise ValueError(
             "retained preparation requires positive heads, head_dim and capacity"
+        )
+    if not 0 < draft_token_num <= history_capacity:
+        raise ValueError(
+            "retained preparation requires a verify window within the capacity"
         )
     states = {torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
     if recurrent_state_dtype not in states:
@@ -478,6 +487,7 @@ def batched_prepare(
         *rows,
         *(x.stride() for x in records),
         CAPACITY=history_capacity,
+        WINDOW=draft_token_num,
         STATE=states[recurrent_state_dtype],
         HEADS=num_heads,
         DIM=head_dim,
@@ -489,6 +499,7 @@ def batched_prepare(
         *args,
         *rows,
         CAPACITY=history_capacity,
+        WINDOW=draft_token_num,
         BLOCK=128,
         num_warps=4,
         # Keeps the interval assertion.

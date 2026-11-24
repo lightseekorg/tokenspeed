@@ -122,12 +122,15 @@ def make_case(
 _PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def prepare_history(state_pool, history, read_indices, query_start_loc):
+def prepare_history(
+    state_pool, history, read_indices, query_start_loc, *, draft_token_num
+):
     """Ready one layer's retained history for its verify, as serving does.
 
     Serving prepares every layer in one launch pair before the forward; this
     runs the same batched prepare over a single layer: rows that move to a
-    private live page or overflow the history capacity get their source state
+    private live page, or whose records plus the verify's window
+    (draft_token_num) overflow the history capacity, get their source state
     with accepted records applied in their live page, and their lengths clear.
     """
     # Only the length and recurrent-state columns are read before verify.
@@ -163,6 +166,7 @@ def prepare_history(state_pool, history, read_indices, query_start_loc):
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
         history_capacity=history.correction.shape[2],
+        draft_token_num=draft_token_num,
         num_heads=heads,
         head_dim=dim,
         recurrent_state_dtype=state_pool.dtype,
@@ -331,7 +335,11 @@ def reference(case):
 def verify(case):
     records = case["records"]
     prepare_history(
-        case["state"], records.history, case["reads"], records.query_start_loc
+        case["state"],
+        records.history,
+        case["reads"],
+        records.query_start_loc,
+        draft_token_num=case["width"],
     )
     producers = {}
     if current_platform().is_nvidia:

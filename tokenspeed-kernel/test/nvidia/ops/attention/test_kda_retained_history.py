@@ -175,7 +175,7 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             )
             old_length = 0
         # Serving readies the history before every verify round.
-        prepare_history(state, history, indices, starts)
+        prepare_history(state, history, indices, starts, draft_token_num=width)
         verify_kernel(
             q,
             k,
@@ -317,7 +317,7 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     out = torch.full_like(v, float("nan"))
 
     def run():
-        prepare_history(state, history, sources, starts)
+        prepare_history(state, history, sources, starts, draft_token_num=width)
         vllm_triton_kda_recoverssm_verify(
             q,
             k,
@@ -506,7 +506,7 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
                 current = states[accepted[row] - 1]
         expected_endpoints.append(current)
     out = torch.empty_like(v)
-    prepare_history(state, history, indices, starts)
+    prepare_history(state, history, indices, starts, draft_token_num=width)
     vllm_triton_kda_recoverssm_verify(
         q,
         k,
@@ -577,7 +577,7 @@ def test_rows_outside_the_page_pool_are_skipped_by_verify_and_commit():
     beta = torch.randn(1, 4, heads, device="cuda").bfloat16()
     out = torch.full_like(v, float("nan"))
     saved = state.clone()
-    prepare_history(state, history, sources, starts)
+    prepare_history(state, history, sources, starts, draft_token_num=width)
     vllm_triton_kda_recoverssm_verify(
         q,
         k,

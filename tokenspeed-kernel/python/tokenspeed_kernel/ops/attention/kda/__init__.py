@@ -772,11 +772,13 @@ def resolve_kda_batched_retained_prepare(
 
     Returns a callable or None for unsupported geometry/platform. It takes the
     commit's descriptors, layer groups, record slots and FP32 records, plus
-    [groups, requests] source and live pages and the packed boundaries of the
-    verify that follows. A request whose live page differs from its source,
-    or whose accepted count L plus its window T exceeds the history capacity,
-    gets the source state with records [0, L) applied in its live page; a
-    second ordered launch then clears L. Every other row is left as it is.
+    [groups, requests] source and live pages, the packed boundaries and the
+    window (draft_token_num) of the verify that follows. A request whose live
+    page differs from its source, or whose accepted count L plus the larger
+    of its window T and draft_token_num exceeds the history capacity, gets
+    the source state with records [0, L) applied in its live page; a second
+    ordered launch then clears L. Every other row is left as it is, so the
+    verify sees at most capacity - draft_token_num records a request.
     Run it once per verify round, after the round's pages, boundaries and
     record slots are refreshed and before any layer's verify: a second run
     would copy the unchanged source over the fold.

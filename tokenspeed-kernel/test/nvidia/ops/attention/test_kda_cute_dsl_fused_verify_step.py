@@ -161,7 +161,11 @@ def _records(x, *, original, capacity=1, correction_stride=1):
 def _verify(x, records, output_norm, *, override=None, **producers):
     # Serving readies the history before every verify round.
     prepare_history(
-        x["state_pool"], records.history, x["state_indices"], x["query_start_loc"]
+        x["state_pool"],
+        records.history,
+        x["state_indices"],
+        x["query_start_loc"],
+        draft_token_num=1,
     )
     return kda_fused_paged_verify(
         x["mixed_qkv"],

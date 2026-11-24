@@ -61,6 +61,38 @@ def _endpoint(base, history, slot, count):
     return state
 
 
+def _reference_tokens(running, taps, raw, weights, gate, beta, begin, end):
+    """Verify tokens [begin, end) of one request from ``running`` and its taps.
+
+    Two heads of dim 128, gate bound -5. Returns the per-token outputs,
+    corrections, keys and decays as [tokens, heads, dim] and the final state.
+    """
+    outputs, corrections, keys, decays = [], [], [], []
+    for token in range(begin, end):
+        window_taps = torch.cat([taps, raw[token, :, None].float()], dim=-1)
+        convolved = (
+            torch.nn.functional.silu((window_taps * weights.float()).sum(-1))
+            .to(raw.dtype)
+            .float()
+        )
+        taps = window_taps[:, 1:]
+        q, key, value = (x.reshape(2, 128) for x in convolved.chunk(3))
+        q = q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6) / (128**0.5)
+        key = key / torch.sqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+        decay = (-5.0 * torch.sigmoid(gate[token].float().view(2, 128))).exp()
+        running = running * decay[:, None, :]
+        correction = (value - (running * key[:, None, :]).sum(-1)) * torch.sigmoid(
+            beta[token].float()
+        )[:, None]
+        running = running + correction[:, :, None] * key[:, None, :]
+        outputs.append((running * q[:, None, :]).sum(-1))
+        corrections.append(correction)
+        keys.append(key)
+        decays.append(decay)
+    stacked = [torch.stack(x) for x in (outputs, corrections, keys, decays)]
+    return (*stacked, running)
+
+
 @pytest.mark.parametrize("layout", ["v_major", "k_major"])
 def test_materialize_shared_source_and_reset_private_lengths(layout):
     history = _history()
@@ -438,33 +470,18 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
         page = int(reads[row])
         slot = int(history.record_slots[row])
         running = _endpoint(state[page], history, slot, int(history.length[slot]))
-        taps = conv[page].float()
-        for token in range(begin, end):
-            window_taps = torch.cat([taps, raw[token, :, None].float()], dim=-1)
-            convolved = (
-                torch.nn.functional.silu((window_taps * weights.float()).sum(-1))
-                .to(raw.dtype)
-                .float()
-            )
-            taps = window_taps[:, 1:]
-            q, key, value = (x.reshape(2, 128) for x in convolved.chunk(3))
-            q = q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6) / (128**0.5)
-            key = key / torch.sqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-            decay = (-5.0 * torch.sigmoid(gate[token].float().view(2, 128))).exp()
-            running = running * decay[:, None, :]
-            correction = (value - (running * key[:, None, :]).sum(-1)) * torch.sigmoid(
-                beta[token].float()
-            )[:, None]
-            running = running + correction[:, :, None] * key[:, None, :]
-            expected_u[token], expected_key[token], expected_decay[token] = (
-                correction,
-                key,
-                decay,
-            )
-            expected_out[token] = (running * q[:, None, :]).sum(-1)
+        (
+            expected_out[begin:end],
+            expected_u[begin:end],
+            expected_key[begin:end],
+            expected_decay[begin:end],
+            running,
+        ) = _reference_tokens(
+            running, conv[page].float(), raw, weights, gate, beta, begin, end
+        )
         expected_final.append(running)
     # Every row moves to a private live page, so the prepare copies them all.
-    prepare_history(state, history, reads, starts)
+    prepare_history(state, history, reads, starts, draft_token_num=window)
     out = kda.kda_fused_paged_verify(
         raw,
         weights,
@@ -486,7 +503,7 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
         g_raw=gate,
         **producer,
         override=None,
-        solution=None
+        solution=None,
     )
     assert out is not None
     torch.testing.assert_close(original, raw, atol=0, rtol=0)
@@ -529,6 +546,96 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
     )
     torch.testing.assert_close(
         endpoint, torch.stack(expected_final), atol=2e-4, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "window,capacity,count", [(8, 24, 20), (16, 16, 5)], ids=["rows16", "rows0"]
+)
+def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, count):
+    """A request shorter than the verify's window folds as a full one would.
+
+    The window kernels read at most capacity - window records (16 when the
+    capacity is 24 and the window 8; none when both are 16). A 2-token request
+    holding more fits its own window, yet the prepare must fold it, or verify
+    would leave records out of its outputs.
+    """
+    torch.manual_seed(11)
+    history = _history(capacity=capacity)
+    # Row 0 continues its own page 3 with two tokens; rows 1-3 are empty.
+    slot = int(history.record_slots[0])
+    history.length[slot] = count
+    reads = torch.tensor([3, 0, 0, 0], device="cuda", dtype=torch.int32)
+    starts = torch.tensor([0, 2, 2, 2, 2], device="cuda", dtype=torch.int32)
+    metadata = torch.tensor(
+        [[0, 3, 5], [1, 4, 7], [2, 5, 9], [-1, -1, -1]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    stamps = torch.full((3, window, 2), -1, device="cuda", dtype=torch.int64)
+    raw = torch.randn(2, 768, device="cuda", dtype=torch.bfloat16) * 0.2
+    original = torch.empty_like(raw)
+    conv = torch.randn(8, 768, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    weights = torch.randn(768, 4, device="cuda", dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(2, 2, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(8, 2, 128, 128, device="cuda") * 0.1
+    endpoint = _endpoint(state[3], history, slot, count)
+    expected_out, *_ = _reference_tokens(
+        endpoint, conv[3].float(), raw, weights, gate, beta, 0, 2
+    )
+
+    prepare_history(state, history, reads, starts, draft_token_num=window)
+    assert int(history.length[slot]) == 0
+    torch.testing.assert_close(state[3], endpoint, atol=2e-6, rtol=2e-5)
+
+    producer = {}
+    if current_platform().is_nvidia:
+        producer["conv_qkv"] = kda.kda_verify_conv_update(
+            raw,
+            weights,
+            conv,
+            reads,
+            num_heads=2,
+            head_dim=128,
+            query_start_loc=starts,
+            draft_token_num=window,
+            original_qkv=None,
+            bias=None,
+            recurrent_layout="v_major",
+        )
+    out = kda.kda_fused_paged_verify(
+        raw,
+        weights,
+        conv,
+        torch.empty(0, device="cuda"),
+        torch.empty(0, device="cuda"),
+        beta,
+        torch.zeros(2, device="cuda"),
+        torch.zeros(256, device="cuda"),
+        state_pool=state,
+        read_indices=reads,
+        num_heads=2,
+        head_dim=128,
+        draft_token_num=window,
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+        retained_records=kda.KdaRetainedRecords(
+            history=history,
+            original_qkv=original,
+            metadata=metadata,
+            stamps=stamps,
+            query_start_loc=starts,
+        ),
+        output_norm=None,
+        g_raw=gate,
+        **producer,
+        override=None,
+        solution=None,
+    )
+    assert out is not None
+    torch.testing.assert_close(
+        out.reshape(2, 2, 128).float(), expected_out, atol=2e-4, rtol=1e-2
     )
 
 
@@ -672,23 +779,35 @@ def _prepare_case(window, *, state_dtype=torch.float32):
     continues its own page and fits exactly, except in layer 1, whose count
     for its slot overflows. Rows 3-6 are padding -- an empty window, a source
     one past the pool, a slot past the record slots, the null page -- and
-    keep their pages and counts.
+    keep their pages and counts. Row 7 continues its own page with fewer
+    tokens than the window: its own tokens fit, but it folds whenever a full
+    window would overflow.
     """
-    heads, dim, layers, capacity, slots, pages, rows = 2, 128, 3, 8, 6, 10, 7
+    heads, dim, layers, capacity, slots, pages, rows = 2, 128, 3, 8, 7, 10, 8
     groups = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int32)
     # [groups, rows] views of 16-row tables, like serving's padded per-batch
     # tables: every row starts on a 16-byte boundary.
     tables = torch.full((2, 2, 16), -1, device="cuda", dtype=torch.int32)
     sources, lives = tables[0, :, :rows], tables[1, :, :rows]
     # Each group names its own pages; live pages are private within a group.
-    sources.copy_(torch.tensor([[1, 2, 3, 4, pages, 1, 0], [2, 6, 7, 4, pages, 2, 0]]))
-    lives.copy_(torch.tensor([[5, 2, 3, 6, 7, 8, 9], [9, 6, 7, 5, 8, 1, 3]]))
-    sizes = [window, window, window, 0, window, window, window]
+    sources.copy_(
+        torch.tensor([[1, 2, 3, 4, pages, 1, 0, 4], [2, 6, 7, 4, pages, 2, 0, 4]])
+    )
+    lives.copy_(torch.tensor([[5, 2, 3, 6, 7, 8, 9, 4], [9, 6, 7, 5, 8, 1, 3, 4]]))
+    sizes = [window, window, window, 0, window, window, window, max(1, window - 3)]
     starts = torch.tensor(
         [0] + torch.tensor(sizes).cumsum(0).tolist(), device="cuda", dtype=torch.int32
     )
-    record_slots = torch.tensor([2, 4, 0, 1, 3, slots, 5], device="cuda")
-    counts = {0: capacity - window, 1: 5, 2: 3, 3: 6, 4: capacity - window + 1, 5: 7}
+    record_slots = torch.tensor([2, 4, 0, 1, 3, slots, 5, 6], device="cuda")
+    counts = {
+        0: capacity - window,
+        1: 5,
+        2: 3,
+        3: 6,
+        4: capacity - window + 1,
+        5: 7,
+        6: capacity - window + 1,
+    }
     shape = (slots, layers + 1, heads, capacity, dim * 2)
     records = tuple(
         field[:, :layers, ..., ::2]
@@ -718,7 +837,7 @@ def _prepare_case(window, *, state_dtype=torch.float32):
             ):
                 continue
             count = int(length[slot])
-            if source != live or count + tokens > capacity:
+            if source != live or count + max(tokens, window) > capacity:
                 expected_state[live] = _fold(
                     state[source], records, slot, layer, count
                 ).to(state_dtype)
@@ -743,6 +862,7 @@ def _prepare_case(window, *, state_dtype=torch.float32):
         retained_key=records[1],
         retained_decay=records[2],
         history_capacity=capacity,
+        draft_token_num=window,
         num_heads=heads,
         head_dim=dim,
         recurrent_state_dtype=state_dtype,
@@ -849,7 +969,7 @@ def test_far_pages_of_a_pool_past_int32_prepare_like_near_ones():
     slot = int(history.record_slots[0])
     expected = _endpoint(state[1].float(), history, slot, 3).to(torch.bfloat16)
     source = state[1].clone()
-    prepare_history(state, history, reads, starts)
+    prepare_history(state, history, reads, starts, draft_token_num=4)
     torch.testing.assert_close(state[2], expected, atol=2e-3, rtol=4e-3)
     torch.testing.assert_close(state[1], source, atol=0, rtol=0)
     assert int(history.length[slot]) == 0
