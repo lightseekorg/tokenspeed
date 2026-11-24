@@ -247,6 +247,21 @@ class CachePoolBinding:
         selection as scheduler slots."""
         return False
 
+    def projects_decode_values(
+        self,
+        layer: PagedAttention,
+        *,
+        tokens: int,
+        topk: int,
+        q_len_per_req: int,
+        value_head_dim: int,
+        gated: bool,
+    ) -> bool:
+        """Whether ``layer``'s sparse decode of ``tokens`` rows over the whole
+        ``topk`` selection applies a ``value_projection`` it is given (its
+        latent's per-head value projection and gate) as it merges."""
+        return False
+
     def dcp_decode_query_rider(
         self, layer: PagedAttention, q: torch.Tensor
     ) -> torch.Tensor | None:

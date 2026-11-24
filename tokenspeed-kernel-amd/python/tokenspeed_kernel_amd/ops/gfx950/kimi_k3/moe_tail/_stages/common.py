@@ -163,6 +163,7 @@ def _gemv_loads_range(
     k0,
     FIRST_CHUNK: gl.constexpr,
     LAST_CHUNK: gl.constexpr,
+    NONTEMPORAL: gl.constexpr = True,
 ):
     """Issue every wave's weight loads, in chunk order."""
     ML: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -202,14 +203,21 @@ def _gemv_loads_range(
                 gl.amd.cdna3.buffer.load(
                     desc,
                     offsets,
-                    cache_policy=gl.amd.cdna3.CachePolicy(nontemporal=True),
+                    cache_policy=gl.amd.cdna3.CachePolicy(nontemporal=NONTEMPORAL),
                 ),
             )
     return out
 
 
 @gluon.jit
-def gemv_loads(wptr, row0, K: gl.constexpr, live, WAVE_ROWS: gl.constexpr):
+def gemv_loads(
+    wptr,
+    row0,
+    K: gl.constexpr,
+    live,
+    WAVE_ROWS: gl.constexpr,
+    NONTEMPORAL: gl.constexpr = True,
+):
     return _gemv_loads_range(
         wptr,
         row0,
@@ -220,6 +228,7 @@ def gemv_loads(wptr, row0, K: gl.constexpr, live, WAVE_ROWS: gl.constexpr):
         0,
         0,
         gl.cdiv(K // 128, 1 if WAVE_ROWS else 8),
+        NONTEMPORAL,
     )
 
 

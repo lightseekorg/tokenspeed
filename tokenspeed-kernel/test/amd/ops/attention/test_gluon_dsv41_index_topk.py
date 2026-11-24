@@ -36,6 +36,13 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
 from tokenspeed_kernel.ops.attention.dsv41 import triton as triton_backend
 from tokenspeed_kernel.ops.attention.dsv41._gluon import indexer as gluon_indexer
+from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
+from tokenspeed_kernel.ops.embedding.triton import (
+    apply_rope_mla_set_kv_buffer_triton,
+    mla_rope_set_kv_buffer_args,
+)
+from tokenspeed_kernel.ops.gemm import bmm
+from tokenspeed_kernel.ops.kvcache.triton import index_k_layernorm_fp8_scatter
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -666,3 +673,107 @@ def test_index_query_planes_do_not_specialize_on_rows_or_row_strides(device):
             gluon_indexer._pack_index_q(
                 padded_q[:, : 32 * 128].view(12, 32, 128), padded_w[:, :32]
             )
+
+
+# The absorb folds only where it reproduces the grouped decode GEMM's sums:
+# 12 heads of 128 by 512, at most 64 rows.
+@pytest.mark.parametrize(
+    ("rows", "mla", "absorb"),
+    [(8, False, False), (8, True, True), (65, True, False)],
+    ids=["pack", "mla-absorb", "mla-unfolded"],
+)
+def test_index_k_scatter_and_pack_query_matches_separate_ops(device, rows, mla, absorb):
+    if absorb and not current_platform().is_cdna4:
+        pytest.skip("GFX950 MLA query absorb")
+    torch.manual_seed(257)
+    heads, nope, rope, rank = 12, 128, 64, 512
+    slots = torch.randperm(256, device=device)[:rows]
+    index_k = torch.randn(rows, 128, device=device, dtype=torch.bfloat16)
+    norm_weight, norm_bias = torch.randn(2, 128, device=device, dtype=torch.bfloat16)
+    projected = torch.randn(
+        rows, heads * (nope + rope) + 32 * 128, device=device, dtype=torch.bfloat16
+    )
+    mla_q, index_q = projected.split([heads * (nope + rope), 32 * 128], dim=1)
+    index_q = index_q.view(rows, 32, 128)
+    plane = torch.randint(0, 256, (256, 68), device=device, dtype=torch.uint8)
+    expected = {"plane": plane.clone()}
+    index_k_layernorm_fp8_scatter(
+        expected["plane"],
+        index_k,
+        norm_weight,
+        norm_bias,
+        slots,
+        eps=1e-6,
+        page_size=64,
+        group_size=32,
+        write_mask=None,
+        index_k_format="mxfp4",
+    )
+    expected["codes"], expected["scales"] = triton_backend.pack_index_queries(index_q)
+    actual = {"plane": plane}
+    mla_args = {}
+    if mla:
+        q_nope, q_pe = mla_q.view(rows, heads, -1).split([nope, rope], dim=-1)
+        w_kc = torch.randn(
+            heads, rank, nope, device=device, dtype=torch.bfloat16
+        ).transpose(1, 2)
+        latent = torch.randn(rows, 1, rank + rope, device=device, dtype=torch.bfloat16)
+        kv = torch.randint(
+            0, 256, (4, 64, rank + rope), device=device, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn)
+        absorbed = torch.empty(rows, heads, rank, device=device, dtype=torch.bfloat16)
+        bmm(q_nope.transpose(0, 1), w_kc.transpose(1, 2), out=absorbed.transpose(0, 1))
+
+        def mla_write(kv_buffer, absorbed_query, query):
+            return {
+                "positions": slots,
+                "q_rope": q_pe,
+                "k_rope": latent[..., rank:],
+                "cos_sin_cache": None,
+                "is_neox": False,
+                "fused_mla_set_kv_buffer_arg": FusedMLASetKVBufferArg(
+                    k_nope=latent[..., :rank],
+                    kv_buffer=kv_buffer,
+                    cache_loc=slots,
+                    q_nope=absorbed_query,
+                    sanitize=True,
+                    write_mask=None,
+                ),
+                "q_rope_out": query,
+            }
+
+        expected["query"] = torch.empty(
+            rows, heads, rank + rope, device=device, dtype=torch.float8_e4m3fn
+        )
+        expected["kv"] = kv.clone()
+        apply_rope_mla_set_kv_buffer_triton(
+            **mla_write(expected["kv"], absorbed, expected["query"])
+        )
+        query = actual["query"] = torch.empty_like(expected["query"])
+        actual["kv"] = kv
+        assert triton_backend.mla_query_absorb_folds(q_nope, w_kc) == absorb
+        if absorb:
+            mla_args["mla_rope"] = mla_rope_set_kv_buffer_args(
+                **mla_write(kv, None, query[..., rank:])
+            )
+            mla_args["mla_absorb"] = (q_nope, w_kc, query[..., :rank])
+        else:
+            mla_args["mla_rope"] = mla_rope_set_kv_buffer_args(
+                **mla_write(kv, absorbed, query)
+            )
+    actual["codes"], actual["scales"] = (
+        triton_backend.index_k_layernorm_scatter_and_pack_query(
+            plane,
+            index_k,
+            norm_weight,
+            norm_bias,
+            slots,
+            index_q,
+            eps=1e-6,
+            page_size=64,
+            write_mask=None,
+            **mla_args,
+        )
+    )
+    for name, want in expected.items():
+        assert torch.equal(actual[name].view(torch.uint8), want.view(torch.uint8)), name
