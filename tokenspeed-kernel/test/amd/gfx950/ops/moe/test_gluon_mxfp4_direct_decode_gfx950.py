@@ -709,14 +709,21 @@ def test_route_tile_schedules_match_direct_reference(
     _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
 
 
-# The EP4 entries whose tiles hold 32 routes, at every eighth row count of
-# their range and its upper end.
-_EP4_WIDE_CASES = [
-    (rows, config)
-    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS[(4096, 4096, 64, 256, 8)]
-    if config.block_m == 32
-    for rows in [*range(min_rows, max_rows, 8), max_rows]
-]
+def _ep4_wide_cases() -> list[tuple[int, _RouteTileConfig]]:
+    """The EP4 entries whose tiles hold 32 routes, at sampled row counts.
+
+    The samples are every eighth row count of each entry plus its upper end.
+    """
+    cases = []
+    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS[(4096, 4096, 64, 256, 8)]:
+        if config.block_m != 32:
+            continue
+        for rows in [*range(min_rows, max_rows, 8), max_rows]:
+            cases.append((rows, config))
+    return cases
+
+
+_EP4_WIDE_CASES = _ep4_wide_cases()
 
 
 @pytest.mark.parametrize(("rows", "config"), _EP4_WIDE_CASES)
