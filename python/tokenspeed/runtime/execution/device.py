@@ -2004,6 +2004,15 @@ def build_device_side(
             gpu_id=gpu_id,
             shared_l2_handle=shared_l2_handle,
         )
+        if cache_observation_capacity > 0:
+            # TODO: record the pool's loads in the engine host's loader, which
+            # runs them. Until then a pool rank records no completed copy, so
+            # its plans keep the loads in their unobserved form.
+            logger.warning(
+                "TOKENSPEED_CACHE_EVENT_LOG=1 logs no prefix_load_completed "
+                "record on a shared L2 rank: the engine host runs its loads"
+            )
+            cache_observation_capacity = 0
     elif server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
