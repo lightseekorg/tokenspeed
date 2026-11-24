@@ -94,6 +94,7 @@ def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
         "weight_dtype": frozenset({"nvfp4"}),
         "activation": frozenset({"silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
+        "topk_weights_dtype": frozenset({torch.float32}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
@@ -163,3 +164,16 @@ def trtllm_nvfp4_mega_moe_apply(
     return runner.run(
         routed_input, topk_ids, topk_weights, weights, max_num_tokens_per_gpu
     )
+
+
+def _prepare_mega_moe_input_buffers(plan: dict, w: torch.nn.Module):
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
+
+    runner = get_runner(plan, w, prequantized=True)
+    runner._ensure_workspace()
+    return runner.input_buffers
+
+
+trtllm_nvfp4_mega_moe_apply._tokenspeed_prepare_input_buffers = (  # type: ignore[attr-defined]
+    _prepare_mega_moe_input_buffers
+)

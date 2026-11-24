@@ -55,6 +55,8 @@ from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.sentinel import (
     sent_sum,
 )
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.staging import (
+    gated_rows_loads,
+    gated_rows_store,
     rows_to_lds,
 )
 
@@ -88,7 +90,47 @@ def stage_o(xl, red, peer_regions, rank, group, weights, S: gl.constexpr):
 
 
 @gluon.jit
-def _stage_oproj_role(
+def _stage_oproj_groups(
+    core,
+    w_o,
+    xl,
+    red,
+    peer_regions,
+    rank,
+    group,
+    S: gl.constexpr,
+    TWO: gl.constexpr,
+    gate,
+    norm_w,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
+):
+    # The gated norm's rows are loaded before the weights: loads complete in
+    # issue order, so behind the weights its arithmetic would wait for all of
+    # them. The scheduling barriers keep that order.
+    if GATED_NORM:
+        gated = gated_rows_loads(core, gate, norm_w, S, GATE_STRIDE)
+        gl.amd.hint.sched_barrier()
+    # Load every group's weights before the attention rows are staged or any
+    # matrix instruction runs.
+    weights0 = gemv_loads(w_o, group * 16, 1536, True, False, NONTEMPORAL=False)
+    if TWO:
+        weights1 = gemv_loads(
+            w_o, (group + 200) * 16, 1536, True, False, NONTEMPORAL=False
+        )
+    if GATED_NORM:
+        gl.amd.hint.sched_barrier()
+        gated_rows_store(gated, xl, S, NORM_EPS)
+    else:
+        rows_to_lds(core, xl, 1536, S, 1536, 0, None)
+    stage_o(xl, red, peer_regions, rank, group, weights0, S)
+    if TWO:
+        stage_o(xl, red, peer_regions, rank, group + 200, weights1, S)
+
+
+@gluon.jit
+def stage_oproj(
     core,
     w_o,
     xl,
@@ -97,35 +139,64 @@ def _stage_oproj_role(
     rank,
     first_group,
     S: gl.constexpr,
-    PREFETCH_THIRD: gl.constexpr,
+    gate,
+    norm_w,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
 ):
-    # Load all three groups' weights, clamped to the last valid group,
-    # before the attention rows are staged or any matrix instruction runs.
-    weights0 = gemv_loads(w_o, gl.minimum(first_group, 447) * 16, 1536, True, False)
-    weights1 = gemv_loads(
-        w_o, gl.minimum(first_group + 200, 447) * 16, 1536, True, False
+    """Output groups ``first_group`` and ``first_group + 200``, of 448."""
+    _stage_oproj_groups(
+        core,
+        w_o,
+        xl,
+        red,
+        peer_regions,
+        rank,
+        first_group,
+        S,
+        True,
+        gate,
+        norm_w,
+        GATED_NORM,
+        GATE_STRIDE,
+        NORM_EPS,
     )
-    if PREFETCH_THIRD:
-        weights2 = gemv_loads(
-            w_o, gl.minimum(first_group + 400, 447) * 16, 1536, True, False
-        )
-    rows_to_lds(core, xl, 1536, S, 1536, 0, None)
-    stage_o(xl, red, peer_regions, rank, first_group, weights0, S)
-    stage_o(xl, red, peer_regions, rank, first_group + 200, weights1, S)
-    if PREFETCH_THIRD:
-        if first_group + 400 < 448:
-            stage_o(xl, red, peer_regions, rank, first_group + 400, weights2, S)
 
 
 @gluon.jit
-def stage_oproj(core, w_o, xl, red, peer_regions, rank, first_group, S: gl.constexpr):
-    # The workgroups that later run the router and latent projections take
-    # a separate path. Each path consumes its loaded weights before the
-    # paths join, so no loaded tensor stays live across the join.
-    if (first_group >= 104) & (first_group < 188):
-        _stage_oproj_role(core, w_o, xl, red, peer_regions, rank, first_group, S, False)
-    else:
-        _stage_oproj_role(core, w_o, xl, red, peer_regions, rank, first_group, S, True)
+def stage_oproj_third(
+    core,
+    w_o,
+    xl,
+    red,
+    peer_regions,
+    rank,
+    group,
+    S: gl.constexpr,
+    gate,
+    norm_w,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
+):
+    """Output group ``group``, one of the 48 past the two rounds of 200."""
+    _stage_oproj_groups(
+        core,
+        w_o,
+        xl,
+        red,
+        peer_regions,
+        rank,
+        group,
+        S,
+        False,
+        gate,
+        norm_w,
+        GATED_NORM,
+        GATE_STRIDE,
+        NORM_EPS,
+    )
 
 
 @gluon.jit

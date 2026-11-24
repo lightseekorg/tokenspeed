@@ -32,6 +32,8 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
     dsa_decode_dcp_records_workspace_bytes,
+    dsa_decode_projected_value,
+    dsa_decode_projected_value_supported,
     dsa_plan,
     dsa_prefill,
     dsa_prefill_dcp_records,
@@ -1062,6 +1064,44 @@ class DSABackend(PagedAttentionBackend):
 
     def takes_owned_decode_topk(self, layer) -> bool:
         return self._owned_decode_topk
+
+    def projects_decode_values(
+        self,
+        layer,
+        *,
+        tokens: int,
+        topk: int,
+        q_len_per_req: int,
+        value_head_dim: int,
+        gated: bool,
+    ) -> bool:
+        """Whether ``layer``'s sparse decode of ``tokens`` rows over the whole
+        ``topk`` selection merges its key splits straight into a
+        ``value_projection`` it is given (``dsa_decode_projected_value``),
+        rounding as a projection of its latent output would. Host sizes
+        only."""
+        return (
+            len(self.kvp_group) == 1
+            and self.decode_kernel_plan is None
+            and self.kernel_page_size == DSA_SPARSE_PAGE_SIZE
+            and dsa_decode_projected_value_supported(
+                tokens=tokens,
+                heads=self.num_local_heads,
+                topk=topk,
+                q_dtype=(
+                    torch.float8_e4m3fn
+                    if self.data_type == torch.float8_e4m3fn
+                    else self.q_data_type
+                ),
+                kv_dtype=self.data_type,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                value_head_dim=value_head_dim,
+                q_len_per_req=q_len_per_req,
+                gated=gated,
+                solution=self.kernel_solution,
+            )
+        )
 
     def dcp_decode_query_rider(self, layer, q: torch.Tensor) -> torch.Tensor | None:
         """This rank's decode query heads as the bytes an owned top-k's
@@ -2555,7 +2595,9 @@ class DSABackend(PagedAttentionBackend):
 
         With ``value_projection`` the decode returns ``value_projection.out``,
         the latent projected through it; a head-sharded KVP combine applies it
-        as it merges (``combine_project_attention_partials``).
+        as it merges (``combine_project_attention_partials``), and the key
+        split reduction does where ``projects_decode_values`` admits the
+        decode.
 
         ``gathered_query`` is every rank's ``q`` as the owned top-k's score
         gather landed it, uint8 ``[ranks, rows, bytes]``: the rider
@@ -2671,6 +2713,36 @@ class DSABackend(PagedAttentionBackend):
         # gathers heads in and reduce-scatters them back.
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
+        if (
+            value_projection is not None
+            and not use_dcp
+            and self.projects_decode_values(
+                layer,
+                tokens=num_tokens,
+                topk=topk_slots.shape[1],
+                q_len_per_req=q_len_per_req,
+                value_head_dim=value_projection.weight.shape[2],
+                gated=value_projection.gate is not None,
+            )
+        ):
+            return dsa_decode_projected_value(
+                q_view,
+                kv_cache,
+                topk_slots,
+                topk_lens,
+                max_seqlen_k,
+                self.qk_nope_head_dim,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                layer.scaling,
+                self.kernel_page_size,
+                value_projection.weight,
+                gate=value_projection.gate,
+                out=value_projection.out,
+                q_len_per_req=q_len_per_req,
+                solution=self.kernel_solution,
+                slot_order=self.slot_order,
+            )
         if use_dcp:
             # Owned slots first, counted as length (full width without topk_lens).
             # An owned top-k already is.

@@ -37,6 +37,15 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.dsv41.triton import mla_query_absorb_folds
+from tokenspeed_kernel.ops.attention.prologue import mla_prologue_kernel
+from tokenspeed_kernel.ops.attention.prologue.checks import check_mla_request
+from tokenspeed_kernel.ops.attention.prologue.types import (
+    KVCacheFormat,
+    LatentKVCache,
+)
+from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
+from tokenspeed_kernel.ops.embedding.triton import mla_rope_set_kv_buffer_args
 from tokenspeed_kernel.ops.metadata import expand_k_row_requests
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch import nn
@@ -163,6 +172,8 @@ class GlmDsaIndexerOutput:
     query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
     # When set, the decode rows' E4M3 query and FP32 weights folding its scales and the score scale.
     quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None
+    # mxfp4 index queries the index-K write packed: codes and scale words.
+    packed_query: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def query_rows(self, start: int, end: int) -> torch.Tensor:
         rows = self.query[start:end]
@@ -752,7 +763,16 @@ class GlmDsaSparseAttentionMixin:
                 "the KV-parallel decode top-k quantizes its own index queries"
             )
         softmax_scale = self.indexer.weights_softmax_scale
-        if quantized is None:
+        if quantized is None and indexer_output.packed_query is not None:
+            if (
+                decode_start != 0
+                or q.shape[0] != indexer_output.packed_query[0].shape[0]
+            ):
+                raise RuntimeError(
+                    "the index-K write packed rows outside the decode window"
+                )
+            q, q_scales = indexer_output.packed_query
+        elif quantized is None:
             q, q_scales = self._scorer_index_query(q, index_k_cache)
         else:
             # Unit query scales: the weights carry them and the score scale.
@@ -1372,6 +1392,100 @@ class GlmDsaSparseAttentionMixin:
             index_k_format=ctx.token_to_kv_pool.index_k_format,
         )
 
+    def _index_launch_prologue(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict, bool] | None:
+        """``forward_absorb_qkv_proj``'s prologue as a write the index-K
+        launch makes: the attention query it fills, the launch's
+        ``mla_rope`` / ``mla_absorb`` arguments, and whether the query is
+        absorbed by the time the launch has run; None where the prologue runs
+        on its own (an exchange, a query shard, RoPE, or another prologue
+        solution).
+
+        The rows are this rank's own, every one written, and NoPE, so the
+        prologue is ``triton_mla_prologue``'s unrotated
+        ``apply_rope_mla_set_kv_buffer_triton`` call. The launch also absorbs
+        the query where ``mla_query_absorb_folds`` holds; otherwise an FP8
+        cache's query is absorbed here first, and a native one afterwards by
+        :meth:`absorb_query`.
+        """
+        mqa = self.attn_mqa
+        num_tokens = q.shape[0]
+        if (
+            num_tokens == 0
+            or mqa.rotary_emb is not None
+            or self.head_tp_exchanges(ctx)
+            or ctx.query_shard is not None
+        ):
+            return None
+        cache = mqa._local_target(out_cache_loc[:num_tokens], ctx)
+        if not isinstance(cache, LatentKVCache) or cache.format not in (
+            KVCacheFormat.NATIVE,
+            KVCacheFormat.FP8,
+        ):
+            return None
+        kernel = mla_prologue_kernel(
+            q.dtype,
+            num_tokens,
+            self.num_local_heads,
+            expanded=None,
+            rotary=None,
+            cache=cache,
+            solution=None,
+            override=None,
+        )
+        if kernel != "triton_mla_prologue":
+            return None
+        rank = self.kv_lora_rank
+        fp8 = cache.format is KVCacheFormat.FP8
+        q_nope, q_pe = q.view(-1, self.num_local_heads, self.qk_head_dim).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        shape = (num_tokens, self.num_local_heads, rank + self.qk_rope_head_dim)
+        query = torch.empty(
+            shape, dtype=torch.float8_e4m3fn if fp8 else q.dtype, device=q.device
+        )
+        mla_absorb = None
+        if self.absorption_kernel_plan is None and mla_query_absorb_folds(
+            q_nope, self.w_kc
+        ):
+            # The check reads the layout of the BF16 query mla_prologue takes,
+            # which this launch never materializes.
+            prologue_query = torch.empty(shape, dtype=q.dtype, device="meta")
+            mla_absorb = (q_nope, self.w_kc, query[..., :rank])
+            nope_source, rope_out = None, query[..., rank:]
+        elif fp8:
+            prologue_query, q_pe = self.absorb_query(q, None)
+            nope_source, rope_out = prologue_query[..., :rank], query
+        else:
+            prologue_query = query
+            nope_source, rope_out = None, query[..., rank:]
+        check_mla_request(prologue_query, q_pe, latent_cache, None, None, cache)
+        latent = latent_cache.unsqueeze(1)
+        launch = mla_rope_set_kv_buffer_args(
+            # NoPE never reads positions; the launch only takes their length.
+            positions=cache.slots,
+            q_rope=q_pe,
+            k_rope=latent[..., rank:],
+            cos_sin_cache=None,
+            is_neox=False,
+            fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+                k_nope=latent[..., :rank],
+                kv_buffer=cache.kv_cache.squeeze(-2),
+                cache_loc=cache.slots,
+                q_nope=nope_source,
+                sanitize=cache.sanitize,
+                write_mask=cache.write_mask,
+            ),
+            q_rope_out=rope_out,
+        )
+        write = {"mla_rope": launch, "mla_absorb": mla_absorb}
+        return query, write, fp8 or mla_absorb is not None
+
     def forward_dsa_core(
         self,
         positions: torch.Tensor,
@@ -1534,7 +1648,7 @@ class GlmDsaSparseAttentionMixin:
             )
         # An owned decode top-k's score gather can carry the absorbed query
         # to the sparse decode, which then skips its own gather.
-        q = decode_query = query_rider = gathered_query = None
+        q = decode_query = query_rider = gathered_query = folded_prologue = None
         if (
             should_compute_indexer
             and num_prefill_tokens == 0
@@ -1601,6 +1715,39 @@ class GlmDsaSparseAttentionMixin:
                     softmax_scale=self.indexer.weights_softmax_scale,
                 )
                 indexer_output = replace(indexer_output, quantized_query=quantized)
+            elif (
+                self.index_query_mxfp4
+                and num_prefill_tokens == 0
+                and placement is None
+                and indexer_output.key_norm is not None
+                and ctx.token_to_kv_pool.index_k_format == "mxfp4"
+            ):
+                # A decode round packs its mxfp4 index queries in the write's
+                # launch, which also makes the MLA prologue's absorption and
+                # write when the query was projected ahead.
+                index_slots, index_mask = resolve_write_slots(
+                    out_cache_loc, placement, shared_topk
+                )
+                if (
+                    projected_q is not None
+                    and decode_query is None
+                    and decode_ctx is not None
+                    and decode_start == 0
+                    and decode_end == num_attn_tokens
+                ):
+                    folded_prologue = self._index_launch_prologue(
+                        projected_q, latent_cache, decode_ctx, decode_locs
+                    )
+                packed = ctx.token_to_kv_pool.set_index_k_buffer_and_pack_query(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                    query=indexer_output.query_rows(0, num_attn_tokens),
+                    **({} if folded_prologue is None else folded_prologue[1]),
+                )
+                indexer_output = replace(indexer_output, packed_query=packed)
             else:
                 index_slots, index_mask = resolve_write_slots(
                     out_cache_loc, placement, shared_topk
@@ -1676,7 +1823,16 @@ class GlmDsaSparseAttentionMixin:
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
             topk_owned = shared_topk.decode.owned_placement is not None
-            if decode_query is None:
+            if decode_query is None and folded_prologue is not None:
+                decode_query, _, absorbed = folded_prologue
+                if not absorbed:
+                    self.absorb_query(
+                        q.view(-1, self.num_local_heads, self.qk_head_dim)[
+                            ..., : self.qk_nope_head_dim
+                        ],
+                        decode_query,
+                    )
+            elif decode_query is None:
                 decode_query = self.forward_absorb_qkv_proj(
                     q[decode_start:decode_end],
                     latent_cache[decode_start:decode_end],
@@ -1786,11 +1942,27 @@ class GlmDsaSparseAttentionMixin:
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Other backends than an owned top-k's keep their signature.
+        # Backends that neither take an owned top-k nor project decode values
+        # keep their signature.
         owned = {"topk_owned": True} if topk_owned else {}
         if gathered_query is not None:
             owned["gathered_query"] = gathered_query
-        value_weight = self.owned_decode_value_weight() if topk_owned else None
+        value_weight = self.owned_decode_value_weight()
+        if value_weight is not None and not (
+            topk_owned
+            or (
+                topk_indices is not None
+                and ctx.attn_backend.projects_decode_values(
+                    self.attn_mqa,
+                    tokens=Q.shape[0],
+                    topk=topk_indices.shape[-1],
+                    q_len_per_req=Q.shape[0] // max(ctx.bs, 1),
+                    value_head_dim=value_weight.shape[2],
+                    gated=output_gate is not None,
+                )
+            )
+        ):
+            value_weight = None
         if value_weight is not None:
             owned["value_projection"] = ValueProjection(
                 weight=value_weight, gate=output_gate, out=output
@@ -1812,10 +1984,11 @@ class GlmDsaSparseAttentionMixin:
         return output
 
     def owned_decode_value_weight(self) -> torch.Tensor | None:
-        """The ``w_vc`` an owned decode top-k's KVP combine projects with, or None.
+        """The ``w_vc`` a decode projects with as it merges, or None: an owned
+        top-k's KVP combine, or a backend that ``projects_decode_values``.
 
-        With a weight the combine projects as it merges (``ValueProjection``);
-        without one the values project after it.
+        With a weight the merge projects (``ValueProjection``); without one the
+        values project after it.
         """
         return None
 
