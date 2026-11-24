@@ -2829,7 +2829,7 @@ class ModelExecutor:
                         num_prefill_tokens = total_tokens - num_decode_tokens
                         gather_ids = torch.empty(
                             num_extends + num_decode_tokens,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                             device=self.device,
                         )
                         gather_ids[:num_extends] = _last_packed_token_rows(
@@ -2839,14 +2839,14 @@ class ModelExecutor:
                             num_prefill_tokens,
                             total_tokens,
                             device=self.device,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                         )
                     else:
                         # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request, with int64 indices for downstream gathers.
+                        # per request.
                         gather_ids = _last_packed_token_rows(
                             self.input_buffers.input_lengths_buf[:bs]
-                        ).to(torch.int64)
+                        )
 
                 output_layout = ForwardOutputLayout(
                     num_extends=num_extends,
