@@ -20,10 +20,12 @@
 
 """Exact E4M3 conversion used by the QSA K/V producer."""
 
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
+
+cutlass = pytest.importorskip("cutlass")
+cute = pytest.importorskip("cutlass.cute")
+
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import target_version

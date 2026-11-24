@@ -429,8 +429,8 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         return original_compile(*args)
 
     monkeypatch.setattr(stream_topk, "_compile", counted_compile)
-    # Widths share two compiled variants: aligned and partial final groups.
-    # Request counts, page-table widths and Q strides stay dynamic in both.
+    # Widths share aligned and uniform variants for each static query tile.
+    # Request counts, page-table widths and Q strides stay dynamic.
     layouts = (
         (256, 8, 4, 128),
         (512, 8, 5, 128),
@@ -508,11 +508,17 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
         )
-        assert compile_count == (1 if i < 4 else 2)
         configs = [key[-1] for key in stream_topk._COMPILED]
+        assert compile_count == len(configs)
+        assert len(configs) == len(
+            {(config.group_layout, config.query_group) for config in configs}
+        )
         assert {config.algorithm for config in configs} == {algorithm}
         assert {config.group_layout for config in configs} == (
             {"aligned"} if i < 4 else {"aligned", "uniform"}
+        )
+        assert {config.query_group for config in configs} <= (
+            {4, 8} if algorithm == "overlap" else {8}
         )
 
 
