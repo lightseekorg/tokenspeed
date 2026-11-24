@@ -341,7 +341,7 @@ def _split_wave(
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
 ) -> int:
-    """Chunks one wave of the decode grid holds, in ``_get_split_kv``'s units."""
+    """Chunks one decode grid wave holds, in ``_get_split_kv``'s units."""
     # M64 FP8 launches one CTA per query tile; the other kernels launch two.
     is_m64_fp8 = torch_dtype == torch.float8_e4m3fn and mma_qk_tiler_mn[0] == 64
     return max(1, max_active_blocks // (q_len * (1 if is_m64_fp8 else 2)))
