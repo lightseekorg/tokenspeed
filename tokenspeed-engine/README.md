@@ -78,10 +78,10 @@ cancellation; one slow request need not retain another request's payload.
 Snapshot SDK updates carry a complete publication directory in the optional
 `UpdateWeightsFromMooncakeReqInput.snapshot` map. The native host and Python
 runtime must be built together to transport this field. The global commit and
-memory-saver rules apply as to any weight update. The configured SDK updater
-receives `update_weights(models, version=..., snapshot=...)`. Tensor data
-remains in the SDK's store. Requests without a snapshot use the SDK protocol
-without one.
+memory-saver rules apply as they do to any weight update. The configured SDK
+updater receives `update_weights(models, version=..., snapshot=...)`. Tensor
+data remains in the SDK's store. Requests without a snapshot use the SDK
+protocol without one.
 
 ## Building
 
@@ -132,14 +132,14 @@ Engine wheels are released in three ways:
   `lightseekorg/whl` only. A version already published from another commit
   fails the run unless `replace_nightly` replaces its wheels and refreshes
   their index hashes.
-* As a stable release. The **Biweekly release**
+* With a stable release. The **Biweekly release**
   ([biweekly releases](../docs/guides/weekly-release.md)) bumps the engine's
-  base version through a version PR and publishes it from
+  base version through a version PR and publishes the engine wheels from
   `release/engine-<version>` to `lightseekorg/whl` and PyPI. TokenSpeed then
   pins `tokenspeed-engine==<version>`. A stable TokenSpeed release builds no
   engine: it requires that pin and a `tokenspeed-engine/` tree unchanged
   since the commit that engine was published from.
-* By a manual run of **Release TokenSpeed Engine**, described below.
+* With a manual run of **Release TokenSpeed Engine**, described below.
 
 Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
 build and test wheels, or `publish` on `main` to upload them. Choose a
