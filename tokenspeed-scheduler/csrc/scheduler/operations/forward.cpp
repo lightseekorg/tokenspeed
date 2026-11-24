@@ -2396,6 +2396,12 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // interval again, which no overdue prompt can suspend. In exchange the
 // held-back count restarts whenever a prompt's chunk runs, so the N-round
 // bound applies to each chunk, not to the prompt in total.
+// With prefill_interval_min_decoding T (which requires K), N and M (held or
+// not) are owed only while at least T requests are ready to decode before
+// the round. With fewer, K still bounds the run: once K prefill rounds in a
+// row have held a decode back, the next round owes one decode round, which
+// ends the run; otherwise the round runs as if none were owed. The counters
+// follow its plan as for any other round.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::buildFusedPlan"};
@@ -2403,8 +2409,10 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     const bool interval_owes_decodes =
-        prefill_min_rounds_left_ > 0 ||
-        (prefill_deferral_rounds_left_ > 0 && !(prefillSuspensionAllowed() && prefillDeferralExhausted(candidates)));
+        intervalDecodingThresholdMet(candidates)
+            ? (prefill_min_rounds_left_ > 0 || (prefill_deferral_rounds_left_ > 0 &&
+                                                !(prefillSuspensionAllowed() && prefillDeferralExhausted(candidates))))
+            : prefillRunCappedBelowThreshold();
     // The prompts waiting for a prefill chunk before this round: the ones
     // whose chunk the round runs restart their held-back count below.
     std::vector<Request*> waiting_prefill;
@@ -2496,6 +2504,23 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
             prefill_interval_held_ = false;
         }
     }
+}
+
+bool Scheduler::intervalDecodingThresholdMet(std::span<Request* const> candidates) const {
+    if (config_.prefill_interval_min_decoding == 0) {
+        return true;
+    }
+    // The same set decodes_waiting tests: a fused prompt is PrefillDone from
+    // the round that schedules its last chunk, before that forward lands.
+    const auto ready_to_decode = std::ranges::count_if(
+        candidates, [](const Request* request) { return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>(); });
+    return ready_to_decode >= config_.prefill_interval_min_decoding;
+}
+
+bool Scheduler::prefillRunCappedBelowThreshold() const {
+    // The run count is kept whenever K > 0, which the threshold requires; it
+    // is capped at K and reset by every round that decodes.
+    return consecutive_prefill_rounds_ >= config_.max_consecutive_prefill_rounds;
 }
 
 bool Scheduler::prefillSuspensionAllowed() const {

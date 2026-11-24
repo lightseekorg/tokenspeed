@@ -288,6 +288,7 @@ class TestFinishTailHitCopyCudaTest:
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
                 max_consecutive_prefill_rounds=0,
+                prefill_interval_min_decoding=0,
                 storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
@@ -513,6 +514,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
                 max_consecutive_prefill_rounds=0,
+                prefill_interval_min_decoding=0,
                 cache_groups=pool_to_cache_groups(pool),
                 num_disk_pages=0,
                 disk_config=None,
