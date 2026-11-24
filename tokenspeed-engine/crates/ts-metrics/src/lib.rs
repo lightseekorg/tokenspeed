@@ -35,6 +35,9 @@
 
 mod peer;
 pub use peer::{PeerMetrics, QueuedPeerRead};
+mod encoder;
+pub use encoder::{EncoderMetrics, EncoderTransferMetrics};
+
 mod prom;
 mod relay;
 

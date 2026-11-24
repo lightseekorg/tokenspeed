@@ -88,6 +88,9 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+EPD encode-mode metric ownership and units are documented in
+[encoder-metrics.md](encoder-metrics.md).
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new

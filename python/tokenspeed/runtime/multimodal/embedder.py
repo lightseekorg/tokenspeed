@@ -132,6 +132,12 @@ class EncoderSpec:
     fn: EncoderFn
     deepstack: bool = False
     make_warmup_items: EncoderWarmupItemsFactory | None = None
+    # Optional factory for owner-thread observations in standalone encode mode.
+    # Receives standard metric configuration kwargs and returns a callback
+    # (phase, items). Phases are start, admit (including cache hits), and encoded.
+    # It must be nonblocking and must not alter features or execution.
+    # Plugins may consume metadata they own.
+    make_metrics_observer: Callable[..., Callable[[str, list], None]] | None = None
 
 
 def warmup_multimodal_encoders(
