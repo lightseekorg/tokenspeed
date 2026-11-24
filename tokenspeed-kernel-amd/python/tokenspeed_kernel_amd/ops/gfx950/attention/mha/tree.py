@@ -54,25 +54,114 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     stream_split_single_buffer,
 )
 
+async_copy = gl.amd.cdna4.async_copy
+
 # Window keys per mask word, and the most words a query row takes.
 _MASK_WORD_BITS = 64
 _MAX_TREE_WORDS = 2
 
 
-def _tree_row_tile(rows_per_req: int, group_size: int) -> tuple[int, int]:
-    """Return (BLOCK_M, NUM_WARPS) for a request's rows of one KV head.
+# Requests x KV heads from which a wide (> 64-row) tree tile picks its row tile
+# by cache dtype and sizes its splits by the work-groups per CU below.
+_TREE_WIDE_MIN_HEADS = 32
+# Work-groups per CU of the wide tiles' grid; deeper splits cost the reduce
+# more than they gain once every CU holds this many.
+_TREE_WIDE_BF16_CTAS_PER_CU = 1
+_TREE_WIDE_FP8_CTAS_PER_CU = 3
 
-    Up to 64 rows take the decode's tile, one 16-row MFMA tile per wave. More
-    rows (target verify: 16 nodes x 6 query heads) need several work-groups
-    per KV head, each reading every K/V page, and each wave reads a whole page
-    from LDS (and widens an FP8 one) for its rows. Two MFMA tiles per wave
-    halve that per row: on the Qwen3.8-27B verify shape a 64-row two-wave tile
-    beats one 16-row tile per wave by 20-35% (BF16) and 25-35% (FP8 E4M3).
+
+def _tree_launch_config(
+    rows_per_req: int,
+    group_size: int,
+    request_heads: int,
+    kv_bytes: int,
+    num_pages: int,
+    page_size: int,
+    head_dim: int,
+) -> tuple[int, int, int, int, bool]:
+    """Return (BLOCK_M, NUM_WARPS, splits, NUM_STAGES, REGISTER_PREFETCH).
+
+    Up to 64 rows of a KV head take the decode's tile, splits and pipeline.
+    More rows (target verify: 16 nodes x 6 query heads) need tiles where each
+    wave reads a whole K/V page from LDS into registers (and widens an FP8
+    one), so every wave holds about 500 registers and a CU runs one wave per
+    SIMD. Those tiles read each page into one LDS buffer and issue the next
+    page's copy as soon as a wave has read this one (REGISTER_PREFETCH).
+
+    At 32 or more requests x KV heads the tile and split count follow the
+    cache dtype. A 16-bit page fills twice the LDS of an FP8 one, so BF16 runs
+    four-wave 128-row work-groups, one per CU, while FP8 runs one-wave 32-row
+    work-groups (no padding rows for 96 rows), three per CU. On the
+    Qwen3.8-27B verify shape at 32 requests and 8k keys this takes the BF16
+    kernel from 285 to 247 us and FP8 from 297 to 228 us. Fewer heads keep a
+    64-row two-wave tile with the decode's split rule, which splits deeper.
     """
     rows = rows_per_req * group_size
     if rows <= _DECODE_MAX_BLOCK_M:
-        return _row_tile(rows_per_req, group_size)
-    return _DECODE_MAX_BLOCK_M, _DECODE_MAX_BLOCK_M // 32
+        block_m, num_warps = _row_tile(rows_per_req, group_size)
+        splits = select_kv_splits(
+            base_ctas=request_heads * triton.cdiv(rows, block_m),
+            num_pages=num_pages,
+            sm_count=_GFX950_SM_COUNT,
+            max_splits=_FULL_DECODE_MAX_SPLITS,
+        )
+        stages = _full_decode_stages(splits, page_size, head_dim, kv_bytes, num_warps)
+        return block_m, num_warps, splits, stages, False
+    if request_heads < _TREE_WIDE_MIN_HEADS:
+        block_m, num_warps = _DECODE_MAX_BLOCK_M, 2
+        splits = select_kv_splits(
+            base_ctas=request_heads * triton.cdiv(rows, block_m),
+            num_pages=num_pages,
+            sm_count=_GFX950_SM_COUNT,
+            max_splits=_FULL_DECODE_MAX_SPLITS,
+        )
+        return block_m, num_warps, splits, 1, True
+    if kv_bytes == 1:
+        block_m, num_warps, ctas_per_cu = 32, 1, _TREE_WIDE_FP8_CTAS_PER_CU
+    else:
+        block_m, num_warps, ctas_per_cu = 128, 4, _TREE_WIDE_BF16_CTAS_PER_CU
+    base_ctas = request_heads * triton.cdiv(rows, block_m)
+    splits = triton.cdiv(_GFX950_SM_COUNT * ctas_per_cu, base_ctas)
+    splits = max(1, min(splits, num_pages, _FULL_DECODE_MAX_SPLITS))
+    return block_m, num_warps, splits, 1, True
+
+
+@gluon.jit
+def stream_split_register_prefetch(program, q, m_i, l_i, acc, k_smem, v_smem):
+    """Single-buffered page loop that loads the next page while this one is
+    consumed.
+
+    Each wave reads a whole K (then V) page tile from LDS into registers
+    before its MFMAs, so the buffer is free as soon as that read is done: the
+    next page's K copy is issued right after K is read, before QK and the
+    softmax, and its V copy right after V is read, before PV. A hd256 page
+    leaves room for one K and one V buffer per work-group at the occupancy
+    this tile runs at, so this hides the copy latency that
+    stream_split_single_buffer leaves exposed on every page.
+    """
+    cfg = program.cfg
+    physical_page = program.load_page(program.split_start)
+    program.issue_load_k(physical_page, k_smem)
+    program.issue_load_v(physical_page, v_smem)
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        next_page = program.load_page(start_n + cfg.BLOCK_N)
+        # Outstanding: this page's K, then its V.
+        async_copy.wait_group(1)
+        k = program.shared_load_k(k_smem)
+        program.issue_load_k(next_page, k_smem)
+        qk = program.compute_qk(q, k)
+        if cfg.IS_SLIDING or start_n + cfg.BLOCK_N > program.mask_start:
+            qk = program.apply_kv_mask(qk, start_n)
+        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+        # Outstanding: this page's V, then the next page's K.
+        async_copy.wait_group(1)
+        v = program.clean_tree_window_v(program.shared_load_v(v_smem), start_n)
+        program.issue_load_v(next_page, v_smem)
+        acc = program.compute_pv(p, v, acc)
+    # The copies past the split (of the page after it, or of page 0) are still
+    # writing into LDS that the epilogue's layout conversions reuse.
+    async_copy.wait_group(0)
+    return m_i, l_i, acc
 
 
 @gluon.jit
@@ -105,6 +194,7 @@ def gluon_mha_tree_decode_gfx950(
     TREE_WINDOW: gl.constexpr,
     TREE_WORDS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    REGISTER_PREFETCH: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -150,9 +240,14 @@ def gluon_mha_tree_decode_gfx950(
         v_smem = gl.allocate_shared_memory(
             v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
         )
-        m_i, l_i, acc = stream_split_single_buffer(
-            program, q, m_i, l_i, acc, k_smem, v_smem
-        )
+        if REGISTER_PREFETCH:
+            m_i, l_i, acc = stream_split_register_prefetch(
+                program, q, m_i, l_i, acc, k_smem, v_smem
+            )
+        else:
+            m_i, l_i, acc = stream_split_single_buffer(
+                program, q, m_i, l_i, acc, k_smem, v_smem
+            )
     else:
         m_i, l_i, acc = stream_split_pipelined(
             program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
@@ -229,26 +324,22 @@ def launch_gluon_mha_tree_decode_gfx950(
     is_sliding = window_left >= 0
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    block_m, num_warps = _tree_row_tile(rows_per_req, group_size)
-    num_row_blocks = triton.cdiv(rows_per_req * group_size, block_m)
     # A sliding window ends at the prefix end, so a request reads at most
     # that window and the tree window, plus a partial leading page.
     keys = min(max_seqlen_k, window_left + 1 + window) if is_sliding else max_seqlen_k
     num_pages = triton.cdiv(keys, page_size) + int(is_sliding)
-    num_kv_splits = select_kv_splits(
-        base_ctas=num_requests * num_kv_heads * num_row_blocks,
-        num_pages=num_pages,
-        sm_count=_GFX950_SM_COUNT,
-        max_splits=_FULL_DECODE_MAX_SPLITS,
-    )
-    if block_m // num_warps > 16:
-        # Two-tile waves hold twice the accumulators; the pipeline's LDS
-        # buffers then cost them more occupancy than the loads they hide.
-        num_stages = 1
-    else:
-        num_stages = _full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
+    block_m, num_warps, num_kv_splits, num_stages, register_prefetch = (
+        _tree_launch_config(
+            rows_per_req,
+            group_size,
+            num_requests * num_kv_heads,
+            k_cache.element_size(),
+            num_pages,
+            page_size,
+            head_dim,
         )
+    )
+    num_row_blocks = triton.cdiv(rows_per_req * group_size, block_m)
     is_fp8 = q.element_size() == 1
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
@@ -294,6 +385,7 @@ def launch_gluon_mha_tree_decode_gfx950(
         window,
         triton.cdiv(window, _MASK_WORD_BITS),
         num_stages,
+        register_prefetch,
         num_warps=num_warps,
         **extern_compile_options(),
     )

@@ -165,10 +165,12 @@ DTYPE_IDS = ["bf16", "w8a16", "w8a8"]
 
 
 @pytest.mark.parametrize("q_dtype,kv_dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("bs", [1, 5])
+@pytest.mark.parametrize("bs", [1, 5, 8, 32])
 def test_verify_rows(q_dtype, kv_dtype, bs):
-    """Target verify: 16 rows over a 16-key window, head dim 256, 24/4 heads."""
-    prefixes = [700, 3, 0, None, 4100][:bs] if bs > 1 else [1000]
+    """Target verify: 16 rows over a 16-key window, head dim 256, 24/4 heads.
+    From 8 requests (32 requests x KV heads) the launcher takes the wide
+    tiles of its cache dtype."""
+    prefixes = ([700, 3, 0, None, 4100, 65, 129, 1500] * 4)[:bs] if bs > 1 else [1000]
     q, k, v, table, seq_lens, mask, ref = _problem(
         prefixes, 16, 16, 24, 4, 256, kv_dtype, q_dtype, seed=bs
     )
