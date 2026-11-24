@@ -23,11 +23,17 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["tree_window_attention"]
+__all__ = [
+    "tree_decode_attention",
+    "tree_decode_query_dtype",
+    "tree_window_attention",
+]
 
 # Tree visibility is up to two 64-bit mask words per query row; verify rows fit one.
 MAX_TREE_ROWS = 64
@@ -126,4 +132,130 @@ def tree_window_attention(
         )
 
 
+def _tree_signature(q_dtype: torch.dtype, kv_dtype: torch.dtype):
+    return format_signature(
+        q=dense_tensor_format(q_dtype),
+        k_cache=dense_tensor_format(kv_dtype),
+        v_cache=dense_tensor_format(kv_dtype),
+    )
+
+
+def tree_decode_query_dtype(
+    *,
+    kv_cache_dtype: torch.dtype,
+    activation_dtype: torch.dtype,
+    head_dim: int,
+    page_size: int,
+    sliding_window: bool,
+    solution: str | None = None,
+) -> torch.dtype | None:
+    """The query dtype a ``tree_decode`` kernel reads this cache with, or
+    ``None`` when none serves it.
+
+    The activation dtype comes first: over an FP8 cache, the tree rows decide
+    which draft tokens are accepted, and a 16-bit query keeps the scores and
+    probabilities out of FP8.
+    """
+    traits = {
+        "head_dim": head_dim,
+        "page_size": page_size,
+        "sliding_window": sliding_window,
+    }
+    for q_dtype in dict.fromkeys((activation_dtype, kv_cache_dtype)):
+        candidates = KernelRegistry.get().get_for_operator(
+            "attention",
+            "tree_decode",
+            platform=current_platform(),
+            format_signature=_tree_signature(q_dtype, kv_cache_dtype),
+            solution=solution,
+        )
+        if any(spec_matches_traits(spec, traits) for spec in candidates):
+            return q_dtype
+    return None
+
+
+def tree_decode_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    rows_per_req: int,
+    window: int,
+    max_seqlen_k: int,
+    window_left: int = -1,
+    sm_scale: float,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Draft-tree attention in one pass over each request's keys.
+
+    The same rows as ``tree_window_attention``, without a prefix partial:
+    query row ``r`` sees every key before the request's ``window``-key tree
+    window, and window key ``j`` when bit ``j % 64`` of its mask word
+    ``j // 64`` is set. With ``window_left >= 0`` the prefix keys are the
+    sliding window ending at the prefix end (``window_left + 1`` keys).
+
+    Args:
+        q: ``[bs * rows_per_req, num_q_heads, head_dim]`` queries.
+        k_cache: ``[num_pages, page_size, num_kv_heads, head_dim]`` paged keys,
+            in ``q.dtype`` or (under a 16-bit query) unit-scale FP8 E4M3.
+        v_cache: Paged values, in ``k_cache``'s dtype and shape.
+        page_table: ``[bs, max_pages]`` int32 page ids.
+        seq_lens: ``[bs]`` int32 keys per request, the window included.
+        mask: ``[bs * rows_per_req * cdiv(window, 64)]`` int64 window
+            visibility, each query row's words contiguous.
+        rows_per_req: query rows per request, at most 64.
+        window: tree window width in keys, at most 128.
+        max_seqlen_k: bound on ``seq_lens`` (sizes the key splits).
+        window_left: exclusive left sliding window of the prefix, or -1.
+        sm_scale: softmax scale applied to ``q . k``.
+        solution: optional kernel solution to restrict selection.
+
+    Returns:
+        ``[bs * rows_per_req, num_q_heads, head_dim]`` output, in ``q.dtype``
+        (BF16 for an FP8 query).
+    """
+    if rows_per_req > MAX_TREE_ROWS or window > MAX_TREE_SLOTS:
+        raise ValueError(
+            f"{rows_per_req} rows over a {window}-key window; at most "
+            f"{MAX_TREE_ROWS} rows over {MAX_TREE_SLOTS} keys"
+        )
+    kernel = select_kernel(
+        "attention",
+        "tree_decode",
+        _tree_signature(q.dtype, k_cache.dtype),
+        traits={
+            "head_dim": q.shape[-1],
+            "page_size": k_cache.shape[1],
+            "sliding_window": window_left >= 0,
+        },
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention",
+        "tree_decode",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0] // rows_per_req,
+        num_q_heads=q.shape[1],
+        head_dim=q.shape[2],
+    ):
+        return kernel(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seq_lens,
+            mask,
+            rows_per_req=rows_per_req,
+            window=window,
+            max_seqlen_k=max_seqlen_k,
+            window_left=window_left,
+            softmax_scale=sm_scale,
+        )
+
+
+import tokenspeed_kernel.ops.attention.tree.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.tree.triton  # noqa: E402,F401

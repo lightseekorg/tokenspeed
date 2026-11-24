@@ -232,8 +232,10 @@ def attention_layouts(head_dim, block_n, is_fp8, dtype, num_warps, instr_shape):
     k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
     p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
     v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
-    # load_vec = elems/lane (dtype-dependent, == qk_kw); load_threads span HEAD_DIM.
-    load_vec = 16 if is_fp8 else 8
+    # load_vec = elems/lane of a 128-bit K/V load (== qk_kw when the query has
+    # the cache's dtype; an FP8 cache under a 16-bit query still loads 16);
+    # load_threads span HEAD_DIM.
+    load_vec = 128 // dtype.primitive_bitwidth
     load_threads = head_dim // load_vec
     load_layout = gl.BlockedLayout(
         [1, load_vec], [64 // load_threads, load_threads], [num_warps, 1], [1, 0]

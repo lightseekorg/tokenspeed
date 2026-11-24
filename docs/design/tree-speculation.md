@@ -83,10 +83,25 @@ same keys, so its prefix half folds the `K` lanes into the query heads (lane
 the same folded Triton decode with `q_len = 1`: the keys are read once per
 request instead of `K` times.
 
+Where a `tree_decode` kernel serves the cache (gfx950: the Gluon split decode
+with a tree window), the `mha` leaf skips the cascade: every tree row sees
+all of the prefix (or the sliding window ending at the prefix end) plus the
+window keys its mask words set, so `tree_decode_attention` reads each key
+once per KV head in one pass over `[kv_start, P + W)`, split along the keys
+and merged by the decode's reduce, with no log-sum-exp round trip, no lane
+folding and no window kernel. Window V pages are sanitised (non-finite to 0)
+so an unseen slot cannot poison `P @ V`, and a row without keys (padding)
+writes zeros. Verify and lanes, full and sliding, take the same kernel.
+
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
 and `tree_window_attention` takes the unquantized query and widens the
-window's FP8 K/V to its dtype after loading them.
+window's FP8 K/V to its dtype after loading them. In the `mha` leaf only the
+`tree_decode` kernel reads an FP8 cache: the tree rows keep the activation
+dtype (`query_dtype` returns it for a bound tree), and the kernel widens each
+FP8 K/V tile to it after the LDS read, so scores and probabilities stay out
+of FP8 for the rows that decide acceptance. Without that kernel (or with
+MXFP8, E5M2 or per-tensor scales) `tree_support` refuses the FP8 cache.
 
 MLA runs the same cascade over its latent cache. The prefix half is the leaf's
 own MLA decode with its base-2 log-sum-exp: trtllm-gen's MLA decode for
@@ -258,7 +273,8 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup) and EAGLE4; `greedy`, `triton`, `flashinfer` and `sonic` sampling backends; the `trtllm`
-attention backend, the `mha` backend with bf16 KV, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
+attention backend, the `mha` backend with bf16 KV (or unit-scale FP8 E4M3 KV
+on gfx950, through the Gluon `tree_decode`), or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
@@ -303,7 +319,12 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
   `trtllm`, `trtllm_mla`, and `tokenspeed_mla` leaves (each leaf's prefix decode plus
   the window kernel) against fp32.
 * `test/runtime/test_tree_attention_cascade_mha.py` — the same through the
-  `mha` leaf's Triton prefix half.
+  `mha` leaf (the Gluon `tree_decode` on gfx950, else the Triton prefix half),
+  over bf16 and, where served, FP8 E4M3 caches.
+* `tokenspeed-kernel/test/amd/gfx950/ops/attention/test_gluon_mha_tree_decode_gfx950.py`
+  — the Gluon tree decode against fp32: verify and lane rows, one and two
+  mask words, sliding, padding requests, NaN in unseen window slots, BF16 and
+  FP8 caches under BF16 and FP8 queries.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the

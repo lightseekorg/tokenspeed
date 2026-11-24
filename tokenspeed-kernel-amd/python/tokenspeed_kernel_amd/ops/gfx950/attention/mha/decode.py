@@ -106,6 +106,9 @@ class AttentionConfig:
     IS_FP8: gl.constexpr
     UNIFORM_ROWS: gl.constexpr
     CAUSAL_ROWS: gl.constexpr
+    TREE_WINDOW: gl.constexpr
+    TREE_WORDS: gl.constexpr
+    ROW_MASKS: gl.constexpr
     GROUP_SIZE: gl.constexpr
     ROWS: gl.constexpr
     NUM_ROW_BLOCKS: gl.constexpr
@@ -142,8 +145,16 @@ class AttentionConfig:
         UNIFORM_ROWS,
         KV_DTYPE,
         q_strides,
+        TREE_WINDOW=0,
+        TREE_WORDS=0,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
+        if TREE_WINDOW:
+            # One or two 64-bit visibility words per query position.
+            assert not UNIFORM_ROWS
+            assert TREE_WORDS in (1, 2) and TREE_WINDOW <= 64 * TREE_WORDS
+        else:
+            assert TREE_WORDS == 0
         assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         # The waves split the rows into whole 16-row MFMA tiles.
@@ -196,7 +207,18 @@ class AttentionConfig:
         # request's positions are causal (verify): position p ends its keys at
         # seq_len - (MAX_SEQLEN_Q - 1 - p).
         self.UNIFORM_ROWS = gl.constexpr(UNIFORM_ROWS)
-        self.CAUSAL_ROWS = gl.constexpr(MAX_SEQLEN_Q > 1 and not UNIFORM_ROWS)
+        self.CAUSAL_ROWS = gl.constexpr(
+            MAX_SEQLEN_Q > 1 and not UNIFORM_ROWS and not TREE_WINDOW
+        )
+        # TREE_WINDOW > 0: a draft tree. A request's last TREE_WINDOW keys are
+        # its tree window; every query position sees all of the keys before it
+        # (the prefix, or its sliding window ending at the prefix end) and
+        # window key j when bit j % 64 of its mask word j // 64 is set.
+        self.TREE_WINDOW = gl.constexpr(TREE_WINDOW)
+        self.TREE_WORDS = gl.constexpr(TREE_WORDS)
+        # Rows of a block can see different keys, so a row can meet a page,
+        # or a whole split, without any of its keys.
+        self.ROW_MASKS = gl.constexpr(self.CAUSAL_ROWS or TREE_WINDOW > 0)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         # A request's queries for one KV head form MAX_SEQLEN_Q * GROUP_SIZE
         # rows, ordered by query position and then by query head, tiled into
@@ -242,6 +264,7 @@ class AttentionProgram:
     split_start: gl.tensor
     split_end: gl.tensor
     mask_start: gl.tensor
+    tree_mask_ptr: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -264,6 +287,7 @@ class AttentionProgram:
         split_start,
         split_end,
         mask_start,
+        tree_mask_ptr,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -283,6 +307,9 @@ class AttentionProgram:
         self.split_start = split_start
         self.split_end = split_end
         self.mask_start = mask_start
+        # The draft tree's int64 visibility words (TREE_WINDOW > 0), else
+        # any pointer (unread).
+        self.tree_mask_ptr = tree_mask_ptr
 
     @gluon.jit
     def create(
@@ -297,6 +324,7 @@ class AttentionProgram:
         batch,
         head_block,
         split_id,
+        tree_mask_ptr,
     ):
         """Locate a program's request, KV head, row block and split from its
         request index, head block (KV head x row block) and split index.
@@ -313,7 +341,12 @@ class AttentionProgram:
             seq_len = gl.load(cache_seqlens_ptr + batch * cfg.MAX_SEQLEN_Q)
         else:
             seq_len = gl.load(cache_seqlens_ptr + batch)
-        if not cfg.CAUSAL_ROWS:
+        if cfg.TREE_WINDOW > 0:
+            # Every row sees the prefix (and a sliding window ends there);
+            # only the window keys after it are masked per row.
+            first_end = maximum(seq_len - cfg.TREE_WINDOW, 0)
+            cache_len = maximum(seq_len, 0)
+        elif not cfg.CAUSAL_ROWS:
             first_end = maximum(seq_len, 0)
             cache_len = first_end
         else:
@@ -363,6 +396,7 @@ class AttentionProgram:
             split_start,
             split_end,
             mask_start,
+            tree_mask_ptr,
         )
 
     @gluon.jit
@@ -559,11 +593,27 @@ class AttentionProgram:
 
     @gluon.jit
     def shared_load_k(self, k_smem):
-        return k_smem.permute([1, 0]).load(self.cfg.k_layout)
+        # An FP8 cache read under a 16-bit query widens to the query's dtype
+        # (a no-op when they match).
+        k = k_smem.permute([1, 0]).load(self.cfg.k_layout)
+        return k.to(self.q_ptr.dtype.element_ty)
 
     @gluon.jit
     def shared_load_v(self, v_smem):
-        return v_smem.load(self.cfg.v_layout)
+        return v_smem.load(self.cfg.v_layout).to(self.q_ptr.dtype.element_ty)
+
+    @gluon.jit
+    def clean_tree_window_v(self, v, start_n):
+        """Zero the non-finite values of a draft tree's window page.
+
+        A window slot no row sees (a lane slot not yet drafted) can hold stale
+        or never-written bits, which would turn its zero probability into NaN
+        in P @ V. Prefix keys are written, and only window pages pay."""
+        cfg = self.cfg
+        if cfg.TREE_WINDOW > 0:
+            if start_n + cfg.BLOCK_N > self.seq_len - cfg.TREE_WINDOW:
+                v = _zero_nonfinite(v)
+        return v
 
     @gluon.jit
     def compute_qk(self, q, k):
@@ -579,6 +629,13 @@ class AttentionProgram:
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
         tokens = start_n + offs_n[None, :]
         mask = (tokens >= self.kv_start) & (tokens < self.split_end)
+        if cfg.TREE_WINDOW > 0:
+            # Rows differ only on window pages; give the mask its row axis
+            # first, as the branch below must keep its type.
+            mask &= gl.full([cfg.BLOCK_M, cfg.BLOCK_N], True, gl.int1, cfg.qk_layout)
+            prefix_end = self.seq_len - cfg.TREE_WINDOW
+            if start_n + cfg.BLOCK_N > prefix_end:
+                mask &= self.tree_window_visible(tokens, prefix_end)
         if cfg.CAUSAL_ROWS:
             # Each query position ends its keys, and starts its sliding window,
             # at its own offset within the block's range.
@@ -591,25 +648,45 @@ class AttentionProgram:
         return gl.where(mask, qk, -float("inf"))
 
     @gluon.jit
+    def tree_window_visible(self, tokens, prefix_end):
+        """Which of the keys ``tokens`` ([1, BLOCK_N]) each row sees: every
+        prefix key, and window key j when its mask word has bit j set."""
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+        words = (
+            self.tree_mask_ptr
+            + (self.batch * cfg.MAX_SEQLEN_Q + self.row_query_pos(offs_m))
+            * cfg.TREE_WORDS
+        )
+        column = tokens - prefix_end
+        word = gl.load(words)[:, None]
+        if cfg.TREE_WORDS == 2:
+            word = gl.where(column < 64, word, gl.load(words + 1)[:, None])
+        # Prefix columns are negative; their shift is unused.
+        shift = gl.where(column >= 0, column % 64, 0).to(gl.int64)
+        return (column < 0) | (((word >> shift) & 1) != 0)
+
+    @gluon.jit
     def softmax(self, qk, m_i, l_i, acc):
         cfg = self.cfg
         row_max = max(qk, axis=1)
         row_max = gl.convert_layout(row_max, gl.SliceLayout(1, cfg.pv_layout))
         m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
-        if cfg.CAUSAL_ROWS:
+        if cfg.ROW_MASKS:
             # A row can meet a page without any of its keys before one with
             # them: a later query position's window starts past the block's
-            # first pages, and an earlier one's causal end can precede a whole
-            # split. Keep -inf - -inf from turning its state into NaN. With
-            # one query position every row sees the same keys, so no row does.
+            # first pages, an earlier one's causal end can precede a whole
+            # split, and a tree row skips window keys. Keep -inf - -inf from
+            # turning its state into NaN. With one query position every row
+            # sees the same keys, so no row does.
             invalid = m_new == -float("inf")
             m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
         p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
         qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
-        if cfg.CAUSAL_ROWS:
+        if cfg.ROW_MASKS:
             m_diff = gl.where(invalid, 0.0, m_diff)
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
@@ -1050,6 +1127,33 @@ def _load_head_output_gate(
     )
 
 
+@gluon.constexpr_function
+def _nonfinite_bits(dtype):
+    """The bits that are all set in a NaN or infinity of dtype, and no
+    finite value."""
+    if dtype == gl.bfloat16:
+        return 0x7F80
+    if dtype == gl.float16:
+        return 0x7C00
+    if dtype == gl.float8e4nv:
+        # E4M3 (fn) has no infinities; its NaN is S.1111.111.
+        return 0x7F
+    assert dtype == gl.float8e5
+    return 0x7C
+
+
+@gluon.jit
+def _zero_nonfinite(x):
+    """x with its NaN and infinite values zeroed."""
+    exponent: gl.constexpr = _nonfinite_bits(x.dtype)
+    if x.dtype.primitive_bitwidth == 16:
+        bits = x.to(gl.int16, bitcast=True)
+    else:
+        bits = x.to(gl.int8, bitcast=True)
+    finite = (bits & exponent) != exponent
+    return gl.where(finite, x, gl.zeros_like(x))
+
+
 @gluon.jit
 def stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
     """Load, wait for and consume one K/V page at a time; enough when other
@@ -1072,7 +1176,7 @@ def stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
 
         with gl.amd.warp_pipeline_stage("pv", priority=1):
             async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
+            v = program.clean_tree_window_v(program.shared_load_v(v_smem), start_n)
             acc = program.compute_pv(p, v, acc)
     return m_i, l_i, acc
 
@@ -1155,7 +1259,9 @@ def stream_split_pipelined(
                 if cfg.IS_SLIDING or start_n + cfg.BLOCK_N > program.mask_start:
                     qk = program.apply_kv_mask(qk, start_n)
                 p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-                v = program.shared_load_v(v_smem.index(stage))
+                v = program.clean_tree_window_v(
+                    program.shared_load_v(v_smem.index(stage)), start_n
+                )
                 acc = program.compute_pv(p, v, acc)
                 # Each page must round as one iteration of the single-buffered
                 # loop does: there the running max enters as a loop-carried
@@ -1233,6 +1339,7 @@ def gluon_mha_decode_gfx950(
         gl.program_id(0),
         gl.program_id(1),
         gl.program_id(2),
+        cache_seqlens_ptr,
     )
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
@@ -1316,6 +1423,7 @@ def gluon_mha_decode_sliding_gfx950(
         gl.program_id(0),
         gl.program_id(1),
         gl.program_id(2),
+        cache_seqlens_ptr,
     )
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
@@ -1415,6 +1523,7 @@ def _mha_decode_sliding_split_atomic(
         gl.program_id(0),
         gl.program_id(1),
         gl.program_id(2),
+        cache_seqlens_ptr,
     )
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
@@ -1466,6 +1575,7 @@ def gluon_mha_decode_reduce_gfx950(
     UNIFORM_ROWS: gl.constexpr,
     GATE_EPS: gl.constexpr,
     HAS_GATE: gl.constexpr,
+    EMPTY_ROWS: gl.constexpr = False,
 ):
     # One wave merges one (query token, head); the attention row tiling does
     # not apply, so the config takes a single-wave tile.
@@ -1523,6 +1633,10 @@ def gluon_mha_decode_reduce_gfx950(
     if HAS_SINK:
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
         m_i = maximum(m_i, sink)
+    if EMPTY_ROWS:
+        # A row may see no key at all (a draft tree's padding request): keep
+        # -inf - -inf out of its weights; it stores zeros.
+        m_i = gl.where(m_i == -float("inf"), 0.0, m_i)
     # Weighted sum of the split partials, normalized by the total softmax mass.
     l_i = gl.sum(gl.exp2(all_lse - m_i), axis=0)
     if HAS_SINK:
@@ -1542,7 +1656,10 @@ def gluon_mha_decode_reduce_gfx950(
         )
         acc += gl.sum(part_o * gl.exp2(part_lse - m_i)[:, None], axis=0)
 
-    output = acc * (1.0 / l_i)
+    if EMPTY_ROWS:
+        output = acc * gl.where(l_i > 0.0, 1.0 / l_i, 0.0)
+    else:
+        output = acc * (1.0 / l_i)
     if HAS_GATE:
         _store_head_rmsnorm_gated(
             output,
@@ -2272,6 +2389,7 @@ def _locate_balanced(
         split_start,
         split_end,
         mask_start,
+        cache_seqlens_ptr,
     )
 
 
