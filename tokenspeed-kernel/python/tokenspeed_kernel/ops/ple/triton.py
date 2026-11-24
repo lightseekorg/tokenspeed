@@ -302,8 +302,6 @@ def _ple_host_gather_rows(
         owner = local_id // SHARD_ROWS
         local_id = local_id % SHARD_ROWS
         table_address = tl.load(table_address + owner)
-        if ROW_SCALE:
-            scale_ptr = tl.load(scale_ptr + owner).to(tl.pointer_type(tl.float32))
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < head_dim
     out_dtype = out_ptr.dtype.element_ty

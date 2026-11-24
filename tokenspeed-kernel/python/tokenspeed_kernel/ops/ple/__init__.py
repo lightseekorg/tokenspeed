@@ -89,8 +89,7 @@ def ple_host_gather(
             ``None`` when using per-row scaling or compute-dtype storage.
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
-            or compute-dtype storage. With shard_ptrs this contains device-visible
-            base addresses for the per-shard scale buffers.
+            or compute-dtype storage. Unsupported with shard_ptrs.
         shard_ptrs: Optional device int64 array of mapped shard addresses in vocab order.
             All shards have the same physical row count as table, including padding.
         table_shards: Number of table partitions, or one for a complete table.
@@ -100,6 +99,8 @@ def ple_host_gather(
         The supplied ``out`` tensor, filled with gathered and dequantized rows.
     """
 
+    if shard_ptrs is not None and row_scale is not None:
+        raise ValueError("row_scale is unsupported with shard_ptrs")
     if table_shards < 1:
         raise ValueError("table_shards must be positive")
     rows = ids.numel()

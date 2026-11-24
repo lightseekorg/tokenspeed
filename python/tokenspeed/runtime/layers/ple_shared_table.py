@@ -146,9 +146,10 @@ class PLESharedTable:
                         backing = mmap.mmap(f.fileno(), nbytes)
                     rows = torch.frombuffer(backing, dtype=torch.uint8)
                     platform.register_host_tensor_for_gpu_access(rows)
-                    weakref.finalize(
+                    finalizer = weakref.finalize(
                         self, platform.unregister_host_tensor_for_gpu_access, rows
                     )
+                    finalizer.atexit = False
                     tables.append(rows)
             except (OSError, RuntimeError) as exc:
                 error = str(exc)
