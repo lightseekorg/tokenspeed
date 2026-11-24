@@ -3703,10 +3703,13 @@ Ordinary admission still requires Device/Host data. Disk replacement remains
 LRU/retention; losing a Disk-only dependency invalidates affected routes without
 advancing either GDS watermark.
 
-Host placement releases safe same-key Disk copies before dirty logical losses.
+Host placement reclaims dead entries and usable Device duplicates before
+safe same-key Disk copies, then considers dirty logical losses.
 GDS trials these removals through the resolver and ranks clean copies by added
-read cost per Host relief. Legacy placement uses clean-first classification as
-well. A Disk prefetch checks credits before planning, pins exact Disk sources,
+read cost per Host relief. Legacy block placement shares the segment planner's
+Device KV duplicate checks, including the contiguous prefix and sliding-window
+constraints, and includes every unpinned State sibling in copy classification.
+A Disk prefetch checks credits before planning, pins exact Disk sources,
 and reserves a complete Host boundary transactionally. A failed boundary evicts
 nothing. Existing warm Host dependencies are protected during allocation;
 admission probes again after I/O. Arrival alone is not checkpoint reuse.
@@ -3719,6 +3722,9 @@ Both policies respect the write-operation limit and reserve foreground read
 capacity. Cleaning length and reuse gates apply to the candidate tip, never
 to its required ancestors. GDS rediscovers a gated candidate on a later pass;
 the queue-based policy keeps cold entries in its bounded reuse queue.
+GDS does not queue write-back ACK notifications: its candidates come from
+residency, so unused notifications consume neither queue space nor the dropped
+cleaning counter. Legacy cleaning retains its bounded FIFO and drop accounting.
 Rank compressed paths before expanding candidate keys, and stop visiting
 candidates when the write credits are filled. A selected closure can still be
 long; this does not bound all cleaning CPU work by the number of writes.

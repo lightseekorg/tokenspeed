@@ -149,8 +149,10 @@ segment opens no gap. A Host placement takes, in order: dead entries, entries
 the Device holds, clean entries, then dirty entries by recency. The
 write-back segment plan, which places what Device evictions write back,
 applies this order to whole victims, checking that their expanded dependencies
-are also clean. Block-by-block placement for prefetch and peer landings also
-reclaims safe Disk-backed copies before ordinary dirty candidates.
+are also clean. Block-by-block placement for prefetch and peer landings follows
+the same class order. Device KV duplicates must preserve the contiguous Device
+prefix and required Host windows; a State victim includes its unpinned siblings.
+Disk-only ancestors keep Host descendants live in both placement and collection.
 
 ### Prefetch
 

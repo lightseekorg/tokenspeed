@@ -345,12 +345,20 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
-    cfg.state_checkpoint_in_forward = state_checkpoint_in_forward
-    cfg.demote_superseded_state_checkpoints = demote_superseded_state_checkpoints
-    cfg.drop_short_prompt_end_checkpoints = drop_short_prompt_end_checkpoints
-    cfg.prefix_cache_evict_policy = prefix_cache_evict_policy
-    cfg.prefix_cache_gds_prefill_cost = prefix_cache_gds_prefill_cost
-    cfg.prefix_cache_gds_disk_block_costs = list(prefix_cache_gds_disk_block_costs)
+    # Leave optional features at the binding's defaults on older engines.
+    # Explicit opt-ins still raise if the installed binding cannot support them.
+    if state_checkpoint_in_forward:
+        cfg.state_checkpoint_in_forward = True
+    if demote_superseded_state_checkpoints:
+        cfg.demote_superseded_state_checkpoints = True
+    if drop_short_prompt_end_checkpoints:
+        cfg.drop_short_prompt_end_checkpoints = True
+    if prefix_cache_evict_policy != "lru":
+        cfg.prefix_cache_evict_policy = prefix_cache_evict_policy
+    if prefix_cache_gds_prefill_cost is not None:
+        cfg.prefix_cache_gds_prefill_cost = prefix_cache_gds_prefill_cost
+    if prefix_cache_gds_disk_block_costs:
+        cfg.prefix_cache_gds_disk_block_costs = list(prefix_cache_gds_disk_block_costs)
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.

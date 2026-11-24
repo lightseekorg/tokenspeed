@@ -164,6 +164,9 @@ StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
+    // GDS discovers dirty entries from residency, including Disk removals;
+    // ACK notifications neither schedule its writes nor consume queue capacity.
+    if (coordinator_.Store().UsesGds()) return;
     for (const CacheKey& key : keys) {
         if (cleaning_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
             cleaning_.pop_front();
@@ -287,7 +290,6 @@ void DiskTransferManager::StartCleaning() {
             for (const auto& [group, location] : copy.members) safe_capacity += 1.0 / host_pool.Packing(group);
         const auto target = std::min(host_pool.NumLcmBlocks(), config_.max_write_host_blocks);
         if (safe_capacity >= target) return;
-        cleaning_.clear();  // Notifications are not the authoritative dirty set.
         std::unordered_set<CacheKey, CacheKeyHash> dependencies;
         VisitGdsHostCleaningCandidates(store, [&](HostCleaningCandidate candidate) {
             // Gate only the recovery point, not its cold ancestor dependencies.

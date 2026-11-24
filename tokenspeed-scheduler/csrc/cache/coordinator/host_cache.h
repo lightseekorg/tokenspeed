@@ -244,22 +244,6 @@ private:
         std::vector<Victim> victims;
         std::shared_ptr<const TieredGdsPlan> tiered;
     };
-    struct HostKvDuplicateCandidate {
-        std::uint32_t group_id{0};
-        CacheBlockLocation location;
-        std::int32_t boundary_tokens{0};
-        // A request holds the Device copy. The visit yields every held copy
-        // before the unheld ones; a Host plan with demoted checkpoint
-        // boundaries next stops at the first unheld one.
-        bool device_in_use{false};
-    };
-    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
-    // excluding pages a sliding group can force into a Host suffix. Visit in
-    // priority order and stop as soon as the callback returns false.
-    // Defined in host_segments.cpp; callers must stay in that translation
-    // unit unless the template definition is moved into a header.
-    template <typename Visitor>
-    void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,

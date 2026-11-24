@@ -467,7 +467,7 @@ void CacheEvictor::prepareTieredPlan(const TieredGdsPlan& plan) {
         const auto source = store_.Groups()[key.group_id].Index().Inspect(store_.DevicePool(), key);
         FatalCheck(source.has_value(), "a required Host copy lost its indexed source");
         auto* node = store_.Boundaries().Find(key.content_hash);
-        FatalCheck(node != nullptr, "a required copy has a publication boundary");
+        FatalCheck(node != nullptr, "a required copy has no publication boundary");
         segment.members.push_back(
             EvictedBlock{.key = key,
                          .device_location = source->location,

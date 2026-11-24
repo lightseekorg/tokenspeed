@@ -28,6 +28,8 @@
 // unpinned State siblings at the same boundary along, and Minimize restores
 // every victim the demand can do without, newest first. Planning changes
 // nothing; the caller evicts the victims and allocates.
+// With Disk, Host placement first reclaims dead entries and usable Device
+// duplicates, then safe Disk-clean copies, before ordinary dirty candidates.
 
 #include <array>
 #include <cstddef>
@@ -89,13 +91,13 @@ public:
     bool Fit(std::span<const BlockPlacementDemand> block_demands) {
         const CacheEvictionCandidates::LocationSet no_request_reclaims{&scratch_};
         return plan_.SelectUntilFits(block_demands, [&] {
-            if (!clean_initialized_) {
-                if (tier_ == CacheTier::kHost) clean_ = DiskCleanHostCopies(store_);
-                clean_initialized_ = true;
+            if (!copies_initialized_) {
+                if (tier_ == CacheTier::kHost) copies_ = HostCopiesBeforeDirty(store_);
+                copies_initialized_ = true;
             }
-            while (next_clean_ < clean_.size()) {
+            while (next_copy_ < copies_.size()) {
                 VictimSet set;
-                for (const auto& [group, location] : clean_[next_clean_++].members) {
+                for (const auto& [group, location] : copies_[next_copy_++].members) {
                     if (taken_.contains(location)) continue;
                     Seed(group, location);
                     set.members.push_back({group, location});
@@ -149,9 +151,9 @@ private:
     const BlockPool& pool_;
     CacheEvictionPlan plan_;
     CacheTier tier_;
-    bool clean_initialized_{false};
-    std::vector<CleanHostCopy> clean_;
-    std::size_t next_clean_{0};
+    bool copies_initialized_{false};
+    std::vector<HostCopyVictim> copies_;
+    std::size_t next_copy_{0};
     CacheEvictionCandidates candidates_;
     // Holds taken_'s slots until the planner dies, first in the planner's own
     // raw buffer (left uninitialized: only the arena writes it), so a small

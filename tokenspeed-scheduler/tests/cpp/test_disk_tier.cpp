@@ -108,10 +108,7 @@ public:
                                       /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0)},
           disks{coordinator, limits} {}
 
-    // Publishes the prompt on the Device -- a checkpoint at its end with State
-    // groups -- copies every entry to a fresh Host block, as a write-back would,
-    // and empties the Device: the prompt then lives in dirty Host entries.
-    std::vector<CacheKey> OnHostOnly(const Prompt& prompt) {
+    std::vector<BlockTable> OnDevice(const Prompt& prompt) {
         std::vector<BlockTable> tables(coordinator.NumGroups());
         EXPECT_TRUE(AdmitForTest(coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
         coordinator.CacheCompletedBlocks(
@@ -123,6 +120,14 @@ public:
                                                               .stream_completed_to_host = false},
                             .num_computed_tokens = static_cast<std::int32_t>(prompt.tokens.size())},
             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        return tables;
+    }
+
+    // Publishes the prompt on the Device -- a checkpoint at its end with State
+    // groups -- copies every entry to a fresh Host block, as a write-back would,
+    // and empties the Device: the prompt then lives in dirty Host entries.
+    std::vector<CacheKey> OnHostOnly(const Prompt& prompt) {
+        auto tables = OnDevice(prompt);
         coordinator.Free(tables);
         std::vector<CacheKey> keys = DeviceKeys(prompt);
         for (const CacheKey& key : keys) {
@@ -1242,6 +1247,80 @@ TEST(DiskGdsTest, CleanStatePrecedesDirtyLossUnderBothPolicies) {
     }
 }
 
+TEST(DiskGdsTest, BlockPlacementReclaimsDeadEntriesBeforeCleanCopies) {
+    for (bool gds : {false, true}) {
+        for (bool whole : {false, true}) {
+            for (bool gap : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << gds << ":" << whole << ":" << gap);
+                DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+                if (gds) ConfigureDiskGds(cache);
+                const auto clean = cache.OnHostOnly(Prompt(1, 1));
+                CopyToDisk(cache, clean);
+                const auto dead = cache.OnHostOnly(Prompt(2, 2));
+                cache.EvictFromHost(gap ? std::span{dead}.first(1) : std::span{dead}.last(1));
+                const auto dead_before =
+                    std::ranges::count_if(dead, [&](const CacheKey& key) { return cache.OnHost(key); });
+                auto held = HoldFreeHost(cache);
+                const std::array<std::uint32_t, 1> groups{0};
+                const std::array<std::int32_t, 1> buckets{0};
+                auto placed = whole ? cache.coordinator.Host().AcquireHostLanding(groups, buckets)
+                                    : cache.coordinator.Host().AcquireHostBlocks(groups, buckets);
+                ASSERT_EQ(placed.stats.allocated, 1u);
+                for (const auto& key : clean) EXPECT_TRUE(cache.OnHost(key));
+                EXPECT_LT(std::ranges::count_if(dead, [&](const CacheKey& key) { return cache.OnHost(key); }),
+                          dead_before);
+                EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+            }
+        }
+    }
+}
+
+TEST(DiskGdsTest, BlockPlacementReclaimsDeviceCopiesBeforeCleanCopies) {
+    for (bool gds : {false, true}) {
+        for (bool whole : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << gds << ":" << whole);
+            DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+            if (gds) ConfigureDiskGds(cache);
+            const auto clean = cache.OnHostOnly(Prompt(1, 1));
+            CopyToDisk(cache, clean);
+            const Prompt duplicate_prompt(1, 2);
+            const auto duplicate = cache.OnHostOnly(duplicate_prompt);
+            auto device_tables = cache.OnDevice(duplicate_prompt);
+            auto held = HoldFreeHost(cache);
+            const std::array<std::uint32_t, 2> groups{0, 1};
+            const std::array<std::int32_t, 2> buckets{0, 0};
+            auto placed = whole ? cache.coordinator.Host().AcquireHostLanding(groups, buckets)
+                                : cache.coordinator.Host().AcquireHostBlocks(groups, buckets);
+            ASSERT_EQ(placed.stats.allocated, 2u);
+            for (const auto& key : clean) EXPECT_TRUE(cache.OnHost(key));
+            for (const auto& key : duplicate) EXPECT_FALSE(cache.OnHost(key));
+            EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(duplicate_prompt.Prefix()).device.num_common_tokens,
+                      4);
+            EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+            cache.coordinator.Free(device_tables);
+        }
+    }
+}
+
+TEST(DiskGdsTest, BlockPlacementKeepsHostDescendantsOfADiskAncestorLive) {
+    for (bool gds : {false, true}) {
+        SCOPED_TRACE(gds);
+        DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+        if (gds) ConfigureDiskGds(cache);
+        const auto clean = cache.OnHostOnly(Prompt(1, 1));
+        CopyToDisk(cache, clean);
+        const auto disk_backed = cache.OnHostOnly(Prompt(2, 2));
+        CopyToDisk(cache, std::span{disk_backed}.first(1));
+        cache.EvictFromHost(std::span{disk_backed}.first(1));
+        auto held = HoldFreeHost(cache);
+        auto block = cache.coordinator.Host().AcquireHostBlock(1, 0);
+        ASSERT_TRUE(block);
+        for (const auto& key : std::span{disk_backed}.subspan(1)) EXPECT_TRUE(cache.OnHost(key));
+        EXPECT_LT(std::ranges::count_if(clean, [&](const CacheKey& key) { return cache.OnHost(key); }), clean.size());
+        EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+    }
+}
+
 TEST(DiskGdsTest, AFailedWholeLandingLeavesHostContentAndPolicyUnchanged) {
     for (bool gds : {false, true}) {
         SCOPED_TRACE(gds);
@@ -1300,6 +1379,24 @@ TEST(DiskGdsTest, CleaningUsesCurrentHostScoresInsteadOfAckOrder) {
     EXPECT_EQ(commands[0].group_ids[0], 0u) << "history before its State";
     EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
     cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+}
+
+TEST(DiskGdsTest, CleaningUsesTheDirtyIndexWithoutAccumulatingAckNotifications) {
+    auto limits = GdsDiskLimits();
+    limits.max_queued_cleanings = 1;
+    DiskTierCache cache(FullAndState(), 32, limits);
+    ConfigureDiskGds(cache);
+    const auto keys = cache.OnHostOnly(Prompt(1, 1));
+    for (int repeat = 0; repeat < 3; ++repeat) cache.disks.QueueCleaning(keys);
+    EXPECT_EQ(cache.disks.NumQueuedCleanings(), 0u);
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 0u);
+    cache.disks.StartCleaning();
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands.front().group_ids.size(), keys.size());
+    cache.disks.Complete(cache::DiskDone{commands.front().op_id, true});
+    for (const auto& key : keys) EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 0u);
 }
 
 TEST(DiskGdsTest, DiskLossMakesHostDirtyWithoutAnotherWriteBackAck) {

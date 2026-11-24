@@ -441,13 +441,16 @@ def test_unused_disk_cost_is_rejected(policy):
         )
 
 
-def test_gds_refuses_disabled_prefix_cache():
+@pytest.mark.parametrize(
+    "flags", [["--disable-prefix-caching"], ["--disaggregation-mode", "encode"]]
+)
+def test_gds_refuses_disabled_prefix_cache(flags):
     with pytest.raises(ValueError, match="gds requires prefix caching"):
         prepare_server_args(
             [
                 "--model",
                 "x",
-                "--disable-prefix-caching",
+                *flags,
                 "--prefix-cache-evict-policy",
                 "gds",
                 "--prefix-cache-gds-prefill-cost",

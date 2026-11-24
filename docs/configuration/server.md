@@ -1826,7 +1826,12 @@ so the copy adds to that step's time.
 
 For hybrid models, `--prefix-cache-evict-policy gds` with explicit
 `--prefix-cache-gds-prefill-cost D E` coordinates Device and Host logical
-retention. Under write-back it reserves necessary Host copies before releasing
+retention. It requires prefix caching after role resolution; the vision-only
+`encode` role disables that cache and rejects GDS. Enabling GDS requires an
+engine whose bundled scheduler supports it. Default `lru` and disabled
+checkpoint options leave optional native fields unset for older engines;
+explicit unsupported options fail instead of being ignored.
+Under write-back it reserves necessary Host copies before releasing
 Device addresses; this may copy additional history needed for a legal Host
 suffix. Pure migration and duplicate removal do not advance logical eviction
 watermarks. Host pressure uses the same dependency contract. Under

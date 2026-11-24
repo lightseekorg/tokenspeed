@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <tuple>
 #include <unordered_set>
 #include <vector>
@@ -29,22 +30,39 @@
 #include "cache/coordinator/cache_store.h"
 
 namespace tokenspeed {
-struct CleanHostCopy {
+struct HostCopyVictim {
     std::uint64_t epoch;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> members;
 };
 
+struct HostKvDuplicateCandidate {
+    std::uint32_t group_id;
+    CacheBlockLocation location;
+    std::int32_t boundary_tokens;
+    // Held Device copies precede unheld ones in the legacy placement order.
+    bool device_in_use;
+};
+
+// Device-backed Host KV, excluding pages a sliding window needs in the Host
+// suffix. Shared by segment and block placement; stop when visit returns false.
+void VisitHostKvDuplicateCandidates(const CacheStore& store,
+                                    const std::function<bool(const HostKvDuplicateCandidate&)>& visit);
+
+// Disk-enabled block placement: dead entries, usable Device copies, then
+// Disk-clean copies, before the ordinary dirty candidate traversal.
+std::vector<HostCopyVictim> HostCopiesBeforeDirty(const CacheStore& store);
+
 // Every removed key, including an implicit State cascade, already has a
 // published Disk copy. No new write or capacity promise makes a copy clean.
-inline std::vector<CleanHostCopy> DiskCleanHostCopies(const CacheStore& store) {
-    std::vector<CleanHostCopy> result;
+inline std::vector<HostCopyVictim> DiskCleanHostCopies(const CacheStore& store) {
+    std::vector<HostCopyVictim> result;
     if (!store.DiskPool() || !store.HostPool()) return result;
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> seen;
     for (const auto& group : store.Groups()) {
         group.Index().ForEachEntry(*store.HostPool(), [&](const CacheKey& key, const auto& entry) {
             if (entry.pinned || seen.contains(entry.location) || !group.Index().Contains(*store.DiskPool(), key))
                 return;
-            CleanHostCopy copy{entry.metadata.eviction.last_access_epoch, {{group.Id(), entry.location}}};
+            HostCopyVictim copy{entry.metadata.eviction.last_access_epoch, {{group.Id(), entry.location}}};
             bool clean = true;
             if (store.GroupIsState(group.Id())) {
                 store.ForEachBoundaryKey(key, 0, [&](std::size_t g, const CacheKey& sibling) {

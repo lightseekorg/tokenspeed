@@ -3400,6 +3400,8 @@ class ServerArgs:
             )
 
     def validate(self):
+        # Disaggregation resolution can disable caching (the encode role).
+        self.validate_prefix_cache_eviction()
         self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
@@ -3964,7 +3966,9 @@ class ServerArgs:
             "--prefix-cache-evict-policy",
             choices=("lru", "gds"),
             default=ServerArgs.prefix_cache_evict_policy,
-            help="Device prefix-cache eviction policy. GDS requires State cache groups and explicit prefill cost D E; Host keeps its existing policy.",
+            help="Prefix-cache retention policy. GDS jointly manages Device and "
+            "Host retention and requires State cache groups, prefix caching and "
+            "explicit prefill cost D E. Disk keeps its existing replacement policy.",
         )
         parser.add_argument(
             "--prefix-cache-gds-prefill-cost",

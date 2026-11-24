@@ -75,12 +75,12 @@ public:
     // Whether the operation finished; an unknown operation counts as finished.
     bool Completed(std::uint64_t id) const;
 
-    // Queues Host entries to be cleaned, oldest first. They are checked
-    // again when a cleaning write takes them.
+    // Queues Host entries for legacy cleaning, oldest first. GDS uses the
+    // resident dirty index instead and does not enqueue these notifications.
     void QueueCleaning(std::span<const CacheKey> keys);
-    // Writes the oldest queued keys that are still dirty Host entries, each
-    // with the dirty Host entries of the pages above it, into Disk blocks it
-    // allocates, within the write credits. At most one write per plan.
+    // Selects dirty Host entries in the current policy's order, with their
+    // dirty ancestors, and writes them within the credits. At most one write
+    // per plan; GDS derives candidates from residency, legacy from the queue.
     void StartCleaning();
     // Forgets the queued keys (a flush, a frozen round).
     void DropCleaning();

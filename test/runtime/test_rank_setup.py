@@ -162,6 +162,29 @@ def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
 
 
+def test_default_cache_policy_starts_and_schedules_without_host():
+    args = ServerArgs(model="x", max_num_seqs=8, disable_kvstore=True)
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    request = ts.RequestSpec()
+    request.request_id = "default-policy"
+    request.tokens = list(range(32))
+    request.max_new_tokens = 1
+    scheduler.submit_requests([request])
+    plan = scheduler.next_execution_plan()
+    assert plan.forward[0].request_ids == [request.request_id]
+    assert plan.forward[0].input_lengths == [32]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("role,interval", [("null", 0), ("null", 2), ("prefill", 0)])
 def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interval):
