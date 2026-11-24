@@ -692,6 +692,15 @@ def test_several_requests_share_cus_from_two_rounds(batch, num_workgroups, share
     assert extend._shares_cus(batch, num_workgroups) == shares
 
 
+def _fp8_request_count_case(count: int) -> PagedCase:
+    """count FP8 requests of 2,048 new rows behind 20,000 cached tokens.
+
+    Equal prefixes keep the page-table width, a compile-time stride, fixed as
+    a served page table's is; only the request count varies.
+    """
+    return fp8_case([2048] * count, [20000] * count, heads=32, kv_heads=4)
+
+
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_request_counts_compile_at_warmup():
     """Batches of 1-8 requests cross the shared-CU grid size (at 4 requests
@@ -704,20 +713,15 @@ def test_fp8_request_counts_compile_at_warmup():
     )
     from utils import assert_no_triton_compile
 
-    def case(count):
-        # Equal prefixes keep the page-table width, a compile-time stride,
-        # fixed as a served page table's is; only the request count varies.
-        return fp8_case([2048] * count, [20000] * count, heads=32, kv_heads=4)
-
     with kernel_warmup(enabled=True):
-        case(1).invoke("gluon", return_lse=True)
+        _fp8_request_count_case(1).invoke("gluon", return_lse=True)
     with assert_no_triton_compile(
         gluon_mha_extend_gfx950,
         gluon_mha_extend_split_gfx950,
         gluon_mha_extend_reduce_gfx950,
     ):
         for count in range(1, 9):
-            case(count).invoke("gluon", return_lse=True)
+            _fp8_request_count_case(count).invoke("gluon", return_lse=True)
 
 
 @pytest.mark.usefixtures("require_gfx950")

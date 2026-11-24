@@ -2078,8 +2078,8 @@ def _extend(
         # Compiling needs only their dtype and alignment, not their size.
         mid_o, mid_lse = split_buffers(1, MAX_KV_SPLITS)
         for tile in sorted(tiles):
-            # The options of a batch of several requests, and those of a
-            # one-request batch where they differ.
+            # Both occupancies a launch can take (_shares_cus): the
+            # compiler's and four waves a SIMD, skipping a duplicate set.
             option_sets = []
             for share_cus in (False, True):
                 options = dict(
