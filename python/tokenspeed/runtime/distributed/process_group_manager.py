@@ -161,6 +161,23 @@ class ProcessGroupManager:
         """Return the accelerator collective group for the requested ranks."""
         return self.get_process_group(self._device_backend, group)
 
+    def get_node_local_device_group(self, mapping: Mapping) -> dist.ProcessGroup:
+        """Reuse or create the device group that spans this node's ranks."""
+        first_rank = mapping.rank - mapping.local_rank
+        ranks = tuple(range(first_rank, first_rank + mapping.nprocs_per_node))
+        backend = self._device_backend
+        if not self.has_process_group(backend, ranks):
+            # Node groups are disjoint, so their creation needs no rendezvous
+            # with nonmembers or matching group-creation order across nodes.
+            group = dist.new_group(
+                ranks,
+                backend=backend,
+                timeout=self._pg_timeout,
+                use_local_synchronization=True,
+            )
+            self.register_process_group(backend, ranks, group)
+        return self.get_device_process_group(ranks)
+
     def has_process_group(
         self, backend: str, group: Group, *, name: str | None = None
     ) -> bool:

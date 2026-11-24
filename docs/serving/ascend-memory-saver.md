@@ -71,9 +71,13 @@ export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
 Follow the [native build and host ABI instructions](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-kernel-npu/memory-saver/README.md#build-and-abi)
-before launch. Ascend requires protocol 3 and matching host/runtime modules;
+before launch. Ascend requires saver ABI 3, protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
 automatic, including with Memory Saver disabled.
+
+When multiple Atlas A3 ranks share a server, the runtime requires HCCL's four
+VMM range and activation APIs. It binds the server-local group before loading
+weights, including for AIV. Atlas A2 uses the existing ACL VMM path.
 
 Keep backend autoload enabled. Leave `PYTORCH_NO_NPU_MEMORY_CACHING` unset or
 `0`; bypassing the caching allocator bypasses managed pools and is rejected.

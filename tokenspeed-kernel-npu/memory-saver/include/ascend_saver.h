@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #ifdef SAVER_FAKE_ACL
 #include "fake_acl.h"
 #else
@@ -17,7 +18,7 @@
 extern "C" {
 #endif
 
-/* ABI v2. Bind the worker's NPU device before calling any mutating API.
+/* ABI v3. Bind the worker's NPU device before calling any mutating API.
  * The caller must stop new launches/allocations and wait for all prior users
  * before pause/resume. Final free synchronizes the current device before
  * unmapping; the owner must still prevent new uses of the released storage.
@@ -30,6 +31,21 @@ SAVER_API int saver_abi_version(void);
  * Allocation/pause/resume fail closed. Explicit release/cleanup remain allowed.
  */
 SAVER_API int saver_has_callback_fault(void);
+/* Register VMM before any managed allocation. The supplied local HCCL
+ * communicator and functions must stay alive until saver_close_hccl succeeds.
+ * configure is collective across the communicator once; allocation callbacks
+ * only use the already-established memory domain afterwards.
+ */
+typedef int (*saver_hccl_set_range_fn)(void *, void *, size_t, size_t, uint64_t);
+typedef int (*saver_hccl_unset_range_fn)(void *, void *);
+typedef int (*saver_hccl_activate_fn)(void *, void *, size_t, size_t, aclrtDrvMemHandle, uint64_t);
+typedef int (*saver_hccl_deactivate_fn)(void *, void *);
+SAVER_API int saver_configure_hccl(void *comm, saver_hccl_set_range_fn set_range,
+    saver_hccl_unset_range_fn unset_range, saver_hccl_activate_fn activate,
+    saver_hccl_deactivate_fn deactivate);
+/* Drain users first. Must finish before the communicator is destroyed. */
+SAVER_API int saver_close_hccl(void);
+
 SAVER_API void *weights_malloc(size_t size, int device, aclrtStream stream);
 SAVER_API void *weights_backup_malloc(size_t size, int device, aclrtStream stream);
 SAVER_API void *weights_discard_malloc(size_t size, int device, aclrtStream stream);

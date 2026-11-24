@@ -10,7 +10,7 @@ are owned by the design document.
 ## Build and ABI
 
 Load the deployment's CANN toolkit environment. Build with CMake 3.18+ and a
-C++17 compiler against its `acl_rt`. The adapter requires saver ABI 2;
+C++17 compiler against its `acl_rt`. The adapter requires saver ABI 3;
 Ascend serving also needs a matching runtime/`ts-host` with protocol 3.
 
 ```bash
@@ -65,3 +65,12 @@ cmake -S tokenspeed-kernel-npu/memory-saver -B /tmp/ascend-saver-test \
 cmake --build /tmp/ascend-saver-test
 ctest --test-dir /tmp/ascend-saver-test --output-on-failure
 ```
+
+
+Multi-rank Atlas A3 serving also binds HCCL's SetMemoryRange,
+ActivateCommMemory, DeactivateCommMemory and UnsetMemoryRange functions from the
+worker's installed HCCL. The host retains that library and communicator through
+`saver_close_hccl()`. Managed allocations are registered before first use, including
+segments later reused by different tensors. Pause drops the physical registration
+before unmap, and resume reactivates the new handle at the original virtual address.
+Retention policies are unchanged; communicator-owned buffers remain resident.

@@ -24,10 +24,10 @@ import ctypes
 import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import torch
 
@@ -42,6 +42,9 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
     TorchMemorySaverAdapter,
     _defer_communication_initializers,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.mapping import Mapping
 
 
 def _check_caching_allocator() -> None:
@@ -70,12 +73,13 @@ class NativeBackend:
     def __init__(self, library: str):
         self.library = ctypes.CDLL(library)
         self._trimmed_tags: set[str] = set()
+        self._hccl_library: ctypes.CDLL | None = None
         self.library.saver_abi_version.argtypes = []
         self.library.saver_abi_version.restype = ctypes.c_int
         self.library.saver_has_callback_fault.argtypes = []
         self.library.saver_has_callback_fault.restype = ctypes.c_int
-        if self.library.saver_abi_version() != 2:
-            raise RuntimeError("Rebuild the Ascend memory saver library for ABI 2")
+        if self.library.saver_abi_version() != 3:
+            raise RuntimeError("Rebuild the Ascend memory saver library for ABI 3")
         for name in ("saver_pause", "saver_resume"):
             operation = getattr(self.library, name)
             operation.argtypes = [ctypes.c_char_p]
@@ -84,6 +88,32 @@ class NativeBackend:
             operation = getattr(self.library, name)
             operation.argtypes = []
             operation.restype = ctypes.c_char_p
+
+    def configure_hccl(self, communicator: int) -> None:
+        self._hccl_library = ctypes.CDLL("libhccl.so")
+        configure = self.library.saver_configure_hccl
+        configure.argtypes = [ctypes.c_void_p] * 5
+        configure.restype = ctypes.c_int
+        functions = (
+            "HcclCommSetMemoryRange",
+            "HcclCommUnsetMemoryRange",
+            "HcclCommActivateCommMemory",
+            "HcclCommDeactivateCommMemory",
+        )
+        addresses = [
+            ctypes.cast(getattr(self._hccl_library, name), ctypes.c_void_p)
+            for name in functions
+        ]
+        if configure(communicator, *addresses) != 0:
+            raise RuntimeError(self.library.saver_last_error().decode(errors="replace"))
+
+    def close_hccl(self) -> None:
+        close = self.library.saver_close_hccl
+        close.argtypes = []
+        close.restype = ctypes.c_int
+        if close() != 0:
+            raise RuntimeError(self.library.saver_last_error().decode(errors="replace"))
+        self._hccl_library = None
 
     def check_health(self) -> None:
         if self.library.saver_has_callback_fault():
@@ -148,6 +178,7 @@ class DeviceState:
         self.device = device
         self.library_path = _library_path()
         self.native = NativeBackend(self.library_path)
+        self.hccl_group: "torch.distributed.ProcessGroup | None" = None
         self.state = PoolState(
             backend=self.native, make_pool=self.make_pool, synchronize=self.synchronize
         )
@@ -183,6 +214,31 @@ _state_lock = RLock()
 class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
     supports_replica_memory_transitions: ClassVar[bool] = True
 
+    @classmethod
+    def configure_node_hccl(
+        cls,
+        mapping: "Mapping",
+        *,
+        emulate_rank_zero: bool,
+        on_startup_failure: ExitStack,
+    ) -> Self | None:
+        """Bind the A3 saver to an existing or new node-local HCCL group."""
+        if emulate_rank_zero or mapping.nprocs_per_node == 1:
+            return None
+        device_name = torch.npu.get_device_properties(mapping.gpu_id).name
+        if not device_name.startswith(("Ascend910_93", "Ascend910C")):
+            return None
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_node_local_device_group(mapping)
+        saver = cls()
+        # A failed configure can already own resources in this group.
+        on_startup_failure.callback(saver.close_hccl)
+        saver.configure_hccl(group)
+        return saver
+
     def _state(self) -> DeviceState:
         pid = os.getpid()
         device = torch.npu.current_device()
@@ -196,6 +252,33 @@ class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
             )
         state.native.check_health()
         return state
+
+    def configure_hccl(self, group: "torch.distributed.ProcessGroup") -> None:
+        """Bind a local HCCL domain before managed allocations can be registered implicitly."""
+        import torch.distributed as dist
+
+        state = self._state()
+        with _state_lock:
+            if state.hccl_group is not None:
+                raise RuntimeError("HCCL memory registration is already configured")
+            marker = torch.ones(
+                1, dtype=torch.float32, device=torch.device("npu", state.device)
+            )
+            dist.all_reduce(marker, group=group)
+            state.synchronize()
+            backend = group._get_backend(marker.device)
+            state.hccl_group = group  # Keep the communicator alive through cleanup.
+            state.native.configure_hccl(backend.get_hccl_comm(state.device))
+
+    def close_hccl(self) -> None:
+        """Detach ranges while the communicator is alive, including on failed cleanup."""
+        # Cleanup must remain available after an allocator callback fault.
+        with _state_lock:
+            state = _states.get(os.getpid())
+            if state is not None and state.hccl_group is not None:
+                state.synchronize()
+                state.native.close_hccl()
+                state.hccl_group = None
 
     @contextmanager
     def configure_subprocess(self):

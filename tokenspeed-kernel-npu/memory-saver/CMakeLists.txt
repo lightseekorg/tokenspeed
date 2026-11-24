@@ -14,6 +14,7 @@ if(SAVER_FAKE_ACL)
   target_include_directories(${saver_target} PRIVATE tests)
   enable_testing()
   add_test(NAME saver_state_tests COMMAND ${saver_target})
+  add_test(NAME saver_hccl_callback_failure COMMAND ${saver_target} hccl-callback)
   # Each callback fault is terminal for its process.
   add_test(NAME saver_void_free_wrong_context COMMAND ${saver_target} wrong-context)
   add_test(NAME saver_void_free_wrong_device COMMAND ${saver_target} wrong-device)

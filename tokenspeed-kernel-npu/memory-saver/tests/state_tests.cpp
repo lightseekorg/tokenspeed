@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #define REQUIRE(condition) do { if (!(condition)) throw std::runtime_error( \
   std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " #condition \
@@ -28,6 +29,131 @@ void expect_pattern(void *ptr, size_t size, unsigned char value) {
   for (size_t i = 0; i < size; ++i) REQUIRE(bytes[i] == value);
 }
 
+
+std::unordered_map<void *, bool> hccl_ranges;
+std::string hccl_fail;
+size_t hccl_deactivations = 0;
+int hccl_result(const char *name) {
+  if (hccl_fail != name) return 0;
+  hccl_fail.clear();
+  return 41;
+}
+int hccl_set(void *, void *ptr, size_t, size_t, uint64_t) {
+  if (int result = hccl_result("set")) return result;
+  if (!hccl_ranges.emplace(ptr, false).second) return 42;
+  return 0;
+}
+int hccl_unset(void *, void *ptr) {
+  if (int result = hccl_result("unset")) return result;
+  auto it = hccl_ranges.find(ptr);
+  if (it == hccl_ranges.end() || it->second) return 43;
+  hccl_ranges.erase(it);
+  return 0;
+}
+int hccl_activate(void *, void *ptr, size_t, size_t, aclrtDrvMemHandle handle, uint64_t) {
+  if (int result = hccl_result("activate")) return result;
+  auto it = hccl_ranges.find(ptr);
+  if (it == hccl_ranges.end() || it->second || !handle || !fake_acl::live_physical()) return 44;
+  it->second = true;
+  return 0;
+}
+int hccl_deactivate(void *, void *ptr) {
+  if (int result = hccl_result("deactivate")) return result;
+  auto it = hccl_ranges.find(ptr);
+  if (it == hccl_ranges.end() || !it->second) return 45;
+  it->second = false;
+  ++hccl_deactivations;
+  return 0;
+}
+void configure_hccl() {
+  ok(saver_configure_hccl(&hccl_ranges, hccl_set, hccl_unset, hccl_activate, hccl_deactivate));
+  REQUIRE(hccl_ranges.empty()); // Priming is balanced before allocation callbacks.
+  REQUIRE(fake_acl::live_reservations() == 0);
+}
+void hccl_graph_lifetime() {
+  reset();
+  REQUIRE(saver_configure_hccl(nullptr, hccl_set, hccl_unset, hccl_activate, hccl_deactivate) != 0);
+  configure_hccl();
+  void *p = graph_backup_malloc(7000, 0, nullptr); REQUIRE(p);
+  void *w = weights_backup_malloc(9000, 0, nullptr); REQUIRE(w);
+  REQUIRE(hccl_ranges.size() == 2 && hccl_ranges.at(p) && hccl_ranges.at(w));
+  REQUIRE(stat_has("\"hccl_active\":true"));
+  pattern(w, 9000, 0x5b);
+  ok(saver_pause("weights"));
+  REQUIRE(!hccl_ranges.at(w) && hccl_ranges.at(p));
+  ok(saver_resume("weights"));
+  expect_pattern(w, 9000, 0x5b);
+  REQUIRE(hccl_ranges.at(w));
+  REQUIRE(saver_configure_hccl(&hccl_ranges, hccl_set, hccl_unset, hccl_activate, hccl_deactivate) != 0);
+  for (int i = 0; i < 3; ++i) {
+    pattern(p, 7000, static_cast<unsigned char>(10 + i));
+    ok(saver_pause("acl_graph"));
+    REQUIRE(!hccl_ranges.at(p) && fake_acl::live_physical() == 1);
+    ok(saver_resume("acl_graph"));
+    REQUIRE(hccl_ranges.at(p));
+    expect_pattern(p, 7000, static_cast<unsigned char>(10 + i));
+  }
+  ok(saver_release(w));
+  ok(saver_close_hccl());
+  REQUIRE(hccl_ranges.empty());
+  const auto deactivations = hccl_deactivations;
+  ok(saver_release(p)); // The PG can be gone; free cannot call it again.
+  REQUIRE(hccl_deactivations == deactivations);
+  reset();
+  p = graph_discard_malloc(5, 0, nullptr); REQUIRE(p);
+  REQUIRE(saver_configure_hccl(&hccl_ranges, hccl_set, hccl_unset, hccl_activate, hccl_deactivate) != 0);
+  ok(saver_release(p));
+}
+void hccl_callback_failure_is_terminal() {
+  reset(); configure_hccl();
+  void *p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
+  hccl_fail = "deactivate";
+  const auto unmaps = fake_acl::calls("aclrtUnmapMem");
+  saver_free(p, 7000, 0, nullptr);
+  REQUIRE(saver_has_callback_fault() == 1);
+  REQUIRE(fake_acl::calls("aclrtUnmapMem") == unmaps);
+  REQUIRE(saver_pause("acl_graph") != 0);
+  ok(saver_close_hccl()); // Cleanup remains legal after the callback fault.
+  ok(saver_collect_failed());
+  REQUIRE(hccl_ranges.empty() && fake_acl::live_physical() == 0);
+  REQUIRE(saver_has_callback_fault() == 1);
+}
+void hccl_failure_boundaries() {
+  reset(); configure_hccl();
+  for (const char *api : {"set", "activate"}) {
+    hccl_fail = api;
+    REQUIRE(!graph_discard_malloc(7000, 0, nullptr));
+    REQUIRE(hccl_ranges.empty() && fake_acl::live_physical() == 0);
+    REQUIRE(saver_has_callback_fault() == 0);
+  }
+  void *p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
+  const auto unmaps = fake_acl::calls("aclrtUnmapMem");
+  hccl_fail = "deactivate";
+  REQUIRE(saver_pause("acl_graph") != 0);
+  REQUIRE(hccl_ranges.at(p));
+  REQUIRE(fake_acl::calls("aclrtUnmapMem") == unmaps);
+  REQUIRE(!graph_discard_malloc(1, 0, nullptr));
+  ok(saver_pause("acl_graph"));
+  hccl_fail = "activate";
+  REQUIRE(saver_resume("acl_graph") != 0);
+  REQUIRE(!hccl_ranges.at(p));
+  REQUIRE(!graph_discard_malloc(1, 0, nullptr));
+  ok(saver_resume("acl_graph"));
+  const auto before_free = fake_acl::calls("aclrtUnmapMem");
+  hccl_fail = "unset";
+  REQUIRE(saver_release(p) != 0);
+  REQUIRE(fake_acl::calls("aclrtUnmapMem") == before_free);
+  ok(saver_collect_failed());
+  REQUIRE(hccl_ranges.empty());
+  p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
+  hccl_fail = "unset";
+  REQUIRE(saver_close_hccl() != 0);
+  REQUIRE(hccl_ranges.count(p) == 1);
+  ok(saver_close_hccl());
+  ok(saver_release(p));
+  reset();
+}
+
 void policy_roundtrips() {
   struct Policy {
     const char *tag;
@@ -39,7 +165,7 @@ void policy_roundtrips() {
            Policy{"acl_graph", graph_backup_malloc, true},
            Policy{"acl_graph", graph_discard_malloc, false}}) {
     reset();
-    REQUIRE(saver_abi_version() == 2);
+    REQUIRE(saver_abi_version() == 3);
     constexpr size_t n = 7000;
     void *ptr = policy.allocate(n, 0, nullptr); REQUIRE(ptr);
     REQUIRE(stat_has("\"aligned_bytes\":8192"));
@@ -310,7 +436,9 @@ int main(int argc, char **argv) {
   try {
     if (argc == 2) {
       const std::string scenario = argv[1];
-      if (scenario == "malloc-rollback") {
+      if (scenario == "hccl-callback") {
+        hccl_callback_failure_is_terminal();
+      } else if (scenario == "malloc-rollback") {
         allocation_rollback_fault_is_terminal();
       } else {
         REQUIRE(scenario == "wrong-context" || scenario == "wrong-device");
@@ -320,6 +448,8 @@ int main(int argc, char **argv) {
       return 0;
     }
     REQUIRE(argc == 1);
+    hccl_graph_lifetime();
+    hccl_failure_boundaries();
     policy_roundtrips();
     default_policies_tags_and_paused_free();
     pause_failure_matrix();
@@ -333,7 +463,7 @@ int main(int argc, char **argv) {
     REQUIRE(fake_acl::live_reservations() == 0);
     REQUIRE(fake_acl::live_physical() == 0);
     REQUIRE(fake_acl::live_host() == 0);
-    std::cout << "PASS: 9 state-machine scenarios with API failure matrices; no fake resources leaked\n";
+    std::cout << "PASS: state-machine scenarios including HCCL VMM with API failure matrices; no fake resources leaked\n";
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "FAIL: " << e.what() << '\n'; return 1;

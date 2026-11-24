@@ -32,6 +32,12 @@ captured graphs may explicitly share a compatible pool or own independent
 scopes. A graph handle alone does not define shared storage. Pool ownership
 survives capture and out-of-scope frees.
 
+On Atlas A3, each managed VMM segment is registered with the server-local HCCL
+group before a collective can use it. This also covers slices reused by other
+operators. Pause deactivates the segment before unmapping. Resume activates the
+new physical handle at the original address before replay. The range stays
+registered until final free or shutdown, while the communicator is still alive.
+
 Named persistent-region aliases, including aliases from different adapter
 instances, reuse the active pool under the shared worker lock. Other nested
 allocation scopes are invalid. Communication initialization is deferred until

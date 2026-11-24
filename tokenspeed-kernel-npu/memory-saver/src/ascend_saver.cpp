@@ -21,7 +21,7 @@ enum class Tag { Weights, KV, Graph };
 enum class Policy { Backup, Discard };
 enum class Phase { Active, Pausing, Paused, Resuming, Releasing };
 constexpr uint64_t kHugePageReservation = 1;
-constexpr int kSaverAbiVersion = 2;
+constexpr int kSaverAbiVersion = 3;
 thread_local char last_error[2048] = {};
 
 const char *tag_name(Tag t) {
@@ -105,6 +105,8 @@ struct Block {
   bool contents_valid = false;
   void *shadow = nullptr;
   bool shadow_valid = false;
+  bool hccl_range = false;
+  bool hccl_active = false;
 };
 
 class Backend {
@@ -117,6 +119,70 @@ public:
   aclrtContext bound_context = nullptr;
   int32_t bound_device = -1;
   std::list<Block> blocks;
+  void *hccl_comm = nullptr;
+  saver_hccl_set_range_fn hccl_set_range = nullptr;
+  saver_hccl_unset_range_fn hccl_unset_range = nullptr;
+  saver_hccl_activate_fn hccl_activate = nullptr;
+  saver_hccl_deactivate_fn hccl_deactivate = nullptr;
+
+  static void check_hccl(int result, const char *api) {
+    if (result != 0) throw std::runtime_error(std::string(api) + " failed, HcclResult=" + std::to_string(result));
+  }
+  void activate_communication(Block &b) {
+    if (!hccl_comm) return;
+    if (!b.hccl_range) {
+      check_hccl(hccl_set_range(hccl_comm, b.va, b.size, 0, 0), "HcclCommSetMemoryRange");
+      b.hccl_range = true;
+    }
+    if (!b.hccl_active) {
+      check_hccl(hccl_activate(hccl_comm, b.va, b.size, 0, b.handle, 0), "HcclCommActivateCommMemory");
+      b.hccl_active = true;
+    }
+  }
+  void deactivate_communication(Block &b) {
+    if (b.hccl_active) {
+      check_hccl(hccl_deactivate(hccl_comm, b.va), "HcclCommDeactivateCommMemory");
+      b.hccl_active = false;
+    }
+  }
+  void unregister_communication(Block &b) {
+    deactivate_communication(b);
+    if (b.hccl_range) {
+      check_hccl(hccl_unset_range(hccl_comm, b.va), "HcclCommUnsetMemoryRange");
+      b.hccl_range = false;
+    }
+  }
+  void configure_hccl(void *comm, saver_hccl_set_range_fn set_range,
+      saver_hccl_unset_range_fn unset_range, saver_hccl_activate_fn activate,
+      saver_hccl_deactivate_fn deactivate) {
+    require_healthy();
+    verify_context();
+    if (!comm || !set_range || !unset_range || !activate || !deactivate)
+      throw std::runtime_error("HCCL VMM requires a communicator and all four memory APIs");
+    if (hccl_comm || !blocks.empty())
+      throw std::runtime_error("configure HCCL once, before managed allocations");
+    hccl_comm = comm;
+    hccl_set_range = set_range;
+    hccl_unset_range = unset_range;
+    hccl_activate = activate;
+    hccl_deactivate = deactivate;
+    // The first SetMemoryRange establishes links collectively. Prime it outside
+    // PTA allocation/capture callbacks, before ranks can diverge in allocation.
+    void *probe = allocate(1, bound_device, Tag::Graph, Policy::Discard);
+    release(probe, std::nullopt);
+  }
+  void close_hccl() {
+    if (!hccl_comm) return;
+    verify_context();
+    checked(aclrtSynchronizeDevice(), "aclrtSynchronizeDevice before HCCL detach");
+    for (auto &b : blocks) unregister_communication(b);
+    hccl_comm = nullptr;
+    hccl_set_range = nullptr;
+    hccl_unset_range = nullptr;
+    hccl_activate = nullptr;
+    hccl_deactivate = nullptr;
+  }
+
   // Control state outlives individual segments: allocation into a paused tag
   // must fail even when the tag currently has no live allocations.
   std::array<bool, 3> paused_tags{{false, false, false}};
@@ -171,6 +237,7 @@ public:
   }
   void release_block(Block &b) {
     b.phase = Phase::Releasing;
+    unregister_communication(b);
     if (b.mapped) {
       checked(aclrtUnmapMem(b.va), "aclrtUnmapMem");
       b.mapped = false;
@@ -229,6 +296,7 @@ public:
       b.reserved = true;
       create_physical(b);
       map(b);
+      activate_communication(b);
       b.contents_valid = true; // malloc semantics: uninitialized, but usable.
       b.phase = Phase::Active;
       return b.va;
@@ -259,6 +327,7 @@ public:
       copy_complete(b.shadow, b.va, b.size, ACL_MEMCPY_DEVICE_TO_HOST);
       b.shadow_valid = true;
     }
+    deactivate_communication(b);
     if (b.mapped) {
       checked(aclrtUnmapMem(b.va), "aclrtUnmapMem");
       b.mapped = false;
@@ -297,6 +366,7 @@ public:
       b.shadow = nullptr;
       b.shadow_valid = false;
     }
+    activate_communication(b);
     b.phase = Phase::Active;
   }
 
@@ -399,6 +469,8 @@ public:
           << ",\"reserved\":" << (b.reserved ? "true" : "false")
           << ",\"physical_live\":" << (b.has_handle ? "true" : "false")
           << ",\"mapped\":" << (b.mapped ? "true" : "false")
+          << ",\"hccl_range\":" << (b.hccl_range ? "true" : "false")
+          << ",\"hccl_active\":" << (b.hccl_active ? "true" : "false")
           << ",\"contents_valid\":" << (b.contents_valid ? "true" : "false")
           << ",\"backup_valid\":" << (b.shadow_valid ? "true" : "false") << '}';
     }
@@ -453,6 +525,12 @@ void saver_free(void *ptr, size_t, int device, aclrtStream) {
     catch (...) { b.latch_callback_fault("unknown exception in raw free callback"); throw; }
   });
 }
+int saver_configure_hccl(void *comm, saver_hccl_set_range_fn set_range,
+    saver_hccl_unset_range_fn unset_range, saver_hccl_activate_fn activate,
+    saver_hccl_deactivate_fn deactivate) {
+  return invoke([&](Backend &b) { b.configure_hccl(comm, set_range, unset_range, activate, deactivate); });
+}
+int saver_close_hccl(void) { return invoke([&](Backend &b) { b.close_hccl(); }); }
 int saver_pause(const char *tag) { return invoke([&](Backend &b) { b.control(tag, true); }); }
 int saver_resume(const char *tag) { return invoke([&](Backend &b) { b.control(tag, false); }); }
 int saver_release(void *ptr) { return invoke([&](Backend &b) { b.release(ptr, std::nullopt); }); }
@@ -466,7 +544,7 @@ const char *saver_stats(void) {
     result = b.stats();
     return result.c_str();
   } catch (...) {
-    return "{\"abi_version\":2,\"stats_error\":\"cannot build statistics\"}";
+    return "{\"abi_version\":3,\"stats_error\":\"cannot build statistics\"}";
   }
 }
 } // extern C

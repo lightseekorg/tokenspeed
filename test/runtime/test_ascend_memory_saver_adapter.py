@@ -25,11 +25,11 @@ import importlib.util
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, local
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -105,7 +105,7 @@ class CpuNativeLibrary:
         self.fault = False
         self.fail_pause = False
         self.blocks = []
-        self.saver_abi_version = CpuFunction(lambda: 2)
+        self.saver_abi_version = CpuFunction(lambda: 3)
         self.saver_has_callback_fault = CpuFunction(lambda: int(self.fault))
         self.saver_last_error = CpuFunction(lambda: b"injected native pause failure")
         self.saver_stats = CpuFunction(
@@ -762,3 +762,62 @@ def test_caching_mode_can_configure_subprocess(
     monkeypatch.setenv("TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY", str(library))
     with adapter_module.AscendMemorySaverAdapter().configure_subprocess():
         pass
+
+
+@pytest.mark.parametrize("device_name", ["Ascend910B3", "Ascend910_9382"])
+@pytest.mark.parametrize("reuse", [True, False])
+def test_local_hccl_lifetime(monkeypatch, device_name, reuse):
+    # Load the real topology and group manager without importing accelerator kernels.
+    dist_dir = (
+        Path(__file__).resolve().parents[2] / "python/tokenspeed/runtime/distributed"
+    )
+    for name in ("mapping", "process_group_manager"):
+        key = f"tokenspeed.runtime.distributed.{name}"
+        spec = importlib.util.spec_from_file_location(key, dist_dir / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, key, module)
+        spec.loader.exec_module(module)
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    _, _, module = saver_modules(monkeypatch)
+    mapping = Mapping(rank=5, world_size=8, nprocs_per_node=4)
+    ranks = (4, 5, 6, 7)
+    manager = ProcessGroupManager()
+    manager._device_backend = "hccl"
+    manager_module = sys.modules["tokenspeed.runtime.distributed.process_group_manager"]
+    monkeypatch.setattr(manager_module, "process_group_manager", manager)
+    group = object()
+    if reuse:
+        manager.register_process_group("hccl", ranks, group)
+
+    def local_group(members, *, backend, timeout, use_local_synchronization):
+        assert device_name != "Ascend910B3" and not reuse
+        assert members == ranks and use_local_synchronization and backend == "hccl"
+        return group
+
+    monkeypatch.setattr(torch.distributed, "new_group", local_group)
+    properties = SimpleNamespace(name=device_name)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(get_device_properties=lambda _: properties),
+        raising=False,
+    )
+
+    class Saver(module.AscendMemorySaverAdapter):
+        def configure_hccl(self, pg):
+            self.group = pg
+
+        def close_hccl(self):
+            self.group = None
+
+    with ExitStack() as cleanup:
+        saver = Saver.configure_node_hccl(
+            mapping, emulate_rank_zero=False, on_startup_failure=cleanup
+        )
+        if device_name == "Ascend910B3":
+            assert saver is None
+            return
+        assert saver.group is group
+    assert saver.group is None
