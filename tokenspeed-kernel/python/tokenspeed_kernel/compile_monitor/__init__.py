@@ -46,17 +46,25 @@ monitor is installed: :func:`is_serving` turns true, and a kernel whose library
 compiles once per batch shape -- with no compile key this package can bucket --
 runs only before then. Afterwards its callers take another
 implementation; CUDA graphs captured during startup keep what they recorded.
+
+Triton JSON-encodes constexpr values for its compile hooks. Gluon kernels pass
+compile-time configuration objects as constexprs, and those objects hold
+compiler state with no JSON form. While the monitor is installed, such objects
+are recorded in the hook payload by their stable ``cache_key`` instead, which
+is the identity Triton already uses to specialize the kernel.
 """
 
 from __future__ import annotations
 
+import functools
+import importlib
 import importlib.util
 import logging
 import os
 import sys
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -412,6 +420,29 @@ def _call_site() -> str:
     return f"{os.sep.join(path[-3:])}:{frame.f_lineno} ({frame.f_code.co_name})"
 
 
+def _serialize_gluon_constants(serializer: Callable[..., str]) -> Callable[..., str]:
+    """Wrap a hook serializer so Gluon compile-time objects use their cache key.
+
+    Gluon marks its compile-time objects with ``__triton_builtin__``. Their
+    ``cache_key`` identifies the specialization and is a string, so it can
+    stand in for an object that Triton cannot JSON-encode.
+    """
+
+    @functools.wraps(serializer)
+    def serialize(name, signature, constants, attrs, options, key, target):
+        encoded = {}
+        for param, value in constants.items():
+            if getattr(type(value), "__triton_builtin__", False) and isinstance(
+                value.cache_key, str
+            ):
+                encoded[param] = {"constexpr": value.cache_key}
+            else:
+                encoded[param] = value
+        return serializer(name, signature, encoded, attrs, options, key, target)
+
+    return serialize
+
+
 class _Hooks:
     """Triton's pre- and post-compile hooks, chained onto earlier ones."""
 
@@ -419,7 +450,17 @@ class _Hooks:
         self.monitor = monitor
         self.previous_cache_hook = triton.knobs.runtime.jit_cache_hook
         self.previous_post_compile_hook = triton.knobs.runtime.jit_post_compile_hook
+        self.jit_module = importlib.import_module(f"{triton.__name__}.runtime.jit")
+        self.previous_serializer = self.jit_module.serialize_specialization_data
         self._started: dict[tuple[int, int, str], float] = {}
+
+    def install_serializer(self) -> None:
+        self.jit_module.serialize_specialization_data = _serialize_gluon_constants(
+            self.previous_serializer
+        )
+
+    def restore_serializer(self) -> None:
+        self.jit_module.serialize_specialization_data = self.previous_serializer
 
     def _timer_key(self, fn: Any, key: str) -> tuple[int, int, str]:
         return threading.get_ident(), id(fn.jit_function), key
@@ -475,6 +516,7 @@ def install_compile_monitor(on_violation: OnViolation) -> None:
         return
     uninstall_compile_monitor()
     _hooks = _Hooks(CompileMonitor(on_violation, UNBOUNDED_VALUE_LIMIT))
+    _hooks.install_serializer()
     triton.knobs.runtime.jit_cache_hook = _hooks.cache_hook
     triton.knobs.runtime.jit_post_compile_hook = _hooks.post_compile_hook
     if not has_optional_package("cutlass"):
@@ -497,6 +539,7 @@ def uninstall_compile_monitor() -> None:
         _cute_dsl_hooks = None
     if _hooks is None:
         return
+    _hooks.restore_serializer()
     triton.knobs.runtime.jit_cache_hook = _hooks.previous_cache_hook
     triton.knobs.runtime.jit_post_compile_hook = _hooks.previous_post_compile_hook
     _hooks = None
