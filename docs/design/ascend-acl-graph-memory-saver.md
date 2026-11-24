@@ -98,10 +98,14 @@ main thread-state after Python log cleanup and before native exit handlers
 run, including when Memory Saver is disabled.
 Before native exit, NPU workers explicitly close process groups: the host skips
 Python atexit, where PTA normally performs this cleanup.
-Build and ABI details belong to the [native README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/0d3a5977a5d354ef9821b41f4fba64151d578499/native/README.md).
+Atlas A3 workers with the saver enabled and local peers bind the saver to the
+node-local HCCL group before profiling device memory or allocating model
+storage. Saver-owned ranges detach before the group is destroyed.
+Build and ABI details belong to the [native README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/95b6ee6f67e1fa2d4ca2357ffeba7fc9eeb972c0/native/README.md).
 
 The runtime and native host in this change provide the complete protocol 3
-transition interface. Ascend uses `acl_graph`; its HCCL allocations remain resident.
+transition interface. Ascend uses `acl_graph`; its communicator-owned HCCL
+allocations remain resident.
 CUDA and ROCm continue to use protocol 2.
 
 Future HCCL work must investigate releasing communicator-owned buffer backing

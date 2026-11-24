@@ -60,21 +60,22 @@ Triton-Ascend 3.2.1 and Transformers 5.12.0.
 export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-9.0.0
 source "$TOKENSPEED_CANN_ROOT/set_env.sh"
 TOKENSPEED_TVM_FFI_VERSION=0.1.13.post3 bash test/ci_system/install_triton_ascend.sh
-TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
-  -e ./tokenspeed-kernel/python ./tokenspeed-engine -e ./python
 
-# Compile the published source package against the configured CANN toolkit.
-python -m pip install --no-deps torch-npu-memory-saver==0.1.1
+# Build the pinned saver source against the configured CANN toolkit.
+python -m pip install --no-deps \
+  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@95b6ee6f67e1fa2d4ca2357ffeba7fc9eeb972c0"
+TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
+  -e ./tokenspeed-kernel/python ./tokenspeed-engine -e './python[ascend-memory-saver]'
 export TORCH_DEVICE_BACKEND_AUTOLOAD=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
 export TORCH_HCCL_ZERO_COPY=0
 export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-The package locates its bundled allocator (ABI 2) automatically. See the
-[package installation instructions](https://pypi.org/project/torch-npu-memory-saver/0.1.1/)
-for the required compiler and CMake. The `ascend-memory-saver` extra also
-selects this version when installing TokenSpeed with dependency resolution.
+The pinned saver source installs version `0.1.3` and its matching ABI 3
+allocator. Install it before the TokenSpeed `ascend-memory-saver` extra.
+See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/95b6ee6f67e1fa2d4ca2357ffeba7fc9eeb972c0/README.md)
+for compiler and CMake requirements.
 Ascend requires protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
 automatic, including with Memory Saver disabled.
@@ -112,11 +113,14 @@ tokenspeed serve "$CHECKPOINT_A" \
 | `kv_cache` | Discard shared target/draft device KV; clear and synchronize on wake. |
 | `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also discards resident device KV. Graph-only wake keeps KV asleep. |
 
-Persistent backup consumes pinned host memory and adds transfer time. HCCL and
-its workspaces stay resident with the default `TORCH_HCCL_ZERO_COPY=0`;
-explicitly registered communication windows also have resident storage. Measure
-reclaimed memory with driver free-memory readings: virtual reservation counters
-can stay high. Free the trainer's device allocations before restoring serving.
+Persistent backup consumes pinned host memory and adds transfer time. HCCL
+communicators and their workspaces stay resident. On Atlas A3, the saver uses
+the node-local HCCL group to register managed memory when there are multiple
+local ranks. The library deactivates and reactivates that backing as the
+existing memory tags pause and resume. This path requires the HCCL VMM
+registration API. Measure reclaimed memory with driver free-memory readings:
+virtual reservation counters can stay high. Free the trainer's device
+allocations before restoring serving.
 
 ## One checkpoint cycle
 

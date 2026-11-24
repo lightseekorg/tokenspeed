@@ -22,7 +22,7 @@
 
 import importlib.util
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -54,6 +54,18 @@ class RecordingNpuSaver:
         self.active = False
         self.inventory = None
         self.scopes = []
+        self.hccl_group = None
+
+    def configure_hccl(self, group):
+        self.hccl_group = group
+        group.registered = True
+        if group.fail_registration:
+            raise RuntimeError("HCCL registration failed after acquiring the buffer")
+
+    def close_hccl(self):
+        if self.hccl_group is not None:
+            self.hccl_group.registered = False
+            self.hccl_group = None
 
     def region(self, tag, enable_cpu_backup):
         policy = (
@@ -88,17 +100,23 @@ def saver_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_memory_saver", None)
 
     # Load the adapter in isolation from the rest of the accelerator runtime.
-    source = Path(__file__).resolve().parents[2] / "python/tokenspeed/runtime/utils"
+    source = Path(__file__).resolve().parents[2] / "python/tokenspeed/runtime"
     modules = []
-    for name in ("torch_memory_saver_adapter", "ascend_memory_saver_adapter"):
-        module_name = f"tokenspeed.runtime.utils.{name}"
+    for name in (
+        "distributed.mapping",
+        "distributed.process_group_manager",
+        "utils.torch_memory_saver_adapter",
+        "utils.ascend_memory_saver_adapter",
+    ):
+        module_name = f"tokenspeed.runtime.{name}"
         spec = importlib.util.spec_from_file_location(
-            module_name, source / f"{name}.py"
+            module_name, source / f"{name.replace('.', '/')}.py"
         )
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, module_name, module)
         spec.loader.exec_module(module)
-        modules.append(module)
+        if name.startswith("utils."):
+            modules.append(module)
     return modules
 
 
@@ -237,3 +255,98 @@ def test_weight_load_defers_communication_until_managed_scope_exits(
         assert output == []
         shared.initialize_communication(initialize)
     assert output == [3]
+
+
+@dataclass
+class LocalHcclGroup:
+    fail_registration: bool = False
+    registered: bool = False
+
+
+@pytest.mark.parametrize("reuse_group", [False, True])
+@pytest.mark.parametrize("failure", [None, "registration", "startup"])
+def test_a3_saver_owns_node_local_registration(
+    saver_modules, monkeypatch, reuse_group, failure
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    _, adapter = saver_modules
+    mapping = Mapping(rank=5, world_size=8, nprocs_per_node=4)
+    manager = ProcessGroupManager()
+    monkeypatch.setattr(manager, "_device_backend", "hccl")
+    manager_module = sys.modules["tokenspeed.runtime.distributed.process_group_manager"]
+    monkeypatch.setattr(manager_module, "process_group_manager", manager)
+    group = LocalHcclGroup(fail_registration=failure == "registration")
+
+    def new_group(ranks, *, backend, timeout, use_local_synchronization):
+        assert not reuse_group
+        assert ranks == (4, 5, 6, 7)
+        assert backend == "hccl"
+        assert use_local_synchronization
+        return group
+
+    def device_properties(device):
+        assert device == mapping.gpu_id
+        return SimpleNamespace(name="Ascend910_9382")
+
+    if reuse_group:
+        manager.register_process_group("hccl", (4, 5, 6, 7), group)
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(get_device_properties=device_properties),
+        raising=False,
+    )
+    result = pytest.raises(RuntimeError, match=failure) if failure else nullcontext()
+    with result, ExitStack() as on_failure:
+        saver = adapter.AscendMemorySaverAdapter.configure_node_hccl(
+            mapping, emulate_rank_zero=False, on_startup_failure=on_failure
+        )
+        assert group.registered
+        if failure == "startup":
+            raise RuntimeError("later startup failed")
+        on_failure.pop_all()
+    if failure is None:
+        assert group.registered
+        saver.close_hccl()
+    assert not group.registered
+    assert manager.get_device_process_group((4, 5, 6, 7)) is group
+
+
+@pytest.mark.parametrize(
+    ("device_name", "local_ranks", "emulate_rank_zero"),
+    [("Ascend910B3", 4, False), (None, 1, False), (None, 4, True)],
+)
+def test_other_npu_workers_do_not_register_hccl(
+    saver_modules, monkeypatch, device_name, local_ranks, emulate_rank_zero
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    _, adapter = saver_modules
+    mapping = Mapping(rank=0, world_size=8, nprocs_per_node=local_ranks)
+
+    def device_properties(device):
+        assert device_name is not None
+        return SimpleNamespace(name=device_name)
+
+    def new_group(*args, **kwargs):
+        pytest.fail("unexpected HCCL process group creation")
+
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(get_device_properties=device_properties),
+        raising=False,
+    )
+    with ExitStack() as on_failure:
+        assert (
+            adapter.AscendMemorySaverAdapter.configure_node_hccl(
+                mapping,
+                emulate_rank_zero=emulate_rank_zero,
+                on_startup_failure=on_failure,
+            )
+            is None
+        )

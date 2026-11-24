@@ -55,7 +55,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from multiprocessing import Pipe
 from multiprocessing.connection import Connection
@@ -1334,6 +1334,7 @@ class HostBootstrap:
         self._gpu_id = gpu_id
         self._port_args = port_args
         self._memory_sampler: MemoryMetricSampler | None = None
+        self._hccl_saver: AscendMemorySaverAdapter | None = None
         attn_tp_rank = mapping.attn.tp_rank
         dp_rank = mapping.attn.dp_rank
         global_rank = mapping.rank
@@ -1350,7 +1351,7 @@ class HostBootstrap:
         install_jit_compile_check()
         with startup_phase(
             "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
-        ):
+        ), ExitStack() as on_startup_failure:
             maybe_warm_cupti_for_graph_capture()
 
             model_config = load_model_config(
@@ -1383,12 +1384,27 @@ class HostBootstrap:
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
 
+            before_memory_profile = None
+            if server_args.device == "npu" and server_args.enable_memory_saver:
+                from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
+                    AscendMemorySaverAdapter,
+                )
+
+                def configure_saver_hccl() -> None:
+                    self._hccl_saver = AscendMemorySaverAdapter.configure_node_hccl(
+                        mapping,
+                        emulate_rank_zero=server_args.emulate_rank_zero,
+                        on_startup_failure=on_startup_failure,
+                    )
+
+                before_memory_profile = configure_saver_hccl
             min_per_gpu_mem = init_distributed(
                 server_args,
                 port_args,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 hidden_size=model_config.hidden_size,
+                before_memory_profile=before_memory_profile,
             )
             overlap_schedule_depth = int(
                 should_use_overlap_schedule(
@@ -1807,6 +1823,7 @@ class HostBootstrap:
                 record_cache_observations=device.specs.cache_observation_capacity > 0,
             )
             self._device = device.handle
+            on_startup_failure.pop_all()
 
     def collective_addresses(self, port: int) -> list[str]:
         """Agree on the memory protocol and exchange the rank mesh addresses."""
@@ -1883,7 +1900,12 @@ class HostBootstrap:
         if self._memory_sampler is not None:
             self._memory_sampler.stop()
             self._memory_sampler = None
-        self._device.shutdown_cache()
+        try:
+            self._device.shutdown_cache()
+        finally:
+            if self._hccl_saver is not None:
+                self._hccl_saver.close_hccl()
+                self._hccl_saver = None
         if self._server_args.device == "npu":
             # The native host skips Python atexit; close HCCL groups while
             # CANN is still live. Each group's shutdown waits for its streams.

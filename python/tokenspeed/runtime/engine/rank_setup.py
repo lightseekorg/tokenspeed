@@ -22,6 +22,8 @@
 model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
+from collections.abc import Callable
+
 import torch
 from tokenspeed_engine.scheduler import (
     DiskConfig,
@@ -173,6 +175,7 @@ def init_distributed(
     gpu_id: int,
     global_rank: int,
     hidden_size: int,
+    before_memory_profile: Callable[[], None] | None = None,
 ) -> float:
     """Initialize this rank's process groups; return the free-memory floor
     the KV budget is sized against."""
@@ -194,7 +197,9 @@ def init_distributed(
         hidden_size=hidden_size,
         max_num_tokens=max_num_input_tokens,
     )
-    return DistributedInitializer.initialize(distributed_config)
+    return DistributedInitializer.initialize(
+        distributed_config, before_memory_profile=before_memory_profile
+    )
 
 
 def request_length_limits(

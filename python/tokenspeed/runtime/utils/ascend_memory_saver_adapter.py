@@ -20,9 +20,11 @@
 
 """TokenSpeed scopes and startup inventory over the standalone NPU saver."""
 
-from contextlib import contextmanager
+from __future__ import annotations
+
+from contextlib import ExitStack, contextmanager
 from threading import local
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import torch
 
@@ -33,9 +35,8 @@ except ModuleNotFoundError as exc:
     if exc.name != "torch_npu_memory_saver":
         raise
     raise ModuleNotFoundError(
-        "Ascend Memory Saver requires torch-npu-memory-saver==0.1.1. "
-        "With CANN and torch_npu configured, run: "
-        "python -m pip install --no-deps torch-npu-memory-saver==0.1.1",
+        "Ascend Memory Saver requires torch-npu-memory-saver==0.1.3. "
+        "See docs/serving/ascend-memory-saver.md for the pinned source install.",
         name=exc.name,
     ) from exc
 
@@ -44,6 +45,9 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
     TorchMemorySaverAdapter,
     _defer_communication_initializers,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.mapping import Mapping
 
 
 class _NamedRegion(local):
@@ -55,6 +59,31 @@ _named_region = _NamedRegion()
 
 class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
     supports_replica_memory_transitions: ClassVar[bool] = True
+
+    @classmethod
+    def configure_node_hccl(
+        cls,
+        mapping: Mapping,
+        *,
+        emulate_rank_zero: bool,
+        on_startup_failure: ExitStack,
+    ) -> Self | None:
+        """Bind the A3 saver to an existing or new node-local HCCL group."""
+        if emulate_rank_zero or mapping.nprocs_per_node == 1:
+            return None
+        device_name = torch.npu.get_device_properties(mapping.gpu_id).name
+        if not device_name.startswith(("Ascend910_93", "Ascend910C")):
+            return None
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_node_local_device_group(mapping)
+        saver = cls()
+        # A failed configure can already own resources in this group.
+        on_startup_failure.callback(saver.close_hccl)
+        saver.configure_hccl(group)
+        return saver
 
     @contextmanager
     def named_region(self, name: str):
