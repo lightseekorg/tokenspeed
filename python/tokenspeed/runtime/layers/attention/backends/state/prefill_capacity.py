@@ -198,13 +198,15 @@ def _capacity_metadata(source, bucket, checkpoints):
     if checkpoints is None and source.state_checkpoints is not None:
         raise ValueError("this capacity layout stores no in-forward State checkpoint")
     # The live checkpoint plan fits this forward only (its interval and scan
-    # buffer); fixed slots replace it.
+    # buffer); fixed slots replace it. The backend plans the scan over the
+    # snapshot's own boundaries (``prepare_prefill_metadata``).
     cloned = _clone_metadata(
         replace(
             source,
             state_checkpoints=None,
             scan_state_checkpoints=None,
             scan_checkpoint_rows=None,
+            prefill_scan_plan=None,
         )
     )
     result = CapacityPrefillMetadata(
@@ -583,6 +585,9 @@ class CapacityPrefillBackend(MambaAttnBackend):
             token_capacity,
             retained,
             checkpoints=self._checkpoint_layout(token_capacity),
+        )
+        target.prefill_scan_plan = self._prefill_scan_plan(
+            target.scan_query_start_loc, target.prefill_scan_plan
         )
         if capture:
             # Only startup grows retained storage; serving never captures.

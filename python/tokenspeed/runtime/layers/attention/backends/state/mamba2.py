@@ -172,6 +172,7 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         recurrent_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         *,
+        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,

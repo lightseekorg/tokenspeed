@@ -222,6 +222,10 @@ class MambaForwardMetadata:
     scan_checkpoint_rows: torch.Tensor | None = None
     # Request slots for families with off-page replay records.
     req_pool_indices: torch.Tensor | None = None
+    # Launch schedules every layer's prefill scan reads, built once per forward
+    # from scan_query_start_loc (``_prefill_scan_plan``); None for scans that
+    # plan inside each launch.
+    prefill_scan_plan: Any = None
 
     @property
     def prefill_token_extent(self) -> int | None:
@@ -1132,6 +1136,11 @@ class MambaAttnBackend(AttentionBackend):
             state_checkpoints=batch_checkpoints,
             scan_state_checkpoints=scan_state_checkpoints,
             scan_checkpoint_rows=scan_checkpoint_rows,
+            prefill_scan_plan=(
+                None
+                if split_mixed
+                else self._prefill_scan_plan(scan_query_start_loc, None)
+            ),
         )
 
         if split_mixed:
@@ -1243,6 +1252,13 @@ class MambaAttnBackend(AttentionBackend):
             state_checkpoints=state_checkpoints,
             scan_state_checkpoints=scan_state_checkpoints,
             scan_checkpoint_rows=scan_checkpoint_rows,
+            prefill_scan_plan=(
+                self._prefill_scan_plan(
+                    full_metadata.scan_query_start_loc[: num_extends + 1], None
+                )
+                if num_extends
+                else None
+            ),
         )
         decode_bs = bs - num_extends
         self.refresh_decode_metadata(
@@ -2293,6 +2309,7 @@ class MambaAttnBackend(AttentionBackend):
                 value,
                 recurrent_state,
                 scan_query_start_loc,
+                layer_id=layer_id,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 D=D,
@@ -2545,6 +2562,7 @@ class MambaAttnBackend(AttentionBackend):
         recurrent_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         *,
+        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,
@@ -2630,3 +2648,19 @@ class MambaAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Return the device boundary tensor consumed by prefill scans."""
         return query_start_loc
+
+    def _prefill_scan_plan(
+        self, scan_query_start_loc: torch.Tensor, retained: Any
+    ) -> Any:
+        """Plan this forward's prefill scans once for all layers.
+
+        Args:
+            scan_query_start_loc: The forward's scan boundaries.
+            retained: A plan a captured shape keeps; refreshed in place and
+                returned. None builds a plan owned by this forward.
+
+        Returns:
+            The plan ``_prefill_scan`` reads, or None when the scan plans
+            inside each launch (GDN).
+        """
+        return None

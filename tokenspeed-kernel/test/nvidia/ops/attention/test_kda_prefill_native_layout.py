@@ -23,8 +23,13 @@
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity, kda_paged_prefill
-from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import _persistent_kda_plan
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillCapacity,
+    build_kda_prefill_plan,
+    kda_paged_prefill,
+    refresh_kda_prefill_plan,
+)
+from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import _kda_prefill_plan
 from utils import assert_no_cute_compile, assert_no_triton_compile
 
 HEADS, DIM = 12, 128
@@ -49,7 +54,7 @@ def _inputs(device, lengths, *, heads=HEADS):
     return (q, k, v, g, beta, a_log, dt_bias), state, boundaries, cpu
 
 
-def _actual(inputs, state, bounds, cpu, layout):
+def _actual(inputs, state, bounds, cpu, layout, plan=None, plan_layer=0):
     return kda_paged_prefill(
         capacity=None,
         *inputs,
@@ -60,6 +65,8 @@ def _actual(inputs, state, bounds, cpu, layout):
         override=None,
         solution="cutedsl_kda",
         recurrent_layout=layout,
+        plan=plan,
+        plan_layer=plan_layer,
     )
 
 
@@ -77,7 +84,7 @@ def test_prefill_reuses_compilation_across_shapes(native_cuda):
     for heads in (12, 24, 96):
         inputs, state, bounds, cpu = _inputs("cuda", [16], heads=heads)
         _actual(inputs, state, bounds, cpu, "v_major")
-    with assert_no_cute_compile(), assert_no_triton_compile(_persistent_kda_plan):
+    with assert_no_cute_compile(), assert_no_triton_compile(_kda_prefill_plan):
         for lengths, heads in (
             ([1], 12),
             ([17, 33], 12),
@@ -167,6 +174,8 @@ def test_strided_prefill_matches_recurrence(lengths, heads, state_dtype, backend
         cu_seqlens=bounds,
         cu_seqlens_cpu=cpu,
         capacity=None,
+        plan=None,
+        plan_layer=0,
         lower_bound=-5.0,
         solution=backend_name,
         recurrent_layout="v_major",
@@ -222,6 +231,8 @@ def test_capacity_preparation_dynamic_replay(
             cu_seqlens=bounds,
             cu_seqlens_cpu=cpu,
             capacity=KdaPrefillCapacity(capacity, sequences),
+            plan=None,
+            plan_layer=0,
             lower_bound=-5.0,
             override=None,
             solution=backend_name,
@@ -257,6 +268,8 @@ def test_capacity_preparation_dynamic_replay(
             cu_seqlens=bounds,
             cu_seqlens_cpu=new_cpu,
             capacity=None,
+            plan=None,
+            plan_layer=0,
             lower_bound=-5.0,
             solution=backend_name,
             recurrent_layout="v_major",
@@ -300,3 +313,98 @@ def test_native_prefill_cuda_graph_replay(native_cuda):
         graph.replay()
         assert torch.equal(actual.out, expected.out)
         assert torch.equal(actual.final_state, expected.final_state)
+
+
+def test_plan_orders_sequences_and_counts_chunks(native_cuda):
+    """The ordinary schedule is FlashInfer's: stable longest-first, 16-token chunks."""
+    torch.manual_seed(0)
+    with assert_no_triton_compile(_kda_prefill_plan):
+        for sequences in (1, 5, 130, 300):
+            build_kda_prefill_plan(
+                torch.zeros(sequences + 1, dtype=torch.int64, device="cuda"),
+                heads=HEADS,
+                layers=1,
+            )
+    for sequences in (1, 5, 130, 300):
+        lengths = torch.randint(1, 40, (sequences,))
+        bounds = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+        plan = build_kda_prefill_plan(bounds.cuda(), heads=HEADS, layers=2)
+        order = sorted(range(sequences), key=lambda row: -int(lengths[row]))
+        chunks = torch.cat((torch.zeros(1, dtype=torch.int64), (lengths + 15) // 16))
+        assert plan.sequence_order.tolist() == order
+        assert plan.cu_chunks.tolist() == chunks.cumsum(0).tolist()
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    # Ordinary scan; persistent without and with FP32 handoffs.
+    [([17, 65], 12), ([31, 129, 7], 96), ([3] * 16, 96), ([200] * 4, 96)],
+)
+def test_layers_sharing_a_plan_match_launches_that_plan_alone(
+    native_cuda, lengths, heads
+):
+    layers = 3
+    inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
+    plan = build_kda_prefill_plan(bounds, heads=heads, layers=layers)
+    for layer in range(layers):
+        layer_inputs = (*(t * (layer + 1) for t in inputs[:3]), *inputs[3:])
+        expected = _actual(layer_inputs, state, bounds, cpu, "v_major")
+        actual = _actual(layer_inputs, state, bounds, cpu, "v_major", plan, layer)
+        assert torch.equal(actual.out, expected.out)
+        assert torch.equal(actual.final_state, expected.final_state)
+
+
+@pytest.mark.parametrize("heads", [12, 96])
+def test_refreshed_plan_replays_shared_layers(native_cuda, heads):
+    """A captured plan refreshed in place serves every captured layer's replay."""
+    layers, capacity, sequences = 2, 1024, 4
+    inputs, state, bounds, cpu = _inputs(
+        "cuda", [capacity // sequences] * sequences, heads=heads
+    )
+    plan = build_kda_prefill_plan(bounds, heads=heads, layers=layers)
+
+    def run():
+        return [
+            kda_paged_prefill(
+                *inputs,
+                initial_state=state,
+                cu_seqlens=bounds,
+                cu_seqlens_cpu=cpu,
+                capacity=KdaPrefillCapacity(capacity, sequences),
+                lower_bound=-5.0,
+                solution="cutedsl_kda",
+                recurrent_layout="v_major",
+                plan=plan,
+                plan_layer=layer,
+            )
+            for layer in range(layers)
+        ]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = run()
+    for lengths in ([capacity - 3, 1, 1, 1], [1, 1, 1, capacity - 3], [17, 19, 23, 29]):
+        live = sum(lengths)
+        new_cpu = torch.tensor([0, *lengths], dtype=torch.int64).cumsum(0)
+        cpu.copy_(new_cpu)
+        bounds.copy_(new_cpu)
+        for tensor in inputs[:5]:
+            tensor.copy_(torch.randn_like(tensor) * 0.1)
+            tensor[:, live:].zero_()
+        refresh_kda_prefill_plan(bounds, plan)
+        with assert_no_cute_compile():
+            graph.replay()
+        exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
+        expected = _actual(exact, state, bounds, new_cpu, "v_major")
+        for result in captured:
+            torch.testing.assert_close(
+                result.out[:, :live], expected.out, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                result.final_state, expected.final_state, rtol=0, atol=0
+            )

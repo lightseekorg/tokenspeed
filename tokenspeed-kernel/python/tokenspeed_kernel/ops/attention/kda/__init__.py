@@ -40,6 +40,11 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
+from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import (
+    KdaPrefillPlan,
+    build_kda_prefill_plan,
+    refresh_kda_prefill_plan,
+)
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
@@ -311,6 +316,8 @@ def kda_paged_prefill(
     override: str | None = None,
     solution: str | None = None,
     recurrent_layout: str | None = None,
+    plan: KdaPrefillPlan | None,
+    plan_layer: int,
 ) -> KdaPrefillResult:
     """Run packed KDA prefill through capability-based kernel selection.
 
@@ -334,6 +341,11 @@ def kda_paged_prefill(
         solution: Optional registered solution name.
         recurrent_layout: Layout of the backend-owned recurrent state; the
             platform default when omitted.
+        plan: Launch schedules built once from ``cu_seqlens`` and shared by
+            the batch's layers, for kernels with the ``prefill_plan`` trait,
+            or None for a call that plans alone.
+        plan_layer: This launch's row in ``plan``; distinct per launch, 0
+            without a plan.
 
     Returns:
         Packed output and FP32 final state, in the caller's
@@ -366,7 +378,7 @@ def kda_paged_prefill(
         )
     if solution == "fla":
         solution = "triton"
-    capacity_kwargs = {}
+    kernel_kwargs = {}
     if capacity is not None:
         capacity.validate(cu_seqlens_cpu, q.shape[1])
     kernel = select_kernel(
@@ -383,7 +395,12 @@ def kda_paged_prefill(
     if capacity is not None and not supports_capacity:
         raise ValueError("Selected KDA kernel does not support planning capacity")
     if supports_capacity:
-        capacity_kwargs["capacity"] = capacity
+        kernel_kwargs["capacity"] = capacity
+    if spec is not None and True in spec.traits.get("prefill_plan", ()):
+        kernel_kwargs["plan"] = plan
+        kernel_kwargs["plan_layer"] = plan_layer
+    elif plan is not None:
+        raise ValueError("Selected KDA kernel does not take a prefill plan")
     supported = None if spec is None else spec.traits.get("recurrent_layout")
     # Kernels that declare no layout consume the caller's state as it is.
     relayout = supported is not None and recurrent_layout not in supported
@@ -401,7 +418,7 @@ def kda_paged_prefill(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
-        **capacity_kwargs,
+        **kernel_kwargs,
     )
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).
@@ -894,6 +911,7 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 __all__ = [
     "KdaOutputNorm",
+    "KdaPrefillPlan",
     "KdaPrefillResult",
     "apply_kda_output_norm",
     "kda_fused_paged_verify_fuses_producers",
@@ -906,6 +924,8 @@ __all__ = [
     "resolve_kda_batched_retained_commit",
     "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",
+    "build_kda_prefill_plan",
+    "refresh_kda_prefill_plan",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_fused_paged_verify",

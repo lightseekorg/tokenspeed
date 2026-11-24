@@ -84,6 +84,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
     backend._kda_gate = lambda g_raw, *_args: g_raw
+    backend._prefill_plan_rows = {7: 0, 9: 1}
     # Prepare boundaries once; repeated preparation must preserve their identity.
     boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
     scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
@@ -97,10 +98,12 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     # ones, even when those have the same row count.
     full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
     full_scan_boundaries = full_boundaries.to(torch.int64)
+    plan = object()
     backend.forward_metadata = mamba.MambaForwardMetadata(
         query_start_loc=full_boundaries,
         scan_query_start_loc=full_scan_boundaries,
         query_start_loc_int64=full_scan_boundaries,
+        prefill_scan_plan=plan,
     )
     num_tokens = sum(lengths)
     stored = torch.arange(len(lengths) * 24, dtype=torch.float32).view(
@@ -122,6 +125,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         value,
         stored,
         scan_boundaries,
+        layer_id=9,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
         D=None,
@@ -139,6 +143,9 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
     assert captured["recurrent_layout"] == "v_major"
+    # Every layer reads the forward's one plan through its own row.
+    assert captured["plan"] is plan
+    assert captured["plan_layer"] == 1
     assert final_state is final
     assert "out" not in captured
 

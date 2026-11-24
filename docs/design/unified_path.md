@@ -2163,8 +2163,11 @@ D2H. Decode refresh/capture does not allocate this prefill-only mirror.
 
 CuTe KDA may select an ordinary or persistent scan internally. Both consume
 the live device boundaries and zero-padded inputs supplied by the runtime;
-the persistent scan may load whole tail tiles. Scheduling scratch belongs to
-the invocation or captured graph, and replay rebuilds it from the live bounds.
+the persistent scan may load whole tail tiles. The extend metadata owns one
+scan plan per forward (`prefill_scan_plan`), built from the scan boundaries
+in one launch; every layer reads it with its own handoff-flag row instead of
+rescanning the boundaries. Capacity metadata refreshes its retained plan in
+place before replay, after the boundaries.
 
 Each metadata build allocates fresh index storage, including when two
 forwards have the same total token count but different request partitions.

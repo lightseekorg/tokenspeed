@@ -18,14 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Device schedules for FlashInfer's persistent KDA launch ABI."""
+"""Device schedules for FlashInfer's CuTe KDA prefill launch ABIs."""
+
+from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
+# Token chunk of the ordinary CuTe prefill (``kda_chunked_bt16``).
+_ORDINARY_CHUNK = tl.constexpr(16)
 
-@triton.jit(do_not_specialize=["num_sequences", "num_workers"])
-def _persistent_kda_plan(
+
+@triton.jit
+def _persistent_kda_schedule(
     boundaries,
     cu32,
     chunk_prefix,
@@ -35,7 +41,6 @@ def _persistent_kda_plan(
     lengths,
     sources,
     destinations,
-    flags,
     num_sequences,
     num_workers,
     HEADS: tl.constexpr,
@@ -57,9 +62,6 @@ def _persistent_kda_plan(
         )
         total += tl.sum(chunks)
         longest = tl.maximum(longest, tl.max(chunks))
-    for flag_begin in range(0, num_workers, BLOCK):
-        workers = flag_begin + lanes
-        tl.store(flags + workers, 0, workers < num_workers)
     tl.debug_barrier()
 
     num_chains = num_sequences.to(tl.int64) * HEADS
@@ -151,51 +153,208 @@ def _persistent_kda_plan(
                 tl.store(pointer + end_task - 1, first_value, incoming)
 
 
-def warm_persistent_kda_plan(heads: int) -> None:
-    """Compile the metadata kernel even when the startup batch uses ordinary CuTe."""
-    _persistent_kda_plan.warmup(
-        torch.int64,
-        torch.int32,
-        torch.int64,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        1,
-        1,
-        HEADS=heads,
-        BLOCK=128,
-        grid=(1,),
-    )
+@triton.jit(do_not_specialize=["num_sequences", "num_workers", "num_flags"])
+def _kda_prefill_plan(
+    boundaries,
+    sequence_order,
+    cu_chunks,
+    cu32,
+    chunk_prefix,
+    offsets,
+    chains,
+    starts,
+    lengths,
+    sources,
+    destinations,
+    flags,
+    num_sequences,
+    num_workers,
+    num_flags,
+    HEADS: tl.constexpr,
+    PERSISTENT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    lanes = tl.arange(0, BLOCK)
+    # Ordinary CuTe: stable longest-first sequence order and 16-token chunk
+    # prefix, as FlashInfer's packed metadata kernel would build per launch.
+    ordinary_total = tl.full((), 0, tl.int32)
+    tl.store(cu_chunks, 0)
+    for seq_begin in range(0, num_sequences, BLOCK):
+        rows = seq_begin + lanes
+        live = rows < num_sequences
+        lo = tl.load(boundaries + rows, live, 0)
+        length = tl.load(boundaries + rows + 1, live, 0) - lo
+        chunks = ((length + _ORDINARY_CHUNK - 1) // _ORDINARY_CHUNK).to(tl.int32)
+        tl.store(cu_chunks + rows + 1, ordinary_total + tl.cumsum(chunks), live)
+        ordinary_total += tl.sum(chunks)
+        rank = tl.zeros((BLOCK,), tl.int32)
+        for other_begin in range(0, num_sequences, BLOCK):
+            others = other_begin + lanes
+            other_live = others < num_sequences
+            other_lo = tl.load(boundaries + others, other_live, 0)
+            other_length = tl.load(boundaries + others + 1, other_live, 0) - other_lo
+            before = other_live[None, :] & (
+                (other_length[None, :] > length[:, None])
+                | (
+                    (other_length[None, :] == length[:, None])
+                    & (others[None, :] < rows[:, None])
+                )
+            )
+            rank += tl.sum(before.to(tl.int32), axis=1)
+        tl.store(sequence_order + rank, rows.to(tl.int32), live)
+    for flag_begin in range(0, num_flags, BLOCK):
+        entries = flag_begin + lanes
+        tl.store(flags + entries, 0, entries < num_flags)
+    if PERSISTENT:
+        _persistent_kda_schedule(
+            boundaries,
+            cu32,
+            chunk_prefix,
+            offsets,
+            chains,
+            starts,
+            lengths,
+            sources,
+            destinations,
+            num_sequences,
+            num_workers,
+            HEADS,
+            BLOCK,
+        )
 
 
-def persistent_kda_plan(boundaries: torch.Tensor, heads: int, workers: int):
-    """Build live, graph-replayable task lists and reset their handoff flags.
+@dataclass(frozen=True)
+class KdaPrefillPlan:
+    """Launch schedules of one packed batch, shared by every layer that scans it.
 
-    Boundaries are device int64 packed sequence offsets. Returns the native
-    int32 boundaries, worker offsets, five task arrays and handoff flags.
-    All storage belongs to this invocation or its CUDA graph pool.
+    Built once per forward from device boundaries (no D2H), then read by each
+    layer's launch. ``flags`` holds one zeroed handoff row per layer, so the
+    persistent launches need no per-layer reset; a row serves one launch, so
+    refresh the plan before another forward reuses it. Capacity plans are
+    refreshed in place before each replay, like the other prefill-graph
+    metadata.
+
+    Attributes:
+        heads: Local KDA heads of every launch that reads the plan.
+        sequence_order/cu_chunks: Ordinary-route int32 sequence order and
+            16-token chunk prefix [sequences + 1].
+        persistent: Whether the persistent schedule below is built; set when
+            the heads divide by 8 and two CTAs per (sequence, head) exceed the
+            SM count.
+        workers: Persistent CTA count, ``min(sequences * heads, SMs)``.
+        cu32, chunk_prefix, offsets, tasks: Persistent int32 boundaries, int64
+            32-token chunk prefix, worker task offsets [workers + 1] and the
+            five task arrays (chain, start, length, source, destination).
+        flags: Int32 handoff flags [layers, workers].
+        handoffs: FP32 handoff states shared by the plan's sequential launches.
+    """
+
+    heads: int
+    sequence_order: torch.Tensor
+    cu_chunks: torch.Tensor
+    persistent: bool
+    workers: int
+    cu32: torch.Tensor
+    chunk_prefix: torch.Tensor
+    offsets: torch.Tensor
+    tasks: torch.Tensor
+    flags: torch.Tensor
+    handoffs: torch.Tensor
+
+
+def warm_kda_prefill_plan(heads: int) -> None:
+    """Compile both plan variants before serving."""
+    for persistent in (False, True):
+        _kda_prefill_plan.warmup(
+            torch.int64,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int64,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            1,
+            1,
+            1,
+            HEADS=heads,
+            PERSISTENT=persistent,
+            BLOCK=128,
+            grid=(1,),
+        )
+
+
+@lru_cache(maxsize=None)
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def build_kda_prefill_plan(
+    boundaries: torch.Tensor, *, heads: int, layers: int
+) -> KdaPrefillPlan:
+    """Allocate and fill the CuTe prefill schedules of one packed batch.
+
+    Args:
+        boundaries: Device int64 packed sequence offsets [sequences + 1].
+        heads: Local KDA heads of every layer that reads the plan.
+        layers: Launches that read the plan; each takes its own
+            ``plan_layer`` row of handoff flags.
+
+    Returns:
+        A plan whose storage belongs to this forward or its CUDA graph pool.
     """
     sequences = boundaries.numel() - 1
-    capacity = (sequences * heads + workers + 15) // 16 * 16
-    cu32 = torch.empty_like(boundaries, dtype=torch.int32)
-    prefix = torch.empty_like(boundaries)
-    offsets = torch.empty(workers + 1, dtype=torch.int32, device=boundaries.device)
-    tasks = torch.empty((5, capacity), dtype=torch.int32, device=boundaries.device)
-    flags = torch.empty(workers, dtype=torch.int32, device=boundaries.device)
-    _persistent_kda_plan[(1,)](
+    device = boundaries.device
+    sm_count = _sm_count(device)
+    persistent = heads % 8 == 0 and 2 * sequences * heads > sm_count
+    workers = min(sequences * heads, sm_count) if persistent else 1
+    capacity = (sequences * heads + workers + 15) // 16 * 16 if persistent else 1
+    plan = KdaPrefillPlan(
+        heads=heads,
+        sequence_order=torch.empty(sequences, dtype=torch.int32, device=device),
+        cu_chunks=torch.empty(sequences + 1, dtype=torch.int32, device=device),
+        persistent=persistent,
+        workers=workers,
+        cu32=torch.empty(sequences + 1, dtype=torch.int32, device=device),
+        chunk_prefix=torch.empty(sequences + 1, dtype=torch.int64, device=device),
+        offsets=torch.empty(workers + 1, dtype=torch.int32, device=device),
+        tasks=torch.empty((5, capacity), dtype=torch.int32, device=device),
+        flags=torch.empty((layers, workers), dtype=torch.int32, device=device),
+        # A handoff exists only when sequences * heads exceed the workers.
+        handoffs=torch.empty(
+            (workers if persistent and sequences * heads > sm_count else 1, 128, 128),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    refresh_kda_prefill_plan(boundaries, plan)
+    return plan
+
+
+def refresh_kda_prefill_plan(boundaries: torch.Tensor, plan: KdaPrefillPlan) -> None:
+    """Rebuild ``plan`` in place from live ``boundaries`` and zero its flags.
+
+    Run once before the layers that read the plan, in their stream order.
+    """
+    if boundaries.numel() != plan.cu_chunks.numel():
+        raise ValueError("KDA prefill plan sequence count changed")
+    _kda_prefill_plan[(1,)](
         boundaries,
-        cu32,
-        prefix,
-        offsets,
-        *tasks,
-        flags,
-        sequences,
-        workers,
-        HEADS=heads,
+        plan.sequence_order,
+        plan.cu_chunks,
+        plan.cu32,
+        plan.chunk_prefix,
+        plan.offsets,
+        *plan.tasks,
+        plan.flags,
+        boundaries.numel() - 1,
+        plan.workers,
+        plan.flags.numel(),
+        HEADS=plan.heads,
+        PERSISTENT=plan.persistent,
         BLOCK=128,
     )
-    return cu32, offsets, *tasks, flags

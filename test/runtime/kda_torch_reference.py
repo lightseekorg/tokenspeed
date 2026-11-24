@@ -157,6 +157,8 @@ def kda_prefill_reference(
         cu_seqlens=bounds_cpu.to(raw.device),
         cu_seqlens_cpu=bounds_cpu,
         capacity=None,
+        plan=None,
+        plan_layer=0,
         lower_bound=lower_bound,
         solution=solution,
         recurrent_layout="v_major",

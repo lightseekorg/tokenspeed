@@ -203,6 +203,7 @@ def _nvidia_kda_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     lower_bound: float | None,
+    **implementation_kwargs,
 ) -> KdaPrefillResult:
     out, final_state = implementation(
         q,
@@ -217,6 +218,7 @@ def _nvidia_kda_prefill(
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
         beta_is_logit=True,
+        **implementation_kwargs,
     )
     return KdaPrefillResult(out, final_state)
 
