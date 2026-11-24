@@ -116,9 +116,9 @@ It creates no finish chunk or token/finish metrics. Only that stream and the
 client's in-flight count change; engine-reported load and slot, cache and
 transfer retirement keep their existing owners and fences.
 
-Cancellation returns true only when it closes the local stream. If a finish,
+Cancellation returns `true` only when it closes the local stream. If a finish,
 stream error or another cancellation wins, its result is preserved and
-cancellation returns false. A failed send or a dropped cancellation future
+cancellation returns `false`. A failed send or a dropped cancellation future
 does not detach the stream: the caller can retry, even if the engine already
 received the abort. Stream drop and send cleanup compare the original local
 admission's channel before removing an entry. This protects a later local
