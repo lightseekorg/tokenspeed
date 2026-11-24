@@ -151,7 +151,8 @@ def parse_server_logs(paths):
             if "event=ts_request_accepted" in line:
                 plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
                 arrival = re.search(
-                    r'(\d{4}-\d\d-\d\dT\S+Z).*event=ts_request_accepted.*rid="([^"]+)"',
+                    r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?"
+                    r'(?:Z|[+-]\d\d:\d\d))\s+.*event=ts_request_accepted.*rid="([^"]+)"',
                     plain,
                 )
                 if arrival:
@@ -229,6 +230,12 @@ def import_prefill(args):
                 elapsed = s["prefill_ms"]
                 queue_source = args.queue_source
                 if queue_source == "server-accepted":
+                    if "accepted_unix_s" not in s:
+                        raise ValueError(
+                            "no ts_request_accepted arrival parsed; server-accepted "
+                            "requires engine acceptance logs with UTC (Z) or "
+                            "numeric-offset (+/-HH:MM) timestamps"
+                        )
                     # created_time precedes client encoding and transport; the
                     # accepted event isolates waiting inside the serving engine.
                     queue = (s["commit_ts"] - s["accepted_unix_s"]) * 1000

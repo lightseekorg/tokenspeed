@@ -28,7 +28,6 @@ import torch
 from tokenspeed_engine.scheduler import (
     DiskConfig,
     PeerConfig,
-    SchedulerConfig,
     SharedL2Config,
     StorageConfig,
 )

@@ -142,6 +142,8 @@ For HTTP, pass all request JSONL files, including the additional cold runs, to `
 
 Import joins request IDs, checks actual prompt/prefix lengths, one output token, completion, finite positive time, reported preemption and queue isolation. It rejects missing or conflicting records. Choose the queue source explicitly: `server-accepted` measures the server's `ts_request_accepted` event to first dispatch and is recommended for isolated native collection; `request-stats` starts at frontend request creation and also includes client encoding and transport; `pd-admission` uses the P-side trace's admission phase. Long token-ID prompts can spend appreciable time before server acceptance, which must not be confused with admission waiting. The selected source is recorded in imported data. Missing events or creation timestamps are rejected, without falling back to another timing source. Neither queue choice changes the fitting target, `prefill_ms`.
 
+The `server-accepted` source accepts both UTC (`Z`) and numeric-offset (`+HH:MM` or `-HH:MM`) timestamps, including the engine's local-time logging format. Timestamps without a timezone are not interpreted using the collector's local timezone. If no matching acceptance event can be parsed, the rejection explains the required event and timestamp formats.
+
 For compatibility with archived measurements, request JSONL retains `expected_a` (requested cached prefix) and `expected_b` (total prompt); imported timing JSONL retains `a` (actual cached tokens) and `b` (actual total prompt tokens). These persisted fields keep their original meanings. The case configuration uses `prefix_tokens` and `new_tokens`, and collector logs name the prefix, additional input and total prompt lengths explicitly.
 
 Rejected samples are preserved separately and cause a nonzero exit. Investigate and recollect; do not silently discard failed requests. `preempt_count` is not a complete prefill replay counter. Audit scheduler batches to confirm computed prefill tokens equal `prompt_tokens - cache_tokens`, and exclude retraction or background load. A CPU forward range may time only asynchronous launch; use device events or an associated device trace when checking kernel execution time.
@@ -212,10 +214,13 @@ Measure missed computed prefill tokens/request, TTFT percentiles, throughput, Di
 
 ```bash
 python -m unittest test.cache_gds_calibration.test_calibrate -v
+cargo fmt --manifest-path tokenspeed-engine/Cargo.toml --all --check
 cargo test --release --manifest-path tokenspeed-engine/Cargo.toml \
   -p tokenspeed-disk --example gds_calibrate
 cargo clippy --release --manifest-path tokenspeed-engine/Cargo.toml \
   -p tokenspeed-disk --example gds_calibrate -- -D warnings
 ```
+
+Run Rust formatting through Cargo so it uses the workspace's edition and formatting settings; the repository's pre-commit hooks do not run this check.
 
 Python tests need no accelerator, model weights or serving runtime import. They exercise the real fitter, log importer, shared sampler, local HTTP exchange and module CLI. Rust tests exercise actual aligned I/O, split blocks, invalid geometry and scratch-file ownership; use a Linux filesystem supporting direct I/O. These checks do not replace measurements on the deployment being calibrated.

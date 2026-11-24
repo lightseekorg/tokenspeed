@@ -212,6 +212,7 @@ class ImportTest(unittest.TestCase):
         preempt,
         source,
         native_queue_ms,
+        arrival_timestamp,
     ):
         dump(
             root / "requests",
@@ -233,7 +234,7 @@ class ImportTest(unittest.TestCase):
         arrival = (
             ""
             if native_queue_ms is None
-            else '1970-01-01T00:01:40.000000Z INFO event=ts_request_accepted rid="r1"\n'
+            else f'{arrival_timestamp} INFO event=ts_request_accepted rid="r1"\n'
         )
         stats = (
             f"INFO Req: r1 Finish! RequestStats(status='finished', prompt_tokens=16384, "
@@ -291,6 +292,7 @@ class ImportTest(unittest.TestCase):
                 preempt=0,
                 source="plain-request-stats",
                 native_queue_ms=None,
+                arrival_timestamp=None,
             )
             self.assertEqual(row["a"], 8191)
             self.assertEqual(row["seconds"], 0.12)
@@ -303,6 +305,7 @@ class ImportTest(unittest.TestCase):
                 preempt=0,
                 source="pd-prefill-trace",
                 native_queue_ms=None,
+                arrival_timestamp=None,
             )
             self.assertEqual(row["seconds"], 0.08)
 
@@ -315,6 +318,7 @@ class ImportTest(unittest.TestCase):
                     preempt=0,
                     source="plain-request-stats",
                     native_queue_ms=None,
+                    arrival_timestamp=None,
                 )
 
     def test_preemption_rejected(self):
@@ -326,18 +330,29 @@ class ImportTest(unittest.TestCase):
                     preempt=1,
                     source="plain-request-stats",
                     native_queue_ms=None,
+                    arrival_timestamp=None,
                 )
 
     def test_native_queue_measured_from_acceptance(self):
-        with tempfile.TemporaryDirectory() as name:
-            row = self.run_import(
-                Path(name),
-                cache=8192,
-                preempt=0,
-                source="plain-request-stats",
-                native_queue_ms=3,
-            )
-            self.assertAlmostEqual(row["queue_ms"], 3)
+        for timestamp in (
+            "1970-01-01T00:01:40.000000Z",
+            "1970-01-01T00:01:40.000000+00:00",
+            "1970-01-01T08:01:40.000000+08:00",
+            "1969-12-31T19:01:40.000000-05:00",
+            "1970-01-01T05:31:40.000000+05:30",
+        ):
+            with self.subTest(timestamp=timestamp):
+                with tempfile.TemporaryDirectory() as name:
+                    row = self.run_import(
+                        Path(name),
+                        cache=8192,
+                        preempt=0,
+                        source="plain-request-stats",
+                        native_queue_ms=3,
+                        arrival_timestamp=timestamp,
+                    )
+                    self.assertAlmostEqual(row["queue_ms"], 3)
+                    self.assertEqual(row["seconds"], 0.12)
 
     def test_native_zero_queue_stat_does_not_hide_admission_wait(self):
         with tempfile.TemporaryDirectory() as name:
@@ -348,7 +363,23 @@ class ImportTest(unittest.TestCase):
                     preempt=0,
                     source="plain-request-stats",
                     native_queue_ms=25,
+                    arrival_timestamp="1970-01-01T00:01:40.000000Z",
                 )
+
+    def test_arrival_without_timezone_reports_required_event(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                self.run_import(
+                    root,
+                    cache=8192,
+                    preempt=0,
+                    source="plain-request-stats",
+                    native_queue_ms=3,
+                    arrival_timestamp="1970-01-01T00:01:40.000000",
+                )
+            rejection = json.loads((root / "rejected").read_text())
+            self.assertIn("no ts_request_accepted arrival parsed", rejection["reason"])
 
     def test_explicit_queue_source_controls_isolation(self):
         for queue_source, accepted, created, expected in (
@@ -420,6 +451,12 @@ class ImportTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "invalid"):
                             import_prefill(args)
                         self.assertEqual((root / "accepted").read_text(), "")
+                        if queue_source == "server-accepted" and not accepted:
+                            rejection = json.loads((root / "rejected").read_text())
+                            self.assertIn(
+                                "no ts_request_accepted arrival parsed",
+                                rejection["reason"],
+                            )
 
 
 class RequestTest(unittest.TestCase):

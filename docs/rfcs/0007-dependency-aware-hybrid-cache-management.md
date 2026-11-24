@@ -762,6 +762,11 @@ lease deadlines.
 --prefix-cache-gds-disk-read-cost A B    # required for GDS with Disk
 ```
 
+Use the [GDS calibration tools](../../test/cache_gds_calibration/README.md) to fit
+`D/E` from isolated prefill timings and `A/B` from native Disk reads; native
+collection defaults to `cases_quick.json`, and configuration is exported only
+after held-out validation passes.
+
 Pass the resolved policy explicitly through server configuration, rank setup,
 scheduler bindings, and coordinator construction. Initially GDS requires
 prefix caching and cacheable State groups; unsupported combinations fail

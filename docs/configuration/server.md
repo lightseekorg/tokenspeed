@@ -1849,6 +1849,11 @@ Published Disk copies preserve recovery routes and lower Host placement cost;
 Disk itself keeps its existing LRU/retention policy and requires write-back L2.
 Cleaning follows current Host GDS scores, with history written before State.
 
+See the [GDS calibration tools](../../test/cache_gds_calibration/README.md) for
+measuring prefill and native Disk costs, fitting `D/E` and `A/B`, and validating
+the coefficients before exporting configuration; native collection defaults to
+the eight-case `cases_quick.json` matrix.
+
 `write_back` runs on every role. On `--disaggregation-mode decode` the
 history a decode server evicted stays reusable from its Host: a later
 request's remote admission loads its Host hit, and the prefill server sends

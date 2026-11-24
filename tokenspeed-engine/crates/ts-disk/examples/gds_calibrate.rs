@@ -31,7 +31,7 @@ use std::{
 };
 
 use ts_disk::{
-    ALIGNMENT, Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, Job, JobReport, Memory,
+    Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, Job, JobReport, Memory, ALIGNMENT,
 };
 
 struct Scratch(PathBuf);
