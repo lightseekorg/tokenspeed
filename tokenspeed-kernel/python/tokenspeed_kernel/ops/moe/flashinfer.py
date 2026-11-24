@@ -1035,7 +1035,7 @@ if platform.is_nvidia:
             )
         else:
             result = trtllm_fp8_block_scale_moe(
-                routing_logits=router_logits.to(torch.float32),
+                routing_logits=router_logits,
                 routing_bias=routing_bias,
                 n_group=n_group,
                 topk_group=topk_group,
