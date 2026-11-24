@@ -376,7 +376,7 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         assert _split_wave(4, 152, torch.bfloat16, (64, 128)) == 19
         assert _split_wave(8, 4, torch.bfloat16, (128, 128)) == 1
 
-        def check(lengths, out, max_seq_len, heads=128, q_len=1):
+        def check(lengths, out, max_seq_len, heads, q_len):
             batch = lengths.numel()
             sms = get_num_sm(lengths.device)
             args = dict(num_heads=heads, q_len=q_len, max_seq_len=max_seq_len,
@@ -413,13 +413,13 @@ def test_split_counts_match_torch_without_recompiling() -> None:
 
         lengths = torch.zeros(2049 * 3, dtype=torch.int32, device="cuda")[::3]
         out = torch.empty(2049 * 5, dtype=torch.int32, device="cuda")[::5]
-        check(lengths[:17], out[:17], 1 << 20)
+        check(lengths[:17], out[:17], 1 << 20, heads=128, q_len=1)
         with assert_no_triton_compile(_mla_decode_split_kvs_kernel):
             for batch in (1, 8, 15, 16, 17, 255, 256, 257, 1023, 1024, 1025, 2049):
                 for max_seq_len in (64, 8192, 1 << 30):
                     lengths[:batch].copy_(torch.arange(batch, device="cuda", dtype=torch.int64)
                                          * (max_seq_len // max(batch, 1)))
-                    check(lengths[:batch], out[:batch], max_seq_len)
+                    check(lengths[:batch], out[:batch], max_seq_len, heads=128, q_len=1)
 
         # A short request and a batch near its average length plan no partials.
         lengths[:1].fill_(130)
@@ -441,7 +441,7 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         wide_lengths = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")
         wide_out = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")
         wide_lengths.copy_(torch.tensor([1, 1 << 30, 1 << 30], dtype=torch.int32, device="cuda"))
-        check(wide_lengths, wide_out, 1 << 30)
+        check(wide_lengths, wide_out, 1 << 30, heads=128, q_len=1)
         offsets = torch.full((1,), -1, dtype=torch.int32, device="cuda")
         tokenspeed_mla_decode_split_kvs(
             lengths[:0], out[:0], offsets, torch.empty(0, dtype=torch.int64, device="cuda"), num_heads=128, q_len=1,
