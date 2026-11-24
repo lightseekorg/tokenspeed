@@ -192,18 +192,22 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
 
     # Four batch rows stage QKV. Twelve resident requests and the two
     # reserved request slots each hold twenty (8 draft tokens + 12) FP32
-    # U/K/decay records and one INT32 accepted count per layer.
+    # U/K/decay records per layer, plus one INT32 accepted count every layer
+    # shares and one INT32 round-start count. Each batch row keeps one INT8
+    # commit verdict per layer.
     qkv_bytes = 69 * 4 * 8 * 4608 * 2
-    retained_bytes = 69 * 14 * (12 * 20 * 128 * 3 * 4 + 4)
-    descriptor_bytes = 69 * (14 * 8 + 4) + 3 * 4 * 8
+    retained_bytes = 14 * (69 * 12 * 20 * 128 * 3 * 4 + 2 * 4)
+    descriptor_bytes = 69 * (12 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
     record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
+    verdict_bytes = 69 * 4
     expected_workspace_bytes = (
         qkv_bytes
         + retained_bytes
         + descriptor_bytes
         + page_and_step_bytes
         + record_metadata_bytes
+        + verdict_bytes
     )
 
     setup = recipe.setup()
@@ -403,7 +407,7 @@ def test_kda_history_capacity_sizes_each_request_slot(capacity):
         kda_history_capacity=capacity,
     )
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * (3 * 12 * capacity * 128 * 4 + 4)
+        69 * 3 * 12 * capacity * 128 * 4 + 2 * 4
     )
 
 
@@ -429,11 +433,11 @@ def test_kimi_checkpoint_is_independent_of_request_history(width):
         "conv_state",
         "recurrent_state",
     }
-    # Increasing residency by one adds the FP32 records and the INT32 accepted
-    # count of that request's slot.
+    # Increasing residency by one adds the FP32 records of that request's
+    # slot and its two INT32 counts, which every layer shares.
     smaller = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=6)
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * (3 * 12 * (width + 12) * 128 * 4 + 4)
+        69 * 3 * 12 * (width + 12) * 128 * 4 + 2 * 4
     )
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.groups() == schema

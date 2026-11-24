@@ -174,8 +174,10 @@ class KdaRetainedHistory:
 
     correction is FP32 [slot, head, capacity, value]. key and decay are
     FP32 [slot, head, capacity, key] and hold normalized K and multiplicative
-    decay. length is INT32 [slot, 1] and counts the records a slot has
-    accepted since the dense base of its request's page. record_slots maps
+    decay. length is INT32 [slot, 1] and counts the records a reader applies
+    to the dense base of a slot's request page: every layer of a request
+    shares one count, which the runtime snapshots for a forward's readers
+    (``replay_start``) while the commit advances it. record_slots maps
     each request row to its resident record slot; slot zero is valid.
     live_state_indices maps each request row to its private physical page.
     Cache pages hold only dense checkpoints: the owner folds a slot's
@@ -245,28 +247,28 @@ class KdaRetainedHistory:
         return width
 
 
-# Retained commit descriptor ABI: UINT64 [layers, 14].
-# Each layer's row contains 4 pointers, 1 page count, and 9 strides:
+# Retained commit descriptor ABI: UINT64 [layers, 12].
+# Each layer's row contains 3 pointers, 1 page count, and 8 strides:
 #   0: original QKV pointer
 #   1: convolution state pointer
-#   2: retained length pointer, one INT32 per request slot
-#   3: page count (the convolution and recurrent pools hold the same pages)
-#   4: QKV row stride
-#   5: convolution page stride
-#   6: retained length slot stride
-#   7: convolution channel stride
-#   8: convolution tap stride
-#   9: v-major recurrent state pointer
-#  10: recurrent page stride
-#  11: recurrent head stride
-#  12: recurrent value stride
-#  13: recurrent key stride
+#   2: page count (the convolution and recurrent pools hold the same pages)
+#   3: QKV row stride
+#   4: convolution page stride
+#   5: convolution channel stride
+#   6: convolution tap stride
+#   7: v-major recurrent state pointer
+#   8: recurrent page stride
+#   9: recurrent head stride
+#  10: recurrent value stride
+#  11: recurrent key stride
 # All strides count elements. Per-layer values support different arena layouts.
+# A request's accepted count is not a layer's: every layer shares it, and the
+# prepare and the commit take it and its round-start snapshot as tensors.
 # Verify already stores U/K/decay records; commit reads them only to fold an
 # ended request's accepted records into its live page. Commit updates the
-# convolution state, then publishes the accepted history length. The prepare
-# ahead of a verify forward reads the length and recurrent-state columns.
-KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 14
+# convolution state, then publishes the request's count. The prepare ahead of
+# a verify forward reads the page count and recurrent-state columns.
+KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 12
 
 
 @dataclass(frozen=True)
@@ -681,7 +683,9 @@ def kda_materialize_retained_state(
 
     recurrent is the [request, head, V, K] gather output (K,V for k_major).
     source_indices holds each row's source page, and history.record_slots its
-    records and accepted length. Rows with nonpositive source pages are skipped.
+    records and the count history.length gives. Rows with nonpositive source
+    pages are skipped. The count stays as it is: a prefill snapshots and
+    clears it once for every layer (kda_snapshot_retained_length).
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -701,13 +705,14 @@ def kda_materialize_retained_pages(
     source_indices: torch.Tensor,
     recurrent_layout: str,
 ) -> None:
-    """Fold each request's accepted records into its private page and clear its length.
+    """Fold each request's accepted records into its private page.
 
     recurrent_pool holds [page, head, V, K] state (K,V for k_major).
     source_indices lists one physical page per history.record_slots entry.
     Positive pages and their slots must be unique. Rows with nonpositive pages
-    are skipped and keep their lengths. The slot-length reset follows the
-    dense writes on the current stream.
+    are skipped. Every layer of a request shares its count, which this leaves
+    as it is: the caller clears it once every layer has folded
+    (kda_reset_retained_length), on the same stream.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -727,13 +732,14 @@ def kda_reset_retained_length(
     record_slots: torch.Tensor,
     page_count: int,
 ) -> None:
-    """Clear the slot lengths of rows whose page received a dense state.
+    """Clear the slot counts of rows whose page received a dense state.
 
     length is INT32 [slot, 1]. write_indices holds each request row's
     destination page and record_slots its slot; page_count is the State pool's
     page count. Padding rows -- a page at or below 0, or at or past
-    page_count -- keep their lengths, as materialization skips them. A
-    separate ordered launch ensures all dense tiles finish before the reset.
+    page_count -- keep their counts, as materialization skips them. Every
+    layer shares a request's count, so the caller clears it once, after every
+    layer's fold, in a launch ordered behind their dense writes.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import reset_length
 
@@ -745,22 +751,62 @@ def kda_reset_retained_length(
     )
 
 
+def kda_snapshot_retained_length(
+    length: torch.Tensor,
+    start: torch.Tensor,
+    *,
+    record_slots: torch.Tensor,
+    live_indices: torch.Tensor,
+    page_count: int,
+) -> None:
+    """Hand a prefill's counts to its layers' gathers, then clear them once.
+
+    Every layer of a request shares the INT32 [slot, 1] count ``length``.
+    Before the forward, this copies each prefill row's count into ``start``,
+    the count the layers' gathers then read (kda_materialize_retained_state),
+    and clears it for each row whose scan stores a dense state: one whose live
+    page lies in the pool in every state group. A row with live pages in no
+    group (padding) keeps its count; one with live pages in some groups only
+    fails a device assertion, as one count cannot describe both.
+
+    Args:
+        length: The shared INT32 [slot, 1] counts.
+        start: INT32 [slot, 1] counts the forward's readers apply.
+        record_slots: Each prefill row's record slot.
+        live_indices: Integer [groups, rows] live pages of the prefill rows.
+        page_count: The State pool's page count.
+    """
+    from tokenspeed_kernel.ops.attention.kda._retained import snapshot_length
+
+    snapshot_length(
+        length,
+        start,
+        record_slots=record_slots,
+        live_indices=live_indices,
+        page_count=page_count,
+    )
+
+
 def resolve_kda_batched_retained_commit(
     dtype: torch.dtype, *, num_heads: int, head_dim: int, recurrent_layout: str
 ):
-    """Resolve retained cross-layer convolution and length publication.
+    """Resolve retained cross-layer convolution and count publication.
 
     Returns a callable or None for unsupported geometry/platform. Its uint64
-    [layers, 14] descriptors hold QKV/conv/length pointers, the page count,
-    QKV row, conv page, length slot, conv channel and conv tap strides, then
-    the recurrent state pointer and its page, head, value and key strides, in
-    elements. record_slots selects each request's length. A request whose
-    slot is set in request_stopped ended in this forward: its accepted
-    records are folded into its live page and its length is cleared. One
-    whose commit a layer rejects instead is reported as
-    ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's per-row
-    ``apply_stop_conditions`` report. Metadata and all pointers remain stable
-    during CUDA graph capture.
+    [layers, 12] descriptors hold QKV/conv pointers, the page count, QKV row,
+    conv page, conv channel and conv tap strides, then the recurrent state
+    pointer and its page, head, value and key strides, in elements.
+    record_slots selects each request's slot in replay_length, the count
+    every layer shares, and replay_start, the count the round's prepare left.
+    The commit writes a request's count once, after every layer's verdict
+    (commit_verdicts): replay_start plus its acceptance when every layer
+    accepted; a request still decoding that some layers reject fails a device
+    assertion. A request whose slot is set in request_stopped ended in this
+    forward: its accepted records are folded into its live page and its count
+    is cleared. One whose commit a layer that carried it rejects instead is
+    reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's
+    per-row ``apply_stop_conditions`` report. Metadata and all pointers
+    remain stable during CUDA graph capture.
     """
     return _resolve_batched_retained(
         "kda_retained_commit",
@@ -777,17 +823,20 @@ def resolve_kda_batched_retained_prepare(
     """Resolve the cross-layer fold that readies retained history for verify.
 
     Returns a callable or None for unsupported geometry/platform. It takes the
-    commit's descriptors, layer groups, record slots and FP32 records, plus
-    [groups, requests] source and live pages, the packed boundaries and the
-    window (draft_token_num) of the verify that follows. A request whose live
-    page differs from its source, or whose accepted count L plus the larger
-    of its window T and draft_token_num exceeds the history capacity, gets
-    the source state with records [0, L) applied in its live page; a second
-    ordered launch then clears L. Every other row is left as it is, so the
-    verify sees at most capacity - draft_token_num records a request.
-    Run it once per verify round, after the round's pages, boundaries and
-    record slots are refreshed and before any layer's verify: a second run
-    would copy the unchanged source over the fold.
+    commit's descriptors, layer groups, record slots, FP32 records and shared
+    counts, plus [groups, requests] source and live pages, the packed
+    boundaries and the window (draft_token_num) of the verify that follows.
+    A request whose live page differs from its source in any state group, or
+    whose count L plus the larger of its window T and draft_token_num exceeds
+    the history capacity, gets the source state with records [0, L) applied
+    in its live page, in every layer. One launch decides, folds and stores
+    each request's round-start count in replay_start: 0 after a fold, else L.
+    The verify reads it, so it sees at most capacity - draft_token_num
+    records a request, and the commit derives the new count from it; the
+    launch leaves replay_length to the commit. Run it once per verify round,
+    after the round's pages, boundaries and record slots are refreshed and
+    before any layer's verify: a second run would copy the unchanged source
+    over the fold.
     """
     return _resolve_batched_retained(
         "kda_retained_prepare",
@@ -909,6 +958,7 @@ __all__ = [
     "kda_materialize_retained_pages",
     "kda_materialize_retained_state",
     "kda_reset_retained_length",
+    "kda_snapshot_retained_length",
     "resolve_kda_batched_retained_commit",
     "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",

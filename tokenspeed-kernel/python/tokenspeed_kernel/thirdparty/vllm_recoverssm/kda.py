@@ -3,9 +3,10 @@
 """Kimi-K3 RecoverSSM verify with stamped retained KDA records.
 
 Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Retained records keep
-FP32 U, normalized K, multiplicative decay and the accepted length in resident
-request slots. Verify reads each live page's dense base plus the slot's
-accepted records and writes this round's candidate records and stamps; it
+FP32 U, normalized K and multiplicative decay in resident request slots, and
+each slot's accepted count, which every layer shares. Verify reads each live
+page's dense base plus the records the round's start count covers and writes
+this round's candidate records and stamps; it
 retains the upstream recurrence, static token loop, and one-warp launch. The
 batched prepare before verify and the batched commit after it are TokenSpeed's
 own kernels in ``ops/attention/kda``.

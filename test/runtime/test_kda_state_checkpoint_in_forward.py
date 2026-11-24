@@ -362,6 +362,7 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
     server = _Server(params, in_forward=True)
     # A decode-capable engine keeps accepted counts beside its slot records.
     server.backend.preallocate_verify_workspace(4, 1)
+    server.backend._replay_length[1:3].fill_(3)
     tables = {group: [[0, 1, 2], [0, 3, 4]] for group in KIMI_STATE_GROUPS}
     tables["full_attention"] = [[1, 2, 3], [4, 5, 0]]
     lengths_cpu = torch.tensor(lengths, dtype=torch.int32)
@@ -382,10 +383,13 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
         extend_state_checkpoint_lens_cpu=torch.tensor(offsets, dtype=torch.int32),
         query_shard=None,
     )
+    # The forward's metadata hands the rows' counts to every layer and clears
+    # them once: each row's scan stores a dense live page.
+    assert not server.backend._replay_length[1:3].any()
+    assert server.backend._replay_start[1:3].flatten().tolist() == [3, 3]
     for layer in LAYERS:
-        server.backend._retained_lengths[layer][1:3].fill_(3)
         server.forward(layer, streams[layer], 0, sum(lengths), bs=2)
-        assert not server.backend._retained_lengths[layer][1:3].any()
+    assert not server.backend._replay_length[1:3].any()
     torch.cuda.synchronize()
 
     starts = [0, lengths[0]]

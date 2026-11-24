@@ -419,8 +419,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
     key.fill_(0.02)
     decay.fill_(0.9)
+    # The start counts every layer's gather reads; the forward's metadata
+    # took them and cleared the counts before any layer ran.
     length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
-    backend._retained_lengths = {0: length}
+    backend._replay_start = length
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -622,8 +624,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
         reset(source)
+        # Neither the eager nor the replayed forward writes a count.
         expected_lengths = length.clone()
-        expected_lengths[source.req_pool_indices.long()] = 0
         from test.runtime.kda_torch_reference import kda_prefill_reference
 
         expected_conv, expected_states = initial_conv.clone(), initial_states.clone()
@@ -757,7 +759,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._retained_lengths = {0: torch.zeros(4, 1, device="cuda", dtype=torch.int32)}
+    backend._replay_start = torch.zeros(4, 1, device="cuda", dtype=torch.int32)
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),

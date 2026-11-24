@@ -1,9 +1,10 @@
 # KDA kernels
 
 Each physical checkpoint holds only a dense recurrent base. Each resident
-request slot holds its FP32 correction U, normalized K and multiplicative decay
-records plus an INT32 accepted length: the number of records accepted since the
-dense base of the request's page. The logical endpoint is the base followed by
+request slot holds every layer's FP32 correction U, normalized K and
+multiplicative decay records plus one INT32 accepted count that all its layers
+share: the number of records accepted since the dense base of the request's
+pages. The logical endpoint is the base followed by
 `S = S * decay + outer(U, K)` in record order. The base follows
 `--mamba-ssm-dtype` (FP32 or BF16). Accumulation and history remain FP32.
 Materialization casts the result to the dense base dtype.
@@ -32,30 +33,38 @@ persistent GPU scratch.
 `KdaRetainedRecords` supplies original pre-convolution QKV, the retained history,
 packed request boundaries, and generation/position stamps. For each batch row,
 `live_state_indices` selects the private physical page and `record_slots` selects
-the record storage and accepted length. Record slot zero is valid. Shared source
-pages hold dense checkpoints; the slot of a request starting from one holds no
-accepted records. Each live destination may alias only its own source.
+the record storage and the round's start count (`history.length`): the records
+the verify applies to the live base, which the prepare stores for every layer
+at once. Record slot zero is valid. Shared source pages hold dense
+checkpoints; the slot of a request starting from one holds no accepted
+records. Each live destination may alias only its own source.
 
 When source equals live and the accepted prefix plus candidate window fits,
 verify reads the base plus accepted history without changing either. A source
 copy or capacity overflow materializes the logical endpoint into the live base,
-then clears the slot's accepted length in a separate ordered launch. Verify
-writes candidate U/K/decay into the request slot after that length. Rejected
-candidate suffixes need no clearing.
+and the round starts from no record. Verify writes candidate U/K/decay into the
+request slot after the start count. Rejected candidate suffixes need no
+clearing.
 
 Commit validates candidate stamps, updates convolution from original QKV, then
-publishes only the slot's accepted retained length. Its UINT64 `[layers, 14]`
-descriptors contain QKV/conv/length pointers, the page count, five strides
-(the length stride steps request slots), then the v-major recurrent-state
-pointer and its page, head, value and key strides; they carry no raw key/gate
-pointers. `record_slots` selects each request's length. A request whose slot
-is set in `request_stopped` ended in this forward: the convolution launch
+publishes the request's count. Its UINT64 `[layers, 12]` descriptors contain
+the QKV and conv pointers, the page count, four strides, then the v-major
+recurrent-state pointer and its page, head, value and key strides; they carry
+no raw key/gate pointers. The count and the start count are not a layer's:
+the commit takes them as `[slots, 1]` tensors, and `record_slots` selects each
+request's. The convolution launch stores each layer's verdict on each row
+(it does not carry the row, rejects its commit or accepts it) in an INT8
+`[rows, layers]` scratch, and the count launch reduces a row's verdicts and
+writes its count once: the start count plus the acceptance, when every layer
+accepted. A request still decoding that some layers accept and others reject
+fails a device assertion instead of letting its layers drift. A request whose
+slot is set in `request_stopped` ended in this forward: the convolution launch
 also folds its records, through this round's acceptance, into its live page
-(each program of a row takes some heads), and the length launch clears its
-length instead of advancing it. Other commits read no record and write no
-dense state. Stamp-ring capacity is independent of retained-history
-capacity. Padding rows (a page at or below 0, or one past the checkpoint
-pool) leave all pages and lengths untouched.
+(each program of a row takes some heads), and the count launch clears its
+count instead of advancing it. Other commits read no record and write no dense
+state. Stamp-ring capacity is independent of retained-history capacity.
+Padding rows (a page at or below 0, or one past the checkpoint pool) leave all
+pages and counts untouched.
 
 ## NVIDIA verification
 
@@ -90,31 +99,34 @@ records. Each history warp computes both products for up to four keys. It
 combines the even and odd U contributions in FP32. Empty histories use only
 the checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
-Convolution and accepted-length publication use the common retained commit
-ABI. A request that ended in the forward has its records folded into its live
-page by the commit; if a layer rejects its commit (stale stamps, an interval
-past the capacity), the commit raises the row's `request_ends` entry to
-`REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
+Convolution and count publication use the common retained commit ABI. A
+request that ended in the forward has its records folded into its live page by
+the commit; if a layer that carries it rejects its commit (stale stamps, an
+interval past the capacity), the commit raises the row's `request_ends` entry
+to `REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
 page that lacks accepted tokens.
 
 ## Retained preparation
 
 Verify reads each request's live page as its dense base and never writes a page
-or an accepted length. Before a verify forward, the caller runs
-`resolve_kda_batched_retained_prepare` once for every layer: one launch folds,
-and a second, ordered launch clears the folded slots' lengths. A request folds
-when its live page differs from its source page, or when its accepted count L
-plus the larger of its window T and the verify's window (`draft_token_num`)
-exceeds the history capacity: its live page receives the source state with
-records [0, L) applied. The verify kernels read at most capacity minus the
+or a count. Before a verify forward, the caller runs
+`resolve_kda_batched_retained_prepare` once for every layer, in one launch. A
+request folds when its live page differs from its source page in any State
+group, or when its count L plus the larger of its window T and the verify's
+window (`draft_token_num`) exceeds the history capacity: every layer's live
+page receives the source state with records [0, L) applied (in place where the
+pages did not move), since the one count cannot describe records folded in some
+groups and kept in others. The verify kernels read at most capacity minus the
 verify window records, so a request with a shorter window folds as soon as a
-full one would. Each layer decides on its own count. Padding rows keep their
-pages and lengths; an out-of-range L or T fails a device assertion. The launches
-take the commit's per-layer descriptors, the layer-to-group map and
-`[groups, requests]` source and live page tables. The fold splits a request's
-heads across programs only when few requests and layers would leave SMs idle.
-Both vendors share these Triton kernels. Running the prepare twice in one round
-would copy the unchanged source over the fold.
+full one would. The first program of a request stores its start count, 0 after
+a fold and L otherwise, which the verify and the commit read; the count itself
+changes only in the commit. Padding rows keep their pages and start counts; an
+out-of-range L or T fails a device assertion. The launch takes the commit's
+per-layer descriptors, which must share the page count, the layer-to-group map
+and `[groups, requests]` source and live page tables. The fold splits a
+request's heads across programs only when few requests and layers would leave
+SMs idle. Both vendors share this Triton kernel. Running the prepare twice in
+one round would copy the unchanged source over the fold.
 
 The core CuTe window solver keeps main's chunked equations, compensated gate
 prefix sums, value tiles and clustered producer sharing. Bounded windows with
@@ -145,14 +157,16 @@ apply the same norm after attention. A missing norm returns ordinary attention
 output. The norm's FP32 math and rounding order follow `rmsnorm_gated_sigmoid`.
 
 Prefill keeps the capacity-aware scan, native state layout, prepared CuTe plans,
-and cuDNN graph paths. A retained source is gathered and reconstructed in FP32
-before the scan, and a separate ordered launch then clears the rows' slot
-lengths; it skips padding rows (a live page at or below 0, or at or past the
-pool's `page_count`) as the gather does. Final/checkpoint dense stores use the
-selected base dtype. Before a retraction stores its image or anything reads
-the endpoint it published, `kda_materialize_retained_pages` folds each
-victim's records into the live page the scheduler lists and then clears the
-slots' lengths.
+and cuDNN graph paths. Before the forward, `kda_snapshot_retained_length`
+copies the prefill rows' counts to their start counts and clears, once, the
+counts of the rows whose scans store a dense live page in every group; it skips
+padding rows (a live page at or below 0, or at or past the pool's
+`page_count`). Each layer's retained source is then gathered and reconstructed
+in FP32 from the start counts before its scan. Final/checkpoint dense stores
+use the selected base dtype. Before a retraction stores its image or anything
+reads the endpoint it published, `kda_materialize_retained_pages` folds each
+victim's records into the live page the scheduler lists, layer by layer, and
+`kda_reset_retained_length` then clears the slots' counts once.
 
 Retained numerical tests cover accepted-prefix rounds, boundary materialization,
 the fold at a request's end, private/shared pages, stale stamps, graph

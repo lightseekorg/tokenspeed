@@ -377,8 +377,8 @@ from one first bound to that pool:
   pool's specs, page counts, and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
-  state rows for live dense checkpoints. KDA stores its FP32 records and their
-  accepted counts by request slot in a separate allocation. The backend tree
+  state rows for live dense checkpoints. KDA stores its FP32 records and one
+  accepted count per request slot in a separate allocation. The backend tree
   covers only itself: the executor's own pool references
   (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
@@ -641,11 +641,15 @@ and the graph padding rows in one launch (`verify_state_groups`, up to four
 groups). Each batch size's buffers are the rows of one `[groups, bs]` table
 (`state_in_tables`, `state_out_tables`). The commit enqueued after the replay
 reads those buffers before the next refresh rewrites them. KDA's refresh then
-readies every layer's retained history in two launches, outside the graph and
+readies every layer's retained history in one launch, outside the graph and
 ahead of the replay, the eager forward or a mixed forward's decode rows: a
-request that moves to its live block, or would overflow the history capacity,
-folds its accepted records into that block, so verify only reads live blocks
-(`KdaAttnBackend._prepare_retained_history`).
+request that moves to its live block in any State group, or would overflow the
+history capacity, folds its accepted records into its live blocks, and every
+request's round-start count lands in a persistent request-slot buffer, so
+verify only reads live blocks and that count
+(`KdaAttnBackend._prepare_retained_history`). An extend's metadata likewise
+hands its rows' counts to the layers' gathers and clears them once, eager or
+replayed.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:

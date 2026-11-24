@@ -273,7 +273,8 @@ def _logical_checkpoint(backend, layer, page, request_slot):
     if backend._retained_records is None:
         # No decode has allocated the request-slot workspace yet.
         return state
-    length = int(backend._retained_lengths[layer][request_slot].item())
+    # Every layer shares the slot's count.
+    length = int(backend._replay_length[request_slot].item())
     if length:
         layer_row = backend._descriptor_row_by_layer[layer]
         correction, key, decay = backend._retained_records[request_slot, layer_row]
@@ -836,13 +837,21 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     gid = "linear_attention_0"
 
     def tables_for(rows0):
-        # Unused groups still need valid rows of the same width (init
-        # computes indices for every group once per batch).
+        # The other groups' layers run every forward too, on their own
+        # blocks: one count serves every layer of a request.
         return {
             "linear_attention_0": rows0,
             "linear_attention_1": [[p + 4 if p else 0 for p in row] for row in rows0],
             "linear_attention_2": [[p + 8 if p else 0 for p in row] for row in rows0],
         }
+
+    def extend_all(*args, **kwargs):
+        """Run every layer's extend; the checks follow layer 0's."""
+        return [h.extend(layer, *args, **kwargs) for layer in h.layer_ids][0]
+
+    def decode_all(*args, **kwargs):
+        """Run every layer's verify before a commit; the checks follow layer 0's."""
+        return [h.decode(layer, *args, **kwargs) for layer in h.layer_ids][0]
 
     # Shared prefix: 4 tokens (exactly one page). Branch A continues with 3
     # decodes; branch B resumes from the snapshot with a 3-token extend and
@@ -865,8 +874,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0], num_extends=1
     )
     a_outs = [
-        h.extend(
-            layer_id,
+        extend_all(
             prefix["mixed"],
             prefix["g_raw"],
             prefix["beta_raw"],
@@ -886,8 +894,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
     assert md.state_out_blocks_by_group[gid].tolist() == [2]
     a_outs.append(
-        h.decode(
-            layer_id,
+        decode_all(
             a_new["mixed"][:1],
             a_new["g_raw"][:1],
             a_new["beta_raw"][:1],
@@ -912,8 +919,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1, 2]
     assert md.state_out_blocks_by_group[gid].tolist() == [3, 2]
-    both = h.extend(
-        layer_id,
+    both = extend_all(
         torch.cat([b_new["mixed"][:3], a_new["mixed"][1:2]], dim=0),
         torch.cat([b_new["g_raw"][:3], a_new["g_raw"][1:2]], dim=0),
         torch.cat([b_new["beta_raw"][:3], a_new["beta_raw"][1:2]], dim=0),
@@ -941,7 +947,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     mixed = torch.cat([a_new["mixed"][2:3], b_new["mixed"][3:4]], dim=0)
     g_raw = torch.cat([a_new["g_raw"][2:3], b_new["g_raw"][3:4]], dim=0)
     beta_raw = torch.cat([a_new["beta_raw"][2:3], b_new["beta_raw"][3:4]], dim=0)
-    both = h.decode(layer_id, mixed, g_raw, beta_raw, bs=2)
+    both = decode_all(mixed, g_raw, beta_raw, bs=2)
     h.commit_decode(2)
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
@@ -985,11 +991,13 @@ def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The real LCM pool's page-strided component views flow
-    through the conv + KDA kernels: prefill + decodes on one KDA layer of
-    each of the three groups, vs naive + FLA."""
+    through the conv + KDA kernels: prefill + decodes on every KDA layer,
+    one layer of each of the three groups checked vs naive + FLA. Every
+    layer of a request verifies each round, as its one count requires."""
     pool = _make_kimi_pool("cuda", usable_pages=4)
     contract = pool.arena.runtime_contract
-    layer_ids = [_kda_layer_for_group(pool, gid) for gid in _STATE_GROUPS]
+    checked = [_kda_layer_for_group(pool, gid) for gid in _STATE_GROUPS]
+    layer_ids = sorted(pool.state_group_by_layer)
 
     # Kimi TP8 geometry: 12 heads, D=128, conv_dim 4608.
     class _KimiHarness(_KDAHarness):
@@ -1031,7 +1039,7 @@ def test_kda_cache_pool_component_views_end_to_end(
             )
         h.commit_decode(1)
 
-    for layer_id, gid in zip(layer_ids, _STATE_GROUPS):
+    for layer_id, gid in zip(checked, _STATE_GROUPS):
         s = streams[layer_id]
         naive_out, naive_state = h.oracle(
             layer_id, s["mixed"], s["g_raw"], s["beta_raw"]

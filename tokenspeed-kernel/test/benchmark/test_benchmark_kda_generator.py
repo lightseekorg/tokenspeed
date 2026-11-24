@@ -299,6 +299,7 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
                 [
                     layer["state"],
                     layer["conv"],
+                    layer["count"],
                     history.length,
                     history.correction,
                     history.key,
@@ -309,7 +310,12 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
                 window if mode == "kda_retained_commit" else history_length
             )
             slots = history.record_slots.long()
-            assert history.length[slots, 0].tolist() == [expected_length]
+            # The commit advances the count every layer shares; the verify
+            # reads the round's start.
+            assert layer["count"][slots, 0].tolist() == [expected_length]
+            assert history.length[slots, 0].tolist() == [
+                0 if mode == "kda_retained_commit" else history_length
+            ]
             if history_length:
                 assert torch.count_nonzero(
                     history.correction[history.record_slots.long(), :, :history_length]

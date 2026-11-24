@@ -44,7 +44,11 @@ def retained_row(history, request):
 
 @cute.jit
 def retained_length(history, slot):
-    """Accepted records the request in ``slot`` holds beyond its dense base."""
+    """Accepted records the request in ``slot`` applies to its dense base.
+
+    The round's start count the prepare stored for the slot: every layer
+    reads the same one.
+    """
     length = history[4]
     return Int32(
         cute.make_tensor(
@@ -69,7 +73,7 @@ def fake_retained_arguments(state, correction, key, *, batch, live_dtype, slot_d
     from quack.compile_utils import make_fake_tensor
 
     decay = make_fake_tensor(Float32, key.shape, leading_dim=None)
-    # One accepted-record count per request slot, beside its records.
+    # The round's start count of each request slot, beside its records.
     length = make_fake_tensor(Int32, (correction.shape[0], 1))
     live = make_fake_tensor(live_dtype, (batch,))
     record_slots = make_fake_tensor(slot_dtype, (batch,), leading_dim=None)

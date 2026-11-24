@@ -167,17 +167,19 @@ def kda_request_slot_bytes(
             default history capacity (``kda_history_capacity``).
 
     Returns:
-        Bytes of the slot's FP32 correction, key and decay records and its
-        INT32 accepted count, for each KDA layer.
+        Bytes of the slot's FP32 correction, key and decay records for each
+        KDA layer, plus its INT32 accepted count, which every layer shares,
+        and the INT32 count a forward's readers apply.
     """
     linear = config.component(LinearAttnConfig)
     heads, value_dim, key_dim = linear.temporal_state_shape
-    return _kda_layer_count(groups) * (
-        heads
+    return (
+        _kda_layer_count(groups)
+        * heads
         * kda_history_capacity(config, draft_token_num)
         * (value_dim + 2 * key_dim)
         * torch.float32.itemsize
-        + torch.int32.itemsize
+        + 2 * torch.int32.itemsize
     )
 
 
@@ -198,9 +200,9 @@ def kda_verify_workspace_bytes(
 
     Returns:
         Bytes for each request slot's retained FP32 correction, key and decay
-        records and INT32 accepted count; plus per-batch QKV, commit
-        descriptors, routing arrays and generation/position stamps used by
-        verify and decode.
+        records and INT32 counts; plus per-batch QKV, commit descriptors,
+        routing arrays, each layer's INT8 commit verdict per row and
+        generation/position stamps used by verify and decode.
     """
     from tokenspeed_kernel.ops.attention.kda import (
         KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS,
@@ -221,4 +223,5 @@ def kda_verify_workspace_bytes(
     metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
     metadata_bytes += config.max_bs * 4 * 8
     metadata_bytes += num_layers * config.max_bs * draft_token_num * 2 * 8
+    metadata_bytes += num_layers * config.max_bs * torch.int8.itemsize
     return retained_bytes + qkv_bytes + metadata_bytes

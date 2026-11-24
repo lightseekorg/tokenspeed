@@ -118,8 +118,9 @@ def make_case(
     )
 
 
-# One layer's (descriptor, group index) pair per layout, kept for graph capture.
-_PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+# One layer's (descriptor, group index, accepted counts) per layout, kept for
+# graph capture.
+_PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def prepare_history(
@@ -127,28 +128,29 @@ def prepare_history(
 ):
     """Ready one layer's retained history for its verify, as serving does.
 
-    Serving prepares every layer in one launch pair before the forward; this
-    runs the same batched prepare over a single layer: rows that move to a
-    private live page, or whose records plus the verify's window
-    (draft_token_num) overflow the history capacity, get their source state
-    with accepted records applied in their live page, and their lengths clear.
+    Serving prepares every layer in one launch before the forward; this runs
+    the same batched prepare over a single layer. history.length holds each
+    slot's accepted count on entry and the round's start count, which the
+    verify reads, on return: rows that move to a private live page, or whose
+    records plus the verify's window (draft_token_num) overflow the history
+    capacity, get their source state with accepted records applied in their
+    live page and start at 0. The prepare reads the counts from a copy, as
+    serving keeps them apart from the start counts it writes.
     """
-    # Only the length and recurrent-state columns are read before verify.
+    # Only the page count and recurrent-state columns are read before verify.
     row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
-    row[2], row[3], row[6] = (
-        history.length.data_ptr(),
-        state_pool.shape[0],
-        history.length.stride(0),
-    )
-    row[9:14] = state_pool.data_ptr(), *state_pool.stride()
+    row[2] = state_pool.shape[0]
+    row[7:12] = state_pool.data_ptr(), *state_pool.stride()
     # Uploaded on the first, eager call; a CUDA-graph capture reuses it.
-    key = (*row, str(state_pool.device))
+    key = (*row, history.length.data_ptr(), str(state_pool.device))
     if key not in _PREPARED_LAYERS:
         _PREPARED_LAYERS[key] = (
             torch.tensor([row], device=state_pool.device, dtype=torch.uint64),
             torch.zeros(1, device=state_pool.device, dtype=torch.int32),
+            torch.empty_like(history.length),
         )
-    descriptors, group_indices = _PREPARED_LAYERS[key]
+    descriptors, group_indices, counts = _PREPARED_LAYERS[key]
+    counts.copy_(history.length)
     _, heads, dim, _ = state_pool.shape
     prepare = kda.resolve_kda_batched_retained_prepare(
         torch.bfloat16, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
@@ -165,6 +167,8 @@ def prepare_history(
         retained_correction=history.correction[:, None],
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
+        replay_length=counts,
+        replay_start=history.length,
         history_capacity=history.correction.shape[2],
         draft_token_num=draft_token_num,
         num_heads=heads,
@@ -379,16 +383,14 @@ def verify(case):
     )
 
 
-def _commit_descriptor(qkv, conv, history, state):
-    """One layer's 14-column retained commit descriptor."""
+def _commit_descriptor(qkv, conv, state):
+    """One layer's 12-column retained commit descriptor."""
     return [
         qkv.data_ptr(),
         conv.data_ptr(),
-        history.length.data_ptr(),
         conv.shape[0],
         qkv.stride(0),
         conv.stride(0),
-        history.length.stride(0),
         conv.stride(1),
         conv.stride(2),
         state.data_ptr(),
@@ -410,10 +412,15 @@ def _run_commit(
     record_stamps,
     request_stopped,
     request_ends,
+    commit_verdicts,
     activation_dtype,
     conv_state_dtype,
 ):
-    """Run the production batched retained commit over a single layer."""
+    """Run the production batched retained commit over a single layer.
+
+    history.length is both the round's start count and the count the commit
+    advances: one layer reads and writes them in separate launches.
+    """
     heads, dim = state.shape[1], state.shape[-1]
     kernel = kda.resolve_kda_batched_retained_commit(
         activation_dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
@@ -433,6 +440,9 @@ def _run_commit(
         retained_correction=history.correction[:, None],
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
+        replay_length=history.length,
+        replay_start=history.length,
+        commit_verdicts=commit_verdicts,
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=width,
@@ -468,7 +478,7 @@ def commit(case, accepted, *, ended_slots):
     ).to(torch.int32)
     _run_commit(
         descriptors=torch.tensor(
-            [_commit_descriptor(qkv, conv, history, state)],
+            [_commit_descriptor(qkv, conv, state)],
             device="cuda",
             dtype=torch.uint64,
         ),
@@ -483,6 +493,9 @@ def commit(case, accepted, *, ended_slots):
         record_stamps=records.stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
+        commit_verdicts=torch.empty(
+            accepted.numel(), 1, device="cuda", dtype=torch.int8
+        ),
         activation_dtype=qkv.dtype,
         conv_state_dtype=conv.dtype,
     )
@@ -557,17 +570,24 @@ def publish(
             qkv,
             window,
             torch.tensor(
-                [_commit_descriptor(qkv, window, history, state)],
+                [_commit_descriptor(qkv, window, state)],
                 device=device,
                 dtype=torch.uint64,
             ),
             torch.zeros(1, device=device, dtype=torch.int32),
             torch.zeros(history.length.shape[0], device=device, dtype=torch.bool),
             torch.zeros(batch, device=device, dtype=torch.int32),
+            torch.empty(batch, 1, device=device, dtype=torch.int8),
         )
-    qkv, window, descriptors, group_indices, request_stopped, request_ends = (
-        _PUBLISHED_LAYERS[layout]
-    )
+    (
+        qkv,
+        window,
+        descriptors,
+        group_indices,
+        request_stopped,
+        request_ends,
+        commit_verdicts,
+    ) = _PUBLISHED_LAYERS[layout]
     _run_commit(
         descriptors=descriptors,
         group_indices=group_indices,
@@ -581,6 +601,7 @@ def publish(
         record_stamps=record_stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
+        commit_verdicts=commit_verdicts,
         activation_dtype=qkv.dtype,
         conv_state_dtype=window.dtype,
     )
