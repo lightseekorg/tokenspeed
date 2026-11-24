@@ -66,6 +66,7 @@ def serving_args(algorithm, route, *, base_variable):
     args += [
         "--enable-async-logging",
         "--enable-startup-requests",
+        "--enable-output-logprobs",
         "--max-num-seqs",
         "8",
         "--max-model-len",
@@ -152,7 +153,9 @@ def generate(driver, count):
         for i in range(count)
     ]
     outputs = driver.generate(requests)
-    assert all(output.finish_reason == "length" for output in outputs)
+    for output in outputs:
+        assert output.finish_reason == "length", output.finish_details
+        assert len(output.output_ids) == len(output.output_token_logprobs) == 24
     return outputs
 
 

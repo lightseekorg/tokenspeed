@@ -38,7 +38,9 @@ Graph, ordinary prefill Graph, and above-ladder eager), two mixed cases, and
 copied restore. The test configures mixed execution explicitly; a mere mixed
 workload without `--enable-mixed-batch` is insufficient. Every required route,
 width, copy and closed admission must still appear in actual records. The
-tests retain their exact token/logprob-bit comparisons and full histogram checks.
+serving fixtures explicitly enable output logprobs and require one score per
+generated token before their exact token/logprob-bit comparisons and full
+histogram checks.
 Record selected case counts, no skips, JUnit, logs and the measured snapshot
 manifests. These commands are a recipe, not a claim of GPU serving success.
 
