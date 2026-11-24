@@ -2078,6 +2078,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // caller, stop withholding forwards for that abandoned clear.
             self.cache_clear_started = None;
         }
+        if coordinated && cancel_memory {
+            // A cache flush may yield to finish_drain below. Withdraw the
+            // active drain and the entire observed queue on every rank first.
+            let reason = "memory operation cancelled before device execution";
+            self.controls.cancel_memory_release(reason);
+            self.refuse_queued_memory(self.memory_calls.len(), reason);
+        }
         let flushed = if want_flush {
             match self.clear_cache()? {
                 Some(flushed) => flushed,
@@ -2116,23 +2123,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
-        if coordinated {
-            if cancel_memory {
-                let reason = "memory operation cancelled before device execution";
-                self.controls.cancel_memory_release(reason);
-                // Cancel the entire observed batch everywhere: local pre/post
-                // continue boundaries can differ across independent ingresses.
-                // Collect the continue and outstanding memory replies before retrying.
-                self.refuse_queued_memory(self.memory_calls.len(), reason);
-            } else if !release_pending {
-                if memory_ready {
-                    release_pending = self.prepare_memory_call()?;
-                } else if memory_timed_out {
-                    self.refuse_queued_memory(
-                        self.memory_calls.len(),
-                        "timed out waiting for the same memory call on every rank",
-                    );
-                }
+        if coordinated && !cancel_memory && !release_pending {
+            if memory_ready {
+                release_pending = self.prepare_memory_call()?;
+            } else if memory_timed_out {
+                self.refuse_queued_memory(
+                    self.memory_calls.len(),
+                    "timed out waiting for the same memory call on every rank",
+                );
             }
         }
         Ok((memory_resident, release_pending, nccl_release_pending))

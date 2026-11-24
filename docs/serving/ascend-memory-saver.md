@@ -63,7 +63,7 @@ TOKENSPEED_TVM_FFI_VERSION=0.1.13.post3 bash test/ci_system/install_triton_ascen
 
 # Build the pinned saver source against the configured CANN toolkit.
 python -m pip install --no-deps \
-  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@95b6ee6f67e1fa2d4ca2357ffeba7fc9eeb972c0"
+  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@866357c48048459d69522e311d56b8e1f6dfaed7"
 TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
   -e ./tokenspeed-kernel/python ./tokenspeed-engine -e './python[ascend-memory-saver]'
 export TORCH_DEVICE_BACKEND_AUTOLOAD=1
@@ -72,9 +72,9 @@ export TORCH_HCCL_ZERO_COPY=0
 export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-The pinned saver source installs version `0.1.3` and its matching ABI 3
+The pinned saver source installs version `0.1.4` and its matching ABI 3
 allocator. Install it before the TokenSpeed `ascend-memory-saver` extra.
-See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/95b6ee6f67e1fa2d4ca2357ffeba7fc9eeb972c0/README.md)
+See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/866357c48048459d69522e311d56b8e1f6dfaed7/README.md)
 for compiler and CMake requirements.
 Ascend requires protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
