@@ -124,6 +124,7 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
+    RMSNormOutputGate,
     hf_sliding_window_to_window_left,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -444,6 +445,7 @@ def _prepare_owned_projections(
             output_size=weight.shape[0] * (1 if kind == "scatter" else size),
             max_tokens=rows,
             dtype=torch.bfloat16,
+            weight_dtype=weight.dtype,
             device=weight.device,
         )
         for kind, weight in projections
@@ -1321,7 +1323,7 @@ class MuseSparkAttention(nn.Module):
                 positions,
                 ctx,
                 rmsnorm_output_gate=(
-                    (output_gate, self.rms_norm_eps) if gated else None
+                    RMSNormOutputGate(output_gate, self.rms_norm_eps) if gated else None
                 ),
             )
         if not gated:
