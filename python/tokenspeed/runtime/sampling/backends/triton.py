@@ -592,9 +592,13 @@ class TritonSamplingBackend(SamplingBackend):
         # Rejection-sampling verify against the DFlash2 sparse draft q
         # (--enable-speculative-sampling): each verify row's accept bit and
         # the token emitted if the chain stops there, and the no-filter
-        # route's per-block partials (row max / sum-exp / best scores).
+        # route's per-block partials (row max / sum-exp / best scores). A
+        # mixed batch also writes the top-k kernel's decisions to their own
+        # pair, next to the no-filter kernel's (see _verify_mixed_rows).
         self._row_accept: torch.Tensor | None = None
         self._row_token: torch.Tensor | None = None
+        self._top_k_row_accept: torch.Tensor | None = None
+        self._top_k_row_token: torch.Tensor | None = None
         self._no_filter_verify_scores: torch.Tensor | None = None
         self._no_filter_verify_ids: torch.Tensor | None = None
         if config.enable_speculative_sampling:
@@ -603,6 +607,12 @@ class TritonSamplingBackend(SamplingBackend):
                 (verify_rows,), dtype=torch.int32, device=config.device
             )
             self._row_token = torch.empty(
+                (verify_rows,), dtype=torch.int32, device=config.device
+            )
+            self._top_k_row_accept = torch.empty(
+                (verify_rows,), dtype=torch.int32, device=config.device
+            )
+            self._top_k_row_token = torch.empty(
                 (verify_rows,), dtype=torch.int32, device=config.device
             )
             scores_shape, ids_shape = verify_rows_no_filter_scratch_shape(
@@ -1126,16 +1136,21 @@ class TritonSamplingBackend(SamplingBackend):
         """Per verify row: whether its draft is accepted, and the token the
         chain emits if it stops there.
 
-        Rows whose node has a recorded q run rejection sampling against the
-        route's filtered target distribution (accept with ``min(1, p/q)``,
+        Rows whose node has a recorded q run rejection sampling against their
+        request's filtered target distribution (accept with ``min(1, p/q)``,
         else a residual draw from ``norm(max(p - q, 0))``); rows without one
-        (slot ``-1``) and greedy rows keep the target-only rule. The no-filter
-        and top-k routes only: the caller keeps the others on the
-        target-only path.
+        (slot ``-1``) and greedy rows keep the target-only rule. The no-filter,
+        top-k and mixed routes only: the caller keeps the top-p-only route on
+        the target-only path.
         """
         bs, num_tokens_per_req = candidates.shape
         rows = bs * num_tokens_per_req
-        if self._row_accept is None or self._row_token is None:
+        if (
+            self._row_accept is None
+            or self._row_token is None
+            or self._top_k_row_accept is None
+            or self._top_k_row_token is None
+        ):
             raise RuntimeError(
                 "verify received a draft q but the triton sampling backend was "
                 "built without enable_speculative_sampling"
@@ -1162,48 +1177,178 @@ class TritonSamplingBackend(SamplingBackend):
                 vocab_size=self.config.vocab_size,
                 num_tokens_per_req=num_tokens_per_req,
             )
-        elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
-            assert self._no_filter_verify_scores is not None
-            assert self._no_filter_verify_ids is not None
-            verify_rows_no_filter_from_pools(
+            return row_accept, row_token
+        assert logits is not None
+        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+            return self._verify_no_filter_rows(
                 logits,
                 req_pool_indices,
-                self._temperature_pool,
-                self._seed_pool,
                 offsets_pool,
                 candidates,
-                draft_q.q,
-                draft_q.q_ids,
-                draft_q.slot,
-                draft_q.pos,
-                self._no_filter_verify_scores[:rows],
-                self._no_filter_verify_ids[:rows],
+                draft_q,
                 row_accept,
                 row_token,
-                num_tokens_per_req=num_tokens_per_req,
             )
-        else:
-            verify_rows_top_k_top_p_from_pools(
-                logits,
-                req_pool_indices,
+        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_GENERIC:
+            return self._verify_mixed_rows(
+                logits, req_pool_indices, offsets_pool, candidates, draft_q
+            )
+        return self._verify_top_k_rows(
+            logits,
+            req_pool_indices,
+            offsets_pool,
+            candidates,
+            draft_q,
+            row_accept,
+            row_token,
+        )
+
+    def _verify_no_filter_rows(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        candidates: torch.Tensor,
+        draft_q: DraftTreeQ,
+        row_accept: torch.Tensor,
+        row_token: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rejection rule against ``softmax(logits / T)`` over the whole vocabulary."""
+        assert self._no_filter_verify_scores is not None
+        assert self._no_filter_verify_ids is not None
+        rows = row_accept.shape[0]
+        verify_rows_no_filter_from_pools(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._seed_pool,
+            offsets_pool,
+            candidates,
+            draft_q.q,
+            draft_q.q_ids,
+            draft_q.slot,
+            draft_q.pos,
+            self._no_filter_verify_scores[:rows],
+            self._no_filter_verify_ids[:rows],
+            row_accept,
+            row_token,
+            num_tokens_per_req=candidates.shape[1],
+        )
+        return row_accept, row_token
+
+    def _verify_top_k_rows(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        candidates: torch.Tensor,
+        draft_q: DraftTreeQ,
+        row_accept: torch.Tensor,
+        row_token: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rejection rule against each row's finite top-k (then top-p) distribution."""
+        rows = row_accept.shape[0]
+        verify_rows_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            self._topk_verify_candidate_ids[:rows],
+            self._topk_verify_candidate_logits[:rows],
+            candidates,
+            draft_q.q,
+            draft_q.q_ids,
+            draft_q.slot,
+            draft_q.pos,
+            row_accept,
+            row_token,
+            block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
+            top_k_pad=self._top_k_top_p_pad,
+            num_tokens_per_req=candidates.shape[1],
+        )
+        return row_accept, row_token
+
+    def _verify_mixed_rows(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        candidates: torch.Tensor,
+        draft_q: DraftTreeQ,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-request rules for a batch that mixes filter kinds (the generic route).
+
+        Each request verifies by its own kind: no filter (top-k disabled,
+        ``top_p = 1``) by the no-filter kernel, a finite top-k (greedy
+        included) by the top-k kernel, and top-p only by the target-only rule
+        against the generic sampler's draw. All three run over the whole
+        batch, so the step's kernels do not depend on its composition and
+        capture in one graph; each request then takes its own kind's rows.
+        This costs two more sampling passes than a single-kind route, small
+        next to the verify forward. The top-k kernel reads a disabled top-k
+        as ``top_k_pad``, so its rows for the other kinds are well defined,
+        and discarded.
+        """
+        assert self._row_accept is not None and self._row_token is not None
+        assert self._top_k_row_accept is not None
+        assert self._top_k_row_token is not None
+        bs, num_tokens_per_req = candidates.shape
+        rows = bs * num_tokens_per_req
+        row_accept, row_token = self._verify_no_filter_rows(
+            logits,
+            req_pool_indices,
+            offsets_pool,
+            candidates,
+            draft_q,
+            self._row_accept[:rows],
+            self._row_token[:rows],
+        )
+        top_k_accept, top_k_token = self._verify_top_k_rows(
+            logits,
+            req_pool_indices,
+            offsets_pool,
+            candidates,
+            draft_q,
+            self._top_k_row_accept[:rows],
+            self._top_k_row_token[:rows],
+        )
+        target_sampled = self._sample_verify_targets(
+            logits,
+            None,
+            req_pool_indices,
+            (
                 self._temperature_pool,
                 self._top_k_pool,
                 self._top_p_pool,
                 self._seed_pool,
-                offsets_pool,
-                self._topk_verify_candidate_ids[:rows],
-                self._topk_verify_candidate_logits[:rows],
-                candidates,
-                draft_q.q,
-                draft_q.q_ids,
-                draft_q.slot,
-                draft_q.pos,
-                row_accept,
-                row_token,
-                block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
-                top_k_pad=self._top_k_top_p_pad,
-                num_tokens_per_req=num_tokens_per_req,
-            )
+            ),
+            offsets_pool,
+            rows,
+            num_tokens_per_req,
+        )
+        # Target-only rule: row r keeps draft r + 1 iff it equals the draw;
+        # a request's last row has no draft to keep.
+        next_draft = torch.cat(
+            (candidates[:, 1:], torch.full_like(candidates[:, :1], -1)), dim=1
+        ).reshape(-1)
+        target_accept = (next_draft == target_sampled).to(torch.int32)
+
+        pool = req_pool_indices[:bs].long()
+        top_k = self._top_k_pool[pool]
+        top_p = self._top_p_pool[pool]
+        finite_top_k = (top_k != _TOP_K_DISABLED).repeat_interleave(num_tokens_per_req)
+        top_p_only = (
+            (top_k == _TOP_K_DISABLED) & (top_p < 1.0 - _SAMPLING_EPS)
+        ).repeat_interleave(num_tokens_per_req)
+        for keep, accept, token in (
+            (finite_top_k, top_k_accept, top_k_token),
+            (top_p_only, target_accept, target_sampled),
+        ):
+            torch.where(keep, accept, row_accept, out=row_accept)
+            torch.where(keep, token.to(torch.int32), row_token, out=row_token)
         return row_accept, row_token
 
     def _verify_block(
@@ -1384,6 +1529,7 @@ class TritonSamplingBackend(SamplingBackend):
             _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
             _SAMPLE_ROUTE_GUMBEL_TOP_K,
             _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+            _SAMPLE_ROUTE_GUMBEL_GENERIC,
         ):
             row_accept, row_token = self._verify_rows_with_draft_q(
                 logits,
@@ -1403,10 +1549,10 @@ class TritonSamplingBackend(SamplingBackend):
             )
             accept_length += 1
         else:
-            # Without a draft q, and on the routes with no exact filtered
-            # distribution (top-p only, mixed), every row keeps the
-            # target-only rule: a draft is kept iff it equals the target's
-            # own keyed draw at that position.
+            # Without a draft q, and on the top-p-only route (no exact
+            # filtered distribution), every row keeps the target-only rule:
+            # a draft is kept iff it equals the target's own keyed draw at
+            # that position.
             target_sampled = self._sample_verify_targets(
                 logits,
                 selected,
