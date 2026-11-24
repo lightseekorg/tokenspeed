@@ -23,6 +23,15 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
+from tokenspeed_kernel.ops.embedding.triton import (
+    MLARopeSetKVBufferLaunch,
+    _mla_rope_set_kv_buffer_lanes,
+    _mla_rope_set_kv_buffer_token,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _index_k_layernorm_fp8_scatter_args,
+    _index_k_layernorm_fp8_scatter_row,
+)
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
 from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _e2m1_decode,
@@ -31,7 +40,12 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _ue8m0_exponent,
     _ue8m0_word,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
@@ -2567,9 +2581,8 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1", "X2"])
-def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
+@triton.jit
+def _pack_index_query_row(X, V, S, X0, X1, X2, row, HEADS: tl.constexpr):
     d = tl.arange(0, 128)
     # Widen before multiplication: large inner strides overflow int32 offsets.
     x = tl.load(X + (row // HEADS) * X0 + (row % HEADS) * X1 + d.to(tl.int64) * X2).to(
@@ -2580,6 +2593,291 @@ def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
     tl.store(V + row * 64 + tl.arange(0, 64), tl.reshape(packed, (64,)))
     tl.store(S + row + tl.arange(0, 1), _ue8m0_word(exponent))
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
+    _pack_index_query_row(X, V, S, X0, X1, X2, tl.program_id(0).to(tl.int64), HEADS)
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _index_k_write_pack_query_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    X,
+    V,
+    S,
+    X0,
+    X1,
+    X2,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
+    HEADS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    _pack_index_query_row(X, V, S, X0, X1, X2, token * HEADS + head, HEADS)
+    # A row's first head also writes its key.
+    if head == 0:
+        _index_k_layernorm_fp8_scatter_row(
+            fp8_buf_ptr,
+            scale_buf_ptr,
+            x_ptr,
+            norm_weight_ptr,
+            norm_bias_ptr,
+            loc_ptr,
+            write_mask_ptr,
+            token,
+            x_row_stride,
+            page_bytes,
+            scale_base_off,
+            eps,
+            HAS_WRITE_MASK,
+            PAGE_SIZE,
+            HD,
+            GROUP,
+            NG,
+            BLOCK_NG,
+            FP8_MAX,
+            MXFP4,
+            UE8M0,
+        )
+
+
+@triton.jit
+def _absorb_query_tile(
+    A,
+    W,
+    O,
+    tile,
+    num_tokens,
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    HEADS: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Output tile ``tile`` of ``O[t, h] = A[t, h] @ W[h].T``: one chain of
+    16x16x32 MFMAs over K in order per element, rounded to ``A``'s dtype
+    before ``O``'s store converts it, as the grouped decode GEMM computes it."""
+    tl.static_assert(BLOCK_M == 16 and BLOCK_N == 16)
+    blocks: tl.constexpr = N // BLOCK_N
+    m = tile // (HEADS * blocks) * BLOCK_M + tl.arange(0, BLOCK_M)
+    h = tile // blocks % HEADS
+    n = tile % blocks * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.arange(0, K)
+    rows = m[:, None] < num_tokens
+    a = tl.load(A + m[:, None] * A0 + h * A1 + k[None, :], mask=rows, other=0.0)
+    w = tl.load(W + h * W0 + n[None, :] * W1 + k[:, None])
+    q = tl.dot(a, w).to(A.dtype.element_ty)
+    tl.store(O + m[:, None] * O0 + h * O1 + n[None, :], q, mask=rows)
+
+
+@triton.jit(do_not_specialize=["X0", "X1", "X2", "num_tokens"])
+def _index_k_write_pack_query_mla_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    X,
+    V,
+    S,
+    X0,
+    X1,
+    X2,
+    q_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    q_out_rope_ptr,
+    kv_buffer_ptr,
+    kv_loc_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_nope_ptr,
+    num_tokens,
+    kv_write_mask_ptr,
+    kv_loc_stride: tl.constexpr,
+    q_rope_stride_t: tl.constexpr,
+    q_rope_stride_h: tl.constexpr,
+    k_nope_stride_t: tl.constexpr,
+    k_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_h: tl.constexpr,
+    kv_buffer_stride_t,
+    kv_buffer_stride_p,
+    KV_PAGE_SIZE: tl.constexpr,
+    cos_sin_stride_p: tl.constexpr,
+    q_nope_stride_t: tl.constexpr,
+    q_nope_stride_h: tl.constexpr,
+    num_q_heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    A,
+    W,
+    O,
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
+    HEADS: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    ASSEMBLE_FULL_QUERY: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    INDEX_INT64: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+    ABSORB: tl.constexpr,
+    ABSORB_K: tl.constexpr,
+    ABSORB_N: tl.constexpr,
+    ABSORB_BLOCK_M: tl.constexpr,
+    ABSORB_BLOCK_N: tl.constexpr,
+):
+    """One program each: with ``ABSORB``, first the absorbed query's tiles
+    (:func:`_absorb_query_tile`); then a token's index query head, as
+    :func:`_index_k_write_pack_query_kernel` (a token's first head also
+    writing its key); then a token's NoPE ``_mla_rope_set_kv_buffer_kernel``
+    query head or latent row."""
+    pid = tl.program_id(0)
+    if ABSORB:
+        tiles = (
+            tl.cdiv(num_tokens, ABSORB_BLOCK_M)
+            * num_q_heads
+            * (ABSORB_N // ABSORB_BLOCK_N)
+        )
+        if pid < tiles:
+            _absorb_query_tile(
+                A,
+                W,
+                O,
+                pid,
+                num_tokens,
+                A0,
+                A1,
+                W0,
+                W1,
+                O0,
+                O1,
+                num_q_heads,
+                ABSORB_K,
+                ABSORB_N,
+                ABSORB_BLOCK_M,
+                ABSORB_BLOCK_N,
+            )
+            return
+        pid -= tiles
+    if pid < num_tokens * HEADS:
+        token = (pid // HEADS).to(tl.int64)
+        head = pid % HEADS
+        _pack_index_query_row(X, V, S, X0, X1, X2, token * HEADS + head, HEADS)
+        if head == 0:
+            _index_k_layernorm_fp8_scatter_row(
+                fp8_buf_ptr,
+                scale_buf_ptr,
+                x_ptr,
+                norm_weight_ptr,
+                norm_bias_ptr,
+                loc_ptr,
+                write_mask_ptr,
+                token,
+                x_row_stride,
+                page_bytes,
+                scale_base_off,
+                eps,
+                HAS_WRITE_MASK,
+                PAGE_SIZE,
+                HD,
+                GROUP,
+                NG,
+                BLOCK_NG,
+                FP8_MAX,
+                MXFP4,
+                UE8M0,
+            )
+        return
+    pid -= num_tokens * HEADS
+    token_idx = pid // (num_q_heads + 1)
+    if INDEX_INT64:
+        token_idx = token_idx.to(tl.int64)
+    _mla_rope_set_kv_buffer_token(
+        token_idx,
+        (pid % (num_q_heads + 1)).to(tl.int64),
+        _mla_rope_set_kv_buffer_lanes(
+            nope_dim, rope_dim, NOPE_BLOCK, HALF_BLOCK, IS_NEOX
+        ),
+        q_rope_ptr,
+        k_nope_ptr,
+        k_rope_ptr,
+        q_out_rope_ptr,
+        kv_buffer_ptr,
+        kv_loc_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        q_nope_ptr,
+        kv_write_mask_ptr,
+        kv_loc_stride,
+        q_rope_stride_t,
+        q_rope_stride_h,
+        k_nope_stride_t,
+        k_rope_stride_t,
+        q_out_rope_stride_t,
+        q_out_rope_stride_h,
+        kv_buffer_stride_t,
+        kv_buffer_stride_p,
+        KV_PAGE_SIZE,
+        cos_sin_stride_p,
+        q_nope_stride_t,
+        q_nope_stride_h,
+        num_q_heads,
+        nope_dim,
+        rope_dim,
+        IS_NEOX,
+        ASSEMBLE_FULL_QUERY,
+        APPLY_ROPE,
+        SANITIZE,
+        MAX_FINITE,
+    )
 
 
 @triton.jit
@@ -2671,6 +2969,192 @@ def pack_index_queries(values):
             HEADS=heads,
             num_warps=4,
             enable_fp_fusion=False,
+        )
+    return data, scales
+
+
+_ABSORB_BLOCK_M = 16
+_ABSORB_BLOCK_N = 16
+# Larger batches absorb with the standalone bmm.
+_ABSORB_MAX_TOKENS = 64
+
+
+def mla_query_absorb_folds(q_nope: torch.Tensor, w_kc: torch.Tensor) -> bool:
+    """Whether :func:`index_k_layernorm_scatter_and_pack_query` can absorb the
+    MLA query (``mla_absorb``), ``bmm(q_nope.transpose(0, 1),
+    w_kc.transpose(1, 2))``, on gfx950.
+
+    The absorb sums each output as one chain of 16x16x32 MFMAs over K in
+    order, so it matches a ``bmm`` that sums the same way (Kimi-K3.1's at TP8)
+    bit for bit for finite ``q_nope`` rows.
+
+    Args:
+        q_nope: ``[tokens, heads, K]`` BF16 query part with unit inner stride.
+        w_kc: ``[heads, K, N]`` BF16 absorption weight, K-major.
+    """
+    if q_nope.ndim != 3 or w_kc.ndim != 3:
+        return False
+    tokens, heads, k = q_nope.shape
+    return (
+        current_platform().is_cdna4
+        and 0 < tokens <= _ABSORB_MAX_TOKENS
+        and q_nope.dtype == w_kc.dtype == torch.bfloat16
+        and w_kc.shape[:2] == (heads, k)
+        and k in (64, 128, 256)
+        and w_kc.shape[2] % _ABSORB_BLOCK_N == 0
+        and q_nope.stride(2) == 1
+        and w_kc.stride(1) == 1
+    )
+
+
+def index_k_layernorm_scatter_and_pack_query(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    loc: torch.Tensor,
+    q: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    write_mask: torch.Tensor | None,
+    mla_rope: MLARopeSetKVBufferLaunch | None = None,
+    mla_absorb: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write mxfp4 index keys and pack the same rows' index queries in one launch.
+
+    The plane's bytes are exactly those of ``index_k_layernorm_fp8_scatter(buf,
+    index_k, norm_weight, norm_bias, loc, ..., group_size=32,
+    index_k_format="mxfp4")`` and the outputs exactly ``pack_index_queries(q)``:
+    each program packs one query head with that kernel's row function, and a
+    row's first head also writes its key with the key kernel's, the LayerNorm
+    in one warp as there.
+
+    Args:
+        buf: uint8 mxfp4 index-K plane, as for ``index_k_layernorm_fp8_scatter``.
+        index_k: ``[tokens, 128]`` pre-norm keys with unit inner stride.
+        norm_weight: ``[128]`` LayerNorm weight.
+        norm_bias: ``[128]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        q: ``[tokens, heads, 128]`` BF16 index queries; may be strided.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows'
+            keys are not written. None writes every row.
+        mla_rope: Optional NoPE ``mla_rope_set_kv_buffer_args`` of the same
+            tokens, whose MLA query assembly and latent cache write the
+            launch then also makes, bit for bit as
+            ``apply_rope_mla_set_kv_buffer_triton`` does. A rotation is
+            refused: its FMA rounding depends on that kernel's compile
+            options, which the index pack does not take.
+        mla_absorb: Optional ``(q_nope, w_kc, out)`` with ``mla_rope``: the
+            launch also stores ``bmm(q_nope.transpose(0, 1), w_kc.transpose(1,
+            2))`` into ``out`` (``[tokens, heads, N]``, unit inner stride),
+            rounded to ``q_nope``'s dtype first, where
+            :func:`mla_query_absorb_folds` holds.
+
+    Returns:
+        uint8 ``[tokens, heads, 64]`` E2M1 codes and int32 ``[tokens, heads]``
+        UE8M0 scale words; ``buf`` is written in place.
+    """
+    key_args, key_constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        norm_weight,
+        norm_bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=32,
+        write_mask=write_mask,
+        index_k_format="mxfp4",
+    )
+    if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16:
+        raise ValueError("mxfp4 index queries pack BF16 [tokens, heads, 128]")
+    tokens, heads = q.shape[:2]
+    if index_k.shape[0] != tokens:
+        raise ValueError(
+            f"index_k has {index_k.shape[0]} rows and q has {tokens}; the "
+            "fused write packs the queries of its own rows"
+        )
+    if mla_rope is not None and mla_rope.num_tokens != tokens:
+        raise ValueError(
+            f"the MLA write has {mla_rope.num_tokens} tokens and q has {tokens}"
+        )
+    if mla_rope is not None and mla_rope.constexprs["APPLY_ROPE"]:
+        raise ValueError("the fused index-K write takes a NoPE MLA write only")
+    absorb = {"A": None, "W": None, "O": None, "A0": 0, "A1": 0}
+    absorb.update(W0=0, W1=0, O0=0, O1=0, ABSORB=False, ABSORB_K=0, ABSORB_N=0)
+    absorb_tiles = 0
+    if mla_absorb is not None:
+        q_nope, w_kc, out = mla_absorb
+        if mla_rope is None or not mla_query_absorb_folds(q_nope, w_kc):
+            raise ValueError(
+                "the fused index-K write absorbs with an MLA write, where "
+                "mla_query_absorb_folds holds"
+            )
+        q_heads, k = q_nope.shape[1:]
+        n = w_kc.shape[2]
+        if (
+            q_nope.shape[0] != tokens
+            or q_heads != mla_rope.num_q_heads
+            or out.shape != (tokens, q_heads, n)
+            or out.stride(2) != 1
+        ):
+            raise ValueError(
+                f"absorbing {tuple(q_nope.shape)} by {tuple(w_kc.shape)} into "
+                f"{tuple(out.shape)} does not match the write's {tokens} tokens "
+                f"and {mla_rope.num_q_heads} heads"
+            )
+        weight = w_kc.transpose(1, 2)
+        absorb = dict(
+            A=q_nope,
+            W=weight,
+            O=out,
+            A0=q_nope.stride(0),
+            A1=q_nope.stride(1),
+            W0=weight.stride(0),
+            W1=weight.stride(1),
+            O0=out.stride(0),
+            O1=out.stride(1),
+            ABSORB=True,
+            ABSORB_K=k,
+            ABSORB_N=n,
+            matrix_instr_nonkdim=16,
+        )
+        absorb_tiles = (
+            triton.cdiv(tokens, _ABSORB_BLOCK_M) * q_heads * (n // _ABSORB_BLOCK_N)
+        )
+    data = torch.empty((tokens, heads, 64), dtype=torch.uint8, device=q.device)
+    scales = torch.empty((tokens, heads), dtype=torch.int32, device=q.device)
+    if tokens and mla_rope is not None:
+        programs = absorb_tiles + tokens * (heads + mla_rope.num_q_heads + 1)
+        _index_k_write_pack_query_mla_kernel[(programs,)](
+            *key_args,
+            q,
+            data,
+            scales,
+            *q.stride(),
+            *mla_rope.args,
+            **key_constexprs,
+            HEADS=heads,
+            **mla_rope.constexprs,
+            **absorb,
+            ABSORB_BLOCK_M=_ABSORB_BLOCK_M,
+            ABSORB_BLOCK_N=_ABSORB_BLOCK_N,
+            num_warps=1,
+        )
+    elif tokens:
+        _index_k_write_pack_query_kernel[(tokens, heads)](
+            *key_args,
+            q,
+            data,
+            scales,
+            *q.stride(),
+            **key_constexprs,
+            HEADS=heads,
+            # One warp: the key's LayerNorm sums in the order of the scatter kernel's.
+            num_warps=1,
         )
     return data, scales
 

@@ -471,6 +471,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
     const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
+    const bool awaits_bootstrap = config_.role == Role::kD ||
+                                  (config_.role == Role::kP && config_.decode_allocation_policy !=
+                                                                   SchedulerConfig::DecodeAllocationPolicy::kDeferred);
     for (const RequestSpec& spec : request_specs) {
         if (cache_event_sink_ && spec.admission_id == 0) {
             throw std::invalid_argument("cache events require the control plane admission identity");
@@ -509,7 +512,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, awaits_bootstrap));
     }
 
     // With prefix caching, every first admission reads the prompt's page

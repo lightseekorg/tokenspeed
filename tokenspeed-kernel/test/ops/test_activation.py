@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 import pytest
 import tokenspeed_kernel.ops.activation.triton as activation_triton
@@ -27,8 +28,9 @@ from tokenspeed_kernel.ops.activation.triton import (
     swiglu_oai,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, assert_warmup_covers
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -576,17 +578,100 @@ def test_moe_finalize_gate_add_compiles_once_across_batch_sizes(device: str) -> 
         spare = gemm2_out.new_zeros(spare_rows, gemm2_out.shape[1])
         moe_finalize_gate_add(torch.cat([gemm2_out, spare]), *args)
 
-    run(3, 0)
-    with assert_no_triton_compile(_moe_finalize_gate_add_kernel):
-        for num_tokens, spare_rows in ((1, 0), (1, 100), (16, 7), (37, 0), (300, 64)):
-            run(num_tokens, spare_rows)
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(3, 0)
+
+    # Decode sizes keep column programs; prefill sizes take one program per row.
+    assert_warmup_covers(
+        (_moe_finalize_gate_add_kernel,),
+        warm,
+        lambda case: run(*case),
+        ((1, 0), (1, 100), (16, 7), (37, 0), (300, 64), (600, 0), (4096, 13)),
+    )
 
 
-def test_moe_finalize_gate_add_reads_gemm2_rows_past_int32_offsets(
+class _GridRecorder:
+    def __init__(self, kernel: Any) -> None:
+        self.kernel = kernel
+        self.grids: list[tuple[int, ...]] = []
+
+    def __getitem__(self, grid: tuple[int, ...]) -> Any:
+        self.grids.append(tuple(grid))
+        return self.kernel[grid]
+
+
+def _force_finalize_layout(monkeypatch: pytest.MonkeyPatch, rows: bool) -> None:
+    monkeypatch.setattr(
+        activation_triton, "_FINALIZE_ROW_PROGRAM_MIN_COLUMNS", 0 if rows else 2**31
+    )
+    monkeypatch.setattr(
+        activation_triton, "_FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM", 0
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [3, 600])
+@pytest.mark.parametrize(
+    "hidden_dim,top_k,pad",
+    [(2048, 10, 0), (2560, 10, 0), (3072, 8, 256), (4096, 8, 0), (7168, 8, 0)],
+)
+def test_moe_finalize_gate_add_row_programs_match_column_programs(
+    num_tokens: int,
+    hidden_dim: int,
+    top_k: int,
+    pad: int,
     device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One program per row writes the same bits as 1024-column programs."""
+    inputs = _moe_finalize_inputs(
+        num_tokens, hidden_dim, top_k, pad, torch.bfloat16, device
+    )
+    recorder = _GridRecorder(_moe_finalize_gate_add_kernel)
+    monkeypatch.setattr(activation_triton, "_moe_finalize_gate_add_kernel", recorder)
+    _force_finalize_layout(monkeypatch, rows=True)
+    rows = moe_finalize_gate_add(*inputs)
+    _force_finalize_layout(monkeypatch, rows=False)
+    columns = moe_finalize_gate_add(*inputs)
+
+    assert recorder.grids == [
+        (num_tokens, 1),
+        (num_tokens, (hidden_dim + 1023) // 1024),
+    ]
+    assert torch.count_nonzero(rows) > 0
+    assert torch.equal(rows, columns)
+
+
+@pytest.mark.parametrize("hidden_dim", [1024, 2048, 2560, 4096, 7168])
+def test_moe_finalize_gate_add_rows_take_one_program_once_columns_fill_the_gpu(
+    hidden_dim: int, device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _GridRecorder(_moe_finalize_gate_add_kernel)
+    monkeypatch.setattr(activation_triton, "_moe_finalize_gate_add_kernel", recorder)
+    columns = (hidden_dim + 1023) // 1024
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    floor = activation_triton._FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM * sms
+    # The last token count whose column grid stays below the floor, and the next one.
+    below = (floor - 1) // columns
+    for num_tokens in (1, below, below + 1):
+        moe_finalize_gate_add(
+            *_moe_finalize_inputs(num_tokens, hidden_dim, 8, 0, torch.bfloat16, device)
+        )
+    row_programs = columns >= activation_triton._FINALIZE_ROW_PROGRAM_MIN_COLUMNS
+    expected = [(1, columns), (below, columns)]
+    expected.append((below + 1, 1 if row_programs else columns))
+    assert recorder.grids == expected
+
+
+@pytest.mark.parametrize("rows", [False, True])
+def test_moe_finalize_gate_add_reads_gemm2_rows_past_int32_offsets(
+    rows: bool,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Routes to gemm2_out rows past 2^31 elements finalize like the same rows
     in a small pool."""
+    _force_finalize_layout(monkeypatch, rows)
     num_tokens, hidden_dim, top_k = 2, 2560, 10
     near, permuted, weights, hidden, gate_weight, shared = _moe_finalize_inputs(
         num_tokens, hidden_dim, top_k, 0, torch.bfloat16, device

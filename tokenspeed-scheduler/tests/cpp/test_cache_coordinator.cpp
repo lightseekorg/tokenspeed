@@ -154,7 +154,8 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
                                        /*checkpoint_retention_requests=*/0);
     PrefixProbe probe;
     {
-        Request request(RequestSpec{.request_id = "prepared", .tokens = {1, 2, 3, 4, 5, 6, 7}}, 2, Role::kFused);
+        Request request(RequestSpec{.request_id = "prepared", .tokens = {1, 2, 3, 4, 5, 6, 7}}, 2,
+                        /*awaits_bootstrap=*/false);
         const auto hashes = request.PromptPrefixHashes();
         for (const auto& hash : hashes) CacheForGroup(coordinator, pool, hash, 0);
         auto* admission = request.AdmissionResourcesPtr();
@@ -12352,7 +12353,7 @@ TEST_F(ShardedHostSegmentPlanTest, ABucketTheHostCannotFillDropsItsSegmentWhole)
              {&CacheEvictor::HostEvictionStats::lru, &CacheEvictor::HostEvictionStats::duplicate,
               &CacheEvictor::HostEvictionStats::superseded, &CacheEvictor::HostEvictionStats::dead_entry,
               &CacheEvictor::HostEvictionStats::tail_cap, &CacheEvictor::HostEvictionStats::flush,
-              &CacheEvictor::HostEvictionStats::duplicate_kv}) {
+              &CacheEvictor::HostEvictionStats::duplicate_kv, &CacheEvictor::HostEvictionStats::clean}) {
             EXPECT_EQ((coordinator_.Evictor().HostEvictions().*reason).blocks, 0u);
         }
     }
@@ -13147,7 +13148,7 @@ TEST_P(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
              {&CacheEvictor::HostEvictionStats::lru, &CacheEvictor::HostEvictionStats::duplicate,
               &CacheEvictor::HostEvictionStats::superseded, &CacheEvictor::HostEvictionStats::dead_entry,
               &CacheEvictor::HostEvictionStats::tail_cap, &CacheEvictor::HostEvictionStats::flush,
-              &CacheEvictor::HostEvictionStats::duplicate_kv}) {
+              &CacheEvictor::HostEvictionStats::duplicate_kv, &CacheEvictor::HostEvictionStats::clean}) {
             EXPECT_EQ((coordinators[0].Evictor().HostEvictions().*reason).blocks,
                       (coordinators[1].Evictor().HostEvictions().*reason).blocks)
                 << "round " << round;
