@@ -169,6 +169,11 @@ LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 
 
+def _last_packed_token_rows(input_lengths: torch.Tensor) -> torch.Tensor:
+    """Locate each request's last row within the scheduler's int32 token budget."""
+    return torch.cumsum(input_lengths, dim=0, dtype=torch.int32).sub_(1)
+
+
 def _sampling_info_for_requests(
     sampling_info: SamplingBatchInfo,
     requests: slice,
@@ -2827,12 +2832,8 @@ class ModelExecutor:
                             dtype=torch.int64,
                             device=self.device,
                         )
-                        gather_ids[:num_extends] = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:num_extends],
-                                dim=0,
-                            )
-                            - 1
+                        gather_ids[:num_extends] = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:num_extends]
                         )
                         gather_ids[num_extends:] = torch.arange(
                             num_prefill_tokens,
@@ -2842,13 +2843,10 @@ class ModelExecutor:
                         )
                     else:
                         # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request via cumsum.
-                        gather_ids = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:bs], dim=0
-                            )
-                            - 1
-                        )
+                        # per request, with int64 indices for downstream gathers.
+                        gather_ids = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:bs]
+                        ).to(torch.int64)
 
                 output_layout = ForwardOutputLayout(
                     num_extends=num_extends,
