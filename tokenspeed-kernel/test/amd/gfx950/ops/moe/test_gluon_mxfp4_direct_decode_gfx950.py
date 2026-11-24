@@ -720,11 +720,12 @@ _EP4_WIDE_CASES = [
 
 
 @pytest.mark.parametrize(("rows", "config"), _EP4_WIDE_CASES)
-def test_wide_route_tiles_match_direct_reference_at_every_row_count(
+def test_wide_route_tiles_match_direct_reference_at_sampled_row_counts(
     rows: int, config: _RouteTileConfig
 ) -> None:
-    """32-route tiles keep every route's bits at each row count of their entry.
+    """32-route tiles keep every route's bits at sampled row counts.
 
+    The samples are every eighth row count of each entry plus its upper end.
     Every local expert holds all rows' routes, so each spans several tiles.
     """
     _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
