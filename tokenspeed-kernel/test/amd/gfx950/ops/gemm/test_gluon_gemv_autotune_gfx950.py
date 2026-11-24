@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -198,57 +201,60 @@ def test_warmup_tunes_an_untabled_weight_once(untabled: Path) -> None:
 
 
 @gpu
-def test_deferred_routing_races_the_tuned_blas_gemms(
-    untabled: Path, tmp_path: Path
-) -> None:
+def test_deferred_routing_races_the_tuned_blas_gemms(tmp_path: Path) -> None:
     # The serving warmup's order (TOKENSPEED_KERNEL_AUTOTUNE=1): the weight
     # is queued on its default path, then its BLAS GEMMs are tuned and the
-    # GEMVs race them.
-    from tokenspeed_kernel.ops.gemm import gluon_gemv_autotune as autotune
-    from tokenspeed_kernel.ops.gemm import mm
-    from tokenspeed_kernel.ops.gemm.hipblaslt import (
-        hipblaslt_online_tuning,
-        hipblaslt_online_tuning_cache,
-    )
-    from tokenspeed_kernel.ops.tuning import kernel_warmup
-    from tokenspeed_kernel.selection import default_autotune_cache
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-        supports_gluon_mm_a16w16_decode_gfx950,
-    )
+    # GEMVs race them. A fresh process: TunableOp keeps tuned results for the
+    # life of the process and offers no way to drop them, so tuning here
+    # would leak into later tests that count what TunableOp holds.
+    code = f"""
+import torch
+from tokenspeed_kernel.ops.gemm import gluon_gemv_autotune as autotune
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm.gluon_gemv_autotune import DEFAULT_ROUTING, GemvRouting
+from tokenspeed_kernel.ops.gemm.hipblaslt import (
+    hipblaslt_online_tuning,
+    hipblaslt_online_tuning_cache,
+)
+from tokenspeed_kernel.ops.tuning import kernel_warmup
+from tokenspeed_kernel.selection import default_autotune_cache
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    supports_gluon_mm_a16w16_decode_gfx950,
+)
 
-    weight = torch.randn(_N, _K, device="cuda", dtype=torch.bfloat16) / _K**0.5
-    x = torch.randn(1, _K, device="cuda", dtype=torch.bfloat16)
-    blas_cache = tmp_path / "blas.csv"
-    tunable = torch.cuda.tunable
-    try:
-        with (
-            kernel_warmup(enabled=True),
-            hipblaslt_online_tuning_cache(str(blas_cache), write=True),
-            autotune.deferred_gemv_autotune(),
-        ):
-            mm(x, weight)
-            assert autotune._current_routing(_N, _K) == DEFAULT_ROUTING
-            assert (_N, _K) not in autotune._settled
-            autotune.tune_deferred_gemv_routings(hipblaslt_online_tuning)
-        routing = autotune._current_routing(_N, _K)
-        tuned = {result[1] for result in tunable.get_results()}
-        # Tuned picks stay in effect for the timing and after it.
-        assert tunable.is_enabled() and not tunable.tuning_is_enabled()
-    finally:
-        tunable.enable(False)
-        tunable.tuning_enable(True)
+N, K = {_N}, {_K}
+autotune._apply(N, K, DEFAULT_ROUTING)
+weight = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / K**0.5
+x = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+blas_cache = {str(tmp_path / "blas.csv")!r}
+tunable = torch.cuda.tunable
+with (
+    kernel_warmup(enabled=True),
+    hipblaslt_online_tuning_cache(blas_cache, write=True),
+    autotune.deferred_gemv_autotune(),
+):
+    mm(x, weight)
+    assert autotune._current_routing(N, K) == DEFAULT_ROUTING
+    assert (N, K) not in autotune._settled
+    autotune.tune_deferred_gemv_routings(hipblaslt_online_tuning)
+routing = autotune._current_routing(N, K)
+tuned = {{result[1] for result in tunable.get_results()}}
+# Tuned picks stay in effect for the timing and after it.
+assert tunable.is_enabled() and not tunable.tuning_is_enabled()
 
-    assert (_N, _K) in autotune._settled
-    (entry,) = default_autotune_cache()._entries.values()
-    assert GemvRouting.from_json(entry) == routing
-    # Every timed row count the default routing sends to torch.mm was tuned.
-    blas_rows = [
-        m
-        for m in autotune._TIMED_MS
-        if not supports_gluon_mm_a16w16_decode_gfx950(m, _N, _K)
-    ]
-    for m in blas_rows:
-        assert any(key.startswith(f"tn_{_N}_{m}_{_K}_") for key in tuned), m
-    saved = blas_cache.read_text()
-    for m in blas_rows:
-        assert f",tn_{_N}_{m}_{_K}_" in saved
+assert (N, K) in autotune._settled
+(entry,) = default_autotune_cache()._entries.values()
+assert GemvRouting.from_json(entry) == routing
+# Every timed row count the default routing sends to torch.mm was tuned.
+blas_rows = [
+    m for m in autotune._TIMED_MS if not supports_gluon_mm_a16w16_decode_gfx950(m, N, K)
+]
+saved = open(blas_cache).read()
+for m in blas_rows:
+    assert any(key.startswith(f"tn_{{N}}_{{m}}_{{K}}_") for key in tuned), m
+    assert f",tn_{{N}}_{{m}}_{{K}}_" in saved, m
+"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTORCH_TUNABLEOP")}
+    env["TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR"] = str(tmp_path / "decisions")
+    env["TOKENSPEED_GEMV_AUTOTUNE"] = "1"
+    subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path, check=True)
