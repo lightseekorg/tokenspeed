@@ -247,7 +247,36 @@ def _fused(x, capacity, output_norm=None, *, history_length=0):
     return _verify(x, records, output_norm), buffers
 
 
-def _assert_matches(expected, actual, capacity):
+def _gate_input_step(x, decays_ref):
+    """The decay change one BF16 step of each gate projection can make.
+
+    The split producers round the gate projection to BF16 in a GEMM whose
+    accumulation order varies across GPUs, where the fused kernel keeps it in
+    FP32. The input z = projection + dt_bias of each written decay follows
+    from the reference decay, and the decay moves by about decay times the
+    log-decay slope times one BF16 step of the projection.
+    """
+    column = torch.arange(decays_ref.shape[1], device="cuda")
+    head = column // DIM % HEADS
+    a = x["A_log"].float().exp()[head]
+    bias = x["dt_bias"].float()[head * DIM + column % DIM]
+    decay = decays_ref.clamp(min=2.0**-126, max=1.0)
+    if x["lower_bound"] is None:
+        # log decay = -a softplus(z); softplus(z) is its negation over a.
+        softplus = -torch.log(decay) / a
+        z = torch.log(torch.expm1(softplus))
+        slope = a * -torch.expm1(-softplus)
+    else:
+        # log decay = lower_bound sigmoid(a z).
+        gate = (torch.log(decay) / x["lower_bound"]).clamp(2.0**-24, 1 - 2.0**-24)
+        z = torch.logit(gate) / a
+        slope = -x["lower_bound"] * a * gate * (1 - gate)
+    step = decay * slope * (z - bias).abs() * 2.0**-7
+    written = decays_ref != KEY_GATE_FILL
+    return torch.where(written, torch.nan_to_num(step, nan=0.0, posinf=0.0), 0.0)
+
+
+def _assert_matches(x, expected, actual, capacity):
     out_ref, (corr_ref, kg_ref, stamps_ref, kept_ref) = expected
     out, (corr, kg, stamps, kept) = actual
     assert torch.equal(kept, kept_ref)
@@ -265,9 +294,10 @@ def _assert_matches(expected, actual, capacity):
     assert torch.equal(kg[:, tail:], kg_ref[:, tail:])
     gate_cols = key_cols + DIM
     gates, gates_ref = kg[:, gate_cols].float(), kg_ref[:, gate_cols].float()
-    # One BF16 step of the larger gate, plus a floor for sums that cancel to near zero.
+    # One BF16 step of the larger gate, a floor for sums that cancel to near
+    # zero, and what one BF16 step of the gate projection moves it by.
     step = torch.maximum(gates.abs(), gates_ref.abs()) * 2.0**-7
-    step = step + gates_ref.abs().max() * 2.0**-16
+    step = step + gates_ref.abs().max() * 2.0**-16 + _gate_input_step(x, gates_ref)
     assert ((gates - gates_ref).abs() <= step).all()
     tail = capacity * WIDTH
     assert torch.equal(corr[:, tail:], corr_ref[:, tail:])
@@ -286,7 +316,7 @@ def _assert_matches(expected, actual, capacity):
 def test_fused_window_matches_split_producers(batch, window, lower_bound):
     x = _inputs(batch, window, seed=batch * 31 + window, lower_bound=lower_bound)
     state, history = x["state_pool"].clone(), x["conv_states"].clone()
-    _assert_matches(_split(x, window), _fused(x, window), window)
+    _assert_matches(x, _split(x, window), _fused(x, window), window)
     assert torch.equal(x["state_pool"], state)
     assert torch.equal(x["conv_states"], history)
 
@@ -294,7 +324,7 @@ def test_fused_window_matches_split_producers(batch, window, lower_bound):
 @pytest.mark.parametrize("capacity", [9, 13])
 def test_record_positions_wrap_the_ring(capacity):
     x = _inputs(4, 8, seed=capacity)
-    _assert_matches(_split(x, capacity), _fused(x, capacity), capacity)
+    _assert_matches(x, _split(x, capacity), _fused(x, capacity), capacity)
 
 
 def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
@@ -331,7 +361,7 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
 
 def test_fused_window_without_metadata_records_by_request():
     x = _inputs(4, 8, seed=40, metadata=False)
-    _assert_matches(_split(x, 8), _fused(x, 8), 8)
+    _assert_matches(x, _split(x, 8), _fused(x, 8), 8)
 
 
 @pytest.mark.parametrize("layout", ["f_a rows", "conv weights", "correction channels"])
@@ -478,7 +508,7 @@ def test_accepted_history_gives_the_same_bits_in_every_value_tile(
             assert torch.equal(other_out, out)
             for got, want in zip(other_records, records):
                 assert torch.equal(got, want)
-    _assert_matches(split[0], fused[0], 16)
+    _assert_matches(x, split[0], fused[0], 16)
 
 
 def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():

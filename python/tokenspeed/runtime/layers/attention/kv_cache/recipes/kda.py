@@ -135,6 +135,49 @@ def kda_retained_supported(config: AttnConfig) -> bool:
     )
 
 
+def _kda_layer_count(groups: tuple[CacheGroupDeclaration, ...]) -> int:
+    """KDA layers in the declarations: one convolution state field each."""
+    return sum(
+        field.field_id.endswith(".conv_state")
+        for spec, fields in groups
+        if spec.attn_kind == "state"
+        for field in fields
+    )
+
+
+def kda_request_slot_bytes(
+    config: AttnConfig,
+    groups: tuple[CacheGroupDeclaration, ...],
+    *,
+    draft_token_num: int,
+) -> int:
+    """Return one request slot's retained KDA records over every KDA layer.
+
+    A request keeps its records in its slot across rounds, scheduled or not,
+    so every resident slot (``max_resident_requests``, including a decode
+    role's extra slots) holds them.
+
+    Args:
+        config: Target attention configuration with model dimensions.
+        groups: Cache declarations containing the target's KDA state fields.
+        draft_token_num: Effective verify width per request; it sets the
+            default history capacity (``kda_history_capacity``).
+
+    Returns:
+        Bytes of the slot's FP32 correction, key and decay records and its
+        INT32 accepted count, for each KDA layer.
+    """
+    linear = config.component(LinearAttnConfig)
+    heads, value_dim, key_dim = linear.temporal_state_shape
+    return _kda_layer_count(groups) * (
+        heads
+        * kda_history_capacity(config, draft_token_num)
+        * (value_dim + 2 * key_dim)
+        * torch.float32.itemsize
+        + torch.int32.itemsize
+    )
+
+
 def kda_verify_workspace_bytes(
     config: AttnConfig,
     groups: tuple[CacheGroupDeclaration, ...],
@@ -161,24 +204,10 @@ def kda_verify_workspace_bytes(
     )
 
     linear = config.component(LinearAttnConfig)
-    num_layers = sum(
-        field.field_id.endswith(".conv_state")
-        for spec, fields in groups
-        if spec.attn_kind == "state"
-        for field in fields
-    )
-    heads, value_dim, key_dim = linear.temporal_state_shape
+    num_layers = _kda_layer_count(groups)
     num_slots = RequestSlotLayout(config.max_resident_requests).capacity
-    retained_bytes = (
-        num_layers
-        * num_slots
-        * (
-            heads
-            * kda_history_capacity(config, draft_token_num)
-            * (value_dim + 2 * key_dim)
-            * torch.float32.itemsize
-            + torch.int32.itemsize
-        )
+    retained_bytes = num_slots * kda_request_slot_bytes(
+        config, groups, draft_token_num=draft_token_num
     )
     qkv_row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
     qkv_bytes = num_layers * config.max_bs * draft_token_num * qkv_row_bytes

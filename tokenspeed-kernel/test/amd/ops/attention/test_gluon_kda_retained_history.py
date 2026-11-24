@@ -236,7 +236,10 @@ def _case(
         for r, n in enumerate(lengths):
             if n and int(source[r]) > 0:
                 begin, end = starts_list[r : r + 2]
-                if int(source[r]) != int(live[r]) or old_lengths[r] + n > capacity:
+                if (
+                    int(source[r]) != int(live[r])
+                    or old_lengths[r] + max(n, width) > capacity
+                ):
                     expected[r] = expected[r].to(state_dtype).float()
                 references.append(
                     _reference(
@@ -358,7 +361,10 @@ def _case(
                         rtol=0,
                     )
                 continue
-            consolidated = dst != src or old_lengths[r] + lengths[r] > capacity
+            # A request shorter than the window folds as a full one would.
+            consolidated = (
+                dst != src or old_lengths[r] + max(lengths[r], width) > capacity
+            )
             old = 0 if consolidated else old_lengths[r]
             assert int(length[int(slots[r]), 0]) == old
             torch.testing.assert_close(
@@ -553,8 +559,8 @@ def test_retained_smoke_gfx1250():
 
 @pytest.mark.parametrize(
     "capacity,initial_length,cross_page",
-    [(8, 6, False), (8, 7, False), (16, 3, True)],
-    ids=["equal", "overflow", "source"],
+    [(8, 4, False), (8, 6, False), (8, 7, False), (16, 3, True)],
+    ids=["equal", "short_window", "overflow", "source"],
 )
 def test_retained_capacity_and_source_gfx1250(capacity, initial_length, cross_page):
     _case(

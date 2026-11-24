@@ -605,9 +605,10 @@ routing.
 
 Each layer has room for `max(16, effective_verify_width)` records per slot, or
 for `--kda-history-capacity` records when set (at least the verify width): a
-smaller capacity shrinks the request-slot workspace but folds more often. When a
-whole candidate window will no longer fit, the accepted updates are folded into
-the dense base before the slot is reused, even for a request whose own window is
+smaller capacity shrinks the request-slot workspace but folds more often. Every
+resident slot holds them, a decode role's extra slots included. When a whole
+candidate window will no longer fit, the accepted updates are folded into the
+dense base before the slot is reused, even for a request whose own window is
 shorter. A change of live page likewise starts from a materialized base. Both
 folds run before the verify forward, in one launch pair for every layer, once
 the metadata refresh has resolved the round's pages

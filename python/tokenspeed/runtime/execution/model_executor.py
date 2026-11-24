@@ -715,12 +715,6 @@ class ModelExecutor:
             self.request_ends = torch.zeros(
                 max_bs, dtype=torch.int32, device=self.device
             )
-        # A backend that defers dense state writes completes them in the
-        # decode commit of the forward that ends a request, and reports a row
-        # whose state it could not complete in request_ends.
-        self.attn_backend.bind_request_stop_flags(
-            self.runtime_states.stopped, self.request_ends
-        )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -827,6 +821,12 @@ class ModelExecutor:
             device=self.device,
         )
 
+        # A backend that defers dense state writes completes them in the
+        # decode commit of the forward that ends a request, and reports a row
+        # whose state it could not complete in request_ends.
+        self.attn_backend.bind_request_stop_flags(
+            self.runtime_states.stopped, self.request_ends
+        )
         self._configure_for_pools()
 
         # Backend-declared CUDA-graph support, AND-composed over the target
