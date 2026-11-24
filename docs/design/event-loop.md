@@ -559,7 +559,7 @@ single call:
 | `grammar` | grammar compilation, its cache, and the matchers |
 | `eplb` | when an expert rebalance runs, the placement solver, the slot moves |
 | `kv_events` | publishing the scheduler's KV cache events |
-| `batch_log`, `request_stats` | the operator's per-round and per-request log lines |
+| `batch_log`, `request_stats` | request lifecycle clocks and the operator's per-round and per-request log lines |
 | `relay`, `transport` | the replica's relay of frontend messages, and the frontend wire |
 
 The round should read, top to bottom, as the schedule of one scheduling
@@ -688,7 +688,7 @@ KV reception and grammar compilation retain their separate queue gauges;
 `num_requests_inflight` covers all unfinished requests, including those waits.
 Queue subcategories overlap the total and must not be added to it again.
 
-Only ranks with an engine metrics exporter retain per-request timing samples.
+Only ranks with an engine metrics exporter retain pending metric observations.
 Decode request logs, exported latency metrics, and request traces use the
 first local decode output as the first-token timestamp. The remote bootstrap
 token's arrival is the prefill/queue boundary (`decode_ready_wait`), not the
@@ -709,6 +709,23 @@ most once a second; this policy belongs to the adapter, not the scheduler
 loop or individual plugins. See
 [metric output plugins](../metrics-plugins.md) for event semantics,
 registration, and output lifecycle contracts.
+
+Every P/D request owns monotonic first-occurrence lifecycle timestamps on every
+rank, independently of metrics, tracing and log settings. `PdTimings` is created
+at admission and stays with the request until release, including after its first
+output. Missing milestones remain absent; a timestamp equal to registration is
+a reached boundary, not a missing value. Plain-role requests allocate no PD
+timing state, and released requests leave no timestamp history.
+
+Each ending milestone returns at most one completed phase to the output processor.
+Only an enabled metrics exporter retains those observations for its next drain.
+An absent starting milestone produces no sample, while a reached zero-length
+phase remains a zero sample. Repeated submissions, plans and dispatches never
+restart the first timestamps. Prompt completion is the final chunk's commit;
+transfer completion is P's transfer acknowledgement or D's complete KV and
+bootstrap-token arrival. Output preparation records the first streamed output
+without consuming the timestamps. These are local lifecycle durations including
+host and scheduling waits, not GPU event measurements.
 
 Per-request metrics anchor to request lifecycle points instead of the round
 snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
@@ -1548,7 +1565,3 @@ Capacity checks must cover the relay and the chosen sink separately; a slow
 sink can fill the relay queue even when transport alone sustains the rate.
 Each output observation pairs its sample destination and timestamp together;
 disabled metrics and prefill output do not create an observation.
-
-Admission failures prepare their final output before logging completion, as the
-other terminal paths do. Preparing that output consumes a sampled TTFT trace;
-completion logging therefore emits no second breakdown for the same request.

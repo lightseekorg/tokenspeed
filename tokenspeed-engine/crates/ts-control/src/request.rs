@@ -343,8 +343,8 @@ pub struct RequestState {
     pub(crate) stream_output_timing: Option<StreamOutputTiming>,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
-    /// Sampled PD timings, consumed at the first output or terminal release.
-    pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
+    /// First PD lifecycle timestamps, retained until request release on every PD rank.
+    pub(crate) pd_timings: Option<Box<crate::request_stats::PdTimings>>,
     /// The matcher of its grammar, once compiled.
     pub grammar: Option<RequestGrammar>,
 
@@ -425,7 +425,7 @@ impl RequestState {
             first_token_time: 0.0,
             stream_output_timing: None,
             timings: None,
-            ttft: None,
+            pd_timings: None,
             grammar: None,
             admission: 0,
             send_token_offset: 0,

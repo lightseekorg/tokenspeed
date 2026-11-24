@@ -89,6 +89,7 @@ use crate::{
     peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
+    request_stats::PdTimings,
 };
 
 /// Fold what an output-processor call produced into the round's results.
@@ -1102,12 +1103,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
-        let sample_ttft = self.outputs.ttft_sampling_enabled();
+        let collect_pd_timings = self.outputs.role() != crate::output::Role::Plain;
         let debug = tracing::enabled!(tracing::Level::DEBUG);
         // Reading the batch crosses FFI and copies its arrays.
-        if sample_ttft || debug {
+        if collect_pd_timings || debug {
             if let Some(batch) = plan.remote_prefill() {
-                if sample_ttft {
+                if collect_pd_timings {
                     self.outputs.mark_planned(&batch.request_ids, true);
                 }
                 if debug {
@@ -1139,7 +1140,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
-        if sample_ttft {
+        if collect_pd_timings {
             if let Some(batch) = &forward {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
@@ -1303,6 +1304,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
             metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
             let request = self.outputs.take_request_metrics();
+            for (phase, seconds) in request.pd_phase_seconds {
+                metrics.observe_pd_phase(phase, seconds);
+            }
             for (rid, lookup, admission, aborted) in request.peer_stops {
                 let outcome = if aborted { "cancelled" } else { "no_gain" };
                 if let Some(start) = admission {
@@ -3364,12 +3368,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             } else {
                                 match self.reserve_bootstrap_room(admission.bootstrap.as_ref()) {
                                     Ok(room_lease) => {
-                                        if self.owns_frontend() {
-                                            self.outputs.sample_ttft(
-                                                &mut admission.state,
-                                                admission.bootstrap.as_ref(),
-                                            );
-                                        }
+                                        admission.state.pd_timings =
+                                            PdTimings::new(self.outputs.role(), Instant::now());
                                         admissions.push(*admission);
                                         room_leases.push(room_lease);
                                     }

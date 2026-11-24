@@ -47,7 +47,6 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 FinishLog {
                     enabled: true,
                     request_stats,
-                    ttft_percentage: 0,
                 },
                 false,
                 None,

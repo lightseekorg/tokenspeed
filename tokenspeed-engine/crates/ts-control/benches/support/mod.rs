@@ -225,7 +225,6 @@ pub fn processor(config: &Config) -> OutputProcessor {
         FinishLog {
             enabled: false,
             request_stats: false,
-            ttft_percentage: 0,
         },
         false,
         None,

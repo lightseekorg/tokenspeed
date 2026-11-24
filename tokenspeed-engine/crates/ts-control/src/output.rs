@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ts_metrics::PdPhase;
 use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
 
 use ts_wire::output::FinishDetails;
@@ -34,7 +35,7 @@ use ts_wire::output::FinishDetails;
 use crate::{
     codec::{Reader, Writer},
     request::{AbortCode, FinishReason, InputLogprobs, RequestState},
-    request_stats::{self, wall_seconds, RequestTimings},
+    request_stats::{self, wall_seconds, PdMilestone, RequestTimings},
 };
 
 const NUMERICAL_ERROR: &str = "Request terminated: numerical corruption (NaN logits or \
@@ -475,13 +476,13 @@ pub struct FinishLog {
     /// `--enable-log-request-stats`: the timing summary replaces the
     /// accept-length line.
     pub request_stats: bool,
-    /// Percentage of PD rooms to trace through their first output.
-    pub ttft_percentage: u8,
 }
 
 /// Per-request latency samples and token totals since the last drain.
 #[derive(Debug, Default)]
 pub struct RequestMetrics {
+    /// Completed PD phases and their durations, once per request and phase.
+    pub pd_phase_seconds: Vec<(PdPhase, f64)>,
     /// Expected and actually consumed remote tokens per finished hinted request.
     pub peer_usage: Vec<(Option<u64>, u64, &'static str)>,
     /// Unfinished lookup/admission intervals closed by request completion.
@@ -522,6 +523,7 @@ pub struct OutputProcessor {
     /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
+    pd_phase_seconds: Vec<(PdPhase, f64)>,
     /// Metric deltas since the event loop last drained them.
     peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
     peer_samples: Vec<(Option<u64>, u64, &'static str)>,
@@ -565,6 +567,7 @@ impl OutputProcessor {
             last_commit_at: 0.0,
             admissions: 0,
             metrics_enabled,
+            pd_phase_seconds: Vec::new(),
             trace,
             peer_stops: Vec::new(),
             peer_samples: Vec::new(),
@@ -585,6 +588,7 @@ impl OutputProcessor {
     /// Per-request latency samples and token totals since the last drain.
     pub fn take_request_metrics(&mut self) -> RequestMetrics {
         RequestMetrics {
+            pd_phase_seconds: std::mem::take(&mut self.pd_phase_seconds),
             peer_stops: std::mem::take(&mut self.peer_stops),
             peer_usage: std::mem::take(&mut self.peer_samples),
             ttft_seconds: std::mem::take(&mut self.ttft_seconds),
@@ -621,10 +625,10 @@ impl OutputProcessor {
         }
     }
 
-    /// Stamp the first dispatch of `rids`, for the request stats.
+    /// Stamp the first dispatch of `rids` for request stats and PD phases.
     pub fn mark_scheduled(&mut self, rids: &[String]) {
         let stats = self.finish_log.request_stats || self.trace.is_some();
-        if !stats && self.finish_log.ttft_percentage == 0 {
+        if !stats && self.role == Role::Plain {
             return;
         }
         let now = stats.then(wall_seconds);
@@ -633,10 +637,12 @@ impl OutputProcessor {
                 if let (Some(timings), Some(now)) = (state.timings.as_mut(), now) {
                     timings.mark_scheduled(now);
                 }
-                if let Some(trace) = state.ttft.as_mut() {
-                    if trace.scheduled_ms.is_none() {
-                        trace.scheduled_ms = Some(trace.ms());
-                    }
+                if let Some(timings) = state.pd_timings.as_mut() {
+                    self.pd_phase_seconds.extend(
+                        timings
+                            .mark(PdMilestone::Scheduled, Instant::now())
+                            .filter(|_| self.metrics_enabled),
+                    );
                 }
             }
         }
@@ -680,9 +686,6 @@ impl OutputProcessor {
     }
 
     fn log_finished(&self, rid: &str, state: &RequestState) {
-        if let Some(trace) = &state.ttft {
-            trace.finish(rid, state);
-        }
         if self.finish_log.enabled && tracing::enabled!(tracing::Level::INFO) {
             let finished_at = wall_seconds();
             let stats = state
@@ -799,14 +802,6 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
-    /// Whether this rank can collect sampled PD first-output summaries.
-    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
-        self.finish_log.enabled
-            && self.finish_log.ttft_percentage > 0
-            && self.role != Role::Plain
-            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
-    }
-
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -828,31 +823,31 @@ impl OutputProcessor {
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
-            if let Some(trace) = state.ttft.as_mut() {
-                let now = trace.ms();
-                trace.submitted_ms.get_or_insert(now);
+            if let Some(timings) = state.pd_timings.as_mut() {
+                let _ = timings.mark(PdMilestone::Submitted, at);
             }
         }
     }
 
-    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Stamp the first plan selecting a PD request, before DP agreement.
     /// Remote admission reserves the D landing pages; it is not a forward.
     pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
-        if self.finish_log.ttft_percentage == 0 {
-            return;
-        }
         for rid in rids {
-            if let Some(trace) = self
+            if let Some(timings) = self
                 .states
                 .get_mut(rid)
-                .and_then(|state| state.ttft.as_mut())
+                .and_then(|state| state.pd_timings.as_mut())
             {
-                let now = trace.ms();
-                if remote_admission {
-                    trace.remote_admitted_ms.get_or_insert(now);
+                let milestone = if remote_admission {
+                    PdMilestone::RemoteAdmitted
                 } else {
-                    trace.planned_ms.get_or_insert(now);
-                }
+                    PdMilestone::Planned
+                };
+                self.pd_phase_seconds.extend(
+                    timings
+                        .mark(milestone, Instant::now())
+                        .filter(|_| self.metrics_enabled),
+                );
             }
         }
     }
@@ -880,23 +875,13 @@ impl OutputProcessor {
         self.states.get(rid)
     }
 
-    pub(crate) fn sample_ttft(
-        &self,
-        state: &mut RequestState,
-        bootstrap: Option<&ts_pd::BootstrapInfo>,
-    ) {
-        if self.ttft_sampling_enabled() {
-            state.ttft = bootstrap.and_then(|b| {
-                request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
-            });
-        }
-    }
-
     pub(crate) fn bootstrapped(&mut self, rid: &str) {
-        if self.finish_log.ttft_percentage > 0 {
-            if let Some(trace) = self.states.get_mut(rid).and_then(|s| s.ttft.as_mut()) {
-                trace.bootstrapped(rid);
-            }
+        if let Some(timings) = self.states.get_mut(rid).and_then(|s| s.pd_timings.as_mut()) {
+            self.pd_phase_seconds.extend(
+                timings
+                    .mark(PdMilestone::Bootstrapped, Instant::now())
+                    .filter(|_| self.metrics_enabled),
+            );
         }
     }
 
@@ -949,8 +934,12 @@ impl OutputProcessor {
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if let Some(trace) = &mut state.ttft {
-            trace.transfer_done_ms = Some(trace.ms());
+        if let Some(timings) = &mut state.pd_timings {
+            self.pd_phase_seconds.extend(
+                timings
+                    .mark(PdMilestone::TransferDone, Instant::now())
+                    .filter(|_| self.metrics_enabled),
+            );
         }
         if !state.finished() {
             state.finished_reason = Some(FinishReason::Length(state.output_ids.len() as i64));
@@ -992,8 +981,12 @@ impl OutputProcessor {
         if self.metrics_enabled {
             state.decode_ready_at.get_or_insert_with(Instant::now);
         }
-        if let Some(trace) = &mut state.ttft {
-            trace.transfer_done_ms = Some(trace.ms());
+        if let Some(timings) = &mut state.pd_timings {
+            self.pd_phase_seconds.extend(
+                timings
+                    .mark(PdMilestone::TransferDone, Instant::now())
+                    .filter(|_| self.metrics_enabled),
+            );
         }
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
@@ -1534,9 +1527,6 @@ impl OutputProcessor {
                 continue;
             };
             if i < batch.num_extends {
-                if let Some(trace) = &mut state.ttft {
-                    trace.prefill_chunks += 1;
-                }
                 tracing::debug!(
                     rid,
                     prefix_tokens = batch.extend_prefix_lens[i],
@@ -1575,10 +1565,12 @@ impl OutputProcessor {
                     })?;
             }
             if !is_decode {
-                if let Some(trace) = &mut state.ttft {
-                    if trace.prompt_done_ms.is_none() {
-                        trace.prompt_done_ms = Some(trace.ms());
-                    }
+                if let Some(timings) = &mut state.pd_timings {
+                    self.pd_phase_seconds.extend(
+                        timings
+                            .mark(PdMilestone::PromptDone, Instant::now())
+                            .filter(|_| self.metrics_enabled),
+                    );
                 }
             }
             if let Some(timings) = state.timings.as_mut() {
@@ -1840,8 +1832,8 @@ impl OutputProcessor {
         if state.finished() {
             state.finished_output = true;
         }
-        if let Some(trace) = state.ttft.take() {
-            trace.finish(rid, state);
+        if let Some(timings) = &mut state.pd_timings {
+            let _ = timings.mark(PdMilestone::OutputPrepared, Instant::now());
         }
         tracing::debug!(
             rid,
@@ -1994,7 +1986,6 @@ mod tests {
     const NO_FINISH_LOG: FinishLog = FinishLog {
         enabled: false,
         request_stats: false,
-        ttft_percentage: 0,
     };
 
     fn processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
@@ -2142,68 +2133,181 @@ mod tests {
     }
 
     #[test]
-    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
-        use tracing::Level;
-
-        for (level, role, enabled, percentage, request_stats, expected) in [
-            (Level::INFO, Role::Prefill, true, 100, false, true),
-            (Level::INFO, Role::Decode, true, 100, false, true),
-            (Level::INFO, Role::Decode, true, 1, false, true),
-            (Level::INFO, Role::Prefill, true, 0, false, false),
-            (Level::INFO, Role::Decode, true, 0, true, false),
-            (Level::DEBUG, Role::Decode, true, 0, false, false),
-            (Level::WARN, Role::Decode, true, 100, true, false),
-            (Level::INFO, Role::Decode, false, 100, true, false),
-            (Level::INFO, Role::Plain, true, 100, true, false),
-            (Level::DEBUG, Role::Decode, true, 100, false, true),
-        ] {
+    fn pd_milestones_survive_without_metrics_or_info_logging() {
+        for level in [tracing::Level::WARN, tracing::Level::INFO] {
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(level)
                 .with_writer(std::io::sink)
                 .finish();
             tracing::subscriber::with_default(subscriber, || {
-                let processor = OutputProcessor::new(
-                    None,
-                    1,
-                    None,
-                    role,
-                    FinishLog {
-                        enabled,
-                        request_stats,
-                        ttft_percentage: percentage,
-                    },
-                    false,
-                    None,
-                );
-                let mut state =
-                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
-                // Room 4 is selected even at one percent sampling.
-                processor.sample_ttft(
-                    &mut state,
-                    Some(&ts_pd::BootstrapInfo {
-                        room: 4,
-                        host: "p".into(),
-                        port: 8080,
-                    }),
-                );
-                assert_eq!(state.ttft.is_some(), expected);
-                assert_eq!(processor.ttft_sampling_enabled(), expected);
+                for role in [Role::Prefill, Role::Decode] {
+                    for metrics_enabled in [false, true] {
+                        let mut p = OutputProcessor::new(
+                            None,
+                            1,
+                            None,
+                            role,
+                            NO_FINISH_LOG,
+                            metrics_enabled,
+                            None,
+                        );
+                        let mut state = RequestState::new(
+                            vec![8, 9, 10, 11],
+                            4,
+                            BTreeSet::new(),
+                            true,
+                            None,
+                            false,
+                        );
+                        state.pd_timings = request_stats::PdTimings::new(role, Instant::now());
+                        register_state(&mut p, "r".into(), state);
+                        p.mark_submitted("r", Instant::now());
+                        p.bootstrapped("r");
+                        let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                        let submitted = timings.submitted.unwrap();
+                        let bootstrapped = timings.bootstrapped.unwrap();
+                        assert!(submitted <= bootstrapped);
+                        p.mark_submitted("r", Instant::now());
+                        p.bootstrapped("r");
+                        let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                        assert_eq!(timings.submitted, Some(submitted));
+                        assert_eq!(timings.bootstrapped, Some(bootstrapped));
+                        let phases = p.take_request_metrics().pd_phase_seconds;
+                        assert_eq!(
+                            phases.iter().map(|s| s.0).collect::<Vec<_>>(),
+                            if metrics_enabled {
+                                vec![PdPhase::BootstrapWait]
+                            } else {
+                                vec![]
+                            }
+                        );
+                        if role == Role::Prefill {
+                            p.mark_planned(&["r".into()], false);
+                            p.mark_scheduled(&["r".into()]);
+                            p.mark_planned(&["r".into()], false);
+                            p.mark_scheduled(&["r".into()]);
+                            p.commit(&batch(&[("r", 2, 0, 4)], 1), None, &result(&[12], &[1]))
+                                .unwrap();
+                            let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                            assert!(timings.planned.unwrap() <= timings.scheduled.unwrap());
+                            assert!(timings.prompt_done.is_none());
+                            assert!(timings.transfer_done.is_none());
+                            let phases = p.take_request_metrics().pd_phase_seconds;
+                            assert_eq!(
+                                phases.iter().map(|s| s.0).collect::<Vec<_>>(),
+                                if metrics_enabled {
+                                    vec![PdPhase::PrefillScheduleWait, PdPhase::PrefillDispatchWait]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            p.commit(&batch(&[("r", 2, 2, 4)], 1), None, &result(&[12], &[1]))
+                                .unwrap();
+                            let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                            assert!(timings.scheduled.unwrap() <= timings.prompt_done.unwrap());
+                            assert!(timings.transfer_done.is_none());
+                            assert!(timings.output_prepared.is_none());
+                            let phases = p.take_request_metrics().pd_phase_seconds;
+                            assert_eq!(
+                                phases.iter().map(|s| s.0).collect::<Vec<_>>(),
+                                if metrics_enabled {
+                                    vec![PdPhase::Prefill]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            let finished = p.finish_prefill("r");
+                            assert_eq!(finished.outputs.len(), 1);
+                            assert_eq!(finished.released, ["r"]);
+                            let phases = p.take_request_metrics().pd_phase_seconds;
+                            assert_eq!(
+                                phases.iter().map(|s| s.0).collect::<Vec<_>>(),
+                                if metrics_enabled {
+                                    vec![PdPhase::PrefillKvTransferTail]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            assert!(p.finish_prefill("r").outputs.is_empty());
+                        } else {
+                            p.mark_planned(&["r".into()], true);
+                            let remote_admitted = p
+                                .state("r")
+                                .unwrap()
+                                .pd_timings
+                                .as_ref()
+                                .unwrap()
+                                .remote_admitted
+                                .unwrap();
+                            p.mark_planned(&["r".into()], true);
+                            p.remote_prefill_done("r", 12, 0, None);
+                            let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                            assert_eq!(timings.remote_admitted, Some(remote_admitted));
+                            assert!(remote_admitted <= timings.transfer_done.unwrap());
+                            assert!(timings.planned.is_none());
+                            assert!(timings.scheduled.is_none());
+                            let phases = p.take_request_metrics().pd_phase_seconds;
+                            assert_eq!(
+                                phases.iter().map(|s| s.0).collect::<Vec<_>>(),
+                                if metrics_enabled {
+                                    vec![PdPhase::DecodeKvReserveWait, PdPhase::DecodeKvArrivalWait]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            p.mark_planned(&["r".into()], false);
+                            p.mark_scheduled(&["r".into()]);
+                            p.commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[13], &[1]))
+                                .unwrap();
+                            let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                            let planned = timings.planned.unwrap();
+                            let scheduled = timings.scheduled.unwrap();
+                            let output_prepared = timings.output_prepared.unwrap();
+                            assert!(timings.transfer_done.unwrap() <= planned);
+                            assert!(planned <= scheduled);
+                            assert!(scheduled <= output_prepared);
+                            // Streaming and replanning retain the first timestamps.
+                            p.mark_planned(&["r".into()], false);
+                            p.mark_scheduled(&["r".into()]);
+                            p.commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[14], &[1]))
+                                .unwrap();
+                            let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                            assert_eq!(timings.planned, Some(planned));
+                            assert_eq!(timings.scheduled, Some(scheduled));
+                            assert_eq!(timings.output_prepared, Some(output_prepared));
+                            p.commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[15], &[1]))
+                                .unwrap();
+                        }
+                        assert!(p.state("r").is_none());
+                        assert!(p.take_request_metrics().pd_phase_seconds.is_empty());
+                        let mut replacement =
+                            RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                        replacement.pd_timings =
+                            request_stats::PdTimings::new(role, Instant::now());
+                        register_state(&mut p, "r".into(), replacement);
+                        let timings = p.state("r").unwrap().pd_timings.as_ref().unwrap();
+                        assert!(timings.submitted.is_none());
+                        assert!(timings.bootstrapped.is_none());
+                        assert!(timings.output_prepared.is_none());
+                    }
+                }
             });
         }
     }
 
     #[test]
-    fn sampled_rooms_emit_bootstrap_and_first_output_once() {
+    fn pd_completion_and_admission_errors_keep_request_logs_without_stage_summaries() {
         use std::{io::Read, os::unix::net::UnixStream};
         let (writer, mut reader) = UnixStream::pair().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
             .with_writer(move || writer.try_clone().unwrap())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             for role in [Role::Prefill, Role::Decode] {
-                let mut processor = OutputProcessor::new(
+                let mut p = OutputProcessor::new(
                     None,
                     1,
                     None,
@@ -2211,182 +2315,47 @@ mod tests {
                     FinishLog {
                         enabled: true,
                         request_stats: false,
-                        ttft_percentage: 1,
                     },
                     false,
                     None,
                 );
-                // Python zlib.crc32 of the decimal room, modulo 1000:
-                // room 4 lands in bucket 8, room 5 is outside the sample.
-                for (room, rid) in [(4, "kept"), (5, "skipped")] {
-                    let mut state =
-                        RequestState::new(vec![8, 9], 1, BTreeSet::new(), true, None, false);
-                    let bootstrap = ts_pd::BootstrapInfo {
-                        room,
-                        host: "p".into(),
-                        port: 8080,
-                    };
-                    processor.sample_ttft(&mut state, Some(&bootstrap));
-                    register_state(&mut processor, rid.into(), state);
-                    processor.mark_submitted(rid, Instant::now());
-                    processor.bootstrapped(rid);
-                    processor.bootstrapped(rid);
-                    if role == Role::Prefill {
-                        processor.mark_planned(&[rid.into()], false);
-                        processor.mark_scheduled(&[rid.into()]);
-                        let committed = processor
-                            .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
-                            .unwrap();
-                        assert!(committed.outputs.is_empty());
-                        if rid == "kept" {
-                            let trace = processor.state(rid).unwrap().ttft.as_ref().unwrap();
-                            assert!(trace.transfer_done_ms.is_none());
-                        }
-                        processor.finish_prefill(rid);
-                    } else {
-                        processor.mark_planned(&[rid.into()], true);
-                        processor.remote_prefill_done(rid, 10, 1, None);
-                        processor.finish_remote_prefill_only(rid);
-                    }
+                let mut state =
+                    RequestState::new(vec![8, 9], 1, BTreeSet::new(), true, None, false);
+                state.pd_timings = request_stats::PdTimings::new(role, Instant::now());
+                register_state(&mut p, "completed".into(), state);
+                p.mark_submitted("completed", Instant::now());
+                p.bootstrapped("completed");
+                if role == Role::Prefill {
+                    p.mark_planned(&["completed".into()], false);
+                    p.mark_scheduled(&["completed".into()]);
+                    p.commit(
+                        &batch(&[("completed", 2, 0, 2)], 1),
+                        None,
+                        &result(&[10], &[1]),
+                    )
+                    .unwrap();
+                    p.finish_prefill("completed");
+                } else {
+                    p.mark_planned(&["completed".into()], true);
+                    p.remote_prefill_done("completed", 10, 1, None);
+                    p.finish_remote_prefill_only("completed");
                 }
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                state.pd_timings = request_stats::PdTimings::new(role, Instant::now());
+                state.abort("invalid request", true, Some(400));
+                assert_eq!(p.publish_finished_at_admission("rejected", state).len(), 1);
+                assert!(p.rids().is_empty());
+                assert!(p.take_request_metrics().pd_phase_seconds.is_empty());
             }
         });
         let mut log = String::new();
         reader.read_to_string(&mut log).unwrap();
-        let records = |marker| {
-            log.lines()
-                .filter_map(|line| line.split_once(marker))
-                .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(records("TTFTBootstrap ").len(), 1, "{log}");
-        let summaries = records("TTFTBreakdown ");
-        assert_eq!(summaries.len(), 2, "{log}");
-        for summary in &summaries {
-            assert_eq!(summary["rid"], "kept");
-            assert_eq!(summary["room"], 4);
-            assert_eq!(summary["status"], "first_output");
-            assert!(summary["phases_ms"]["bootstrap"].is_number());
-            assert!(summary["milestones_ms"]["submitted"].is_number());
-        }
-        assert_eq!(summaries[0]["prefill_chunks"], 1);
-        assert!(summaries[0]["phases_ms"]["prefill"].is_number());
-        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
-        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
-        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
-        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
-        assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
-        assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
-        assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
-    }
-
-    #[test]
-    fn admission_failure_emits_one_ttft_breakdown() {
-        use std::{io::Read, os::unix::net::UnixStream};
-        for role in [Role::Prefill, Role::Decode] {
-            let (writer, mut reader) = UnixStream::pair().unwrap();
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_writer(move || writer.try_clone().unwrap())
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                let mut processor = OutputProcessor::new(
-                    None,
-                    1,
-                    None,
-                    role,
-                    FinishLog {
-                        enabled: true,
-                        request_stats: false,
-                        ttft_percentage: 100,
-                    },
-                    true,
-                    None,
-                );
-                let mut state =
-                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
-                processor.sample_ttft(
-                    &mut state,
-                    Some(&ts_pd::BootstrapInfo {
-                        room: 4,
-                        host: "p".into(),
-                        port: 8080,
-                    }),
-                );
-                state.abort("invalid request", true, Some(400));
-                let outputs = processor.publish_finished_at_admission("rejected", state);
-                assert_eq!(outputs.len(), 1);
-                assert!(processor.rids().is_empty());
-                let metrics = processor.take_request_metrics();
-                assert!(metrics.tpot_seconds.is_empty());
-                assert!(metrics.e2e_tpot_seconds.is_empty());
-            });
-            let mut log = String::new();
-            reader.read_to_string(&mut log).unwrap();
-            assert_eq!(log.matches("TTFTBreakdown ").count(), 1, "{log}");
-            assert_eq!(log.matches("event=ts_request_finished").count(), 1, "{log}");
-            assert!(log.contains("\"status\":\"abort\""), "{log}");
-        }
-    }
-
-    #[test]
-    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(std::io::sink)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let mut processor = OutputProcessor::new(
-                None,
-                1,
-                None,
-                Role::Decode,
-                FinishLog {
-                    enabled: true,
-                    request_stats: false,
-                    ttft_percentage: 100,
-                },
-                false,
-                None,
-            );
-            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
-            processor.sample_ttft(
-                &mut state,
-                Some(&ts_pd::BootstrapInfo {
-                    room: 4,
-                    host: "p".into(),
-                    port: 8080,
-                }),
-            );
-            register_state(&mut processor, "r".into(), state);
-            processor.mark_submitted("r", Instant::now());
-            processor.bootstrapped("r");
-            processor.mark_planned(&["r".into()], true);
-            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
-            let first_submit = trace.submitted_ms.unwrap();
-            let remote_admitted = trace.remote_admitted_ms.unwrap();
-            assert!(trace.planned_ms.is_none());
-
-            processor.remote_prefill_done("r", 10, 0, None);
-            processor.mark_planned(&["r".into()], false);
-            processor.mark_scheduled(&["r".into()]);
-            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
-            let first_plan = trace.planned_ms.unwrap();
-            let first_dispatch = trace.scheduled_ms.unwrap();
-            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
-            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
-            assert!(first_plan <= first_dispatch);
-
-            processor.mark_submitted("r", Instant::now());
-            processor.mark_planned(&["r".into()], true);
-            processor.mark_planned(&["r".into()], false);
-            processor.mark_scheduled(&["r".into()]);
-            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
-            assert_eq!(trace.submitted_ms, Some(first_submit));
-            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
-            assert_eq!(trace.planned_ms, Some(first_plan));
-            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
-        });
+        assert!(!log.contains("TTFTBootstrap"), "{log}");
+        assert!(!log.contains("TTFTBreakdown"), "{log}");
+        assert_eq!(log.matches("event=ts_request_accepted").count(), 2, "{log}");
+        assert_eq!(log.matches("event=ts_request_finished").count(), 4, "{log}");
+        assert_eq!(log.matches("invalid request").count(), 2, "{log}");
     }
 
     #[test]
@@ -2720,7 +2689,6 @@ mod tests {
             FinishLog {
                 enabled: true,
                 request_stats: true,
-                ttft_percentage: 0,
             },
             false,
             None,

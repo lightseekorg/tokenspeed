@@ -35,7 +35,7 @@ use std::{
 use ts_metrics::{
     DiskExecutorStats, DiskMetrics, DiskSchedulerStats, EngineLabels, EngineMetrics, Exporter,
     KvTransferMetrics, L3ExecutorSnapshot, L3Labels, L3Metrics, L3OperationSnapshot,
-    L3SchedulerStats, MetricEvent, MetricsConfig,
+    L3SchedulerStats, MetricEvent, MetricsConfig, PdPhase,
 };
 
 fn fixtures() -> PathBuf {
@@ -209,6 +209,84 @@ fn decode_ready_wait_exports_duration_and_the_100ms_bucket() {
         ),
         2.0
     );
+}
+
+#[test]
+fn pd_phases_export_individual_counts_seconds_and_zero_buckets() {
+    let directory = scratch_dir("pd-phases");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".into(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    let phases = [
+        (
+            PdPhase::BootstrapWait,
+            "tokenspeed:pd_bootstrap_wait_seconds",
+            0.2,
+        ),
+        (
+            PdPhase::PrefillScheduleWait,
+            "tokenspeed:prefill_schedule_wait_seconds",
+            0.4,
+        ),
+        (
+            PdPhase::PrefillDispatchWait,
+            "tokenspeed:prefill_dispatch_wait_seconds",
+            0.6,
+        ),
+        (PdPhase::Prefill, "tokenspeed:prefill_time_seconds", 0.8),
+        (
+            PdPhase::PrefillKvTransferTail,
+            "tokenspeed:prefill_kv_transfer_tail_seconds",
+            1.0,
+        ),
+        (
+            PdPhase::DecodeKvReserveWait,
+            "tokenspeed:decode_kv_reserve_wait_seconds",
+            1.2,
+        ),
+        (
+            PdPhase::DecodeKvArrivalWait,
+            "tokenspeed:decode_kv_arrival_wait_seconds",
+            1.4,
+        ),
+    ];
+    // Distinct phase totals expose any permutation of the metric collectors.
+    for (phase, _, duration) in phases {
+        for seconds in [0.0, 0.025, duration] {
+            engine.observe_pd_phase(phase, seconds);
+        }
+    }
+    let text = render(&directory).expect("PD metrics tests require prometheus_client");
+    for (_, name, duration) in phases {
+        let value = |suffix: &str, label: Option<&str>| -> f64 {
+            text.lines()
+                .find(|line| {
+                    line.starts_with(&format!("{name}{suffix}{{"))
+                        && label.is_none_or(|label| line.contains(label))
+                })
+                .unwrap_or_else(|| panic!("missing {name}{suffix} in {text}"))
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(value("_count", None), 3.0);
+        assert!((value("_sum", None) - (0.025 + duration)).abs() < 1e-12);
+        assert_eq!(value("_bucket", Some("le=\"0.0\"")), 1.0);
+        assert_eq!(value("_bucket", Some("le=\"0.025\"")), 2.0);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

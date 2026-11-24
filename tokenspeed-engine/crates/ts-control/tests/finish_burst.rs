@@ -154,7 +154,6 @@ fn processor(specs: &[RequestSpec]) -> OutputProcessor {
         FinishLog {
             enabled: false,
             request_stats: false,
-            ttft_percentage: 0,
         },
         false,
         None,
