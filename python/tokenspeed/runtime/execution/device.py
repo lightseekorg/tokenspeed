@@ -141,8 +141,8 @@ The two planes exchange information ONLY through the two channels below.
      (``SharedL2LoadExecutor.submit_load_backs``, through the host's shared
      L2 handle, ``SharedL2Handle.submit_load``). The discipline is ordering:
      the map is
-     written at the head of the round, before the plan that may load from
-     those blocks is queued, and the scheduler holds a proxy block a planned
+     written right before the plan that may load from those blocks is
+     queued, and the scheduler holds a proxy block a planned
      load reads until the load is acknowledged, so no later answer remaps it
      first.
 """

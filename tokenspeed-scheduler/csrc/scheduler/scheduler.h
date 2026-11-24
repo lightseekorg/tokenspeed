@@ -913,8 +913,7 @@ private:
     std::unique_ptr<StorageTransferManager> storage_transfers_;
     // The Disk tier's prefetches and cleaning writes; null without one.
     std::unique_ptr<DiskTransferManager> disk_transfers_;
-    // The rank's proxy of its shared L2 pool; null without one. It outlives
-    // the lookup holds of the requests below.
+    // The rank's proxy of its shared L2 pool; null without one.
     std::unique_ptr<SharedL2Proxy> shared_l2_proxy_;
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
