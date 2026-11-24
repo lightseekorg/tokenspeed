@@ -294,6 +294,29 @@ class DFlash(BaseDrafter):
         self.logits_processor.require_full_vocab_logits()
 
     @override
+    def keep_draft_logits_vocab_sharded(
+        self,
+        supports: Callable[[torch.dtype, int, int], bool],
+        vocab_start: int,
+    ) -> bool:
+        """Never keep the block's logits on this rank's shard.
+
+        The block proposal projects every row in one GEMM and does not go
+        through ``sample_draft_step``, so there is no per-step shard to keep. The
+        base method also reads the draft model's own ``lm_head``, which a DFLASH
+        draft does not have: it projects through the target's head.
+
+        Args:
+            supports: The verifier's ``supports_vocab_shard``.
+            vocab_start: Global token id of the target head's shard column 0.
+
+        Returns:
+            False: the block records q over whole vocabulary rows.
+        """
+        del supports, vocab_start
+        return False
+
+    @override
     def idle_forward_global_num_tokens(
         self,
         global_num_tokens: list[int],

@@ -805,8 +805,13 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
             )
 
 
-def _check_sampled_drafting_on_cuda():
-    """Check the draft q rows and the sampler's scratch survive a weights release."""
+def _check_sampled_drafting_on_cuda(sparse: bool):
+    """Check the recorded draft q and the sampler's scratch survive a weights release.
+
+    Args:
+        sparse: Record DFlash2's sparse q (``future_draft_q``) instead of the
+            dense ``draft_probs`` rows the other sampled drafters record.
+    """
     from tokenspeed.runtime.execution.drafter.speculative_sampling import (
         DraftProposalSampler,
     )
@@ -820,15 +825,21 @@ def _check_sampled_drafting_on_cuda():
     executor.memory_saver_adapter = saver
 
     class _Drafter:
-        """Binds a real DraftProposalSampler, as every sampled drafter does."""
+        """Binds what a sampled drafter binds: a real DraftProposalSampler over
+        dense rows, or DFlash2's sparse q."""
 
-        records_sparse_draft_q = False
+        records_sparse_draft_q = sparse
 
         def __init__(self, states):
             self.states = states
             self.draft_sampler = None
 
         def bind_sampling_backend(self, backend):
+            if sparse:
+                self.states.init_draft_tree_q(
+                    num_nodes=width, num_slots=width - 1, num_candidates=3
+                )
+                return
             self.draft_sampler = DraftProposalSampler(
                 pools=backend.speculative_sampling_pools(),
                 runtime_states=self.states,
@@ -877,10 +888,21 @@ def _check_sampled_drafting_on_cuda():
     )
     sampler = executor.drafter.draft_sampler
     states = executor.runtime_states
-    assert states.draft_probs is not None and sampler is not None
-    retained = [states.draft_probs, sampler._offsets_pool, sampler._gumbel_out]
-    # Persistent contents, not just addresses: a recorded row must come back.
-    states.draft_probs[3, 1, :] = torch.arange(vocab, device="cuda") / vocab
+    if sparse:
+        # DFlash2 records no dense rows; its walk writes the sparse tables.
+        assert states.draft_probs is None and sampler is None
+        draft_q = states.future_draft_q
+        retained = [draft_q.q, draft_q.q_ids, draft_q.slot, draft_q.pos]
+        draft_q.q[3, 1, :] = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+        draft_q.q_ids[3, 1, :] = torch.tensor(
+            [7, 8, 9], dtype=torch.int32, device="cuda"
+        )
+        draft_q.slot[3, :] = 1
+    else:
+        assert states.draft_probs is not None and sampler is not None
+        retained = [states.draft_probs, sampler._offsets_pool, sampler._gumbel_out]
+        # Persistent contents, not just addresses: a recorded row must come back.
+        states.draft_probs[3, 1, :] = torch.arange(vocab, device="cuda") / vocab
     snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
     for _ in range(3):
         torch.cuda.synchronize()
@@ -904,7 +926,8 @@ def _check_sampled_drafting_on_cuda():
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="requires native CUDA VMM memory-saver hooks",
 )
-def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes():
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense-q", "dflash2-sparse-q"])
+def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes(sparse):
     memory_saver = pytest.importorskip("torch_memory_saver")
     # Preload hooks must be installed before CUDA initializes in the child.
     with memory_saver.configure_subprocess():
@@ -913,7 +936,8 @@ def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes():
                 sys.executable,
                 "-c",
                 "from test.runtime.test_torch_memory_saver_adapter import "
-                "_check_sampled_drafting_on_cuda; _check_sampled_drafting_on_cuda()",
+                "_check_sampled_drafting_on_cuda; "
+                f"_check_sampled_drafting_on_cuda({sparse})",
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,

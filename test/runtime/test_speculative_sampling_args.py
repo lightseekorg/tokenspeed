@@ -104,6 +104,18 @@ def test_dflash_resolves_with_a_draft_prob_verifier(backend):
     assert args.sampling_backend == backend
 
 
+@pytest.mark.parametrize("backend", ["flashinfer", "triton"])
+def test_dflash_refuses_block_verification(backend):
+    # Block verification reads a dense q over a chain the DFlash2 walk never
+    # records, and is validated only for DSPARK and EAGLE3 chains.
+    with pytest.raises(ValueError, match="block with sampled drafts requires"):
+        _args(
+            speculative_algorithm="DFLASH",
+            sampling_backend=backend,
+            speculative_rejection_sample_method="block",
+        )
+
+
 @pytest.mark.parametrize("backend", ["triton_full", "greedy"])
 def test_dflash_refuses_a_verifier_that_reads_no_recorded_q(backend):
     with pytest.raises(ValueError, match="DFLASH needs --sampling-backend triton"):
