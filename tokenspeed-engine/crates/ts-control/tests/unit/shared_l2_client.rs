@@ -363,52 +363,6 @@ fn a_lookup_the_owner_answers_with_an_error_fails() {
 }
 
 #[test]
-fn a_hit_names_pages_the_pool_has() {
-    // The pool's 8 LCM blocks end at KV page 16 and State page 8.
-    let owner = TestOwner::serve(|_| hits(vec![hit_value(41, [16, 16, 8])]));
-    let answers = Rank::of(&owner)
-        .client
-        .lookup(&[lookup("request", &PROMPT)])
-        .unwrap();
-    assert_eq!(answers[0].pool_pages, [16, 16, 8]);
-
-    for pages in [[0, 4, 8], [-3, 4, 8], [17, 4, 8], [3, 4, 9], [3, 4, 0]] {
-        let owner =
-            TestOwner::serve(move |_| hits(vec![hit_value(41, [3, 4, 8]), hit_value(42, pages)]));
-        let error = Rank::of(&owner)
-            .client
-            .lookup(&[lookup("hit", &PROMPT), lookup("spoiled", &PROMPT)])
-            .unwrap_err();
-        assert!(error.0.contains("is out of range"), "{pages:?}: {error}");
-    }
-
-    // A group the pool does not have, and a shard it does not have.
-    let (_, _, keys) = prompt_keys(&PROMPT);
-    for (group_id, bucket, message) in [
-        (2, 0, "the shared L2 pool has no cache group 2"),
-        (KV, 1, "a shared L2 pool holds bucket 0 only"),
-    ] {
-        let Value::Array(mut hit) = hit_value(41, [3, 4, 8]) else {
-            unreachable!()
-        };
-        hit[4] = Value::Array(vec![Value::Array(vec![
-            key_value(&StorageKeyView {
-                group_id,
-                ..keys[0].clone()
-            }),
-            Value::from(bucket),
-            Value::from(3),
-        ])]);
-        let owner = TestOwner::serve(move |_| hits(vec![Value::Array(hit.clone())]));
-        let error = Rank::of(&owner)
-            .client
-            .lookup(&[lookup("request", &PROMPT)])
-            .unwrap_err();
-        assert_eq!(error.0, message);
-    }
-}
-
-#[test]
 fn a_write_copies_only_the_blocks_the_owner_placed() {
     let mut reservations = 0;
     let owner = TestOwner::serve(move |request| {

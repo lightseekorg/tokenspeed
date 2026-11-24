@@ -36,10 +36,9 @@
 //! Nothing is sent twice, and every failure stops the rank's engine: a
 //! request the owner does not answer in time or answers with an error (an
 //! owner that does not know the rank answers so), an answer that is not one
-//! hit of the wire's shape, on pages the pool has, for each lookup, a
-//! reservation that does not answer each key of the write with a page the
-//! pool has or with none, a copy that fails, a commit the owner does not
-//! carry out. A lookup returns its failure; a write's, a notice's and a
+//! hit of the wire's shape for each lookup, a reservation that does not
+//! answer each key of the write with a page the pool has or with none, a
+//! copy that fails, a commit the owner does not carry out. A lookup returns its failure; a write's, a notice's and a
 //! load's are kept ([`FailureLatch`]) for the loop's next poll or check.
 
 use std::{
@@ -131,7 +130,6 @@ enum Notice {
 /// The client as the loop drives it, on the control thread.
 pub struct RankClient {
     owner: OwnerConnection,
-    geometry: Arc<PoolGeometry>,
     proxy_pages: Arc<ProxyPages>,
     failure: Arc<FailureLatch>,
     /// The plan's write ops; `None` tells a write thread to stop.
@@ -290,7 +288,6 @@ pub fn start(
     Ok((
         RankClient {
             owner,
-            geometry,
             proxy_pages,
             failure,
             writes: writes.clone(),
@@ -363,19 +360,7 @@ impl PoolClient for RankClient {
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-        let answers = self.owner.lookup(lookups)?;
-        // A load reads a hit's pages at their addresses: each has one.
-        for answer in &answers {
-            for ((key, bucket), page) in answer
-                .keys
-                .iter()
-                .zip(&answer.buckets)
-                .zip(&answer.pool_pages)
-            {
-                self.geometry.page_address(key.group_id, *bucket, *page)?;
-            }
-        }
-        Ok(answers)
+        self.owner.lookup(lookups)
     }
 
     fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError> {

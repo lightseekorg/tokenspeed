@@ -2195,7 +2195,7 @@ rank left the mesh):
 
 | What fails | How |
 |---|---|
-| A lookup | The owner does not answer within `request_timeout_ms` (after a restart of the owner too: the rank's next request leaves on the connection to the earlier owner and is lost), answers with an error (an owner that does not know the rank answers so: it dropped the rank after `--client-timeout-s` of silence), or answers with anything but one well-formed hit for each prompt (a hit that names a page the pool does not have is not well formed). A failed lookup is never taken for a miss. |
+| A lookup | The owner does not answer within `request_timeout_ms` (after a restart of the owner too: the rank's next request leaves on the connection to the earlier owner and is lost), answers with an error (an owner that does not know the rank answers so: it dropped the rank after `--client-timeout-s` of silence), or answers with anything but one well-formed hit for each prompt. A failed lookup is never taken for a miss. |
 | A write | Its reservation or its commit is not answered within `request_timeout_ms` or is answered with an error, or its RDMA copy fails (a dead provider included). |
 | A release, a touch or a ping | It is not answered within `request_timeout_ms` or is answered with an error. |
 | A load of an admitted prompt | A provider died or an RDMA read failed (reported after the RDMA retries, some seconds). The forward already depends on the pages; none of its results is returned. |
