@@ -516,9 +516,10 @@ def _case(
                 continue
             take = max(0, min(accepted, n))
             dst = int(live[r])
+            # The prepare folded a row shorter than the window as a full one.
             old = (
                 0
-                if int(source[r]) != dst or old_lengths[r] + n > capacity
+                if int(source[r]) != dst or old_lengths[r] + max(n, width) > capacity
                 else old_lengths[r]
             )
             assert int(length[int(slots[r]), 0]) == old + take
