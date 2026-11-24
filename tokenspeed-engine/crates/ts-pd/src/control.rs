@@ -106,9 +106,8 @@ pub enum PdEvent {
     /// The request may be admitted. D role: its peers are connected and,
     /// when the prefill node defers the decode allocation, that node holds every
     /// page of the prompt. P role under early decode allocation: every
-    /// decode rank allocated its destination. P role under deferred
-    /// decode allocation: its decode node announced it; the destination has
-    /// its own event.
+    /// decode rank allocated its destination. Deferred P requests are
+    /// schedulable on submission and do not receive this event.
     Bootstrapped(String),
     /// P role, deferred decode allocation: every decode rank allocated
     /// the request's destination.

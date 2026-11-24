@@ -344,7 +344,7 @@ fn deferred_allocation_peer(
             active_rooms: HashMap::new(),
             stall_logged_at: None,
             drain_logged_at: None,
-            timeouts_logged: HashSet::new(),
+            timeout_logged: false,
         },
         PrefillOutbox {
             shared,
@@ -444,22 +444,17 @@ fn room(room: u64) -> BootstrapInfo {
 }
 
 #[test]
-fn a_request_under_deferred_allocation_is_admitted_by_its_announcement_and_granted_by_its_manifest()
-{
+fn a_deferred_destination_is_granted_after_the_pages_held_notice_and_manifest() {
     let native = NativeLibrary::new();
     let (mut peer, outbox, mut mesh, group) =
         deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
 
-    // Not announced: the request waits.
     peer.register("r", &room(7)).unwrap();
     assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
     peer.shared.handle(&wire::announce_frames(7, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("r".to_owned())]
-    );
+    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
     // The announcement is answered only once the prompt holds its pages,
     // and a manifest before that is refused: the room fails on both sides.
     assert!(next_status(&received, Duration::from_millis(100)).is_none());
@@ -496,12 +491,9 @@ fn an_announcement_before_its_request_waits_for_it_and_expires_unclaimed() {
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     peer.shared.handle(&wire::announce_frames(7, "cache-a"));
     peer.shared.handle(&wire::announce_frames(8, "cache-a"));
-    // Room 7's request arrives: it is admitted at once.
+    // Room 7's request arrives and claims its announcement.
     peer.register("r", &room(7)).unwrap();
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("r".to_owned())]
-    );
+    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
     // Room 8's never does: its Decode rank is told, and the room stays
     // failed for a later announcement or manifest.
     peer.shared.drop_unclaimed(Duration::ZERO);
@@ -554,10 +546,7 @@ fn a_request_holding_its_pages_times_out_from_then_and_its_announcer_is_told() {
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     peer.register("r", &room(7)).unwrap();
     peer.shared.handle(&wire::announce_frames(7, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("r".to_owned())]
-    );
+    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
     // While the prompt computes nothing times out here.
     thread::sleep(Duration::from_millis(300));
     assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
@@ -610,13 +599,16 @@ fn an_announcement_of_a_room_that_ended_binds_its_tombstone_to_the_cache() {
 }
 
 #[test]
-fn a_request_its_decode_node_never_announces_times_out_from_its_registration() {
+fn an_unannounced_request_times_out_only_after_it_holds_its_pages() {
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) =
+    let (mut peer, outbox, mut mesh, group) =
         deferred_allocation_peer(&native, Duration::from_millis(150));
     register(&peer.shared, "cache-a", "127.0.0.1:41001", 42001);
     peer.register("r", &room(7)).unwrap();
     assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
+    outbox.mark_pages_held(&["r".to_owned()]);
     thread::sleep(Duration::from_millis(300));
     assert_eq!(
         peer.poll(&mut mesh, &group).unwrap(),
@@ -625,76 +617,44 @@ fn a_request_its_decode_node_never_announces_times_out_from_its_registration() {
             PdEvent::Stopped("r".to_owned())
         ]
     );
-    assert_eq!(
-        timeouts(&native),
-        [("waiting_for_announcement".to_owned(), 1.0)]
-    );
+    assert_eq!(timeouts(&native), [("bootstrapping".to_owned(), 1.0)]);
 }
 
 #[test]
-fn a_room_is_admitted_once_every_rank_of_its_decode_node_announced_it() {
+fn an_announcement_after_the_prompt_holds_its_pages_gets_its_notice_at_once() {
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) =
+    let (mut peer, outbox, mut mesh, group) =
         deferred_allocation_peer(&native, Duration::from_secs(60));
-    // One Decode node of two attention-TP ranks: one destination.
-    for (cache, session, port, rank) in [
-        ("d-0", "127.0.0.1:41001", 42001, 0),
-        ("d-1", "127.0.0.1:41002", 42002, 1),
-    ] {
-        let mut frames = registration(cache, session, port);
-        frames[6] = Bytes::from("2");
-        frames[7] = Bytes::from(format!("{rank}"));
-        peer.shared
-            .plan_registration(&frames)
-            .expect("valid TP registration");
-        peer.shared.handle_registration(&frames);
-    }
-    for (rid, number) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.shared.handle(&wire::announce_frames(number, "d-0"));
-        // The fourth room's second announcement is still on its way.
-        if number != 4 {
-            peer.shared.handle(&wire::announce_frames(number, "d-1"));
-        }
-    }
-    // Every request the node announced is admitted at once, whatever the
-    // node has not allocated yet.
+    peer.register("r", &room(7)).unwrap();
+    outbox.mark_pages_held(&["r".to_owned()]);
+    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
+
+    let (decode, received) = decode_socket();
+    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("a".to_owned()),
-            PdEvent::Bootstrapped("b".to_owned()),
-            PdEvent::Bootstrapped("c".to_owned())
-        ]
+        announce_until_answered(&peer, &received, 7, "cache-a"),
+        (7, TransferPoll::Bootstrapped)
     );
-    peer.shared.handle(&wire::announce_frames(4, "d-1"));
+    assert_eq!(preallocate(&peer.shared, "cache-a", 7), Ok(()));
     assert_eq!(
         peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("d".to_owned())]
+        [PdEvent::DestinationReady("r".to_owned())]
     );
 }
 
 #[test]
-fn a_request_waiting_for_its_announcement_is_reported_after_the_stall_interval() {
+fn a_request_waiting_for_its_destination_is_reported_after_the_stall_interval() {
     use std::{io::Read, os::unix::net::UnixStream};
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) =
+    let (mut peer, outbox, mut mesh, group) =
         deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, _received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    for (rid, number) in [("computing", 1), ("unannounced", 2)] {
+    for (rid, number) in [("computing", 1), ("waiting", 2)] {
         peer.register(rid, &room(number)).unwrap();
     }
-    peer.shared.handle(&wire::announce_frames(1, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("computing".to_owned())]
-    );
-    // Both registered a stall interval ago. `computing` was admitted and
-    // waits for nothing while it computes; `unannounced` is reported.
-    for sender in peer.senders.values_mut() {
-        sender.started -= BOOTSTRAP_STALL;
-    }
+    outbox.mark_pages_held(&["waiting".to_owned()]);
+    *peer.shared.state().pages_held.get_mut(&2).unwrap() -= BOOTSTRAP_STALL;
     let (writer, mut reader) = UnixStream::pair().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -708,8 +668,8 @@ fn a_request_waiting_for_its_announcement_is_reported_after_the_stall_interval()
     reader.read_to_string(&mut log).unwrap();
     assert!(
         log.contains("WARN")
-            && log.contains("waiting for their decode instance's announcement")
-            && log.contains("unannounced(room=2"),
+            && log.contains("waiting for their decode allocation")
+            && log.contains("waiting(room=2"),
         "{log}"
     );
     assert!(!log.contains("computing(room=1"), "{log}");
