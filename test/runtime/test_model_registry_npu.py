@@ -20,6 +20,9 @@
 
 """Discovering GPU-only models must not prevent Ascend startup."""
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -28,11 +31,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_model_discovery_on_npu():
-    from tokenspeed.runtime.models.inkling2 import Inkling2ForConditionalGeneration
-    from tokenspeed.runtime.models.registry import ModelRegistry
+@pytest.mark.parametrize("module", ["inkling2_monokernel", "registry"])
+def test_model_discovery_on_npu(module):
+    # Use a fresh interpreter so cached model imports cannot hide a regression.
+    code = f"""
+import importlib
 
-    assert ModelRegistry.resolve_model_cls("Inkling2ForConditionalGeneration") == (
-        Inkling2ForConditionalGeneration,
-        "Inkling2ForConditionalGeneration",
+importlib.import_module("tokenspeed.runtime.models.{module}")
+from tokenspeed.runtime.models.inkling2 import Inkling2ForConditionalGeneration
+from tokenspeed.runtime.models.registry import ModelRegistry
+
+assert ModelRegistry.resolve_model_cls("Inkling2ForConditionalGeneration") == (
+    Inkling2ForConditionalGeneration,
+    "Inkling2ForConditionalGeneration",
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
     )
+    assert result.returncode == 0, result.stdout + result.stderr

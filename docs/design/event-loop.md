@@ -94,6 +94,9 @@ output termination and restoration; no Python request-slot history is added.
 See [execution observations](execution-observations.md) for W/A/K/C, the applied
 force mask, completion snapshots and loss-aware trace closure.
 
+EPD encode-mode metric ownership and units are documented in
+[encoder-metrics.md](encoder-metrics.md).
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new
@@ -1185,10 +1188,9 @@ order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
 room's prefill ranks once connected, again with every heartbeat until each
 answered (at most 256 per endpoint and beat; a beat resumes in room order at
-the first room the previous one left out, whichever endpoint's). The prefill
-peer admits a registered request (`Bootstrapped`) once its decode ranks
-announced it: every attention-TP rank of the decode replica that holds it. The
-pages-held marks and the clocks that start at them are local to a rank and
+the first room the previous one left out, whichever endpoint's). Prefill
+requests are schedulable on submission, without waiting for an announcement.
+The pages-held marks and the clocks that start at them are local to a rank and
 time-based; the members of a replica would have to agree on them, and
 `deferred` requires single-member replicas. When the plan carrying a
 request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
@@ -1204,9 +1206,9 @@ request does not hold its pages yet, fails the room, so a decode rank that
 does not follow the order fails at once. The decode scheduler sees every
 noticed request and may allocate them in any order. Timeouts: on the prefill
 side the bootstrap timeout bounds what a request waits for from its decode
-node. Not announced, it runs from registration. Admitted, it runs from the
-pages-held mark to the manifests, with none while the prompt is queued or
-computes: the decode node's waiting timeout bounds that wait. On the decode
+node. It runs from the pages-held mark to the manifests, whether or not the
+request was announced; queueing and computation before that mark consume no budget.
+A late announcement receives the pages-held notice immediately. On the decode
 side the waiting timeout runs from registration to the notice, restarted at
 the notice. A request that fails on the prefill side tells its announcing
 ranks as well as those that pre-allocated.

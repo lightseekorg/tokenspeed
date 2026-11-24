@@ -135,16 +135,17 @@ def stage_sdown(
             mask=live,
             scope="gpu",
         )
+        publish(
+            shrdy,
+            gl.full([512], 0, gl.int32, tid.type.layout) + group - rank * 56,
+            gl.full([512], 1, gl.int32, tid.type.layout),
+            tag,
+            tid == 0,
+        )
     else:
+        # No flag, so no drain: a prefetched next task's weights stay in
+        # flight.
         put_final(final_regions, rank, group * 16 + pair * 2, token, lo, hi, live, S)
-    publish(
-        shrdy,
-        gl.full([512], 0, gl.int32, tid.type.layout)
-        + gl.minimum(gl.maximum(group - rank * 56, 0), 55),
-        gl.full([512], 1, gl.int32, tid.type.layout),
-        tag,
-        (tid == 0) & mine,
-    )
     gl.barrier()
 
 
@@ -169,10 +170,21 @@ def run_sdown_rest(
     w_sd, h, shp, shrdy, xl, red, final_regions, rank, bid, tag, S: gl.constexpr, guard
 ):
     if bid >= 84:
-        load_h(h, xl, tag, S, guard)
+        # Each task's weights are issued a task ahead, the first before h is
+        # polled.
         k = 56 + bid - 84
+        ops = gemv_loads(w_sd, (k + rank * 56) % 448 * 16, 768, True, False)
+        load_h(h, xl, tag, S, guard)
         while k < 448:
             group = (k + rank * 56) % 448
-            ops = gemv_loads(w_sd, group * 16, 768, True, False)
+            next_k = k + 172
+            next_ops = gemv_loads(
+                w_sd,
+                (gl.minimum(next_k, 447) + rank * 56) % 448 * 16,
+                768,
+                next_k < 448,
+                False,
+            )
             stage_sdown(xl, red, shp, shrdy, final_regions, rank, group, ops, tag, S)
-            k += 172
+            k = next_k
+            ops = next_ops

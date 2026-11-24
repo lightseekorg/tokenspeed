@@ -1135,9 +1135,10 @@ tight prefill pool smaller prompts that keep fitting can delay a larger one.
 The two servers keep one order under `deferred`: a request takes every page
 it needs on the prefill server before its Decode server allocates its
 destination, so neither holds pages the other waits for. The Decode server
-announces each request to the prefill server. The prefill server admits a
-request once it is announced, and tells the Decode server when the request's
-last chunk is admitted; only then may the Decode server allocate. The Decode
+announces each request independently of prefill admission. The prefill server
+can compute before that announcement and tells the Decode server when the
+request's last chunk is admitted; only then may the Decode server allocate.
+An announcement arriving later receives this notice immediately. The Decode
 server's scheduler sees every request whose notice arrived and chooses among
 them as it chooses among the requests of `early` prefill servers. Every Decode
 server of a prefill server that runs `deferred` must understand the
@@ -1145,25 +1146,23 @@ announcement: an older one sends its manifest unannounced and fails each
 request at once.
 
 `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) bounds what a
-request waits for from its Decode server on the prefill server. A request its
-Decode server has not announced fails one timeout after its arrival; an
-announcement that waits for the Decode server's registration to be applied
-does not count yet. An admitted request has no clock while it is queued or
-computed, and fails one timeout after it held its pages if its destination is
-not allocated by then. On the Decode server
+request waits for from its Decode server on the prefill server. Under
+`deferred`, the clock starts when the request holds all its prompt pages,
+whether or not Decode has announced it. The request fails if the destination
+is not allocated within that timeout. On the Decode server
 `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for the prefill
 server's notice, which covers the prefill server's queue and computation, and
 then again the wait for the allocation.
 
 Known limits. With a tight prefill pool `deferred` is slower than `early` even
 when every Decode server is healthy: prompts wait for destinations with their
-pages. The prefill server computes every request a Decode server announces,
-whether or not that server allocates: a Decode server that does not allocate
-keeps its computed prompts' pages on the prefill server until each fails, one
+pages. The prefill server computes requests without waiting for Decode,
+whether or not that server announces or allocates. A Decode server that does
+not allocate keeps its computed prompts' pages on the prefill server until each fails, one
 timeout after it held its pages, and prompts for other Decode servers wait for
-those pages meanwhile. An admitted request has no timeout on the prefill
-server while it is queued or computed: its Decode server's waiting timeout
-ends it, and if that server is gone, it fails one timeout after it held its
+those pages meanwhile. Before a request holds all prompt pages, only its
+Decode server's waiting timeout bounds the wait. If that server is gone,
+the prefill-side timeout starts once the request holds its
 pages. A computed prompt waiting for its destination publishes its last chunk
 to the prefix cache only with its transfer, so a prompt with the same prefix
 admitted meanwhile computes that chunk again. On a Decode server that is full,
@@ -1569,18 +1568,16 @@ carry the `model_name` and `app_key` labels:
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
-| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_announcement` (the Decode server never announced the request to a prefill server that runs `deferred`, same timeout), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
+| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
 Every prefill server states its policy ([P/D admission](#pd-admission)) in
 what it registers with the bootstrap server (`decode_allocation_policy`,
 served to Decode servers as `prefill_decode_allocation_policy` in `/route`).
 
-Under `deferred`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
-requests the prefill server has not admitted yet, those waiting for their
-Decode server's announcement, and an admitted request not yet scheduled counts
-in `tokenspeed:num_requests_waiting`. A computed prompt waiting for its
-destination counts in `tokenspeed:num_requests_running`, as one awaiting its
+Under `deferred`, requests enter `tokenspeed:num_requests_waiting` directly;
+`tokenspeed:num_prefill_prealloc_queue_reqs` stays zero. A computed prompt waiting
+for its destination counts in `tokenspeed:num_requests_running`, as one awaiting its
 PD transfer does: both hold their pages and request slot.
 
 ## TokenSpeed-specific runtime knobs

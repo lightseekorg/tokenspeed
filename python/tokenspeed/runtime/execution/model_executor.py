@@ -136,6 +136,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
     local_pages_by_group,
 )
+from tokenspeed.runtime.layers.hyperconnection import (
+    register_workspace_region as register_hc_workspace_region,
+)
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessorOutput,
     prepare_logits_communication,
@@ -662,6 +665,7 @@ class ModelExecutor:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=config.enable_memory_saver
         )
+        register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
