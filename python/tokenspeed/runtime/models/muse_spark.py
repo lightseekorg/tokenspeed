@@ -1499,8 +1499,8 @@ OUTPUT_GAIN_OFFSET = 0.0
 RESIDUAL_GATE_EPS = 1e-3
 MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
-# NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
-MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
+# NVIDIA owns rows from here; below it the split collectives cost more than they save.
+MUSE_OWNED_PROJECTIONS_MIN_TOKENS = 2048
 # The owned-row layout serves forwards up to the prefill chunk the server is
 # configured for (--chunked-prefill-size), and at least 8192 rows. Startup
 # sizes three per-rank buffers from min(max forward tokens, that) full
@@ -3321,7 +3321,7 @@ class MuseSparkModel(BaseTransformerModel):
         mapping = self.mapping
         if self.owned_projections is not None:
             return (
-                rows >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS
+                rows >= MUSE_OWNED_PROJECTIONS_MIN_TOKENS
                 and not ctx.forward_mode.is_idle()
                 and not ctx.forward_mode.is_mixed()
                 and mapping.pp_size == 1
@@ -3818,7 +3818,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         backend = get_global_backend()
         group = mapping.attn.tp_group
         owned = self.model.owned_projections
-        if owned is not None and max_num_tokens >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS:
+        if owned is not None and max_num_tokens >= MUSE_OWNED_PROJECTIONS_MIN_TOKENS:
             rows = owned.local_rows(max_num_tokens)
             if owned.qkv is None:
                 _prepare_owned_projections(owned, self.model.layers[0], group, rows)
