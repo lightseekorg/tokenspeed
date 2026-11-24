@@ -4126,6 +4126,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"nvfp4"}),
             "activation": frozenset({"situ"}),
             "routing_mode": frozenset({"precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
             "supports_deferred_finalize": frozenset({True, False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),

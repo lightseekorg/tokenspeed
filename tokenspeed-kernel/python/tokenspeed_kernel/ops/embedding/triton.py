@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -164,6 +164,163 @@ def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
     return tl.minimum(tl.maximum(x, -MAX_FINITE), MAX_FINITE)
 
 
+@triton.jit
+def _mla_rope_set_kv_buffer_lanes(
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+):
+    """The token-independent lane offsets and masks of the MLA write."""
+    half = rope_dim // 2
+    half_offsets = tl.arange(0, HALF_BLOCK)
+    half_mask = half_offsets < half
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < nope_dim
+    if IS_NEOX:
+        pair_lo = half_offsets
+        pair_hi = half + half_offsets
+    else:
+        pair_lo = half_offsets * 2
+        pair_hi = half_offsets * 2 + 1
+    return half_offsets, half_mask, nope_offsets, nope_mask, pair_lo, pair_hi
+
+
+@triton.jit
+def _mla_rope_set_kv_buffer_token(
+    token_idx,
+    head_idx,
+    lanes,
+    q_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    q_out_rope_ptr,
+    kv_buffer_ptr,
+    loc_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_nope_ptr,
+    write_mask_ptr,
+    loc_stride: tl.constexpr,
+    q_rope_stride_t: tl.constexpr,
+    q_rope_stride_h: tl.constexpr,
+    k_nope_stride_t: tl.constexpr,
+    k_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_h: tl.constexpr,
+    kv_buffer_stride_t,
+    kv_buffer_stride_p,
+    PAGE_SIZE: tl.constexpr,
+    cos_sin_stride_p: tl.constexpr,
+    q_nope_stride_t: tl.constexpr,
+    q_nope_stride_h: tl.constexpr,
+    num_q_heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    ASSEMBLE_FULL_QUERY: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+):
+    """Program ``head_idx``'s share of token ``token_idx`` in
+    :func:`_mla_rope_set_kv_buffer_kernel`: query head ``head_idx`` below
+    ``num_q_heads``, the token's latent row at ``num_q_heads``."""
+    half = rope_dim // 2
+    half_offsets, half_mask, nope_offsets, nope_mask, pair_lo, pair_hi = lanes
+    if APPLY_ROPE:
+        pos = tl.load(positions_ptr + token_idx).to(tl.int64)
+        cos = tl.load(
+            cos_sin_cache_ptr + pos * cos_sin_stride_p + half_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            cos_sin_cache_ptr + pos * cos_sin_stride_p + half + half_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    if head_idx < num_q_heads:
+        q_base = q_rope_ptr + token_idx * q_rope_stride_t + head_idx * q_rope_stride_h
+        q_out_base = (
+            q_out_rope_ptr
+            + token_idx * q_out_rope_stride_t
+            + head_idx * q_out_rope_stride_h
+        )
+        if ASSEMBLE_FULL_QUERY:
+            q_nope = tl.load(
+                q_nope_ptr
+                + token_idx * q_nope_stride_t
+                + head_idx * q_nope_stride_h
+                + nope_offsets,
+                mask=nope_mask,
+                other=0.0,
+            )
+            tl.store(q_out_base + nope_offsets, q_nope, mask=nope_mask)
+            q_out_base = q_out_base + nope_dim
+
+        q1 = tl.load(q_base + pair_lo, mask=half_mask, other=0.0)
+        q2 = tl.load(q_base + pair_hi, mask=half_mask, other=0.0)
+        if APPLY_ROPE:
+            q1_f = q1.to(tl.float32)
+            q2_f = q2.to(tl.float32)
+            # The association the CUDA embedding.rope kernel compiles to.
+            tl.store(
+                q_out_base + pair_lo,
+                tl.fma(q1_f, cos, -q2_f * sin),
+                mask=half_mask,
+            )
+            tl.store(
+                q_out_base + pair_hi,
+                tl.fma(q2_f, cos, q1_f * sin),
+                mask=half_mask,
+            )
+        else:
+            tl.store(q_out_base + pair_lo, q1, mask=half_mask)
+            tl.store(q_out_base + pair_hi, q2, mask=half_mask)
+    else:
+        loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
+        kv_base = (
+            kv_buffer_ptr
+            + (loc // PAGE_SIZE) * kv_buffer_stride_p
+            + (loc % PAGE_SIZE) * kv_buffer_stride_t
+        )
+        nope_store = nope_mask
+        half_store = half_mask
+        if write_mask_ptr is not None:
+            owned = tl.load(write_mask_ptr + token_idx)
+            nope_store = nope_mask & owned
+            half_store = half_mask & owned
+        k_nope = tl.load(
+            k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
+            mask=nope_mask,
+            other=0.0,
+        )
+        if SANITIZE:
+            k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
+        tl.store(kv_base + nope_offsets, k_nope, mask=nope_store)
+
+        k_base = k_rope_ptr + token_idx * k_rope_stride_t
+        k1 = tl.load(k_base + pair_lo, mask=half_mask, other=0.0)
+        k2 = tl.load(k_base + pair_hi, mask=half_mask, other=0.0)
+        if APPLY_ROPE:
+            k1_f = k1.to(tl.float32)
+            k2_f = k2.to(tl.float32)
+            k1_out = tl.fma(k1_f, cos, -k2_f * sin)
+            k2_out = tl.fma(k2_f, cos, k1_f * sin)
+        else:
+            k1_out = k1
+            k2_out = k2
+        if SANITIZE:
+            # After the rotation, which would carry a partner's NaN or inf back in.
+            k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
+            k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
+        tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_store)
+        tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_store)
+
+
 # num_tokens is unspecialized so counts of 1 or multiples of 16 share one binary.
 @triton.jit(do_not_specialize=["num_tokens"])
 def _mla_rope_set_kv_buffer_kernel(
@@ -216,17 +373,9 @@ def _mla_rope_set_kv_buffer_kernel(
     """
     block_idx = tl.program_id(0)
     head_idx = tl.program_id(1).to(tl.int64)
-    half = rope_dim // 2
-    half_offsets = tl.arange(0, HALF_BLOCK)
-    half_mask = half_offsets < half
-    nope_offsets = tl.arange(0, NOPE_BLOCK)
-    nope_mask = nope_offsets < nope_dim
-    if IS_NEOX:
-        pair_lo = half_offsets
-        pair_hi = half + half_offsets
-    else:
-        pair_lo = half_offsets * 2
-        pair_hi = half_offsets * 2 + 1
+    lanes = _mla_rope_set_kv_buffer_lanes(
+        nope_dim, rope_dim, NOPE_BLOCK, HALF_BLOCK, IS_NEOX
+    )
 
     # Wait only after the address-independent index math, so the producer's
     # tail overlaps work that touches no global memory.
@@ -247,100 +396,42 @@ def _mla_rope_set_kv_buffer_kernel(
         else:
             token_idx = block_idx * BLOCK_N + tok
         if token_idx < num_tokens:
-            if APPLY_ROPE:
-                pos = tl.load(positions_ptr + token_idx).to(tl.int64)
-                cos = tl.load(
-                    cos_sin_cache_ptr + pos * cos_sin_stride_p + half_offsets,
-                    mask=half_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                sin = tl.load(
-                    cos_sin_cache_ptr + pos * cos_sin_stride_p + half + half_offsets,
-                    mask=half_mask,
-                    other=0.0,
-                ).to(tl.float32)
-
-            if head_idx < num_q_heads:
-                q_base = (
-                    q_rope_ptr
-                    + token_idx * q_rope_stride_t
-                    + head_idx * q_rope_stride_h
-                )
-                q_out_base = (
-                    q_out_rope_ptr
-                    + token_idx * q_out_rope_stride_t
-                    + head_idx * q_out_rope_stride_h
-                )
-                if ASSEMBLE_FULL_QUERY:
-                    q_nope = tl.load(
-                        q_nope_ptr
-                        + token_idx * q_nope_stride_t
-                        + head_idx * q_nope_stride_h
-                        + nope_offsets,
-                        mask=nope_mask,
-                        other=0.0,
-                    )
-                    tl.store(q_out_base + nope_offsets, q_nope, mask=nope_mask)
-                    q_out_base = q_out_base + nope_dim
-
-                q1 = tl.load(q_base + pair_lo, mask=half_mask, other=0.0)
-                q2 = tl.load(q_base + pair_hi, mask=half_mask, other=0.0)
-                if APPLY_ROPE:
-                    q1_f = q1.to(tl.float32)
-                    q2_f = q2.to(tl.float32)
-                    # The association the CUDA embedding.rope kernel compiles to.
-                    tl.store(
-                        q_out_base + pair_lo,
-                        tl.fma(q1_f, cos, -q2_f * sin),
-                        mask=half_mask,
-                    )
-                    tl.store(
-                        q_out_base + pair_hi,
-                        tl.fma(q2_f, cos, q1_f * sin),
-                        mask=half_mask,
-                    )
-                else:
-                    tl.store(q_out_base + pair_lo, q1, mask=half_mask)
-                    tl.store(q_out_base + pair_hi, q2, mask=half_mask)
-            else:
-                loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
-                kv_base = (
-                    kv_buffer_ptr
-                    + (loc // PAGE_SIZE) * kv_buffer_stride_p
-                    + (loc % PAGE_SIZE) * kv_buffer_stride_t
-                )
-                nope_store = nope_mask
-                half_store = half_mask
-                if write_mask_ptr is not None:
-                    owned = tl.load(write_mask_ptr + token_idx)
-                    nope_store = nope_mask & owned
-                    half_store = half_mask & owned
-                k_nope = tl.load(
-                    k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
-                    mask=nope_mask,
-                    other=0.0,
-                )
-                if SANITIZE:
-                    k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
-                tl.store(kv_base + nope_offsets, k_nope, mask=nope_store)
-
-                k_base = k_rope_ptr + token_idx * k_rope_stride_t
-                k1 = tl.load(k_base + pair_lo, mask=half_mask, other=0.0)
-                k2 = tl.load(k_base + pair_hi, mask=half_mask, other=0.0)
-                if APPLY_ROPE:
-                    k1_f = k1.to(tl.float32)
-                    k2_f = k2.to(tl.float32)
-                    k1_out = tl.fma(k1_f, cos, -k2_f * sin)
-                    k2_out = tl.fma(k2_f, cos, k1_f * sin)
-                else:
-                    k1_out = k1
-                    k2_out = k2
-                if SANITIZE:
-                    # After the rotation, which would carry a partner's NaN or inf back in.
-                    k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
-                    k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
-                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_store)
-                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_store)
+            _mla_rope_set_kv_buffer_token(
+                token_idx,
+                head_idx,
+                lanes,
+                q_rope_ptr,
+                k_nope_ptr,
+                k_rope_ptr,
+                q_out_rope_ptr,
+                kv_buffer_ptr,
+                loc_ptr,
+                cos_sin_cache_ptr,
+                positions_ptr,
+                q_nope_ptr,
+                write_mask_ptr,
+                loc_stride,
+                q_rope_stride_t,
+                q_rope_stride_h,
+                k_nope_stride_t,
+                k_rope_stride_t,
+                q_out_rope_stride_t,
+                q_out_rope_stride_h,
+                kv_buffer_stride_t,
+                kv_buffer_stride_p,
+                PAGE_SIZE,
+                cos_sin_stride_p,
+                q_nope_stride_t,
+                q_nope_stride_h,
+                num_q_heads,
+                nope_dim,
+                rope_dim,
+                IS_NEOX,
+                ASSEMBLE_FULL_QUERY,
+                APPLY_ROPE,
+                SANITIZE,
+                MAX_FINITE,
+            )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -361,7 +452,19 @@ def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
     return max(1, min(_MLA_KV_MAX_BLOCK_N, -(-num_tokens * ctas_per_token // 1100)))
 
 
-def apply_rope_mla_set_kv_buffer_triton(
+class MLARopeSetKVBufferLaunch(NamedTuple):
+    """A checked :func:`apply_rope_mla_set_kv_buffer_triton` write: its
+    kernel's positional arguments and its constexprs but ``ENABLE_PDL`` and
+    ``BLOCK_N``, for any kernel that runs :func:`_mla_rope_set_kv_buffer_token`
+    over them."""
+
+    args: tuple[Any, ...]
+    constexprs: dict[str, Any]
+    num_tokens: int
+    num_q_heads: int
+
+
+def mla_rope_set_kv_buffer_args(
     positions: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -369,27 +472,9 @@ def apply_rope_mla_set_kv_buffer_triton(
     is_neox: bool,
     fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
     q_rope_out: torch.Tensor | None,
-    enable_pdl: bool = False,
-) -> None:
-    """Apply MLA RoPE and write the query and KV cache with store conversion.
-
-    A ``cos_sin_cache`` of ``None`` selects the NoPE form: the same halves are
-    assembled without rotation, which is what a model with no rotary embedding
-    needs.
-    ``fused_mla_set_kv_buffer_arg.write_mask``, when given, holds one bool per
-    token, and a False token's latent row is not stored; its slot is still
-    formed into an address, so it must be in range.
-
-    Contract the caller owns, unchecked here because the decode scheduler
-    already guarantees it: ``fused_mla_set_kv_buffer_arg.cache_loc`` holds one
-    write destination per token and every entry is in range and unique for
-    the duration of this call. A duplicate tears the row between whichever
-    programs race for it; an out-of-range entry writes outside the pool. The
-    composite solution relies on the same guarantee. Every tensor's
-    last dimension must be contiguous (stride 1) -- true for a fresh
-    allocation and for the ``Q[..., a:b]`` / ``K[..., a:b]`` slices every
-    caller in this tree passes.
-    """
+) -> MLARopeSetKVBufferLaunch | None:
+    """Validate an :func:`apply_rope_mla_set_kv_buffer_triton` write (same
+    arguments). None for zero tokens."""
     k_nope = fused_mla_set_kv_buffer_arg.k_nope
     kv_buffer = fused_mla_set_kv_buffer_arg.kv_buffer
     loc = fused_mla_set_kv_buffer_arg.cache_loc
@@ -399,7 +484,7 @@ def apply_rope_mla_set_kv_buffer_triton(
 
     num_tokens = q_rope.shape[0]
     if num_tokens == 0:
-        return
+        return None
 
     nope_dim = k_nope.shape[2]
     assert q_rope.ndim == 3
@@ -457,9 +542,7 @@ def apply_rope_mla_set_kv_buffer_triton(
 
     half_block = max(_next_power_of_2(rope_dim // 2), 16)
     nope_block = max(_next_power_of_2(nope_dim), 16)
-    block_n = select_mla_kv_block_n(num_tokens, num_q_heads)
-    grid = (triton.cdiv(num_tokens, block_n), num_q_heads + 1)
-    kernel_launcher(_mla_rope_set_kv_buffer_kernel, grid)(
+    args = (
         q_rope,
         k_nope,
         k_rope,
@@ -487,16 +570,67 @@ def apply_rope_mla_set_kv_buffer_triton(
         num_q_heads,
         nope_dim,
         rope_dim,
-        NOPE_BLOCK=nope_block,
-        HALF_BLOCK=half_block,
-        IS_NEOX=bool(is_neox),
-        ASSEMBLE_FULL_QUERY=q_nope is not None,
+    )
+    constexprs = {
+        "NOPE_BLOCK": nope_block,
+        "HALF_BLOCK": half_block,
+        "IS_NEOX": bool(is_neox),
+        "ASSEMBLE_FULL_QUERY": q_nope is not None,
+        "APPLY_ROPE": apply_rope,
+        "INDEX_INT64": index_int64,
+        "SANITIZE": sanitize,
+        "MAX_FINITE": max_finite,
+    }
+    return MLARopeSetKVBufferLaunch(args, constexprs, num_tokens, num_q_heads)
+
+
+def apply_rope_mla_set_kv_buffer_triton(
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    is_neox: bool,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
+    q_rope_out: torch.Tensor | None,
+    enable_pdl: bool = False,
+) -> None:
+    """Apply MLA RoPE and write the query and KV cache with store conversion.
+
+    A ``cos_sin_cache`` of ``None`` selects the NoPE form: the same halves are
+    assembled without rotation, which is what a model with no rotary embedding
+    needs.
+    ``fused_mla_set_kv_buffer_arg.write_mask``, when given, holds one bool per
+    token, and a False token's latent row is not stored; its slot is still
+    formed into an address, so it must be in range.
+
+    Contract the caller owns, unchecked here because the decode scheduler
+    already guarantees it: ``fused_mla_set_kv_buffer_arg.cache_loc`` holds one
+    write destination per token and every entry is in range and unique for
+    the duration of this call. A duplicate tears the row between whichever
+    programs race for it; an out-of-range entry writes outside the pool. The
+    composite solution relies on the same guarantee. Every tensor's
+    last dimension must be contiguous (stride 1) -- true for a fresh
+    allocation and for the ``Q[..., a:b]`` / ``K[..., a:b]`` slices every
+    caller in this tree passes.
+    """
+    launch = mla_rope_set_kv_buffer_args(
+        positions,
+        q_rope,
+        k_rope,
+        cos_sin_cache,
+        is_neox,
+        fused_mla_set_kv_buffer_arg,
+        q_rope_out,
+    )
+    if launch is None:
+        return
+    block_n = select_mla_kv_block_n(launch.num_tokens, launch.num_q_heads)
+    grid = (triton.cdiv(launch.num_tokens, block_n), launch.num_q_heads + 1)
+    kernel_launcher(_mla_rope_set_kv_buffer_kernel, grid)(
+        *launch.args,
+        **launch.constexprs,
         ENABLE_PDL=enable_pdl,
-        APPLY_ROPE=apply_rope,
         BLOCK_N=block_n,
-        INDEX_INT64=index_int64,
-        SANITIZE=sanitize,
-        MAX_FINITE=max_finite,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
         # On AMD, keep the rotation scalar: LLVM then folds each FMA and its

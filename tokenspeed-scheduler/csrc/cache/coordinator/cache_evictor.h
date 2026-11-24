@@ -219,6 +219,9 @@ public:
         // A segment plan reclaimed a prefix-closed KV copy independently of
         // the boundary's checkpoints, while the Device still held its key.
         HostEvictionCounts duplicate_kv;
+        // A segment plan took it as clean Host-only cache -- the Disk holds
+        // its key too -- before any dirty entry (docs/rfcs/0006-disk-tier.md).
+        HostEvictionCounts clean;
     };
 
     // Disk entries evicted for one reason, each also counted as host_resident

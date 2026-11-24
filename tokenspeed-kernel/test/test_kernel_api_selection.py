@@ -324,6 +324,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm_bf16",
         "post_norm_residual_pre_norm_bf16_fp8",
         "residual_gate_coefficients",
+        "set_gated_residual_workspace_region",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
     }
