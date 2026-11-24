@@ -684,7 +684,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
                     correction
                     + slot * u_slot_stride
                     + head_idx.to(gl.int64) * u_head_stride
-                    + ((start + token_offset) % CAPACITY) * u_pos_stride
+                    + (start + token_offset) * u_pos_stride
                     + (panel_idx * panel_rows + panel_value_offsets).to(gl.int64)
                     * u_channel_stride,
                     delta,
