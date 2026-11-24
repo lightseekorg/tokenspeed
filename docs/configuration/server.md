@@ -845,6 +845,23 @@ run on the draft-tree path and share its requirements, with these limits:
   draft greedy trees and chains, and the drafter refuses sampling at
   startup.
 
+### Top-k chain verification
+
+The target-only rule (the default, described in the next section) needs a
+request's filtered target distribution only on the tokens its `top_k` keeps. On
+`--sampling-backend flashinfer`, a batch whose requests all set `top_k` at most
+the route's width (32; 16 above a 262,144-token vocabulary, where the shared
+candidate selection takes no more), greedy requests included, verifies its
+chains on each row's best logits instead of whole probability rows: the same
+temperature, top-k / top-p filter, acceptance rule and residual draw, computed
+on the candidates. A request draws the same coins on both routes, so its tokens
+differ from the whole-row route only where a coin falls within fp32 rounding of
+a decision boundary. Batches with a larger or disabled `top_k` keep whole rows,
+and so do servers that record draft probabilities
+(`--enable-speculative-sampling`), verify draft trees or use DP sampling;
+`flashinfer_full` always uses whole rows. Each route has its own decode CUDA
+graphs (one more graph per captured batch size).
+
 ### Draft-prob rejection sampling
 
 By default the chain drafters (`EAGLE3`, `MTP`) propose the argmax of their
@@ -862,15 +879,6 @@ round's verify accepts with `coin * q(x) < p(x)` and resamples from
 requests sample at temperature. Greedy requests behave identically under both
 rules. `top_k`, `top_p`, `min_p`, penalties, and `logit_bias` stay on the
 verifier's side. `q` only follows the temperature.
-
-On `--sampling-backend flashinfer`, a target-only batch whose requests all set
-`top_k` at most 32 (greedy requests included) verifies on each row's 32 best
-logits instead of whole probability rows: the same temperature, top-k / top-p
-filter, acceptance rule and residual draw, computed on the candidates. A
-request draws the same coins on both routes, so its tokens differ from the
-whole-row route only where a coin falls within fp32 rounding of a decision
-boundary. A batch with a larger or disabled `top_k` keeps the whole-row route;
-each route has its own decode CUDA graphs.
 
 A request admitted has no
 recorded `q` for its first chain: its rows hold a sentinel above

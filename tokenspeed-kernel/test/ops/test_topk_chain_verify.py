@@ -319,7 +319,7 @@ def test_first_draft_outside_the_kept_set_stops_the_chain(device: str) -> None:
     assert accept_index.tolist() == [[0, -1, -1, -1]]
 
 
-def test_rejecting_the_only_kept_token_samples_among_the_rest(device: str) -> None:
+def test_top_k_one_rejects_any_other_draft(device: str) -> None:
     """Top-k 1 rejects any other draft; the residual is then the best token."""
     best = [5, 9, 2, 7]
     predicts, _, accepted = _one_request(
@@ -327,6 +327,59 @@ def test_rejecting_the_only_kept_token_samples_among_the_rest(device: str) -> No
     )
     assert accepted.tolist() == [1]
     assert predicts[:2].tolist() == [5, 9]
+
+
+def _two_tied(device: str, vocab: int = 4096) -> torch.Tensor:
+    """Two rows where tokens 10 and 20 share the best logit, far above the rest."""
+    logits = torch.zeros(2, vocab)
+    logits[:, [10, 20]] = 15.0
+    return logits.to(device, torch.bfloat16)
+
+
+def test_a_coin_equal_to_the_probability_accepts(device: str) -> None:
+    """Top-k 2 over two tied tokens gives each exactly 0.5; the dense rule
+    accepts at ``coin <= q``, so a coin of exactly 0.5 accepts the draft."""
+    predicts, _, accepted = _one_request(
+        _two_tied(device), 2, 1.0, [1, 20], [0.5, 0.5], 0.5
+    )
+    assert accepted.tolist() == [1]
+    assert predicts[0].item() == 20
+
+
+def test_a_rejected_kept_draft_leaves_the_residual(device: str) -> None:
+    """Tokens 10 and 20 each have 0.5; draft 20 rejected at coin 0.75 leaves
+    only token 10 to draw, even at a final coin that would land on 20."""
+    predicts, _, accepted = _one_request(
+        _two_tied(device), 2, 1.0, [1, 20], [0.75, 0.75], 0.9
+    )
+    assert accepted.tolist() == [0]
+    assert predicts[0].item() == 10
+
+
+def test_top_p_one_keeps_the_whole_top_k(device: str) -> None:
+    """Top-p 1 keeps every top-k token, even one whose mass is below the
+    total's ulp (exp(-30)): a draft of it accepts at a smaller coin. Top-p
+    0.999 drops it."""
+    logits = torch.full((2, 4096), -100.0)
+    logits[:, 10] = 15.0
+    logits[:, 20] = -15.0
+    logits = logits.to(device, torch.bfloat16)
+    _, _, accepted = _one_request(logits, 2, 1.0, [1, 20], [1e-15, 0.5], 0.5)
+    assert accepted.tolist() == [1]
+    predicts, _, accepted = _one_request(logits, 2, 0.999, [1, 20], [1e-15, 0.5], 0.5)
+    assert accepted.tolist() == [0]
+    assert predicts[0].item() == 10
+
+
+def test_top_p_reached_exactly_keeps_the_prefix_only(device: str) -> None:
+    """Top-p 0.5 over two tied tokens: the first prefix sum equals the
+    threshold, so (first sum at or above it) only the lower id is kept and a
+    draft of the other id is rejected."""
+    predicts, _, accepted = _one_request(
+        _two_tied(device), 2, 0.5, [1, 20], [0.25, 0.25], 0.9
+    )
+    assert accepted.tolist() == [0]
+    assert predicts[0].item() == 10
 
 
 def test_masked_tokens_are_never_drawn(device: str) -> None:
@@ -483,22 +536,30 @@ def test_a_request_selects_and_verifies_the_same_at_any_batch_size(
 def test_batch_size_and_strides_do_not_recompile(device: str) -> None:
     vocab = 50000
 
-    def run(bs: int, coin_width: int) -> None:
+    def run(bs: int, coin_width: int, offset: int) -> None:
+        # A mixed batch's decode suffix: chains and coins start ``offset`` rows in.
         logits = _logits(bs * N, vocab, bs, device)
-        coins = _coins((bs, coin_width), bs, device)[:, :N]
+        head = torch.zeros((offset, N), dtype=torch.int32, device=device)
+        chains = torch.cat([head, _chains(logits, N, bs)])
+        coins = _coins((offset + bs, coin_width), bs, device)[offset:, :N]
         _verify(
             topk_chain_verify,
             _select(logits),
-            _chains(logits, N, bs),
+            chains[offset:],
             coins,
-            _coins((bs,), bs + 1, device),
+            _coins((offset + bs,), bs + 1, device)[offset:],
             *_params(bs, N, bs, device),
         )
 
-    run(16, N)
-    run(5, N + 1)
+    run(16, N, 0)
+    run(5, N + 1, 0)
     with assert_no_triton_compile(
         _topk_chain_verify_kernel, _vocab_shard_topk_kernel, _vocab_topk_merge_kernel
     ):
-        for bs, coin_width in ((1, N), (7, N + 3), (33, 16), (128, N)):
-            run(bs, coin_width)
+        for bs, coin_width, offset in (
+            (1, N, 0),
+            (7, N + 3, 1),
+            (33, 16, 2),
+            (128, N, 3),
+        ):
+            run(bs, coin_width, offset)

@@ -241,7 +241,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
-        self._sparse_verify_width = self._sparse_chain_verify_width(config)
+        self._sparse_verify_width: int | None = self._sparse_chain_verify_width(config)
         # This step's verify route: per batch in prepare_step, per variant at capture.
         self._sparse_verify = False
         self._sparse_verify_batch = False
@@ -774,10 +774,15 @@ class FlashInferSamplingBackend(SamplingBackend):
         ``accept_index`` and ``accept_length`` as the dense chain kernel does.
         """
         width = self._sparse_verify_width
-        if width is None or draft_probs is not None or dp_sampling:
+        if (
+            width is None
+            or draft_probs is not None
+            or dp_sampling
+            or self.config.synthetic_acceptance_length is not None
+        ):
             raise RuntimeError(
-                "sparse chain verify takes target-only, whole-batch chains on a "
-                "server that enables it"
+                "sparse chain verify takes target-only, whole-batch chains without "
+                "synthetic acceptance on a server that enables it"
             )
         rows, columns = logits.shape
         if not vocab_shard_topk_supports(logits.dtype, columns, width):
@@ -1191,6 +1196,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             # verifier meets the same requirement: fixed grids, per-program
             # reductions and no atomics, so equal inputs give equal outputs
             # on every rank.
+            # The sparse route keeps this rule (its kernels need none) until it is validated at TP > 1.
             needs_tp_sync = pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:

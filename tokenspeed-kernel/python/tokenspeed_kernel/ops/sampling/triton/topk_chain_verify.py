@@ -55,6 +55,7 @@ __all__ = ["triton_topk_chain_verify"]
 _INT32_MAX = tl.constexpr(2147483647)
 
 
+# A mixed batch verifies a decode suffix: its chains and coins start at any row offset.
 @triton.jit(
     do_not_specialize=[
         "stride_candidates",
@@ -62,7 +63,8 @@ _INT32_MAX = tl.constexpr(2147483647)
         "stride_topk",
         "threshold_single",
         "threshold_acc",
-    ]
+    ],
+    do_not_specialize_on_alignment=["candidates_ptr", "coins_ptr", "final_coins_ptr"],
 )
 def _topk_chain_verify_kernel(
     predicts_ptr,
@@ -208,8 +210,10 @@ def triton_topk_chain_verify(
         temperatures: Contiguous fp32 ``[bs * N]`` per-row temperatures.
         top_ks: Contiguous int32 ``[bs * N]`` per-row top-k, at most ``k``.
         top_ps: Contiguous fp32 ``[bs * N]`` per-row top-p.
-        threshold_single: Accept outright at or above this probability.
-        threshold_acc: Accept with probability ``q / threshold_acc``.
+        threshold_single: Accept outright at or above this probability, in
+            ``[0, 1]``.
+        threshold_acc: Accept with probability ``q / threshold_acc``, in
+            ``[0, 1]`` (raised to 1e-9 when smaller).
     """
     bs, n = candidates.shape
     rows = bs * n
@@ -256,6 +260,10 @@ def triton_topk_chain_verify(
     ):
         raise ValueError(
             f"topk must be fp32 [>= {rows}, >= {2 * k}] with unit column stride"
+        )
+    if not (0.0 <= threshold_single <= 1.0 and 0.0 <= threshold_acc <= 1.0):
+        raise ValueError(
+            f"thresholds must lie in [0, 1], got single {threshold_single}, acc {threshold_acc}"
         )
     if bs == 0:
         return

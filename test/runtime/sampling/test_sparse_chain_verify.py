@@ -133,7 +133,7 @@ def test_the_batch_top_k_picks_the_route_and_its_graph():
 @pytest.mark.parametrize(
     "server", ["speculative_sampling", "draft_tree", "flashinfer_full"]
 )
-def test_verifies_the_route_does_not_cover_capture_only_the_dense_graph(server):
+def test_servers_outside_the_route_capture_only_the_dense_graph(server):
     """Recorded draft probabilities, draft trees and the full backend's
     penalties keep every batch on whole probability rows."""
     if server == "flashinfer_full":
@@ -227,6 +227,144 @@ def test_both_routes_commit_the_same_tokens():
     assert sparse == dense
     lengths = {len(tokens) for tokens in sparse}
     assert {1, N} <= lengths
+
+
+def _emitted(predict: torch.Tensor, accept_length: torch.Tensor, bs: int) -> list:
+    tokens = predict.view(-1, N)[:bs].tolist()
+    return [row[:length] for row, length in zip(tokens, accept_length[:bs].tolist())]
+
+
+def test_a_mixed_batch_decode_suffix_on_the_batch_stream_commits_the_dense_tokens():
+    """Batch coin stream, a mixed round: verify reads the decode suffix's coins
+    at its row offset; the sparse route commits what the dense route does."""
+    num_extends, num_decodes = 3, 6
+    bs = num_extends + num_decodes
+    params = _mixed_params(bs, 7)
+    admissions = list(range(1, bs + 1))
+    pool = [a % POOL + 1 for a in admissions]
+    logits = _logits(num_decodes * N, 8)
+    chains = _chains(logits, 9)
+    results = []
+    for sparse in (True, False):
+        backend = _backend(sampling_stream="batch")
+        assert _step(backend, admissions, params) == SPARSE
+        # The dense route on the same legacy coins (a capture variant would redraw them).
+        backend._sparse_verify = sparse
+        info = SamplingBatchInfo(
+            req_pool_indices=torch.tensor(pool, device="cuda"),
+            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int32, device="cuda"),
+            device="cuda",
+        )
+        predict, accept_length = backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits),
+            info[num_extends:],
+            chains,
+            tree=None,
+        )
+        results.append(_emitted(predict, accept_length, num_decodes))
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("stream", ["per-request", "batch"])
+def test_captured_variants_replay_the_route_the_step_picks(stream):
+    """Both variants captured at padded batch 8 (the dense one last); a step of
+    5 eligible requests replays the sparse graph, which commits what eager
+    verification on either route commits."""
+    backend = _backend(sampling_stream=stream)
+    padded, live = 8, 5
+    logits_buf = torch.zeros(padded * N, VOCAB, dtype=torch.bfloat16, device="cuda")
+    chains_buf = torch.zeros(padded, N, dtype=torch.int32, device="cuda")
+    pool_buf = torch.zeros(padded, dtype=torch.int64, device="cuda")
+    lengths = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    info = SamplingBatchInfo(
+        req_pool_indices=pool_buf, valid_cache_lengths=lengths, device="cuda"
+    )
+    output = LogitsProcessorOutput(next_token_logits=logits_buf)
+    graphs = {}
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    for variant in (SPARSE, DEFAULT):
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                backend.prepare_capture_variant(
+                    bs=padded, num_tokens_per_req=N, variant=variant
+                )
+                backend.verify(output, info, chains_buf, tree=None)
+        torch.cuda.current_stream().wait_stream(side)
+        backend.prepare_capture_variant(
+            bs=padded, num_tokens_per_req=N, variant=variant
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            outputs = backend.verify(output, info, chains_buf, tree=None)
+        graphs[variant] = (graph, outputs)
+
+    admissions = list(range(1, live + 1))
+    pool = [a % POOL + 1 for a in admissions]
+    variant = _step(backend, admissions, _mixed_params(live, 3))
+    assert variant == SPARSE
+    logits = _logits(live * N, 4)
+    chains = _chains(logits, 5)
+    logits_buf[: live * N] = logits
+    chains_buf[:live] = chains
+    pool_buf[:live] = torch.tensor(pool, device="cuda")
+    lengths[torch.tensor(pool)] = torch.arange(
+        200, 200 + live, dtype=torch.int32, device="cuda"
+    )
+    graph, (predict, accept_length) = graphs[variant]
+    graph.replay()
+    replayed = _emitted(predict.clone(), accept_length.clone(), live)
+
+    live_info = SamplingBatchInfo(
+        req_pool_indices=pool_buf[:live].clone(),
+        valid_cache_lengths=lengths,
+        device="cuda",
+    )
+    eager = []
+    for sparse in (True, False):
+        # Both routes on the coins this step drew.
+        backend._sparse_verify = sparse
+        predict, accept_length = backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits.clone()),
+            live_info,
+            chains,
+            tree=None,
+        )
+        eager.append(_emitted(predict.clone(), accept_length.clone(), live))
+    assert replayed == eager[0] == eager[1]
+
+
+def _verify_peak_bytes(backend, logits, chains, pool, cache_lengths) -> int:
+    """Peak bytes allocated during one verify, after a warm-up call."""
+    _verify(backend, logits, chains, pool, cache_lengths)
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    _verify(backend, logits, chains, pool, cache_lengths)
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() - base
+
+
+def test_the_sparse_route_allocates_no_probability_rows():
+    """The sparse route verifies from the candidates: it allocates nothing of
+    whole-row size, where the dense route allocates fp32 probability rows."""
+    bs = 32
+    backend = _backend()
+    params = _mixed_params(bs, 4)
+    admissions = list(range(1, bs + 1))
+    pool = [a % POOL + 1 for a in admissions]
+    assert _step(backend, admissions, params) == SPARSE
+    logits = _logits(bs * N, 5)
+    chains = _chains(logits, 6)
+    cache_lengths = [64] * bs
+    row_bytes = bs * N * VOCAB * 4
+
+    sparse = _verify_peak_bytes(backend, logits, chains, pool, cache_lengths)
+    backend.prepare_capture_variant(bs=bs, num_tokens_per_req=N, variant=DEFAULT)
+    dense = _verify_peak_bytes(backend, logits, chains, pool, cache_lengths)
+
+    assert sparse < row_bytes // 8
+    assert dense >= row_bytes
 
 
 @pytest.mark.parametrize("top_k", [1, 20])

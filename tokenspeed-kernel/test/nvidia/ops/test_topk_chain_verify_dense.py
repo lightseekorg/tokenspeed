@@ -91,7 +91,16 @@ def _outputs(bs: int):
     )
 
 
-def _dense(logits, temperatures, top_ks, top_ps, chains, coins, final_coins):
+def _dense(
+    logits,
+    temperatures,
+    top_ks,
+    top_ps,
+    chains,
+    coins,
+    final_coins,
+    thresholds=(1.0, 1.0),
+):
     bs = chains.shape[0]
     fused_topk_topp_prepare(logits.device)
     probs = softmax(logits, temperature=temperatures)
@@ -106,8 +115,8 @@ def _dense(logits, temperatures, top_ks, top_ps, chains, coins, final_coins):
         uniform_samples_for_final_sampling=final_coins,
         target_probs=probs.view(bs, N, VOCAB),
         draft_probs=None,
-        threshold_single=1.0,
-        threshold_acc=1.0,
+        threshold_single=thresholds[0],
+        threshold_acc=thresholds[1],
         deterministic=True,
         use_draft_prob=False,
         reject_draft_prob_threshold=2.0,
@@ -115,7 +124,16 @@ def _dense(logits, temperatures, top_ks, top_ps, chains, coins, final_coins):
     return (predicts, accept_index, accepted), probs
 
 
-def _sparse(logits, temperatures, top_ks, top_ps, chains, coins, final_coins):
+def _sparse(
+    logits,
+    temperatures,
+    top_ks,
+    top_ps,
+    chains,
+    coins,
+    final_coins,
+    thresholds=(1.0, 1.0),
+):
     bs = chains.shape[0]
     topk = torch.empty(bs * N, 2 * K, device="cuda")
     vocab_shard_topk(
@@ -143,8 +161,8 @@ def _sparse(logits, temperatures, top_ks, top_ps, chains, coins, final_coins):
         temperatures,
         top_ks,
         top_ps,
-        threshold_single=1.0,
-        threshold_acc=1.0,
+        threshold_single=thresholds[0],
+        threshold_acc=thresholds[1],
     )
     return predicts, accept_index, accepted
 
@@ -161,7 +179,7 @@ def _ulps(a: float, b: float) -> float:
 
 
 def _boundary_ulps(
-    dense, probs, chains, coins, final_coins, sparse, b: int
+    dense, probs, chains, coins, final_coins, sparse, b: int, thresholds
 ) -> tuple[str, float]:
     """Where request ``b``'s routes first part, and how far the dense decision
     there lies from its threshold, in fp32 ulps."""
@@ -170,7 +188,11 @@ def _boundary_ulps(
     row = probs[b * N + j].double()
     draft = int(chains[b, j + 1]) if j + 1 < N else None
     if (len(want) > j + 1) != (len(got) > j + 1):
-        return "accept", _ulps(float(coins[b, j]), float(row[draft]))
+        prob = float(row[draft])
+        single, acc = thresholds
+        return "accept", min(
+            _ulps(float(coins[b, j]), prob / max(acc, 1e-9)), _ulps(prob, single)
+        )
     rejected = draft
     mass = row.clone()
     if rejected is not None:
@@ -181,21 +203,29 @@ def _boundary_ulps(
     return "sample", min(_ulps(threshold, float(c)) for c in cdf[low:high].tolist())
 
 
-def test_sparse_route_commits_the_dense_tokens_but_at_rounding_boundaries() -> None:
-    """4096 requests (mixed temperature, top-k 1 to 32, top-p) at the
-    production vocabulary: report the mismatch fraction and, for each
-    mismatch, the dense decision's distance from its threshold in fp32 ulps;
-    every distance must be a rounding-scale one (at most 64 ulps)."""
+@pytest.mark.parametrize(
+    "thresholds,batches", [((1.0, 1.0), 16), ((0.4, 0.2), 4), ((1.0, 0.0), 4)]
+)
+def test_sparse_route_commits_the_dense_tokens_but_at_rounding_boundaries(
+    thresholds, batches
+) -> None:
+    """256 requests per batch (mixed temperature, top-k 1 to 32, top-p) at the
+    production vocabulary, with the serving thresholds and two others: report
+    the mismatch fraction and, for each mismatch, the dense decision's
+    distance from its threshold in fp32 ulps; every distance must be a
+    rounding-scale one (at most 64 ulps)."""
     requests, mismatches, decisions = 0, [], 0
-    for seed in range(16):
+    for seed in range(batches):
         batch = _batch(256, seed)
         chains, coins, final_coins = (t.cpu() for t in batch[4:])
-        dense, probs = _dense(*batch)
-        sparse = _sparse(*batch)
+        dense, probs = _dense(*batch, thresholds)
+        sparse = _sparse(*batch, thresholds)
         for b in range(256):
             if _emitted(dense, b) != _emitted(sparse, b):
                 mismatches.append(
-                    _boundary_ulps(dense, probs, chains, coins, final_coins, sparse, b)
+                    _boundary_ulps(
+                        dense, probs, chains, coins, final_coins, sparse, b, thresholds
+                    )
                 )
         requests += 256
         decisions += int((dense[2] + 1).clamp(max=N - 1).sum()) + 256

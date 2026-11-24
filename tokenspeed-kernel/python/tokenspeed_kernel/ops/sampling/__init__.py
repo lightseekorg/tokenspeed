@@ -498,8 +498,10 @@ def topk_chain_verify(
         temperatures: Contiguous fp32 ``[bs * N]`` per-row temperatures.
         top_ks: Contiguous int32 ``[bs * N]`` per-row top-k, at most ``k``.
         top_ps: Contiguous fp32 ``[bs * N]`` per-row top-p.
-        threshold_single: Accept outright at or above this probability.
-        threshold_acc: Accept with probability ``q / threshold_acc``.
+        threshold_single: Accept outright at or above this probability, in
+            ``[0, 1]``.
+        threshold_acc: Accept with probability ``q / threshold_acc``, in
+            ``[0, 1]`` (raised to 1e-9 when smaller).
     """
     kernel = select_kernel(
         "sampling",
