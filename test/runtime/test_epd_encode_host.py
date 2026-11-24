@@ -34,6 +34,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import timedelta
 from multiprocessing import shared_memory
 
@@ -59,6 +60,7 @@ from tokenspeed.runtime.engine.gc_hooks import (  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import MsgpackEncoder  # noqa: E402
 from tokenspeed.runtime.epd.encode_host import (  # noqa: E402
     EncodeDataPlane,
+    EncodeSettings,
     SendRing,
     assign_encoded_embeddings,
     embedding_cache_bytes,
@@ -74,6 +76,44 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle  # noqa:
 from tokenspeed.runtime.utils.env import envs  # noqa: E402
 
 HIDDEN = 4
+
+
+@pytest.mark.parametrize(
+    "rank,tp_ranks,expected", [(0, (0,), 0), (3, (3, 7), 0), (7, (3, 7), 1)]
+)
+def test_native_encode_settings_report_the_group_local_metric_rank(
+    rank, tp_ranks, expected
+):
+    settings = EncodeSettings(
+        rank=rank,
+        tp_ranks=tp_ranks,
+        collective_bind_host="127.0.0.1",
+        handshake_address=None,
+        engine_index=0,
+        ready_response=None,
+        bootstrap_port=None,
+        bootstrap_url="http://127.0.0.1:1/route",
+        library="unused-mooncake-library",
+        local_ip="127.0.0.1",
+        protocol="tcp",
+        ib_device="",
+        bootstrap_timeout_s=1.0,
+        transfer_workers=1,
+        ring_slots=2,
+        ring_slot_bytes=1024,
+        ring_base=0,
+        ring_deepstack_base=0,
+        max_batch_tokens=128,
+        max_batch_items=2,
+        metrics_enabled=True,
+        metrics_prometheus_dir=None,
+        metrics_relay_endpoint=None,
+        metrics_model_name="test-encoder",
+        metrics_app_key="",
+    )
+    assert settings.attn_tp_rank == expected
+    with pytest.raises(ValueError):
+        _ = replace(settings, rank=max(tp_ranks) + 1).attn_tp_rank
 
 
 class _Tower:
