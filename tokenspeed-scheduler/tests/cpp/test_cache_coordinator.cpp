@@ -12352,7 +12352,7 @@ TEST_F(ShardedHostSegmentPlanTest, ABucketTheHostCannotFillDropsItsSegmentWhole)
              {&CacheEvictor::HostEvictionStats::lru, &CacheEvictor::HostEvictionStats::duplicate,
               &CacheEvictor::HostEvictionStats::superseded, &CacheEvictor::HostEvictionStats::dead_entry,
               &CacheEvictor::HostEvictionStats::tail_cap, &CacheEvictor::HostEvictionStats::flush,
-              &CacheEvictor::HostEvictionStats::duplicate_kv}) {
+              &CacheEvictor::HostEvictionStats::duplicate_kv, &CacheEvictor::HostEvictionStats::clean}) {
             EXPECT_EQ((coordinator_.Evictor().HostEvictions().*reason).blocks, 0u);
         }
     }
@@ -13147,7 +13147,7 @@ TEST_P(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
              {&CacheEvictor::HostEvictionStats::lru, &CacheEvictor::HostEvictionStats::duplicate,
               &CacheEvictor::HostEvictionStats::superseded, &CacheEvictor::HostEvictionStats::dead_entry,
               &CacheEvictor::HostEvictionStats::tail_cap, &CacheEvictor::HostEvictionStats::flush,
-              &CacheEvictor::HostEvictionStats::duplicate_kv}) {
+              &CacheEvictor::HostEvictionStats::duplicate_kv, &CacheEvictor::HostEvictionStats::clean}) {
             EXPECT_EQ((coordinators[0].Evictor().HostEvictions().*reason).blocks,
                       (coordinators[1].Evictor().HostEvictions().*reason).blocks)
                 << "round " << round;

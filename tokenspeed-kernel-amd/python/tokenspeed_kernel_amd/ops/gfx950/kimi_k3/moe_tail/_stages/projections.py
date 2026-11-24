@@ -46,6 +46,7 @@ from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.common import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.lds import store_mask_i32
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.polls import poll_pairs
+from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.route import shuffle
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.staging import (
     poll_rows_to_lds,
     rows_to_lds,
@@ -115,44 +116,57 @@ def shared_gate_up(w_sgu, xbuf, xrdy, sgu, xl, red, group, tag, S: gl.constexpr,
 @gluon.jit
 def quantize_latent(av, regions, rank, group, tag, S: gl.constexpr):
     tid = thread_ids()
-    # One lane per row, each holding the row's 32 values.
-    if wave_pending(tid < S):
-        L: gl.constexpr = gl.BlockedLayout([1, 32], [64, 1], [8, 1], [1, 0])
+    # Four lanes per row, each with 8 of the row's 32 values, so a row's four
+    # payload words reach each peer as one contiguous write.
+    if wave_pending(tid < 4 * S):
+        L: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [1, 0])
         ids = gl.arange(0, 512, layout=gl.SliceLayout(1, L))
-        token = gl.minimum(ids, S - 1)
-        col = gl.arange(0, 32, layout=gl.SliceLayout(0, L))
+        first = gl.minimum(ids // 4, S - 1) * 32 + ids % 4 * 8
+        col = gl.arange(0, 8, layout=gl.SliceLayout(0, L))
         values = gl.reshape(
-            av.gather(gl.reshape(token[:, None] * 32 + col[None, :], [16384]), 0),
-            [512, 32],
+            av.gather(gl.reshape(first[:, None] + col[None, :], [4096]), 0),
+            [512, 8],
         )
         values = gl.convert_layout(values, L)
         bits = values.to(gl.uint32, bitcast=True) & 0x7FFFFFFF
-        amax = gl.max(bits, 1).to(gl.float32, bitcast=True)
+        amax = gl.convert_layout(gl.max(bits, 1), tid.type.layout, assert_trivial=True)
+        lane = tid % 64
+        amax = gl.maximum(amax, shuffle(amax, lane ^ 1))
+        amax = gl.maximum(amax, shuffle(amax, lane ^ 2)).to(gl.float32, bitcast=True)
         code = gl.minimum(
             ((amax * (1.0 / 6.0)).to(gl.uint32, bitcast=True) + 0x7FFFFF) >> 23 & 255,
             254,
         )
+        scale = gl.convert_layout(code, gl.SliceLayout(1, L), assert_trivial=True)
         packed = gl.amd.cdna4.scaled_downcast(
-            values.to(gl.bfloat16), code[:, None].to(gl.uint8), "e2m1", axis=1
+            values.to(gl.bfloat16), scale[:, None].to(gl.uint8), "e2m1", axis=1
         )
-        words = gl.reshape(packed, [512, 4, 4]).to(gl.uint32)
-        b0, b1 = gl.split(gl.reshape(words, [512, 4, 2, 2]))
         # Pack four sequential bytes, retaining even-value low nibbles.
+        b0, b1 = gl.split(gl.reshape(packed.to(gl.uint32), [512, 2, 2]))
         pairs = b0 | (b1 << 8)
         p0, p1 = gl.split(pairs)
-        payload = p0 | (p1 << 16)
-        word = gl.arange(0, 4, layout=gl.SliceLayout(0, payload.type.layout))
-        out_token = gl.arange(0, 512, layout=gl.SliceLayout(1, payload.type.layout))
-        at = out_token[:, None] * 560 + (rank * 14 + group) * 4 + word[None, :]
+        payload = gl.convert_layout(
+            p0 | (p1 << 16), tid.type.layout, assert_trivial=True
+        )
+        token = gl.minimum(tid // 4, S - 1)
+        word = tid % 4
+        live = tid < 4 * S
         for peer in gl.static_range(8):
-            put_pair(regions[peer], at, payload, tag, out_token[:, None] < S, "sys")
+            put_pair(
+                regions[peer],
+                token * 560 + (rank * 14 + group) * 4 + word,
+                payload,
+                tag,
+                live,
+                "sys",
+            )
         for peer in gl.static_range(8):
             put_pair(
                 regions[peer],
                 token * 560 + 448 + rank * 14 + group,
                 code,
                 tag,
-                ids < S,
+                live & (word == 0),
                 "sys",
             )
 
@@ -172,12 +186,16 @@ def latent(
     acc1 = gemv_dot(xl, weights1, 1792, S, False)
     tid = thread_ids()
     token, row = gl.minimum(tid // 16, S - 1), tid % 16
+    # Both 16-row halves' partials are out before quarter 0 waits, so it
+    # waits once for all six.
+    values = ()
     for h in gl.static_range(2):
         gemv_reduce(acc0 if h == 0 else acc1, red, S)
+        value = row_sum(red, row, token)
+        values += (value,)
         # Only the waves holding live rows run this. Every workgroup barrier
-        # stays outside this wave guard; the masked LDS store adds none.
+        # stays outside this wave guard.
         if wave_pending(tid < S * 16):
-            value = row_sum(red, row, token)
             if q > 0:
                 put_pair(
                     lpart,
@@ -187,13 +205,19 @@ def latent(
                     tid < S * 16,
                     "gpu",
                 )
-            if q == 0:
-                indices = ()
+        gl.barrier()
+    if q == 0:
+        # The masked LDS stores add no barrier inside the wave guard.
+        if wave_pending(tid < S * 16):
+            indices = ()
+            for h in gl.static_range(2):
                 for qq in gl.static_range(1, 4):
                     indices += (((group * 4 + qq) * S + token) * 32 + h * 16 + row,)
-                got = poll_pairs(lpart, indices, tag, tid < S * 16, "gpu", guard)
+            got = poll_pairs(lpart, indices, tag, tid < S * 16, "gpu", guard)
+            for h in gl.static_range(2):
+                value = values[h]
                 for qq in gl.static_range(3):
-                    value = value + got[qq]
+                    value = value + got[3 * h + qq]
                 store_mask_i32(
                     av,
                     token * 32 + h * 16 + row,
@@ -201,6 +225,5 @@ def latent(
                     tid < S * 16,
                 )
         gl.barrier()
-    if q == 0:
         quantize_latent(av, regions, rank, group, tag, S)
     gl.barrier()

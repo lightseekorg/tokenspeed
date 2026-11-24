@@ -502,6 +502,34 @@ Trainer-side contract:
 
 ## Scheduler and memory
 
+Host L2 allocation honors PyTorch's original allocator environment variables;
+TokenSpeed does not temporarily override the user's registration or thread
+settings. With no allocator configuration, the original serial path is used.
+To opt into parallel page touching and `cudaHostRegister`, set before startup:
+
+```bash
+export PYTORCH_ALLOC_CONF="pinned_use_cuda_host_register:True,pinned_num_register_threads:8"
+```
+
+The legacy name `PYTORCH_CUDA_ALLOC_CONF` remains supported by PyTorch; older
+builds that ignore `PYTORCH_ALLOC_CONF` require this legacy name. Keep any
+existing allocator options in the same value. `pinned_num_register_threads`
+accepts powers of two from 1 to 128; use 1 for serial registration, or disable
+registration with `pinned_use_cuda_host_register:False`.
+
+The parallel task count is not the thread-pool size: PyTorch 2.14 creates a
+persistent 128-thread pool on the first sufficiently large parallel registration.
+Choosing 2 or 4 tasks still creates that pool. Leave registration disabled or
+use one task in environments with tight thread or virtual-memory limits.
+These options affect all PyTorch pinned allocations, including the snapshot
+pool. They do not bind CPUs or memory to NUMA nodes.
+
+The L2 buffer uses a 4 KiB-aligned view when the Disk tier requires direct I/O
+alignment, or on NVIDIA with the native allocator and registration enabled.
+Its alignment padding is included in the Host memory budget. Both ratio and
+explicit sizes stay within their original pinned bucket by dropping whole
+LCM blocks when possible. Other policies keep their original allocation sizes.
+
 | Parameter | Purpose |
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
@@ -1841,9 +1869,10 @@ A ratio size larger than a rank's share is capped to the largest whole-LCM
 buffer that fits under those allocator settings beside its snapshot pool,
 with one size agreed across ranks. Each rank logs the requested and capped
 size. An explicit
-`--kvstore-size` is never shrunk: one that does not fit is refused at
-startup, as is a share without room for a single LCM block. Every rank
-must also resolve the same page counts: startup compares them across the
+`--kvstore-size` may lose whole LCM blocks to keep alignment padding within its
+original pinned reservation, when at least one block remains. A size that still
+does not fit is refused at startup, as is a share without room for a single
+LCM block. Every rank must also resolve the same page counts: startup compares them across the
 ranks and refuses a difference on every rank. A size in gigabytes is a
 different page count wherever the ranks' LCM blocks differ in bytes, as
 they usually do on pipeline stages, which store different layers, so with
@@ -2021,8 +2050,8 @@ request computes the prefix itself.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
-| `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
+| `--peer-prefix-port` | off | One public peer control port per node, shared by its attention-DP ranks. |
+| `--peer-prefix-host` | detected | The host others reach the endpoint at. Rank zero is named `host:PORT` and rank `r > 0` is named `host:PORT/r`, and a holder hint must name it exactly so. |
 | `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 | `--peer-prefix-landing-tier` | required | `device` reads the prefix into the GPU pages the request's admission allocates, which wait out the transfer; `host` reads it into Host blocks before the admission, which then takes it as a Host hit, at the cost of Host capacity and one host-to-device copy ([RFC 0006](../rfcs/0006-disk-tier.md)). |
@@ -2038,9 +2067,12 @@ Peer sharing is refused with
 `--query-context-parallel-size > 1`; the
 scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
 groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
-each other only within one namespace: the same checkpoints, cache layout,
-numerics and parallel layout (the L3 deployment id), and the same
-`--weight-version`. A flushed weight update must name its `weight_version`,
+each other within one namespace when their configured model and draft revisions,
+cache layout and numerical settings are compatible. Deploy the same weights on
+all peers and identify each generation with the same `--weight-version`. At
+startup, rank 0 warns if the version is left at its default and any loaded target
+or draft revision is unpinned. Live peers trust the configured versions.
+A flushed weight update must name its `weight_version`,
 which moves the namespace, as it does for L3.
 
 ### Local Disk tier

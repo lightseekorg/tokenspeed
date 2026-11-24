@@ -32,6 +32,9 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
+from tokenspeed_kernel.ops.communication._cuda.symmetric_memory import (
+    empty_owned_symmetric,
+)
 from tokenspeed_kernel.ops.communication.fabric import group_has_fabric, host_identity
 from tokenspeed_kernel.registry import register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -100,7 +103,7 @@ class TokenSpeedA2ALamportState:
         self.fp8_output = self.fp8_scales = None
         self.chunk_capacity = self.words // 2
         with torch.inference_mode(False):
-            self.scratch = symm.empty(
+            self.scratch = empty_owned_symmetric(
                 (3 * self.words,), dtype=torch.int64, device=device
             )
         self.scratch.zero_()
@@ -181,10 +184,10 @@ class TokenSpeedA2ALamportState:
             return
         device = self.output.device
         with torch.inference_mode(False):
-            self.chunk_scratch = symm.empty(
+            self.chunk_scratch = empty_owned_symmetric(
                 (3 * self.chunk_capacity,), dtype=torch.int64, device=device
             )
-            self.chunk_flags = symm.empty(
+            self.chunk_flags = empty_owned_symmetric(
                 (3 * self.tp_size * self.blocks,), dtype=torch.int64, device=device
             )
         self.chunk_flags.zero_()

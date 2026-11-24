@@ -66,6 +66,17 @@ __all__ = [
 ]
 
 
+if current_platform().is_hopper:
+    try:
+        import cutlass.cute  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        from tokenspeed_kernel.ops.attention.dsa._cute_dsl import (  # noqa: F401
+            sm90_bf16_dsa_score,
+        )
+
+
 def _ts_supported_arch() -> bool:
     """Gate: the CuTe DSL multi-CTA / cluster radix top-k needs NVIDIA sm_100+.
 

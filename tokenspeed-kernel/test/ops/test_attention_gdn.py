@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
+from tokenspeed_kernel.ops.attention.gdn.triton import set_total_chunks_hint
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -331,6 +332,95 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
         cu_seqlens=cu_seqlens,
     )
 
+    torch.testing.assert_close(
+        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        result.final_state.float(),
+        ref_state.float(),
+        rtol=2e-2,
+        atol=3e-2,
+    )
+
+
+# 17-32 token batches make chunk_fwd_o plan 32-token chunks; the rest use 16/64.
+@pytest.mark.parametrize("seq_lens", [[11], [19], [27], [5, 14], [40], [63, 67]])
+def test_gdn_chunk_prefill_with_length_hint_never_syncs(
+    device: str, require, seq_lens: list[int]
+):
+    # With the host length hint bound to cu_seqlens, planning every chunk size
+    # the scan uses must stay on the host: a device read of the chunk count is
+    # a stream sync that a sync-checked serving forward rejects.
+    require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
+
+    torch.manual_seed(2468)
+    total_tokens = sum(seq_lens)
+    num_q_heads = 4
+    num_v_heads = 8
+    head_dim = 128
+    dtype = torch.bfloat16
+    q = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    v = (
+        torch.randn(1, total_tokens, num_v_heads, head_dim, device=device, dtype=dtype)
+        * 0.5
+    )
+    g = F.logsigmoid(
+        torch.randn(1, total_tokens, num_v_heads, device=device, dtype=torch.float32)
+    )
+    beta = torch.rand(
+        1, total_tokens, num_v_heads, device=device, dtype=dtype
+    ).sigmoid()
+    initial_state = (
+        torch.randn(
+            len(seq_lens), num_v_heads, head_dim, head_dim, device=device, dtype=dtype
+        )
+        * 0.01
+    )
+    host_cu_seqlens = [0, *torch.tensor(seq_lens).cumsum(0).tolist()]
+    scale = head_dim**-0.5
+
+    def run(cu_seqlens: torch.Tensor) -> GdnChunkPrefillResult:
+        set_total_chunks_hint(seq_lens, cu_seqlens)
+        return gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_final_state=True,
+            solution="triton",
+        )
+
+    def boundaries() -> torch.Tensor:
+        return torch.tensor(host_cu_seqlens, device=device, dtype=torch.int32)
+
+    run(boundaries())  # Compile and autotune outside the checked region.
+    # A fresh boundary tensor misses the chunk-index caches, as every
+    # forward's metadata does.
+    cu_seqlens = boundaries()
+    torch.cuda.synchronize()
+    previous_debug_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        result = run(cu_seqlens)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_debug_mode)
+
+    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
+        _torch_l2norm(q),
+        _torch_l2norm(k),
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+    )
     torch.testing.assert_close(
         result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
     )

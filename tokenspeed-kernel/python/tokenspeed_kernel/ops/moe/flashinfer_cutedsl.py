@@ -26,6 +26,9 @@ linear E4M3 block scales) into the CuTe DSL layout: W13 rows become
 swizzled. The kernels read the scales through an MMA-layout view of that
 expert-major storage, so the peer-weight store can stream experts as it does
 the TRT-LLM layout.
+
+The file also registers FlashInfer's Kimi K3 MegaMoE for MXFP4 experts, which
+fuses the expert-parallel dispatch and combine with the routed GEMMs.
 """
 
 from __future__ import annotations
@@ -171,6 +174,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"nvfp4"}),
             "activation": frozenset({"situ"}),
             "routing_mode": frozenset({"precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.float32}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
@@ -274,3 +278,109 @@ if platform.is_nvidia:
             situ_linear_beta=w.cutedsl_situ_linear_beta,
             tactic=_TACTIC,
         )
+
+    # ===-------------------------------------------------------------------===#
+    # MXFP4 MegaMoE: FlashInfer Kimi K3 (NVIDIA SM100)
+    # ===-------------------------------------------------------------------===#
+
+    def flashinfer_mxfp4_situ_mega_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+        """Rewrite the checkpoint's MXFP4 experts into the MegaMoE layout in place."""
+        from tokenspeed_kernel.thirdparty.flashinfer.kimi_mega_moe import (
+            prepare_kimi_mega_moe_weights,
+        )
+
+        del plan
+        if w.tp_size != 1:
+            raise ValueError("MXFP4 MegaMoE requires MoE TP=1")
+        w._moe_backend_state = prepare_kimi_mega_moe_weights(
+            w.w13_weight.data,
+            w.w13_weight_scale.data,
+            w.w2_weight.data,
+            w.w2_weight_scale.data,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_mxfp4_situ_mega_moe_apply",
+        solution="mega_moe",
+        weight_preprocessor=flashinfer_mxfp4_situ_mega_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.float32}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            # The kernel quantizes its BF16 input to MXFP8.
+            "internal_activation_dtype": frozenset({"fp8"}),
+            "supports_bias": frozenset({False}),
+        },
+        # Below every non-fused kernel: only --moe-backend mega_moe selects it.
+        priority=Priority.PORTABLE - 1,
+    )
+    def flashinfer_mxfp4_situ_mega_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_tokens_global: int,
+        max_num_tokens_per_gpu: int,
+        do_finalize: bool,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """Run fused dispatch/MXFP4 SiTU experts and reduce the returned outputs.
+
+        No other stream may run on the device during the launch. The first call
+        creates the shared workspaces, so it must be eager and reached by every
+        EP rank together.
+
+        Args:
+            plan: The selected MoE plan; ``process_group`` is the EP group.
+            x: BF16 ``[local_tokens, hidden]`` activations of this rank's rows.
+            w: Expert module prepared by the preprocessor.
+            router_logits: Unused; routing is precomputed.
+            topk_weights: ``[local_tokens, top_k]`` FP32 route weights.
+            topk_ids: ``[local_tokens, top_k]`` int32 global expert ids.
+            num_tokens_global: Unused.
+            max_num_tokens_per_gpu: Largest local token count over the EP ranks
+                this step, the same on every rank.
+            do_finalize: Must be True.
+            enable_pdl: Unused; the kernel sets its own launch attributes.
+
+        Returns:
+            BF16 ``[local_tokens, hidden]`` over every rank's experts, a view of
+            the shared workspace valid until its next launch.
+        """
+        from tokenspeed_kernel.thirdparty.flashinfer.kimi_mega_moe import (
+            get_kimi_mega_moe_runner,
+        )
+
+        del router_logits, num_tokens_global, enable_pdl
+        if not do_finalize:
+            raise ValueError("MXFP4 MegaMoE requires complete finalization")
+        runner = get_kimi_mega_moe_runner(plan, w)
+        return runner.run(
+            x, topk_ids, topk_weights, w._moe_backend_state, max_num_tokens_per_gpu
+        )
+
+    def _prepare_kimi_mega_moe_input_buffers(plan: dict, w: torch.nn.Module):
+        from tokenspeed_kernel.thirdparty.flashinfer.kimi_mega_moe import (
+            get_kimi_mega_moe_runner,
+        )
+
+        runner = get_kimi_mega_moe_runner(plan, w)
+        return runner.input_buffers
+
+    flashinfer_mxfp4_situ_mega_moe_apply._tokenspeed_prepare_input_buffers = (  # type: ignore[attr-defined]
+        _prepare_kimi_mega_moe_input_buffers
+    )

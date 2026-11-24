@@ -322,6 +322,27 @@ served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
 
+## Hopper BF16 paged scoring
+
+`dsa_paged_score` takes consecutive `q_len_per_req` query rows per request and
+one page-table row per request. `context_lens` gives each query's visible token
+count. The output columns follow logical token order. The TMA inputs
+require 16-byte aligned Q and K addresses, non-overlapping outer strides
+that are multiples of 16 bytes, and unit stride in the head dimension.
+The context lengths use unit stride.
+
+For H200 batches with 16 or 32 index heads, 64- or 128-token pages and
+32K–256K history, the paged scorer estimates the K tile count from the total
+query rows and the history width rounded down to a power of two. It targets
+eight tiles per CTA and caps the budget at three CTA waves when the estimate
+is at most 8,192 tiles. Larger estimates use the default partition policy.
+Fewer partitions reduce CTA setup and repeated Q loads.
+
+The 78-SM Hopper configuration uses the same wave estimate for power-of-two
+batches with one query per request and 64-token pages. Its 8,192-tile limit
+uses the actual history width, so batch 8 at 96K uses the default partition
+policy.
+
 ## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
 
 On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
