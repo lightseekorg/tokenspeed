@@ -336,6 +336,12 @@ rows are dense K-last and 16-byte aligned, with room for padding between rows.
 The launcher also accepts strided Q/K/V inputs through a variant with
 scalar input loads and the same replay-before-verify contract.
 
+The WY warp loads each K16 coefficient fragment once for both V16 subtiles.
+Query and retained key coefficients start in different shared-memory bank
+groups so they can be loaded together. Each replay warp packs its high and
+residual deltas into its own V16 rows and synchronizes within that warp.
+The TMA producer waits for all consumer warps before writing the state tile.
+
 `benchmarks/nvidia/bench_gdn_deferred.py` measures a continuous sequence
 at the layer count and dimensions read from a checkpoint config. It
 includes pending metadata and conv commit. The serving benchmark

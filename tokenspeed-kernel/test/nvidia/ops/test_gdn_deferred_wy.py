@@ -224,6 +224,56 @@ def test_deferred_wy_real_model_geometry(batch, heads, vheads):
     )
 
 
+def test_deferred_wy_graph_replays_both_payload_banks():
+    batch = 64
+    case = make_case(
+        batch=batch,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=4,
+        vheads=12,
+    )
+    rows = torch.arange(batch, device="cuda", dtype=torch.int32)
+    previous = (
+        dict(case, k=-case["k"], v=case["v"] + 0.125),
+        dict(case, k=case["k"] * 0.75, b=case["b"] - 0.375),
+    )
+    counts = (rows % 5, (rows + 2) % 5)
+    pending = make_pending(previous[0], counts[0], capacity=batch + 1, bank=0)
+    other = make_pending(previous[1], counts[1], capacity=batch + 1, bank=1)
+    pending.payload[1].copy_(other.payload[1])
+    pending.pages[1].copy_(other.pages[1])
+    pending.steps[1].copy_(other.steps[1])
+
+    state = case["initial_state"]
+    initial = state.clone()
+    indices = case["initial_state_indices"].long()
+    gdn_decode_mtp(**case, pending_replay=pending)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gdn_decode_mtp(**case, pending_replay=pending)
+    state.copy_(initial)
+
+    for bank, payload_case in enumerate(previous):
+        pending.rows.copy_(rows + bank * pending.steps.shape[1])
+        pending.write_bank.fill_(1 - bank)
+        committed = state.clone()
+        accepted = accepted_state(
+            dict(payload_case, initial_state=committed), counts[bank]
+        )
+        verify_state = committed.double()
+        verify_state[indices] = accepted
+        expected = reference(dict(case, initial_state=verify_state))
+
+        graph.replay()
+        committed[indices] = accepted.bfloat16()
+        torch.testing.assert_close(actual.double(), expected, rtol=8e-3, atol=5e-4)
+        torch.testing.assert_close(state, committed, rtol=8e-3, atol=5e-4)
+
+
 def test_deferred_wy_rejects_non_k_last_state_rows():
     case = make_case(
         batch=2,

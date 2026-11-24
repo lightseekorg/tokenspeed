@@ -190,7 +190,7 @@ def _dot_bf16_hilo(a, high, low, lane: Int32, reduction: cutlass.Constexpr):
 
 @cute.jit
 def _mixed_state_product(h, phi_high, phi_low, key_high, key_low, lane: Int32):
-    accumulator = cute.make_rmem_tensor(4, Float32)
+    accumulator = cute.make_rmem_tensor((4, 2), Float32)
     accumulator.fill(0.0)
     row = lane % 8
     high_base = Int32(phi_high.iterator.toint())
@@ -201,24 +201,23 @@ def _mixed_state_product(h, phi_high, phi_low, key_high, key_low, lane: Int32):
     high_base += (row % 4) * 136 * 2 + ((lane % 16) // 8) * 8 * 2
     low_base += (row % 4) * 136 * 2 + ((lane % 16) // 8) * 8 * 2
     for step in cutlass.range_constexpr(8):
-        a = cute.make_rmem_tensor(4, Int32)
+        # Both V16 subtiles use the same K16 coefficients.
         bh = cute.make_rmem_tensor(2, Int32)
         bl = cute.make_rmem_tensor(2, Int32)
-        a.store(
-            _ldmatrix4(
-                h.iterator.toint()
-                + ((lane % 16) * 136 + (lane // 16) * 8 + step * 16) * 2
-            )
-        )
         bh.store(_ldmatrix2(high_base + step * 32))
         bl.store(_ldmatrix2(low_base + step * 32))
-        accumulator.store(
-            _mma_bf16(a[0], a[1], a[2], a[3], bh[0], bh[1], accumulator.load())
-        )
-        accumulator.store(
-            _mma_bf16(a[0], a[1], a[2], a[3], bl[0], bl[1], accumulator.load())
-        )
-    return accumulator.load()
+        for group in cutlass.range_constexpr(2):
+            a = cute.make_rmem_tensor(4, Int32)
+            row = group * 16 + lane % 16
+            a.store(
+                _ldmatrix4(
+                    h.iterator.toint() + (row * 136 + (lane // 16) * 8 + step * 16) * 2
+                )
+            )
+            chunk = accumulator[None, group]
+            chunk.store(_mma_bf16(a[0], a[1], a[2], a[3], bh[0], bh[1], chunk.load()))
+            chunk.store(_mma_bf16(a[0], a[1], a[2], a[3], bl[0], bl[1], chunk.load()))
+    return accumulator[None, 0].load(), accumulator[None, 1].load()
 
 
 @dsl_user_op
@@ -717,16 +716,13 @@ class GdnDeferredWYKernel:
         wp = cute.recast_tensor(weights, cutlass.BFloat16)
         wh = cute.make_tensor(wp.iterator, cute.make_layout((8, 8), stride=(8, 1)))
         wl = cute.make_tensor(wp.iterator + 64, cute.make_layout((8, 8), stride=(8, 1)))
+        state_products = _mixed_state_product(h, qh, ql, kh, kl, lane)
         for group in cutlass.range_constexpr(self.value_tile // (16 * self.wy_warps)):
             value_base = (warp + group * self.wy_warps) * 16
-            hs = cute.make_tensor(
-                h.iterator + value_base * 136,
-                cute.make_layout((16, 128), stride=(136, 1)),
-            )
             vs = cute.make_tensor(
                 v.iterator + value_base * 8, cute.make_layout((16, 8), stride=(8, 1))
             )
-            state_product = _mixed_state_product(hs, qh, ql, kh, kl, lane)
+            state_product = state_products[group]
             states = cute.make_rmem_tensor(4, Float32)
             states.store(state_product)
             result = cute.make_rmem_tensor(4, Float32)
@@ -773,19 +769,18 @@ class GdnDeferredWYKernel:
                 delta[part] = (
                     Float32(v[rank, value]) - prefixes[rank] * predictions[rank, value]
                 )
-        cute.arch.barrier(barrier_id=3, number_of_threads=64)
-        address = v.iterator.toint() + (value * 4 + first_rank) * 2
-        _write_delta_pair(
-            address, address + self.value_tile * 4 * 2, delta[0], delta[1]
-        )
-        cute.arch.barrier(barrier_id=3, number_of_threads=64)
+        # Keep the high and residual halves in the owning warp's value rows.
+        cute.arch.sync_warp()
+        address = v.iterator.toint() + (value * 8 + first_rank) * 2
+        _write_delta_pair(address, address + 4 * 2, delta[0], delta[1])
+        cute.arch.sync_warp()
         pair = (lane % 2) * 2
         row = warp * 16 + lane // 4
-        address = v.iterator.toint() + (row * 4 + pair) * 2
+        address = v.iterator.toint() + (row * 8 + pair) * 2
         if lane % 4 >= 2:
-            address += self.value_tile * 4 * 2
+            address += 4 * 2
         a0 = _shared_word(address)
-        a1 = _shared_word(address + 8 * 4 * 2)
+        a1 = _shared_word(address + 8 * 8 * 2)
         words = cute.recast_tensor(k, cutlass.BFloat16)
         rh = words.iterator.toint() + 8 * 136 * 2
         rl = rh + 128 * 4 * 2
@@ -831,7 +826,7 @@ class GdnDeferredWYKernel:
                         accumulators[3, part],
                     )
         cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.barrier(barrier_id=3, number_of_threads=64)
+        cute.arch.sync_warp()
 
     @cute.kernel
     def run(
@@ -949,9 +944,13 @@ class GdnDeferredWYKernel:
             cute.recast_tensor(raw_qk, Float32).iterator,
             cute.make_layout((4, 136), stride=(136, 1)),
         )
-        key_alignment = smem.allocate_tensor(Float32, cute.make_layout(16))
-        k = smem.allocate_tensor(
-            Float32, cute.make_layout((8, 136), stride=(136, 1)), byte_alignment=64
+        key_storage = smem.allocate_tensor(
+            Float32, cute.make_layout(8 * 136 + 16), byte_alignment=128
+        )
+        # A single ldmatrix reads four query rows and four retained key rows.
+        # Start the key rows 64 bytes later to use the other half of the banks.
+        k = cute.make_tensor(
+            key_storage.iterator + 16, cute.make_layout((8, 136), stride=(136, 1))
         )
         replay_basis = cute.make_tensor(
             k.iterator + 4 * 136,
