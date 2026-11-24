@@ -1548,7 +1548,13 @@ Its responsibilities:
   order, with the retention rank, once the usable duplicate capacity is
   exhausted. With superseded checkpoint demotion (`scheduler.md` §1.2), a
   Host-only checkpoint boundary whose checkpoints are all demoted goes after
-  the held copies and before the unheld ones.
+  the held copies and before the unheld ones. With a Disk tier, clean
+  Host-only cache (the Disk holds every entry the victim takes) goes after
+  every Device-covered copy and before any dirty entry, whatever its age:
+  dropping it loses nothing a prefetch cannot read back. A checkpoint ranks
+  clean by its State; one whose victim would also take a dirty page (above it
+  or under it) ranks with the dirty Host-only cache instead. Evictions in the
+  clean class count as `HostEvictionStats::clean`.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree counts each node's closed-group duplicates as entries
@@ -1639,7 +1645,11 @@ Its responsibilities:
     `TierEvictionPlanner`). The write holds its Host sources and Disk
     destinations until every owner finished it, then publishes the Disk
     entries with the Host entries' metadata; a Host placement can then drop
-    the Host copy without loss. Cleaning never removes a Host entry.
+    the Host copy without loss. The write-back segment plan
+    (`AcquireHostSegments`) drops clean entries before dirty ones; the
+    block-by-block placement (`AcquireHostBlocks`: prefetch and peer landing,
+    a retraction leg's fallback) still ranks them by recency alone. Cleaning
+    never removes a Host entry.
   * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
     admission: the Disk's keys of the prompt stand in as Host hits for
     `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the

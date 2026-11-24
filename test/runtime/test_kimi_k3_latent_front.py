@@ -62,6 +62,7 @@ class UnloadedExperts(nn.Module):
         super().__init__()
         self.plan = {"weight_dtype": "bf16", "a2a_backend": "none"}
         self.supports_precomputed_topk = True
+        self.topk_weights_dtype = torch.float32
         self.sorted_route_rows: frozenset[int] = frozenset()
         self.num_experts = num_experts
         self.activation = torch.empty(MAX_ROWS, hidden_size, dtype=torch.bfloat16)
@@ -225,18 +226,13 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
         torch.testing.assert_close(captured, reference(), atol=1e-2, rtol=1e-2)
 
 
-def test_attention_dp_shared_down_projection_waits_for_the_front(monkeypatch):
-    """The auxiliary stream consumes the front's shared activation after it exists.
-
-    During the CUDA graph phase the shared down projection runs on the
-    auxiliary stream. Delaying the main stream right before the front makes a
-    missing dependency deterministic: the branch would then read the
-    activation buffer before the front wrote it.
-    """
+def test_attention_dp_front_and_shared_work_finish_before_their_consumers(monkeypatch):
+    """Delay each stream to expose missing front-to-shared and shared-to-MoE waits."""
     rows = 2048
     layer = build_layer(monkeypatch, alt_stream=torch.cuda.Stream())
     ctx = forward_context(rows)
     monkeypatch.setattr(forward_step, "_is_cuda_graph_phase", True)
+    monkeypatch.setattr(forward_step, "_is_capture_mode", True)
     front = kimi_k3.try_latent_moe_input_projections
 
     def delayed_front(*args, **kwargs):
@@ -275,6 +271,33 @@ def test_attention_dp_shared_down_projection_waits_for_the_front(monkeypatch):
         expected = layer.routed_expert_up_proj.forward_add3(
             routed, prefix, shared, norm_weight=None, eps=None
         )
+        shared_done = torch.zeros(1, device="cuda")
+        observed = torch.empty_like(shared_done)
+        shared_down = kimi_k3.kimi3_shared_down_projection
+
+        def delayed_shared_down(*args, **kwargs):
+            output = shared_down(*args, **kwargs)
+            torch.cuda._sleep(20_000_000)
+            shared_done.fill_(1)
+            return output
+
+        def observe_shared_completion(module, args):
+            observed.copy_(shared_done)
+
+        monkeypatch.setattr(
+            kimi_k3, "kimi3_shared_down_projection", delayed_shared_down
+        )
+        layer.experts.register_forward_pre_hook(observe_shared_completion)
         actual = layer(hidden, prefix, 2 * rows, rows, ctx, prefix_is_sharded=False)
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+        assert observed.item() == 1
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = layer(
+                hidden, prefix, 2 * rows, rows, ctx, prefix_is_sharded=False
+            )
+        shared_done.zero_()
+        graph.replay()
+        torch.testing.assert_close(captured, expected, atol=1e-2, rtol=1e-2)
+        assert observed.item() == 1

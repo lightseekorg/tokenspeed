@@ -145,7 +145,10 @@ public:
     // (a shared State access epoch proves the continuation), newest Device
     // copy first; then safe closed-group KV duplicates, held Device copies
     // first and newer Device copies first within each ownership class; then
-    // Host-only cache, least recently used first. A Host-only checkpoint
+    // clean Host-only cache (with a Disk tier: the Disk holds every entry
+    // the victim takes; a checkpoint whose victim would take a dirty page
+    // ranks as dirty), least recently used first; then the dirty Host-only
+    // cache, least recently used first. A Host-only checkpoint
     // boundary whose checkpoints are all demoted (SetCheckpointDemotion) goes
     // after the held copies and before the unheld ones. A missing Device window
     // still protects every closed-group Host page in the required suffix.

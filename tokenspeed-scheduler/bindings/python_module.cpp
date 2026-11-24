@@ -468,6 +468,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("tail_cap", &tokenspeed::CacheEvictor::HostEvictionStats::tail_cap)
         .def_ro("flush", &tokenspeed::CacheEvictor::HostEvictionStats::flush)
         .def_ro("duplicate_kv", &tokenspeed::CacheEvictor::HostEvictionStats::duplicate_kv)
+        .def_ro("clean", &tokenspeed::CacheEvictor::HostEvictionStats::clean)
         .def_ro("released", &tokenspeed::CacheEvictor::HostEvictionStats::released);
     nb::class_<tokenspeed::CacheEvictor::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheEvictor::DeviceEvictionCounts::blocks)
