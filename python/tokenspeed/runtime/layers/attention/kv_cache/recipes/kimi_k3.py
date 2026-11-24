@@ -267,22 +267,18 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        shard_count = self.attn_config.kvp_size
-        return tuple(
-            (
-                (
-                    replace(
-                        spec,
-                        rows_per_page=self.history_page_size,
-                        shard_count=shard_count,
-                    )
-                    if spec.group_id == FULL_ATTENTION
-                    else spec
-                ),
-                fields,
-            )
-            for spec, fields in super().groups()
-        )
+        groups = []
+        for spec, fields in super().groups():
+            if spec.group_id == FULL_ATTENTION:
+                spec = replace(
+                    spec,
+                    rows_per_page=self.history_page_size,
+                    shard_count=self.attn_config.kvp_size,
+                )
+            elif spec.group_id == DRAFT_SLIDING_ATTENTION:
+                spec = replace(spec, rows_per_page=self.draft_sliding_page_size)
+            groups.append((spec, fields))
+        return tuple(groups)
 
     # ---- geometry ----
 
@@ -296,6 +292,20 @@ class KimiK3Recipe(CacheRecipe):
         if self.attn_config.component(DSAConfig) is not None:
             return dsa_kernel_page_size(self.attn_config)
         return _KIMI_K3_PREFIX_GRANULARITY
+
+    @property
+    def draft_sliding_page_size(self) -> int:
+        """Padded draft pages cannot be subdivided by a contiguous view."""
+        from tokenspeed.runtime.layers.attention.registry import (
+            AttentionArch,
+            _get_backend_cls,
+        )
+
+        config = self.draft_attn_config
+        backend = _get_backend_cls(
+            config.component(MHAConfig).backend_name, AttentionArch.MHA, config
+        )
+        return backend.resolve_kernel_page_size(config, self.prefix_granularity)
 
     @property
     @override
@@ -341,7 +351,10 @@ class KimiK3Recipe(CacheRecipe):
         plane_id = f"slot.{occurrence}"
         if group_id == DRAFT_SLIDING_ATTENTION:
             fields = mha_layer_fields(
-                self.draft_attn_config, self.prefix_granularity, layer_id, occurrence
+                self.draft_attn_config,
+                self.draft_sliding_page_size,
+                layer_id,
+                occurrence,
             )
             # K and V take one MLA plane each. The attention kernels read the
             # view's page stride, and the KV write needs it 16-byte aligned.

@@ -407,15 +407,23 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
         )
 
 
-def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> None:
+@pytest.mark.parametrize("kernel_page_size", [None, 64, 128])
+def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes(
+    kernel_page_size,
+) -> None:
     """At attention TP 1 a draft K page is narrower than its share of an MLA
     plane: K and V are strided 4-D views of two planes with one page stride,
     and the parent is the draft-less Kimi-K3.1 target's."""
+    from dataclasses import replace
     from test.runtime.conftest import kimi_layout
 
+    from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         DRAFT_SLIDING_ATTENTION,
     )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
     num_draft_layers = 5
     target_recipe = kimi_recipe(
@@ -430,16 +438,27 @@ def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> N
         draft_attn="mha",
         draft_window=2048,
     )
+    recipe.draft_attn_config = replace(
+        recipe.draft_attn_config, kernel_page_size=kernel_page_size
+    )
+    config = recipe.draft_attn_config
+    component = config.component(MHAConfig)
+    page_size = MHAAttnBackend.resolve_kernel_page_size(config, 128)
     groups, layout = kimi_layout(recipe)
     assert layout.plane_bytes == target.plane_bytes
     assert layout.lcm_block_bytes == target.lcm_block_bytes
+    window = next(
+        spec for spec, _ in groups if spec.group_id == DRAFT_SLIDING_ATTENTION
+    )
+    assert layout.prefix_granularity == 128
+    assert window.block_granularity == page_size
 
     assert len(layout.plane_bytes) == 24
     assert layout.lcm_block_bytes == 81_838_080
 
     plan = layout.bind(3)
     draft_packing = dict(layout.group_packing)[DRAFT_SLIDING_ATTENTION]
-    assert draft_packing == 12
+    assert draft_packing * page_size == 12 * 128
     draft_fields = [
         field for field in plan.fields if field.group_id == DRAFT_SLIDING_ATTENTION
     ]
@@ -448,15 +467,42 @@ def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> N
     for index, field in enumerate(draft_fields):
         assert field.plane_id == f"slot.{index}"
         assert field.page_stride_bytes == plane_bytes[field.plane_id] // draft_packing
-        assert field.payload_bytes == 262_144
-        assert field.page_stride_bytes == 284_160
+        assert field.payload_bytes == page_size * 16 * 64 * 2
+        assert field.page_stride_bytes > field.payload_bytes
 
-    arena = make_arena(plan, cache_group_specs=tuple(spec for spec, _ in groups))
+    arena = make_arena(
+        plan, device="cpu", cache_group_specs=tuple(spec for spec, _ in groups)
+    )
     for field in draft_fields:
         view = arena.field(field.field_id)
         assert view.shape[0] >= 3 * draft_packing
         assert view.shape[1:] == field.shape
         assert view.stride(0) * view.element_size() == field.page_stride_bytes
+
+    pool = MHATokenToKVPool(
+        arena,
+        torch.bfloat16,
+        16,
+        64,
+        num_draft_layers,
+        0,
+        field_layer_offset=recipe.num_target_layers,
+    )
+    layer = PagedAttention(
+        num_heads=96,
+        num_kv_heads=16,
+        head_dim=64,
+        scaling=1.0,
+        layer_id=0,
+        sliding_window_size=2047,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    leaf = MHAAttnBackend(config, component, kernel_page_size=page_size)
+    key, value = leaf._get_kv_cache(layer, pool)
+    assert key.shape[1] == value.shape[1] == page_size
+    assert key.data_ptr() == pool.get_key_buffer(0).data_ptr()
+    assert value.data_ptr() == pool.get_value_buffer(0).data_ptr()
 
 
 def test_drafter_keeps_fused_kv_writes_for_an_unsharded_draft_group() -> None:
