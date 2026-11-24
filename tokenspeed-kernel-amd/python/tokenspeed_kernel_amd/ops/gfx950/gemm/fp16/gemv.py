@@ -68,6 +68,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+    supports_gluon_rowcta_bf16_gemv_gfx950,
+)
 
 cdna4 = gl.amd.cdna4
 
@@ -1069,6 +1072,10 @@ _PREFERRED_LAST_M: dict[tuple[int, int], int] = {
 
 def prefers_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
     """Whether this GEMV measured faster than the default selection here."""
+    # A row-CTA tile measured for this power-of-two row bucket is finer than
+    # the GEMV's 2-4 and 5-16 buckets and keeps those rows.
+    if m > 1 and supports_gluon_rowcta_bf16_gemv_gfx950(m, n, k):
+        return False
     bucket = 1 if m == 1 else 4 if m <= 4 else 16 if m <= MAX_M else None
     return bucket in _PREFERRED_BUCKETS.get(
         (n, k), frozenset()
