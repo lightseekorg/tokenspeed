@@ -1857,9 +1857,11 @@ of the candidates, so the counters, held-back counts and run count follow
 the plans, identical on every rank, like the interval's; under attention DP
 each replica compares its own ready decodes with `T`. A retracted or
 restoring request is not ready to decode, so a retraction can drop the count
-below `T` and waive the rest of the interval from the round the retraction
-is planned. In mixed mode a round below `T` runs its prefill beside the
-decodes, which ends the run, so `K` never forces a round there. While few
+below `T` and waive the rest of the interval: from the round it is planned
+for a forced retraction, which runs before the count, and from the next
+round for a capacity retraction, which runs after it. In mixed mode a round
+below `T` runs its prefill beside the decodes, which ends the run, so `K`
+never forces a round there. While few
 requests decode, this trades their token latency for first-token latency; at
 or above `T`, and with `T` unset, every plan is unchanged.
 
