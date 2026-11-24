@@ -11,6 +11,9 @@ queues, cache decisions, batching and copy-complete outcomes. Every encode TP
 rank reports its physical writes with a tp_rank label. A write timeout is
 counted as a transfer failure. Vision and ring-copy failures belong to the
 logical failed-item counter and do not increment transfer failures.
+The Python bootstrap exposes that group-local rank as the position of its
+global rank in the ordered attention-TP group; the native host consumes the
+same value when constructing transfer metrics.
 
 ImageCount counts image items in a decoded encode request. The token offset
 ranges within one image are not separate images. Encode wire requests usually
