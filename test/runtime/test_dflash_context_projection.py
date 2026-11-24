@@ -46,10 +46,32 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-4gpu")
 
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
-from tokenspeed.runtime.models.dflash import DFlashDraftModel  # noqa: E402
+from tokenspeed.runtime.models.dflash import (  # noqa: E402
+    DFlashDraftModel,
+    _draft_rope_cache_limit,
+)
 
 TAPS = 3
 ROWS = 24
+
+
+@pytest.mark.parametrize(
+    ("scaling", "context", "width", "expected"),
+    [
+        ({"rope_type": "deepseek_yarn"}, 512000, 8, 512032),
+        ({"type": "deepseek_yarn"}, 512000, 8, 512032),
+        ({"rope_type": "default", "type": "deepseek_yarn"}, 512000, 8, None),
+        (None, 512000, 8, None),
+        ({"type": "deepseek_yarn"}, None, 8, None),
+        ({"type": "deepseek_yarn"}, 512000, None, None),
+    ],
+)
+def test_draft_rope_cache_limit(monkeypatch, scaling, context, width, expected):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "max_model_len", context)
+    monkeypatch.setitem(global_server_args_dict, "speculative_num_draft_tokens", width)
+    assert _draft_rope_cache_limit(scaling) == expected
 
 
 def _draft(mapping: Mapping, hidden: int, layers: int = 0) -> DFlashDraftModel:
