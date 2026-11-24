@@ -118,7 +118,7 @@ def topk_leaves(fresh_registry, h100_platform):
             mode,
             f"bf16_{mode}",
             index_k_format="bf16",
-            layouts=("packed",),
+            layouts=("packed", "page_planar"),
             workspace_rows=False,
         )
         for mode in ("dsa_decode_topk", "dsa_prefill_topk")
@@ -160,9 +160,10 @@ def _prefill_topk(index_k_cache: torch.Tensor, slot_order: str = "selection", **
     )
 
 
-def test_bf16_plane_selects_the_bf16_leaf(topk_leaves):
+@pytest.mark.parametrize("shape", [(128, HEAD_DIM), (2, 64, HEAD_DIM)])
+def test_bf16_plane_selects_the_bf16_leaf(topk_leaves, shape):
     fp8, bf16 = topk_leaves
-    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    plane = torch.zeros(shape, dtype=torch.bfloat16)
     _decode_topk(plane)
     _prefill_topk(plane)
     assert len(bf16["dsa_decode_topk"]) == 1
@@ -177,7 +178,6 @@ def test_uint8_planes_select_the_fp8_leaf_by_layout(topk_leaves):
     _prefill_topk(torch.zeros((2, 64, FP8_ROW_BYTES), dtype=torch.uint8))
     assert len(fp8["dsa_decode_topk"]) == 1 and len(fp8["dsa_prefill_topk"]) == 1
     assert not bf16["dsa_decode_topk"] and not bf16["dsa_prefill_topk"]
-    # A page-planar plane never reaches a packed-only bf16 leaf either way.
     assert dsa_pkg._index_k_plane_traits(
         torch.zeros((2, 64, FP8_ROW_BYTES), dtype=torch.uint8), HEAD_DIM
     ) == {"index_k_format": "fp8_scaled", "index_k_layout": "page_planar"}
@@ -208,7 +208,7 @@ def test_unknown_plane_dtypes_and_shapes_are_refused(topk_leaves):
     with pytest.raises(TypeError, match="no registered format"):
         _decode_topk(torch.zeros((128, HEAD_DIM), dtype=torch.float16))
     with pytest.raises(ValueError, match="packed \\[slots, head_dim\\]"):
-        _decode_topk(torch.zeros((2, 64, HEAD_DIM), dtype=torch.bfloat16))
+        _decode_topk(torch.zeros((2, 64, HEAD_DIM + 1), dtype=torch.bfloat16))
 
 
 def test_candidate_lens_cpu_reaches_only_leaves_declaring_the_feature(

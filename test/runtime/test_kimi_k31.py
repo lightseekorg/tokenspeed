@@ -3803,7 +3803,7 @@ def _decode_ctx(router, pool, requests, seq_lens, blocks):
 def _slot_rows(pool) -> tuple[torch.Tensor, torch.Tensor]:
     """Layer 3's latent and index-K bytes, one row per cache slot."""
     latent = pool.get_key_buffer(3)
-    num_slots = latent.shape[0]
+    num_slots = latent.numel() // latent.shape[-1]
     index_k = pool.gather_index_k_rows(
         3,
         torch.arange(num_slots, device=latent.device),

@@ -7988,16 +7988,17 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
 
     monkeypatch.setattr(_attention_gluon_dsa, implementation_name, fake_impl)
 
-    marker = object()
+    cache = torch.zeros((1, 64, 576), dtype=torch.bfloat16)
+    kv_seq_lens = torch.tensor([64], dtype=torch.int32)
     for warming_up in (False, True):
         forwarded.clear()
         with kernel_warmup(enabled=warming_up):
-            result = entrypoint(marker=marker, kv_seq_lens=object())
+            result = entrypoint(kv_cache=cache, kv_seq_lens=kv_seq_lens)
 
         assert result is expected
         # The gfx950 launcher prepares its split variants during warmup.
         warmup = {"warm_split_variants": warming_up} if forwards_warmup else {}
-        assert forwarded == {"marker": marker, **warmup}
+        assert forwarded == {"kv_cache": cache, **warmup}
 
 
 @pytest.mark.parametrize(
