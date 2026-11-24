@@ -103,8 +103,8 @@ _async_log_handler: AsyncStreamHandler | None = None
 def stop_async_logging() -> None:
     """Drain the default async logger, allowing at most five seconds.
 
-    The Rust host calls this explicitly: returning from its main function
-    does not finalize the embedded interpreter or run Python atexit hooks.
+    The Rust host calls this explicitly: it ends the rank with
+    ``process::exit``, which skips Python finalization and atexit hooks.
     """
     global _async_log_handler
     handler, _async_log_handler = _async_log_handler, None
