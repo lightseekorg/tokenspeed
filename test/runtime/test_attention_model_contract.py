@@ -43,6 +43,10 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import (
+    CudaGraphSupport,
+    TreeSupport,
+)
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
@@ -52,6 +56,91 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.paged_attention import PagedAttention, bind_cache_groups
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+
+class CPUAcceptedRows:
+    """Small extension publishing a selected forward row through the router."""
+
+    cuda_graph_support = CudaGraphSupport()
+
+    def __init__(self):
+        self.rows = None
+        self.output = None
+
+    def validate_cache_pool(self, pool):
+        if pool.arena.buffer.device.type != "cpu":
+            raise ValueError("CPU rows require CPU storage")
+
+    def bind_cache_pool(self, pool):
+        self.rows = torch.zeros((4, 3))
+        self.output = torch.zeros(4)
+
+    def reset_batch(self):
+        self.rows.zero_()
+
+    def fixed_workspace_bytes(self):
+        return (self.rows.numel() + self.output.numel()) * self.rows.element_size()
+
+    def preallocate_verify_workspace(self, max_bs, draft_token_num):
+        assert (max_bs, draft_token_num) == self.rows.shape
+        return self.fixed_workspace_bytes()
+
+    def model_binding(self, layer_id, binding_type):
+        return self if binding_type is CPUAcceptedRows else None
+
+    def tree_support(self):
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
+
+    def commit_state_after_acceptance(
+        self, accepted_lengths, *, num_extends, accepted_path
+    ):
+        assert accepted_path is None
+        accepted = accepted_lengths[num_extends:]
+        for row, count in enumerate(accepted.tolist()):
+            if count:
+                self.output[row] = self.rows[row, count - 1]
+
+
+@pytest.mark.parametrize("num_extends", [0, 1])
+def test_router_verify_rows_publish_through_hybrid_and_reset(num_extends):
+    owners = [CPUAcceptedRows(), CPUAcceptedRows()]
+    routers = [
+        CacheGroupRouter(
+            lambda gid, grain: router_tests._StubLeaf(grain, spec=3),
+            is_draft=False,
+            spec_num_tokens=3,
+            device="cpu",
+            consumed_group_ids=None,
+            verify_state=owner,
+        )
+        for owner in owners
+    ]
+    backend = HybridLinearAttnBackend(*routers, [0])
+    backend.set_cache_pool(router_tests._router_pool())
+    backend.init_cuda_graph_state(4)
+    assert backend.preallocate_verify_workspace(4, 3) == 128
+    assert backend.fixed_workspace_bytes() == 128
+    for layer, offset in [(0, 0), (1, 20)]:
+        binding = backend.model_binding(layer, CPUAcceptedRows)
+        binding.rows.copy_(torch.arange(12).reshape(4, 3) + offset)
+    backend.commit_state_after_acceptance(
+        torch.tensor([3] * num_extends + [1, 3, 0]),
+        num_extends=num_extends,
+        accepted_path=None,
+    )
+    torch.testing.assert_close(owners[0].output, torch.tensor([0.0, 5.0, 0.0, 0.0]))
+    torch.testing.assert_close(owners[1].output, torch.tensor([20.0, 25.0, 0.0, 0.0]))
+    for router, owner in zip(routers, owners):
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2),
+            torch.tensor([6, 3]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=router_tests.TestCacheGroupRouterTest()._tables(),
+            for_graph_replay=True,
+        )
+        torch.testing.assert_close(owner.rows, torch.zeros((4, 3)))
 
 
 @dataclass(frozen=True)

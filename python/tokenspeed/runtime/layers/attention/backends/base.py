@@ -44,7 +44,7 @@ from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import torch
 
@@ -81,6 +81,43 @@ if TYPE_CHECKING:
 
 
 ModelBindingT = TypeVar("ModelBindingT")
+
+
+class AttentionVerifyState(Protocol):
+    """Optional batch workspace for a paged model's accepted-state publication.
+
+    Persistent history remains in the cache pool. Implementations retain only
+    forward-derived inputs until the ordinary post-acceptance hook, including
+    after graph replay. Factories must not allocate before cache binding.
+    """
+
+    cuda_graph_support: CudaGraphSupport
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None: ...
+
+    def bind_cache_pool(self, cache_pool: CachePool) -> None: ...
+
+    def fixed_workspace_bytes(self) -> int: ...
+
+    def preallocate_verify_workspace(
+        self, max_bs: int, draft_token_num: int
+    ) -> int: ...
+
+    def model_binding(
+        self, layer_id: int, binding_type: type[ModelBindingT]
+    ) -> ModelBindingT | None: ...
+
+    def reset_batch(self) -> None: ...
+
+    def commit_state_after_acceptance(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
+    ) -> None: ...
+
+    def tree_support(self) -> TreeSupport: ...
 
 
 @dataclass(frozen=True)

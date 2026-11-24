@@ -34,8 +34,9 @@ their component explicitly: ``Backend(config, spec)``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar
 
 import torch
 
@@ -43,6 +44,9 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionVerifyState
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
@@ -143,6 +147,9 @@ class SoftmaxAttnConfig(AttnComponentSpec):
 
     # Optional model-specific implementation of this paged attention family.
     paged_backend_cls: type | None = None
+    # Model-owned, forward-derived verification state on the ordinary router.
+    # None preserves the stateless paged lifecycle.
+    verify_state_factory: Callable[[AttnConfig], AttentionVerifyState] | None = None
     is_dsa: ClassVar[bool] = False
     # Whether this family stores a latent KV page (MLA and its DSA variant) as
     # opposed to K/V head rows (MHA, MSA). A draft of the latter kind plans an

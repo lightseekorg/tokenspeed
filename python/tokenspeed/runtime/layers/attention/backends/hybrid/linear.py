@@ -248,8 +248,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
-        return self.linear_attn_backend.preallocate_verify_workspace(
-            max_bs, draft_token_num
+        return sum(
+            backend.preallocate_verify_workspace(max_bs, draft_token_num)
+            for backend in self.child_backends()
         )
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
@@ -421,6 +422,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        self.linear_attn_backend.commit_state_after_acceptance(
-            accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
-        )
+        for backend in self.child_backends():
+            backend.commit_state_after_acceptance(
+                accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
+            )

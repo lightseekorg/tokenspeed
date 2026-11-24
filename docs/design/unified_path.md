@@ -1575,6 +1575,18 @@ attention execution, metadata refresh, cache binding and state commits continue
 through the outer backend. A binding must read current owner readiness across
 pool/weight changes rather than caching an admission-time answer.
 
+A paged component may supply `verify_state_factory` for forward-derived
+batch workspace on the existing `CacheGroupRouter`. Its `AttentionVerifyState`
+is validated and bound with the pool, contributes to fixed workspace accounting,
+and exposes operands through `model_binding`. The factory allocates nothing;
+binding allocates recipe-reserved tensors in the memory saver's CPU-backed
+`attention_state` region. Extend/mixed initialization and decode refresh reset
+batch validity. Writers replace that validity and saved inputs during every
+forward, including graph replay. Commit must use stable saved metadata and live
+accepted lengths, never temporary forward views or capture-time Python flags.
+This state is batch-derived scratch; persistent request history stays in LCM.
+Omitting the factory preserves the stateless paged lifecycle.
+
 ## Backend package layout
 
 `layers/attention/backends/` is organized by the role a node plays in the
@@ -1772,7 +1784,7 @@ arrangements write the existing replay workspace; commit reads that workspace
 after acceptance. A missing batched binding is an error,
 not a reason to recompute each layer through a second commit path. Since forward
 mode is derived from the extend count, zero means decode at this entry. Hybrid
-delegates to the recurrent child.
+delegates to both the full-attention and recurrent children.
 A mixed batch gives prefill and decode rows their existing metadata and
 forwards; only the decode suffix enters the acceptance commit. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
@@ -1785,8 +1797,9 @@ of the persistent request caches.
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
 before sizing the arena. `preallocate_verify_workspace` is called on the
-backend root and returns its verify buffers' bytes. The hybrid delegates to
-its recurrent child; Qwen4-Exp invokes its attention child, PLE, and QSA.
+backend root and returns its verify buffers' bytes. The hybrid sums both
+children, including optional paged verification state; Qwen4-Exp invokes its
+attention child, PLE, and QSA.
 Registry retains the recipe's preparation conditions and budget check,
 without opening the recurrent child. Inkling ring accounting and QCP
 history-gather allocation and sharing remain separate from verify preparation.

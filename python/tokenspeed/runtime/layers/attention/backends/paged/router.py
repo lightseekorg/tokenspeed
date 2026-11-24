@@ -36,10 +36,10 @@ scheduler bridge and the kernels that expands raw group tables:
   that group's write locations.
 
 Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. Indexers consume
-resolved ``group_view`` results for cross-group indexing. Their verification
-state is registered at startup on the outermost backend and committed through
-its side-state hook, independently of these leaves. A single-group model is a
-router with one leaf; there is no single-table special case.
+resolved ``group_view`` results for cross-group indexing. Optional verification
+state is supplied by the attention component at startup and committed through
+the router's post-acceptance hook, independently of these leaves. A single-group
+model is a router with one leaf; there is no single-table special case.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    AttentionVerifyState,
     PrefillRequestLayout,
     reject_bounded_replay,
 )
@@ -143,6 +144,7 @@ class CacheGroupRouter(AttentionBackend):
         device,
         consumed_group_ids: tuple[str, ...] | None,
         query_sharded: bool = False,
+        verify_state: AttentionVerifyState | None = None,
     ) -> None:
         """Args:
         leaf_factory: ``(group_id, block_granularity) -> leaf``; called once
@@ -158,6 +160,8 @@ class CacheGroupRouter(AttentionBackend):
             serve every local paged group. Other groups go to peer consumers.
         query_sharded: Whether this side's config carries a query-context
             shard; False without ``--query-context-parallel-size``.
+        verify_state: Optional model-owned batch workspace. None leaves
+            allocation, model bindings and acceptance stateless.
         """
         self._leaf_factory = leaf_factory
         self._consumed_group_ids = consumed_group_ids
@@ -168,6 +172,7 @@ class CacheGroupRouter(AttentionBackend):
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
         self._query_sharded = bool(query_sharded)
+        self._verify_state = verify_state
         # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
         self._tree_verify_armed = False
         self._tree_window_rows: dict[str, tuple[torch.Tensor, int]] = {}
@@ -209,6 +214,42 @@ class CacheGroupRouter(AttentionBackend):
 
     def child_backends(self) -> tuple[PagedAttentionBackend, ...]:
         return tuple(self.leaves.values())
+
+    @property
+    def cuda_graph_support(self):
+        support = super().cuda_graph_support
+        if self._verify_state is not None:
+            support = support & self._verify_state.cuda_graph_support
+        return support
+
+    def model_binding(self, layer_id, binding_type):
+        if self._verify_state is not None:
+            binding = self._verify_state.model_binding(layer_id, binding_type)
+            if binding is not None:
+                return binding
+        return super().model_binding(layer_id, binding_type)
+
+    def fixed_workspace_bytes(self):
+        return super().fixed_workspace_bytes() + (
+            self._verify_state.fixed_workspace_bytes()
+            if self._verify_state is not None
+            else 0
+        )
+
+    def preallocate_verify_workspace(self, max_bs, draft_token_num):
+        if self._verify_state is None:
+            return 0
+        return self._verify_state.preallocate_verify_workspace(max_bs, draft_token_num)
+
+    def commit_state_after_acceptance(
+        self, accepted_lengths, *, num_extends, accepted_path
+    ):
+        if self._verify_state is not None:
+            self._verify_state.commit_state_after_acceptance(
+                accepted_lengths,
+                num_extends=num_extends,
+                accepted_path=accepted_path,
+            )
 
     def _forget_bound_pool_state(self) -> None:
         """The table stacks and write locations built for a bound pool; init rebuilds them."""
@@ -267,6 +308,8 @@ class CacheGroupRouter(AttentionBackend):
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
         self._learn(cache_pool)
+        if self._verify_state is not None:
+            self._verify_state.validate_cache_pool(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         """A first bind builds and binds the leaves; every bind drops the tables."""
@@ -285,6 +328,8 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values():
                 leaf.set_cache_pool(cache_pool)
         super()._publish_cache_pool(cache_pool)
+        if self._verify_state is not None:
+            self._verify_state.bind_cache_pool(cache_pool)
         if self._tree_verify_armed:
             self._bind_tree_window_rows()
 
@@ -502,6 +547,8 @@ class CacheGroupRouter(AttentionBackend):
             if attn_kind != "full_history" or entry_stride_tokens not in (None, 1):
                 unsupported.append(gid)
         if not unsupported:
+            if self._verify_state is not None:
+                return self._verify_state.tree_support()
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         blocker = (
             "draft trees need full-history cache groups of one row per token; "
@@ -731,6 +778,8 @@ class CacheGroupRouter(AttentionBackend):
         sharded = query_shard is not None and query_shard.size > 1
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
+        if self._verify_state is not None:
+            self._verify_state.reset_batch()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "decode metadata goes through refresh_decode_metadata; "
@@ -805,6 +854,8 @@ class CacheGroupRouter(AttentionBackend):
             self._prefill_request_layout = None
         del kwargs
         self.sparse_topk.clear()
+        if self._verify_state is not None:
+            self._verify_state.reset_batch()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
@@ -873,6 +924,8 @@ class CacheGroupRouter(AttentionBackend):
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
         del kwargs
         self.sparse_topk.clear()
+        if self._verify_state is not None:
+            self._verify_state.reset_batch()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"

@@ -684,6 +684,11 @@ def create_paged_router(
         device=config.device,
         consumed_group_ids=(FULL_ATTENTION,) if name == "qsa" else None,
         query_sharded=config.qcp_size > 1,
+        verify_state=(
+            spec.verify_state_factory(config)
+            if spec.verify_state_factory is not None
+            else None
+        ),
     )
 
 
@@ -1225,8 +1230,14 @@ def _prepare_fixed_workspaces(
     if dsa_kvp_history_prefill(config):
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
-    if isinstance(backend, Qwen4ExpBackend) or (
-        uses_paged_state_verify and expected_bytes > actual_bytes
+    paged_spec = config.component(SoftmaxAttnConfig)
+    has_paged_verify_state = (
+        paged_spec is not None and paged_spec.verify_state_factory is not None
+    )
+    if (
+        isinstance(backend, Qwen4ExpBackend)
+        or has_paged_verify_state
+        or (uses_paged_state_verify and expected_bytes > actual_bytes)
     ):
         actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
         allocated = True
