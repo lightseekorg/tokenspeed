@@ -74,3 +74,6 @@ worker's installed HCCL. The host retains that library and communicator through
 segments later reused by different tensors. Pause drops the physical registration
 before unmap, and resume reactivates the new handle at the original virtual address.
 Retention policies are unchanged; communicator-owned buffers remain resident.
+An error from any of the four HCCL calls leaves peer registration uncertain.
+The saver keeps its mappings and rejects further transitions and cleanup.
+Restart the workers before reusing the device memory.

@@ -41,21 +41,21 @@ int hccl_result(const char *name) {
 int hccl_set(void *, void *ptr, size_t, size_t, uint64_t) {
   if (int result = hccl_result("set")) return result;
   if (!hccl_ranges.emplace(ptr, false).second) return 42;
-  return 0;
+  return hccl_result("set-after");
 }
 int hccl_unset(void *, void *ptr) {
   if (int result = hccl_result("unset")) return result;
   auto it = hccl_ranges.find(ptr);
   if (it == hccl_ranges.end() || it->second) return 43;
   hccl_ranges.erase(it);
-  return 0;
+  return hccl_result("unset-after");
 }
 int hccl_activate(void *, void *ptr, size_t, size_t, aclrtDrvMemHandle handle, uint64_t) {
   if (int result = hccl_result("activate")) return result;
   auto it = hccl_ranges.find(ptr);
   if (it == hccl_ranges.end() || it->second || !handle || !fake_acl::live_physical()) return 44;
   it->second = true;
-  return 0;
+  return hccl_result("activate-after");
 }
 int hccl_deactivate(void *, void *ptr) {
   if (int result = hccl_result("deactivate")) return result;
@@ -63,7 +63,7 @@ int hccl_deactivate(void *, void *ptr) {
   if (it == hccl_ranges.end() || !it->second) return 45;
   it->second = false;
   ++hccl_deactivations;
-  return 0;
+  return hccl_result("deactivate-after");
 }
 void configure_hccl() {
   ok(saver_configure_hccl(&hccl_ranges, hccl_set, hccl_unset, hccl_activate, hccl_deactivate));
@@ -104,54 +104,35 @@ void hccl_graph_lifetime() {
   REQUIRE(saver_configure_hccl(&hccl_ranges, hccl_set, hccl_unset, hccl_activate, hccl_deactivate) != 0);
   ok(saver_release(p));
 }
-void hccl_callback_failure_is_terminal() {
+void hccl_failure_is_terminal(const std::string &scenario) {
   reset(); configure_hccl();
-  void *p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
-  hccl_fail = "deactivate";
-  const auto unmaps = fake_acl::calls("aclrtUnmapMem");
-  saver_free(p, 7000, 0, nullptr);
-  REQUIRE(saver_has_callback_fault() == 1);
-  REQUIRE(fake_acl::calls("aclrtUnmapMem") == unmaps);
-  REQUIRE(saver_pause("acl_graph") != 0);
-  ok(saver_close_hccl()); // Cleanup remains legal after the callback fault.
-  ok(saver_collect_failed());
-  REQUIRE(hccl_ranges.empty() && fake_acl::live_physical() == 0);
-  REQUIRE(saver_has_callback_fault() == 1);
-}
-void hccl_failure_boundaries() {
-  reset(); configure_hccl();
-  for (const char *api : {"set", "activate"}) {
-    hccl_fail = api;
-    REQUIRE(!graph_discard_malloc(7000, 0, nullptr));
-    REQUIRE(hccl_ranges.empty() && fake_acl::live_physical() == 0);
-    REQUIRE(saver_has_callback_fault() == 0);
+  const std::string operation = scenario.substr(0, scenario.find('-'));
+  void *p = nullptr;
+  if (operation != "set") {
+    p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
+    if (operation == "activate") ok(saver_pause("acl_graph"));
   }
-  void *p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
   const auto unmaps = fake_acl::calls("aclrtUnmapMem");
-  hccl_fail = "deactivate";
-  REQUIRE(saver_pause("acl_graph") != 0);
-  REQUIRE(hccl_ranges.at(p));
+  hccl_fail = scenario == "callback" ? "deactivate-after" : scenario;
+  if (operation == "set") REQUIRE(!graph_discard_malloc(7000, 0, nullptr));
+  else if (operation == "activate") REQUIRE(saver_resume("acl_graph") != 0);
+  else if (operation == "deactivate") REQUIRE(saver_pause("acl_graph") != 0);
+  else if (operation == "unset") REQUIRE(saver_release(p) != 0);
+  else {
+    REQUIRE(scenario == "callback");
+    saver_free(p, 7000, 0, nullptr);
+  }
+  REQUIRE(hccl_fail.empty());
+  REQUIRE(saver_has_callback_fault() == 1);
+  REQUIRE(std::string(saver_last_error()).find("HCCL registration state unknown") != std::string::npos);
+  const auto ranges = hccl_ranges;
+  REQUIRE(!kv_malloc(1, 0, nullptr));
+  REQUIRE(saver_pause(nullptr) != 0 && saver_resume(nullptr) != 0);
+  if (p) REQUIRE(saver_release(p) != 0);
+  REQUIRE(saver_collect_failed() != 0 && saver_close_hccl() != 0);
+  REQUIRE(hccl_ranges == ranges);
+  REQUIRE(fake_acl::live_reservations() == 1 && fake_acl::live_physical() == 1);
   REQUIRE(fake_acl::calls("aclrtUnmapMem") == unmaps);
-  REQUIRE(!graph_discard_malloc(1, 0, nullptr));
-  ok(saver_pause("acl_graph"));
-  hccl_fail = "activate";
-  REQUIRE(saver_resume("acl_graph") != 0);
-  REQUIRE(!hccl_ranges.at(p));
-  REQUIRE(!graph_discard_malloc(1, 0, nullptr));
-  ok(saver_resume("acl_graph"));
-  const auto before_free = fake_acl::calls("aclrtUnmapMem");
-  hccl_fail = "unset";
-  REQUIRE(saver_release(p) != 0);
-  REQUIRE(fake_acl::calls("aclrtUnmapMem") == before_free);
-  ok(saver_collect_failed());
-  REQUIRE(hccl_ranges.empty());
-  p = graph_discard_malloc(7000, 0, nullptr); REQUIRE(p);
-  hccl_fail = "unset";
-  REQUIRE(saver_close_hccl() != 0);
-  REQUIRE(hccl_ranges.count(p) == 1);
-  ok(saver_close_hccl());
-  ok(saver_release(p));
-  reset();
 }
 
 void policy_roundtrips() {
@@ -436,20 +417,19 @@ int main(int argc, char **argv) {
   try {
     if (argc == 2) {
       const std::string scenario = argv[1];
-      if (scenario == "hccl-callback") {
-        hccl_callback_failure_is_terminal();
+      if (scenario.rfind("hccl-", 0) == 0) {
+        hccl_failure_is_terminal(scenario.substr(5));
       } else if (scenario == "malloc-rollback") {
         allocation_rollback_fault_is_terminal();
       } else {
         REQUIRE(scenario == "wrong-context" || scenario == "wrong-device");
         callback_retires_before_validation(scenario == "wrong-context");
       }
-      std::cout << "PASS: " << scenario << " fault is terminal and cleanup released all resources\n";
+      std::cout << "PASS: " << scenario << " fault is terminal\n";
       return 0;
     }
     REQUIRE(argc == 1);
     hccl_graph_lifetime();
-    hccl_failure_boundaries();
     policy_roundtrips();
     default_policies_tags_and_paused_free();
     pause_failure_matrix();

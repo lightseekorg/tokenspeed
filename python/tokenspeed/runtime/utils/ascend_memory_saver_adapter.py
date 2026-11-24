@@ -137,6 +137,8 @@ class NativeBackend:
         blocks = self.stats()["blocks"]
         if blocks and all(block["phase"] == "paused" for block in blocks):
             torch.npu.empty_cache()
+            # A void allocator callback can record a failure without raising here.
+            self.check_health()
             self._trimmed_tags = {block["tag"] for block in blocks}
 
     def resume(self, tag: str | None) -> None:

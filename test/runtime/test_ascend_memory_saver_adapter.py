@@ -347,6 +347,23 @@ def test_failed_native_pause_or_cache_trim_can_be_retried(runtime, monkeypatch):
     assert calls == [1, 1]
 
 
+def test_cache_trim_callback_fault_fails_pause(runtime, monkeypatch):
+    library = runtime.memory.library
+    library.blocks.append({"tag": "weights", "phase": "active"})
+    state = runtime.adapter._state().state
+
+    def trim():
+        library.fault = True
+
+    monkeypatch.setattr(runtime.memory, "empty_cache", trim, raising=False)
+    with pytest.raises(
+        RuntimeError, match="restart this worker: injected callback fault"
+    ):
+        runtime.adapter.pause("weights")
+    assert state.failed == {"weights"}
+    assert not state.paused
+
+
 def test_all_owners_share_one_pool_across_adapter_instances(runtime, monkeypatch):
     memory, adapter = runtime.memory, runtime.adapter
     with monkeypatch.context() as missing_library:

@@ -860,6 +860,61 @@ fn dp_memory_cancels_an_active_drain_without_clearing_peer_prefixes() {
     assert!(ranks.iter().all(|rank| rank.device_ops.is_empty()));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_cancels_a_queued_release_while_flush_waits_for_storage() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            l3_clear_cache_drain_timeout: Some(Duration::from_secs(30)),
+            replica_memory_transitions: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release_store = ReleaseStoreGate(gate.clone());
+    run(&engine.client, request("warm", 65, budget(4))).await;
+    wait_for_store_put(&store).await;
+    wait_for_storage_only_clear(&engine).await;
+
+    let flush = control(
+        &engine,
+        ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }),
+    );
+    tokio::pin!(flush);
+    // The next control reply fences ingress while the flush waits for the native PUT.
+    tokio::select! {
+        biased;
+        reply = &mut flush => panic!("flush finished with PUT held: {reply:?}"),
+        _ = admission_on_every_rank(&engine) => {}
+    }
+    let (release, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(biased;
+            control(&engine, memory_request(true, Some(&["kv_cache"]), Some("park"))),
+            async {
+                assert_eq!(control(&engine, resume()).await, [("ResumeSchedulerReqOutput", true)]);
+                assert!(store.put_results.lock().unwrap().is_empty());
+                gate.open();
+            }
+        )
+    })
+    .await
+    .expect("release and continue did not finish");
+    assert_eq!(flush.await, [("FlushCacheReqOutput", true)]);
+    assert_eq!(release, [("ReleaseMemoryOccupationReqOutput", false)]);
+    assert!(engine.ranks[0].device_ops.lock().unwrap().is_empty());
+}
+
 #[test]
 fn dp_memory_cancelled_resume_leaves_every_replica_asleep() {
     let mut scripts = vec![vec![Vec::new(); 25]; 2];

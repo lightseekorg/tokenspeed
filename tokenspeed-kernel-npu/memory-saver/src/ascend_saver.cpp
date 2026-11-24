@@ -120,13 +120,22 @@ public:
   int32_t bound_device = -1;
   std::list<Block> blocks;
   void *hccl_comm = nullptr;
+  bool hccl_registration_uncertain = false;
   saver_hccl_set_range_fn hccl_set_range = nullptr;
   saver_hccl_unset_range_fn hccl_unset_range = nullptr;
   saver_hccl_activate_fn hccl_activate = nullptr;
   saver_hccl_deactivate_fn hccl_deactivate = nullptr;
 
-  static void check_hccl(int result, const char *api) {
-    if (result != 0) throw std::runtime_error(std::string(api) + " failed, HcclResult=" + std::to_string(result));
+  void check_hccl(int result, const char *api) {
+    if (result == 0) return;
+    // A peer may have changed its mapping before its acknowledgement failed.
+    // Keep this communicator's VA and backing until the worker exits.
+    hccl_registration_uncertain = true;
+    char error[192];
+    std::snprintf(error, sizeof(error),
+                  "%s failed, HcclResult=%d; HCCL registration state unknown; restart worker", api, result);
+    latch_callback_fault(error);
+    throw std::runtime_error(error);
   }
   void activate_communication(Block &b) {
     if (!hccl_comm) return;
@@ -173,6 +182,7 @@ public:
   }
   void close_hccl() {
     if (!hccl_comm) return;
+    require_safe_cleanup();
     verify_context();
     checked(aclrtSynchronizeDevice(), "aclrtSynchronizeDevice before HCCL detach");
     for (auto &b : blocks) unregister_communication(b);
@@ -200,7 +210,10 @@ public:
   }
   void require_healthy() const {
     if (callback_fault.load(std::memory_order_acquire))
-      throw std::runtime_error("allocator callback fault is latched; cleanup is allowed, but worker restart is required");
+      throw std::runtime_error("allocator callback fault is latched; worker restart is required");
+  }
+  void require_safe_cleanup() const {
+    if (hccl_registration_uncertain) throw std::runtime_error(callback_error);
   }
   void verify_context() {
     int32_t current_device = -1;
@@ -301,6 +314,7 @@ public:
       b.phase = Phase::Active;
       return b.va;
     } catch (const std::exception &allocation) {
+      if (hccl_registration_uncertain) throw; // Retain the allocation record and its mapping.
       try {
         release_block(b);
         blocks.erase(it);
@@ -391,6 +405,7 @@ public:
 
   void release(void *ptr, std::optional<int> callback_device) {
     if (!ptr) return;
+    require_safe_cleanup();
     auto it = std::find_if(blocks.begin(), blocks.end(),
                            [ptr](const Block &b) { return b.va == ptr; });
     if (it == blocks.end())
@@ -411,6 +426,7 @@ public:
     blocks.erase(it);
   }
   void collect_failed() {
+    require_safe_cleanup();
     verify_context();
     for (auto it = blocks.begin(); it != blocks.end();) {
       if (it->phase != Phase::Releasing) { ++it; continue; }
