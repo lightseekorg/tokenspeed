@@ -349,6 +349,13 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         // A checkpoint that counts as demoted (CacheEvictor::IsDemotedEntry); read for State
         // entries only.
         bool demoted;
+        // The Disk holds its key too: the Host copy is clean, and dropping it
+        // loses nothing a prefetch cannot read back (docs/rfcs/0006-disk-tier.md).
+        bool on_disk;
+    };
+    const BlockPool* disk_pool = store_.DiskPool();
+    const auto on_disk = [&](std::size_t group, const CacheKey& key) {
+        return disk_pool != nullptr && store_.Groups()[group].Index().Contains(*disk_pool, key);
     };
     struct HostEntries {
         explicit HostEntries(std::pmr::memory_resource* resource) : states{resource}, all{resource} {}
@@ -388,7 +395,8 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                                                .location = entry.location,
                                                .in_use = entry.pinned,
                                                .last_access_epoch = entry.metadata.eviction.last_access_epoch,
-                                               .demoted = evictor_.IsDemotedEntry(entry.metadata)});
+                                               .demoted = evictor_.IsDemotedEntry(entry.metadata),
+                                               .on_disk = on_disk(i, key)});
                 }
             });
     }
@@ -406,7 +414,8 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                                                         .location = entry->location,
                                                         .in_use = entry->pinned,
                                                         .last_access_epoch = entry->metadata.eviction.last_access_epoch,
-                                                        .demoted = false});
+                                                        .demoted = false,
+                                                        .on_disk = on_disk(i, key)});
                     }
                 });
             entries.all_loaded = true;
@@ -498,7 +507,8 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
 
     // A candidate victim's node and its rank, the smallest first: by class
     // (VictimClass: a dead entry, a duplicate or a superseded checkpoint
-    // boundary, Host-only cache), then by epoch -- a dead entry's and
+    // boundary, Host-only cache the Disk holds, the rest of the Host-only
+    // cache), then by epoch -- a dead entry's and
     // Host-only checkpoint's newest State entry (a KV-only node's newest
     // Host entry), oldest first; a duplicate's or
     // superseded checkpoint boundary's Device copy, newest first, since the
@@ -510,7 +520,13 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
     // (SetCheckpointDemotion) ranks in a class of its own, whatever its pages'
     // dates: the placement below takes it after the Host copies of KV a
     // request holds on the Device and before the copies of unheld Device KV.
-    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kDemoted, kHostOnly };
+    // Clean Host-only cache -- every Host entry its victim takes is on the
+    // Disk too -- goes after every Device-covered copy and before any dirty
+    // entry (docs/rfcs/0006-disk-tier.md, Invariant 3).
+    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kDemoted, kClean, kHostOnly };
+    // Nodes ranked clean whose victim turned out to take a dirty Host entry
+    // (one under them, or a page above): they rank as dirty Host-only cache.
+    std::pmr::unordered_set<const BoundaryTree::Node*> takes_dirty{&scratch};
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
         VictimClass victim_class{VictimClass::kDead};
@@ -626,6 +642,16 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                 candidate.epoch_sort_key = *newest_epoch(*store_.HostPool(), node, /*kv_only=*/false);
             }
             candidate.reason = &CacheEvictor::HostEvictionStats::lru;
+            // A checkpoint is judged by its State here, as it ranks; the
+            // victim it becomes is checked whole when it is taken.
+            if (candidate.victim_class == VictimClass::kHostOnly && disk_pool != nullptr &&
+                !takes_dirty.contains(&node) &&
+                std::ranges::all_of(
+                    num_checkpoint_entries > 0 ? entries_for(node).states : host_entries_of(node),
+                    [&](const HostEntry& entry) { return taken.contains(entry.location) || entry.on_disk; })) {
+                candidate.victim_class = VictimClass::kClean;
+                candidate.reason = &CacheEvictor::HostEvictionStats::clean;
+            }
         }
         candidates.push(candidate);
     };
@@ -676,8 +702,9 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         }
         // Existing dead and Device-covered segments retain their priority.
         // Reclaim safe duplicates before the only copy of a checkpoint,
-        // including when the Device KV is no longer held by a request.
-        const bool host_only_next = candidates.empty() || candidates.top().victim_class == VictimClass::kHostOnly;
+        // including when the Device KV is no longer held by a request, and
+        // before a copy the Disk holds.
+        const bool host_only_next = candidates.empty() || candidates.top().victim_class >= VictimClass::kClean;
         const bool demoted_next = !candidates.empty() && candidates.top().victim_class == VictimClass::kDemoted;
         if ((!added_kv_duplicates && (host_only_next || demoted_next)) ||
             (unheld_duplicates_deferred && host_only_next)) {
@@ -816,6 +843,14 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                 TakenNode{.node = &candidate_node, .entries = std::move(checkpoint_entries), .takes_page = false});
             walked.clear();
             victim.nearest_untaken_page = &candidate_node;
+        }
+        if (candidate.victim_class == VictimClass::kClean &&
+            !std::ranges::all_of(taken_nodes, [](const TakenNode& taken_node) {
+                return std::ranges::all_of(taken_node.entries, &HostEntry::on_disk);
+            })) {
+            takes_dirty.insert(&candidate_node);
+            add_candidate(candidate_node);
+            continue;
         }
         walked_by_taken_victims.insert(walked.begin(), walked.end());
         for (const TakenNode& taken_node : taken_nodes) {

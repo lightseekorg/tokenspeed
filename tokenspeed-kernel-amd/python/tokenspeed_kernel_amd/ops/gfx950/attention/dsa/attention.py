@@ -27,20 +27,27 @@ import math
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
     "gluon_dsa_decode_dcp_records_supported_gfx950",
     "gluon_dsa_decode_dcp_records_workspace_bytes_gfx950",
+    "gluon_dsa_decode_projected_value_supported_gfx950",
     "launch_gluon_dsa_decode_dcp_records_gfx950",
     "launch_gluon_dsa_decode_gfx950",
+    "launch_gluon_dsa_decode_projected_value_gfx950",
     "launch_gluon_dsa_prefill_gfx950",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX950_COMPUTE_UNITS = 256
+_GFX950_XCDS = 8
 _GLM52_SINGLE_ROW_DECODE_SPLITS = 16
+# The value projection the grouped decode GEMM serves and the projected
+# reduction repeats: (heads, value_head_dim, kv_lora_rank).
+_PROJECTED_VALUE_SHAPE = (12, 128, 512)
 
 
 @gluon.constexpr_function
@@ -1522,6 +1529,215 @@ def _dsa_dense_mfma_records_reduce_kernel(
     )
 
 
+# How _dsa_dense_mfma_reduce_kernel's 32-split build rounds `acc += weight *
+# partial`: bit s set where split s adds a rounded product, clear where it is
+# one FMA, for even and odd latents. The projected reduction repeats it.
+_REDUCE32_ROUNDED_PRODUCTS_EVEN = 0b1110
+_REDUCE32_ROUNDED_PRODUCTS_ODD = 0b1111
+
+
+@gluon.jit(
+    do_not_specialize=(
+        "num_tokens",
+        "stride_lse_t",
+        "stride_lse_h",
+        "stride_lse_s",
+        "num_kv_splits",
+    )
+)
+def _dsa_dense_mfma_reduce_project_kernel(
+    partial_out,
+    partial_lse,
+    weight,
+    gate,
+    out,
+    num_tokens,
+    stride_po_t,
+    stride_po_h,
+    stride_po_s,
+    stride_lse_t,
+    stride_lse_h,
+    stride_lse_s,
+    stride_w_h,
+    stride_w_n,
+    stride_gate_t,
+    stride_out_t,
+    num_kv_splits,
+    HEADS: gl.constexpr,
+    D_V: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_T: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    MAX_SPLITS: gl.constexpr,
+    ROUNDED_EVEN: gl.constexpr,
+    ROUNDED_ODD: gl.constexpr,
+    GATE: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """``_dsa_dense_mfma_reduce_kernel`` and the gated grouped value GEMM
+    (``gluon_mm_a16w16_medium_gfx950``) in one launch, bit for bit.
+
+    A program merges the splits of ``BLOCK_T`` tokens of one head as the
+    reduction does, rounds the latents to BF16 and projects them onto
+    ``BLOCK_N`` value columns with the GEMM's MFMA chain, so no program waits
+    for another's latents. ``weight`` is ``[heads, N, D_V]``; ``gate`` and
+    ``out`` are ``[tokens, heads * N]`` rows.
+    """
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    num_t = gl.cdiv(num_tokens, BLOCK_T)
+    num_n: gl.constexpr = N // BLOCK_N
+    pid = gl.program_id(axis=0)
+    if NUM_XCDS > 1:
+        # One XCD's programs share its heads' value columns in L2.
+        pid = _remap_xcd(pid, HEADS * num_t * num_n, NUM_XCDS)
+    head = pid // (num_t * num_n)
+    t0 = (pid % (num_t * num_n)) // num_n * BLOCK_T
+    n0 = pid % num_n * BLOCK_N
+
+    # The GEMM's MFMA: its instruction, operand width and K order.
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, NUM_WARPS],
+    )
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
+    comb: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [1, NUM_WARPS], [1, 0])
+    lse_layout: gl.constexpr = gl.BlockedLayout([1, 1], [64, 1], [NUM_WARPS, 1], [1, 0])
+    flat: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+
+    # Loads complete in issue order: the split LSEs first, then the partials
+    # and value columns as direct-to-LDS copies, then the gate.
+    offs_ls = gl.arange(0, MAX_SPLITS, layout=gl.SliceLayout(1, lse_layout))
+    offs_lt = t0 + gl.arange(0, BLOCK_T, layout=gl.SliceLayout(0, lse_layout))
+    lse = gl.amd.cdna4.buffer_load(
+        ptr=partial_lse,
+        offsets=(
+            offs_ls[:, None] * stride_lse_s
+            + (offs_lt * stride_lse_t + head * stride_lse_h)[None, :]
+        ).to(gl.int32),
+        mask=(offs_ls[:, None] < num_kv_splits) & (offs_lt[None, :] < num_tokens),
+        other=-float("inf"),
+    )
+
+    # Row s * BLOCK_T + t holds split s of token t0 + t.
+    p_copy: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [NUM_WARPS, 1], [1, 0])
+    smem_p = gl.allocate_shared_memory(
+        partial_out.dtype.element_ty, [MAX_SPLITS * BLOCK_T, D_V], flat
+    )
+    offs_pr = gl.arange(0, MAX_SPLITS * BLOCK_T, layout=gl.SliceLayout(1, p_copy))
+    offs_pv = gl.arange(0, D_V, layout=gl.SliceLayout(0, p_copy))
+    p_split = offs_pr // BLOCK_T
+    p_token = t0 + offs_pr % BLOCK_T
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_p,
+        partial_out,
+        (
+            (p_split * stride_po_s + p_token * stride_po_t + head * stride_po_h)[
+                :, None
+            ]
+            + offs_pv[None, :]
+        ).to(gl.int32),
+        mask=((p_split < num_kv_splits) & (p_token < num_tokens))[:, None],
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
+    w_copy: gl.constexpr = gl.BlockedLayout([8, 1], [64, 1], [1, NUM_WARPS], [0, 1])
+    sh_w: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [D_V, BLOCK_N], [0, 1]
+    )
+    smem_w = gl.allocate_shared_memory(weight.dtype.element_ty, [D_V, BLOCK_N], sh_w)
+    offs_wk = gl.arange(0, D_V, layout=gl.SliceLayout(1, w_copy))
+    offs_wn = n0 + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, w_copy))
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_w,
+        weight,
+        (head * stride_w_h + offs_wn[None, :] * stride_w_n + offs_wk[:, None]).to(
+            gl.int32
+        ),
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
+    offs_cm = gl.arange(0, 16, layout=gl.SliceLayout(1, mfma))
+    offs_cn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))
+    rows = t0 + offs_cm
+    c_mask = ((offs_cm < BLOCK_T) & (rows < num_tokens))[:, None] & (offs_cn < BLOCK_N)[
+        None, :
+    ]
+    cols = head * N + n0 + offs_cn
+    if GATE:
+        gate_raw = gl.amd.cdna4.buffer_load(
+            ptr=gate,
+            offsets=(rows[:, None] * stride_gate_t + cols[None, :]).to(gl.int32),
+            mask=c_mask,
+            other=0.0,
+        )
+
+    # The reduction's split weights; the max is order-free.
+    max_lse = gl.max(lse, axis=0)
+    safe_max_lse = gl.where(max_lse > -float("inf"), max_lse, 0.0)
+    lse_valid = lse > -float("inf")
+    split_weights = gl.where(
+        lse_valid, gl.exp(gl.where(lse_valid, lse, 0.0) - safe_max_lse[None, :]), 0.0
+    )
+    smem_l = gl.allocate_shared_memory(gl.float32, [MAX_SPLITS, BLOCK_T], flat)
+    smem_l.store(split_weights)
+    gl.amd.cdna4.async_copy.wait_group(1)
+    gl.barrier()
+
+    odd = (gl.arange(0, D_V, layout=gl.SliceLayout(0, comb)) % 2 == 1)[None, :]
+    denom = gl.zeros([BLOCK_T, 1], gl.float32, comb)
+    acc = gl.zeros([BLOCK_T, D_V], gl.float32, comb)
+    for split_idx in gl.static_range(MAX_SPLITS):
+        weight_s = smem_l.slice(split_idx, 1, 0).permute([1, 0]).load(comb)
+        partial = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_p.slice(split_idx * BLOCK_T, BLOCK_T, 0), comb
+        ).to(gl.float32)
+        if (ROUNDED_EVEN >> split_idx) & 1 and (ROUNDED_ODD >> split_idx) & 1:
+            acc = acc + weight_s * partial
+        elif (ROUNDED_ODD >> split_idx) & 1:
+            acc = gl.where(
+                odd, acc + weight_s * partial, gl.fma(weight_s, partial, acc)
+            )
+        elif (ROUNDED_EVEN >> split_idx) & 1:
+            acc = gl.where(
+                odd, gl.fma(weight_s, partial, acc), acc + weight_s * partial
+            )
+        else:
+            acc = gl.fma(weight_s, partial, acc)
+        denom += weight_s
+
+    safe_denom = gl.where(denom > 0.0, denom, 1.0)
+    latent = gl.where(denom > 0.0, acc / safe_denom, 0.0)
+
+    # MFMA rows past BLOCK_T read stale LDS; their outputs are never stored.
+    sh_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [16, D_V], [1, 0]
+    )
+    smem_a = gl.allocate_shared_memory(gl.bfloat16, [16, D_V], sh_a)
+    smem_a.slice(0, BLOCK_T, 0).store(latent.to(gl.bfloat16))
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.barrier()
+    projected = gl.amd.cdna4.mfma(
+        smem_a.load(dot_a),
+        gl.amd.cdna4.async_copy.load_shared_relaxed(smem_w, dot_b),
+        gl.zeros([16, BLOCK_N], gl.float32, mfma),
+    )
+    if GATE:
+        projected = projected.to(out.dtype.element_ty).to(gl.float32) * (
+            1.0 / (1.0 + gl.exp(-gate_raw.to(gl.float32)))
+        )
+    gl.amd.cdna4.buffer_store(
+        stored_value=projected.to(out.dtype.element_ty),
+        ptr=out,
+        offsets=(rows[:, None] * stride_out_t + cols[None, :]).to(gl.int32),
+        mask=c_mask,
+    )
+
+
 @gluon.jit
 def _dsa_dense_kv_kernel(
     q,
@@ -2038,12 +2254,22 @@ def _launch_dense_kv(
     lse: torch.Tensor | None,
     records: bool,
     workspace: torch.Tensor | None,
+    value_projection: tuple | None = None,
+    projection_block: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """``q`` is ``[tokens, heads, dim]``; with ``records`` it is a KVP
     gather's rank-major ``[ranks, tokens, local_heads, dim]``, and each head's
     output and LSE land in its DCP record (int32 ``[ranks, tokens,
     local_heads, kv_lora_rank / 2 + 1]``, returned) instead of ``out`` and
-    ``lse``. The records then lead ``workspace`` (flat int32) when given."""
+    ``lse``. The records then lead ``workspace`` (flat int32) when given.
+
+    With ``value_projection`` (``_launch_dense_mfma_reduce_project``'s
+    ``weight, gate, out``) a split decode merges its splits straight into
+    the projected rows, returned; ``out`` is not written."""
+    if value_projection is not None and (
+        num_kv_splits == 1 or records or lse is not None
+    ):
+        raise ValueError("a projected DSA decode merges split keys without an LSE")
     if not records:
         tokens, heads = q.shape[0], q.shape[1]
         stride_q_r, stride_q_t, stride_q_h = 0, q.stride(0), q.stride(1)
@@ -2200,6 +2426,14 @@ def _launch_dense_kv(
             D_V=kv_lora_rank,
             num_warps=4,
         )
+    elif num_kv_splits > 1 and value_projection is not None:
+        return _launch_dense_mfma_reduce_project(
+            stage_out,
+            partial_lse,
+            *value_projection,
+            num_kv_splits=num_kv_splits,
+            block=projection_block,
+        )
     elif num_kv_splits > 1:
         _dsa_dense_mfma_reduce_kernel[(tokens, heads)](
             stage_out,
@@ -2223,6 +2457,79 @@ def _launch_dense_kv(
             num_warps=4,
         )
     return workspace[0] if records else out
+
+
+def _projected_value_block(tokens: int) -> tuple[int, int]:
+    """``(BLOCK_T, BLOCK_N)`` of the projected reduction for ``tokens`` rows:
+    a token a program with the narrowest value block whose programs fit one a
+    CU, else two tokens a program (each re-reads its head's value columns)."""
+    heads, value, _ = _PROJECTED_VALUE_SHAPE
+    for block_n in (32, 64):
+        if heads * tokens * (value // block_n) <= _GFX950_COMPUTE_UNITS:
+            return 1, block_n
+    return 2, 64
+
+
+def _launch_dense_mfma_reduce_project(
+    stage_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor | None,
+    out: torch.Tensor,
+    *,
+    num_kv_splits: int,
+    block: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Merge the split partials ``stage_out`` ``[tokens, heads, splits,
+    kv_lora_rank]`` into ``out = (latent @ weight[h].T) * sigmoid(gate)``
+    per head, as the reduction then the grouped decode GEMM compute it.
+
+    ``weight`` is contiguous ``[heads, value_head_dim, kv_lora_rank]``;
+    ``gate`` (or None) and ``out`` are BF16 ``[tokens, heads *
+    value_head_dim]`` rows with unit inner stride."""
+    if triton.next_power_of_2(num_kv_splits) != 32:
+        raise ValueError(
+            f"the projected DSA reduction repeats the 32-split reduction, got "
+            f"{num_kv_splits} splits"
+        )
+    tokens, heads = stage_out.shape[:2]
+    value = weight.shape[1]
+    block_t, block_n = block or _projected_value_block(tokens)
+    _dsa_dense_mfma_reduce_project_kernel[
+        (heads * triton.cdiv(tokens, block_t) * (value // block_n),)
+    ](
+        stage_out,
+        partial_lse,
+        weight,
+        out if gate is None else gate,
+        out,
+        tokens,
+        stage_out.stride(0),
+        stage_out.stride(1),
+        stage_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        0 if gate is None else gate.stride(0),
+        out.stride(0),
+        num_kv_splits,
+        HEADS=heads,
+        D_V=stage_out.shape[3],
+        N=value,
+        BLOCK_T=block_t,
+        BLOCK_N=block_n,
+        MAX_SPLITS=32,
+        ROUNDED_EVEN=_REDUCE32_ROUNDED_PRODUCTS_EVEN,
+        ROUNDED_ODD=_REDUCE32_ROUNDED_PRODUCTS_ODD,
+        GATE=gate is not None,
+        NUM_XCDS=_GFX950_XCDS,
+        num_warps=4,
+        # Products the reduction rounds stay unfused; FMAs are explicit.
+        enable_fp_fusion=False,
+    )
+    return out
 
 
 def _run_dense_kv_scalar(
@@ -2468,6 +2775,174 @@ def launch_gluon_dsa_decode_gfx950(
         is_prefill=False,
         warm_split_variants=warm_split_variants,
         return_lse=return_lse,
+    )
+
+
+def gluon_dsa_decode_projected_value_supported_gfx950(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    value_head_dim: int,
+) -> bool:
+    """Whether :func:`launch_gluon_dsa_decode_projected_value_gfx950` serves a
+    decode of this size: the dense matrix core over the 32 key splits whose
+    reduction it repeats, and the value projection the grouped decode GEMM
+    computes for these rows. Host values only."""
+    if (
+        tokens < 1
+        or (heads, value_head_dim, kv_lora_rank) != _PROJECTED_VALUE_SHAPE
+        or not _use_dense_mfma_core(
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+    ):
+        return False
+    splits = _select_num_kv_splits(
+        num_tokens=tokens,
+        num_heads=heads,
+        topk_width=topk,
+        max_seqlen_k=topk,
+        is_fp8=q_dtype in _FP8_DTYPES,
+        native_fp8=q_dtype == kv_dtype and q_dtype in _FP8_DTYPES,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+    )
+    return splits > 1 and triton.next_power_of_2(splits) == 32
+
+
+def launch_gluon_dsa_decode_projected_value_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    value_weight: torch.Tensor,
+    *,
+    gate: torch.Tensor | None = None,
+    out: torch.Tensor,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    warm_split_variants: bool = False,
+) -> torch.Tensor:
+    """:func:`launch_gluon_dsa_decode_gfx950`, then the gated value projection
+    of its latent the grouped decode GEMM computes, with the split reduction
+    and the projection in one launch: ``out`` matches bit for bit.
+
+    ``value_weight`` is the K-major ``[heads, kv_lora_rank, value_head_dim]``
+    view of a contiguous ``[heads, value_head_dim, kv_lora_rank]`` weight;
+    ``gate`` (raw, or None) and ``out`` (contiguous) are BF16 ``[tokens, heads
+    * value_head_dim]`` with unit inner stride. Returns ``out``. Raises
+    ``ValueError`` for a size
+    :func:`gluon_dsa_decode_projected_value_supported_gfx950` refuses."""
+    del q_len_per_req, max_seqlen_k
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
+    _check_inputs(
+        q,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        page_size=page_size,
+    )
+    q = _flatten_query(q).contiguous()
+    tokens, heads = q.shape[0], q.shape[1]
+    dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+    weight = value_weight.transpose(1, 2)
+    value = weight.shape[1]
+    if not gluon_dsa_decode_projected_value_supported_gfx950(
+        tokens=tokens,
+        heads=heads,
+        topk=topk_slots.shape[1],
+        q_dtype=q.dtype,
+        kv_dtype=dense_kv.dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        value_head_dim=value,
+    ):
+        raise ValueError(
+            "DSA projected decode needs the dense core's 32 key splits and the "
+            "grouped value GEMM's shape "
+            "(check gluon_dsa_decode_projected_value_supported_gfx950 first)"
+        )
+    rows = (tokens, heads * value)
+    if (
+        tuple(value_weight.shape) != (heads, kv_lora_rank, value)
+        or not weight.is_contiguous()
+        or value_weight.dtype != torch.bfloat16
+        or tuple(out.shape) != rows
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or (
+            gate is not None
+            and (
+                tuple(gate.shape) != rows
+                or gate.dtype != out.dtype
+                or gate.stride(1) != 1
+            )
+        )
+    ):
+        raise ValueError(
+            "DSA projected decode needs a K-major BF16 value weight and BF16 "
+            f"{rows} gate and out rows with unit inner stride"
+        )
+    topk_slots = topk_slots.contiguous()
+    topk_lens = topk_lens.contiguous()
+    num_kv_splits = _select_num_kv_splits(
+        num_tokens=tokens,
+        num_heads=heads,
+        topk_width=topk_slots.shape[1],
+        max_seqlen_k=int(topk_slots.shape[1]),
+        is_fp8=q.dtype in _FP8_DTYPES,
+        native_fp8=q.dtype == dense_kv.dtype and q.dtype in _FP8_DTYPES,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+    )
+    launch = functools.partial(
+        _launch_dense_kv,
+        softmax_scale=float(softmax_scale) * float(k_scale),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=False,
+        lse=None,
+        records=False,
+        workspace=None,
+        num_kv_splits=num_kv_splits,
+    )
+    if warm_split_variants:
+        # One row per block shape compiles every projected reduction serving can reach.
+        blocks = {_projected_value_block(rows) for rows in range(1, tokens + 1)}
+        for block in sorted(blocks):
+            launch(
+                q[:1],
+                dense_kv,
+                topk_slots[:1],
+                topk_lens[:1],
+                None,
+                value_projection=(weight, None if gate is None else gate[:1], out[:1]),
+                projection_block=block,
+            )
+    return launch(
+        q,
+        dense_kv,
+        topk_slots,
+        topk_lens,
+        None,
+        value_projection=(weight, gate, out),
     )
 
 

@@ -294,9 +294,11 @@ Select the transport with `--all2all-backend`:
   and its projection/shared-expert weight placement in one module.
   See [Kimi-K3 Hopper PD](../guides/kimi-k3-hopper-pd.md) for deployment layouts.
 
-For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
+For NVIDIA NVFP4 and MXFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 `--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+MXFP4 experts run FlashInfer's Kimi K3 MegaMoE, which quantizes the BF16 routed
+rows to MXFP8.
 
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
@@ -329,6 +331,7 @@ requires gated MLA with Q-LoRA. TokenSpeed rejects gated MLA without Q-LoRA
 even with replicated projections. MLA Q-B, KV-B, KDA convolution and
 norms keep their existing mapping. Target-model projection settings do not
 change the draft model.
+Kimi-K3.1 sparse MLA (DSA) supports the same QKV and output projection settings.
 
 Each sharded computation restores complete outputs to the original token owner:
 
@@ -347,6 +350,25 @@ norm and local up-projection. Native collectives cover the configured decode
 batch bound including speculative tokens; larger batches retain NCCL.
 Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
+
+Automatic projection fusion uses TP2 or TP4. Column fusion requires input
+widths and output shard widths aligned to 128 channels. Row fusion requires
+input and output widths aligned to `TP × 128` channels. BF16 TP4 sparse-MLA QKV-A
+can fuse with 96-channel shard alignment on SM100 and SM103. This layout pads
+14400 logical outputs to 14592 stored channels and preserves the original order
+and width of the checkpoint and returned logical outputs. With multicast
+memory, the 512-row bucket can use 192-channel GEMM tiles on both architectures.
+
+Block-FP8 and BF16 fusion support SM100 and SM103. A subgroup can span nodes
+within one NVLink domain when every rank can allocate fabric memory.
+The subgroup maximum must be at least 32 physical rows for BF16 column fusion
+and 64 for BF16 row or block-FP8 fusion.
+BF16 fusion uses BF16 operands directly.
+Row GEMM partials round to BF16, then sum in FP32 rank order before final BF16
+rounding. Unsupported configurations use the ordinary projection collectives.
+
+These projection settings apply to DEP; DWDP still requires them to be `1`.
+Shared-expert TP requires BF16 weights.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
 total model memory or latency. Communication and padding can outweigh GEMM

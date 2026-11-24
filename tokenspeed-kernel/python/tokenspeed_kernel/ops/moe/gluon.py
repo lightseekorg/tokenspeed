@@ -3511,6 +3511,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"swiglu", "silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
+        "topk_weights_dtype": frozenset({torch.float32}),
         "supports_deferred_finalize": frozenset({False, True}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),

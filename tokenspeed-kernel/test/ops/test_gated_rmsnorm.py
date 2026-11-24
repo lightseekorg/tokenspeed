@@ -23,11 +23,15 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.layernorm.triton as layernorm_triton
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
-from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
+from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import gated_rmsnorm_kernel
+from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_ROW_BLOCK
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_warmup_covers
 
 platform = current_platform()
 
@@ -36,12 +40,12 @@ pytestmark = pytest.mark.skipif(
     reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
 )
 
-ROWS_PER_PROGRAM = GATED_RMSNORM_ROWS_PER_PROGRAM
+ROWS_PER_ROW_BLOCK = GATED_RMSNORM_ROWS_PER_ROW_BLOCK
 
 
 # Row counts around the per-program row block, including partial last blocks.
 @pytest.mark.parametrize(
-    "rows", [1, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM + 1, 527, 8449]
+    "rows", [1, ROWS_PER_ROW_BLOCK - 1, ROWS_PER_ROW_BLOCK + 1, 527, 8449]
 )
 @pytest.mark.parametrize("width,group_size", [(128, 128), (512, 128), (1024, 1024)])
 @pytest.mark.parametrize("norm_before_gate", [True, False])
@@ -74,7 +78,9 @@ def test_gated_rmsnorm_matches_reference(
 def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
     """A row's output must not depend on which other rows share its program."""
     torch.manual_seed(0)
-    x = torch.randn(4 * ROWS_PER_PROGRAM + 3, 128, device=device, dtype=torch.bfloat16)
+    x = torch.randn(
+        4 * ROWS_PER_ROW_BLOCK + 3, 128, device=device, dtype=torch.bfloat16
+    )
     z = torch.randn_like(x)
     weight = torch.randn(128, device=device, dtype=torch.bfloat16)
     kwargs = dict(
@@ -86,9 +92,191 @@ def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
         weights_independent=True,
     )
     full = gated_rmsnorm(x, weight, z, **kwargs)
-    for row in (0, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM, x.shape[0] - 1):
+    for row in (0, ROWS_PER_ROW_BLOCK - 1, ROWS_PER_ROW_BLOCK, x.shape[0] - 1):
         alone = gated_rmsnorm(x[row : row + 1], weight, z[row : row + 1], **kwargs)
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+def test_gated_rmsnorm_row_blocks_match_one_row_programs(
+    norm_before_gate: bool, device: str
+) -> None:
+    """Every row of a row block equals a one-row, one-warp program bit for bit."""
+    torch.manual_seed(2)
+    x = torch.randn(
+        2048 * ROWS_PER_ROW_BLOCK + 5, 128, device=device, dtype=torch.bfloat16
+    )
+    z = torch.randn_like(x)
+    weight = torch.randn(128, device=device, dtype=torch.bfloat16)
+    out = gated_rmsnorm(
+        x,
+        weight,
+        z,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        sigmoid_gate=False,
+        fp8_scale=None,
+        weights_independent=True,
+    )
+    single = torch.empty_like(x)
+    gated_rmsnorm_kernel[(x.shape[0], 1)](
+        x,
+        single,
+        weight,
+        z,
+        None,
+        x.stride(0),
+        single.stride(0),
+        z.stride(0),
+        x.shape[0],
+        128,
+        1e-6,
+        BLOCK_M=1,
+        BLOCK_N=128,
+        ROW_BLOCKS=1,
+        NORM_BEFORE_GATE=norm_before_gate,
+        SIGMOID_GATE=False,
+        ENABLE_PDL=False,
+        WEIGHTS_INDEPENDENT=True,
+        OUT_FP8=False,
+        SHARED_WEIGHT=False,
+        num_warps=1,
+    )
+    torch.testing.assert_close(out, single, rtol=0, atol=0)
+
+
+def _model_norm_inputs(
+    rows: int, device: str, groups: int = 32
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(rows)
+    x = torch.randn(rows, groups * 128, device=device, generator=generator)
+    # z is the gate slice of a wider projection row, as in the linear-attention block.
+    z = torch.randn(rows, 3 * groups * 128, device=device, generator=generator)
+    z = z[:, 2 * groups * 128 :]
+    weight = 1.0 + 0.1 * torch.randn(128, device=device, generator=generator)
+    return x.bfloat16(), z.bfloat16(), weight.bfloat16()
+
+
+def _model_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return gated_rmsnorm(
+        x,
+        weight,
+        z,
+        eps=1e-6,
+        group_size=128,
+        norm_before_gate=True,
+        sigmoid_gate=True,
+        fp8_scale=None,
+        weights_independent=True,
+    )
+
+
+@pytest.mark.parametrize("rows", [2048, 2049, 2111, 4097, 8449])
+@pytest.mark.parametrize(
+    "norm_before_gate,sigmoid_gate,fp8", [(True, True, False), (False, False, True)]
+)
+def test_gated_rmsnorm_row_loops_match_single_row_blocks(
+    rows: int,
+    norm_before_gate: bool,
+    sigmoid_gate: bool,
+    fp8: bool,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Looping over row blocks writes the same bits as one row block per program."""
+    x, z, weight = _model_norm_inputs(rows, device)
+    kwargs = dict(
+        eps=1e-6,
+        group_size=128,
+        norm_before_gate=norm_before_gate,
+        sigmoid_gate=sigmoid_gate,
+        fp8_scale=torch.tensor(0.05, device=device) if fp8 else None,
+        weights_independent=True,
+    )
+    monkeypatch.setattr(layernorm_triton, "GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM", 0)
+    looped = gated_rmsnorm(x, weight, z, **kwargs)
+    monkeypatch.setattr(
+        layernorm_triton, "GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM", 2**31
+    )
+    single = gated_rmsnorm(x, weight, z, **kwargs)
+    assert torch.equal(looped.view(torch.uint8), single.view(torch.uint8))
+
+
+@pytest.mark.parametrize("groups", [1, 4, 32])
+def test_gated_rmsnorm_loops_only_while_the_looped_grid_fills_the_gpu(
+    groups: int, device: str
+) -> None:
+    target = torch.empty(0, device=device).device
+    sms = torch.cuda.get_device_properties(target).multi_processor_count
+    floor = layernorm_triton.GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM * sms
+    blocks = layernorm_triton.GATED_RMSNORM_ROW_BLOCKS
+    rows_per_loop = ROWS_PER_ROW_BLOCK * blocks
+    # The last row count whose looped grid stays below the floor, and the next one.
+    below = ((floor - 1) // groups) * rows_per_loop
+    row_blocks = layernorm_triton._gated_rmsnorm_row_blocks
+    counts = (8, below, below + 1, 4 * below)
+    chosen = [row_blocks(rows, ROWS_PER_ROW_BLOCK, groups, target) for rows in counts]
+    assert chosen == [1, 1, blocks, blocks]
+    # Rows spanning several warps never loop.
+    assert row_blocks(4 * below, 1, groups, target) == 1
+
+
+def test_gated_rmsnorm_warmup_covers_looping_and_single_block_launches(
+    device: str,
+) -> None:
+    def run(rows: int) -> None:
+        _model_norm(*_model_norm_inputs(rows, device))
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(4)
+
+    # Decode and prefill row counts, both alignment classes of each.
+    assert_warmup_covers(
+        (gated_rmsnorm_kernel.fn,), warm, run, (1, 17, 512, 3001, 16384, 16389)
+    )
+
+
+@pytest.mark.parametrize("rows", [65, 1000, 4097])
+def test_gated_rmsnorm_row_loops_leave_rows_past_the_last_one(
+    rows: int, device: str
+) -> None:
+    """A partial last loop writes its valid rows and nothing after them."""
+    x, z, weight = _model_norm_inputs(rows, device)
+    blocks = layernorm_triton.GATED_RMSNORM_ROW_BLOCKS
+    padded = rows + 3 * ROWS_PER_ROW_BLOCK * blocks
+    outputs = []
+    for row_blocks in (1, blocks):
+        out = torch.full((padded, x.shape[1]), 7.0, device=device, dtype=torch.bfloat16)
+        rows_per_program = ROWS_PER_ROW_BLOCK * row_blocks
+        gated_rmsnorm_kernel[((rows + rows_per_program - 1) // rows_per_program, 32)](
+            x,
+            out,
+            weight,
+            z,
+            None,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0),
+            rows,
+            128,
+            1e-6,
+            BLOCK_M=ROWS_PER_ROW_BLOCK,
+            BLOCK_N=128,
+            ROW_BLOCKS=row_blocks,
+            NORM_BEFORE_GATE=True,
+            SIGMOID_GATE=True,
+            ENABLE_PDL=False,
+            WEIGHTS_INDEPENDENT=True,
+            OUT_FP8=False,
+            SHARED_WEIGHT=True,
+            num_warps=ROWS_PER_ROW_BLOCK,
+        )
+        outputs.append(out)
+    single, looped = outputs
+    assert torch.equal(looped[:rows], single[:rows])
+    assert torch.equal(looped[rows:], torch.full_like(looped[rows:], 7.0))
 
 
 def test_one_group_weight_on_whole_rows_matches_one_row_per_group(device):

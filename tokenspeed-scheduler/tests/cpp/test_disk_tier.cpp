@@ -26,6 +26,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -95,9 +97,10 @@ struct Prompt {
 
 class DiskTierCache {
 public:
-    DiskTierCache(std::vector<CacheGroupSpec> specs, std::int32_t disk_parents, DiskConfig limits = Limits())
+    DiskTierCache(std::vector<CacheGroupSpec> specs, std::int32_t disk_parents, DiskConfig limits = Limits(),
+                  std::int32_t host_parents = 64)
         : device{64, Packing(specs)},
-          host{64, Packing(specs)},
+          host{host_parents, Packing(specs)},
           disk{disk_parents, Packing(specs)},
           coordinator{MakeCoordinator(specs, kGrain, device, /*enable_l3_storage=*/false, &host, &disk,
                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
@@ -125,6 +128,22 @@ public:
         EXPECT_TRUE(coordinator.ClearDeviceCache());
         return keys;
     }
+
+    // A write-back's Host placement of `rows` Full blocks as one segment.
+    HostCache::HostAllocationBatch PlaceSegment(std::size_t rows) {
+        const std::vector<std::uint32_t> groups(rows, 0);
+        const std::vector<std::int32_t> buckets(rows, 0);
+        const std::array segments{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = rows}};
+        return coordinator.Host().AcquireHostSegments(groups, buckets, segments);
+    }
+
+    // Writes keys to the Disk: their Host entries become clean.
+    void CleanAll(std::span<const CacheKey> keys) {
+        const DiskOperation write = Clean(keys);
+        disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    }
+
+    bool OnHost(const CacheKey& key) const { return coordinator.Host().ContainsHostCachedBlock(key); }
 
     // The prompt's keys the Device indexes, Full pages first.
     std::vector<CacheKey> DeviceKeys(const Prompt& prompt) const {
@@ -418,6 +437,63 @@ TEST(DiskTierTest, AStateCheckpointIsCleanedWithItsHistoryAndPrefetchedWithIt) {
     EXPECT_EQ(commands[0].group_ids.size(), 4u);
     cache.disks.Complete(cache::DiskDone{.op_id = read.OperationId(), .success = true});
     EXPECT_EQ(cache.HostHitTokens(prompt), 12) << "the checkpoint resumes the prompt end";
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+// A Host placement drops clean entries -- the Disk holds them too -- before
+// dirty ones, whatever their age (docs/rfcs/0006-disk-tier.md, Invariant 3).
+TEST(DiskTierTest, AWriteBackPlacementDropsANewerCleanPageBeforeAnOlderDirtyOne) {
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16, Limits(), /*host_parents=*/4);
+    const std::vector<CacheKey> dirty = cache.OnHostOnly(Prompt(2, 1));
+    const std::vector<CacheKey> clean = cache.OnHostOnly(Prompt(2, 2));
+    cache.CleanAll(clean);
+    ASSERT_EQ(cache.coordinator.Host().NumFreeLcmBlocks(), 0);
+
+    const HostCache::HostAllocationBatch batch = cache.PlaceSegment(1);
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    EXPECT_FALSE(cache.OnHost(clean[1])) << "the clean leaf leaves, though it is the newest";
+    EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(clean[1]));
+    EXPECT_TRUE(cache.OnHost(clean[0]));
+    EXPECT_TRUE(std::ranges::all_of(dirty, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "no dirty entry is lost while a clean one can make room";
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 1u);
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().lru.blocks, 0u);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+TEST(DiskTierTest, AWriteBackPlacementDropsACleanCheckpointWithItsHistoryBeforeADirtyOne) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16, Limits(), /*host_parents=*/8);
+    const std::vector<CacheKey> dirty = cache.OnHostOnly(Prompt(3, 1));
+    const std::vector<CacheKey> clean = cache.OnHostOnly(Prompt(3, 2));
+    ASSERT_EQ(clean.size(), 4u) << "three pages and the checkpoint at the prompt end";
+    cache.CleanAll(clean);
+    ASSERT_EQ(cache.coordinator.Host().NumFreeLcmBlocks(), 0);
+
+    EXPECT_EQ(cache.PlaceSegment(1).stats.allocated, 1u);
+    EXPECT_TRUE(std::ranges::none_of(clean, [&](const CacheKey& key) { return cache.OnHost(key); }));
+    EXPECT_TRUE(std::ranges::all_of(dirty, [&](const CacheKey& key) { return cache.OnHost(key); }));
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 4u);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+// A checkpoint whose State the Disk holds still ranks as dirty when the
+// victim it becomes would take a Host page the Disk lacks.
+TEST(DiskTierTest, ACleanCheckpointAboveADirtyPageRanksAsDirty) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16, Limits(), /*host_parents=*/8);
+    const std::vector<CacheKey> older = cache.OnHostOnly(Prompt(3, 1));
+    const std::vector<CacheKey> newer = cache.OnHostOnly(Prompt(3, 2));
+    cache.CleanAll(newer);
+    // The newer prompt's root page is dirty again; its checkpoint is not.
+    ASSERT_TRUE(cache.coordinator.Disk().DropUnreadableEntry(newer[0]));
+    ASSERT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(newer.back()));
+
+    EXPECT_EQ(cache.PlaceSegment(1).stats.allocated, 1u);
+    EXPECT_TRUE(std::ranges::all_of(newer, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "taking the newer checkpoint would take its dirty root page along";
+    EXPECT_TRUE(std::ranges::none_of(older, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "the older checkpoint leaves first, by recency";
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 0u);
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().lru.blocks, 4u);
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
 }
 

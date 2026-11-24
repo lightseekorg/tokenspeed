@@ -1,0 +1,28 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-bf16-tp-projection-gb300-slurm
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 1
+  gpus_per_node: 4
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - >-
+      python3 -m pytest -v --junitxml=.ci-artifacts/bf16-tp-projection.xml
+      test/runtime/distributed/test_fused_bf16_tp_projection.py
+      test/runtime/distributed/test_fused_bf16_tp_projection_capacity.py
+      test/runtime/distributed/test_kimi_k31_dsa_bf16_projection_output_lifetime.py
+      && python3 -c 'from xml.etree import ElementTree;
+      report = ElementTree.parse(".ci-artifacts/bf16-tp-projection.xml");
+      assert report.find(".//skipped") is None, "GB300 projection tests must run without skips"'
+report:
+  github_step_summary: true

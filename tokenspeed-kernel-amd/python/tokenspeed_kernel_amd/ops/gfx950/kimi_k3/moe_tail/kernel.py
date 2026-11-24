@@ -78,6 +78,7 @@ from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.next_mix import (
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.oproj import (
     rearm_ar,
     stage_oproj,
+    stage_oproj_third,
     stage_reduce,
 )
 from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail._stages.projections import (
@@ -166,6 +167,10 @@ def gluon_kimi_k3_moe_tail_gfx950(
     mix_s,
     mix_acc,
     mixed,
+    # With GATED_NORM: the attention output's gate logits and norm weight;
+    # else unused.
+    gate,
+    norm_w,
     S: gl.constexpr,
     NB: gl.constexpr,
     RESET: gl.constexpr,
@@ -199,6 +204,9 @@ def gluon_kimi_k3_moe_tail_gfx950(
     FLAGS_OFFSET: gl.constexpr,
     NEXT_MIX: gl.constexpr,
     MIX_EPS: gl.constexpr,
+    GATED_NORM: gl.constexpr,
+    GATE_STRIDE: gl.constexpr,
+    NORM_EPS: gl.constexpr,
 ):
     bid = gl.program_id(0)
     tag = step_tag(epoch, slot)
@@ -237,7 +245,21 @@ def gluon_kimi_k3_moe_tail_gfx950(
     route_expert = gl.allocate_shared_memory(gl.int32, [128], shared)
     route_kof = gl.allocate_shared_memory(gl.int32, [1024], shared)
     if bid >= 56:
-        stage_oproj(core, w_o, xl, red, regions, rank, bid - 56, S)
+        stage_oproj(
+            core,
+            w_o,
+            xl,
+            red,
+            regions,
+            rank,
+            bid - 56,
+            S,
+            gate,
+            norm_w,
+            GATED_NORM,
+            GATE_STRIDE,
+            NORM_EPS,
+        )
         early_x = union.reinterpret(gl.bfloat16, [EARLY], shared)
         peer_parity = gl.load(epoch) % 2
         rlogp_regions = ()
@@ -291,8 +313,26 @@ def gluon_kimi_k3_moe_tail_gfx950(
                 (epoch, own, peers, rank, FLAGS_OFFSET, 8),
             )
     if bid < 56:
+        if bid < 48:
+            # The third round of output groups, ahead of this workgroup's
+            # wait for their reduction: no workgroup runs more than two.
+            stage_oproj_third(
+                core,
+                w_o,
+                xl,
+                red,
+                regions,
+                rank,
+                bid + 400,
+                S,
+                gate,
+                norm_w,
+                GATED_NORM,
+                GATE_STRIDE,
+                NORM_EPS,
+            )
         preloads = slice_loads(
-            prefix_in, blocks, ares_nw, ares_qk, bid, blk_sm, blk_sr, S, NB
+            prefix_in, blocks, ares_nw, ares_qk, in_nw, bid, blk_sm, blk_sr, S, NB
         )
         stage_reduce(ar_own, delta, bid, epoch, own, peers, rank, S, FLAGS_OFFSET)
         stage_slice_delta(
@@ -316,7 +356,7 @@ def gluon_kimi_k3_moe_tail_gfx950(
             scratch + XRDY,
             vals,
             red,
-            in_nw,
+            preloads[4],
             (scratch + XROW).to(gl.pointer_type(gl.bfloat16)),
             bid,
             tag,
@@ -584,6 +624,8 @@ def compile_signature(key: KimiK3MoeTailBuild):
         mix_s="*fp32",
         mix_acc="*fp32",
         mixed="*bf16",
+        gate="*bf16",
+        norm_w="*bf16",
     )
     layout = scratch_layout(key)
     play = peer_layout(key.tokens)
@@ -626,6 +668,9 @@ def compile_signature(key: KimiK3MoeTailBuild):
         "FLAGS_OFFSET": flags_offset(),
         "NEXT_MIX": key.next_mix,
         "MIX_EPS": 0.0 if key.mix_eps is None else key.mix_eps,
+        "GATED_NORM": key.gated_norm,
+        "GATE_STRIDE": key.gate_stride,
+        "NORM_EPS": key.norm_eps,
     }
     return signature, constants
 
@@ -705,6 +750,8 @@ def launch_gluon_kimi_k3_moe_tail_gfx950(
     mix_acc,
     mixed,
     compile_only: bool,
+    gate=None,
+    norm_w=None,
 ):
     """Launch one layer's MoE tail on this rank, for the build ``key``.
 
@@ -752,6 +799,9 @@ def launch_gluon_kimi_k3_moe_tail_gfx950(
             norm weight (BF16 ``[7168]``), its FP32 block partial (maximum and
             sum ``[rows]``, accumulator ``[rows, 7168]``), and the next
             layer's attention input the launch writes (BF16 ``[rows, 7168]``).
+        gate, norm_w: given exactly when ``key.gated_norm``: the attention
+            output's gate logits, BF16 ``[rows, 1536]`` rows ``key.gate_stride``
+            apart with a unit inner stride, and the norm weight, BF16 ``[128]``.
         compile_only: only compile the kernel for these operands, without
             launching it. A launch waits on its peers, so the first launch of
             a build must not wait for one rank's compile; compile every
@@ -816,6 +866,23 @@ def launch_gluon_kimi_k3_moe_tail_gfx950(
         # Unused pointer arguments: typed stand-ins, never read.
         mix_wp = mix_nw = mixed = output
         mix_m = mix_s = mix_acc = bias
+    if (gate is not None or norm_w is not None) != key.gated_norm:
+        raise ValueError("the gate and norm weight are given exactly with gated_norm")
+    if key.gated_norm:
+        if (
+            gate.dtype != bf16
+            or tuple(gate.shape) != (rows, ATTENTION)
+            or gate.stride(1) != 1
+            or gate.stride(0) != key.gate_stride
+        ):
+            raise ValueError(
+                f"The MoE tail reads the gate as BF16 {(rows, ATTENTION)} rows "
+                f"{key.gate_stride} apart, not {gate.dtype} {tuple(gate.shape)} "
+                f"with strides {gate.stride()}"
+            )
+        _check(norm_w, bf16, (128,), "the attention output norm weight")
+    else:
+        gate = norm_w = core
     _, constants = compile_signature(key)
     args = (
         core,
@@ -851,6 +918,8 @@ def launch_gluon_kimi_k3_moe_tail_gfx950(
         mix_s,
         mix_acc,
         mixed,
+        gate,
+        norm_w,
     )
     options = dict(
         num_warps=8, num_stages=1, enable_fp_fusion=False, **compile_options()
