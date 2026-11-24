@@ -2083,19 +2083,33 @@ owner, then the providers, then the engines.
   | Flag | Meaning |
   |---|---|
   | `--address tcp://HOST:PORT` | Where the ranks and providers reach it. There is no authentication: bind it to a cluster-internal address. |
-  | `--num-providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
+  | `--num-providers K` | Provider processes to wait for (a node may run several). The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
   | `--headroom-lcm-blocks H` | When fewer than `H/2` LCM blocks are empty, a write evicts back up to `H` in one pass. |
   | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations, and the owner answers its next request with an error, which stops the rank's engine. A rank pings the owner whenever it has had no release or touch to send for 5 seconds; a ping fails after at most the rank's `request_timeout_ms`, and the engine's loop reads the failure at the head of its next round (an idle rank runs a round about every 10 ms). A running rank that cannot reach the owner therefore stops about 5 seconds plus its `request_timeout_ms` after the owner last heard it: keep `S` well above that, so that it stops before the owner drops its pins, and well above any pause a rank process can take (the frozen rank under *Known limits*). |
   | `--checkpoint-retention-requests R` | `--checkpoint-retention-requests` of the scheduler, counted over the lookups of every rank together, hit or miss. A rank sends one lookup for each new prompt its own GPU cache does not cover already; a prompt it covers sends none and is not counted. A rank's own default is 16 x its batch size; for the pool use about 16 x the sum of the ranks' batch sizes. `0` ranks every entry by its own last use. |
   | `--checkpoint-retention-leaf-distance D` | As the scheduler's option of that name. |
 
 * `provider --owner-address ADDRESS --hostname HOST --device-name NICS --bytes B`: one
-  per node, hosting `B` bytes of pool memory registered for RDMA. A provider
+  or more per node, each a process hosting `B` bytes of pool memory registered
+  for RDMA on the NICs it names. A provider
   announces its memory once, at start, and the owner counts every
   announcement as one provider: a provider that is started again counts as one
   more until `--num-providers` have joined, and is refused after that. The owner
   cannot tell that the earlier one's memory is gone, so restart the owner
   together with a provider.
+
+  A provider does not bind its CPUs or memory to a NUMA node. On a node with
+  several NUMA domains, run one provider per domain under `numactl` and give
+  it the NICs of that domain (`cat /sys/class/infiniband/NIC/device/numa_node`),
+  so that a provider's memory and the NICs that read and write it are in one
+  domain. `--num-providers` counts each of these processes:
+
+  ```bash
+  numactl --cpunodebind=0 --membind=0 python -m tokenspeed.runtime.cache.shared_l2 provider \
+      --owner-address tcp://HOST:PORT --hostname NODE --device-name mlx5_0,mlx5_1 --bytes B
+  numactl --cpunodebind=1 --membind=1 python -m tokenspeed.runtime.cache.shared_l2 provider \
+      --owner-address tcp://HOST:PORT --hostname NODE --device-name mlx5_2,mlx5_3 --bytes B
+  ```
 
 The owner keeps everything in memory, and a provider announces its memory
 only when it starts: a restarted owner waits for new providers and knows none
