@@ -113,10 +113,13 @@ def create_layer_weights(
         return
 
     if quant_kind == "nvfp4":
+        from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4PerExpertConfig
+
         create_nvfp4_weight_pair(
             spec,
             layer,
             group_size=quant_config.group_size,
+            per_expert_fc1=isinstance(quant_config, Nvfp4PerExpertConfig),
         )
         return
 

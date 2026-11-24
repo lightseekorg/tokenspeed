@@ -43,6 +43,7 @@ holds (``V41Metadata.global_write_floor``).
 """
 
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -312,6 +313,15 @@ def zeroed_fused_output(
 
 
 @dataclass
+class V41QueryRows:
+    # Keep the source tensors alive: their identities key these per-forward views.
+    source_positions: torch.Tensor
+    source_requests: torch.Tensor
+    positions: torch.Tensor
+    request_indices: torch.Tensor
+
+
+@dataclass
 class V41IndexGeometry:
     # positions, request_indices and source_table are never read back: they
     # pin the tensors whose id()s key the per-invocation geometry cache, so a
@@ -376,11 +386,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_views_by_shape: dict[tuple[int, int], V41Metadata] = {}
         self._decode_buffers: V41Metadata | None = None
         self._max_decode_bs = 0
-        self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
+        self._swa_plans: dict[
+            tuple[ForwardMode, int, QueryShardPlan | None], V41SWAQueryPlan
+        ] = {}
+        self._query_row_views: dict[tuple[int, int, QueryShardPlan], V41QueryRows] = {}
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
         self._decoder_view: V41DecoderView | None = None
         self._prefill_query_shard: V41PrefillQueryShard | None = None
         self._decode_schedule_keepalive: list[object] = []
+        self._attention_kernel_schedule: object | None = None
         # One native decode schedule per distinct (SWA lengths, global lengths)
         # pair within a forward; layers reusing a selection share it.
         self._decode_schedules: dict[
@@ -468,6 +482,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._local_decode_selections.clear()
         self._prepared_selections.clear()
         self._prepared_swa_writes.clear()
+        self._query_row_views.clear()
         self._index_geometry.clear()
 
     def init_cuda_graph_state(
@@ -590,6 +605,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
         self._prepared_swa_writes.clear()
+        self._query_row_views.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -786,6 +802,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_kv_batch = None
         self._prepared_selections.clear()
         self._prepared_swa_writes.clear()
+        self._query_row_views.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -1437,6 +1454,25 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             index_k, self.cache_pool.index_k(owner), slots, self.index_format
         )
 
+    def _local_query_rows(self, positions, requests, plan: QueryShardPlan):
+        """Keep one local row identity across selection producers and consumers.
+
+        New slices alias the same values but defeat the identity-based reuse of
+        Top-K slots/candidates. Cache views, never their computed values, and
+        discard them on metadata refresh (including page/slot reuse).
+        """
+        key = (id(positions), id(requests), plan)
+        rows = self._query_row_views.get(key)
+        if rows is None:
+            rows = V41QueryRows(
+                positions,
+                requests,
+                positions[plan.local_row_ids],
+                requests[plan.local_row_ids],
+            )
+            self._query_row_views[key] = rows
+        return rows.positions, rows.request_indices
+
     def _selection_rows(self, record, positions, requests):
         if positions is record.positions and requests is record.request_indices:
             return torch.arange(positions.numel(), device=positions.device).masked_fill(
@@ -1543,8 +1579,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError(
                     "Model QCP selection requires its canonical source window"
                 )
-            positions = positions[query_shard.local_row_ids]
-            request_indices = request_indices[query_shard.local_row_ids]
+            positions, request_indices = self._local_query_rows(
+                positions, request_indices, query_shard
+            )
         owner, source = self.spec.kv_owners[layer_id], self.spec.index_sources[layer_id]
         if owner < 0:
             if index_q is not None or index_weights is not None:
@@ -2167,6 +2204,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 SWA source rows disagree with the query shard")
             if self._window(positions, requests, forward_mode) is None:
                 raise ValueError("V4.1 sharded SWA requires a canonical source window")
+            local_positions, local_requests = self._local_query_rows(
+                positions, requests, query_shard
+            )
+            key = (forward_mode, id(positions), query_shard)
+            cached = self._swa_plans.get(key)
+            if (
+                cached is not None
+                and cached.positions is local_positions
+                and cached.request_indices is local_requests
+            ):
+                return cached
             source = self._swa_query_plan(
                 positions, requests, forward_mode, query_shard=None
             )
@@ -2189,12 +2237,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                         current_rows=rows,
                     )
                 )
-            return V41SWAQueryPlan(
-                positions[query_shard.local_row_ids],
-                requests[query_shard.local_row_ids],
+            result = V41SWAQueryPlan(
+                local_positions,
+                local_requests,
                 tuple(plans),
             )
-        key = (forward_mode, id(positions))
+            self._swa_plans[key] = result
+            return result
+        key = (forward_mode, id(positions), None)
         plan = self._swa_plans.get(key)
         if (
             plan is not None
@@ -2471,7 +2521,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         entry = self._decode_schedules.get(key)
         if entry is not None and entry[0] is swa_lens and entry[1] is global_lens:
             return entry[2]
-        schedule = dsv41.new_attention_schedule()
+        schedule = dsv41.new_attention_schedule(
+            previous=self._attention_kernel_schedule
+        )
+        self._attention_kernel_schedule = schedule
         if schedule is not None:
             self._decode_schedules[key] = (swa_lens, global_lens, schedule)
             if torch.cuda.is_current_stream_capturing():
@@ -2592,8 +2645,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             source_window = self._window(positions, request_indices, forward_mode)
             if source_window is None:
                 raise ValueError("V4.1 sharded SWA requires a canonical source window")
-            positions = positions[key_rows.plan.local_row_ids]
-            request_indices = request_indices[key_rows.plan.local_row_ids]
+            positions, request_indices = self._local_query_rows(
+                positions, request_indices, key_rows.plan
+            )
         n = positions.numel()
         if (
             n > self.spec.max_query_tokens
@@ -2854,8 +2908,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
-        layout = self._prefill_layout(plan, owner, forward_mode)
-        prefixes = dsv41.cache_gather(cache, layout.prefix_slots, self.swa_format, None)
+        # The native reader addresses [old prefix | current] directly. Only a
+        # single contiguous, unsharded request shares those row coordinates.
+        native_request = (
+            plan.requests[0]
+            if len(plan.requests) == 1
+            and isinstance(plan.requests[0].rows, slice)
+            and plan.requests[0].rows == slice(0, q.shape[0])
+            and key_rows is None
+            and self.kvp_size == 1
+            and len(self.spec.attention_query_group) == 1
+            and fused_decode_groups is None
+            and q.is_cuda
+            and os.environ.get("TOKENSPEED_ENABLE_SM120_PAGED_PREFILL") == "1"
+            else None
+        )
+        layout = None
+        if native_request is None:
+            layout = self._prefill_layout(plan, owner, forward_mode)
+            prefix_slots = layout.prefix_slots
+        else:
+            prefix_slots = native_request.prefix_slots
+        prefixes = dsv41.cache_gather(cache, prefix_slots, self.swa_format, None)
         if swa_rope_cache is None:
             current = dsv41.cache_unpack(
                 dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
@@ -2873,6 +2947,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 swa_norm_weight,
                 swa_norm_eps,
             )
+        if native_request is not None:
+            out = dsv41.try_paged_prefill(
+                q,
+                prefixes,
+                current,
+                native_request.swa_indices,
+                global_cache,
+                global_slots if owner >= 0 else None,
+                global_lens if owner >= 0 else None,
+                attn_sink,
+                softmax_scale,
+                None,
+                None,
+            )
+            if out is not None:
+                if swa_rope_cache is None:
+                    dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+                if out_rope_cache is not None:
+                    dsv41.rope_inplace(out, positions, out_rope_cache, None)
+                return out
+            layout = self._prefill_layout(plan, owner, forward_mode)
         logical_rows = None
         if owner >= 0:
             record = self.sparse_topk.prefill

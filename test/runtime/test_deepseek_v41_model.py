@@ -169,6 +169,8 @@ def _config():
         hc_sinkhorn_iters=3,
         hc_eps=1e-6,
         engram_layer_ids=[1, 14],
+        engram_embed_quant="mxfp8",
+        moe_quant_algo=None,
         engram_num_embeddings=[72, 204],
         engram_max_ngram_size=4,
         engram_vocab_size=5,
@@ -254,6 +256,7 @@ class _DenseFFN(nn.Module):
         )
         self.shared_experts = None
         self.use_mega_moe = False
+        self.use_sm120_deepep = False
         self.owns_ep_communication = False
         self.use_gluon_petit = False
         self.gate = nn.Module()
@@ -858,6 +861,56 @@ def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
     )
     with pytest.raises(ValueError, match="requires --disable-prefill-graph"):
         DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize("sm120", [False, True])
+def test_qcp_constructor_registers_only_its_sm120_count_group(monkeypatch, sm120):
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    class Expert(_DenseFFN):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.use_sm120_deepep = sm120
+            self.owns_ep_communication = sm120
+
+    manager = ProcessGroupManager()
+    created = []
+
+    def new_group(ranks, *, backend, timeout):
+        group = object()
+        created.append((tuple(ranks), backend, group))
+        return group
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(v41, "pg_manager", manager)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", Expert)
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=8,
+        attn_tp_size=8,
+        attn_qcp_size=8,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=8,
+    )
+    with torch.device("meta"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+    assert len(created) == int(sm120)
+    assert (
+        manager.has_process_group("gloo", tuple(range(8)), name="v41_decoder_counts")
+        is sm120
+    )
+    assert not manager.has_process_group("gloo", tuple(range(8)))
+    if sm120:
+        assert created[0][:2] == (tuple(range(8)), "gloo")
+        assert (
+            manager.get_process_group(
+                "gloo", tuple(range(8)), name="v41_decoder_counts"
+            )
+            is created[0][2]
+        )
 
 
 def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
@@ -4548,6 +4601,7 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     )
     moe.hash_indices_dtype = torch.int64
     moe.use_mega_moe = False
+    moe.use_sm120_deepep = False
     moe.use_gluon_petit = False
     empty = logits[:0]
     target = torch.empty_like(empty)
@@ -5069,3 +5123,281 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+@pytest.mark.parametrize("maximum", [1, 43, 127, 128, 129, 171, 257])
+@pytest.mark.parametrize(
+    "backend,all_decode", [("elastic", False), ("elastic", True), ("cake", False)]
+)
+def test_sm120_ep_capacity_agrees_with_idle_and_decode_peers(
+    monkeypatch, maximum, backend, all_decode
+):
+    from tokenspeed_kernel.thirdparty.deepep_sm120_experiment import (
+        deepep_flashinfer_fp8_opt as transport,
+    )
+
+    from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    # Only GPU transport and checkpoint-sized experts are replaced. Exercise
+    # the actual forward's chunking with the contexts used by the executor.
+    capacities = []
+
+    def communicate(buffer, x, state, ids, weights, **kwargs):
+        capacities.append(kwargs["num_max_tokens_per_rank"])
+        return x.clone()
+
+    def route(self, x, ids):
+        return StandardTopKOutput(
+            torch.ones((len(x), 1)), torch.zeros((len(x), 1), dtype=torch.int32), None
+        )
+
+    monkeypatch.setattr(transport, "apply_deepep_flashinfer", communicate)
+    monkeypatch.setattr(v41.DeepseekV41MoE, "_compute_topk_output", route)
+    monkeypatch.setattr(v4.DeepseekV4MoE, "_compute_topk_output", route)
+    moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+    nn.Module.__init__(moe)
+    moe.use_sm120_deepep = True
+    moe.use_sm120_cake = backend == "cake"
+    moe.sm120_shared_overlap = False
+    moe.sm120_deepep_buffer = None if moe.use_sm120_cake else object()
+    state = None
+    if moe.use_sm120_cake:
+
+        def run(x, ids, weights, capacity):
+            capacities.append(capacity)
+            return x.clone()
+
+        state = SimpleNamespace(capacity=128, run=run)
+    moe.experts = SimpleNamespace(_moe_backend_state=state, num_experts=384)
+    moe.stream_fork = StreamFork(None)
+    moe.n_shared_experts = None
+    moe.shared_experts = None
+    rank_capacities = []
+    # The idle rank has DECODE locally even in a collective prefill round.
+    for rows, mode in (
+        (maximum, ForwardMode.DECODE if all_decode else ForwardMode.EXTEND),
+        (0, ForwardMode.DECODE),
+        (1, ForwardMode.DECODE),
+    ):
+        capacities.clear()
+        x = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8)
+        ctx = (
+            _ctx(None, rows, mode)
+            if rows
+            else ForwardContext(
+                attn_backend=None,
+                token_to_kv_pool=None,
+                bs=0,
+                num_extends=0,
+                input_num_tokens=0,
+                forward_mode=ForwardMode.DECODE,
+                output_layout=ForwardOutputLayout(0, 0, 0, 1),
+            )
+        )
+        ctx.all_decode_or_idle = all_decode
+        output = moe(x, None, maximum + 1, maximum, ctx=ctx)
+        torch.testing.assert_close(output, x, atol=0, rtol=0)
+        rank_capacities.append(tuple(capacities))
+    expected = tuple(min(128, maximum - start) for start in range(0, maximum, 128))
+    assert rank_capacities == [expected] * 3
+
+
+@pytest.mark.parametrize("total", [5, 11])
+def test_qcp_multimodal_embeddings_and_router_mask_keep_packed_span_offsets(
+    monkeypatch, total
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.multimodal.embedder import MultimodalEmbedder
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalForwardContext,
+        MultimodalInputs,
+    )
+
+    monkeypatch.delenv("TOKENSPEED_EXPERIMENT_SM120_DEEPEP", raising=False)
+    model = _loader_model(monkeypatch, _loader_config(), 0, "cpu")
+    embedding = nn.Embedding(128, 128)
+    with torch.no_grad():
+        embedding.weight.copy_(torch.arange(128).float()[:, None].expand(-1, 128))
+    model.model.embed_tokens = embedding
+    model.vision_embedder = MultimodalEmbedder()
+    ids = torch.arange(total, dtype=torch.int64)
+    expected = embedding(ids).detach()
+    expected[1:3] = torch.tensor([11.0, 12.0])[:, None]
+    expected[3:5] = torch.tensor([22.0, 23.0])[:, None]
+    expected_mask = torch.zeros(total, dtype=torch.bool)
+    expected_mask[1:5] = True
+    # Only the absent process group is substituted. The real embedder clips
+    # both requests' spans, consumes cached encoder rows and assembles inputs.
+    monkeypatch.setattr(
+        v41, "token_all_gather_rows", lambda *args: plan.to_gather_order(ids[:, None])
+    )
+    actual, masks = [], []
+    for rank in range(8):
+        mapping = Mapping(
+            rank=rank,
+            world_size=8,
+            attn_tp_size=8,
+            attn_qcp_size=8,
+            dense_tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=8,
+        )
+        model.mapping = mapping
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total,
+            input_lengths=[3, total - 3],
+            size=8,
+            rank=rank,
+            device="cpu",
+        )
+        first = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=1,
+            offsets=[(1, 2)],
+            encoded=torch.tensor([11.0, 12.0])[:, None].expand(-1, 128).clone(),
+        )
+        second = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=2,
+            offsets=[(1, 3)],
+            encoded=torch.tensor([21.0, 22.0, 23.0])[:, None].expand(-1, 128).clone(),
+        )
+        mm = MultimodalForwardContext(
+            mm_inputs=[
+                MultimodalInputs(mm_items=[first]),
+                MultimodalInputs(mm_items=[second]),
+            ],
+            extend_prefix_lens=[0, 2],
+            extend_seq_lens=[3, total - 3],
+            max_encoder_tokens=32,
+        )
+        ctx = _ctx(None, total, ForwardMode.EXTEND)
+        ctx.query_shard = plan
+        kwargs = model.prepare_model_kwargs(
+            ctx, ids[plan.local_row_ids], {"multimodal_context": mm}
+        )
+        torch.testing.assert_close(kwargs["input_embeds"], expected[plan.local_row_ids])
+        torch.testing.assert_close(
+            kwargs["image_mask"], expected_mask[plan.local_row_ids]
+        )
+        actual.append(kwargs["input_embeds"])
+        masks.append(kwargs["image_mask"])
+    torch.testing.assert_close(plan.to_span_order(torch.cat(actual)), expected)
+    torch.testing.assert_close(
+        plan.to_span_order(torch.cat(masks)[:, None]).flatten(), expected_mask
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("mixed_config", [False, True])
+def test_nvfp4_checkpoint_keeps_local_expert_scales(
+    monkeypatch, tmp_path, rank, reverse, mixed_config
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    config = _loader_config()
+    config.n_routed_experts = 8
+    config.moe_quant_algo = "NVFP4"
+    config.hidden_size = 256
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    monkeypatch.setattr(v41.pg_manager, "init_process_group", lambda *a, **kw: None)
+    mapping = Mapping(
+        rank=rank,
+        world_size=4,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=4,
+    )
+    _mock_loader_hardware(monkeypatch, mapping)
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENT_SM120_DEEPEP", "1")
+    monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
+    for module in (v41, v4, expert_module):
+        monkeypatch.setattr(module, "get_moe_backend", lambda: MoeBackend("flashinfer"))
+    # Only hardware kernel selection and process groups are absent on CPU.
+    monkeypatch.setattr(
+        expert_module,
+        "kernel_moe_plan",
+        lambda *args, **kwargs: {
+            "solution": "flashinfer",
+            "apply_kernel_name": "flashinfer_sm12x_nvfp4_moe_apply",
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
+            "weight_preprocessor": None,
+            "warmup": None,
+        },
+    )
+    raw_quant = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "quant_algo": "MIXED_PRECISION",
+        "moe_quant_algo": "NVFP4",
+        "group_size": 16,
+        "quantized_layers": {
+            f"layers.{i}.ffn.experts": {"quant_algo": "NVFP4", "group_size": 16}
+            for i in range(config.num_hidden_layers)
+        },
+    }
+    quant = v41.ModelOptMixedConfig.from_config(raw_quant) if mixed_config else _quant()
+    with set_default_torch_dtype(torch.bfloat16), torch.device("cpu"):
+        model = DeepseekV41ForCausalLM(
+            SimpleNamespace(text_config=config, quantization_config=raw_quant),
+            mapping,
+            quant,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+    assert isinstance(model.quant_config, v41.Fp8Config)
+    assert model.quant_config.weight_block_size == [32, 32]
+    weights = _checkpoint(config)
+    for layer in range(config.num_hidden_layers):
+        for expert in range(config.n_routed_experts):
+            for shard in ("w1", "w3", "w2"):
+                p = f"layers.{layer}.ffn.experts.{expert}.{shard}"
+                codes = weights[p + ".weight"].view(torch.uint8)
+                weights[p + ".weight"] = codes
+                del weights[p + ".scale"]
+                n, kp = codes.shape
+                weights[p + ".weight_scale"] = torch.full(
+                    (n, kp // 8),
+                    0.5 + expert / 8,
+                    dtype=torch.float32,
+                ).to(torch.float8_e4m3fn)
+                weights[p + ".weight_scale_2"] = torch.tensor(
+                    (expert + 1) / 1000,
+                    dtype=torch.float32,
+                )
+                weights[p + ".input_scale"] = torch.tensor(
+                    (expert + 1) / (200 if shard == "w2" else 100),
+                    dtype=torch.float32,
+                )
+    rest = _bind_engram_tables(model, weights, tmp_path)
+    items = list(rest.items())
+    model.load_weights(reversed(items) if reverse else items)
+    local = slice(2 * rank, 2 * rank + 2)
+    for layer in model.model.layers:
+        experts = layer.ffn.experts
+        values = torch.arange(1, 9, dtype=torch.float32)[local]
+        torch.testing.assert_close(
+            experts.w13_input_scale, values / 100, atol=0, rtol=0
+        )
+        torch.testing.assert_close(experts.w2_input_scale, values / 200, atol=0, rtol=0)
+        torch.testing.assert_close(
+            experts.w13_weight_scale_2,
+            (values / 1000)[:, None].expand(-1, 2),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            experts.w2_weight_scale_2, values / 1000, atol=0, rtol=0
+        )
+        assert experts.w13_weight.dtype == experts.w2_weight.dtype == torch.uint8

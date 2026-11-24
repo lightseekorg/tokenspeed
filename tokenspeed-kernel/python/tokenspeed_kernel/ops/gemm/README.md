@@ -388,3 +388,13 @@ The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
 and rejects unsupported scale arguments. Its cached callable uses runtime row
 counts, so changing M does not add specializations. The provider is optional;
 builds without this FlashInfer module retain the existing registered kernels.
+
+## SM120 group-32 MXFP8
+
+`deepgemm_mm_mxfp8_sm120` reads original E4M3 weights and G32 UE8M0 scales.
+`prepare_mxfp8_weight_scales(..., solution="deepgemm")` packs weight scales
+once when SM120 and the selected backend admit the layout. The int32 packed
+weight scales remain distinct from FlashInfer's uint8 swizzled layout.
+Activation scales retain the canonical row contract unless a producer and
+consumer explicitly agree on another layout. [Private Triton helpers](_triton/README.md)
+include optional scale packing.

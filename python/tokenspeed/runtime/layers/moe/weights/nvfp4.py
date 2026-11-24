@@ -39,6 +39,7 @@ def create_nvfp4_weight_pair(
     layer: nn.Module,
     *,
     group_size: int,
+    per_expert_fc1: bool,
 ) -> None:
     ispp = spec.intermediate_size // spec.tp_size
     w13_rows = 2 * ispp if spec.gated else ispp
@@ -96,7 +97,10 @@ def create_nvfp4_weight_pair(
         requires_grad=False,
     )
     w13_input_scale = torch.nn.Parameter(
-        torch.zeros(1, dtype=torch.float32), requires_grad=False
+        torch.zeros(
+            spec.num_local_experts if per_expert_fc1 else 1, dtype=torch.float32
+        ),
+        requires_grad=False,
     )
     # The second GEMM reads each expert's own intermediate rows, so its activation
     # scale stays per expert; collapsing it would quantize most experts far too coarsely.
@@ -118,7 +122,16 @@ def create_nvfp4_weight_pair(
         w13_weight_scale_2, {"weight_loader": load_per_tensor_weight_scale}
     )
     set_weight_attrs(w2_weight_scale_2, {"weight_loader": load_per_tensor_weight_scale})
-    set_weight_attrs(w13_input_scale, {"weight_loader": load_per_tensor_input_scale})
+    set_weight_attrs(
+        w13_input_scale,
+        {
+            "weight_loader": (
+                load_per_expert_input_scale
+                if per_expert_fc1
+                else load_per_tensor_input_scale
+            )
+        },
+    )
     set_weight_attrs(w2_input_scale, {"weight_loader": load_per_expert_input_scale})
 
 

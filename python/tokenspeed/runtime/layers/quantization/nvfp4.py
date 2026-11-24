@@ -115,6 +115,10 @@ class Nvfp4Config(QuantizationConfig):
         return []
 
 
+class Nvfp4PerExpertConfig(Nvfp4Config):
+    """NVFP4 experts with distinct calibrated FC1 and FC2 activation scales."""
+
+
 class Nvfp4W4A16Config(Nvfp4Config):
     """Per-layer config for weight-only ModelOpt NVFP4 projections."""
 

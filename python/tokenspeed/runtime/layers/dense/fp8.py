@@ -285,7 +285,11 @@ class Fp8LinearMethod(LinearMethodBase):
             or layer.weight_scale_inv.dtype != torch.uint8
         ):
             return
-        prepared = prepare_mxfp8_weight_scales(layer.weight, layer.weight_scale_inv)
+        prepared = prepare_mxfp8_weight_scales(
+            layer.weight,
+            layer.weight_scale_inv,
+            solution=global_server_args_dict["dense_gemm_backend"],
+        )
         cached = self.prepared_weight_scales
         if cached is None:
             self.prepared_weight_scales = prepared

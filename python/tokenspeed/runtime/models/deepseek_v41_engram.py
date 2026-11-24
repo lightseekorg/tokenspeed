@@ -22,7 +22,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4.1 Engram, with caller-owned history and FP8-resident tables.
+"""DeepSeek V4.1 Engram, with caller-owned history and packed FP8 or MXFP4 tables.
 
 Integration contract:
 * Construct one EngramHashState from the text config and the actual tokenizer.
@@ -64,11 +64,14 @@ from __future__ import annotations
 import atexit
 import ctypes
 import ctypes.util
+import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -107,7 +110,7 @@ _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
 
 
 def is_engram_embed_checkpoint_name(name: str) -> bool:
-    """True for the two huge FP8 table tensors that must not be load_file'd."""
+    """True for the two huge packed table tensors that must not be load_file'd."""
     return name.endswith(_ENGRAM_EMBED_SUFFIXES)
 
 
@@ -683,8 +686,69 @@ def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     )
 
 
+def _dequant_fp4_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode gathered MXFP4 rows; never expand the resident embedding table."""
+    bits = torch.stack((codes & 15, codes >> 4), dim=-1).flatten(-2).long()
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=codes.device,
+        dtype=torch.float32,
+    )
+    values = levels[bits & 7] * torch.where((bits & 8) != 0, -1.0, 1.0)
+    scale = scales.view(torch.uint8).view(torch.float8_e8m0fnu).float()
+    return (
+        (values.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1))
+        .flatten(-2)
+        .to(torch.bfloat16)
+    )
+
+
+class EngramFileSlice:
+    """Read complete packed rows without mmap faults; metadata is validated by safe_open."""
+
+    def __init__(self, path: str, name: str, tensor_slice):
+        self._path: str = path
+        self._shape: tuple[int, int] = tuple(tensor_slice.get_shape())
+        with open(path, "rb") as source:
+            header_size = struct.unpack("<Q", source.read(8))[0]
+            entry = json.loads(source.read(header_size))[name]
+        dtypes = {
+            "U8": torch.uint8,
+            "F8_E4M3": torch.float8_e4m3fn,
+            "F8_E8M0": torch.float8_e8m0fnu,
+        }
+        if entry["dtype"] not in dtypes:
+            raise TypeError("Engram file rows must contain packed byte dtypes")
+        self._dtype: torch.dtype = dtypes[entry["dtype"]]
+        self._offset: int = 8 + header_size + entry["data_offsets"][0]
+
+    def get_shape(self) -> tuple[int, int]:
+        return self._shape
+
+    def __getitem__(self, key) -> torch.Tensor:
+        rows, columns = key
+        if rows.step not in (None, 1) or columns != slice(None):
+            raise ValueError("Engram file reads require contiguous complete rows")
+        start = 0 if rows.start is None else rows.start
+        stop = self._shape[0] if rows.stop is None else rows.stop
+        data = torch.empty(
+            (stop - start, self._shape[1]), dtype=torch.uint8, device="cpu"
+        )
+        view = memoryview(data.numpy()).cast("B")
+        # Independent descriptors preserve readahead for concurrent row chunks.
+        with open(self._path, "rb", buffering=0) as source:
+            source.seek(self._offset + start * self._shape[1])
+            done = 0
+            while done < len(view):
+                count = source.readinto(view[done : done + 4 * 1024**2])
+                if not count:
+                    raise EOFError("Safetensors row ended before its declared extent")
+                done += count
+        return data.view(self._dtype)
+
+
 class RowShardedEngramEmbedding(nn.Module):
-    """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
+    """Packed MX codes and raw E8M0 scale bytes, GPU or host-resident."""
 
     def __init__(
         self,
@@ -696,6 +760,7 @@ class RowShardedEngramEmbedding(nn.Module):
         host_layout: str,
         host_alloc: EngramHostAlloc | None,
         layer_id: int,
+        storage_format: str,
     ):
         super().__init__()
         if (
@@ -722,6 +787,21 @@ class RowShardedEngramEmbedding(nn.Module):
             raise ValueError("GPU Engram tables require host_layout='gpu'")
         elif host_alloc is not None:
             raise ValueError("GPU Engram tables take no host allocation")
+        if storage_format not in ("mxfp8", "mxfp4"):
+            raise ValueError("Unsupported Engram storage format")
+        if (
+            storage_format == "mxfp4"
+            and mapping.attn.tp_size > 1
+            and host_layout != "shared"
+        ):
+            raise ValueError(
+                "MXFP4 multi-rank Engram requires shared packed host tables"
+            )
+        self.storage_format = storage_format
+        weight_width = (
+            embedding_dim // 2 if storage_format == "mxfp4" else embedding_dim
+        )
+        weight_dtype = torch.uint8 if storage_format == "mxfp4" else torch.float8_e4m3fn
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
@@ -733,8 +813,10 @@ class RowShardedEngramEmbedding(nn.Module):
         # A host table holding every row its rank looks up (one shared copy, or
         # a single attention-TP rank) needs no reduction, so its rows can feed
         # wkv as MXFP8 directly.
-        self.serves_mxfp8_rows = host_table and (
-            host_layout == "shared" or mapping.attn.tp_size == 1
+        self.serves_mxfp8_rows = (
+            storage_format == "mxfp8"
+            and host_table
+            and (host_layout == "shared" or mapping.attn.tp_size == 1)
         )
         row_sharded = (not host_table) or host_layout == "sharded"
         if row_sharded:
@@ -767,7 +849,7 @@ class RowShardedEngramEmbedding(nn.Module):
         if host_table:
             packed_shape = (
                 self.part_num_embeddings,
-                embedding_dim + embedding_dim // 32,
+                weight_width + embedding_dim // 32,
             )
             packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
             if host_layout == "shared" and torch.device(device).type != "meta":
@@ -786,18 +868,18 @@ class RowShardedEngramEmbedding(nn.Module):
                     packed_shape, packed_bytes, device, shared_file, layer_id
                 )
             self.weight = nn.Parameter(
-                self.packed[:, :embedding_dim].view(torch.float8_e4m3fn),
+                self.packed[:, :weight_width].view(weight_dtype),
                 requires_grad=False,
             )
             self.scale = nn.Parameter(
-                self.packed[:, embedding_dim:], requires_grad=False
+                self.packed[:, weight_width:], requires_grad=False
             )
         else:
             self.weight = nn.Parameter(
                 torch.empty(
                     self.part_num_embeddings,
-                    embedding_dim,
-                    dtype=torch.float8_e4m3fn,
+                    weight_width,
+                    dtype=weight_dtype,
                     device=device,
                 ),
                 requires_grad=False,
@@ -895,8 +977,10 @@ class RowShardedEngramEmbedding(nn.Module):
                     "Engram scales must be E8M0 or raw uint8 exponent bytes"
                 )
             rows = rows.view(torch.uint8)
-        elif rows.dtype != torch.float8_e4m3fn:
-            raise TypeError("Engram table weights must stay FP8 E4M3")
+        elif rows.dtype != param.dtype:
+            raise TypeError(
+                f"Engram {self.storage_format} weights must stay {param.dtype}"
+            )
         param.data[local_start : local_start + rows.shape[0]].copy_(rows)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -925,29 +1009,44 @@ class RowShardedEngramEmbedding(nn.Module):
             )
         self._copy_rows(param, loaded_weight, 0)
 
-    def load_sharded(self, parameter_name: str, tensor_slice, chunk_rows: int) -> None:
-        """Copy table rows from a CPU safetensors get_slice() in bounded chunks.
-
-        GPU and host-sharded tables copy only this rank's rows. Shared host
-        tables copy every row on the writer rank; followers map the same memory.
-        Args: parameter_name is 'weight' or 'scale'; tensor_slice is the global
-        checkpoint tensor's lazy CPU slice; chunk_rows bounds transient host
-        storage. No full tensor, remote shard, or BF16 table is allocated.
-        Returns: None; the caller records the corresponding parameter as loaded.
-        """
-        if parameter_name not in ("weight", "scale") or chunk_rows < 1:
-            raise ValueError("Expected weight/scale and a positive row chunk size")
+    def load_sharded(
+        self, parameter_name: str, tensor_slice, chunk_rows: int, *, read_workers: int
+    ) -> None:
+        """Load weight/scale rows from a CPU slice, at most read_workers chunks at once."""
+        if (
+            parameter_name not in ("weight", "scale")
+            or chunk_rows < 1
+            or read_workers < 1
+        ):
+            raise ValueError(
+                "Expected weight/scale, positive chunk rows and read workers"
+            )
         if self.host_table and not self._shared_writer:
             return
         param = getattr(self, parameter_name)
         if tuple(tensor_slice.get_shape()) != (self.num_embeddings, param.shape[1]):
             raise ValueError("Checkpoint Engram shape does not match the global table")
-        for start in range(self.row_start, self.row_end, chunk_rows):
+        if read_workers > 1 and param.device.type != "cpu":
+            raise ValueError("Parallel Engram loading requires a CPU destination")
+
+        def copy_chunk(start: int) -> None:
             end = min(start + chunk_rows, self.row_end)
             rows = tensor_slice[start:end, :]
             if rows.device.type != "cpu":
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
+
+        if read_workers == 1:
+            for start in range(self.row_start, self.row_end, chunk_rows):
+                copy_chunk(start)
+            return
+        # Bound queued chunks as well as active reads.
+        with ThreadPoolExecutor(max_workers=read_workers) as pool:
+            window_rows = chunk_rows * read_workers
+            for window in range(self.row_start, self.row_end, window_rows):
+                stop = min(window + window_rows, self.row_end)
+                for _ in pool.map(copy_chunk, range(window, stop, chunk_rows)):
+                    pass
 
     def mxfp8_rows(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather CUDA [T, hash columns] IDs as the MXFP8 input of wkv.
@@ -985,13 +1084,16 @@ class RowShardedEngramEmbedding(nn.Module):
                     indices, self.tp_group, list(query_shard.row_counts)
                 )
         if indices.is_cuda and not self.host_table:
-            from tokenspeed_kernel.ops.embedding import mxfp8_embedding
+            from tokenspeed_kernel.ops.embedding import mxfp4_embedding, mxfp8_embedding
 
             # Each layer's 2D hash slice can be gathered directly; retain the
             # contiguous fallback for arbitrary leading dimensions.
             if indices.ndim != 2:
                 indices = indices.contiguous()
-            values = mxfp8_embedding(
+            gather = (
+                mxfp4_embedding if self.storage_format == "mxfp4" else mxfp8_embedding
+            )
+            values = gather(
                 self.weight,
                 self.scale,
                 indices,
@@ -1005,13 +1107,28 @@ class RowShardedEngramEmbedding(nn.Module):
                 # Gather whole packed rows and split them: a gather per column
                 # view would pay each random row's host page translation twice.
                 rows = host_gather.uint8_row_gather(self.packed, local_ids, None)
-                values = _dequant_fp8_e8m0(
-                    rows[..., : self.embedding_dim], rows[..., self.embedding_dim :]
-                )
+                width = self.weight.shape[-1]
+                codes, scales = rows[..., :width], rows[..., width:]
+                if self.storage_format == "mxfp4" and codes.is_cuda:
+                    from tokenspeed_kernel.ops.embedding import mxfp4_embedding_decode
+
+                    values = mxfp4_embedding_decode(codes, scales)
+                else:
+                    decode = (
+                        _dequant_fp4_e8m0
+                        if self.storage_format == "mxfp4"
+                        else _dequant_fp8_e8m0
+                    )
+                    values = decode(codes, scales)
             else:
                 local_ids = local_ids.long()
                 # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
-                values = _dequant_fp8_e8m0(
+                decode = (
+                    _dequant_fp4_e8m0
+                    if self.storage_format == "mxfp4"
+                    else _dequant_fp8_e8m0
+                )
+                values = decode(
                     self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
@@ -1123,6 +1240,7 @@ class DeepseekV41Engram(nn.Module):
             host_layout,
             host_alloc,
             layer_id,
+            config.engram_embed_quant,
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader

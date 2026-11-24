@@ -310,9 +310,17 @@ def marlin_mxfp4_local_moe_apply(
     workspace = marlin_make_workspace(x.device)
 
     gemm1_n = 2 * ispp
+    # The activation consumes GEMM1 before GEMM2 writes, so their outputs
+    # can share storage. Both views must be contiguous even when widths differ.
+    routes = num_tokens * top_k
+    intermediate13 = torch.empty(
+        routes * max(gemm1_n, hidden), dtype=x.dtype, device=x.device
+    )
+    gate_up = intermediate13[: routes * gemm1_n].view(routes, gemm1_n)
+    gate_up.zero_()
     intermediate1 = moe_wna16_marlin_gemm(
         x,
-        None,
+        gate_up,
         w.w13_weight,
         w.w13_weight_scale,
         workspace,
@@ -344,10 +352,13 @@ def marlin_mxfp4_local_moe_apply(
         intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
-    # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
+    # plain sum over top_k. Clear the reused storage after activation:
+    # EP-masked routes write nothing and must not retain gate-up values.
+    down = intermediate13[: routes * hidden].view(routes, hidden)
+    down.zero_()
     intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
-        torch.zeros(num_tokens * top_k, hidden, dtype=x.dtype, device=x.device),
+        down,
         w.w2_weight,
         w.w2_weight_scale,
         workspace,

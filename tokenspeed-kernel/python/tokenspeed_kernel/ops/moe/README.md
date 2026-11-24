@@ -963,3 +963,14 @@ rounds logits once to BF16. Compile/cache keys contain model dimensions only;
 row count stays runtime, with M1 and capacity-8 kernels built together before
 capture. The native tile is a temporary CUDA implementation preserving the
 validated arithmetic; no AOT files or task-specific loader are needed.
+
+## SM120 local experts
+
+`flashinfer_sm12x.py` registers MXFP4-weight/FP8-activation and optional NVFP4
+local expert execution. The outer transport owns inter-rank dispatch; these
+plans process weights once and return local routed contributions.
+NVFP4 retains calibrated FC1 and FC2 input scales per expert and requires
+agreement of the fused gate/up global scales.
+
+[DeepEP integration](../../thirdparty/deepep_sm120_experiment/README.md)
+documents the communication and padding contract.

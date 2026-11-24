@@ -429,6 +429,7 @@ def _mhc_prenorm_gemm_triton_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     split_id = tl.program_id(0)
     token_block = tl.program_id(1)
@@ -455,7 +456,7 @@ def _mhc_prenorm_gemm_triton_kernel(
             x_values.to(tl.float32),
             fn_values,
             dot_acc,
-            input_precision="ieee",
+            input_precision=DOT_PRECISION,
         )
         x_fp32 = x_values.to(tl.float32)
         square_acc += tl.sum(x_fp32 * x_fp32, axis=1)
@@ -492,6 +493,19 @@ def _mhc_prenorm_gemm_triton(
     block_m, block_n, block_k, num_warps, num_stages = _mhc_prenorm_gemm_launch_config(
         num_tokens, k, n, n_splits
     )
+    platform = current_platform()
+    if (
+        platform.is_nvidia
+        and platform.arch_version == ArchVersion(12, 0)
+        and k == 20480
+        and n == 24
+        and 0 < num_tokens <= 64
+    ):
+        # Smaller IEEE tiles reduce wasted work for decode rows. Keep this
+        # local to the IEEE launcher: the compensated Tensor Core solution
+        # has different tile constraints and retains its existing geometry.
+        block_m, block_n = (8, 16) if num_tokens <= 32 else (16, 32)
+        num_warps, num_stages = 2, 1
     split_k = triton.cdiv(triton.cdiv(k, n_splits), block_k) * block_k
     _mhc_prenorm_gemm_triton_kernel[
         (
@@ -511,6 +525,7 @@ def _mhc_prenorm_gemm_triton(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
+        DOT_PRECISION="ieee",
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -42,6 +42,8 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.rope_parameters = kwargs.get("rope_scaling", {})
         super().__init__(**kwargs)
         self.expert_dtype: str | None = kwargs.get("expert_dtype")
+        self.moe_quant_algo: str | None = kwargs.get("moe_quant_algo")
+        self.engram_embed_quant: str = kwargs.get("engram_embed_quant", "mxfp8")
         # These are architectural facts, not V4 defaults: V4.1 has learned,
         # ungrouped routing in every layer and no hash-routed MoE layers.
         self.num_hash_layers = 0
@@ -115,9 +117,48 @@ class DeepseekV41Config(PretrainedConfig):
         self.text_config = text_config
         self.vision_config = vision_config
         super().__init__(**kwargs)
-        expert_dtype = kwargs.get("quantization_config", {}).get("expert_dtype")
+        quantization = kwargs.get("quantization_config", {})
+        expert_dtype = quantization.get("expert_dtype")
         if expert_dtype is not None:
             self.text_config.expert_dtype = expert_dtype
+        self.text_config.moe_quant_algo = quantization.get("moe_quant_algo")
+        if self.text_config.moe_quant_algo is not None:
+            if (
+                self.text_config.moe_quant_algo != "NVFP4"
+                or quantization.get("group_size") != 16
+                or quantization.get("weight_block_size") != [32, 32]
+                or quantization.get("scale_fmt") != "ue8m0"
+            ):
+                raise ValueError(
+                    "V4.1 NVFP4 experts require group16 and original FP8 dense weights"
+                )
+            expected = {
+                f"layers.{i}.ffn.experts"
+                for i in range(self.text_config.num_hidden_layers)
+            }
+            entries = quantization.get("quantized_layers", {})
+            if set(entries) != expected or any(
+                entry != {"group_size": 16, "quant_algo": "NVFP4"}
+                for entry in entries.values()
+            ):
+                raise ValueError(
+                    "V4.1 NVFP4 must cover exactly the main routed experts"
+                )
+        self.text_config.engram_embed_quant = quantization.get(
+            "engram_embed_quant", "mxfp8"
+        )
+        if self.text_config.engram_embed_quant == "mxfp4":
+            if (
+                quantization.get("engram_embed_block_size") != 32
+                or quantization.get("engram_embed_scale_dtype") != "ue8m0"
+                or quantization.get("engram_embed_layers")
+                != self.text_config.engram_layer_ids
+            ):
+                raise ValueError(
+                    "V4.1 MXFP4 Engram requires group32 E8M0 on all Engram layers"
+                )
+        elif self.text_config.engram_embed_quant != "mxfp8":
+            raise ValueError("Unsupported V4.1 Engram checkpoint format")
         for name in ("dtype", "bos_token_id", "eos_token_id", "pad_token_id"):
             if name in kwargs:
                 setattr(self.text_config, name, getattr(self, name))

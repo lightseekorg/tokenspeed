@@ -499,3 +499,110 @@ if has_optional_package("deep_gemm"):
     ) -> torch.Tensor:
         """DeepGEMM E4M3 projection; see ``fp8_projection``."""
         return fp8_mm(x, x_scales, weight, weight_scales, out)
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="deepgemm_mm_mxfp8_sm120",
+    solution="deepgemm",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 0),
+    ),
+    signatures=format_signatures(
+        ("a", "b"),
+        "mxfp8",
+        {torch.float8_e4m3fn},
+        scale=ScaleFormat(
+            storage_dtype=torch.uint8, granularity="block", block_shape=(1, 32)
+        ),
+    ),
+    traits={"out_dtype": frozenset({torch.bfloat16})},
+    priority=Priority.PERFORMANT,
+)
+def deepgemm_mm_mxfp8_sm120(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Opt-in SM120 group-32 FP8 GEMM; narrow K keeps the Triton path.
+
+    B_scales may be canonical uint8 [N,K/32] or prepacked int32 scales
+    returned by prepare_mxfp8_weight_scales. A_scales are canonical uint8;
+    BF16/FP16 A without scales uses the existing group-32 quantizer.
+    """
+    from tokenspeed_kernel.ops.gemm._triton.fp8 import w8a8_block_fp8_matmul_triton
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.thirdparty.deepgemm import (
+        mxfp8_mm_sm120,
+        pack_mxfp8_ue8m0_scales,
+    )
+
+    platform = Platform.get()
+    if not platform.is_nvidia or platform.arch_version != ArchVersion(12, 0):
+        raise ValueError("DeepGEMM MXFP8 requires SM120")
+    if alpha is not None or block_size != [1, 32] or out_dtype != torch.bfloat16:
+        raise ValueError(
+            "DeepGEMM SM120 requires group-32 scales, BF16 output and alpha=None"
+        )
+    if (
+        A.ndim != 2
+        or B.ndim != 2
+        or A.shape[1] != B.shape[1]
+        or B.dtype != torch.float8_e4m3fn
+        or not A.is_cuda
+        or B.device != A.device
+        or A.stride(-1) != 1
+        or B.stride(-1) != 1
+        or B.shape[1] % 32
+        or B_scales is None
+        or B_scales.device != B.device
+    ):
+        raise ValueError(
+            "Expected contiguous-inner CUDA A[M,K], E4M3 B[N,K] and group-32 scales"
+        )
+    m, k = A.shape
+    n = B.shape[0]
+    if out is not None and (
+        out.shape != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("Expected contiguous BF16 output [M,N] on the operand device")
+    if A_scales is None:
+        if A.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("Unscaled activations must be BF16 or FP16")
+        A, A_scales = quantize_fp8(
+            A, granularity="token_group", group_size=32, scale_encoding="ue8m0"
+        )
+    if (
+        A.dtype != torch.float8_e4m3fn
+        or A_scales.dtype != torch.uint8
+        or A_scales.shape != (m, k // 32)
+        or A_scales.device != A.device
+    ):
+        raise ValueError("E4M3 activations require canonical uint8 [M,K/32] scales")
+    if B_scales.dtype == torch.uint8:
+        if B_scales.shape != (n, k // 32):
+            raise ValueError("Expected canonical uint8 weight scales [N,K/32]")
+        if n % 64 or k % 128:
+            return w8a8_block_fp8_matmul_triton(
+                A, B, A_scales, B_scales, [1, 32], out_dtype, out=out
+            )
+        B_scales = pack_mxfp8_ue8m0_scales(B_scales, n, k)
+    elif B_scales.dtype != torch.int32 or B_scales.ndim != 2:
+        raise ValueError("Expected prepared int32 DeepGEMM weight scales")
+    if out is None:
+        out = torch.empty((m, n), device=A.device, dtype=out_dtype)
+    if m == 0:
+        return out
+    return mxfp8_mm_sm120(A, B, A_scales, B_scales, out)

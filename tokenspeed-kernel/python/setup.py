@@ -347,6 +347,12 @@ def _refresh_python_install_paths() -> None:
 
 def _install_backend_build_requirements(verbose) -> None:
     backend = _selected_backend()
+    if os.environ.get("TOKENSPEED_KERNEL_SKIP_BUILD_DEPS") == "1":
+        print(
+            f"Skipping {backend} build-requirement installation because "
+            "TOKENSPEED_KERNEL_SKIP_BUILD_DEPS=1"
+        )
+        return
     if (
         backend == "cuda"
         and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"

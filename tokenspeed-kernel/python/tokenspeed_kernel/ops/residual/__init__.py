@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch as _torch
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -1226,6 +1227,9 @@ import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
+
+if os.environ.get("TOKENSPEED_ENABLE_SM120_MHC_MIXES") == "1":
+    import tokenspeed_kernel.ops.residual.triton_sm120  # noqa: E402,F401
 from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,

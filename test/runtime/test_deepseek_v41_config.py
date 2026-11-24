@@ -519,3 +519,36 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_mixed_nvfp4_and_mxfp4_engram_config(raw_config):
+    q = raw_config["quantization_config"]
+    q.update(
+        moe_quant_algo="NVFP4",
+        group_size=16,
+        quantized_layers={
+            f"layers.{i}.ffn.experts": {"group_size": 16, "quant_algo": "NVFP4"}
+            for i in range(40)
+        },
+        engram_embed_quant="mxfp4",
+        engram_embed_block_size=32,
+        engram_embed_scale_dtype="ue8m0",
+        engram_embed_layers=[1, 14],
+    )
+    c = DeepseekV41Config(**raw_config)
+    assert c.text_config.moe_quant_algo == "NVFP4"
+    assert c.text_config.engram_embed_quant == "mxfp4"
+    q["group_size"] = 32
+    with pytest.raises(ValueError, match="group16"):
+        DeepseekV41Config(**raw_config)
+    q["group_size"] = 16
+    q["quantized_layers"]["mtp.layers.0.ffn.experts"] = {
+        "group_size": 16,
+        "quant_algo": "NVFP4",
+    }
+    with pytest.raises(ValueError, match="exactly the main"):
+        DeepseekV41Config(**raw_config)
+    del q["quantized_layers"]["mtp.layers.0.ffn.experts"]
+    q["engram_embed_scale_dtype"] = "e4m3"
+    with pytest.raises(ValueError, match="E8M0"):
+        DeepseekV41Config(**raw_config)

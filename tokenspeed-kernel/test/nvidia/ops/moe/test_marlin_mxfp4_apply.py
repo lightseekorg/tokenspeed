@@ -373,3 +373,61 @@ def test_swiglu_limit_rejects_alpha_and_beta(swiglu_arg, swiglu_beta) -> None:
     w = SimpleNamespace(swiglu_arg=swiglu_arg, swiglu_beta=swiglu_beta)
     with pytest.raises(ValueError, match="standard SwiGLU"):
         _swiglu_limit(w)
+
+
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size", [(256, 128), (256, 256), (512, 128)]
+)
+@pytest.mark.parametrize("graph", [False, True])
+def test_marlin_reused_output_clears_nonlocal_routes(
+    hidden_size, intermediate_size, graph
+):
+    """Changing routes must not expose gate-up values in the reused down output."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(83)
+    num_tokens, num_local, top_k = 33, 4, 2
+    raw = make_mxfp4_moe_weights(
+        num_local, hidden_size, intermediate_size, generator, device="cuda"
+    )
+    w = _Weights(raw, num_local, 2, 0, 4.0, 25.0)
+    plan = {"activation": "situ"}
+    marlin_mxfp4_moe_weights(plan, w)
+    x = (
+        torch.randn(num_tokens, hidden_size, generator=generator, device="cuda") * 0.2
+    ).to(torch.bfloat16)
+    ids = torch.arange(top_k, device="cuda", dtype=torch.int32).repeat(num_tokens, 1)
+    weights = torch.full((num_tokens, top_k), 0.5, device="cuda")
+
+    def apply():
+        return marlin_mxfp4_precomputed_moe_apply(
+            plan, x, w, None, topk_weights=weights, topk_ids=ids
+        )
+
+    active = apply().clone()
+    assert torch.isfinite(active).all()
+    assert torch.count_nonzero(active) > 0
+    if graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                apply()
+        torch.cuda.current_stream().wait_stream(stream)
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            output = apply()
+
+    ids.add_(num_local)
+    if graph:
+        captured.replay()
+    else:
+        output = apply()
+    assert torch.count_nonzero(output) == 0
+
+    ids[:17].sub_(num_local)
+    if graph:
+        captured.replay()
+    else:
+        output = apply()
+    torch.testing.assert_close(output[:17], active[:17], atol=1e-2, rtol=1e-2)
+    assert torch.count_nonzero(output[17:]) == 0

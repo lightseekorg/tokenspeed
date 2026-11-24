@@ -132,9 +132,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
                 "over attention TP, or are replicated under model QCP"
             )
         if attn.has_qcp:
-            if server_args.disaggregation_mode != "prefill":
+            if server_args.disaggregation_mode not in ("null", "prefill"):
                 raise ValueError(
-                    "V4.1 model QCP currently requires the PD prefill role"
+                    "V4.1 model QCP requires a normal or PD prefill engine"
                 )
             if (
                 not server_args.disable_prefill_graph
