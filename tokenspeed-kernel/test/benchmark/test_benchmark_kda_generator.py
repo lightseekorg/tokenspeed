@@ -154,7 +154,7 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
     host_boundaries = source_boundaries.clone()
     seen: dict[str, object] = {}
 
-    def record_hint(_batch, _tokens, boundaries, _chunk_sizes):
+    def record_hint(_batch, _tokens, boundaries):
         seen["hint"] = boundaries
 
     def record_operation(

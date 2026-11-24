@@ -51,6 +51,7 @@ from flashinfer.autotuner import AutoTuner  # noqa: E402
 from tokenspeed_kernel.ops.moe import (  # noqa: E402
     moe_apply,
     moe_plan,
+    moe_prepare_input_buffers,
     moe_process_weights,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize  # noqa: E402
@@ -310,9 +311,8 @@ def run_correctness(
                 apply(x)
         x, ids, weights = external_inputs
     if prequantized:
-        values_out, scales_out, ids_out, weights_out = runner.input_buffers(
-            tokens, capacity
-        )
+        input_buffers = moe_prepare_input_buffers(plan, w)
+        values_out, scales_out, ids_out, weights_out = input_buffers(tokens, capacity)
         values_out.copy_(x[0])
         scales_out[:tokens].copy_(x[1].view(torch.uint8))
         ids_out.copy_(ids)

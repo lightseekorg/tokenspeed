@@ -1066,7 +1066,7 @@ compaction had nothing left to move or publish first, it is aborted with
 `AbortReason::kNoProgress` (§2, "Stall diagnostic"). On the P and D roles
 the abort does not run and such a request waits behind the stall warning as
 before: there a stuck `Submitted` request's PD transfer is already registered
-(bootstrapped; on the P role the decode peer holds pages for it), and a
+(under early allocation the decode peer holds pages for a P request), and a
 scheduler abort does not conclude it, so the peer would wait for its own
 timeout and the engine's transfer layer would keep the room for good.
 
@@ -1577,13 +1577,12 @@ of what the Device holds.
 **Decode allocation** (`SchedulerConfig::decode_allocation_policy`). The
 policy is this role's alone: under either one the D role allocates a
 destination for every request its transfer peer lets in. A config without a
-policy is `early`, as a caller built before the policy existed sends it. A
-request here starts in `Bootstrapping` and becomes a candidate with
-`pd::BootstrappedEvent`; before that it is not probed, so it reports no
-capacity failure and stops no other prompt. Under `early` that event says
-every Decode rank allocated the request's destination, so an admitted prompt
-always has one. Under `deferred` the event only admits, and the destination
-has its own event, `pd::DestinationReadyEvent`
+policy is `early`, as a caller built before the policy existed sends it.
+Under `early`, a request starts in `Bootstrapping` and becomes a candidate
+with `pd::BootstrappedEvent`, once every Decode rank allocated its destination.
+Under `deferred`, a request starts in `Submitted` and can compute as soon as
+local resources allow, without any Decode announcement. Its destination has
+its own event, `pd::DestinationReadyEvent`
 (`Request::MarkDestinationReady`), which may come in any state: a prompt whose
 final result lands before it waits in `PrefillAwaitingDestination`, with its
 pages and request-pool slot, until the event moves it to `PrefillDone`, whose
@@ -1601,9 +1600,8 @@ meanwhile as under `early`: a smaller prompt passes one that does not fit, so
 on a tight pool a larger prompt can wait until the smaller ones behind it stop
 arriving.
 
-The scheduler decides neither when the peer admits a request nor when the
-Decode node may allocate. What keeps the two nodes from waiting for each
-other is the order the transfer peers keep: the Decode node allocates a
+The transfer peer controls when the Decode node may allocate. What keeps the
+two nodes from waiting for each other is their allocation order: Decode allocates a
 request's destination only after this scheduler admitted the request's last
 chunk, when it holds every page the prompt needs, so no destination is held
 for a prompt this node cannot compute. That includes the prompt's remote
@@ -1616,7 +1614,7 @@ during the forward), attention TP 1, KVP 1, PP 1, no external encoder and a
 model without multimodal input.
 
 The peers' side of that order is in `event-loop.md` (PD): the Decode rank
-announces the room, the prefill peer then sends `pd::BootstrappedEvent`,
+announces the room independently of prefill admission. The prefill peer
 notifies the Decode rank when the plan that carries the request's last chunk
 goes to the device, and sends `pd::DestinationReadyEvent` when the manifests
 arrived; the Decode peer shows its scheduler a request only after that notice.

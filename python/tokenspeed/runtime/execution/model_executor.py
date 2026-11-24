@@ -126,6 +126,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
     local_pages_by_group,
 )
+from tokenspeed.runtime.layers.hyperconnection import (
+    register_workspace_region as register_hc_workspace_region,
+)
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessorOutput,
     prepare_logits_communication,
@@ -164,6 +167,11 @@ logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
+
+
+def _last_packed_token_rows(input_lengths: torch.Tensor) -> torch.Tensor:
+    """Locate each request's last row within the scheduler's int32 token budget."""
+    return torch.cumsum(input_lengths, dim=0, dtype=torch.int32).sub_(1)
 
 
 def _sampling_info_for_requests(
@@ -637,6 +645,7 @@ class ModelExecutor:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=config.enable_memory_saver
         )
+        register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -2820,30 +2829,23 @@ class ModelExecutor:
                         num_prefill_tokens = total_tokens - num_decode_tokens
                         gather_ids = torch.empty(
                             num_extends + num_decode_tokens,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                             device=self.device,
                         )
-                        gather_ids[:num_extends] = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:num_extends],
-                                dim=0,
-                            )
-                            - 1
+                        gather_ids[:num_extends] = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:num_extends]
                         )
                         gather_ids[num_extends:] = torch.arange(
                             num_prefill_tokens,
                             total_tokens,
                             device=self.device,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                         )
                     else:
                         # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request via cumsum.
-                        gather_ids = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:bs], dim=0
-                            )
-                            - 1
+                        # per request.
+                        gather_ids = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:bs]
                         )
 
                 output_layout = ForwardOutputLayout(
