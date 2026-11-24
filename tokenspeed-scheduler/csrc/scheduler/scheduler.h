@@ -858,6 +858,14 @@ private:
     // always without max_consecutive_prefill_rounds; with it, only until a
     // run of back-to-back prefill rounds reaches the cap.
     bool prefillSuspensionAllowed() const;
+    // Whether enough candidates are ready to decode (PrefillDone or
+    // Decoding) for the interval to be owed this round: always without
+    // prefill_interval_min_decoding; with it, at least that many.
+    bool intervalDecodingThresholdMet(std::span<Request* const> candidates) const;
+    // Below the threshold, whether the round owes a decode round anyway:
+    // once the run of back-to-back prefill rounds holding a decode back has
+    // reached max_consecutive_prefill_rounds.
+    bool prefillRunCappedBelowThreshold() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
     // Admits the waiting prompts whose holder answered with more than their

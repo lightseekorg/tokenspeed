@@ -1840,6 +1840,27 @@ rank, like the interval's. With both `K` and the minimum interval `M`, a
 round owes decodes when `M` has rounds left or when the interval does and no
 overdue prompt may suspend it.
 
+**Decode threshold** (`prefill_interval_min_decoding` `T`, requires `K`;
+`0` is off): the decode rounds `N` and `M` owe, held by `K` or not, are owed
+only while at least `T` requests are ready to decode (`PrefillDone` or
+`Decoding`) before the round. Below `T` the interval is waived but `K`'s
+bound on the run is not: once `K` prefill rounds in a row have held a decode
+back, the next round owes one decode round, which ends the run; otherwise
+the round runs as if nothing were owed. So while few requests decode, a
+waiting prompt's first token no longer waits out a whole interval, and the
+few decodes stall at most `K` prefill rounds at a time for it: first-token
+latency is bought with those decodes' token latency, and the interval's
+per-prompt bound of `N` held-back rounds no longer applies below `T` (nothing
+is owed there). At or above `T` the rule is unchanged, and with `T` unset
+every plan is the same as without it.
+
+The counters, the held-back counts and the run count follow the round's plan
+as for any other round; the request slots (`max_batch_size`) still count
+every resident request, prefilling or decoding. A fused prompt is
+`PrefillDone` from the round that plans its last chunk, before that forward
+lands. `M`'s floor ("no prefill round directly follows another") is waived
+with the interval below `T`. The P and D roles refuse `T`.
+
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
 one: with L2 the published prefix — tail and state checkpoint included —

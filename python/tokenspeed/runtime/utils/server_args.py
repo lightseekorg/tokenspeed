@@ -499,6 +499,10 @@ class ServerArgs:
     # The most back-to-back prefill rounds an overdue prompt may suspend the
     # interval for; 0 keeps the unbounded suspension.
     max_consecutive_prefill_rounds: int = 0
+    # The interval is owed only while at least this many requests are ready
+    # to decode; below it --max-consecutive-prefill-rounds still ends a run of
+    # prefill rounds that hold a decode back. 0 always owes the interval.
+    prefill_interval_min_decoding: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -3276,6 +3280,17 @@ class ServerArgs:
                 "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
                 "it bounds how long an overdue prompt suspends the interval"
             )
+        if self.prefill_interval_min_decoding < 0:
+            raise ValueError("--prefill-interval-min-decoding must be non-negative")
+        if (
+            self.prefill_interval_min_decoding
+            and not self.max_consecutive_prefill_rounds
+        ):
+            raise ValueError(
+                "--prefill-interval-min-decoding needs "
+                "--max-consecutive-prefill-rounds: below the threshold the round "
+                "cap is what still bounds how long running decodes stall"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3728,6 +3743,19 @@ class ServerArgs:
             "interval again, and a prompt's held-back count restarts whenever "
             "one of its chunks runs. 0 (the default) keeps the unbounded "
             "suspension.",
+        )
+        parser.add_argument(
+            "--prefill-interval-min-decoding",
+            type=int,
+            default=ServerArgs.prefill_interval_min_decoding,
+            help="With --max-consecutive-prefill-rounds (which needs "
+            "--prefill-decode-interval): owe the "
+            "--prefill-decode-interval and --prefill-decode-min-interval decode "
+            "rounds only while at least this many requests are ready to decode. "
+            "With fewer, waiting prompts are prefilled at once, but once "
+            "--max-consecutive-prefill-rounds prefill rounds in a row have held "
+            "a decode back, the next round decodes. Aggregated serving only. "
+            "0 (the default) always owes them.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

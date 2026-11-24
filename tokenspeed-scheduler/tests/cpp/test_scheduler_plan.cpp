@@ -2384,6 +2384,231 @@ TEST(SchedulerConstructionTest, RefusesAPrefillRoundCapWithoutAnInterval) {
     }
 }
 
+// prefill_interval_min_decoding T (requires the cap K): the interval (and the
+// minimum interval) is owed only while at least T requests are ready to
+// decode before the round. With fewer, K prefill rounds in a row that hold a
+// decode back are followed by one decode round; otherwise the round runs as
+// if none were owed. 0 always owes the interval.
+class PrefillIntervalMinDecodingSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_interval_min_decoding = min_decoding_;
+        cfg.max_consecutive_prefill_rounds = cap_;
+        cfg.max_batch_size = max_batch_size_;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        // Pages for every prompt at once: no capacity retraction interleaves
+        // its rounds with the interval's.
+        cfg.device_allocator.total_pages = 64;
+        cfg.cache_groups.front().total_pages = 64;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Rebuilds the scheduler with the threshold, the cap and the batch slots
+    // as given.
+    void Restart(std::int32_t min_decoding, std::int32_t cap, std::int32_t max_batch_size) {
+        min_decoding_ = min_decoding;
+        cap_ = cap;
+        max_batch_size_ = max_batch_size;
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(MakeConfig()));
+    }
+
+    std::int32_t min_decoding_{0};
+    std::int32_t cap_{0};
+    std::int32_t max_batch_size_{8};
+};
+
+// T = 0 owes the interval as before; so does any T the decodes meet (here 1,
+// with a alone decoding).
+TEST_F(PrefillIntervalMinDecodingSuite, AMetThresholdOwesTheIntervalAsBefore) {
+    for (const std::int32_t min_decoding : {0, 1}) {
+        SCOPED_TRACE(min_decoding);
+        Restart(min_decoding, /*cap=*/4, /*max_batch_size=*/8);
+        Submit(MakeRequestSpec("a", 2));
+        EXPECT_EQ(Round(), "P:a");
+        EXPECT_EQ(Round(), "D:a");
+        Submit(MakeRequestSpec("b", 2, /*start=*/100));
+        EXPECT_EQ(Round(), "D:a");
+        EXPECT_EQ(Round(), "P:b");
+        EXPECT_EQ(Round(), "D:ab");
+    }
+}
+
+// One request decodes, fewer than T = 2: b is prefilled at once although a's
+// prefill owes two decode rounds (the cap, 4, is not reached). b's prefill
+// starts a new interval, and with a and b decoding c waits it out.
+TEST_F(PrefillIntervalMinDecodingSuite, TooFewDecodesOweNoInterval) {
+    Restart(/*min_decoding=*/2, /*cap=*/4, /*max_batch_size=*/8);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "P:b");
+    Submit(MakeRequestSpec("c", 2, /*start=*/200));
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+    EXPECT_EQ(Round(), "D:abc");
+}
+
+// Two requests decode, T = 2: the interval is owed as without the threshold.
+TEST_F(PrefillIntervalMinDecodingSuite, EnoughDecodesOweTheInterval) {
+    Restart(/*min_decoding=*/2, /*cap=*/4, /*max_batch_size=*/8);
+    // One page each: both fit one round's budget.
+    Submit({MakeRequestSpec("a", 1), MakeRequestSpec("b", 1, /*start=*/100)});
+    EXPECT_EQ(Round(), "P:ab");
+    Submit(MakeRequestSpec("c", 2, /*start=*/200));
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+}
+
+// The threshold changes only whether the interval is owed, not the request
+// slots: a decoding and b mid-prefill fill both, so c waits for one even
+// though too few decode for the interval.
+TEST_F(PrefillIntervalMinDecodingSuite, AdmissionStillCountsPrefillingAndDecodingRequests) {
+    Restart(/*min_decoding=*/3, /*cap=*/4, /*max_batch_size=*/2);
+    Submit(MakeRequestSpec("a", 1));
+    EXPECT_EQ(Round(), "P:a");
+    // b's first chunk fills the budget; its 2-token remainder leaves room
+    // for c's 2 tokens, but no slot.
+    Submit({MakeRequestSpec("b", 3, /*start=*/100), MakeRequestSpec("c", 1, /*start=*/200)});
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    SendFinish("a");
+    EXPECT_EQ(Round(), "P:c");
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillIntervalMinDecodingItCannotApply) {
+    const auto config = [](Role role, std::int32_t interval, std::int32_t min_interval, std::int32_t cap,
+                           std::int32_t min_decoding) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_interval = interval;
+        cfg.prefill_decode_min_interval = min_interval;
+        cfg.max_consecutive_prefill_rounds = cap;
+        cfg.prefill_interval_min_decoding = min_decoding;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 4, 0, 1, 8).Validate());
+    EXPECT_NO_THROW(config(Role::kFused, 4, 2, 1, 8).Validate());
+    EXPECT_NO_THROW(config(Role::kP, 0, 0, 0, 0).Validate());
+    EXPECT_NO_THROW(config(Role::kD, 0, 0, 0, 0).Validate());
+    struct Refused {
+        Role role;
+        std::int32_t interval;
+        std::int32_t min_interval;
+        std::int32_t cap;
+        std::int32_t min_decoding;
+    };
+    // P and D roles; no cap (with the interval, the minimum interval alone,
+    // or nothing); a negative threshold.
+    for (const Refused& refused :
+         {Refused{Role::kP, 0, 0, 0, 8}, Refused{Role::kD, 0, 0, 0, 8}, Refused{Role::kFused, 4, 0, 0, 8},
+          Refused{Role::kFused, 0, 2, 0, 8}, Refused{Role::kFused, 0, 0, 0, 8}, Refused{Role::kFused, 4, 0, 1, -1}}) {
+        try {
+            config(refused.role, refused.interval, refused.min_interval, refused.cap, refused.min_decoding).Validate();
+            ADD_FAILURE() << "prefill_interval_min_decoding " << refused.min_decoding << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_interval_min_decoding"), std::string::npos)
+                << error.what();
+        }
+    }
+}
+
+// Below T the interval stays waived, but K back-to-back prefill rounds that
+// hold a decode back are followed by one decode round, which ends the run.
+TEST_F(PrefillIntervalMinDecodingSuite, BelowTheThresholdTheCapStillEndsTheRun) {
+    for (const std::int32_t cap : {1, 2, 4}) {
+        SCOPED_TRACE(::testing::Message() << "cap " << cap);
+        // T 16 is never met: at most 2 * cap + 1 requests decode.
+        Restart(/*min_decoding=*/16, cap, /*max_batch_size=*/16);
+        Submit(MakeRequestSpec("a", 2));
+        EXPECT_EQ(Round(), "P:a");
+        const std::string prompts = std::string{"bcdefghi"}.substr(0, 2 * cap);
+        std::vector<RequestSpec> specs;
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            specs.push_back(MakeRequestSpec(std::string(1, prompts[i]), 2, /*start=*/100 * (i + 1)));
+        }
+        Submit(specs);
+        std::string decoding = "a";
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            const std::string id(1, prompts[i]);
+            EXPECT_EQ(Round(), "P:" + id);
+            decoding += id;
+            // The run ends at the cap. The suite's 4-token budget decodes the
+            // 4 oldest.
+            if ((i + 1) % cap == 0) {
+                EXPECT_EQ(Round(), "D:" + decoding.substr(0, 4));
+            }
+        }
+        EXPECT_EQ(Round(), "D:" + decoding.substr(0, 4));
+    }
+}
+
+// With K = 1, b's prefill stalls a and reaches the cap: below T = 3 the next
+// round decodes once, and c's prefill
+// starts a new run. With a, b and c decoding T is met, and the interval c's
+// prefill holds is owed in full, as without the threshold.
+TEST_F(PrefillIntervalMinDecodingSuite, TheForcedDecodeEndsTheRunAndTheThresholdOwesTheHeldInterval) {
+    Restart(/*min_decoding=*/3, /*cap=*/1, /*max_batch_size=*/8);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 2, /*start=*/100), MakeRequestSpec("c", 2, /*start=*/200)});
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+    Submit(MakeRequestSpec("d", 2, /*start=*/300));
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "P:d");
+}
+
+// The run reached the cap, but its decodes finished before the next round:
+// with nothing to decode the round runs prefill work, it does not idle.
+TEST_F(PrefillIntervalMinDecodingSuite, TheCapForcesNoRoundWithNothingToDecode) {
+    Restart(/*min_decoding=*/8, /*cap=*/1, /*max_batch_size=*/8);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "P:b");
+    SendFinish("a");
+    SendFinish("b");
+    Submit(MakeRequestSpec("c", 2, /*start=*/200));
+    EXPECT_EQ(Round(), "P:c");
+}
+
+// At or above T the threshold changes nothing: two requests decode, T = 2,
+// K = 1, and the held interval is owed as without the threshold.
+TEST_F(PrefillIntervalMinDecodingSuite, AMetThresholdOwesTheHeldInterval) {
+    Restart(/*min_decoding=*/2, /*cap=*/1, /*max_batch_size=*/8);
+    Submit({MakeRequestSpec("a", 1), MakeRequestSpec("b", 1, /*start=*/100)});
+    EXPECT_EQ(Round(), "P:ab");
+    Submit({MakeRequestSpec("c", 2, /*start=*/200), MakeRequestSpec("d", 2, /*start=*/300)});
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "P:d");
+}
+
 class PrefillDecodeIntervalTwoSlotsSuite : public PrefillDecodeIntervalSuite {
 protected:
     SchedulerConfig MakeConfig() override {
