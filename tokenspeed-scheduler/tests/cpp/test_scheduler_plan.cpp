@@ -2609,6 +2609,127 @@ TEST_F(PrefillIntervalMinDecodingSuite, AMetThresholdOwesTheHeldInterval) {
     EXPECT_EQ(Round(), "P:d");
 }
 
+// The invariants of docs/design/scheduler.md §3.3 that the threshold touches:
+// the minimum interval, the held-back bound below T, retraction, mixed mode
+// and the roles. Adds the minimum interval, mixed mode and forced retraction
+// to the threshold's suite.
+class PrefillIntervalMinDecodingInvariantSuite : public PrefillIntervalMinDecodingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillIntervalMinDecodingSuite::MakeConfig();
+        cfg.prefill_decode_min_interval = min_interval_;
+        cfg.enable_mixed_prefill_decode = mixed_;
+        if (mixed_) {
+            // Room for the decodes beside a two-page chunk.
+            cfg.max_scheduled_tokens = 6;
+        }
+        cfg.debug_force_retraction_interval = force_retraction_;
+        if (force_retraction_ != 0) {
+            cfg.debug_force_retraction_max_per_request = 1;
+        }
+        return cfg;
+    }
+
+    // Rebuilds the scheduler with the threshold, the cap, the minimum
+    // interval, mixed mode and the forced retraction period as given.
+    void Restart(std::int32_t min_decoding, std::int32_t cap, std::int32_t min_interval, bool mixed,
+                 std::int32_t force_retraction) {
+        min_interval_ = min_interval;
+        mixed_ = mixed;
+        force_retraction_ = force_retraction;
+        PrefillIntervalMinDecodingSuite::Restart(min_decoding, cap, /*max_batch_size=*/8);
+    }
+
+    std::int32_t min_interval_{0};
+    bool mixed_{false};
+    std::int32_t force_retraction_{0};
+};
+
+// The minimum interval M is waived below T like the interval: with a alone
+// decoding (below T 3), b's three chunks run back to back, which M alone
+// never allows while a decode can run. With a, b and c decoding T is met and
+// M is owed again: e waits M's three decode rounds, more than the interval's
+// two.
+TEST_F(PrefillIntervalMinDecodingInvariantSuite, BelowTheThresholdTheMinimumIntervalIsWaived) {
+    Restart(/*min_decoding=*/3, /*cap=*/8, /*min_interval=*/3, /*mixed=*/false, /*force_retraction=*/0);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    Submit(MakeRequestSpec("c", 2, /*start=*/200));
+    EXPECT_EQ(Round(), "P:c");
+    Submit(MakeRequestSpec("e", 2, /*start=*/300));
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(Round(), "P:e");
+    EXPECT_EQ(Round(), "D:abce");
+}
+
+// Below T the decode round K forces is not suspended by an overdue prompt:
+// c, queued behind b's three chunks with K 1, counts each forced round as
+// held back, three in all, past the interval's N 2. It is still held only
+// one round per K prefill rounds, never two decode rounds in a row, so its
+// wait is bounded by the chunks ahead of it, about one round per chunk.
+TEST_F(PrefillIntervalMinDecodingInvariantSuite, BelowTheThresholdAWaitingPromptIsHeldOneRoundPerCap) {
+    Restart(/*min_decoding=*/16, /*cap=*/1, /*min_interval=*/0, /*mixed=*/false, /*force_retraction=*/0);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 6, /*start=*/100), MakeRequestSpec("c", 2, /*start=*/200)});
+    std::vector<std::string> ran;
+    ran.push_back(Round({"b"}));
+    ran.push_back(Round());
+    ran.push_back(Round({"b"}));
+    ran.push_back(Round());
+    ran.push_back(Round());
+    ran.push_back(Round());
+    ran.push_back(Round());
+    ran.push_back(Round());
+    EXPECT_EQ(ran, (std::vector<std::string>{"P:b", "D:a", "P:b", "D:a", "P:b", "D:ab", "P:c", "D:abc"}));
+    const auto before_c = std::ranges::find(ran, "P:c");
+    const auto held = std::count_if(ran.begin(), before_c, [](const std::string& round) { return round[0] == 'D'; });
+    EXPECT_GT(held, 2) << "c's held-back count stayed within N";
+    for (auto round = ran.begin(); round + 1 < before_c; ++round) {
+        EXPECT_FALSE((*round)[0] == 'D' && (*(round + 1))[0] == 'D') << "c was held two rounds in a row";
+    }
+}
+
+// A retracted decode is not ready to decode, so it leaves the count: a and b
+// decode (T 2 met) and c waits the interval (EnoughDecodesOweTheInterval
+// runs D:ab twice). The forced retraction of a in the third plan drops the
+// count to 1, so that round waives the rest of the interval and runs c. a is
+// restored beside the next decode; with b and c decoding the count is met
+// again, and d waits the whole interval c's prefill started.
+TEST_F(PrefillIntervalMinDecodingInvariantSuite, ARetractedDecodeLeavesTheThresholdCount) {
+    Restart(/*min_decoding=*/2, /*cap=*/4, /*min_interval=*/0, /*mixed=*/false, /*force_retraction=*/3);
+    Submit({MakeRequestSpec("a", 1), MakeRequestSpec("b", 1, /*start=*/100)});
+    EXPECT_EQ(Round(), "P:ab");
+    Submit(MakeRequestSpec("c", 2, /*start=*/200));
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");  // plan 3 retracts a, the oldest decode
+    Submit(MakeRequestSpec("d", 2, /*start=*/300));
+    EXPECT_EQ(Round(), "D:bc");  // a's restore rides beside the decode
+    EXPECT_EQ(Round(), "D:abc");
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(Round(), "P:d");
+}
+
+// In mixed mode below T nothing is owed, so b's chunks ride beside a's decode
+// at once instead of waiting the interval (CappedPrefillDecodeIntervalSuite.
+// InMixedModeEachChunkWaitsTheInterval). Every such round decodes, which ends
+// the run, so K never forces a round: the threshold behaves as if K were off.
+TEST_F(PrefillIntervalMinDecodingInvariantSuite, InMixedModeTooFewDecodesOweNoIntervalAndTheCapIsNeverReached) {
+    Restart(/*min_decoding=*/3, /*cap=*/1, /*min_interval=*/0, /*mixed=*/true, /*force_retraction=*/0);
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round(), "P:ba");
+    EXPECT_EQ(Round(), "D:ab");
+}
 class PrefillDecodeIntervalTwoSlotsSuite : public PrefillDecodeIntervalSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -3208,6 +3329,8 @@ protected:
         // The two bounds; empty leaves the config's default.
         std::optional<std::int32_t> cap;
         std::optional<std::int32_t> yield_max_rounds;
+        // prefill_interval_min_decoding; empty leaves the config's default.
+        std::optional<std::int32_t> min_decoding;
     };
 
     // Long prompts arriving together, four chunks each, no shared prefix.
@@ -3258,6 +3381,9 @@ protected:
         }
         if (settings.yield_max_rounds) {
             cfg.prefill_chunk_yield_max_rounds = *settings.yield_max_rounds;
+        }
+        if (settings.min_decoding) {
+            cfg.prefill_interval_min_decoding = *settings.min_decoding;
         }
         SetTestSnapshotPool(cfg);
         config_ = WithHostPackingFromDevice(cfg);
@@ -3318,10 +3444,20 @@ protected:
     }
 
     static Settings Fused(std::int32_t interval) {
-        return Settings{.role = Role::kFused, .interval = interval, .yield = 0, .cap = {}, .yield_max_rounds = {}};
+        return Settings{.role = Role::kFused,
+                        .interval = interval,
+                        .yield = 0,
+                        .cap = {},
+                        .yield_max_rounds = {},
+                        .min_decoding = {}};
     }
     static Settings PrefillRoleWithYield() {
-        return Settings{.role = Role::kP, .interval = 0, .yield = kChunk / 2, .cap = {}, .yield_max_rounds = {}};
+        return Settings{.role = Role::kP,
+                        .interval = 0,
+                        .yield = kChunk / 2,
+                        .cap = {},
+                        .yield_max_rounds = {},
+                        .min_decoding = {}};
     }
 
     // The sequences below were recorded with the scheduler as it was before
@@ -3390,6 +3526,61 @@ protected:
             "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
             "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
             "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
+        };
+    }
+    // Recorded with the scheduler as it was before
+    // prefill_interval_min_decoding existed, interval 2 and a cap of 1.
+    static std::vector<std::string> ManyLongPromptsUnderTheIntervalCappedAtOne() {
+        return {
+            "P r0@0+32", "P r0@32+32", "P r0@64+32", "P r0@96+32", "D r0+1", "D r0+1", "P r1@0+32",
+            "D r0+1",    "P r1@32+32", "P r1@64+32", "P r1@96+32", "D r1+1", "D r1+1", "P r2@0+32",
+            "D r1+1",    "P r2@32+32", "P r2@64+32", "P r2@96+32", "D r2+1", "D r2+1", "P r3@0+32",
+            "D r2+1",    "P r3@32+32", "P r3@64+32", "P r3@96+32", "D r3+1", "D r3+1", "P r4@0+32",
+            "D r3+1",    "P r4@32+32", "P r4@64+32", "P r4@96+32", "D r4+1", "D r4+1", "P r5@0+32",
+            "D r4+1",    "P r5@32+32", "P r5@64+32", "P r5@96+32", "D r5+1", "D r5+1", "D r5+1",
+        };
+    }
+    static std::vector<std::string> MixedQueueUnderTheIntervalCappedAtOne() {
+        return {
+            "P r0@0+32",
+            "P r0@32+32",
+            "P r0@64+32",
+            "P r0@96+32",
+            "P r0@128+8 r1@0+6 r2@0+10",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "P r3@0+32",
+            "P r3@32+32",
+            "P r3@64+8 r4@0+5 r5@0+19",
+            "D r3+1 r4+1",
+            "D r3+1 r4+1",
+            "P r5@19+32",
+            "D r3+1 r4+1",
+            "D r3+1 r4+1",
+            "P r5@51+32",
+            "D r3+1 r4+1",
+            "P r5@83+17 r6@0+12 r7@0+3",
+            "D r5+1 r6+1",
+            "D r5+1 r6+1",
+            "P r7@3+4",
+            "D r5+1 r6+1 r7+1",
+            "D r5+1 r6+1 r7+1",
+            "D r5+1 r6+1 r7+1",
+            "P r8@0+9 r9@0+23",
+            "D r7+1 r8+1",
+            "D r7+1 r8+1",
+            "P r9@23+32",
+            "D r8+1",
+            "D r8+1",
+            "P r9@55+9",
+            "D r8+1 r9+1",
+            "D r9+1",
+            "D r9+1",
+            "D r9+1",
+            "D r9+1",
         };
     }
     static std::vector<std::string> MixedQueueUnderTheInterval() {
@@ -3499,6 +3690,36 @@ TEST_F(PlanSequenceSuite, TheExplicitDefaultsPlanAsTheFieldsLeftOut) {
     Settings unbounded = PrefillRoleWithYield();
     unbounded.yield_max_rounds = std::numeric_limits<std::int32_t>::max();
     EXPECT_EQ(Run(MixedQueue(), unbounded), MixedQueueWithTheChunkYield());
+}
+
+// prefill_interval_min_decoding T 0 plans both workloads as recorded, with
+// the cap or without. So does T 1 with the cap (T requires it): a round with
+// nothing ready to decode owes no decode round under either rule, so T 1 is
+// met whenever it matters. Under the cap of 1 the recorded rounds pass
+// through fewer ready decodes than the workload's concurrency, so a threshold
+// at the concurrency plans them differently.
+TEST_F(PlanSequenceSuite, TheThresholdUnsetOrAlwaysMetPlansAsRecorded) {
+    Settings unset = Fused(/*interval=*/2);
+    unset.min_decoding = 0;
+    EXPECT_EQ(Run(ManyLongPrompts(), unset), ManyLongPromptsUnderTheInterval());
+    EXPECT_EQ(Run(MixedQueue(), unset), MixedQueueUnderTheInterval());
+    struct Recorded {
+        Workload workload;
+        std::vector<std::string> capped;
+    };
+    for (const Recorded& recorded : {Recorded{ManyLongPrompts(), ManyLongPromptsUnderTheIntervalCappedAtOne()},
+                                     Recorded{MixedQueue(), MixedQueueUnderTheIntervalCappedAtOne()}}) {
+        SCOPED_TRACE(recorded.workload.prompts.size());
+        Settings capped = Fused(/*interval=*/2);
+        capped.cap = 1;
+        EXPECT_EQ(Run(recorded.workload, capped), recorded.capped);
+        for (const std::int32_t min_decoding : {0, 1}) {
+            capped.min_decoding = min_decoding;
+            EXPECT_EQ(Run(recorded.workload, capped), recorded.capped) << "threshold " << min_decoding;
+        }
+        capped.min_decoding = recorded.workload.concurrency;
+        EXPECT_NE(Run(recorded.workload, capped), recorded.capped) << "a threshold at the concurrency changed nothing";
+    }
 }
 
 }  // namespace tokenspeed::test
