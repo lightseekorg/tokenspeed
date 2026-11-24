@@ -437,26 +437,37 @@ def test_runtime_rows_and_scales(model, enable_pdl, tensor_scale):
             _check(actual, values, model, torch.bfloat16)
 
 
-@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@pytest.mark.parametrize(
+    "models",
+    [
+        ((4, 2560, 320), (4, 2560, 320)),
+        ((4, 8192, 1024), (4, 8192, 1024)),
+        ((4, 2560, 320), (4, 8192, 1024)),
+    ],
+    ids=["narrow", "wide", "mixed"],
+)
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @torch.inference_mode()
-def test_concurrent_graphs(model, enable_pdl):
+def test_concurrent_graphs(models, enable_pdl):
     pdl_enabled(enable_pdl)
-    # Both streams use the same compiled bucket, so their scratch must be distinct.
-    values = [_inputs(model, rows, True, False) for rows in [17, 31]]
+    values = [
+        _inputs(model, rows, True, False)
+        for model, rows in zip(models, (17, 31), strict=True)
+    ]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs = [
         torch.cuda.CUDAGraph(keep_graph=True),
         torch.cuda.CUDAGraph(keep_graph=True),
     ]
     outputs = []
-    for v, stream, graph in zip(values, streams, graphs, strict=True):
+    for model, v, stream, graph in zip(models, values, streams, graphs, strict=True):
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             _warm(v, model, torch.bfloat16, False)
         stream.synchronize()
-        with torch.cuda.graph(graph, stream=stream):
-            outputs.append(_run(v, model, torch.bfloat16, False))
+        with assert_no_cute_compile():
+            with torch.cuda.graph(graph, stream=stream):
+                outputs.append(_run(v, model, torch.bfloat16, False))
         assert _kernel_nodes(graph) == 1
     with assert_no_cute_compile():
         for _ in range(4):
@@ -466,7 +477,7 @@ def test_concurrent_graphs(model, enable_pdl):
                     graph.replay()
         for stream in streams:
             stream.synchronize()
-    for out, v in zip(outputs, values, strict=True):
+    for model, out, v in zip(models, outputs, values, strict=True):
         _check(out, v, model, torch.bfloat16)
 
 

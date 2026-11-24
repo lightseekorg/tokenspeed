@@ -34,9 +34,7 @@ from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
     _launch_prequantized,
     _standard_workspace,
 )
-from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.wide import (
-    Fp8FusedGatedResidualKernel,
-)
+from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.sm103 import WideFp8Mixer
 
 _PLANS = {}
 _WORKSPACES = {}
@@ -151,7 +149,7 @@ def _execute(
     return _launch_prequantized(
         (x, xs, down, ds, up, us),
         outputs,
-        kernel_type=Fp8FusedGatedResidualKernel,
+        kernel_type=WideFp8Mixer,
         kernel_options=options,
         key=key,
         cache=(_PLANS, _WORKSPACES, _LOCK),
