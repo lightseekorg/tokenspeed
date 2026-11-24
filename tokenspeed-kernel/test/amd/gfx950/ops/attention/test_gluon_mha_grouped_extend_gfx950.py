@@ -703,8 +703,11 @@ def _fp8_request_count_case(count: int) -> PagedCase:
 
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_request_counts_compile_at_warmup():
-    """Batches of 1-8 requests cross the shared-CU grid size (at 4 requests
-    of 2,048 rows on 4 KV heads); after one warm-up none of them compiles."""
+    """After one warm-up, no batch of 1-8 requests compiles at launch.
+
+    The batches cross the shared-CU grid size (_shares_cus) at 4 requests of
+    2,048 rows on 4 KV heads.
+    """
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         gluon_mha_extend_gfx950,

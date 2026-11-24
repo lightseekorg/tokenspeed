@@ -227,17 +227,17 @@ def _launch_options(
 
 
 def _shares_cus(batch: int, num_workgroups: int) -> bool:
-    """Whether an extend launch of batch requests and num_workgroups work-groups
-    (query blocks x KV heads x KV splits) takes four waves a SIMD (two
-    work-groups a CU, _launch_options).
+    """Whether an extend launch takes four waves a SIMD (two work-groups a CU).
 
-    A batch of one request always does. With several, work-groups of
-    requests with different cached lengths finish at different times and do
-    not move between CUs: within one round of pairs, a pair of long ones keeps
-    sharing a CU beside idle ones, which can cost more than sharing gains.
-    From two rounds on, the dispatcher refills each CU as its work-groups
-    finish, so the unequal ones balance out. The cached lengths live on the
-    device, so the launcher sizes this by the grid alone.
+    batch is the request count and num_workgroups the grid size (query blocks
+    x KV heads x KV splits); _launch_options applies the result. A batch of
+    one request always does. With several, work-groups of requests with
+    different cached lengths finish at different times and do not move between
+    CUs: within one round of pairs, a pair of long ones keeps sharing a CU
+    beside idle ones, which can cost more than sharing gains. From two rounds
+    on, the dispatcher refills each CU as its work-groups finish, so the
+    unequal ones balance out. The cached lengths live on the device, so the
+    launcher sizes this by the grid alone.
     """
     # Two rounds of work-group pairs on every CU.
     min_workgroups_per_cu = 4
