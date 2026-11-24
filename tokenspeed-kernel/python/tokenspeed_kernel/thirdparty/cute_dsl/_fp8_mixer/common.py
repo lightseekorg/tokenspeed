@@ -311,6 +311,41 @@ def _store_private_epoch(ptr, value):
 
 
 @cute.experimental.jit
+def _mma_barriers(
+    bars,
+    stages: cutlass.Constexpr,
+    empty_stages: cutlass.Constexpr,
+    parts: cutlass.Constexpr,
+):
+    empty = bars + stages
+    done = empty + empty_stages
+    return bars, empty, done, done + parts
+
+
+@cute.experimental.jit
+def _init_mma_barriers(
+    bars,
+    stages: cutlass.Constexpr,
+    empty_stages: cutlass.Constexpr,
+    parts: cutlass.Constexpr,
+    full_arrivals: cutlass.Constexpr,
+    prepared_stages,
+    reader_arrivals: cutlass.Constexpr,
+):
+    full, empty, done, read_done = _mma_barriers(bars, stages, empty_stages, parts)
+    for stage in cutlass.range_constexpr(stages):
+        # The producer already owns the prepared full events.
+        if stage >= prepared_stages:
+            cute.arch.mbarrier_init(full + stage, full_arrivals)
+        if cutlass.const_expr(stage < empty_stages):
+            cute.arch.mbarrier_init(empty + stage, 1)
+    for part in cutlass.range_constexpr(parts):
+        cute.arch.mbarrier_init(done + part, 1)
+    if cutlass.const_expr(reader_arrivals > 0):
+        cute.arch.mbarrier_init(read_done, reader_arrivals)
+
+
+@cute.experimental.jit
 def _issue_mma_block(mma, acc, a_desc, b_desc, block, stage):
     cute.gemm(
         mma,

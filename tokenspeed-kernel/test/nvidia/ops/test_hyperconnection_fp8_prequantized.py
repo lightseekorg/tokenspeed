@@ -32,6 +32,9 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_mix,
     prepare_gated_residual_up_weight,
 )
+from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
+    _execute as _execute_generic,
+)
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import pdl_enabled
 from utils import assert_no_cute_compile
@@ -128,6 +131,30 @@ def _check(actual, v, model, dtype):
             torch.testing.assert_close(
                 a.cpu().double(), e, atol=atol, rtol=rtol, equal_nan=True
             )
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@torch.inference_mode()
+def test_generic_paired_up_keeps_prefix_accumulators(model):
+    g, h, r = model
+    v = _inputs(model, 257, True, False)
+    actual = _execute_generic(
+        v.x,
+        v.xs,
+        v.down,
+        v.ds,
+        v.up,
+        v.us,
+        g=g,
+        h=h,
+        r=r,
+        p=r + g,
+        output_dtype=torch.bfloat16,
+        projection_scale=1.0,
+        weights_independent=True,
+        token_bucket=256,
+    )
+    _check(actual, v, model, torch.bfloat16)
 
 
 @pytest.mark.parametrize(

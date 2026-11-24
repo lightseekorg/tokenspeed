@@ -26,7 +26,6 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings.driver import CUstream
 from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import CopyUniversalOp, tcgen05
 from cutlass.cutlass_dsl import T
 from cutlass.experimental.cuda import (
@@ -40,8 +39,10 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _arrive_phase_release,
     _decode_residual,
     _grid_barrier,
+    _init_mma_barriers,
     _make_down_fragments,
     _make_down_operands,
+    _mma_barriers,
     _mul_hidden_float_pair,
     _operand_at,
     _run_cute_mma_ring,
@@ -56,13 +57,13 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.raw_issue import (
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.resident import (
     MixerOperands,
     QuantizationConfig,
+    ResidentDown,
     ResidentMixer,
     _mixer_cta,
     _mixer_shared,
     _read_down_partials,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
-    Fp8GatedResidualGemm,
     _epilogue_barrier,
     _up_sigmoid_tanh,
 )
@@ -222,7 +223,7 @@ def _down_retirement_events(start, size, weight_bytes, input_bytes, stages, tile
     return tuple(events)
 
 
-class _DownPhase(Fp8GatedResidualGemm):
+class _DownPhase(ResidentDown):
     def __init__(
         self,
         *,
@@ -253,6 +254,29 @@ class _DownPhase(Fp8GatedResidualGemm):
         self.mma_warp = 17
 
     @cute.experimental.jit
+    def _load_down_stage(self, operands, full, stage, tile):
+        sw, sx, weight_map, input_map, cache_priority, output_tile, token_tile = (
+            operands
+        )
+        k_segment = tile * (self.k // 128)
+        self._operand_load(
+            sw[None, None, None, stage],
+            full + stage,
+            cache_priority=cache_priority,
+            is_weight=True,
+            descriptor=weight_map,
+            coordinates=(0, output_tile * self.m, k_segment),
+        )
+        self._operand_load(
+            sx[None, None, None, stage],
+            full + stage,
+            cache_priority=cache_priority,
+            is_weight=False,
+            descriptor=input_map,
+            coordinates=(0, cutlass.Int64(token_tile) * self.n, k_segment),
+        )
+
+    @cute.experimental.jit
     def project(
         self,
         x,
@@ -277,82 +301,35 @@ class _DownPhase(Fp8GatedResidualGemm):
         warp = cute.arch.make_warp_uniform(tid // 32)
         tiler = (self.m, self.n, self.k)
         mma, sw, sx = _make_down_operands(arena, tiler, self.stages)
-        full, empty = barriers, barriers + self.stages
-        done, read_done = empty + self.stages, empty + self.stages + 1
+        full, empty, done, read_done = _mma_barriers(
+            barriers, self.stages, self.stages, 1
+        )
         if not entry_prefilled:
             if warp == self.mma_warp:
                 with cute.arch.elect_one():
-                    for stage in cutlass.range_constexpr(self.stages):
-                        cute.arch.mbarrier_init(full + stage, 1)
-                        cute.arch.mbarrier_init(empty + stage, 1)
-                    cute.arch.mbarrier_init(done, 1)
-                    cute.arch.mbarrier_init(read_done, self.epilogue_threads)
+                    _init_mma_barriers(
+                        barriers,
+                        self.stages,
+                        self.stages,
+                        1,
+                        1,
+                        0,
+                        self.epilogue_threads,
+                    )
             cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
         tcgen05_fence("after_thread_sync")
-        stage_bytes = (self.m + self.n) * self.k
         if warp == self.producer_warp:
-            if not entry_prefilled:
-                # The enclosing kernel already waited for input and weight producers.
-                # Pair each stage's operands so its MMA can start before later loads.
-                for stage in cutlass.range_constexpr(self.stages):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            full + stage, stage_bytes
-                        )
-                    self._operand_load(
-                        sw[None, None, None, stage],
-                        (full + stage),
-                        cache_priority=cache_priority,
-                        is_weight=True,
-                        descriptor=down_weight_map,
-                        coordinates=(
-                            0,
-                            output_tile * self.m,
-                            (split * self.tiles + stage) * (self.k // 128),
-                        ),
-                    )
-                    self._operand_load(
-                        sx[None, None, None, stage],
-                        (full + stage),
-                        cache_priority=cache_priority,
-                        is_weight=False,
-                        descriptor=down_input_map,
-                        coordinates=(
-                            0,
-                            token_tile * self.n,
-                            (split * self.tiles + stage) * (self.k // 128),
-                        ),
-                    )
-            for tile in cutlass.range(self.stages, self.tiles, unroll=1):
-                stage = tile % self.stages
-                cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(full + stage, stage_bytes)
-                self._operand_load(
-                    sw[None, None, None, stage],
-                    (full + stage),
-                    cache_priority=cache_priority,
-                    is_weight=True,
-                    descriptor=down_weight_map,
-                    coordinates=(
-                        0,
-                        output_tile * self.m,
-                        (split * self.tiles + tile) * (self.k // 128),
-                    ),
-                )
-                self._operand_load(
-                    sx[None, None, None, stage],
-                    (full + stage),
-                    cache_priority=cache_priority,
-                    is_weight=False,
-                    descriptor=down_input_map,
-                    coordinates=(
-                        0,
-                        token_tile * self.n,
-                        (split * self.tiles + tile) * (self.k // 128),
-                    ),
-                )
+            operands = (
+                sw,
+                sx,
+                down_weight_map,
+                down_input_map,
+                cache_priority,
+                output_tile,
+                token_tile,
+            )
+            self._feed_down_ring(operands, full, empty, split, entry_prefilled, None)
             if cutlass.const_expr(self.up_reuse_stages > 0):
                 if prepare_up_weights:
                     # A Down weight slot covers 16 KiB for these shapes. Each Up weight
@@ -616,8 +593,7 @@ class _DownPhase(Fp8GatedResidualGemm):
         warp = cute.arch.make_warp_uniform(tid // 32)
         tiler = (self.m, self.n, self.k)
         mma, sw, sx = _make_down_operands(arena, tiler, self.stages)
-        full, empty = barriers, barriers + self.stages
-        done, read_done = empty + self.stages, empty + self.stages + 1
+        full = barriers
         if cutlass.const_expr(self.early_entry_weights > 0):
             if warp == self.producer_warp:
                 # The producer owns these full events. The original CTA join
@@ -639,12 +615,15 @@ class _DownPhase(Fp8GatedResidualGemm):
                     )
         if warp == self.mma_warp:
             with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.stages):
-                    if cutlass.const_expr(stage >= self.early_entry_weights):
-                        cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                cute.arch.mbarrier_init(done, 1)
-                cute.arch.mbarrier_init(read_done, self.epilogue_threads)
+                _init_mma_barriers(
+                    barriers,
+                    self.stages,
+                    self.stages,
+                    1,
+                    1,
+                    self.early_entry_weights,
+                    self.epilogue_threads,
+                )
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         if warp == self.producer_warp:
@@ -1345,22 +1324,9 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
 
     @cute.experimental.jit
     def _load_hidden_pair(self, tensor, offset, dtype: cutlass.Constexpr):
-        pointer = cute.make_ptr(
-            dtype,
-            (tensor.iterator + offset).toint(),
-            cute.AddressSpace.smem,
-            assumed_align=2 * dtype.width // 8,
+        return self._load_hidden_packet(
+            tensor, offset, dtype, 2, cute.AddressSpace.smem
         )
-        source = cute.make_tensor(pointer, cute.make_layout(2))
-        values = cute.make_rmem_tensor(2, dtype)
-        cute.copy(
-            cute.make_copy_atom(
-                CopyUniversalOp(), dtype, num_bits_per_copy=2 * dtype.width
-            ),
-            source,
-            values,
-        )
-        return values
 
     @cute.experimental.jit
     def _write_hidden_pairs(
@@ -1548,20 +1514,19 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         self, bars, prepared_weight_stages, use_existing_join: cutlass.Constexpr
     ):
         warp = cute.arch.make_warp_uniform(cute.arch.thread_idx()[0] // 32)
-        full, empty = bars, bars + self.up_stages
-        done = empty + self.up_stages
-        read_done = done + self.up_parts
         if warp == self.mma_warp:
             with cute.arch.elect_one():
-                for stage in cutlass.range_constexpr(self.up_stages):
-                    if stage >= prepared_weight_stages:
-                        cute.arch.mbarrier_init(full + stage, 1)
-                    cute.arch.mbarrier_init(empty + stage, 1)
-                for part in cutlass.range_constexpr(self.up_parts):
-                    cute.arch.mbarrier_init(done + part, 1)
-                cute.arch.mbarrier_init(read_done, self.compute_threads)
+                _init_mma_barriers(
+                    bars,
+                    self.up_stages,
+                    self.up_stages,
+                    self.up_parts,
+                    1,
+                    prepared_weight_stages,
+                    self.compute_threads,
+                )
                 if cutlass.const_expr(self.up_grouped_readers):
-                    cute.arch.mbarrier_init(read_done + 1, 1)
+                    cute.arch.mbarrier_init(bars + self.up_barrier_count - 1, 1)
                 if cutlass.const_expr(use_existing_join):
                     cute.arch.mbarrier_init_fence()
                     llvm.inline_asm(
@@ -1833,15 +1798,6 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
                 _epilogue_barrier(32 * (1 + self.up_scale_warps), cutlass.Int32(13))
 
     @cute.experimental.jit
-    def _retire_up_slot(self, empty, slot, tile):
-        notify = cutlass.Boolean(True)
-        if cutlass.const_expr(self.up_unused_empty):
-            notify = tile < self.up_tiles - self.up_unused_empty
-        if notify:
-            with cute.arch.elect_one():
-                tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
-
-    @cute.experimental.jit
     def _up(
         self,
         alpha,
@@ -1864,12 +1820,7 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
     ):
         tid = cute.arch.thread_idx()[0]
         warp = cute.arch.make_warp_uniform(tid // 32)
-        cached = cute_ext.allocate(
-            cutlass.Float32,
-            cute.AddressSpace.smem,
-            cute.make_layout(self.up_cached_weight_base + self.up_channels),
-            alignment=16,
-        )
+        cached = self._up_scale_storage(self.up_cached_weight_base)
         residual_tile = None
         reader_channel = cutlass.Int32(0)
         reader_row = cutlass.Int32(0)
@@ -1877,19 +1828,12 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
         if cutlass.const_expr(self.up_grouped_readers):
             kept_gates = cute.make_rmem_tensor((2, self.up_parts), cutlass.Float32)
         if cutlass.const_expr(not self.token_major_up):
-            residual_tile = cute_ext.allocate(
-                cutlass.Float8E4M3FN,
-                cute.AddressSpace.smem,
-                cute.make_layout(
-                    (self.up_rows, self.up_channels), stride=(self.up_channels, 1)
-                ),
-                alignment=16,
-            )
+            residual_tile = self._up_residual_tile(self.up_channels, 16)
         mma, _, al, bl = self._up_operand_layouts()
         sw, sa0, sa1 = self._up_operand_storage(arena, al, bl)
-        full, empty = bars, bars + self.up_stages
-        done = empty + self.up_stages
-        read_done = done + self.up_parts
+        full, empty, done, read_done = _mma_barriers(
+            bars, self.up_stages, self.up_stages, self.up_parts
+        )
         if not weights_prepared:
             self._init_up_barriers(bars, cutlass.Int32(0), use_existing_join=False)
         tcgen05_fence("after_thread_sync")
@@ -1980,21 +1924,23 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
                 )
         elif warp == self.mma_warp:
             fragments = self._up_mma_fragments(mma, base, sa0, sa1, sw)
-            if cutlass.const_expr(self.up_issue_style == "cute"):
+            if cutlass.const_expr(self.up_issue_style != "raw_unrolled"):
+                fully_unroll = self.up_issue_style == "cute_unrolled"
+                prefix_tiles = (
+                    self.up_tiles - self.up_tail_tiles - int(self.up_grouped_readers)
+                )
                 mma.set(tcgen05.Field.ACCUMULATE, False)
-                for tile in cutlass.range(
-                    self.up_tiles - int(self.up_grouped_readers),
-                    unroll=1,
-                ):
-                    slot = tile % self.up_stages
-                    cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
-                    for block in cutlass.range_constexpr(
-                        cute.size(fragments.a[0], mode=[2])
-                    ):
-                        self._issue_up_mma_pair(mma, fragments, block, slot)
-                        mma.set(tcgen05.Field.ACCUMULATE, True)
-                    self._retire_up_slot(empty, slot, tile)
+                self._run_up_mma_tiles(
+                    mma,
+                    fragments,
+                    full,
+                    (empty, self.up_unused_empty),
+                    None,
+                    prefix_tiles,
+                    fully_unroll,
+                )
                 if cutlass.const_expr(self.up_grouped_readers):
+                    mma.set(tcgen05.Field.ACCUMULATE, prefix_tiles > 0)
                     tile = self.up_tiles - 1
                     slot = tile % self.up_stages
                     cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
@@ -2003,47 +1949,13 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
                         tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
                     cute.arch.mbarrier_wait(read_done + 1, 0)
                     self._issue_up_mma_part(mma, fragments, slot, 1)
-                    self._retire_up_slot(empty, slot, tile)
+                    self._retire_up_slot(empty, slot, tile, self.up_unused_empty)
                     with cute.arch.elect_one():
                         tcgen05.commit(done + 1, None, tcgen05.CtaGroup.ONE)
-                elif cutlass.const_expr(self.up_parts == 2):
-                    with cute.arch.elect_one():
-                        tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-                    with cute.arch.elect_one():
-                        tcgen05.commit(done + 1, None, tcgen05.CtaGroup.ONE)
+                elif cutlass.const_expr(self.up_tail_tiles != 0):
+                    self._run_paired_up_tail(mma, fragments, full, empty, done, True)
                 else:
-                    with cute.arch.elect_one():
-                        tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-                cute.arch.mbarrier_wait(read_done, 0)
-            elif cutlass.const_expr(self.up_issue_style == "cute_unrolled"):
-                mma.set(tcgen05.Field.ACCUMULATE, False)
-                for tile in cutlass.range_constexpr(self.up_tiles - self.up_tail_tiles):
-                    slot = tile % self.up_stages
-                    cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
-                    for block in cutlass.range_constexpr(
-                        cute.size(fragments.a[0], mode=[2])
-                    ):
-                        self._issue_up_mma_pair(mma, fragments, block, slot)
-                        mma.set(tcgen05.Field.ACCUMULATE, True)
-                    self._retire_up_slot(empty, slot, tile)
-                for tile in cutlass.range_constexpr(
-                    self.up_tiles - self.up_tail_tiles, self.up_tiles
-                ):
-                    slot = tile % self.up_stages
-                    cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
-                    self._issue_up_mma_part(mma, fragments, slot, 0)
-                    # Retain these last operand slots for the other token part.
-                with cute.arch.elect_one():
-                    tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-                for tile in cutlass.range_constexpr(
-                    self.up_tiles - self.up_tail_tiles, self.up_tiles
-                ):
-                    slot = tile % self.up_stages
-                    self._issue_up_mma_part(mma, fragments, slot, 1)
-                    with cute.arch.elect_one():
-                        tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
-                with cute.arch.elect_one():
-                    tcgen05.commit(done + 1, None, tcgen05.CtaGroup.ONE)
+                    self._publish_up_done(done)
                 cute.arch.mbarrier_wait(read_done, 0)
             else:
                 instruction = fp8_instruction(self.up_mn[0], self.up_mn[1])
@@ -2070,10 +1982,7 @@ class Fp8FusedGatedResidualKernel(ResidentMixer):
                                 accumulate,
                             )
                         tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
-                with cute.arch.elect_one():
-                    tcgen05.commit(done, None, tcgen05.CtaGroup.ONE)
-                with cute.arch.elect_one():
-                    tcgen05.commit(done + 1, None, tcgen05.CtaGroup.ONE)
+                self._publish_up_done(done)
                 cute.arch.mbarrier_wait(read_done, 0)
             if cutlass.const_expr(self.up_tmem_dealloc_site != "kernel_tail"):
                 if terminal_up_task:

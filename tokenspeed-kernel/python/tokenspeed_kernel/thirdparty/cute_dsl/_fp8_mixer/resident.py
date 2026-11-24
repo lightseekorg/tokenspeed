@@ -27,7 +27,7 @@ import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
-from cutlass.cute.nvgpu import CopyUniversalOp
+from cutlass.cute.nvgpu import CopyUniversalOp, tcgen05
 from cutlass.cutlass_dsl import T
 from cutlass.experimental.primitives import tcgen05_fence
 from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
@@ -47,10 +47,14 @@ from tokenspeed_kernel.thirdparty.cute_dsl._fp8_mixer.common import (
     _scale_down_value,
     _store_token_major_mix,
     _tiled_tmem_reader,
+    _tma_matrix_view,
     _token_major_reader,
     _x_scale,
 )
-from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import _epilogue_barrier
+from tokenspeed_kernel.thirdparty.cute_dsl.hc_fp8 import (
+    Fp8GatedResidualGemm,
+    _epilogue_barrier,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import (
     _publish_activation_proxy,
     _up_sigmoid_tanh,
@@ -230,6 +234,29 @@ def _read_down_partials(
     cute_ext.partition_and_copy(reader, accumulator, values)
     cute.arch.fence_view_async_tmem_load()
     return values, coords
+
+
+class ResidentDown(Fp8GatedResidualGemm):
+    @cute.experimental.jit
+    def _feed_down_ring(
+        self, operands, full, empty, split, entry_prefilled, refill_hint
+    ):
+        stage_bytes = (self.m + self.n) * self.k
+        first_tile = split * self.tiles
+        if not entry_prefilled:
+            for stage in cutlass.range_constexpr(self.stages):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(full + stage, stage_bytes)
+                self._load_down_stage(operands, full, stage, first_tile + stage)
+        if cutlass.const_expr(refill_hint is not None):
+            descriptor, output_tile, token_tile = refill_hint
+            self._hint_refill_input(descriptor, output_tile, split, token_tile)
+        for tile in cutlass.range(self.stages, self.tiles, unroll=1):
+            stage = tile % self.stages
+            cute.arch.mbarrier_wait(empty + stage, (tile // self.stages - 1) % 2)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(full + stage, stage_bytes)
+            self._load_down_stage(operands, full, stage, first_tile + tile)
 
 
 class ResidentMixer:
@@ -597,27 +624,16 @@ class ResidentMixer:
 
     @cute.experimental.jit
     def _up_weight_view(self, weight):
-        return cute.make_tensor(
-            weight.iterator,
-            cute.make_layout(
-                (
-                    (self.up_hidden, self.g, self.h // self.up_hidden),
-                    (64, self.r // 64),
-                    1,
-                ),
-                stride=((self.r, self.h * self.r, self.up_hidden * self.r), (1, 64), 0),
-            ),
+        return _tma_matrix_view(
+            weight,
+            (self.up_hidden, self.g, self.h // self.up_hidden),
+            (self.r, self.h * self.r, self.up_hidden * self.r),
+            self.r,
         )
 
     @cute.experimental.jit
     def _up_tma_operands(self, mma, tiler, activation, weight, hidden_tile):
-        av = cute.make_tensor(
-            activation.iterator,
-            cute.make_layout(
-                (activation.shape[0], (64, self.r // 64), 1),
-                stride=(self.r, (1, 64), 0),
-            ),
-        )
+        av = _tma_matrix_view(activation, activation.shape[0], self.r, self.r)
         wv = self._up_weight_view(weight)
         gx0 = cute.local_tile(av, (self.up_rows, self.up_k), (0, None, 0))
         gx1 = cute.local_tile(av, (self.up_rows, self.up_k), (1, None, 0))
@@ -641,6 +657,49 @@ class ResidentMixer:
             cta_v_map=mapping,
             update_expect_tx=False,
         )
+
+    @cute.experimental.jit
+    def _up_scale_storage(self, weight_offset: cutlass.Constexpr):
+        return cute_ext.allocate(
+            cutlass.Float32,
+            cute.AddressSpace.smem,
+            cute.make_layout(weight_offset + self.up_channels),
+            alignment=16,
+        )
+
+    @cute.experimental.jit
+    def _up_residual_tile(
+        self, row_stride: cutlass.Constexpr, alignment: cutlass.Constexpr
+    ):
+        return cute_ext.allocate(
+            cutlass.Float8E4M3FN,
+            cute.AddressSpace.smem,
+            cute.make_layout((self.up_rows, self.up_channels), stride=(row_stride, 1)),
+            alignment=alignment,
+        )
+
+    @cute.experimental.jit
+    def _load_hidden_packet(
+        self,
+        tensor,
+        offset,
+        dtype: cutlass.Constexpr,
+        width: cutlass.Constexpr,
+        space: cutlass.Constexpr,
+    ):
+        pointer = cute.make_ptr(
+            dtype,
+            (tensor.iterator + offset).toint(),
+            space,
+            assumed_align=width * dtype.width // 8,
+        )
+        source = cute.make_tensor(pointer, cute.make_layout(width))
+        values = cute.make_rmem_tensor(width, dtype)
+        atom = cute.make_copy_atom(
+            CopyUniversalOp(), dtype, num_bits_per_copy=width * dtype.width
+        )
+        cute.copy(atom, source, values)
+        return values
 
     @cute.experimental.jit
     def _up_mma_fragments(self, mma, base, sa0, sa1, sw):
@@ -679,6 +738,70 @@ class ResidentMixer:
     def _issue_up_mma_part(self, mma, fragments, slot, part: cutlass.Constexpr):
         for block in cutlass.range_constexpr(cute.size(fragments.a[part], mode=[2])):
             self._issue_up_mma_block(mma, fragments, block, slot, part)
+
+    @cute.experimental.jit
+    def _retire_up_slot(self, empty, slot, tile, unused_empty: cutlass.Constexpr):
+        notify = cutlass.Boolean(True)
+        if cutlass.const_expr(unused_empty != 0):
+            notify = tile < self.up_tiles - unused_empty
+        if notify:
+            with cute.arch.elect_one():
+                tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
+
+    @cute.experimental.jit
+    def _run_up_mma_tiles(
+        self,
+        mma,
+        fragments,
+        full,
+        empty,
+        suffix,
+        tiles: cutlass.Constexpr,
+        unroll_full: cutlass.Constexpr,
+    ):
+        """Wait, accumulate and optionally release each Up operand slot."""
+        for tile in cutlass.range(
+            tiles, unroll=-1 if unroll_full else 1, unroll_full=unroll_full
+        ):
+            slot = tile % self.up_stages
+            cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
+            for block in cutlass.range_constexpr(cute.size(fragments.a[0], mode=[2])):
+                if cutlass.const_expr(suffix is not None and block == suffix[1]):
+                    cute.arch.mbarrier_wait(suffix[0], 0)
+                self._issue_up_mma_pair(mma, fragments, block, slot)
+                # CuTe tracks the accumulator state across the loop here.
+                mma.set(tcgen05.Field.ACCUMULATE, True)
+            if cutlass.const_expr(empty is not None):
+                self._retire_up_slot(empty[0], slot, tile, empty[1])
+
+    @cute.experimental.jit
+    def _run_paired_up_tail(
+        self, mma, fragments, full, empty, done, unroll_full: cutlass.Constexpr
+    ):
+        # Start from the prefix's accumulated fragments across the JIT boundary.
+        mma.set(tcgen05.Field.ACCUMULATE, self.up_tiles > self.up_tail_tiles)
+        for part in cutlass.range_constexpr(2):
+            for tile in cutlass.range(
+                self.up_tiles - self.up_tail_tiles,
+                self.up_tiles,
+                unroll=-1 if unroll_full else 1,
+                unroll_full=unroll_full,
+            ):
+                slot = tile % self.up_stages
+                if cutlass.const_expr(part == 0):
+                    cute.arch.mbarrier_wait(full + slot, tile // self.up_stages % 2)
+                self._issue_up_mma_part(mma, fragments, slot, part)
+                if cutlass.const_expr(part == 1):
+                    with cute.arch.elect_one():
+                        tcgen05.commit(empty + slot, None, tcgen05.CtaGroup.ONE)
+            with cute.arch.elect_one():
+                tcgen05.commit(done + part, None, tcgen05.CtaGroup.ONE)
+
+    @cute.experimental.jit
+    def _publish_up_done(self, done):
+        for part in cutlass.range_constexpr(self.up_parts):
+            with cute.arch.elect_one():
+                tcgen05.commit(done + part, None, tcgen05.CtaGroup.ONE)
 
     @cute.experimental.jit
     def _reader(

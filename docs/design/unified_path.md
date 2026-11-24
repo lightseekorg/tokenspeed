@@ -737,10 +737,12 @@ W8A8 uses the FP8 scale floor and rounds the multiplier independently.
 Prequantized W8A8 takes E4M3 input, FP32 tensor or row scales and an explicit
 BF16 or FP16 output dtype. One cooperative kernel runs all stages and mixes
 the residual from the input codes and scale in FP32. Schedules share the
-resident loop, quantizer, TMEM readers and token-major Up epilogue, with
-compile-time operand layouts and handoff policies. The 16-token injection
-schedule publishes epoch-tagged activations for early Up MMA. The K128
-schedule prefetches Up weights as Down releases stages and can share weights
+resident loop, quantizer, MMA barriers, Down operand ring, Up tile loop and
+TMEM readers. Paired streaming plans share an Up tail that releases stages
+after the second token part. Operand layouts and handoffs are compile-time
+policies. The 16-token injection schedule publishes epoch-tagged activations
+for early Up MMA. The K128 schedule prefetches Up weights as Down releases
+stages and can share weights
 across the two token parts at 256 rows.
 
 Compiled occupancy bounds the resident grid. Each stream owns scratch and
