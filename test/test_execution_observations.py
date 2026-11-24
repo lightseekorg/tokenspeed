@@ -268,6 +268,9 @@ def test_restore_keeps_the_admission_and_observed_continuation(capfd, tmp_path):
     ) + [
         "--debug-force-retraction-interval",
         "3",
+        # Rotate the global debug victim selection through every admission.
+        "--debug-force-retraction-max-per-request",
+        "1",
     ]
     with launch(args, observed=True) as driver:
         outputs = generate(driver, 3)

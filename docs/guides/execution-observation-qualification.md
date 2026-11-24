@@ -73,7 +73,7 @@ modified by these helpers.
 | DFLASH W8 | `TOKENSPEED_EXECUTION_DRAFT_MODEL`: a real trained draft compatible with the target, tokenizer/vocabulary, hidden-state taps and checkpoint-declared block/verify layout. Both models must pass the chosen envelope gate. |
 | Inline plus DFLASH | Both inline target arguments and `TOKENSPEED_EXECUTION_INLINE_DRAFT_MODEL`, compatible with that target. |
 | Idle DP peer | `TOKENSPEED_EXECUTION_DP_TEST_ARGS`: a supported two-DP-rank topology with enough reserved GPUs; the test requires `--data-parallel-size 2`. |
-| Memory release/resume | `TOKENSPEED_EXECUTION_MEMORY_TEST_ARGS`: local target arguments including `--enable-memory-saver`. |
+| Memory release/resume | `TOKENSPEED_EXECUTION_MEMORY_TEST_ARGS`: local target arguments including `--enable-memory-saver --weight-memory-policy cpu_backup`. |
 
 No real DFLASH pair or inline-capable checkpoint is manufactured by the synthetic
 generator. The W8 suite requires an ordinary width-8 layout: a checkpoint whose
@@ -82,10 +82,13 @@ invoked case. Keep these cases pending until compatible assets are supplied and
 their actual serving tests run; helper replay tests do not replace them.
 
 For the memory case, a local JSON argument file can append
-`--enable-memory-saver` to the generated arguments and become
+`--enable-memory-saver --weight-memory-policy cpu_backup` to the generated arguments and become
 `TOKENSPEED_EXECUTION_MEMORY_TEST_ARGS`. Restore does not require a new model,
 but needs the native snapshot pool and positive copied-cache evidence. Do not
 disable that pool or count an empty restore ACK as successful physical copying.
+The fixture caps forced retractions at one per admission so that the global
+debug victim selection reaches every measured request. Each still needs its own
+completed physical copy and subsequent target execution.
 
 See the [observation contract](../design/execution-observations.md) for capture,
 startup, draft-only and idle exclusions, and the separate CUDA helper suite for
