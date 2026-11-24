@@ -35,6 +35,7 @@ import functools
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -150,6 +151,21 @@ def l3_cache_quantization_id(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def warn_if_unpinned_peer_weights(
+    weight_version: str, revisions: Sequence[str]
+) -> None:
+    """Warn when live peers have no explicit version covering all loaded weights."""
+    if weight_version.strip() in ("", "default") and any(
+        not _HF_COMMIT_HASH_RE.fullmatch(revision) for revision in revisions
+    ):
+        logging.getLogger(__name__).warning(
+            "Peer prefix sharing uses the default weight identity and an unpinned "
+            "model revision. Replicas that load different weights can reuse incorrect KV. "
+            "Set --weight-version for the target and draft weights together, or pin "
+            "each loaded model revision to an immutable commit."
+        )
 
 
 def l3_checkpoint_id(
@@ -910,6 +926,7 @@ def storage_deployment_id(
     skip_softmax_threshold: float,
     eagle3_layers_to_capture: Sequence[int],
     kv_producer: dict[str, Any],
+    for_peer: bool = False,
 ) -> str:
     """Snapshot static cache compatibility facts into an immutable identity.
 
@@ -941,6 +958,10 @@ def storage_deployment_id(
     shards = [int(count) for count in group_shard_counts]
     if not shards or any(count < 1 for count in shards):
         raise ValueError("group_shard_counts must contain positive shard counts")
+    # EP places experts independently of attention heads and KV page ownership.
+    # Persistent keys and stricter numerical policies still distinguish EP.
+    if for_peer and kv_producer.get("numerics") == "auto":
+        kv_producer = {k: v for k, v in kv_producer.items() if k != "moe_ep_size"}
     payload = json.dumps(
         {
             "model": str(model_name),

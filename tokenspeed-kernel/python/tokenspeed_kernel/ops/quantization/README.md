@@ -58,33 +58,31 @@ or packed layout. Packed scales use MN-major int32 words with the row count
 padded to four; their column offsets use 64-bit arithmetic as that stride
 grows with the batch. Only canonical scales support arbitrary row selection.
 
-## Native FP32 token-group scales
+## MN-major FP32 token-group scales
 
 Explicitly selecting `override="trtllm_quantize_fp8_mn_major"` with
 `granularity="token_group"`, `group_size=128` and `scale_encoding="float32"`
-returns FP8 values and a strided `[M, K / 128]` view of the native scales.
-This kernel accepts BF16 matrix inputs and does not support PDL. Values and
-logical scales match the canonical TRT-LLM quantizer exactly. Only the scale
-storage changes; the FP8 activation data layout is unchanged.
+returns FP8 values and `[M, K / 128]` scales stored MN-major: the transpose of
+a contiguous `[K / 128, M]` tensor. This kernel accepts BF16 matrix inputs and
+does not support PDL. Values and scales match the canonical TRT-LLM quantizer
+exactly. Only the scale storage changes; the FP8 activation data layout is
+unchanged.
 
 Here MN-major refers to scale storage: for activation scales, the M (token)
 dimension is contiguous. It does not prescribe the weight matrix layout.
-The returned view preserves the native stride, which depends on the TRT-LLM
-implementation. Native storage may be unpadded `(1, M)` or padded, such as
-`(1, round_up(M, 4))` for the flat-buffer ABI. The latter satisfies Hopper
-DeepGEMM's 16-byte stride alignment for FP32 scales (four 4-byte elements).
-MN-major storage alone does not guarantee TMA alignment.
+Rows are not padded, so MN-major storage alone does not guarantee TMA
+alignment.
 
-This entry eliminates the contiguous-scale copy in the quantization wrapper.
-A downstream GEMM can also skip its scale repack only when it accepts the
-native strides and encoding. In particular, it does not guarantee that
-Blackwell consumers can skip scale alignment or encoding conversion.
+The TRT-LLM kernel writes either layout directly, so neither entry copies its
+scales. The TRT-LLM CuTe-DSL block-FP8 GEMM reads MN-major scales in place,
+and the FlashInfer TRT-LLM FP8 MoE reads their contiguous `[K / 128, M]`
+transpose.
 
 Ordinary quantization requests token-major storage and excludes this entry
-from ranked selection. Explicit `override` selects the native entry; its
-implementation validates the supported quantization parameters. Callers
-opting in must support the returned strides. This entry does not change
-model projections or GEMM dispatch.
+from ranked selection. Explicit `override` selects it; its implementation
+validates the supported quantization parameters. Block-FP8 linear layers
+select it when `mm_activation_scale_layout` reports that their GEMM reads
+MN-major scales, and the FP8 MoE always does.
 
 ## DeepGEMM packed UE8M0
 

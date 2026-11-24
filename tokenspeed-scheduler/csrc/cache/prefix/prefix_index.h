@@ -348,8 +348,8 @@ public:
     // a checkpoint there while a State group does. `state` and `closed` give
     // this group's kind. The coordinator binds each index once, before
     // anything is registered; an index never bound holds nothing.
-    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool, bool state,
-                         bool closed) {
+    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool,
+                         const BlockPool* disk_pool, bool state, bool closed) {
         const auto bind = [&](const BlockPool& pool, CacheTier tier) {
             CacheEntries& cache_index = cacheEntries(pool);
             _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
@@ -360,6 +360,9 @@ public:
         bind(device_pool, CacheTier::kDevice);
         if (host_pool != nullptr) {
             bind(*host_pool, CacheTier::kHost);
+        }
+        if (disk_pool != nullptr) {
+            bind(*disk_pool, CacheTier::kDisk);
         }
     }
 
@@ -653,6 +656,24 @@ public:
                                                  .metadata = metadataOf(entry),
                                                  .pinned = !entry.block_ref.unique()});
         }
+    }
+
+    // Maintenance inspection only: borrowing neither pins the block nor
+    // changes ownership. The visitor must not mutate this index or its refs.
+    template <typename Visit>
+    void ForEachBlockRef(const BlockPool& pool, const Visit& visit) const {
+        const CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) return;
+        for (const CacheEntry& entry : entries->entries) visit(entry.block_ref);
+    }
+
+    // Forget reuse metadata, including pinned entries, without revoking their
+    // external owners. A caller must first establish which live refs may remain.
+    // eraseEntry also unlinks observers, peer indexes and boundary-tree holds.
+    void Invalidate(const BlockPool& pool) {
+        CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) return;
+        while (!entries->entries.empty()) eraseEntry(*entries, entries->entries.begin());
     }
 
     std::int32_t NumEntries(const BlockPool& pool) const {

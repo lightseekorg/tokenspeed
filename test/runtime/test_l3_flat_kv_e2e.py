@@ -204,6 +204,7 @@ class TestL3FlatKvRoundTripTest:
                     kvp_rank=rank,
                     nprocs_per_node=1,
                     world_cpu_group=None,
+                    block_alignment=1,
                 )
                 stack.callback(executor.shutdown)
                 ownership = BlockOwnerTranslation.for_host_pool(
@@ -360,6 +361,7 @@ class TestL3FlatKvRoundTripTest:
             attn_tp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
 
     @staticmethod

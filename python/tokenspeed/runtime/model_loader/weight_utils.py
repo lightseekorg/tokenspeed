@@ -180,7 +180,12 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
-        if is_inkling2_manifest_stub(hf_quant_config):
+        # A released Inkling2 config.json carries a generic modelopt summary
+        # next to the manifest the inkling2 method reads.
+        if is_inkling2_manifest_stub(hf_quant_config) or (
+            model_config.quantization == "inkling2"
+            and hf_quant_config.get("quant_method") != "inkling2"
+        ):
             hf_quant_config = read_inkling2_manifest(
                 _json_folder(model_config, load_config)
             )

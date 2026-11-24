@@ -50,7 +50,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
 )
 
 
-@triton.jit
+# The source row count follows the batch and only bounds the validity mask;
+# without do_not_specialize, Triton compiles separate binaries for counts that
+# are and are not multiples of 16.
+@triton.jit(do_not_specialize=["source_rows"])
 def _gather_package_cdna4_scale_kernel(
     src_scale,
     sorted_ids,

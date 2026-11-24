@@ -99,6 +99,10 @@ def stage_lnorm(
     live = tid < S * 64
     token, lane = gl.minimum(tid // 64, S - 1), tid % 64
     col = group * 128 + lane * 2
+    # The norm weight loads are in flight across the wait for the rows.
+    desc = descriptor(ln_w)
+    w0 = gl.amd.cdna3.buffer.load(desc, col)
+    w1 = gl.amd.cdna3.buffer.load(desc, col + 1)
     lo, hi = sent_sum(
         latr,
         col,
@@ -134,10 +138,9 @@ def stage_lnorm(
     for q in gl.static_range(1, 28):
         total = total + load_f32(red, token * 32 + q)
     inverse = gl.rsqrt(total * (1.0 / 3584.0) + EPS)
-    desc = descriptor(ln_w)
-    w0 = gl.amd.cdna3.buffer.load(desc, col).to(gl.float32)
-    w1 = gl.amd.cdna3.buffer.load(desc, col + 1).to(gl.float32)
-    word = bf16_pair((lo * inverse) * w0, (hi * inverse) * w1)
+    word = bf16_pair(
+        (lo * inverse) * w0.to(gl.float32), (hi * inverse) * w1.to(gl.float32)
+    )
     gl.amd.cdna3.buffer.store(
         word,
         descriptor(ln.to(gl.pointer_type(gl.uint32))),

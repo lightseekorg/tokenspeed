@@ -538,6 +538,77 @@ def _check_managed_metadata_on_cuda():
                 assert tensor.data_ptr() == pointer
                 torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
 
+    from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+
+    if cutedsl_kda_supported():
+        # Exercise lazy compilation and both workspace routes, including growth.
+        for tokens, heads, sequences in (
+            (32, 12, 1),
+            (257, 96, 1),
+            (384, 96, 3),
+            (128, 12, 1),
+        ):
+            host_bounds = torch.arange(sequences + 1, dtype=torch.int64) * (
+                tokens // sequences
+            )
+            with saver.named_region("runtime_states"):
+                packed = torch.full(
+                    (1, tokens, 3, heads, 128), 0.1, device="cuda", dtype=torch.bfloat16
+                )
+                gate = torch.zeros(
+                    (1, tokens, heads, 128), device="cuda", dtype=torch.bfloat16
+                )
+                beta = torch.zeros(
+                    (1, tokens, heads), device="cuda", dtype=torch.bfloat16
+                )
+                decay = torch.zeros(heads, device="cuda")
+                bias = torch.zeros(heads, 128, device="cuda")
+                state = torch.zeros(sequences, heads, 128, 128, device="cuda")
+                bounds = host_bounds.to("cuda")
+
+            def scan():
+                return kda_paged_prefill(
+                    *packed.unbind(2),
+                    gate,
+                    beta,
+                    decay,
+                    bias,
+                    initial_state=state,
+                    cu_seqlens=bounds,
+                    cu_seqlens_cpu=host_bounds,
+                    capacity=None,
+                    lower_bound=-5.0,
+                    solution="cutedsl_kda",
+                    recurrent_layout="v_major",
+                )
+
+            result = scan()
+            expected_out, expected_state = result.out.cpu(), result.final_state.cpu()
+            del result
+            pointer = packed.data_ptr()
+            for _ in range(2):
+                torch.cuda.synchronize()
+                saver.pause(tag="weights")
+                torch.cuda.empty_cache()
+                ordinary_bytes = sum(
+                    segment["total_size"]
+                    for segment in torch.cuda.memory_snapshot()
+                    if segment["device"] == torch.cuda.current_device()
+                    and tuple(segment["segment_pool_id"]) == (0, 0)
+                )
+                assert ordinary_bytes == 0, ordinary_bytes
+                saver.resume(tag="weights")
+                assert packed.data_ptr() == pointer
+                result = scan()
+                torch.testing.assert_close(
+                    result.out.cpu(), expected_out, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    result.final_state.cpu(), expected_state, rtol=0, atol=0
+                )
+                del result
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -557,6 +628,128 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
             cwd=Path(__file__).resolve().parents[2],
             check=True,
             timeout=90,
+        )
+
+
+def _check_megamoe_buffers_on_cuda():
+    import gc
+    import tempfile
+
+    import torch.distributed as dist
+    from tokenspeed_kernel.thirdparty.flashinfer import kimi_mega_moe
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+    from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.cuda.set_device(0)
+    moe_utils.MOE_BACKEND = moe_utils.MoeBackend.MEGA_MOE
+    moe_utils.ALL2ALL_BACKEND = moe_utils.All2AllBackend.NONE
+    global_server_args_dict.update(
+        enable_memory_saver=True,
+        mapping=Mapping(rank=0, world_size=1),
+    )
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        dist.init_process_group(
+            "nccl",
+            init_method=f"file://{tmp}/group",
+            rank=0,
+            world_size=1,
+            device_id=torch.device("cuda", 0),
+        )
+        process_group_manager.init_process_group((0,))
+        with torch.device("cuda"), saver.region(tag="weights", enable_cpu_backup=True):
+            experts = MoELayer(
+                top_k=16,
+                num_experts=896,
+                hidden_size=3584,
+                intermediate_size=3072,
+                quant_config=Mxfp4Config(is_checkpoint_mxfp4_serialized=True),
+                layer_index=0,
+                activation="situ",
+                activation_situ_beta=4.0,
+                activation_situ_linear_beta=25.0,
+                routing_mode="precomputed_topk",
+                internal_activation_dtype_override="fp8",
+                input_dtype=torch.bfloat16,
+            )
+            with torch.no_grad():
+                experts.w13_weight.fill_(0x11)
+                experts.w2_weight.fill_(0x11)
+                experts.w13_weight_scale.fill_(124)
+                experts.w2_weight_scale.fill_(124)
+            experts.process_weights_after_loading(experts)
+
+        for rows in (128, 256, 128):
+            with saver.named_region("runtime_states"):
+                x = torch.full((rows, 3584), 0.01, device="cuda", dtype=torch.bfloat16)
+            buffers = experts.input_buffers(rows, rows)
+            ids, scores = buffers[2:]
+            ids.copy_(torch.arange(16, device="cuda", dtype=torch.int32).expand_as(ids))
+            scores.fill_(1 / 16)
+            routing = StandardTopKOutput(scores, ids, None)
+            expected = experts(x, routing, rows, rows).cpu()
+            assert torch.isfinite(expected).all() and expected.abs().sum() > 0
+            pointers = tuple(t.data_ptr() for t in (x, *buffers))
+            graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with saver.cuda_graph(graph, pool=None, stream=stream, tag="cuda_graph"):
+                output = experts(x, routing, rows, rows)
+            graph.replay()
+            torch.cuda.synchronize()
+            for _ in range(2):
+                saver.pause(tag="weights")
+                torch.cuda.empty_cache()
+                ordinary_bytes = sum(
+                    segment["total_size"]
+                    for segment in torch.cuda.memory_snapshot()
+                    if segment["device"] == 0
+                    and tuple(segment["segment_pool_id"]) == (0, 0)
+                )
+                assert ordinary_bytes == 0, ordinary_bytes
+                saver.resume(tag="weights")
+                assert tuple(t.data_ptr() for t in (x, *buffers)) == pointers
+                graph.replay()
+                torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+            graph.reset()
+            del output, graph, routing, ids, scores, buffers, x
+        del experts
+        for runner in kimi_mega_moe._runners.values():
+            for workspace in runner.workspaces.values():
+                workspace.destroy()
+        kimi_mega_moe._runners.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="requires the FlashInfer Kimi MegaMoE CUDA backend",
+)
+def test_megamoe_buffers_survive_sleep_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_megamoe_buffers_on_cuda; _check_megamoe_buffers_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=300,
         )
 
 

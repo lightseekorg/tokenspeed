@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
-from utils import is_amd
+from utils import assert_warmup_covers, is_amd
 
 pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
 
@@ -134,3 +134,85 @@ def test_column_gather_matches_the_concatenated_shards():
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_column_gather_worker, args=(port,), nprocs=8, join=True)
+
+
+def _column_gather_warmup_worker(rank: int, port: int, world_size: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=180),
+    )
+    group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        IrisAllGather,
+        iris_pull_allgather_columns,
+    )
+    from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+    state = create_iris_state(
+        group=group,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=8192 * 7168,
+        dtype=torch.bfloat16,
+        heap_size=None,
+        device=device,
+    )
+    gather = IrisAllGather(state.producer)
+    state.peers.finish_prepare()
+    width = 896
+    # One row published in producer storage and unpublished, two rows, and on
+    # TP8 a payload past the two-subgroup switch.
+    sweep = [("published", 1), ("plain", 1), ("plain", 2)]
+    if world_size == 8:
+        sweep.append(("plain", 848))
+
+    def run(case) -> None:
+        kind, rows = case
+        shard = torch.full((rows, width), float(rank), device=device).bfloat16()
+        if kind == "published":
+            local = state.producer.data[rank * width : (rank + 1) * width].view(
+                1, width
+            )
+            local.copy_(shard)
+            shard = local
+        torch.cuda.synchronize()
+        dist.barrier()
+        result = gather.run(shard)
+        expected = torch.cat(
+            [
+                torch.full((rows, width), float(peer), device=device).bfloat16()
+                for peer in range(world_size)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    assert_warmup_covers(
+        (iris_pull_allgather_columns,), lambda: gather.warmup(width), run, sweep
+    )
+    # A width the gather cannot serve compiles nothing and does not raise.
+    gather.warmup(3)
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_column_gather_warmup_covers_every_served_variant(world_size):
+    if not current_platform().is_cdna4 or torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CDNA4 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(
+        _column_gather_warmup_worker,
+        args=(port, world_size),
+        nprocs=world_size,
+        join=True,
+    )

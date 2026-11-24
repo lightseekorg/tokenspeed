@@ -21,7 +21,9 @@ ut:
       -m pytest -q --import-mode=importlib --disable-warnings --maxfail=1
       test/runtime/test_adaptive_dspark_dp_runtime.py
     # Dump rank stacks before a stalled collective consumes the job's budget.
+    # MegaMoE uses peer buffer pointers; unused multicast setup can hang on B200.
     - >-
+      env TORCH_SYMM_MEM_DISABLE_MULTICAST=1
       timeout -k 30 600 python3 -m torch.distributed.run --standalone --nproc_per_node=2
       -m pytest -q -s --import-mode=importlib --disable-warnings --maxfail=1
       -o faulthandler_timeout=180

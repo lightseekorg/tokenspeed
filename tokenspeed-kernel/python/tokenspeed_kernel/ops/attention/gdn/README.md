@@ -1,5 +1,13 @@
 # GDN kernels
 
+## Triton prefill KKT
+
+Accumulate `K @ K.T` before applying the row-wise beta scaling. This avoids
+the Hopper WGMMA shared-buffer lifetime bug triggered when a loaded K tile
+also feeds a separate register-side beta multiplication. Applying beta after
+the FP32 accumulation also avoids rounding beta-scaled K back to its storage
+dtype before the dot product.
+
 ## CuTe DSL WY verification
 
 `gdn_decode_mtp` selects the output-only TF32 MMA kernel for ReplaySSM through
