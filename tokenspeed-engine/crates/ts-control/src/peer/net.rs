@@ -19,8 +19,10 @@
 // SOFTWARE.
 
 //! The replica's peer endpoint: one PULL socket every other replica pushes
-//! requests and replies to, and PUSH sockets to them (`ts_pd::Sockets`). Each
-//! message is a kind frame and the encoded request or reply.
+//! requests and replies to, and PUSH sockets to them (`ts_pd::Sockets`). A message to rank 0
+//! has two frames: kind and encoded request or reply. A suffixed endpoint adds
+//! a leading four-byte big-endian destination rank. The public listener removes
+//! this frame before delivery to the destination replica.
 
 use std::sync::mpsc;
 
@@ -118,22 +120,36 @@ impl PeerNet {
 
     /// Queue `request` to the holder at `endpoint`.
     pub fn request(&self, endpoint: &str, request: &Request) -> Result<(), PeerSendError> {
-        let (host, port) = split_endpoint(endpoint)?;
-        Ok(self.sockets.send(
-            host,
-            port,
-            vec![Bytes::from_static(REQUEST), Bytes::from(request.encode())],
-        )?)
+        self.send(endpoint, REQUEST, request.encode())
     }
 
-    /// Queue `reply` to the reader at `endpoint`.
+    /// Queue a reply to the named reader, including its DP rank.
     pub fn reply(&self, endpoint: &str, reply: &Reply) -> Result<(), PeerSendError> {
-        let (host, port) = split_endpoint(endpoint)?;
-        Ok(self.sockets.send(
-            host,
-            port,
-            vec![Bytes::from_static(REPLY), Bytes::from(reply.encode())],
-        )?)
+        self.send(endpoint, REPLY, reply.encode())
+    }
+
+    fn send(
+        &self,
+        endpoint: &str,
+        kind: &'static [u8],
+        payload: Vec<u8>,
+    ) -> Result<(), PeerSendError> {
+        let mut frames = Vec::with_capacity(3);
+        let address = if let Some((address, rank)) = endpoint.split_once('/') {
+            let rank: u32 = rank.parse().map_err(|_| BadEndpoint(endpoint.to_owned()))?;
+            frames.push(Bytes::copy_from_slice(&rank.to_be_bytes()));
+            address
+        } else {
+            endpoint
+        };
+        let (host, port) = split_endpoint(address)?;
+        frames.extend([Bytes::from_static(kind), Bytes::from(payload)]);
+        Ok(self.sockets.send(host, port, frames)?)
+    }
+
+    /// Deliver to a node-local replica through its private loopback socket.
+    pub(super) fn forward(&self, port: u16, frames: Vec<Bytes>) -> Result<(), SendError> {
+        self.sockets.send("127.0.0.1", port, frames)
     }
 }
 

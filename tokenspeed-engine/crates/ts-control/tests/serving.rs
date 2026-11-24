@@ -476,6 +476,21 @@ struct FakePeer {
 
 impl TransferPeer for FakePeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
+        if self.tracked.iter().any(|(id, ..)| id == rid) {
+            return Err(PdError::Peer(format!(
+                "request {rid} is already registered with the transfer peer"
+            )));
+        }
+        if let Some((existing, ..)) = self
+            .tracked
+            .iter()
+            .find(|(_, room, ..)| *room == bootstrap.room)
+        {
+            return Err(PdError::Peer(format!(
+                "bootstrap room {} for request {rid} is already active for request {existing}",
+                bootstrap.room
+            )));
+        }
         if self.role == Role::Decode {
             self.wire
                 .lock()
@@ -610,6 +625,10 @@ impl TransferPeer for FakePeer {
 
     fn has_in_flight(&self) -> bool {
         !self.tracked.is_empty()
+    }
+
+    fn has_room(&self, room: u64) -> bool {
+        self.tracked.iter().any(|(_, tracked, ..)| *tracked == room)
     }
 
     fn abort_room(&mut self, _: &str, _: u64) {}
@@ -959,6 +978,14 @@ impl DataPlane for FakeDevice {
             .lock()
             .unwrap()
             .push(format!("resume {}", tags.join(",")));
+        Ok(())
+    }
+
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        self.device_ops
+            .lock()
+            .unwrap()
+            .push("finish memory resume".to_owned());
         Ok(())
     }
 
@@ -5541,6 +5568,7 @@ fn nccl_resume_waits_for_every_dp_engine() {
                 vec![
                     "release kv_cache,weights,nccl",
                     "resume nccl,weights,kv_cache",
+                    "finish memory resume",
                 ]
             } else {
                 vec!["release kv_cache,weights,nccl"]
@@ -8290,7 +8318,7 @@ fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
 
 #[test]
 fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
-    for wake_peer in [false, true] {
+    for (nccl, wake_peer) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut scripts = vec![vec![Vec::new(); 90]; 2];
         for (rank, script) in scripts.iter_mut().enumerate() {
             script[0].push(EngineRequest::Control(Box::new(
@@ -8300,7 +8328,11 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
                     tags: None,
                 }),
             )));
-            for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
+            let mut wake = vec![(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")];
+            if nccl {
+                wake.insert(0, (2, "nccl"));
+            }
+            for (round, tag) in wake {
                 if rank == 1 && tag == "kv_cache" && !wake_peer {
                     continue;
                 }
@@ -8322,7 +8354,10 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
             Layout::Dp(2),
             0,
             Tiers::DeviceOnly,
-            Setup::default(),
+            Setup {
+                nccl_suspendable: nccl,
+                ..Setup::default()
+            },
             scripts,
             no_reaction,
         );
@@ -8330,14 +8365,21 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
             assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
             assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
         }
-        assert_eq!(
-            ranks[0].device_ops,
-            [
-                "release kv_cache,weights",
-                "resume weights",
-                "resume kv_cache"
-            ]
-        );
+        for (rank, result) in ranks.iter().enumerate() {
+            let mut expected = if nccl {
+                vec!["release kv_cache,weights,nccl", "resume nccl"]
+            } else {
+                vec!["release kv_cache,weights"]
+            };
+            expected.push("resume weights");
+            if rank == 0 || wake_peer {
+                expected.push("resume kv_cache");
+            }
+            if nccl && wake_peer {
+                expected.push("finish memory resume");
+            }
+            assert_eq!(result.device_ops, expected);
+        }
         assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
         if wake_peer {
             assert_eq!(
@@ -9180,4 +9222,354 @@ fn scheduler_metrics_exclude_dp_idle_padding() {
         assert_eq!(gauges["tokenspeed:num_requests_running"], 0.0);
     }
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn assert_room_conflict_409(outputs: &[StreamedOutput], rid: &str) {
+    let finals: Vec<_> = outputs
+        .iter()
+        .filter(|output| output.rid == rid && output.finish_reason.is_some())
+        .collect();
+    assert_eq!(finals.len(), 1, "{rid}: expected one final output");
+    assert_eq!(finals[0].finish_reason, Some("abort"));
+    assert_eq!(finals[0].completion_tokens, 0);
+    assert_eq!(
+        finals[0]
+            .finish_details
+            .as_ref()
+            .unwrap()
+            .get(&"status_code".to_owned()),
+        Some(&Value::from(409i64)),
+        "{rid}: expected a 409 refusal"
+    );
+}
+
+/// The final chunk of a client stream refused for its bootstrap room.
+fn assert_chunks_room_conflict_409(chunks: &[OutputChunk]) {
+    let last = chunks.last().expect("a final chunk");
+    assert!(tokens(chunks).is_empty());
+    assert_eq!(last.finish_reason.as_deref(), Some("abort"));
+    let details = &last.finish_details.as_ref().unwrap().0;
+    let field = |key: &str| details.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+    assert_eq!(field("status_code"), Some(&Value::from(409i64)));
+    assert!(matches!(
+        field("message"),
+        Some(Value::Str(message)) if message.starts_with("Bootstrap room")
+    ));
+}
+
+/// Wait until `room` on the wire satisfies `ready`.
+async fn wait_for_room(wire: &Arc<Mutex<Wire>>, room: u64, ready: impl Fn(&WireRoom) -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !wire.lock().unwrap().rooms.get(&room).is_some_and(&ready) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("room {room} never became ready"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_bootstrap_room_is_refused_with_409_while_active_and_reusable_after_retirement() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for role in [Role::Decode, Role::Prefill] {
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let engine = start_ranks_with(
+                layout,
+                1,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role,
+                        wire: wire.clone(),
+                    }),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let original = engine
+                .client
+                .generate(disaggregated("orig", 42, 16, 3))
+                .await
+                .unwrap();
+            // The original is tracked by the transfer peer: Decode allocated
+            // its landing pages, Prefill registered and waits for them.
+            match role {
+                Role::Decode => wait_for_room(&wire, 42, |room| room.preallocated.is_some()).await,
+                _ => wait_for_room(&wire, 42, |_| true).await,
+            }
+
+            let refused = run(&engine.client, disaggregated("dup", 42, 16, 3)).await;
+            assert_chunks_room_conflict_409(&refused);
+
+            // Let the original finish on its untouched state.
+            {
+                let mut wire = wire.lock().unwrap();
+                let room = wire.rooms.get_mut(&42).unwrap();
+                match role {
+                    Role::Decode => {
+                        room.sent = Some(1000);
+                        room.sent_by = vec![0];
+                    }
+                    _ => room.preallocated = Some(0),
+                }
+            }
+            let original = collect(original).await;
+            let expected: &[i32] = match role {
+                Role::Decode => &[1000, 1001, 1002],
+                _ => &[1000],
+            };
+            assert_eq!(tokens(&original), expected, "{layout:?} {role:?}");
+            engine.settle().await;
+
+            // Healthy retirement frees the room for a fresh request.
+            wire.lock().unwrap().rooms.insert(
+                42,
+                match role {
+                    Role::Decode => WireRoom {
+                        sent: Some(1000),
+                        sent_by: vec![0],
+                        ..WireRoom::default()
+                    },
+                    _ => WireRoom {
+                        preallocated: Some(0),
+                        ..WireRoom::default()
+                    },
+                },
+            );
+            let reused = run(&engine.client, disaggregated("reused", 42, 16, 3)).await;
+            assert_eq!(tokens(&reused), expected, "{layout:?} {role:?}");
+            engine.settle().await;
+            for rank in 0..engine.ranks.len() {
+                let released: Vec<String> = engine
+                    .released_on(rank)
+                    .into_iter()
+                    .map(|(rid, _)| rid)
+                    .collect();
+                // The refused request never reached the data plane.
+                assert_eq!(released, ["orig", "reused"], "{layout:?} {role:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_bootstrap_room_is_refused_with_409_while_draining_until_stopped() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(77)
+        .or_default()
+        .hold_cancel = true;
+    let decode = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let stream = decode
+        .client
+        .generate(disaggregated("draining", 77, 20, 3))
+        .await
+        .unwrap();
+    wait_for_room(&wire, 77, |room| room.preallocated.is_some()).await;
+
+    // The failure ends the output while the held cancellation keeps
+    // `Stopped` back: the transfer peer still owns room 77.
+    wire.lock().unwrap().rooms.get_mut(&77).unwrap().fails = true;
+    let failed = collect(stream).await;
+    assert_eq!(
+        failed.last().unwrap().finish_reason.as_deref(),
+        Some("abort")
+    );
+
+    let refused = run(&decode.client, disaggregated("dup", 77, 20, 3)).await;
+    assert_chunks_room_conflict_409(&refused);
+
+    // Once the writers retire, the room is free again. Wait on `FlushCache`,
+    // which succeeds only once every rank's transfer peer retired `draining`.
+    wire.lock().unwrap().rooms.get_mut(&77).unwrap().hold_cancel = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if control(
+                &decode,
+                ControlRequest::FlushCache(FlushCacheReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                }),
+            )
+            .await
+                == [("FlushCacheReqOutput", true)]
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the draining transfer retired");
+    decode.settle().await;
+    wire.lock().unwrap().rooms.insert(
+        77,
+        WireRoom {
+            sent: Some(1000),
+            sent_by: vec![0],
+            ..WireRoom::default()
+        },
+    );
+    let reused = run(&decode.client, disaggregated("reused", 77, 20, 2)).await;
+    assert_eq!(tokens(&reused), [1000, 1001]);
+    decode.settle().await;
+    for rank in 0..decode.ranks.len() {
+        let released: Vec<String> = decode
+            .released_on(rank)
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+        assert_eq!(released, ["draining", "reused"]);
+    }
+}
+
+#[test]
+fn duplicate_bootstrap_room_is_refused_while_withheld_and_released_when_aborted() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    wire.lock().unwrap().rooms.insert(
+        88,
+        WireRoom {
+            sent: Some(1000),
+            sent_by: vec![0],
+            ..WireRoom::default()
+        },
+    );
+    let mut script: Script = vec![Vec::new(); 30];
+    script[0] = vec![
+        EngineRequest::Control(Box::new(pause("freeze"))),
+        EngineRequest::Add(Box::new(disaggregated("withheld-orig", 88, 16, 3))),
+        EngineRequest::Add(Box::new(disaggregated("dup-same-round", 88, 16, 3))),
+    ];
+    // Arrives while `withheld-orig` sits in `withheld`, before `TransferPeer::register`.
+    script[1].push(EngineRequest::Add(Box::new(disaggregated(
+        "dup-while-withheld",
+        88,
+        16,
+        3,
+    ))));
+    // Aborting the withheld request and resuming drops its `RoomLease`.
+    script[2] = vec![
+        EngineRequest::Abort(vec!["withheld-orig".to_owned()]),
+        EngineRequest::Control(Box::new(resume())),
+    ];
+    script[4].push(EngineRequest::Add(Box::new(disaggregated(
+        "after-withheld-abort",
+        88,
+        16,
+        3,
+    ))));
+
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire,
+            }),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert!(!rank
+            .released
+            .iter()
+            .any(|(rid, _)| rid == "dup-same-round" || rid == "dup-while-withheld"));
+    }
+    assert_room_conflict_409(&ranks[0].outputs, "dup-same-round");
+    assert_room_conflict_409(&ranks[0].outputs, "dup-while-withheld");
+    assert_scripted_tokens(&ranks[0], "after-withheld-abort", 3);
+}
+
+#[test]
+fn duplicate_bootstrap_room_is_refused_while_epd_staged_and_released_on_epd_failure() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    wire.lock().unwrap().rooms.insert(
+        91,
+        WireRoom {
+            preallocated: Some(0),
+            ..WireRoom::default()
+        },
+    );
+    let mut lost_epd = epd_request("lost-staged");
+    lost_epd.bootstrap_host = Some("127.0.0.1".to_owned());
+    lost_epd.bootstrap_port = Some(8998);
+    lost_epd.bootstrap_room = Some(91);
+
+    let mut script: Script = vec![Vec::new(); 25];
+    script[0] = vec![
+        EngineRequest::Add(Box::new(lost_epd)),
+        EngineRequest::Add(Box::new(disaggregated("dup-same-round", 91, 8, 2))),
+    ];
+    // `lost-staged` is still waiting in `staged` on round 1 before failing on round 2.
+    script[1].push(EngineRequest::Add(Box::new(disaggregated(
+        "dup-while-staged",
+        91,
+        8,
+        2,
+    ))));
+    // Once `lost-staged` fails EPD staging, its `RoomLease` is dropped and a
+    // fresh request can use room 91.
+    script[6].push(EngineRequest::Add(Box::new(disaggregated(
+        "after-epd-fail",
+        91,
+        8,
+        2,
+    ))));
+
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire,
+            }),
+            epd_receive_enabled: true,
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert!(!rank
+            .released
+            .iter()
+            .any(|(rid, _)| rid == "dup-same-round" || rid == "dup-while-staged"));
+    }
+    assert_room_conflict_409(&ranks[0].outputs, "dup-same-round");
+    assert_room_conflict_409(&ranks[0].outputs, "dup-while-staged");
+    assert_scripted_tokens(&ranks[0], "after-epd-fail", 1);
 }

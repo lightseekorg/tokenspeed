@@ -1745,15 +1745,12 @@ impl OutputProcessor {
             extend.spec_candidate_ids = spec_candidate_ids;
             committed.events.push(extend);
 
-            if self.role == Role::Prefill {
+            if self.role == Role::Prefill && !nan_detected {
                 // A numerically corrupted prompt's KV must never transfer:
-                // the abort stops the remote decode. Otherwise the transfer
-                // owns the pages until it succeeds or fails, and the output
-                // goes out then.
-                if nan_detected {
-                    committed.events.push(finish(rid, true));
-                    self.release(rid, &mut committed);
-                }
+                // it falls through to emit its terminal abort (unless the
+                // client already cancelled) and send Abort to stop the remote
+                // decode. Otherwise the transfer owns the pages until it
+                // succeeds or fails, and the output goes out then.
                 continue;
             }
             if state.to_abort && state.finished() {
@@ -3228,6 +3225,119 @@ mod tests {
                 assert_eq!(failed.released, ["r"]);
                 assert!(p.state("r").is_none());
             }
+        }
+    }
+
+    #[test]
+    fn a_nan_on_the_prefill_role_emits_a_terminal_abort() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 3, 4, &[]);
+        let mut nan = result(&[9], &[1]);
+        nan.nan_flags = Some(vec![1]);
+
+        let committed = p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &nan).unwrap();
+        assert_eq!(
+            kinds(&committed),
+            [
+                ("r".into(), ForwardEventKind::ExtendResult, vec![9]),
+                ("r".into(), ForwardEventKind::Abort, vec![]),
+            ]
+        );
+        assert_eq!(committed.stats.nan_aborts, 1);
+        assert_eq!(committed.outputs.len(), 1);
+        assert_eq!(committed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(committed.outputs[0].output_ids, [9]);
+        assert_eq!(
+            committed.outputs[0].finish_details,
+            Some(
+                FinishReason::Abort {
+                    message: NUMERICAL_ERROR.to_owned(),
+                    err_type: AbortCode::NumericalError,
+                    status_code: None,
+                }
+                .details()
+            )
+        );
+        assert_eq!(committed.released, ["r"]);
+        assert!(p.state("r").is_none());
+        assert!(p.fail_transfer("r").outputs.is_empty());
+        assert!(p.finish_prefill("r").outputs.is_empty());
+    }
+
+    #[test]
+    fn a_mid_chunk_nan_on_the_prefill_role_aborts_when_the_prompt_completes() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 6, 4, &[]);
+
+        let mut first = result(&[0], &[1]);
+        first.nan_flags = Some(vec![1]);
+        let mid = p
+            .commit(&batch(&[("r", 3, 0, 6)], 1), None, &first)
+            .unwrap();
+        assert_eq!(
+            kinds(&mid),
+            [("r".into(), ForwardEventKind::ExtendResult, vec![])]
+        );
+        assert!(mid.outputs.is_empty());
+        assert!(mid.released.is_empty());
+        assert!(p.state("r").is_some());
+
+        let mut last = result(&[7], &[1]);
+        last.nan_flags = Some(vec![0]);
+        let done = p.commit(&batch(&[("r", 3, 3, 6)], 1), None, &last).unwrap();
+        assert_eq!(
+            kinds(&done),
+            [
+                ("r".into(), ForwardEventKind::ExtendResult, vec![7]),
+                ("r".into(), ForwardEventKind::Abort, vec![]),
+            ]
+        );
+        assert_eq!(done.stats.nan_aborts, 1);
+        assert_eq!(done.outputs.len(), 1);
+        assert_eq!(done.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(done.outputs[0].output_ids, [7]);
+        assert_eq!(
+            done.outputs[0].finish_details,
+            Some(
+                FinishReason::Abort {
+                    message: NUMERICAL_ERROR.to_owned(),
+                    err_type: AbortCode::NumericalError,
+                    status_code: None,
+                }
+                .details()
+            )
+        );
+        assert_eq!(done.released, ["r"]);
+        assert!(p.state("r").is_none());
+    }
+
+    #[test]
+    fn a_nan_on_the_prefill_role_preserves_client_and_pause_abort_notifications() {
+        for notify in [false, true] {
+            let mut p =
+                OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+            register(&mut p, "r", 3, 4, &[]);
+            p.mark_abort("r", notify);
+            let mut nan = result(&[9], &[1]);
+            nan.nan_flags = Some(vec![1]);
+
+            let committed = p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &nan).unwrap();
+            assert_eq!(
+                kinds(&committed),
+                [
+                    ("r".into(), ForwardEventKind::ExtendResult, vec![9]),
+                    ("r".into(), ForwardEventKind::Abort, vec![]),
+                ]
+            );
+            assert_eq!(committed.stats.nan_aborts, 0);
+            assert_eq!(committed.outputs.len(), usize::from(notify));
+            if notify {
+                assert_eq!(committed.outputs[0].finish_reason, Some("abort"));
+                assert_eq!(committed.outputs[0].output_ids, [9]);
+            }
+            assert_eq!(committed.released, ["r"]);
+            assert!(p.state("r").is_none());
+            assert!(p.fail_transfer("r").outputs.is_empty());
         }
     }
 
