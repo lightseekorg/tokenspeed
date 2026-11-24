@@ -21,7 +21,7 @@
 //! An EPD encode rank: the host's encode mode (`epd/encode_host.py` is its
 //! Python half).
 //!
-//! The embedded interpreter loads the vision tower and allocates the send
+//! The rank's interpreter loads the vision tower and allocates the send
 //! ring. The host then starts the embedding sender over the ring (the
 //! attention-TP group's first rank also hosts the node's bootstrap server
 //! and dials the frontend, which sends it the encode requests), connects the

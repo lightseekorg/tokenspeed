@@ -237,13 +237,13 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         }
     }
 
-    /// Serve until `stop` is set on the group's first rank.
     /// Enable logical metrics on the first attention-TP rank.
     pub fn with_metrics(mut self, metrics: Option<Arc<ts_metrics::EncoderMetrics>>) -> Self {
         self.metrics = metrics;
         self
     }
 
+    /// Serve until `stop` is set on the group's first rank.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), EncodeError> {
         loop {
             let received = match self.intake.as_mut() {

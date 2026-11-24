@@ -20,9 +20,11 @@
 
 """The Python half of the Rust engine host (RFC 0002).
 
-``ts-host`` (``tokenspeed-engine/crates/ts-host``) runs one rank: its control
-thread schedules, admits requests and emits outputs in Rust, and the
-interpreter it embeds runs the data plane. This module is everything that
+``ts-host`` (``tokenspeed-engine/crates/ts-host``) starts one rank by
+exec'ing the launcher's interpreter into ``tokenspeed_engine.host``. That
+process's main thread enters the host extension and becomes the control
+thread, which schedules, admits requests and emits outputs in Rust; its
+forward thread runs the data plane. This module is everything that
 interpreter runs, plus the launcher's side:
 
 * ``start_rust_host`` starts the binary for one rank; every launch path
