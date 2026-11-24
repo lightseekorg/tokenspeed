@@ -35,6 +35,9 @@ and the host launcher remains `ts-host`, backed by the `_host` extension. For ex
 ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 ```
 
+The [GDS cost calibration tools](../test/cache_gds_calibration/README.md) sample
+aligned block reads through the serving Disk executor for offline cost fitting.
+
 ## Wire conformance
 
 The native frontend offers two distinct request operations. `abort(rid)`
