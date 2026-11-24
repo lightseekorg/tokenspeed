@@ -86,6 +86,7 @@ def test_k3_moe_builds_physical_slots_and_a_static_router_map(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": "none"}
+            self.topk_weights_dtype = torch.float32
             self.sorted_route_rows: frozenset[int] = frozenset()
 
     for key, value in [

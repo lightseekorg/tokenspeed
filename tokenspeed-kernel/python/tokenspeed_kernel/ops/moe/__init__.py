@@ -57,6 +57,7 @@ __all__ = [
     "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
+    "moe_prepare_input_buffers",
     "moe_process_weights",
     "moe_warmup",
     "moe_topk",
@@ -2287,6 +2288,9 @@ def moe_plan(
         "features": features,
         "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
+        "prepare_input_buffers": getattr(
+            kernel.impl, "_tokenspeed_prepare_input_buffers", None
+        ),
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "fuse_shared_expert": getattr(
             kernel.impl, "_tokenspeed_fuse_shared_expert", None
@@ -2371,6 +2375,25 @@ def moe_process_weights(
         else:
             communication_initializer(initialize)
     return result
+
+
+def moe_prepare_input_buffers(
+    plan: dict, w: torch.nn.Module
+) -> Callable[
+    [int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+]:
+    """Prepare the selected kernel's input storage and return its view factory.
+
+    Args:
+        plan: The selected MoE plan, including its EP process group.
+        w: Processed expert weights used to prepare the runner.
+
+    Returns:
+        A callable taking live rows and the maximum rows over EP ranks. It
+        returns activation, scale, expert-ID and route-weight buffer views.
+        Call collectively before capture, in the runtime's workspace region.
+    """
+    return plan["prepare_input_buffers"](plan, w)
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:

@@ -301,7 +301,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
 // fewer reads a prefix of it.
 TEST(RequestKvEventBlockHashes, ChainEachFullPageOnTheOneBefore) {
     Request request(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4, 5, 6, 7}}, /*prefix_granularity=*/2,
-                    Role::kFused);
+                    /*awaits_bootstrap=*/false);
     const std::uint64_t first = HashKvBlock(std::vector<std::int32_t>{1, 2}, std::nullopt);
     const std::uint64_t second = HashKvBlock(std::vector<std::int32_t>{3, 4}, first);
     const std::uint64_t third = HashKvBlock(std::vector<std::int32_t>{5, 6}, second);
