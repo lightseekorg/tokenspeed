@@ -2541,7 +2541,10 @@ The contract a model (in tree or a plugin) implements:
   collectives — and projects nothing.
 * The model exit hands the logits processor the shard's rows with the plan
   on `LogitsMetadata.query_shard` (`BaseCausalLM.exit_logits` is that one
-  call; a model with its own exit does the same). The shard is a parameter
+  call; a model with its own exit does the same). The eager executor computes
+  packed last-token indices in int32 within the scheduler's token budget.
+  Mixed speculative batches also store their decode verify row indices in
+  int32. The shard is a parameter
   of the processor's row selection: it scores the planned prompt rows
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
