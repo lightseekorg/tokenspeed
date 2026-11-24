@@ -447,10 +447,11 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         let mut refused = Vec::new();
         for ((admission, item), cached) in taken.into_iter().zip(cached) {
             match item {
-                Some(item) => {
+                Some(mut item) => {
                     if let Some(metrics) = &self.metrics {
                         metrics.cache_lookup(cached);
                     }
+                    item.queued_at = Instant::now();
                     self.requests.insert(admission, item);
                     if cached {
                         self.hits.push_back(admission);
@@ -549,7 +550,7 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                             .expect("dispatched admission")
                             .elapsed()
                             .as_secs_f64(),
-                        request.queued_at.elapsed().as_secs_f64(),
+                        request.received_at.elapsed().as_secs_f64(),
                         outcome.is_ok(),
                     );
                 }
@@ -655,10 +656,14 @@ mod tests {
         log: Arc<Mutex<Log>>,
         rooms: HashMap<u64, u64>,
         pending: Vec<(u64, usize)>,
+        admit_delay: Duration,
     }
 
     impl EncodeDataPlane for FakeDevice {
         fn admit(&mut self, requests: &[(u64, Vec<Bytes>)]) -> Result<Vec<bool>, DataPlaneError> {
+            if !self.admit_delay.is_zero() {
+                std::thread::sleep(self.admit_delay);
+            }
             let mut cached = Vec::new();
             for (admission, frames) in requests {
                 let request: EncodeRequest = ts_wire::decode_frames(frames).unwrap();
@@ -822,6 +827,7 @@ mod tests {
                             log: log.clone(),
                             rooms: HashMap::new(),
                             pending: Vec::new(),
+                            admit_delay: Duration::ZERO,
                         },
                         FakeSender {
                             sends: sends.clone(),
@@ -952,6 +958,72 @@ mod tests {
         assert_eq!(ranks[0].encode.free.len(), 4);
         assert!(!ranks[0].encode.busy());
     }
+    #[test]
+    fn queue_time_excludes_data_plane_admission_but_request_time_includes_it() {
+        use std::process::Command;
+        use ts_metrics::{EncoderMetrics, EngineLabels, Exporter, MetricsConfig};
+
+        let directory = std::env::temp_dir().join(format!(
+            "ts-epd-queue-time-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exporter = Exporter::new(&MetricsConfig {
+            prometheus_dir: Some(directory.clone()),
+            relay_endpoint: None,
+        })
+        .unwrap();
+        let metrics = Arc::new(EncoderMetrics::new(
+            &exporter,
+            &EngineLabels {
+                model_name: "encoder".to_owned(),
+                app_key: "test.encoder".to_owned(),
+                dp_rank: 0,
+            },
+        ));
+        let rounds = vec![vec![request("delayed-admission", 1, vec![vec![(0, 3)]])]];
+        let mut ranks = ranks(2, &[0], rounds);
+        ranks[0].encode.data_plane.admit_delay = Duration::from_millis(100);
+        ranks[0].encode.metrics = Some(metrics);
+        run(&mut ranks, 5);
+
+        let output = Command::new(
+            std::env::var("TS_TEST_PYTHON").unwrap_or_else(|_| "python3".to_owned()),
+        )
+        .arg("-c")
+        .arg(
+            "import json,sys; from prometheus_client import CollectorRegistry,multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r,path=sys.argv[1]); print(json.dumps({s.name:s.value for m in r.collect() for s in m.samples}))",
+        )
+        .arg(&directory)
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let queue_time = values["tokenspeed:encoder_queue_time_seconds_sum"]
+            .as_f64()
+            .unwrap();
+        let request_time = values["tokenspeed:encoder_request_time_seconds_sum"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            queue_time < 0.05,
+            "data-plane admission delay leaked into queue time: {queue_time}s"
+        );
+        assert!(
+            request_time >= 0.08,
+            "request time omitted the data-plane admission delay: {request_time}s"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn encoder_metrics_count_items_once_and_keep_transfer_failures_separate() {
         use std::process::Command;

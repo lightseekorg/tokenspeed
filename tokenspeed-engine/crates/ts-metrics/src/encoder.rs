@@ -104,7 +104,7 @@ impl EncoderMetrics {
             ),
             queue_time: histogram(
                 "tokenspeed:encoder_queue_time_seconds",
-                "Admission to data-plane submission.",
+                "Time waiting in the encoder queues before batch submission.",
                 SECONDS,
             ),
             execution_time: histogram(
@@ -114,7 +114,7 @@ impl EncoderMetrics {
             ),
             request_time: histogram(
                 "tokenspeed:encoder_request_time_seconds",
-                "Admission through observed device-copy completion.",
+                "Request receipt through observed device-copy completion.",
                 SECONDS,
             ),
             batch_tokens: histogram(
