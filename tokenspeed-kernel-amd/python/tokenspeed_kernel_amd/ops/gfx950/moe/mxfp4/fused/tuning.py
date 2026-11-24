@@ -431,15 +431,18 @@ _ROUTE_TILE_MAX_M = max(
 
 
 # Key: hidden width, intermediate width, local experts, global experts, top-k.
-# Entries: inclusive row bounds and how many route-tile stage-2 jobs (16-route
+# Entries: inclusive row bounds and how many route-tile stage-2 jobs (route
 # groups x output tiles) still get one program each; past it, the persistent
 # programs loop over the jobs. Rows outside every entry keep the persistent
 # programs. One program a job removes the tail where a few persistent programs
 # run a second job alone after the rest finish.
 _ROUTE_TILE_STAGE2_SINGLE_ROUND_JOBS = {
     # EP4, 65-128 rows, measured on MI350X and MI355X with uniform, Zipf and
-    # served-like routing: one program a job won from 33 to 41 groups (2112-2624
-    # jobs) and was slower past 41.
+    # served-like routing under the 16-route schedule (64-wide output tiles):
+    # one program a job won from 33 to 41 groups (2112-2624 jobs) and was
+    # slower past 41. At 96-128 rows the 32-route schedule (128-wide output
+    # tiles) keeps the same bound, which then covers up to 82 groups; that
+    # schedule was measured with this bound in place, not re-tuned for it.
     (4096, 4096, 64, 256, 8): ((65, 128, 2624),),
 }
 
