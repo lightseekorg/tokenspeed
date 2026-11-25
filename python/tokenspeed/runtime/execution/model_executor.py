@@ -372,11 +372,12 @@ def warn_past_rope_table(
     else:
         table_len = get_context_length(model_config.hf_text_config)
     if physical_context_len > table_len:
+        role = "draft" if model_config.is_draft_worker else "target"
         logger.warning(
             f"physical context extent {physical_context_len!s} (context_len "
             f"{context_len!s} + spec overshoot "
             f"pad {physical_context_len - context_len!s}) exceeds the "
-            f"{table_len!s} positions of the model's rope tables; "
+            f"{table_len!s} positions of the {role} model's rope tables; "
             "positions in the pad index past the precomputed rope tables. "
             "Lower --max-model-len by at least "
             f"{physical_context_len - table_len!s} to stay in bounds.",
@@ -669,6 +670,15 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
+        if draft_model_runner is not None and isinstance(
+            draft_model_runner.model, RopeTableModel
+        ):
+            warn_past_rope_table(
+                draft_model_runner.model,
+                draft_model_runner.model_config,
+                config.context_len,
+                config.physical_context_len,
+            )
         self._draft_final_step_counter = None
         self._pp_wire_logged = False
 
