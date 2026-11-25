@@ -34,6 +34,8 @@ output norm is checked against the norm kernel on the plain output.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -403,15 +405,55 @@ def test_windows_up_to_sixteen_tokens_and_requests_fuse_their_producers(
     )
 
 
-def test_serving_batches_reuse_one_compiled_kernel():
-    # One compile per value tile and spread: on 108 to 167 SMs, batches of 1-3
-    # requests, then 7-10 (one to two CTAs per SM) and the rest of 4-16.
-    for batch in (1, 9, 16):
-        _fused(_inputs(batch, 8, seed=50 + batch), 8)
+def _compile_buckets(window, *, packed):
+    """Batches of 1 to 16 requests by the kernel they compile on the test device.
+
+    A compile is keyed by the value tile rows, whether the grid holds one to
+    two CTAs per SM (the shared-memory floor) and whether it copies records,
+    which only packed records on 64-row grids of at most one CTA per SM do.
+    With ``packed`` set, it assumes room for records that fit a CTA, as the
+    packed geometry used here to predict the copy bucket has; unpacked
+    buckets never copy, whatever their capacity.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    buckets = {}
+    for batch in range(1, 17):
+        rows = window_kernel._value_tile_rows(batch, HEADS, window, DIM)
+        ctas = batch * HEADS * (DIM // rows)
+        copies = packed and rows == 64 and ctas <= sms
+        buckets.setdefault((rows, sms < ctas <= 2 * sms, copies), []).append(batch)
+    return buckets
+
+
+def test_serving_batches_reuse_one_compiled_kernel(monkeypatch):
+    # One compile per value tile and spread on the test device's SMs: the first
+    # batch of each bucket warms it and every other batch reuses it. The
+    # compile cache starts empty, so no earlier test's kernel can stand in for
+    # a batch's own, and every launch must get its bucket's kernel.
+    window_kernel._compile.cache_clear()
+    launches = _spy_compiles(monkeypatch)
+    buckets = _compile_buckets(8, packed=False)
+    warm = {}
+    for bucket, batches in buckets.items():
+        _fused(_inputs(batches[0], 8, seed=50 + batches[0]), 8)
+        assert len(launches) == len(warm) + 1
+        warm[bucket] = launches[-1]
     with assert_no_cute_compile():
-        for batch in (2, 3, 4, 7, 10, 14):
-            _fused(_inputs(batch, 8, seed=60 + batch), 8)
+        for bucket, batches in buckets.items():
+            for batch in batches[1:]:
+                launched = len(launches)
+                _fused(_inputs(batch, 8, seed=60 + batch), 8)
+                assert len(launches) == launched + 1
+                arguments, kernel = launches[-1]
+                assert arguments == warm[bucket][0] and kernel is warm[bucket][1]
     torch.cuda.synchronize()
+    # Each bucket is its own compile: its tile and spread, never copies.
+    for (rows, one_to_two, _), (arguments, _) in warm.items():
+        assert arguments["value_tile_rows"] == rows
+        assert (arguments["smem_floor"] > 0) == one_to_two
+        assert arguments["copy_records"] is False
+    assert len({id(kernel) for _, kernel in warm.values()}) == len(warm)
 
 
 def test_grids_of_one_to_two_ctas_per_sm_spread_over_all_sms():
@@ -563,3 +605,434 @@ def test_a_page_past_the_pool_verifies_as_padding():
     assert torch.equal(past_out, out)
     for past, padded in zip(past_buffers, buffers, strict=True):
         assert torch.equal(past, padded)
+
+
+def _packed_records(x, capacity, history_length, first_slot=0):
+    """Records laid out as serving allocates them: dense [slot, head, position, channel].
+
+    Unlike ``_records``' interleaved views, these satisfy
+    ``packed_record_width``, so 64-row tiles may bulk-copy them. The requests'
+    record slots start at ``first_slot``; the buffers returned are the
+    storage and lengths of the ``x["slots"]`` slots from there on, which hold
+    the same contents whatever ``first_slot`` is. Only those slots are
+    initialized: no request addresses the slots before them.
+    """
+    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
+    storage = torch.empty((first_slot + slots, 3, HEADS, capacity, DIM), device="cuda")
+    lengths = torch.empty((first_slot + slots, 1), dtype=torch.int32, device="cuda")
+    own = slice(first_slot, None)
+    storage[own] = KEY_GATE_FILL
+    storage[own, 0] = CORRECTION_FILL
+    lengths[own] = history_length
+    requests = x["state_indices"].numel()
+    history = KdaRetainedHistory(
+        *storage.unbind(1),
+        lengths,
+        x["state_indices"],
+        torch.arange(
+            first_slot, first_slot + requests, device="cuda", dtype=torch.int32
+        ),
+    )
+    assert history.packed_record_width == DIM
+    if history_length:
+        gen = torch.Generator(device="cuda").manual_seed(history_length)
+        shape = (slots, HEADS, history_length, DIM)
+        accepted = slice(0, history_length)
+        history.correction[own, :, accepted] = 0.02 * torch.randn(
+            shape, device="cuda", generator=gen
+        )
+        history.key[own, :, accepted] = F.normalize(
+            torch.randn(shape, device="cuda", generator=gen), dim=-1
+        )
+        history.decay[own, :, accepted] = 0.7 + 0.25 * torch.rand(
+            shape, device="cuda", generator=gen
+        )
+    stamps = torch.full(
+        (slots, capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
+    )
+    retained = torch.full(
+        (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
+    ).bfloat16()
+    records = KdaRetainedRecords(
+        original_qkv=retained[:, : 3 * WIDTH],
+        history=history,
+        metadata=x["record_metadata"],
+        stamps=stamps,
+        query_start_loc=x["query_start_loc"],
+    )
+    return records, (storage[own], history.length[own], stamps, retained)
+
+
+def _fused_packed(x, capacity, history_length, output_norm=None, first_slot=0):
+    records, buffers = _packed_records(x, capacity, history_length, first_slot)
+    return _verify(x, records, output_norm), buffers
+
+
+def _assert_same_bytes(got, want):
+    """Bitwise equality: unlike ``torch.equal``, -0.0 differs from 0.0."""
+    assert got.dtype == want.dtype and got.shape == want.shape
+    assert torch.equal(
+        got.contiguous().view(torch.uint8), want.contiguous().view(torch.uint8)
+    )
+
+
+def _copy_runs(x, runs):
+    """Each run's output and buffers; the checkpoint pool must stay as it was.
+
+    ``runs`` yields a function per run; the history the prepare readies fits
+    beside the window, so neither it nor the verify writes the pool.
+    """
+    pool = x["state_pool"].clone()
+    results = []
+    for run in runs:
+        results.append(run())
+        _assert_same_bytes(x["state_pool"], pool)
+    return results
+
+
+def _spy_compiles(monkeypatch):
+    """The window kernel's compile lookups, one per launch, in launch order.
+
+    Each entry holds the compile's arguments by name and the kernel the real,
+    cached ``_compile`` returned, so a test sees which specialization a launch
+    ran and whether launches share one.
+    """
+    compile_kernel = window_kernel._compile
+    signature = inspect.signature(compile_kernel)
+    launches = []
+
+    def compile_and_record(*args, **kwargs):
+        kernel = compile_kernel(*args, **kwargs)
+        launches.append((signature.bind(*args, **kwargs).arguments, kernel))
+        return kernel
+
+    monkeypatch.setattr(window_kernel, "_compile", compile_and_record)
+    return launches
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("window", "capacity", "history_length"),
+    [
+        *[
+            (window, window + 12, length)
+            for window in (2, 4, 8)
+            for length in (0, 6, 12)
+        ],
+        # Records 32 on: lane 0's second copy, alone in the last group.
+        (4, 37, 33),
+    ],
+)
+def test_record_copies_give_the_same_bits_as_register_loads(
+    state_dtype, window, capacity, history_length, monkeypatch
+):
+    """A 64-row tile that bulk-copies its records stores what one loading them does.
+
+    Batch 4 (12 heads) runs 64-row tiles, padding requests included; the
+    prepare leaves at most ``capacity - window`` records, which the longest
+    histories fill.
+    """
+    assert history_length <= capacity - window
+    x = _inputs(4, window, seed=300 + window + history_length)
+    x["state_pool"] = x["state_pool"].to(state_dtype)
+    assert window_kernel._value_tile_rows(4, HEADS, window, DIM) == 64
+    norm = _output_norm(x, torch.bfloat16)
+    taken = []
+    launches = _spy_compiles(monkeypatch)
+
+    def run(copies):
+        def verify():
+            monkeypatch.setattr(
+                window_kernel,
+                "_copies_records",
+                lambda *_: taken.append(copies) or copies,
+            )
+            return _fused_packed(x, capacity, history_length, norm)
+
+        return verify
+
+    (out, records), (copied_out, copied_records) = _copy_runs(
+        x, [run(False), run(True)]
+    )
+    # Both runs reached the window kernel, the second with copies.
+    assert taken == [False, True]
+    # Each launch compiled its choice: alike but for the copies, and not shared.
+    (load_args, load_kernel), (copy_args, copy_kernel) = launches
+    assert load_args["copy_records"] is False and copy_args["copy_records"] is True
+    assert load_args == {**copy_args, "copy_records": False}
+    assert copy_kernel is not load_kernel
+    _assert_same_bytes(copied_out, out)
+    for got, want in zip(copied_records, records, strict=True):
+        _assert_same_bytes(got, want)
+    # The prepare kept the history for the verify instead of folding it.
+    assert (records[1] == history_length).all()
+
+
+def test_far_record_slots_past_int32_copy_like_near_ones(monkeypatch):
+    """Record slots whose offsets pass 2**31 elements copy like near ones.
+
+    The slot stride fits 32 bits; the far slots' offsets do not. Both runs
+    bulk-copy the same records on 64-row tiles, so every result must have
+    the same bits.
+    """
+    window, capacity, history_length = 4, 16, 12
+    stride = 3 * HEADS * capacity * DIM
+    far = 2**31 // stride + 1
+    assert stride < 2**31 < far * stride
+    x = _inputs(4, window, seed=320)
+    assert window_kernel._value_tile_rows(4, HEADS, window, DIM) == 64
+    taken = []
+    monkeypatch.setattr(
+        window_kernel, "_copies_records", lambda *_: taken.append(True) or True
+    )
+    launches = _spy_compiles(monkeypatch)
+    (near_out, near), (far_out, far_buffers) = _copy_runs(
+        x,
+        [
+            lambda first_slot=first_slot: _fused_packed(
+                x, capacity, history_length, first_slot=first_slot
+            )
+            for first_slot in (0, far)
+        ],
+    )
+    assert taken == [True, True]
+    # Both launches ran the one record-copy kernel.
+    (near_args, near_kernel), (far_args, far_kernel) = launches
+    assert near_args["copy_records"] is True and far_args == near_args
+    assert far_kernel is near_kernel
+    _assert_same_bytes(far_out, near_out)
+    for got, want in zip(far_buffers, near, strict=True):
+        _assert_same_bytes(got, want)
+    assert (near[1] == history_length).all()
+
+
+def test_only_grids_of_one_cta_per_sm_copy_records_on_64_row_tiles():
+    """The copy region can cost a 64-row tile a CTA per SM, so only grids that
+    hold one CTA per SM take it, and only for dense records with room beside
+    the window that fit a CTA. Real launches check each condition in
+    ``test_interleaved_records_run_the_register_load_kernel`` and
+    ``test_each_copy_condition_decides_the_compiled_kernel``."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+
+    def copies(rows=64, ctas=sms, packed=True, window=4, capacity=16):
+        return window_kernel._copies_records(
+            rows, ctas, packed, HEADS, window, capacity, True, True, True, True, device
+        )
+
+    assert copies()
+    assert copies(window=2, capacity=14) and copies(window=8, capacity=20)
+    assert not copies(ctas=sms + 1)
+    assert not copies(rows=32) and not copies(rows=128)
+    assert not copies(packed=False)
+    # No records fit beside the window.
+    assert not copies(capacity=4)
+    # The region of 1020 records exceeds what a CTA may claim.
+    assert not copies(capacity=1024)
+
+
+def test_batches_of_one_bucket_share_one_compiled_kernel(monkeypatch):
+    """Compiles happen once per (value tile, grid class) bucket, the record-copy
+    bucket included: every other batch of a bucket reuses its kernel.
+
+    The buckets follow from the SM count of the device that runs the test. The
+    compile cache starts empty, so no earlier test's kernel can stand in for a
+    batch's own. The compile lookup of every launch is observed: 64-row tiles
+    of at most one CTA per SM must run the record-copy kernel, which differs
+    from the kernel the same launch compiles with its copies turned off; no
+    other bucket copies.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    window, capacity = 4, 16
+    buckets = _compile_buckets(window, packed=True)
+    window_kernel._compile.cache_clear()
+    launches = _spy_compiles(monkeypatch)
+    compiled = {}
+
+    def run(batch):
+        x = _inputs(batch, window, seed=400 + batch)
+        assert x["state_indices"].device == device
+        launched = len(launches)
+        _fused_packed(x, capacity, 4)
+        # Each run is one launch of the window kernel.
+        assert len(launches) == launched + 1
+        return launches[-1]
+
+    for batches in buckets.values():
+        compiled[batches[0]] = run(batches[0])
+    with assert_no_cute_compile():
+        for batches in buckets.values():
+            for batch in batches[1:]:
+                compiled[batch] = run(batch)
+    torch.cuda.synchronize()
+    assert sorted(compiled) == list(range(1, 17))
+    for (rows, one_to_two, copies), batches in buckets.items():
+        arguments, kernel = compiled[batches[0]]
+        assert arguments["value_tile_rows"] == rows
+        assert (arguments["smem_floor"] > 0) == one_to_two
+        assert arguments["copy_records"] is copies
+        for batch in batches[1:]:
+            assert compiled[batch][0] == arguments
+            assert compiled[batch][1] is kernel
+    # The same launches with their copies turned off compile another kernel.
+    monkeypatch.setattr(window_kernel, "_copies_records", lambda *_: False)
+    for (_, _, copies), batches in buckets.items():
+        for batch in batches if copies else ():
+            arguments, kernel = compiled[batch]
+            loads, load_kernel = run(batch)
+            assert loads == {**arguments, "copy_records": False}
+            assert load_kernel is not kernel
+    torch.cuda.synchronize()
+
+
+def _copy_bucket(window):
+    """The batches of 1 to 16 requests whose packed records copy on the test device.
+
+    Skips where no 64-row grid of them holds at most one CTA per SM.
+    """
+    for (_, _, copies), batches in _compile_buckets(window, packed=True).items():
+        if copies:
+            return batches
+    pytest.skip("no 64-row grid of 1 to 16 requests fits one CTA per SM here")
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_interleaved_records_run_the_register_load_kernel(state_dtype, monkeypatch):
+    """Only packed records take the copies.
+
+    Every batch of the device's record-copy bucket verifies the same requests
+    and accepted history twice: from packed records, then from ``_records``'
+    interleaved views. The two launches compile alike but for the copies,
+    only the packed one copies, and both store the same bits.
+    """
+    window, capacity, history_length = 4, 16, 6
+    batches = _copy_bucket(window)
+    launches = _spy_compiles(monkeypatch)
+    for batch in batches:
+        x = _inputs(batch, window, seed=500 + batch)
+        x["state_pool"] = x["state_pool"].to(state_dtype)
+        packed = _packed_records(x, capacity, history_length)[0]
+        interleaved = _records(
+            x, original=True, capacity=capacity, history_length=history_length
+        )[0]
+        assert packed.history.packed_record_width == DIM
+        assert interleaved.history.packed_record_width is None
+        launched = len(launches)
+        packed_out, interleaved_out = _copy_runs(
+            x,
+            [
+                lambda records=records: _verify(x, records, None)
+                for records in (packed, interleaved)
+            ],
+        )
+        (copy_args, copy_kernel), (load_args, load_kernel) = launches[launched:]
+        assert copy_args["copy_records"] is True
+        assert load_args == {**copy_args, "copy_records": False}
+        assert load_kernel is not copy_kernel
+        _assert_same_bytes(interleaved_out, packed_out)
+        for field in ("correction", "key", "decay", "length"):
+            _assert_same_bytes(
+                getattr(interleaved.history, field), getattr(packed.history, field)
+            )
+        _assert_same_bytes(interleaved.stamps, packed.stamps)
+        _assert_same_bytes(interleaved.original_qkv, packed.original_qkv)
+        # The prepare kept the accepted history for the verify.
+        assert (packed.history.length == history_length).all()
+
+
+@pytest.mark.parametrize(
+    "condition", ["64-row tile", "room for records", "one CTA per SM", "fits a CTA"]
+)
+def test_each_copy_condition_decides_the_compiled_kernel(condition, monkeypatch):
+    """Each other condition ``_copies_records`` checks, through real launches.
+
+    A launch of packed records that copies is paired with launches that break
+    only that condition. Their compile lookups differ from its lookup in the
+    condition's own arguments and the copies alone, and only it gets the
+    record-copy kernel:
+
+    - 64-row tile: the same requests on forced 64-, 32- and 128-row tiles, the
+      most requests up to 3 whose 32-row grid holds one CTA per SM; every
+      tile stores the same bits;
+    - room for records: a capacity of the window plus one against the window;
+    - one CTA per SM: the record-copy bucket's last batch against the next;
+    - fits a CTA: the largest capacity whose copying CTA fits the device's
+      opt-in shared memory against the next.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    window, capacity, history_length = 4, 16, 4
+    launches = _spy_compiles(monkeypatch)
+
+    def launch(x, capacity, history_length, rows=None):
+        if rows is not None:
+            monkeypatch.setattr(window_kernel, "_value_tile_rows", lambda *_: rows)
+        launched = len(launches)
+        result = _copy_runs(x, [lambda: _fused_packed(x, capacity, history_length)])[0]
+        assert len(launches) == launched + 1
+        return launches[-1], result
+
+    if condition == "64-row tile":
+        batch = min(3, props.multi_processor_count // (HEADS * DIM // 32))
+        if batch == 0:
+            pytest.skip("no 32-row grid fits one CTA per SM here")
+        x = _inputs(batch, window, seed=600)
+        copied = launch(x, capacity, history_length, rows=64)
+        others = [launch(x, capacity, history_length, rows=rows) for rows in (32, 128)]
+        changed = {"value_tile_rows", "copy_records"}
+        out, buffers = copied[1]
+        for _, (other_out, other_buffers) in others:
+            _assert_same_bytes(other_out, out)
+            for got, want in zip(other_buffers, buffers, strict=True):
+                _assert_same_bytes(got, want)
+    elif condition == "room for records":
+        x = _inputs(_copy_bucket(window)[0], window, seed=610)
+        copied = launch(x, window + 1, 1)
+        others = [launch(x, window, 0)]
+        changed = {"capacity", "copy_records"}
+    elif condition == "one CTA per SM":
+        buckets = _compile_buckets(window, packed=True)
+        last = _copy_bucket(window)[-1]
+        if last == 16:
+            pytest.skip("every 64-row grid of up to 16 requests fits one CTA per SM")
+        (rows, one_to_two, copies), _ = next(
+            (key, batches) for key, batches in buckets.items() if last + 1 in batches
+        )
+        assert rows == 64 and not copies
+        copied = launch(_inputs(last, window, seed=620), capacity, history_length)
+        others = [launch(_inputs(last + 1, window, seed=621), capacity, history_length)]
+        changed = {"copy_records", "smem_floor"} if one_to_two else {"copy_records"}
+    else:
+        x = _inputs(_copy_bucket(window)[0], window, seed=630)
+        factored = window * abs(x["lower_bound"]) <= window_kernel.FACTORED_DECAY
+
+        def fits(capacity):
+            return (
+                window_kernel.FusedVerifyWindow(
+                    HEADS, window, 64, capacity, True, factored, True, False, 0, True
+                ).smem_bytes
+                <= props.shared_memory_per_block_optin
+            )
+
+        largest = capacity
+        assert fits(largest)
+        while fits(largest + 1):
+            largest += 1
+            if largest == 1024:
+                pytest.skip("a CTA here fits the region of 1020 records")
+        copied = launch(x, largest, history_length)
+        others = [launch(x, largest + 1, history_length)]
+        changed = {"capacity", "copy_records"}
+        # The footprint above is that of the launched configuration.
+        arguments = copied[0][0]
+        assert arguments["bounded_gate"] and arguments["factored"] == factored
+        assert arguments["has_metadata"] and arguments["norm_dtype"] is None
+    torch.cuda.synchronize()
+    (copy_args, copy_kernel), _ = copied
+    assert copy_args["copy_records"] is True
+    for (arguments, kernel), _ in others:
+        assert arguments["copy_records"] is False
+        assert {name for name in arguments if arguments[name] != copy_args[name]} == (
+            changed
+        )
+        assert kernel is not copy_kernel
