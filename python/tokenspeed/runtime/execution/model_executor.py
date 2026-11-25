@@ -797,12 +797,7 @@ class ModelExecutor:
                 f"{shard_top_k} candidates per shard instead of gathering logits"
             )
         # After the target's shard decision: a drafter sharded alike records q over its shard.
-        self._init_draft_probs(config, spec_num_tokens)
-        if self.drafter is not None:
-            # Draft-prob sampling reads the request's temperature / top-k /
-            # seed from the verifier's pool buffers: one owner of per-request
-            # sampling state.
-            self.drafter.bind_sampling_backend(self.sampling_backend)
+        self._init_sampled_drafting(config, spec_num_tokens)
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -2227,17 +2222,39 @@ class ModelExecutor:
             ib.state_write_padding_pool_index,
         )
 
+    def _init_sampled_drafting(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate and bind the state --enable-speculative-sampling keeps.
+
+        The recorded draft q rows and the drafter's sampling scratch live across
+        rounds and inside captured graphs, so they join the CPU-backed
+        ``runtime_states`` region: a weights release unmaps them and a resume
+        restores their addresses and contents.
+
+        Args:
+            config: The executor config.
+            spec_num_tokens: Verify chain width.
+        """
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self._init_draft_probs(config, spec_num_tokens)
+            if self.drafter is not None:
+                # Draft-prob sampling reads the request's temperature / top-k /
+                # seed from the verifier's pool buffers: one owner of per-request
+                # sampling state.
+                self.drafter.bind_sampling_backend(self.sampling_backend)
+
     def _init_draft_probs(
         self, config: ModelExecutorConfig, spec_num_tokens: int
     ) -> None:
         """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
 
-        Trees keep their draft q per tree instead (bind_tree), and DFLASH
-        (DFlash2) records a sparse q over its selector's candidates
+        Trees keep their draft q per tree instead (bind_tree), and DFlash2
+        records a sparse q over its selector's candidates
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
-        The step drafters and DSpark sample from full-vocab logits and need
-        the dense rows: whole-vocabulary rows, or this rank's columns when
-        the verifier reads q per shard and the drafter can record them
+        The step drafters, DSpark and base DFLASH sample from full-vocab logits
+        and need the dense rows: whole-vocabulary rows, or this rank's columns
+        when the verifier reads q per shard and the drafter can record them
         (``_draft_probs_shard``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
@@ -2247,7 +2264,11 @@ class ModelExecutor:
                 "enable_speculative_sampling needs a speculative drafter to "
                 "record proposal distributions for"
             )
-        if config.spec_algo != "DFLASH":
+        # DFlash2 records a sparse q instead. A stage without a drafter (a
+        # pipeline stage before the last) keeps the old rule: no rows for DFLASH.
+        if config.spec_algo != "DFLASH" or (
+            self.drafter is not None and not self.drafter.records_sparse_draft_q
+        ):
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,

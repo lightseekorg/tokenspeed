@@ -716,9 +716,9 @@ parser option keeps its existing behavior.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` with a DFlash2 draft (see below). Off by default. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` (base or DFlash2 draft, see below). Off by default. |
 | `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
-| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH`. |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH` with a DFlash2 draft, which records a sparse `q`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
@@ -882,8 +882,8 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3`, `MTP`, or `DSPARK` (each
-DSpark Markov step samples its token; `DFLASH` is covered below),
+Requirements: `--speculative-algorithm EAGLE3`, `MTP`, `DSPARK` (each
+DSpark Markov step samples its token) or `DFLASH` (covered below),
 `--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
 reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
@@ -925,13 +925,50 @@ residue, out of the
 KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
 headroom.
 
+#### DFLASH with a base draft
+
+A base `DFLASH` draft (no candidate selector) proposes a whole block from one
+forward. Under the flag it samples every block row from the target head's
+distribution `q = softmax(logits / T)` at the request's temperature and records
+that dense `q`, as the step drafters do; verify then runs the same draft-prob
+rule (`coin * q(x) < p(x)`, residual `norm(relu(p - q))`), so the served
+distribution is the target's `p`. The rows share no token dependency, so one
+GEMM projects all `num_draft_tokens - 1` of them through the head, and each
+row draws with its own noise offset. Greedy requests keep the argmax and a
+one-hot `q`. The verifier is one of `flashinfer`, `flashinfer_full` or `sonic`;
+`triton` reads only the DFlash2 `q` below, so the pairing is refused when the
+server loads the draft.
+
+Both rules serve `p`, so the flag changes the acceptance rate and not the
+distribution. The draft-prob rule accepts `1 - TV(p, q)` of the drafts and the
+target-only rule `p(argmax q)`; which is higher for a draft trained to be read
+greedily is a measurement, not a given.
+
+- Memory: the same dense rows as the step drafters above,
+  `(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes, plus the
+  verifier's gather buffer. Those rows are persistent; the block's own peak is
+  transient and sits in the drafting round: the one GEMM's whole-vocabulary
+  logits over every block row,
+  `(num_draft_tokens - 1) x batch x vocab_size x 2` bytes, which under tensor
+  parallelism is the gathered vocabulary rather than this rank's shard, plus
+  one `batch x vocab_size` fp32 `q` per row. A greedy block keeps only the
+  shard, so expect the drafting round's logits to grow by the head's TP size
+  when the flag goes on.
+- No proposal: a fresh admission and a PD landing hold the sentinel, so their
+  first verify rejects every draft and samples from the full target, as for the
+  step drafters. `--spec-reject-draft-prob-threshold` applies. Pass the flag to
+  the decode role only.
+- The draft head: sampling needs the whole row, so the head's logits are
+  gathered to full vocabulary rather than reduced to an argmax. Under
+  `--lm-head-tp-size` with attention DP the draft already holds a rank-local
+  copy of the head, so this adds no collective.
+
 #### DFLASH with a DFlash2 draft
 
 `DFLASH` takes the flag with a DFlash2 draft (a checkpoint with candidate
-selector weights) and `--sampling-backend triton` only; `DFLASH` with any other
-backend is refused at startup, and a base DFlash draft (no selector) is refused
-when the server loads it. The DFlash2 walk picks one of the selector's `K`
-candidates per draft step. Under the flag a sampling request draws that
+selector weights) and `--sampling-backend triton` only; a DFlash2 draft with
+any other backend is refused when the server loads it. The DFlash2 walk picks
+one of the selector's `K` candidates per draft step. Under the flag a sampling request draws that
 candidate from `q = softmax(scores / T)` over the `K` edges out of the
 previous pick, with noise keyed by the request's seed, the round and the drawn
 token id, so every TP rank draws the same token. Greedy requests keep the best

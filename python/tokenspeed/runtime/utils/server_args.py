@@ -86,7 +86,9 @@ logger = get_colorful_logger(__name__)
 # either.
 SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
-# draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
+# draft q (RuntimeStates.future_draft_q): a DFlash2 draft needs it. A base DFLASH
+# draft records the dense q and takes SPECULATIVE_SAMPLING_BACKENDS; DFlash.
+# bind_sampling_backend checks the pairing once the draft is loaded.
 DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
 
 # Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
@@ -2300,12 +2302,10 @@ class ServerArgs:
         the draft-prob chain kernel:
         ``greedy`` verifies by exact match, so a dense q never enters it, and
         ``triton`` by a target-sampled exact match unless it runs block
-        verification, which reads the dense q. The one block drafter
-        served is DFLASH with the DFlash2 candidate selector: its walk samples
-        each step from the selector's q over its top-K candidates, which only
-        the ``triton`` backend verifies (sparse q); base DFLASH without the
-        selector is refused when the drafter binds the verifier, since only
-        the loaded checkpoint tells the two apart. The prefill role of a
+        verification, which reads the dense q. DFLASH is admitted with either
+        ``triton`` (a DFlash2 draft's sparse q) or a draft-prob backend (a base
+        draft's dense q); only the loaded checkpoint says which, so the drafter
+        refuses the wrong pairing when it binds the verifier. The prefill role of a
         disaggregated deployment never verifies a chain of its own and its
         drafted candidates ship to the decode node without q, so there the
         flag would only allocate the per-slot distribution buffer; it is
@@ -2325,8 +2325,7 @@ class ServerArgs:
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
-                "--speculative-algorithm EAGLE3, MTP, or DSPARK (or DFLASH with a "
-                "DFlash2 draft and --sampling-backend triton)"
+                "--speculative-algorithm EAGLE3, MTP, DSPARK, or DFLASH"
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
@@ -2335,12 +2334,15 @@ class ServerArgs:
                 f"{self.speculative_eagle_topk=}"
             )
         if self.speculative_algorithm == "DFLASH":
-            if self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND:
+            if (
+                self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND
+                and self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
+            ):
                 raise ValueError(
-                    "--enable-speculative-sampling with DFLASH needs --sampling-backend "
-                    f"{DFLASH_SPECULATIVE_SAMPLING_BACKEND}, the one verifier that reads "
-                    "the DFlash2 selector's sparse draft distribution; got "
-                    f"--sampling-backend {self.sampling_backend}"
+                    "--enable-speculative-sampling with DFLASH needs "
+                    f"--sampling-backend {DFLASH_SPECULATIVE_SAMPLING_BACKEND} "
+                    f"(DFlash2) or one of {sorted(SPECULATIVE_SAMPLING_BACKENDS)} "
+                    f"(base draft); got --sampling-backend {self.sampling_backend}"
                 )
         elif (
             self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
@@ -5071,15 +5073,14 @@ class ServerArgs:
             "drafter samples each step from its own distribution q (per-request "
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule (vLLM's "
-            "draft_sample_method=probabilistic). Needs EAGLE3 or MTP, or DSPARK "
-            "with the block or synthetic rejection method, with "
-            "--speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend, EAGLE4 on EAGLE-Harness "
-            "(--speculative-exec-mode 0 or 1, trees or chains) and the "
-            "flashinfer backend, or DFLASH with a DFlash2 (candidate selector) "
-            "draft and the triton backend; refused on the prefill role of "
-            "a disaggregated deployment. Every drafter but DFLASH costs a "
-            "per-request fp32 draft distribution buffer; see "
+            "draft_sample_method=probabilistic). Needs EAGLE3, MTP, DSPARK or "
+            "DFLASH with a base draft, with --speculative-eagle-topk 1 and the "
+            "flashinfer or flashinfer_full sampling backend, EAGLE4 on "
+            "EAGLE-Harness (--speculative-exec-mode 0 or 1, trees or chains) "
+            "and the flashinfer backend, or DFLASH with a DFlash2 (candidate "
+            "selector) draft and the triton backend; refused on the prefill "
+            "role of a disaggregated deployment. Every drafter but a DFlash2 "
+            "draft costs a per-request fp32 draft distribution buffer; see "
             "docs/configuration/server.md.",
         )
         parser.add_argument(
