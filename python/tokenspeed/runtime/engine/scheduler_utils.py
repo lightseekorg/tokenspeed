@@ -53,13 +53,14 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     scheduler_role,
 )
 
-# The data plane reports L2 and retraction ACKs as ``(kind, op_id)``.
+# The data plane reports Host cache and state commit ACKs as ``(kind, op_id)``.
 _CACHE_EVENT_TYPES = frozenset(
     {
         "WriteBackDoneEvent",
         "LoadBackDoneEvent",
         "SnapshotDoneEvent",
         "RestoreDoneEvent",
+        "StateCommitDoneEvent",
     }
 )
 # make_config's host_write_policy names; ServerArgs validates the flag.
@@ -133,6 +134,7 @@ def make_config(
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
     max_consecutive_prefill_rounds: int,
+    prefill_interval_min_decoding: int,
     decode_allocation_policy: str | None = None,
     debug_force_retraction_interval: int = 0,
     debug_force_retraction_max_per_request: int | None = None,
@@ -208,6 +210,12 @@ def make_config(
             that reaches it owes the decodes the whole interval again, and a
             prompt's held-back count restarts whenever one of its chunks
             runs. 0 keeps the unbounded suspension. Fused role only.
+        prefill_interval_min_decoding: ``--prefill-interval-min-decoding``:
+            a round owes the intervals' decode rounds only while at least
+            this many requests are ready to decode; below it,
+            max_consecutive_prefill_rounds back-to-back prefill rounds that
+            hold a decode back are still followed by one decode round. 0
+            always owes them. Fused role only.
         decode_allocation_policy:
             ``--disaggregation-decode-allocation-policy``, a prefill-role
             setting and None on every other role: ``"early"``, which None is
@@ -363,6 +371,9 @@ def make_config(
     if max_consecutive_prefill_rounds:
         # Set only when on, for the same reason.
         cfg.max_consecutive_prefill_rounds = max_consecutive_prefill_rounds
+    if prefill_interval_min_decoding:
+        # Set only when on, for the same reason.
+        cfg.prefill_interval_min_decoding = prefill_interval_min_decoding
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True
@@ -505,7 +516,7 @@ def cache_event_to_payload(event) -> dict:
     """A cache ACK as the payload the host's data plane reports
     (``HostDataPlane.poll_cache_events``).
 
-    ``(kind, op_id)`` identifies a completed Host copy.
+    ``(kind, op_id)`` identifies a completed Host copy or state commit fence.
     """
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:

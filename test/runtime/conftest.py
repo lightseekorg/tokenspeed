@@ -36,6 +36,7 @@ def kimi_recipe(
     draft_window: int | None = None,
     pd_enabled: bool = False,
     max_bs: int = 1,
+    max_resident_requests: int | None = None,
     max_scheduled_tokens: int = 128,
     context_len: int = 4096,
     decode_input_tokens: int = 1,
@@ -45,6 +46,7 @@ def kimi_recipe(
     kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
     mamba_ssm_dtype: str = "float32",
     dsa_index_k_format: str | None = None,
+    kda_history_capacity: int | None = None,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits.
 
@@ -78,6 +80,7 @@ def kimi_recipe(
         conv_kernel_size=int(kda["short_conv_kernel_size"]),
         layer_ids=tuple(text_config.linear_layer_ids),
         tp_size=tp_size,
+        kda_history_capacity=kda_history_capacity,
     )
     mla = MLAConfig(
         backend_name="mla",
@@ -112,7 +115,9 @@ def kimi_recipe(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
         max_bs=max_bs,
-        max_resident_requests=max_bs,
+        max_resident_requests=(
+            max_bs if max_resident_requests is None else max_resident_requests
+        ),
         # K3's per-group demand reads the scheduler's concurrency through
         # CacheRecipe.scheduler_limits, context length included.
         context_len=context_len,
@@ -209,28 +214,23 @@ def kimi_layout(recipe):
     return groups, layout
 
 
-def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
-    return kimi_tp8_layout()[2].bind(num_lcm_blocks)
+def make_kimi_pool(
+    device,
+    usable_pages: int = 6,
+    *,
+    mamba_ssm_dtype: str = "float32",
+):
+    from test.runtime.cache_pool_test_utils import make_pool
 
-
-def _kimi_group_specs(group_ids, layer_types, plan):
-    del group_ids, layer_types, plan
-    return tuple(spec for spec, _ in kimi_recipe().groups())
-
-
-def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
 
-    del with_mla_dims
     text_config = KimiLinearConfig()
-    plan = kimi_tp8_plan(num_lcm_blocks=usable_pages)
-    recipe = kimi_recipe()
-    group_ids = recipe.target_group_ids
-    layer_types = recipe.layer_types
-    from test.runtime.cache_pool_test_utils import make_pool
+    recipe = kimi_recipe(mamba_ssm_dtype=mamba_ssm_dtype)
+    groups, layout = kimi_layout(recipe)
+    plan = layout.bind(usable_pages)
 
     _, pool = make_pool(
         HybridKDATokenToKVPool,
@@ -243,8 +243,8 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         qk_rope_head_dim=MLA_QK_ROPE_DIM,
         layer_num=text_config.num_hidden_layers,
         rank=0,
-        layer_types=layer_types,
-        cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
+        layer_types=recipe.layer_types,
+        cache_group_specs=tuple(spec for spec, _ in groups),
     )
     return pool
 

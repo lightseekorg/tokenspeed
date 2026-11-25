@@ -78,6 +78,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
         output_lengths=torch.tensor([1], dtype=torch.int32, device="cpu"),
         output_logprobs=torch.tensor([-0.5], dtype=torch.float32, device="cpu"),
         output_nan_flags=torch.tensor([0], dtype=torch.int32, device="cpu"),
+        output_request_ends=torch.tensor([1], dtype=torch.int32, device="cpu"),
         next_input_ids=torch.tensor([[1, 2]], dtype=torch.int32, device="cpu"),
         input_token_logprobs=torch.tensor(
             [-0.25, -1.0], dtype=torch.float32, device="cpu"
@@ -113,7 +114,8 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     del result
     gc.collect()
     assert exported[8].tolist() == [0.875]
-    assert len(exported) == 9
+    assert exported[9] == [1]
+    assert len(exported) == 10
 
 
 def test_completed_result_keeps_absent_columns_absent():
@@ -124,4 +126,4 @@ def test_completed_result_keeps_absent_columns_absent():
     exported = completed_result(
         result, serving_compiles=None, grammar_terminated_at=None
     )
-    assert exported == ([7], [1], None, None, None, None, None, None, None)
+    assert exported == ([7], [1], None, None, None, None, None, None, None, None)

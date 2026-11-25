@@ -58,7 +58,7 @@ key_span Keys(const std::vector<std::string>& v) {
 
 TEST(RequestPromptHashesTest, RepeatedQueriesKeepTheFullInputPageChain) {
     Request request(RequestSpec{.request_id = "prompt", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
-                    /*prefix_granularity=*/4, Role::kFused);
+                    /*prefix_granularity=*/4, /*awaits_bootstrap=*/false);
     const std::string first = HashPrefixPage(Tokens({1, 2, 3, 4}), "");
     const std::string second = HashPrefixPage(Tokens({5, 6, 7, 8}), first);
     const std::vector<std::string> expected{first, second};
@@ -70,7 +70,7 @@ TEST(RequestPromptHashesTest, RepeatedQueriesKeepTheFullInputPageChain) {
 
 TEST(RequestPromptHashesTest, AnAlignedInputKeepsItsLastFullPageForDecodeRoleMatching) {
     Request request(RequestSpec{.request_id = "decode", .tokens = {1, 2, 3, 4}},
-                    /*prefix_granularity=*/2, Role::kD);
+                    /*prefix_granularity=*/2, /*awaits_bootstrap=*/true);
     const std::string first = HashPrefixPage(Tokens({1, 2}), "");
     const std::string second = HashPrefixPage(Tokens({3, 4}), first);
     const auto hashes = request.PromptPrefixHashes();
@@ -79,7 +79,7 @@ TEST(RequestPromptHashesTest, AnAlignedInputKeepsItsLastFullPageForDecodeRoleMat
 
 TEST(RequestPromptHashesTest, AShortInputHasNoFullPageHashes) {
     Request request(RequestSpec{.request_id = "short", .tokens = {1, 2, 3}},
-                    /*prefix_granularity=*/4, Role::kFused);
+                    /*prefix_granularity=*/4, /*awaits_bootstrap=*/false);
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
 }
@@ -104,7 +104,7 @@ struct SpanRecording {
 TEST(RequestPromptHashesTest, APromptsFirstLookupIsProfiledAsHashingEvenWithoutACompletePage) {
     const SpanRecording recording;
     Request short_prompt(RequestSpec{.request_id = "short", .tokens = {1, 2, 3}},
-                         /*prefix_granularity=*/4, Role::kFused);
+                         /*prefix_granularity=*/4, /*awaits_bootstrap=*/false);
     EXPECT_TRUE(short_prompt.PromptPrefixHashes().empty());
     EXPECT_EQ(recorded_spans, std::vector<std::string>{"ComputePrefixHashes"});
     // A lookup the chain already covers hashes nothing.
@@ -112,7 +112,7 @@ TEST(RequestPromptHashesTest, APromptsFirstLookupIsProfiledAsHashingEvenWithoutA
     EXPECT_EQ(recorded_spans.size(), 1U);
 
     Request long_prompt(RequestSpec{.request_id = "long", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
-                        /*prefix_granularity=*/2, Role::kFused);
+                        /*prefix_granularity=*/2, /*awaits_bootstrap=*/false);
     long_prompt.PromptPrefixHashes(1);
     long_prompt.PromptPrefixHashes(1);
     long_prompt.PromptPrefixHashes();
@@ -122,7 +122,7 @@ TEST(RequestPromptHashesTest, APromptsFirstLookupIsProfiledAsHashingEvenWithoutA
 
 TEST(RequestPromptHashesTest, BoundedStorageThenAdmissionAndPublicationShareTheSameChain) {
     Request request(RequestSpec{.request_id = "bounded", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
-                    /*prefix_granularity=*/2, Role::kFused);
+                    /*prefix_granularity=*/2, /*awaits_bootstrap=*/false);
     const auto expected = ComputePrefixHashes(request.FullPrefixPages(false), "");
     const auto bounded = request.PromptPrefixHashes(2);
     EXPECT_EQ(std::vector<std::string>(bounded.begin(), bounded.end()),
@@ -145,7 +145,8 @@ TEST(RequestPromptHashesTest, BoundedStorageThenAdmissionAndPublicationShareTheS
 TEST(RequestPromptHashesTest, ABoundedSpanStaysValidAfterLaterCallsExtendTheChain) {
     std::vector<std::int32_t> tokens(33);
     for (std::size_t i = 0; i < tokens.size(); ++i) tokens[i] = static_cast<std::int32_t>(i);
-    Request request(RequestSpec{.request_id = "stable", .tokens = tokens}, /*prefix_granularity=*/2, Role::kFused);
+    Request request(RequestSpec{.request_id = "stable", .tokens = tokens}, /*prefix_granularity=*/2,
+                    /*awaits_bootstrap=*/false);
     const auto expected = ComputePrefixHashes(request.FullPrefixPages(false), "");
     ASSERT_EQ(expected.size(), 16);
     const auto bounded = request.PromptPrefixHashes(1);
@@ -162,7 +163,7 @@ TEST(RequestPromptHashesTest, ABoundedSpanStaysValidAfterLaterCallsExtendTheChai
 
 TEST(RequestPromptHashesTest, PublicationWithoutAdmissionHashesOnlyCompletedPages) {
     Request request(RequestSpec{.request_id = "uncached", .tokens = {1, 2, 3, 4, 5}},
-                    /*prefix_granularity=*/2, Role::kFused);
+                    /*prefix_granularity=*/2, /*awaits_bootstrap=*/false);
     std::vector<std::string> completed;
     request.AppendPrefixHashes(completed, 0);
     EXPECT_TRUE(completed.empty());
@@ -179,7 +180,8 @@ TEST(RequestPromptHashesTest, PageByPageAppendsGrowTheCompletedChainGeometricall
     std::vector<std::int32_t> tokens(2 * kPages);
     std::iota(tokens.begin(), tokens.end(), 0);
     for (const bool prompt_hashed : {false, true}) {
-        Request request(RequestSpec{.request_id = "grow", .tokens = tokens}, /*prefix_granularity=*/2, Role::kFused);
+        Request request(RequestSpec{.request_id = "grow", .tokens = tokens}, /*prefix_granularity=*/2,
+                        /*awaits_bootstrap=*/false);
         if (prompt_hashed) {
             ASSERT_EQ(request.PromptPrefixHashes().size(), kPages);
         }

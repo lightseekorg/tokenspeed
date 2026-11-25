@@ -40,7 +40,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op  # noqa: E402
+from cutlass.cutlass_dsl import dsl_user_op, target_version  # noqa: E402
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
     _CONVERT_WARPGROUPS,
     _HEAD_DIM,
@@ -70,11 +70,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
     warpgroup_threads,
     warpgroup_warps,
 )
-
-# FP8 producer ring: 16 KB shared stages per convert warpgroup (all eight
-# allocated KV stages) and gathered items kept in flight ahead of conversion.
-_FP8_RING = 4
-_FP8_DEPTH = 3
+from tokenspeed_kernel.thirdparty.cute_dsl.conversion import convert_e4m3_bf16
 
 
 @dsl_user_op
@@ -127,6 +123,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         work_sync_threads: int,
         prefix_in_cta: bool,
         large_query_grid: bool,
+        fp8_gather_depth: int,
+        prefetch_fp8_tail: bool,
     ):
         self.kv_splits = kv_splits
         self.bf16_smem_slots = bf16_smem_slots
@@ -184,6 +182,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.work_sync_threads = work_sync_threads
         self.prefix_in_cta = prefix_in_cta
         self.large_query_grid = large_query_grid
+        self.fp8_gather_depth = fp8_gather_depth
+        self.fp8_gather_ring = fp8_gather_depth + 1
+        self.prefetch_fp8_tail = prefetch_fp8_tail
         self.prefetch_private_kv = False
         self.prefetch_private_kv_warp = self.mma_kq_warp_id + 2
         self.overlap_private_tail = False
@@ -230,6 +231,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self.overlap_private_tail = private_tail_workers > 0
             assert private_tail_workers in (0, 2, 6)
         self.sp_stages = 1 if self.prefetch_private_kv else 2
+        if prefetch_fp8_tail:
+            assert original_heads_per_kv == 12 and problem_shape[2] == 2
+            assert query_group == 1 and kv_splits == 1
+            # FP8 retains two score stages for its interleaved K/V stream;
+            # only the private tail borrows the otherwise idle MMA warp.
+            self.prefetch_private_kv = True
         self.o_stages = 1
         self.kv_ring_stages = 2
         if leader_first:
@@ -635,30 +642,31 @@ class MixedInputFusedMultiHeadAttentionDecode:
         v_address: cutlass.Int64,
         staged_slots: cute.Tensor,
         item: cutlass.Int32,
-        num_items: cutlass.Int32,
         dim_offset: cutlass.Int32,
         smem_base: cutlass.Int64,
         smem_stage: cutlass.Int32,
         warpgroup_tidx: cutlass.Int32,
     ):
-        """Gather item `item` of the K0,K1,V0,K2,V1,...,V_last stream (16 KB).
+        """Gather a 16 KB item from the K0,V0,K1,V1,... prefix stream.
 
-        Slot ids come from the CTA's shared-memory copy, so V items reuse their
-        K tile's ids and no global load precedes the copies. The stream covers
-        the row's prefix tiles up to its last one holding a positive id, so
-        `num_items` is a runtime value.
+        Even items gather keys and odd items gather values. Both read the
+        CTA's staged slot ids, so no global id load precedes the copies.
+        Four lanes gather one row in two coalesced 64-byte halves. Each
+        lane loads one slot id and broadcasts it to its four copying lanes.
+        The second destination toggles bit 6 of the SW128 layout.
         """
-        is_value = cutlass.Int32(item == num_items - 1) | (
-            cutlass.Int32(item > 0) & cutlass.Int32(item % 2 == 0)
-        )
-        tile = (item + 1) // 2 - is_value
+        is_value = item % 2
+        tile = item // 2
         base = k_address + cutlass.Int64(is_value) * (v_address - k_address)
-        for iteration in cutlass.range_constexpr(8):
+        lane = warpgroup_tidx % 32
+        index_row = (warpgroup_tidx // 32) * 8 + lane % 8 + (lane // 8) * 32
+        raw_slot = staged_slots[tile * 128 + index_row]
+        for iteration in cutlass.range_constexpr(4):
             vector = warpgroup_tidx + iteration * warpgroup_threads
-            row = vector // 8
-            col = (vector - row * 8) * 16
+            row = vector // 4
+            col = (vector - row * 4) * 16
             slot = cutlass.Int32(_PADDING_READ_SLOT)
-            candidate = staged_slots[tile * 128 + row]
+            candidate = cute.arch.shuffle_sync(raw_slot, iteration * 8 + lane // 4)
             if candidate > 0:
                 slot = candidate
             source = (
@@ -669,6 +677,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             logical_address = smem_base + row * 128 + col + smem_stage * 16384
             swizzled_address = logical_address ^ ((logical_address >> 3) & 0x70)
             _cp_async_16_addr(cutlass.Int64(swizzled_address), source)
+            _cp_async_16_addr(cutlass.Int64(swizzled_address ^ 64), source + 64)
         cute.arch.cp_async_commit_group()
 
     @cute.jit
@@ -1469,6 +1478,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
             ),
             prefix_in_cta=self.prefix_in_cta,
             large_query_grid=self.large_query_grid,
+            fp8_gather_depth=self.fp8_gather_depth,
+            prefetch_fp8_tail=self.prefetch_fp8_tail,
         )
 
     @cute.jit
@@ -1635,12 +1646,14 @@ class MixedInputFusedMultiHeadAttentionDecode:
             smem_alloc_bits += (selected_slots.shape[1] // 128) * 128 * 32  # staged ids
             # Per-warp prefix tile counts (16-byte aligned).
             smem_alloc_bits += 128 + (self.threads_per_cta // warp_threads) * 32
+            if cutlass.const_expr(self.prefetch_fp8_tail):
+                smem_alloc_bits += 3 * _HEAD_DIM * 2 * k_iter.dtype.width
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         kv_smem_dtype = k_iter.dtype
         self.kv_stages = (smem_capacity * 8 - smem_alloc_bits) // (
             mma_tile_m * mma_tile_k * kv_smem_dtype.width
         )
-        self.kv_stages = min(self.kv_stages, 8)
+        self.kv_stages = min(self.kv_stages, self.fp8_gather_ring * _CONVERT_WARPGROUPS)
         if cutlass.const_expr(bf16_kv):
             self.kv_stages = self.bf16_smem_slots * _CONVERT_WARPGROUPS
         assert self.kv_stages >= self.kv_ring_stages * _CONVERT_WARPGROUPS
@@ -1750,7 +1763,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 + 2 * 128 * 128 * self.kv_stages
                 + mma_tile_n * (512 + 256 * self.sp_stages)
                 + (
-                    self.query_group * 3 * _HEAD_DIM * 4
+                    self.query_group * 3 * _HEAD_DIM * 2 * kv_smem_dtype.width // 8
                     if self.prefetch_private_kv
                     else 0
                 )
@@ -2247,6 +2260,18 @@ class MixedInputFusedMultiHeadAttentionDecode:
         if cutlass.const_expr(self.register_budget is not None):
             # 128*208 + 384*80 = 57344 registers from the CTA pool.
             cute.arch.setmaxregister_increase(self.register_budget[0])
+        # Pairwise softmax arithmetic needs an even bound; padded P stays zero.
+        active_columns = (
+            min(softmax_head_tile, cute.ceil_div(self.original_heads_per_kv, 2) * 2)
+            if self.query_group == 1
+            and self.head_tile == softmax_head_tile
+            and tAsK.element_type is not cutlass.BFloat16
+            else softmax_head_tile
+        )
+        # Reduced maxima agree across lanes, making correction warp-uniform.
+        skip_vector_correction = (
+            self.head_tile == 16 and tAsK.element_type is not cutlass.BFloat16
+        )
         head_in_tile = softmax_head_offset + lane_idx
         lane_store_max = lane_idx < softmax_head_tile
         softmax_dice = (None, None, None)
@@ -2297,7 +2322,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         tOcO = thrblk_mma_vp.partition_C(cO)
         tScO = thr_load_s.partition_D(tOcO)
         tScO = tScO[None, softmax_copy_group, None, None]
-        if cutlass.const_expr(self.scalar_softmax_stats):
+        if cutlass.const_expr(self.scalar_softmax_stats or skip_vector_correction):
             # Eight-head fragments permit a whole warp to skip
             # identity correction without masking TMEM instructions.
             chunk_load_atom = cute.make_copy_atom(
@@ -2336,6 +2361,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Initialize O
         tSrO.fill(cutlass.Float32(0))
         cute.copy(thr_store_o, tSrO, tStO)
+        # Initial O must be visible before the first P commit enables PV.
+        cute.arch.fence_view_async_tmem_store()
 
         # Initialize colsum and colmax in smem and wait
         if warpgroup_widx == 0 and lane_store_max:
@@ -2362,17 +2389,19 @@ class MixedInputFusedMultiHeadAttentionDecode:
             tSrP = cute.make_rmem_tensor(tSsP.shape[:-1], mma_dtype)
             tSrP.fill(cutlass.BFloat16(0))
             tSrP_f32 = cute.make_rmem_tensor(tSrS.shape, acc_dtype)
+            tSrP_f32.fill(cutlass.Float32(0))
             if cutlass.const_expr(self.scalar_softmax_stats):
                 max_lane = previous_max_lane
                 correction_lane = cutlass.Float32(0.0)
             else:
                 tSrM = cute.make_rmem_tensor_like(tSsM)
                 correction = cute.make_rmem_tensor_like(tSsM)
+                correction.fill(cutlass.Float32(1))
             if active_head_group:
                 # Invalid entries load slot 1, which the caller keeps finite.
                 # Mask their logits using the original selection so
                 # they never contribute to the softmax.
-                for i in cutlass.range_constexpr(cute.size(tSrS)):
+                for i in cutlass.range_constexpr(active_columns):
                     score_coord = tScS[i]
                     selected_idx = selected_tile * blk_tile_s + score_coord[0]
                     valid = cutlass.Boolean(False)
@@ -2397,7 +2426,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 # Reduce colmax in warp RF
                 tSrM_lane = cutlass.Float32(0)  # Avoid dynamic register indexing
-                for i in cutlass.range_constexpr(cute.size(tSrS)):
+                for i in cutlass.range_constexpr(active_columns):
                     reduced_max = warp_fmax(tSrS[i])
                     if cutlass.const_expr(not self.scalar_softmax_stats):
                         tSrM[i] = reduced_max
@@ -2418,8 +2447,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 else:
                     cute.autovec_copy(tSsM, tSrM)
 
+                if cutlass.const_expr(tAsK.element_type is not cutlass.BFloat16):
+                    # Capture this tile's maxima in every warp before a faster
+                    # warp can raise the shared maxima for the next tile.
+                    softmax_nbar.arrive_and_wait()
+
                 # Compute online softmax
-                for i in cutlass.range_constexpr(0, cute.size(tSrS), 2):
+                for i in cutlass.range_constexpr(0, active_columns, 2):
                     if cutlass.const_expr(self.scalar_softmax_stats):
                         max_f32x2 = (
                             cute.arch.shuffle_sync(max_lane, i),
@@ -2455,7 +2489,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             (previous_max_lane - max_lane) * scale_qs_log2_e
                         )
                         previous_max_lane = max_lane
-                for i in cutlass.range_constexpr(0, cute.size(tSsM), 2):
+                for i in cutlass.range_constexpr(0, active_columns, 2):
                     if cutlass.const_expr(self.scalar_softmax_stats):
                         c_f32x2 = (
                             cute.arch.shuffle_sync(correction_lane, i),
@@ -2487,17 +2521,26 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 if active_head_group:
                     # Apply correction
-                    if cutlass.const_expr(self.scalar_softmax_stats):
+                    if cutlass.const_expr(
+                        self.scalar_softmax_stats or skip_vector_correction
+                    ):
                         for head_chunk in cutlass.range_constexpr(
                             softmax_head_tile // 8
                         ):
                             begin = head_chunk * 8
-                            changed = (
-                                lane_idx >= begin
-                                and lane_idx < begin + 8
-                                and correction_lane != cutlass.Float32(1)
-                            )
-                            needs_chunk = cute.arch.vote_any_sync(changed)
+                            if cutlass.const_expr(self.scalar_softmax_stats):
+                                changed = (
+                                    lane_idx >= begin
+                                    and lane_idx < begin + 8
+                                    and correction_lane != cutlass.Float32(1)
+                                )
+                                needs_chunk = cute.arch.vote_any_sync(changed)
+                            else:
+                                needs_chunk = cutlass.Boolean(False)
+                                for i in cutlass.range_constexpr(8):
+                                    needs_chunk = needs_chunk | (
+                                        correction[begin + i] != cutlass.Float32(1)
+                                    )
                             if needs_chunk:
                                 copy_group = softmax_head_offset // 8 + head_chunk
                                 source = chunk_tmem[
@@ -2518,14 +2561,22 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     for i in cutlass.range_constexpr(
                                         0, cute.size(values), 2
                                     ):
-                                        coeff = (
-                                            cute.arch.shuffle_sync(
-                                                correction_lane, begin + i
-                                            ),
-                                            cute.arch.shuffle_sync(
-                                                correction_lane, begin + i + 1
-                                            ),
-                                        )
+                                        if cutlass.const_expr(
+                                            self.scalar_softmax_stats
+                                        ):
+                                            coeff = (
+                                                cute.arch.shuffle_sync(
+                                                    correction_lane, begin + i
+                                                ),
+                                                cute.arch.shuffle_sync(
+                                                    correction_lane, begin + i + 1
+                                                ),
+                                            )
+                                        else:
+                                            coeff = (
+                                                correction[begin + i],
+                                                correction[begin + i + 1],
+                                            )
                                         product = fmul2(
                                             (values[i], values[i + 1]), coeff
                                         )
@@ -2547,14 +2598,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 tSrO_dm,
                             )
 
-                            for i in cutlass.range_constexpr(0, cute.size(tSrO_dm), 2):
-                                if cutlass.const_expr(self.scalar_softmax_stats):
-                                    c_f32x2 = (
-                                        cute.arch.shuffle_sync(correction_lane, i),
-                                        cute.arch.shuffle_sync(correction_lane, i + 1),
-                                    )
-                                else:
-                                    c_f32x2 = (correction[i], correction[i + 1])
+                            for i in cutlass.range_constexpr(0, active_columns, 2):
+                                c_f32x2 = (correction[i], correction[i + 1])
                                 o_f32x2 = fmul2((tSrO_dm[i], tSrO_dm[i + 1]), c_f32x2)
                                 tSrO_dm[i] = o_f32x2[0]
                                 tSrO_dm[i + 1] = o_f32x2[1]
@@ -2575,7 +2620,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
         # Reduce colsum in warp RF
         tSrL_lane = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(cute.size(tSrL)):
+        for i in cutlass.range_constexpr(active_columns):
             tSrL[i] = cute.arch.warp_reduction_sum(tSrL[i])
             if i == lane_idx:
                 tSrL_lane = tSrL[i]
@@ -2850,7 +2895,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self.original_heads_per_kv == 12 and self.problem_shape[2] == 2
         ):
             if cutlass.const_expr(self.prefetch_private_kv):
-                assert kv_smem_dtype is cutlass.BFloat16
                 private_kv = smem.allocate_tensor(
                     kv_smem_dtype,
                     cute.make_layout(
@@ -3938,7 +3982,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                         convert_phase * mma_tile_k,
                                                     )
                             else:
-                                cvt_type = cutlass.Float32
                                 assert tiles_dk % _CONVERT_WARPGROUPS == 0
                                 assert (tiles_dm * tiles_sk) % _CONVERT_WARPGROUPS == 0
                                 convert_phase = warpgroup_idx % _CONVERT_WARPGROUPS
@@ -4002,14 +4045,17 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 thr_load_v = smem_load_v.get_slice(warpgroup_tidx)
                                 tVsV = thr_load_v.partition_S(tAsV)
                                 tVrV_shape = thr_load_v.partition_D(tAsV).shape[:-1]
-                                ring = _FP8_RING
-                                depth = _FP8_DEPTH
+                                ring = self.fp8_gather_ring
+                                depth = self.fp8_gather_depth
                                 assert self.kv_stages >= ring * _CONVERT_WARPGROUPS
                                 assert 1 <= depth < ring
-                                # V_(s-1) follows K_s (one prefetched S stage) for
-                                # every runtime tile count >= 1.
+                                # Two S/P stages let QK and PV advance independently.
                                 assert self.sp_stages == 2
-                                # K0,K1,V0,...,V_last over this row's prefix tiles.
+                                # Non-bulk cp.async and ldmatrix use the generic
+                                # proxy. The wait and warpgroup barrier publish
+                                # copies and protect ring reuse; no async-proxy
+                                # shared fence is needed after the register load.
+                                # K0,V0,K1,V1,... over this row's prefix tiles.
                                 num_items = prefix_iters * 2
                                 k_address = k_iter.toint()
                                 v_address = v_iter.toint()
@@ -4021,7 +4067,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                             v_address,
                                             staged_slots,
                                             cutlass.Int32(first),
-                                            num_items,
                                             convert_phase * mma_tile_k,
                                             sKV_vector_address,
                                             cutlass.Int32(
@@ -4032,138 +4077,154 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                         )
                                     else:
                                         cute.arch.cp_async_commit_group()
-                                for s in cutlass.range(prefetch_iters + prefix_iters):
-                                    if s < prefix_iters:
-                                        # Convert and scale K_s (stream item 0 or 2s-1)
-                                        item = 2 * s - 1 + cutlass.Int32(s == 0)
-                                        # `depth` groups are pending: items item..item+depth-1.
-                                        cute.arch.cp_async_wait_group(depth - 1)
-                                        # All threads' copies of `item` are complete, and every
-                                        # thread finished reading item-1, whose ring slot the
-                                        # refill below may reuse (ring == depth + 1).
-                                        cvt_load_nbar.arrive_and_wait()
-                                        refill = item + depth
-                                        if refill < num_items:
-                                            self._issue_fp8_ring_item(
-                                                k_address,
-                                                v_address,
-                                                staged_slots,
-                                                refill,
-                                                num_items,
-                                                convert_phase * mma_tile_k,
-                                                sKV_vector_address,
-                                                (refill % ring) * _CONVERT_WARPGROUPS
-                                                + convert_phase,
-                                                warpgroup_tidx,
-                                            )
-                                        else:
-                                            cute.arch.cp_async_commit_group()
-                                        k_smem_stage = (
-                                            item % ring
-                                        ) * _CONVERT_WARPGROUPS + convert_phase
+                                for s in cutlass.range(prefix_iters):
+                                    # Convert K_s, then V_s, publishing each complete TMEM item.
+                                    item = 2 * s
+                                    # `depth` groups are pending: items item..item+depth-1.
+                                    cute.arch.cp_async_wait_group(depth - 1)
+                                    # All threads' copies of `item` are complete, and every
+                                    # thread finished reading item-1, whose ring slot the
+                                    # refill below may reuse (ring == depth + 1).
+                                    cvt_load_nbar.arrive_and_wait()
+                                    refill = item + depth
+                                    if refill < num_items:
+                                        self._issue_fp8_ring_item(
+                                            k_address,
+                                            v_address,
+                                            staged_slots,
+                                            refill,
+                                            convert_phase * mma_tile_k,
+                                            sKV_vector_address,
+                                            (refill % ring) * _CONVERT_WARPGROUPS
+                                            + convert_phase,
+                                            warpgroup_tidx,
+                                        )
+                                    else:
+                                        cute.arch.cp_async_commit_group()
+                                    k_smem_stage = (
+                                        item % ring
+                                    ) * _CONVERT_WARPGROUPS + convert_phase
 
+                                    cvt_handle = cvt_producer.acquire_and_advance()
+                                    for chunk in cutlass.range_constexpr(2):
                                         tKrK = cute.make_rmem_tensor(
-                                            tKrK_shape, kv_smem_dtype
+                                            (tKrK_shape[0], 1, 1), kv_smem_dtype
                                         )
                                         tKrK_cvt = cute.make_rmem_tensor(
-                                            tKrK_cvt_shape, mma_dtype
+                                            (tKrK_cvt_shape[0], 1, 1), mma_dtype
                                         )
-
                                         cute.copy(
                                             thr_load_k,
-                                            tKsK[cpy_dice + (k_smem_stage,)],
+                                            tKsK[None, chunk, None, None, k_smem_stage],
                                             tKrK,
                                         )
-                                        cute.arch.fence_view_async_shared()
-
-                                        tKrK_ssa = (
-                                            tKrK.load().to(cvt_type).to(mma_dtype)
+                                        convert_e4m3_bf16(
+                                            tKrK,
+                                            tKrK_cvt,
+                                            native=target_version(min_version="13.2"),
                                         )
-                                        tKrK_cvt.store(tKrK_ssa.reshape(tKrK_cvt_shape))
-
-                                        cvt_handle = cvt_producer.acquire_and_advance()
                                         cute.copy(
                                             thr_store_k,
                                             tKrK_cvt,
-                                            tKtK_cvt[cpy_dice + (cvt_handle.index,)],
+                                            tKtK_cvt[
+                                                None,
+                                                chunk,
+                                                None,
+                                                None,
+                                                cvt_handle.index,
+                                            ],
                                         )
-                                        cute.arch.fence_view_async_tmem_store()
-                                        cvt_handle.commit()
+                                    cute.arch.fence_view_async_tmem_store()
+                                    cvt_handle.commit()
 
-                                        # Advance again for multiple warpgroups
-                                        for _ in cutlass.range_constexpr(
-                                            _CONVERT_WARPGROUPS - 1
-                                        ):
-                                            cvt_producer.advance()
+                                    # Advance again for multiple warpgroups
+                                    for _ in cutlass.range_constexpr(
+                                        _CONVERT_WARPGROUPS - 1
+                                    ):
+                                        cvt_producer.advance()
 
-                                    if s >= prefetch_iters:
-                                        # Convert and scale V_(s-1) (stream item 2s, or the last)
-                                        item = 2 * s - cutlass.Int32(s == prefix_iters)
-                                        cute.arch.cp_async_wait_group(depth - 1)
-                                        cvt_load_nbar.arrive_and_wait()
-                                        refill = item + depth
-                                        if refill < num_items:
-                                            self._issue_fp8_ring_item(
-                                                k_address,
-                                                v_address,
-                                                staged_slots,
-                                                refill,
-                                                num_items,
-                                                convert_phase * mma_tile_k,
-                                                sKV_vector_address,
-                                                (refill % ring) * _CONVERT_WARPGROUPS
-                                                + convert_phase,
-                                                warpgroup_tidx,
-                                            )
-                                        else:
-                                            cute.arch.cp_async_commit_group()
-                                        v_smem_stage = (
-                                            item % ring
-                                        ) * _CONVERT_WARPGROUPS + convert_phase
+                                    # Convert and scale V_s
+                                    item = 2 * s + 1
+                                    cute.arch.cp_async_wait_group(depth - 1)
+                                    cvt_load_nbar.arrive_and_wait()
+                                    refill = item + depth
+                                    if refill < num_items:
+                                        self._issue_fp8_ring_item(
+                                            k_address,
+                                            v_address,
+                                            staged_slots,
+                                            refill,
+                                            convert_phase * mma_tile_k,
+                                            sKV_vector_address,
+                                            (refill % ring) * _CONVERT_WARPGROUPS
+                                            + convert_phase,
+                                            warpgroup_tidx,
+                                        )
+                                    else:
+                                        cute.arch.cp_async_commit_group()
+                                    v_smem_stage = (
+                                        item % ring
+                                    ) * _CONVERT_WARPGROUPS + convert_phase
 
+                                    cvt_handle = cvt_producer.acquire_and_advance()
+                                    for chunk in cutlass.range_constexpr(2):
                                         tVrV = cute.make_rmem_tensor(
-                                            tVrV_shape, kv_smem_dtype
+                                            (tVrV_shape[0], 1, 1), kv_smem_dtype
                                         )
                                         tVrV_cvt = cute.make_rmem_tensor(
-                                            tVrV_cvt_shape, mma_dtype
+                                            (tVrV_cvt_shape[0], 1, 1), mma_dtype
                                         )
-
                                         cute.copy(
                                             thr_load_v,
-                                            tVsV[cpy_dice + (v_smem_stage,)],
+                                            tVsV[None, chunk, None, None, v_smem_stage],
                                             tVrV,
                                         )
-                                        cute.arch.fence_view_async_shared()
-
-                                        tVrV_ssa = (
-                                            tVrV.load().to(cvt_type).to(mma_dtype)
+                                        convert_e4m3_bf16(
+                                            tVrV,
+                                            tVrV_cvt,
+                                            native=target_version(min_version="13.2"),
                                         )
-                                        tVrV_cvt.store(tVrV_ssa.reshape(tVrV_cvt_shape))
-
-                                        cvt_handle = cvt_producer.acquire_and_advance()
                                         cute.copy(
                                             thr_store_v,
                                             tVrV_cvt,
-                                            tVtV_cvt[cpy_dice + (cvt_handle.index,)],
+                                            tVtV_cvt[
+                                                None,
+                                                chunk,
+                                                None,
+                                                None,
+                                                cvt_handle.index,
+                                            ],
                                         )
-                                        cute.arch.fence_view_async_tmem_store()
-                                        cvt_handle.commit()
+                                    cute.arch.fence_view_async_tmem_store()
+                                    cvt_handle.commit()
 
-                                        # Advance again for multiple warpgroups
-                                        for _ in cutlass.range_constexpr(
-                                            _CONVERT_WARPGROUPS - 1
-                                        ):
-                                            cvt_producer.advance()
+                                    # Advance again for multiple warpgroups
+                                    for _ in cutlass.range_constexpr(
+                                        _CONVERT_WARPGROUPS - 1
+                                    ):
+                                        cvt_producer.advance()
                                 # Only empty groups can remain; retire them before the
                                 # epilogue reuses the KV stages.
                                 cute.arch.cp_async_wait_group(0)
                         else:
+                            # Alternating FP8 K/V needs only the buffer pipelines:
+                            # QK owns Q/K and S; PV owns V/P and corrected O. Their
+                            # releases retain each operand until its MMA completes.
+                            # BF16's lookahead stream retains its warp handshakes.
                             if warp_idx == self.mma_kq_warp_id:
                                 tBsQ_desc = thrblk_mma_kq.make_fragment_B(tBsQ)
                                 for dk in cutlass.range_constexpr(tiles_dk):
                                     q_consumer.wait_and_advance()
                                 s_token = True  # Producer always acquires first
                                 for s in cutlass.range(prefix_iters):
+                                    if cutlass.const_expr(
+                                        k_dtype is not cutlass.BFloat16
+                                    ):
+                                        if s > 0:
+                                            for _ in cutlass.range_constexpr(
+                                                tiles_dm * tiles_sk
+                                            ):
+                                                cvt_consumer.advance()
                                     k_token = cvt_consumer.try_wait()
                                     tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
                                     s_handle = s_producer.acquire_and_advance(s_token)
@@ -4178,11 +4239,14 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                         ):
                                             cute.arch.fence_view_async_shared()
                                         # Signal BMM2 to start
-                                        if is_last_iter:
-                                            if s & 1:
-                                                mma_kq_odd_nbar.arrive()
-                                            else:
-                                                mma_kq_even_nbar.arrive()
+                                        if cutlass.const_expr(
+                                            k_dtype is cutlass.BFloat16
+                                        ):
+                                            if is_last_iter:
+                                                if s & 1:
+                                                    mma_kq_odd_nbar.arrive()
+                                                else:
+                                                    mma_kq_even_nbar.arrive()
                                         for mma_k in cutlass.range_constexpr(
                                             cute.size(tAtK_cvt, mode=[2])
                                         ):
@@ -4213,43 +4277,62 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                 # wait for its first softmax reader to retire.
                                                 s_token = s_producer.try_acquire()
                                     if s > 0:
-                                        for _ in cutlass.range_constexpr(
-                                            tiles_dm * tiles_sk
+                                        if cutlass.const_expr(
+                                            k_dtype is cutlass.BFloat16
                                         ):
-                                            cvt_consumer.advance()
-                                        pipeline.NamedBarrier(
-                                            barrier_id=3 + 9 * ((s - 1) % 2),
-                                            num_threads=64,
-                                        ).arrive_and_wait()
+                                            for _ in cutlass.range_constexpr(
+                                                tiles_dm * tiles_sk
+                                            ):
+                                                cvt_consumer.advance()
+                                        if cutlass.const_expr(
+                                            k_dtype is cutlass.BFloat16
+                                        ):
+                                            pipeline.NamedBarrier(
+                                                barrier_id=3 + 9 * ((s - 1) % 2),
+                                                num_threads=64,
+                                            ).arrive_and_wait()
                                         s_token = s_producer.try_acquire()
                                 if cutlass.const_expr(
                                     self.query_rows_per_cta > 1 or self.reuse_work
                                 ):
                                     # The final PV tile also arrives on this named barrier.
                                     # Retire its matching QK arrival before the next query.
-                                    pipeline.NamedBarrier(
-                                        barrier_id=3 + 9 * ((prefix_iters - 1) % 2),
-                                        num_threads=64,
-                                    ).arrive_and_wait()
+                                    if cutlass.const_expr(k_dtype is cutlass.BFloat16):
+                                        pipeline.NamedBarrier(
+                                            barrier_id=3 + 9 * ((prefix_iters - 1) % 2),
+                                            num_threads=64,
+                                        ).arrive_and_wait()
                             else:
                                 if warp_idx == self.mma_vp_warp_id:
                                     tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
                                     tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
                                     for _ in cutlass.range_constexpr(tiles_dk):
                                         cvt_consumer.advance()
-                                    mma_kq_even_nbar.arrive_and_wait()
+                                    if cutlass.const_expr(k_dtype is cutlass.BFloat16):
+                                        mma_kq_even_nbar.arrive_and_wait()
                                     p_token = False
                                     o_token = True  # Producer always acquires first
                                     for s in cutlass.range(prefix_iters):
                                         # Advance and wait for BMM1
-                                        if s < prefix_iters - 1:
+                                        skip_key_tile = (
+                                            s < prefix_iters - 1
+                                            if cutlass.const_expr(
+                                                k_dtype is cutlass.BFloat16
+                                            )
+                                            else s > 0
+                                        )
+                                        if skip_key_tile:
                                             for _ in cutlass.range_constexpr(tiles_dk):
                                                 cvt_consumer.advance()
-                                            # V_s follows K_{s+1} in the shared K/V stream.
-                                            if (s + 1) & 1:
-                                                mma_kq_odd_nbar.arrive_and_wait()
-                                            else:
-                                                mma_kq_even_nbar.arrive_and_wait()
+                                            # BF16 prefetches K_(s+1) before V_s;
+                                            # FP8 alternates K_s and V_s.
+                                            if cutlass.const_expr(
+                                                k_dtype is cutlass.BFloat16
+                                            ):
+                                                if (s + 1) & 1:
+                                                    mma_kq_odd_nbar.arrive_and_wait()
+                                                else:
+                                                    mma_kq_even_nbar.arrive_and_wait()
                                             p_token = p_consumer.try_wait()
 
                                         # BMM2
@@ -4275,11 +4358,14 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                                 ):
                                                     cute.arch.fence_view_async_shared()
                                                 # Signal BMM1 to start
-                                                if is_last_iter:
-                                                    pipeline.NamedBarrier(
-                                                        barrier_id=3 + 9 * (s % 2),
-                                                        num_threads=64,
-                                                    ).arrive()
+                                                if cutlass.const_expr(
+                                                    k_dtype is cutlass.BFloat16
+                                                ):
+                                                    if is_last_iter:
+                                                        pipeline.NamedBarrier(
+                                                            barrier_id=3 + 9 * (s % 2),
+                                                            num_threads=64,
+                                                        ).arrive()
                                                 for mma_k in cutlass.range_constexpr(
                                                     cute.size(tAtV_cvt, mode=[2])
                                                 ):
@@ -5018,7 +5104,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     if cutlass.const_expr(self.original_heads_per_kv == 12):
                         if cutlass.const_expr(self.register_budget is not None):
                             cute.arch.setmaxregister_increase(self.register_budget[2])
-                self._sync_cluster_work()
+                # The local CTA join above is sufficient for unsplit FP8;
+                # only multiple CTAs need to publish their partials to peers.
+                if cutlass.const_expr(
+                    k_dtype is cutlass.BFloat16 or self.kv_splits > 1
+                ):
+                    self._sync_cluster_work()
                 cluster_splits = self.kv_splits
                 cta_rank = cute.arch.block_idx_in_cluster()
                 local_partial = cute.make_tensor(
@@ -5095,7 +5186,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     ):
                                         if cutlass.const_expr(
                                             q_dtype is cutlass.BFloat16
-                                            and k_dtype is cutlass.BFloat16
                                         ):
                                             query_values[part] = cutlass.Float32(
                                                 self._load_staged_query_bf16(
@@ -5432,7 +5522,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 else 0.0
                             )
                         self._sync_work_threads()
-                self._sync_cluster_work()
+                # Local readers have joined; split peers must also
+                # finish their DSM reads before the shared storage is reused.
+                if cutlass.const_expr(
+                    k_dtype is cutlass.BFloat16 or self.kv_splits > 1
+                ):
+                    self._sync_cluster_work()
                 if cutlass.const_expr(self.query_rows_per_cta > 1 or self.reuse_work):
                     if warp_idx == 0:
                         with cute.arch.elect_one():

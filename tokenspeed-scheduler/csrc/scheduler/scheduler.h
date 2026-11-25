@@ -20,11 +20,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -312,6 +314,14 @@ public:
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
+    // Whether a cache group defers its decode state to a request's end
+    // (CacheGroupConfig::deferred_decode_state). A finish only the host saw
+    // leaves that state incomplete, so the runtime ends such a request with
+    // forward::Abort, which publishes nothing.
+    bool DefersDecodeState() const {
+        return std::ranges::any_of(config_.cache_groups,
+                                   [](const CacheGroupConfig& group) { return group.deferred_decode_state; });
+    }
 
     std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
@@ -516,6 +526,27 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // (group, kernel page id) of State blocks whose deferred decode state
+    // (CacheGroupConfig::deferred_decode_state) the runtime has not committed.
+    using StateCommitPages = std::set<std::pair<std::uint32_t, std::int32_t>>;
+    // The live block (slot 1, which a decode step writes in place) of each of
+    // `request`'s deferred-decode-state groups once it has decoded: its
+    // accepted decode records stay in its request slot until the runtime
+    // folds them into that block. None before its first decode.
+    StateCommitPages liveDeferredStatePages(const Request& request) const;
+    // Lists each of `live_state` that `victim` still holds after its
+    // retraction's publication in `plan`'s state_folds. A block the
+    // publication swapped for another request's equal entry is left out: that
+    // entry already holds the complete state.
+    void planStateFolds(const Request& victim, const StateCommitPages& live_state, ExecutionPlan& plan) const;
+    // Withholds from peers each of `candidates` that a publication put into
+    // the Device index as `request`'s own block, until the commit of the plan
+    // being built is acknowledged. A duplicate the index kept from another
+    // request holds committed state and stays readable.
+    void withholdUncommittedState(const Request& request, std::int32_t state_slot, const StateCommitPages& candidates);
+    // Whether `page` of `group` is a published endpoint whose deferred decode
+    // state the runtime has not acknowledged committing yet.
+    bool awaitsStateCommit(std::uint32_t group, std::int32_t page) const;
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
     // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
     // request's prompt end dead, from the prompt and where the request
@@ -616,6 +647,7 @@ private:
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
+    void handleEvent(const cache::StateCommitDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
@@ -807,8 +839,9 @@ private:
     // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
-    // since its last admission (see forward.cpp).
-    void publishCompletedPrefix(Request& victim);
+    // since its last admission (see forward.cpp). `live_state` is the
+    // victim's liveDeferredStatePages, taken before the publication.
+    void publishCompletedPrefix(Request& victim, const StateCommitPages& live_state);
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
@@ -858,6 +891,14 @@ private:
     // always without max_consecutive_prefill_rounds; with it, only until a
     // run of back-to-back prefill rounds reaches the cap.
     bool prefillSuspensionAllowed() const;
+    // Whether enough candidates are ready to decode (PrefillDone or
+    // Decoding) for the interval to be owed this round: always without
+    // prefill_interval_min_decoding; with it, at least that many.
+    bool intervalDecodingThresholdMet(std::span<Request* const> candidates) const;
+    // Below the threshold, whether the round owes a decode round anyway:
+    // once the run of back-to-back prefill rounds holding a decode back has
+    // reached max_consecutive_prefill_rounds.
+    bool prefillRunCappedBelowThreshold() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
     // Admits the waiting prompts whose holder answered with more than their
@@ -912,6 +953,14 @@ private:
     std::uint64_t storage_pressure_bypasses_{0};
     bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
+    // Decoded endpoints of deferred-decode-state groups that a retraction
+    // published while peers can pin: gathered while a plan is built, then
+    // held under that plan's state_commit_fence until the runtime
+    // acknowledges the commit (cache::StateCommitDone). No PIN exports any of
+    // them (PeerPagesMatch).
+    StateCommitPages uncommitted_state_pages_;
+    std::map<std::uint32_t, StateCommitPages> state_commit_fences_;
+    std::uint32_t next_state_commit_fence_{0};
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.
