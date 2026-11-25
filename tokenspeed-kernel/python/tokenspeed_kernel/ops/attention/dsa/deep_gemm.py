@@ -794,37 +794,30 @@ if _HAS_DEEP_GEMM:
                 row_ends[start:end],
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
-            # The padded rows as one contiguous matrix: the scrub stays
-            # vectorized and the TRT-LLM top-k takes it without a copy. The
-            # padding columns hold stale allocation values, finite ones that
-            # nan_to_num_ keeps, and the TRT-LLM top-k reads whole padded
-            # rows for some launch shapes, so every column past a row's
-            # candidate count is masked out of the ranking below; otherwise
-            # a stale score can outrank a real boundary score and the
-            # selection changes with the launch shape.
+            # The padded rows as one contiguous matrix, which the TRT-LLM
+            # top-k takes without a copy. It ranks only each row's candidates
+            # (it takes the row lengths), so the padding columns, which hold
+            # stale allocation values, stay as they are and the scrub reads
+            # each row's candidates once.
             logits = _widen_logits_rows(logits)
-            logits.nan_to_num_(
-                nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
-            )
+            tile_lens = candidate_lens[start:end]
+            if batch_invariant:
+                logits.nan_to_num_(
+                    nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+                )
+            else:
+                scrub_nonfinite_logits(logits, tile_lens, next_n=1)
             mark_forced_initial_local_logits(
                 logits,
-                candidate_lens[start:end],
+                tile_lens,
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
-            tile_lens = candidate_lens[start:end]
             if batch_invariant:
                 tile_out = out[start:end]
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
             else:
-                col_ids = torch.arange(
-                    logits.shape[1], dtype=torch.int32, device=logits.device
-                )
-                logits.masked_fill_(
-                    col_ids.view(1, -1) >= tile_lens.to(torch.int32).view(-1, 1),
-                    float("-inf"),
-                )
                 indexer_topk_prefill(
                     logits,
                     local_starts_i32[start:end],
