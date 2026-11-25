@@ -664,6 +664,250 @@ def _muse_collective_policy_worker(rank, world_size, device):
         )
 
 
+def _muse_twoshot_boundary_worker(rank, world_size, device):
+    """The fused TP4 two-shot boundary (27-172 rows) equals the unfused path bit
+    for bit: reduce_outputs (the Lamport two-shot) and then the Triton boundary.
+
+    Checks the row window, eager calls over a mixed row-count sequence with the
+    plain two-shot interleaved on the shared state, graph replays with fresh
+    inputs and a delayed rank, and that startup's warmup compiles the only
+    binary every row count uses.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        ProducerAllReduce,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_twoshot_muse_attntail,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192, True)
+    # The two-shot's last row count, a multiple of the world size.
+    last = ProducerAllReduce.LAMPORT_TWO_SHOT_MAX_ELEMENTS // 8192
+    assert last % world_size == 0 and state.twoshot_boundary_max_rows == last
+    torch.manual_seed(215)
+    pre = torch.randn(8192, device=device).bfloat16()
+    post = torch.randn_like(pre)
+    beta = torch.sigmoid(torch.randn(8192, device=device))
+    alpha = torch.sqrt(1 - beta.square())
+    generator = torch.Generator(device=device).manual_seed(2150 + rank)
+
+    def admitted(rows, post_weight):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        stream = torch.empty((rows, 8192), device=device)
+        return state.can_all_reduce_symmetric_boundary(
+            branch, stream, post_weight, alpha, beta, pre
+        )
+
+    # The one-shot push keeps its rows; the two-shot fusion takes whole rows a
+    # rank up to the two-shot's last row, and no post-norm weight.
+    first = state.boundary_max_rows + 1
+    for rows, post_weight, expected in (
+        (first - 1, None, True),
+        (first, None, first % world_size == 0),
+        (first + 1, None, (first + 1) % world_size == 0),
+        (28, None, True),
+        (28, post, False),
+        (96, None, True),
+        (last - 2, None, False),
+        (last, None, True),
+        (last + world_size, None, False),
+    ):
+        assert admitted(rows, post_weight) == expected, (rows, post_weight)
+
+    def partial_rows(rows):
+        values = torch.randn(
+            (rows, 8192), device=device, generator=generator
+        ).bfloat16()
+        # Negative zero in every row: alone on this rank, and on every rank.
+        values[:, rank::97] = -0.0
+        values[:, ::89] = -0.0
+        return values
+
+    def fused(rows, stream):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        return state.all_reduce_symmetric_boundary(
+            branch, stream, None, alpha, beta, pre, 1e-6, 1.0, 1e-6, 1.0
+        )
+
+    def unfused(rows, stream):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        reduced = state.reduce_outputs((branch,))[0]
+        return _boundary_reference(stream, reduced, None, alpha, beta, pre)
+
+    def check_rows(rows, stream):
+        got = [t.clone() for t in fused(rows, stream)]
+        want = unfused(rows, stream)
+        for index, (a, b) in enumerate(zip(got, want)):
+            assert torch.equal(a, b), (rows, index, (a != b).sum().item())
+
+    state.warmup_symmetric_boundary(None, pre, 1e-6, 1.0, 1e-6, 1.0)
+    torch.cuda.synchronize()
+    dist.barrier()
+    # Startup's warmup compiled the one binary every row count takes.
+    with assert_no_triton_compile(iris_fused_lamport_twoshot_muse_attntail):
+        for rows in (28, last, 96, 32, 128, 160, 168, 104, 64, last, 28, 36):
+            state.all_reduce.acquire_outputs(((rows, 8192),))[0].copy_(
+                partial_rows(rows)
+            )
+            stream = torch.randn((rows, 8192), device=device)
+            dist.barrier()
+            check_rows(rows, stream)
+            # The plain two-shot on the shared state, next to the fusion.
+            plain = state.all_reduce.acquire_outputs(((rows, 4096),))[0]
+            plain.fill_(rank + 1)
+            torch.testing.assert_close(
+                state.reduce_outputs((plain,))[0],
+                torch.full_like(plain, world_size * (world_size + 1) // 2),
+                atol=0,
+                rtol=0,
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+    graphs = []
+    for rows in (28, 96, last):
+        stream = torch.randn((rows, 8192), device=device)
+        state.all_reduce.acquire_outputs(((rows, 8192),))[0].copy_(partial_rows(rows))
+        torch.cuda.synchronize()
+        dist.barrier()
+        fused_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(fused_graph):
+            fused_out = fused(rows, stream)
+        unfused_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(unfused_graph):
+            unfused_out = unfused(rows, stream)
+        graphs.append(
+            (rows, stream, fused_graph, fused_out, unfused_graph, unfused_out)
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+    for step in range(4):
+        for rows, stream, fused_graph, fused_out, unfused_graph, unfused_out in graphs:
+            state.all_reduce.acquire_outputs(((rows, 8192),))[0].copy_(
+                partial_rows(rows)
+            )
+            stream.copy_(torch.randn((rows, 8192), device=device))
+            torch.cuda.synchronize()
+            dist.barrier()
+            if rank == step % world_size:
+                torch.cuda._sleep(10000)
+            first, second = (
+                (fused_graph, unfused_graph)
+                if step % 2 == 0
+                else (unfused_graph, fused_graph)
+            )
+            first.replay()
+            second.replay()
+            torch.cuda.synchronize()
+            for index, (a, b) in enumerate(zip(fused_out, unfused_out)):
+                assert torch.equal(a, b), (step, rows, index, (a != b).sum().item())
+            dist.barrier()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def test_muse_twoshot_boundary_matches_unfused():
+    _skip_if_unsupported(4, "Muse fused two-shot boundary")
+    _spawn_and_collect(
+        _communication_worker,
+        (4, _get_open_port(), _muse_twoshot_boundary_worker, "nccl"),
+        4,
+    )
+
+
+def _twoshot_boundary_assembly() -> str:
+    """gfx950 assembly of the fused TP4 two-shot boundary on rank 1, at the
+    region size of the two-shot's capacity."""
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        ProducerAllReduce,
+        iris_arch_policy,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_twoshot_muse_attntail as fn,
+    )
+
+    local_rows = ProducerAllReduce.LAMPORT_TWO_SHOT_MAX_ELEMENTS // 8192 // 4
+
+    pointers = {
+        "input_ptr": "*bf16",
+        "region_sym_ptr": "*bf16",
+        "stream_ptr": "*fp32",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "pre_weight_ptr": "*bf16",
+        "out_stream_ptr": "*fp32",
+        "pre_fp32_ptr": "*fp32",
+        "pre_bf16_ptr": "*bf16",
+        "sender_epochs": "*i32",
+        "finisher_epochs": "*i32",
+        "regions": ("i64",) * 4,
+        "ROWS": "i32",
+    }
+    kernel = _compile_gfx950(
+        fn,
+        pointers,
+        {
+            "RANK": 1,
+            "WORLD_SIZE": 4,
+            "WIDTH": 8192,
+            "MAX_SHARD_ELEMENTS": local_rows * 8192,
+            "MAX_LOCAL_ROWS": local_rows,
+            "POST_EPS": 1e-8,
+            "PRE_EPS": 1e-5,
+            "PRE_WEIGHT_OFFSET": 1.0,
+            "ELEMENTS_PER_THREAD": 8192 // (64 * 16),
+            "NUM_WARPS": 16,
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=16,
+        unspecialized=("ROWS",),
+    )
+    return kernel.asm["amdgcn"]
+
+
+def test_twoshot_boundary_codegen():
+    """No scratch, and both roles' stage stores follow a workgroup barrier.
+
+    Sender and finisher each load their stage and store the next one; a wave
+    that loaded after the store would use the next stage's mailbox slot.
+    """
+    assembly = _twoshot_boundary_assembly()
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+    lines = assembly.splitlines()
+    stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
+    assert len(stores) == 2, "expected two global stores (the two roles' stages)"
+    for index in stores:
+        while index > 0 and not lines[index].startswith(".LBB"):
+            if "s_barrier" in lines[index]:
+                break
+            index -= 1
+        assert "s_barrier" in lines[index], "a stage store does not follow a barrier"
+
+
+def test_twoshot_boundary_polling_codegen():
+    """Every poll (the senders' reduce-scatter wait and the finishers' row
+    wait) rereads its system-cache words on each retry and branches on one
+    subgroup lane mask, with no workgroup exchange or barrier in the loop."""
+    # Polls: loops that read with system scope and store nothing.
+    polls = [
+        cycle
+        for cycle in polling_cycles(_twoshot_boundary_assembly())
+        if any("_load" in line and "sc0 sc1" in line for line in cycle)
+        and not any("_store" in line for line in cycle)
+    ]
+    # The finisher's row: one 16-byte system-scope read a lane per retry.
+    assert any(_batched_peer_reads(cycle, 1) for cycle in polls)
+    # The senders' reduce-scatter wait: every peer's word on each retry.
+    assert any(
+        sum("buffer_load_dword " in line and "sc0 sc1" in line for line in cycle) == 3
+        for cycle in polls
+    )
+    assert all(votes_with_subgroup_mask(cycle) for cycle in polls)
+
+
 def _muse_pull_warmup_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_pull_twoshot_allreduce,

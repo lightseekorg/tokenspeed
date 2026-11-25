@@ -2105,7 +2105,8 @@ class ProducerAllReduce:
             if buffer is not None
         )
 
-    def _lamport_two_shot_serves(self, numel: int) -> bool:
+    def lamport_two_shot_serves(self, numel: int) -> bool:
+        """Whether run reduces a numel-element payload with the Lamport two-shot."""
         return (
             self.lamport_two_shot_min_numel <= numel <= self.lamport_two_shot_max_numel
             and numel % (self.world_size * self.LAMPORT_TWO_SHOT_TILE) == 0
@@ -2185,7 +2186,7 @@ class ProducerAllReduce:
         # At TP4 the Lamport two-shot adds in the push's order, not the
         # producer pull's (local first), so an ordinary payload takes it only
         # inside the push window, where the bits are the push's.
-        two_shot = self._lamport_two_shot_serves(numel) and (
+        two_shot = self.lamport_two_shot_serves(numel) and (
             self.world_size != 4 or in_push_window
         )
         if two_shot or self._lamport_one_shot_serves(numel):
@@ -2209,7 +2210,7 @@ class ProducerAllReduce:
         assert 0 < numel <= self.pull.producer.data.numel()
         assert numel % (self.world_size * 8) == 0
         two_shot_tile = self.world_size * self.LAMPORT_TWO_SHOT_TILE
-        if self._lamport_two_shot_serves(numel):
+        if self.lamport_two_shot_serves(numel):
             iris_lamport_twoshot_bf16_allreduce[(numel // two_shot_tile,)](
                 input,
                 self.lamport_two_shot_region,
@@ -2617,19 +2618,21 @@ def iris_lamport_twoshot_ag_wait(
 
 
 @gluon.jit
-def iris_lamport_twoshot_clear(
+def iris_lamport_twoshot_clear_phase(
     region_sym_ptr,
     stage,
     offsets,
+    PHASE_INDEX: gl.constexpr,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     MAX_SHARD_ELEMENTS: gl.constexpr,
 ):
-    """Restore the empty markers in both phases' peer slots at offsets.
+    """Restore the empty markers in one phase's peer slots at offsets.
 
-    The caller consumed them in this stage; it orders the restores before
-    any stage advance (a workgroup barrier) and they reach memory before the
-    launch ends.
+    PHASE_INDEX is 0 for the reduce-scatter mailboxes and 1 for the
+    all-gather ones. The caller consumed them in this stage; it orders the
+    restores before any stage advance (a workgroup barrier) and they reach
+    memory before the launch ends.
     """
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
     slots = stage * (2 * PHASE)
@@ -2638,15 +2641,31 @@ def iris_lamport_twoshot_clear(
         .to(gl.uint16)
         .to(gl.bfloat16, bitcast=True)
     )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        source = (RANK + delta) % WORLD_SIZE
+        gl.amd.cdna4.buffer_store(
+            sentinel,
+            region_sym_ptr + slots + PHASE_INDEX * PHASE + source * MAX_SHARD_ELEMENTS,
+            offsets,
+            cache=".wt",
+        )
+
+
+@gluon.jit
+def iris_lamport_twoshot_clear(
+    region_sym_ptr,
+    stage,
+    offsets,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+):
+    """Restore the empty markers in both phases' peer slots at offsets
+    (iris_lamport_twoshot_clear_phase for each)."""
     for phase in gl.static_range(2):
-        for delta in gl.static_range(1, WORLD_SIZE):
-            source = (RANK + delta) % WORLD_SIZE
-            gl.amd.cdna4.buffer_store(
-                sentinel,
-                region_sym_ptr + slots + phase * PHASE + source * MAX_SHARD_ELEMENTS,
-                offsets,
-                cache=".wt",
-            )
+        iris_lamport_twoshot_clear_phase(
+            region_sym_ptr, stage, offsets, phase, RANK, WORLD_SIZE, MAX_SHARD_ELEMENTS
+        )
 
 
 @gluon.jit

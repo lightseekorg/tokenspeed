@@ -56,6 +56,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     iris_fused_lamport_allreduce_muse_attntail,
+    iris_fused_lamport_twoshot_muse_attntail,
     iris_fused_pull_allgather_muse_attntail,
     iris_fused_sliding_attention_twoshot_muse_attntail,
 )
@@ -230,7 +231,39 @@ class MuseIrisState:
         if MuseIrisState._attntail_supported(world_size, enable_lamport):
             for shape, dtype in MuseIrisState._attntail_buffers(world_size):
                 size += allocation_bytes(shape, dtype)
+        twoshot_rows = MuseIrisState._twoshot_boundary_max_rows(
+            max_numel, world_size=world_size, enable_lamport=enable_lamport
+        )
+        if twoshot_rows:
+            size += allocation_bytes(
+                MuseIrisState._twoshot_boundary_region_shape(twoshot_rows, world_size),
+                torch.bfloat16,
+            )
         return size
+
+    @staticmethod
+    def _twoshot_boundary_max_rows(
+        max_numel: int, *, world_size: int, enable_lamport: bool
+    ) -> int:
+        """Most rows the fused two-shot boundary serves (TP4 gfx950), or 0.
+
+        That is the Lamport two-shot's last whole-rows-a-rank count, if it is
+        past the one-shot boundary's rows.
+        """
+        if not (current_platform().is_cdna4 and world_size == 4 and enable_lamport):
+            return 0
+        two_shot = ProducerAllReduce.lamport_two_shot_capacity(
+            max_numel, world_size=world_size, enable_lamport=enable_lamport
+        )
+        rows = two_shot // _MUSE_BOUNDARY_WIDTH // world_size * world_size
+        return rows if rows > _MUSE_BOUNDARY_MAX_ROWS else 0
+
+    @staticmethod
+    def _twoshot_boundary_region_shape(
+        max_rows: int, world_size: int
+    ) -> tuple[int, int, int, int]:
+        """[stage][reduce-scatter, all-gather][source rank][shard], max_rows rows."""
+        return (3, 2, world_size, max_rows // world_size * _MUSE_BOUNDARY_WIDTH)
 
     @staticmethod
     def _int8_payload_buffers(
@@ -540,6 +573,43 @@ class MuseIrisState:
             # Split arrival counters, reset by each row block's merging split.
             self.attntail_counters = torch.zeros(
                 _MUSE_ATTNTAIL_MAX_ROWS // 8 * 2, dtype=torch.int32, device=peers.device
+            )
+        # The fused two-shot boundary (all_reduce_symmetric_boundary past the
+        # one-shot's rows): its own mailbox region, so the plain two-shot's
+        # region and stage counters stay untouched, one stage word per sender
+        # program and one per (owner, row slot) finisher. Its senders cover
+        # 2048 elements each, so they cannot share the plain two-shot's
+        # per-128-element stage words.
+        self.twoshot_boundary_max_rows = self._twoshot_boundary_max_rows(
+            capacity, world_size=self.world_size, enable_lamport=enable_lamport
+        )
+        self.twoshot_boundary_region: torch.Tensor | None = None
+        self.twoshot_boundary_peers: tuple[int, ...] | None = None
+        self.twoshot_boundary_sender_epochs: torch.Tensor | None = None
+        self.twoshot_boundary_finisher_epochs: torch.Tensor | None = None
+        if self.twoshot_boundary_max_rows:
+            self.twoshot_boundary_region = peers.ctx.empty(
+                self._twoshot_boundary_region_shape(
+                    self.twoshot_boundary_max_rows, self.world_size
+                ),
+                dtype=torch.bfloat16,
+            )
+            # Empty two-shot words: low half +0, high half -0 (0x80000000),
+            # iris_lamport_twoshot_clear's marker.
+            self.twoshot_boundary_region.view(torch.int32).fill_(-(2**31))
+            base = peers.addresses[peers.rank]
+            self.twoshot_boundary_peers = tuple(
+                address + self.twoshot_boundary_region.data_ptr() - base
+                for address in peers.addresses[: self.world_size]
+            )
+            self.twoshot_boundary_sender_epochs = torch.zeros(
+                self.twoshot_boundary_max_rows, dtype=torch.int32, device=peers.device
+            )
+            # [owner][row slot], row slot < max rows / world size.
+            self.twoshot_boundary_finisher_epochs = torch.zeros(
+                self.world_size * (self.twoshot_boundary_max_rows // self.world_size),
+                dtype=torch.int32,
+                device=peers.device,
             )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1388,6 +1458,23 @@ class MuseIrisState:
         )
         return result, output_ids, output_weights
 
+    def _twoshot_boundary_serves(self, rows: int) -> bool:
+        """Whether the fused two-shot boundary takes rows.
+
+        Only past the one-shot boundary's rows, and only where the unfused
+        path reduces with the Lamport two-shot, whose sum order it keeps. The
+        rows must split into whole rows a rank: a finisher reads its row from
+        one shard's all-gather slot, and with rows % world_size != 0 a row
+        straddles two shards. Decode and verify rows (8 a request) always
+        split; other counts fall back to the two-shot and the separate
+        boundary kernel, with the same bits.
+        """
+        return (
+            self.boundary_max_rows < rows <= self.twoshot_boundary_max_rows
+            and rows % self.world_size == 0
+            and self.reduction.lamport_two_shot_serves(rows * _MUSE_BOUNDARY_WIDTH)
+        )
+
     def can_all_reduce_symmetric_boundary(
         self,
         branch: torch.Tensor,
@@ -1397,7 +1484,11 @@ class MuseIrisState:
         beta: torch.Tensor,
         pre_weight: torch.Tensor,
     ) -> bool:
-        """Check the measured small push or large row-scatter boundary policy."""
+        """Whether a fused all-reduce + boundary serves these rows.
+
+        Each fused kernel reduces in the order of the all-reduce it replaces at
+        that row count, so the fused result is the unfused one.
+        """
         max_rows = (
             min(self.boundary_max_rows, _MUSE_WEIGHTED_BOUNDARY_MAX_ROWS)
             if post_weight is not None
@@ -1407,6 +1498,10 @@ class MuseIrisState:
             branch.ndim != 2
             or not (
                 0 < branch.shape[0] <= max_rows
+                or (
+                    post_weight is None
+                    and self._twoshot_boundary_serves(branch.shape[0])
+                )
                 or (
                     self.row_boundary_supported
                     and post_weight is None
@@ -1520,6 +1615,28 @@ class MuseIrisState:
         out_stream = torch.empty_like(stream)
         pre_fp32 = torch.empty_like(stream)
         pre_bf16 = torch.empty_like(branch)
+        if post_weight is None and self._twoshot_boundary_serves(rows):
+            self._launch_twoshot_boundary(
+                branch,
+                stream,
+                alpha,
+                beta,
+                pre_weight,
+                out_stream,
+                pre_fp32,
+                pre_bf16,
+                post_eps,
+                pre_eps,
+                pre_weight_offset,
+                rows=rows,
+                compile_only=False,
+            )
+            return out_stream, pre_fp32, pre_bf16
+        if rows > self.boundary_max_rows:
+            raise ValueError(
+                f"no fused boundary serves {rows} rows "
+                f"(post-norm weight: {post_weight is not None})"
+            )
         self._launch_lamport_boundary(
             branch,
             stream,
@@ -1548,13 +1665,15 @@ class MuseIrisState:
         pre_eps: float,
         pre_weight_offset: float,
     ) -> None:
-        """Compile the small-boundary Lamport push for each peer order without
-        running it.
+        """Compile the small-boundary Lamport push for each peer order, and the
+        fused two-shot boundary, without running them.
 
         Rows pick the peer order at launch (staggered from
         ``_MUSE_BOUNDARY_ROTATE_MIN_ROWS`` rows), and startup's warmup and
         capture may reach only one side, so the first batch on the other side
-        would compile it while peers wait in the exchange.
+        would compile it while peers wait in the exchange. The two-shot
+        boundary has one binary for all of its rows, which capture may not
+        reach either.
         """
         if (
             not self.boundary_max_rows
@@ -1563,6 +1682,28 @@ class MuseIrisState:
         ):
             return
         device = self.all_reduce.device
+        if self.twoshot_boundary_max_rows and post_weight is None:
+            rows = self.twoshot_boundary_max_rows
+            branch = self.all_reduce.acquire_outputs(((rows, _MUSE_BOUNDARY_WIDTH),))[0]
+            stream = torch.empty(branch.shape, dtype=torch.float32, device=device)
+            alpha = torch.empty(
+                (_MUSE_BOUNDARY_WIDTH,), dtype=torch.float32, device=device
+            )
+            self._launch_twoshot_boundary(
+                branch,
+                stream,
+                alpha,
+                torch.empty_like(alpha),
+                pre_weight,
+                torch.empty_like(stream),
+                torch.empty_like(stream),
+                torch.empty_like(branch),
+                post_eps,
+                pre_eps,
+                pre_weight_offset,
+                rows=rows,
+                compile_only=True,
+            )
         # The serving branch is the producer output view; its storage is part
         # of the specialization, so warm with the same view.
         branch = self.all_reduce.acquire_outputs(((1, _MUSE_BOUNDARY_WIDTH),))[0]
@@ -1649,6 +1790,71 @@ class MuseIrisState:
             kernel.warmup(*args, grid=(1,), **options)
         else:
             kernel[(branch.shape[0], _MUSE_BOUNDARY_SENDERS + 1)](*args, **options)
+
+    def _launch_twoshot_boundary(
+        self,
+        branch: torch.Tensor,
+        stream: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor,
+        out_stream: torch.Tensor,
+        pre_fp32: torch.Tensor,
+        pre_bf16: torch.Tensor,
+        post_eps: float,
+        pre_eps: float,
+        pre_weight_offset: float,
+        *,
+        rows: int,
+        compile_only: bool,
+    ) -> None:
+        """Launch iris_fused_lamport_twoshot_muse_attntail on rows producer rows.
+
+        ``branch`` is the producer view, so the kernel reads the same input as
+        the unfused two-shot (``reduce_outputs``) would.
+        """
+        if self.twoshot_boundary_region is None:
+            raise RuntimeError("the fused two-shot boundary is not prepared")
+        if not 0 < rows <= self.twoshot_boundary_max_rows or rows % self.world_size:
+            raise ValueError(f"the fused two-shot boundary cannot serve {rows} rows")
+        if branch.data_ptr() != self.all_reduce.producer.data.data_ptr():
+            raise ValueError("the fused two-shot boundary reads the producer view")
+        kernel = iris_fused_lamport_twoshot_muse_attntail
+        args = (
+            branch,
+            self.twoshot_boundary_region,
+            stream,
+            alpha,
+            beta,
+            pre_weight,
+            out_stream,
+            pre_fp32,
+            pre_bf16,
+            self.twoshot_boundary_sender_epochs,
+            self.twoshot_boundary_finisher_epochs,
+            self.twoshot_boundary_peers,
+            rows,
+        )
+        options = dict(
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=self.world_size,
+            WIDTH=_MUSE_BOUNDARY_WIDTH,
+            MAX_SHARD_ELEMENTS=self.twoshot_boundary_region.shape[-1],
+            MAX_LOCAL_ROWS=self.twoshot_boundary_max_rows // self.world_size,
+            POST_EPS=post_eps,
+            PRE_EPS=pre_eps,
+            PRE_WEIGHT_OFFSET=pre_weight_offset,
+            # One 16-wave program normalizes a whole row in the Triton
+            # boundary's reduce layout (16 warps), which keeps the norms' bits.
+            ELEMENTS_PER_THREAD=_MUSE_BOUNDARY_WIDTH // (64 * 16),
+            NUM_WARPS=16,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            num_warps=16,
+        )
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(2 * rows,)](*args, **options)
 
     def _sliding_attention_config(
         self,
