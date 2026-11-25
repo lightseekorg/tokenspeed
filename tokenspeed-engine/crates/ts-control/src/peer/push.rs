@@ -545,12 +545,24 @@ impl Holder {
                     };
                     let started = Instant::now();
                     let deadline = queued.arrived + queued.budget;
-                    let ok = state.run(
-                        &queued.session,
-                        deadline,
-                        &queued.items,
-                        &queued.guard.running,
-                    );
+                    let ok = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.run(
+                            &queued.session,
+                            deadline,
+                            &queued.items,
+                            &queued.guard.running,
+                        )
+                    })) {
+                        Ok(ok) => ok,
+                        Err(_) => {
+                            tracing::error!(
+                                job = queued.guard.key.job,
+                                worker = index,
+                                "peer push worker caught panic; failing job without retiring worker"
+                            );
+                            false
+                        }
+                    };
                     queued.guard.ok = ok;
                     tracing::debug!(
                         job = queued.guard.key.job,
@@ -1537,5 +1549,144 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert_eq!(slots.free_count(), 1);
+    }
+
+    #[test]
+    fn worker_survives_writer_panic_leaks_slot_and_serves_next_push() {
+        use std::{path::PathBuf, sync::atomic::AtomicUsize};
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        // One more slot than MAX_PUSH_WORKERS so panicking MAX_PUSH_WORKERS
+        // times proves both that every panicked job leaks its slot and that
+        // workers survive rather than exhausting the pool.
+        const TOTAL_SLOTS: usize = MAX_PUSH_WORKERS + 1;
+
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-panic-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (2 * BLOCK) as u64).unwrap();
+        let ring = Arc::new(Memory::map(TOTAL_SLOTS * BLOCK).unwrap());
+        let mut seed_mem = Memory::map(BLOCK).unwrap();
+        seed_mem.write_at(0, &[0xAB; BLOCK]);
+
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[
+                    (ring.address(), ring.size()),
+                    (seed_mem.address(), seed_mem.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = mpsc::channel();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: 0,
+                        address: seed_mem.address(),
+                        len: BLOCK,
+                    }],
+                },
+                move |r| {
+                    let _ = tx.send(r.outcome);
+                },
+            )
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        struct PanicNWriter {
+            remaining_panics: AtomicUsize,
+            ok_writes: AtomicUsize,
+        }
+        impl PageWriter for PanicNWriter {
+            fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
+                if self
+                    .remaining_panics
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    panic!("simulated writer panic");
+                }
+                self.ok_writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let writer = Arc::new(PanicNWriter {
+            remaining_panics: AtomicUsize::new(MAX_PUSH_WORKERS),
+            ok_writes: AtomicUsize::new(0),
+        });
+        let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 11).unwrap();
+        holder
+            .serve(PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: writer.clone(),
+                ring,
+                slot_bytes: BLOCK,
+            })
+            .unwrap();
+        let reader = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 12).unwrap();
+        let one = vec![PushItem {
+            group: 0,
+            block: 1,
+            spans: vec![PushSpan {
+                offset: 0,
+                address: 100_000,
+                length: BLOCK as u64,
+            }],
+        }];
+
+        for i in 0..MAX_PUSH_WORKERS {
+            assert!(reader
+                .push(
+                    holder.name(),
+                    &format!("p{i}"),
+                    Duration::from_secs(5),
+                    one.clone()
+                )
+                .is_err());
+        }
+        assert_eq!(holder.push_ring_slot_counts(), Some((1, TOTAL_SLOTS)));
+        assert_eq!(
+            reader.push(holder.name(), "survivor", Duration::from_secs(5), one),
+            Ok(())
+        );
+        assert_eq!(writer.ok_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(holder.push_ring_slot_counts(), Some((1, TOTAL_SLOTS)));
     }
 }

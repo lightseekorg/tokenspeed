@@ -248,10 +248,21 @@ struct FrontendState {
     finished: StdMutex<Vec<String>>,
     replies: StdMutex<Vec<ControlOutput>>,
     receive_hook: PauseHook,
+    receive_count: AtomicUsize,
 }
 impl FrontendState {
     fn push(&self, req: EngineRequest) {
         self.inbox.lock().unwrap().push_back(req);
+    }
+    fn wait_receive_gt(&self, prev: usize) {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            if self.receive_count.load(Ordering::SeqCst) > prev {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for frontend receive count > {prev}");
     }
     fn wait_finished(&self, rid: &str) {
         let t = Instant::now();
@@ -283,6 +294,7 @@ struct ChannelFrontend {
 impl Frontend for ChannelFrontend {
     fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
         self.state.receive_hook.pause_if_armed();
+        self.state.receive_count.fetch_add(1, Ordering::SeqCst);
         let mut items: Vec<_> = self.state.inbox.lock().unwrap().drain(..).collect();
         if items.is_empty() {
             if let Some(w) = wait {
@@ -1224,10 +1236,13 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
     // 5. While rank 0 is paused inside the copy-only execute, arm dp1's
     //    receive_hook so rank 0 enters gate() on the next round with
     //    in_flight.is_empty() == true and copies_confirmed_at == Some(...).
-    //    gate() must keep self.scheduler locked.
+    //    Wait for rank 0's receive_count to advance so we know it exited the
+    //    copy-only round and entered the next round's gate().
+    let r0_rounds = fe0.receive_count.load(Ordering::SeqCst);
     fe1.receive_hook.arm();
     h0.execute.release();
     fe1.receive_hook.wait_entered();
+    fe0.wait_receive_gt(r0_rounds);
     thread::sleep(Duration::from_millis(15));
     send_lookup(201, &a_prompts[4]);
     assert!(
@@ -1256,10 +1271,12 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         rx.recv_timeout(Duration::from_millis(80)).is_err(),
         "idle_forward must keep scheduler locked while copies_confirmed_at is pending"
     );
+    let r0_rounds = fe0.receive_count.load(Ordering::SeqCst);
     fe1.receive_hook.arm();
     h0.execute.release();
     assert_eq!(recv_answer().0, 8);
     fe1.receive_hook.wait_entered();
+    fe0.wait_receive_gt(r0_rounds);
     thread::sleep(Duration::from_millis(15));
     send_lookup(202, &a_prompts[4]);
     assert!(
@@ -1284,9 +1301,11 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         2,
     ));
     h1.execute.wait_entered();
+    let r0_rounds = fe0.receive_count.load(Ordering::SeqCst);
     fe1.receive_hook.arm();
     h1.execute.release();
     fe1.receive_hook.wait_entered();
+    fe0.wait_receive_gt(r0_rounds);
     thread::sleep(Duration::from_millis(15));
     let post_lease = pin_prompt(204, &r_page0_prompt);
     release_lease(post_lease);
