@@ -69,26 +69,47 @@ execution permit, and `decode_process` / `tpot` start after it.
 
 ## Response timing metadata
 
-The native output wire also returns `rollout_perf` once, on a request's terminal
-output. This is response metadata, independent of trace sampling, metrics and
-request logging; it adds no log records. Intermediate outputs omit the column.
-Older wire producers decode with no timing metadata.
+The native output wire returns a typed `request_timing` record once, on a
+request's terminal output. Each record covers one local engine request; PD
+prefill and decode report separate lifetimes. It is independent of trace
+sampling, metrics and request logging and adds no log records. Intermediate
+outputs carry no timing record. Older wire producers decode with no timing.
 
-The output processor records acceptance at registration. For disaggregated
-decode, the transfer peer captures readiness after both KV and the bootstrap
-token have arrived and before publishing its completion event. For ordinary
-execution, readiness is the first completed prefill output. The recorded
-`kv_output_tokens` is the actual committed output count at that boundary;
-consumers must not assume one token. Retraction does not replace the first
-readiness boundary. Missing boundaries, including failed transfers, stay null.
+`RequestTiming` is a map on the wire and in native Python chunk dictionaries.
+The Rust client exposes the typed record; the Python wire schema and
+`WireDriver.Completion` use the corresponding `msgspec` types. The existing
+output fields remain the source of the request id, completion token count and
+finish reason.
 
-The existing processor-release completion point supplies the terminal timestamp
-and the existing `e2e_latency_s` definition: completion minus the frontend's
-`created_time`, clamped as in the native finish log. It is not acceptance-to-finish
-time. Rejected requests that never registered have no acceptance timestamp.
+| Field | Meaning |
+| --- | --- |
+| `role`, `dp_rank`, `tp_rank` | Local engine role and host-configured DP/attention-TP ranks; unknown ranks are null. |
+| `clock` | Shared `host_id`, `process_instance_id`, `clock_sync` and `clock_uncertainty_ns` for every boundary in this record. |
+| `events.accepted` | Output-processor registration; null for requests rejected before registration. |
+| `events.kv_ready` | First completed plain prefill output, or decode's agreed KV/bootstrap readiness; null on the prefill role or if readiness was never observed. |
+| `events.finished` | Local output-processor completion, before transport and physical resource retirement. |
+| `kv_output_tokens` | Committed output count at first readiness, or null without that boundary. |
+| `e2e_latency_s` | Native backend latency: `max(finished_unix_seconds - created_time, 0)`, or null when the frontend supplied no positive `created_time`. |
 
-Timestamps carry nanosecond decimal strings, a process identity, sequence and
-host identity. Monotonic values are comparable only within their process;
-wall-clock synchronization is unknown unless independently established. DP and
-attention-TP identities come from the host configuration. Metadata contains no
-prompt text, generated text, token arrays or credentials.
+Every boundary holds `ts_unix_ns` and `ts_mono_ns` as nanosecond decimal
+strings. The monotonic value is null if the observation predates the process
+clock origin. Subtract monotonic values only within the same process instance.
+Wall-clock synchronization is `unknown` and its uncertainty is null unless
+independently established; in particular, frontend `created_time` and engine
+completion can use different hosts' clocks.
+
+The transfer peer captures decode readiness after KV and the bootstrap token
+have arrived and replica agreement completes, before publishing its completion
+event. Retraction and later prefill commits preserve the first readiness
+boundary and its token count. `complete_response` samples completion once,
+constructs the terminal timing record and passes that same completion time to
+the finish logger. Logging never constructs or mutates the response.
+Cancellation paths without a terminal response return no timing record.
+
+Consumers can derive backend proxy TTFT as readiness minus registration and
+decode-path duration as completion minus readiness. Proxy TPOT divides that
+duration by the containing output's `completion_tokens - kv_output_tokens`,
+only when the denominator is positive and the required clocks/boundaries are
+available. Missing measurements remain unavailable. These are backend proxies;
+client receipt, GPU execution time and the existing native first-local-output
+TTFT/TPOT use different boundaries.

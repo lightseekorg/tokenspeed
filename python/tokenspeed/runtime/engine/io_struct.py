@@ -40,6 +40,7 @@ import msgspec
 import numpy as np
 import torch
 
+from tokenspeed.runtime.engine.request_timing import RequestTiming
 from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -229,7 +230,7 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_resident_tokens: int | None = None
     num_waiting_uncached_tokens: int | None = None
     # Request timing metadata: only terminal rows carry a map. Older producers omit it.
-    rollout_perf: list[dict | None] = []
+    request_timing: list[RequestTiming | None] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

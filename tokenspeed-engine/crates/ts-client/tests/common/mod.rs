@@ -391,7 +391,7 @@ fn step(
         output_top_logprobs_val: vec![],
         output_top_logprobs_idx: vec![],
         reasoning_tokens: vec![k * 10],
-        rollout_perf: vec![],
+        request_timing: vec![],
     }))
     .to_frames()
 }

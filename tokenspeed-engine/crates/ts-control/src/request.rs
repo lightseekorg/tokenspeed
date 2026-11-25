@@ -344,7 +344,7 @@ pub struct RequestState {
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
     /// Boundaries returned once on the final response; independent of logging.
-    pub(crate) rollout_perf: crate::rollout_perf::RequestPerf,
+    pub(crate) request_timing: crate::request_timing::RequestTimingState,
     /// Sampled PD timings, consumed at the first output or terminal release.
     pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
@@ -427,7 +427,7 @@ impl RequestState {
             first_token_time: 0.0,
             stream_output_timing: None,
             timings: None,
-            rollout_perf: crate::rollout_perf::RequestPerf::default(),
+            request_timing: crate::request_timing::RequestTimingState::default(),
             ttft: None,
             grammar: None,
             admission: 0,

@@ -378,7 +378,7 @@ pub fn output_batch(
     let n = outputs.len();
     let mut batch = BatchTokenIDOutSlim {
         rids: Some(Vec::with_capacity(n)),
-        rollout_perf: Vec::with_capacity(n),
+        request_timing: Vec::with_capacity(n),
         output_ids: Vec::with_capacity(n),
         finished_reasons: Vec::with_capacity(n),
         prompt_tokens: Vec::with_capacity(n),
@@ -407,7 +407,7 @@ pub fn output_batch(
         output_top_logprobs_idx: Vec::with_capacity(n),
     };
     for output in outputs {
-        batch.rollout_perf.push(output.rollout_perf);
+        batch.request_timing.push(output.request_timing);
         batch.rids.as_mut().expect("set above").push(output.rid);
         // The logprob ids are the tokens the logprobs belong to.
         let logprob_ids = if output.output_logprobs.is_empty() {
@@ -453,8 +453,8 @@ pub fn output_batch(
             column.clear();
         }
     }
-    if batch.rollout_perf.iter().all(Option::is_none) {
-        batch.rollout_perf.clear();
+    if batch.request_timing.iter().all(Option::is_none) {
+        batch.request_timing.clear();
     }
     frame_column(&mut batch.input_token_logprobs_val);
     frame_column(&mut batch.input_token_logprobs_idx);
@@ -812,7 +812,7 @@ mod tests {
         let (mut transport, _requests, mut outputs) = transport(2);
         let output = StreamedOutput {
             rid: "r0".to_owned(),
-            rollout_perf: None,
+            request_timing: None,
             output_ids: vec![7, 8],
             finish_reason: None,
             prompt_tokens: 4,
