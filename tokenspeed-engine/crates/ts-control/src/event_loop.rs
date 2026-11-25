@@ -3278,6 +3278,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             done.bootstrap_token,
                             done.cached_tokens,
                             done.bootstrap_logprob,
+                            done.kv_ready_at,
                         );
                     }
                     absorb(

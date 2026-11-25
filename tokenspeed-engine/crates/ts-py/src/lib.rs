@@ -463,6 +463,13 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
             })
             .transpose()?,
     )?;
+    dict.set_item(
+        "request_timing",
+        chunk
+            .request_timing
+            .map(|timing| request_timing_dict(py, timing))
+            .transpose()?,
+    )?;
     dict.set_item("prompt_tokens", chunk.prompt_tokens)?;
     dict.set_item("completion_tokens", chunk.completion_tokens)?;
     dict.set_item("cached_tokens", chunk.cached_tokens)?;
@@ -477,6 +484,51 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
     dict.set_item("input_token_logprobs", chunk.input_token_logprobs)?;
     dict.set_item("input_top_logprobs", chunk.input_top_logprobs)?;
     dict.set_item("output_top_logprobs", chunk.output_top_logprobs)?;
+    Ok(dict)
+}
+
+fn request_timing_dict(
+    py: Python<'_>,
+    timing: ts_wire::RequestTiming,
+) -> PyResult<Bound<'_, PyDict>> {
+    fn timestamp(py: Python<'_>, stamp: ts_wire::RequestTimestamp) -> PyResult<Bound<'_, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("ts_unix_ns", stamp.ts_unix_ns)?;
+        dict.set_item("ts_mono_ns", stamp.ts_mono_ns)?;
+        Ok(dict)
+    }
+
+    let clock = PyDict::new(py);
+    clock.set_item("host_id", timing.clock.host_id)?;
+    clock.set_item("process_instance_id", timing.clock.process_instance_id)?;
+    clock.set_item("clock_sync", timing.clock.clock_sync)?;
+    clock.set_item("clock_uncertainty_ns", timing.clock.clock_uncertainty_ns)?;
+    let events = PyDict::new(py);
+    events.set_item(
+        "accepted",
+        timing
+            .events
+            .accepted
+            .map(|stamp| timestamp(py, stamp))
+            .transpose()?,
+    )?;
+    events.set_item(
+        "kv_ready",
+        timing
+            .events
+            .kv_ready
+            .map(|stamp| timestamp(py, stamp))
+            .transpose()?,
+    )?;
+    events.set_item("finished", timestamp(py, timing.events.finished)?)?;
+    let dict = PyDict::new(py);
+    dict.set_item("role", timing.role)?;
+    dict.set_item("dp_rank", timing.dp_rank)?;
+    dict.set_item("tp_rank", timing.tp_rank)?;
+    dict.set_item("clock", clock)?;
+    dict.set_item("events", events)?;
+    dict.set_item("kv_output_tokens", timing.kv_output_tokens)?;
+    dict.set_item("e2e_latency_s", timing.e2e_latency_s)?;
     Ok(dict)
 }
 

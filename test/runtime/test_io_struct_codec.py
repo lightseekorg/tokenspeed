@@ -250,7 +250,11 @@ def test_small_tensor_is_inlined_as_raw_view_ext():
 
     # The tensor slot is (dtype, shape, Ext(CUSTOM_TYPE_RAW_VIEW, bytes)).
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    mm = raw[-3]  # multimodal_inputs (then validation_error, data_parallel_rank)
+    # The message tag precedes the declared fields; optional tail fields may grow.
+    mm_index = (
+        TokenizedGenerateReqInput.__struct_fields__.index("multimodal_inputs") + 1
+    )
+    mm = raw[mm_index]
     feature_slot = mm[0][0][4]
     dtype, shape, data = feature_slot
     assert dtype == "float32"
@@ -266,7 +270,10 @@ def test_large_tensor_rides_out_of_band_aux_frame():
     assert len(frames) == 2  # primary + one aux frame for the 2 KiB tensor
 
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    dtype, shape, data = raw[-3][0][0][4]
+    mm_index = (
+        TokenizedGenerateReqInput.__struct_fields__.index("multimodal_inputs") + 1
+    )
+    dtype, shape, data = raw[mm_index][0][0][4]
     assert dtype == "bfloat16"
     assert shape == [4, 256]
     assert data == 1  # one-based aux frame index (frame 0 = primary buffer)
