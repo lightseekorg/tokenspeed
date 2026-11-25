@@ -3091,6 +3091,9 @@ class _Profile:
     # 1024 rows, up to what keeps its symmetric heap below 32-bit offsets.
     # Every other world size keeps the default.
     raised_capacity_world_sizes: frozenset[int] = frozenset()
+    # The target profile a draft profile is served with: one server's target
+    # and draft share the smaller of their capacities. None for a target.
+    served_with: str | None = None
 
 
 _GPT_OSS_120B_PROFILE = _Profile(
@@ -3146,6 +3149,7 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     activation="silu_clamped",
     world_sizes=frozenset({4, 8}),
     raised_capacity_world_sizes=frozenset({4, 8}),
+    served_with="dsv41_flash",
 )
 _MUSE_SPARK_PROFILE = _Profile(
     name="muse_spark",
@@ -3156,6 +3160,7 @@ _MUSE_SPARK_PROFILE = _Profile(
     inter_dim=4096,
     has_bias=False,
     activation="silu",
+    raised_capacity_world_sizes=frozenset({8}),
 )
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
@@ -3253,22 +3258,27 @@ def _profile_largest_max_tokens_per_rank(profile: _Profile, world_size: int) -> 
 def gluon_petit_largest_max_tokens_per_rank(world_size: int) -> int:
     """Return the largest per-rank token capacity Petit admits at ``world_size``.
 
-    The minimum, over the profiles whose capacity rises at ``world_size``
-    (``_Profile.raised_capacity_world_sizes``: the DSv4.1 Flash target and
-    DSpark draft at EP4 and EP8), of the largest 32-row multiple whose
-    symmetric heap stays below 32-bit offsets: 7808 rows at EP4 and 2624 at
-    EP8, both set by the DSv4.1 Flash target. A world size at which no profile
+    The server checks its prefill chunk against this before the model is
+    known. Profiles one server runs together (``_Profile.served_with``: the
+    DSv4.1 Flash target and its DSpark draft) admit the smaller of their
+    limits; the result is the largest such limit over the profiles whose
+    capacity rises at ``world_size`` (``_Profile.raised_capacity_world_sizes``):
+    7808 rows at EP4 and 2624 at EP8, both set by the DSv4.1 Flash target
+    (Muse Spark's 2368 at EP8 is smaller). A world size at which no profile
     raises (and any world size Petit does not serve, which MoELayer refuses)
-    keeps the default 1024 rows; so do the other profiles at EP8, which
-    ``gluon_petit_max_tokens_per_rank`` enforces when given the profile.
+    keeps the default 1024 rows. A model whose own limit is lower (Muse Spark
+    above 2368 rows at EP8, or a profile that keeps the default) is refused
+    when its workspace is built (``gluon_petit_max_tokens_per_rank`` with the
+    profile).
     """
     world_size = int(world_size)
-    largest = [
-        _profile_largest_max_tokens_per_rank(profile, world_size)
-        for profile in _PROFILES
-        if _raises_capacity(profile, world_size)
-    ]
-    return min(largest) if largest else _MAX_TOKENS_PER_RANK
+    served: dict[str, int] = {}
+    for profile in _PROFILES:
+        if _raises_capacity(profile, world_size):
+            group = profile.served_with or profile.name
+            largest = _profile_largest_max_tokens_per_rank(profile, world_size)
+            served[group] = min(served.get(group, largest), largest)
+    return max(served.values(), default=_MAX_TOKENS_PER_RANK)
 
 
 def gluon_petit_max_tokens_per_rank(

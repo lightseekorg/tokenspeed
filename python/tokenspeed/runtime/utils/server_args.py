@@ -3074,8 +3074,10 @@ class ServerArgs:
             # Petit's buffers are sized for the largest per-rank batch; above
             # 1024 rows its heap grows up to the 32-bit offset limit for the
             # profiles that list this world size in
-            # _Profile.raised_capacity_world_sizes; the others keep 1024 rows,
-            # which Petit's workspace enforces per model.
+            # _Profile.raised_capacity_world_sizes. The model is not known
+            # here, so this is the largest limit over models (DSv4.1 Flash's);
+            # Petit's workspace enforces each model's own limit (Muse Spark's
+            # 2368 rows at EP8, 1024 for the profiles that keep the default).
             from tokenspeed_kernel.ops.moe.gluon import (
                 gluon_petit_largest_max_tokens_per_rank,
             )

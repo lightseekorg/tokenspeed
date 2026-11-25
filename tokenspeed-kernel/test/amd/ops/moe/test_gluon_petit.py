@@ -604,7 +604,9 @@ def test_largest_capacity_per_world_size() -> None:
     # EP4: the DSv4.1 Flash target's heap reaches 2**32 above 7808 rows; the
     # DSpark draft fits every encodable capacity. EP8: the rank-slot region
     # grows with ranks squared, so the target reaches 2**32 above 2624 rows and
-    # the draft above 5280; the server's limit is the smaller.
+    # the draft above 5280; their server's limit is the smaller. Muse Spark's
+    # 2368 rows at EP8 do not lower the server-wide limit, the largest over
+    # models; its workspace enforces its own.
     assert gluon_petit_largest_max_tokens_per_rank(4) == 7808
     assert gluon_petit_largest_max_tokens_per_rank(8) == 2624
     assert (
@@ -619,11 +621,17 @@ def test_largest_capacity_per_world_size() -> None:
         (_DSV41_FLASH_DSPARK_PROFILE, 4, 9184),
         (_DSV41_FLASH_PROFILE, 8, 2624),
         (_DSV41_FLASH_DSPARK_PROFILE, 8, 5280),
+        # Muse Spark's heap reaches 2**32 above 2368 rows at EP8.
+        (_MUSE_SPARK_PROFILE, 8, 2368),
         # Profiles that do not raise their capacity at EP8 keep 1024 rows.
         (_GPT_OSS_120B_PROFILE, 8, 1024),
         (_DSV4_PROFILE, 8, 1024),
         (_KIMI_K3_PROFILE, 8, 1024),
-        (_MUSE_SPARK_PROFILE, 8, 1024),
+        # Profiles not served at EP4 keep 1024 rows there.
+        (_GPT_OSS_120B_PROFILE, 4, 1024),
+        (_DSV4_PROFILE, 4, 1024),
+        (_KIMI_K3_PROFILE, 4, 1024),
+        (_MUSE_SPARK_PROFILE, 4, 1024),
     ],
 )
 def test_largest_capacity_per_profile(profile, world_size, largest) -> None:
@@ -646,7 +654,9 @@ def test_largest_capacity_per_profile(profile, world_size, largest) -> None:
             _megamoe_config(petit_kernel, profile, world_size, largest + 32)
 
 
-@pytest.mark.parametrize("profile", [_KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE])
+@pytest.mark.parametrize(
+    "profile", [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE]
+)
 def test_profile_without_raised_capacity_refuses_above_1024_at_ep8(profile) -> None:
     # The server admits EP8 chunks up to 2624 rows for DSv4.1 Flash; a model
     # whose profile keeps the default refuses them when its workspace is built.
@@ -667,6 +677,47 @@ def test_profile_without_raised_capacity_refuses_above_1024_at_ep8(profile) -> N
         ),
     ):
         _get_workspace(torch.device("cuda", 0), profile, 2048)
+
+
+def test_muse_spark_capacity_at_ep8() -> None:
+    # The server admits EP8 chunks up to DSv4.1 Flash's 2624 rows; Muse Spark's
+    # workspace admits its 2304-row chunk and its 2368-row limit and refuses
+    # the next 32-row block, which would take its heap past 32-bit offsets.
+    assert gluon_petit_largest_max_tokens_per_rank(8) == 2624
+    assert _profile_largest_max_tokens_per_rank(_MUSE_SPARK_PROFILE, 8) == 2368
+    assert gluon_petit_max_tokens_per_rank(8, 2304, _MUSE_SPARK_PROFILE) == 2304
+    assert gluon_petit_max_tokens_per_rank(8, 2368, _MUSE_SPARK_PROFILE) == 2368
+    for rows in (2369, 2400, 2560):
+        assert gluon_petit_max_tokens_per_rank(8, rows) == -(-rows // 32) * 32
+        with pytest.raises(
+            ValueError,
+            match="at most 2368 tokens per rank at world size 8 for muse_spark; "
+            rf"got {rows} \(a larger capacity would exceed",
+        ):
+            gluon_petit_max_tokens_per_rank(8, rows, _MUSE_SPARK_PROFILE)
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size", return_value=8
+        ),
+        pytest.raises(ValueError, match="at most 2368 tokens per rank"),
+    ):
+        _get_workspace(torch.device("cuda", 0), _MUSE_SPARK_PROFILE, 2400)
+    petit_kernel = _import_petit_kernel()
+    reserved, _ = _megamoe_config(
+        petit_kernel, _MUSE_SPARK_PROFILE, 8, 2368
+    ).heap_bytes()
+    assert reserved == 4_252_979_200
+    # Startup compiles one more variant at 2304 rows than at 1024: the plain
+    # Triton class above 1024 rows.
+    assert _megamoe_config(
+        petit_kernel, _MUSE_SPARK_PROFILE, 8, 1024
+    ).variant_token_counts() == (0, 1, 2, 12, 16, 128, 129, 1024)
+    assert _megamoe_config(
+        petit_kernel, _MUSE_SPARK_PROFILE, 8, 2304
+    ).variant_token_counts() == (0, 1, 2, 12, 16, 128, 129, 1024, 1025)
 
 
 @pytest.mark.parametrize(

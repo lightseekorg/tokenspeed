@@ -384,6 +384,16 @@ _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 # The raised capacity each world size serves DSv4.1 Flash with: EP4's
 # 4096-token chunks, and EP8's 2560 (a 512-multiple below its 2624-row limit).
 _RAISED_CAPACITY = {4: 4096, 8: 2560}.get(_WORLD_SIZE, 4096)
+# A profile whose own limit is below that serves its own raised capacity in
+# the raised-capacity cases: Muse Spark's EP8 2304-token chunks (a 256-multiple
+# below its 2368-row limit).
+_PROFILE_RAISED_CAPACITY = {"muse_spark": 2304}
+
+
+def _profile_capacity(profile_name: str, capacity: int) -> int:
+    if capacity == 1024:
+        return capacity
+    return _PROFILE_RAISED_CAPACITY.get(profile_name, capacity)
 # Rows of a 50,000-token prompt's last prefill chunk at each capacity
 # (848 at 1024 and 4096 rows, 1360 at 2560).
 _PROMPT_TOKENS = 50_000
@@ -412,6 +422,7 @@ def test_distributed_petit_reference(profile_name, capacity):
     if _WORLD_SIZE not in profile.world_sizes:
         sizes = "/".join(map(str, profile.world_sizes))
         pytest.skip(f"{profile_name} is registered for EP{sizes} only")
+    capacity = _profile_capacity(profile_name, capacity)
     _skip_above_profile_capacity(profile_name, capacity)
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
@@ -547,7 +558,9 @@ _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
     reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+@pytest.mark.parametrize(
+    "profile_name", ("dsv41_flash", "dsv41_flash_dspark", "muse_spark")
+)
 def test_distributed_petit_startup_warmup_compiles_every_variant(
     profile_name, capacity
 ):
@@ -563,6 +576,10 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
     from tokenspeed_kernel.ops.tuning import kernel_warmup
 
     profile = _PROFILES[profile_name]
+    if _WORLD_SIZE not in profile.world_sizes:
+        sizes = "/".join(map(str, profile.world_sizes))
+        pytest.skip(f"{profile_name} is registered for EP{sizes} only")
+    capacity = _profile_capacity(profile_name, capacity)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
@@ -619,6 +636,9 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
         8: {
             "dsv41_flash": (0, 1, 2, 256, 257, 512, 513),
             "dsv41_flash_dspark": (0, 1, 2, 12, 16, 24, 32, 256, 257, 1024)
+            + ((1025,) if capacity > 1024 else ()),
+            # Muse Spark's raised 2304 rows add the plain class above 1024.
+            "muse_spark": (0, 1, 2, 12, 16, 128, 129, 1024)
             + ((1025,) if capacity > 1024 else ()),
         },
     }

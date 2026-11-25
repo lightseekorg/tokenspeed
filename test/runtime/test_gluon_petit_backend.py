@@ -554,6 +554,11 @@ def test_petit_ep4_prefill_capacity(petit_args, overrides, error, capacity) -> N
             2560,
         ),
         ({"chunked_prefill_size": 2624, "max_prefill_tokens": 2624}, None, 2624),
+        # Muse Spark's EP8 chunk and limit; the server admits up to 2624 rows
+        # before the model is known and Petit's workspace refuses a Muse
+        # capacity above 2368 (test_petit_ep8_muse_capacity_per_model).
+        ({"chunked_prefill_size": 2304, "max_prefill_tokens": 2304}, None, 2304),
+        ({"chunked_prefill_size": 2368, "max_prefill_tokens": 2368}, None, 2368),
         ({"chunked_prefill_size": 0}, "2624 prefill tokens per rank at EP8", None),
         ({"chunked_prefill_size": 2625}, "2624 prefill tokens per rank at EP8", None),
         ({"max_prefill_tokens": 2625}, "2624 prefill tokens per rank at EP8", None),
@@ -571,6 +576,40 @@ def test_petit_ep8_prefill_capacity(petit_args, overrides, error, capacity) -> N
         ServerArgs.validate_petit_moe_options(petit_args)
     if capacity is not None:
         assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == capacity
+
+
+@pytest.mark.parametrize(
+    "chunk,error",
+    [
+        (2304, None),
+        (2368, None),
+        (2400, "at most 2368 tokens per rank at world size 8 for muse_spark"),
+    ],
+)
+def test_petit_ep8_muse_capacity_per_model(petit_args, chunk, error) -> None:
+    from tokenspeed_kernel.ops.moe.gluon import (
+        _DSV41_FLASH_DSPARK_PROFILE,
+        _DSV41_FLASH_PROFILE,
+        _MUSE_SPARK_PROFILE,
+        gluon_petit_max_tokens_per_rank,
+    )
+
+    assert petit_args.mapping.moe.ep_size == 8
+    petit_args.chunked_prefill_size = chunk
+    petit_args.max_prefill_tokens = chunk
+    # The server-side check passes before the model is known.
+    ServerArgs.validate_petit_moe_options(petit_args)
+    capacity = ServerArgs.gluon_petit_max_tokens_per_rank(petit_args)
+    assert capacity == chunk
+    # DSv4.1 Flash's target and draft admit every chunk up to 2624.
+    for profile in (_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE):
+        assert gluon_petit_max_tokens_per_rank(8, capacity, profile) == capacity
+    # Muse Spark's workspace enforces its own limit.
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        assert (
+            gluon_petit_max_tokens_per_rank(8, capacity, _MUSE_SPARK_PROFILE)
+            == capacity
+        )
 
 
 def test_petit_capacity_is_none_without_petit(petit_args) -> None:
