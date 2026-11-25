@@ -1117,6 +1117,106 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
+## LongCat-Flash-Lite
+
+### LongCat-Flash-Lite on Ascend NPU
+
+The Ascend path supports the LongCat-Flash-Lite checkpoint on one or more
+NPUs. It uses the normal TokenSpeed scheduler and paged KV cache: prefill runs
+eagerly, while the runtime captures fixed-shape decode batches as ACL Graphs.
+All seven decode capture sizes were validated
+(`--cudagraph-capture-sizes 64 32 16 8 4 2 1`, 7/7 captures succeeded).
+
+The validated environment is the same as the Qwen3-0.6B NPU recipe: CANN
+9.0.0, PyTorch 2.9.0, `torch_npu` 2.9.0.post2, Transformers 5.12.0, Triton
+3.2.0, Triton-Ascend 3.2.1, `apache-tvm-ffi==0.1.13`, and editable
+`tokenspeed-kernel-npu==0.1.0`. From the repository root, install the Ascend
+dependencies, source CANN, and expose the three source packages:
+
+```bash
+test/ci_system/install_triton_ascend.sh
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+
+python -m tokenspeed.cli serve <longcat-checkpoint> \
+  --served-model-name longcat-flash-lite \
+  --device npu \
+  --dtype bfloat16 \
+  --disable-pdl \
+  --disable-prefill-graph \
+  --attention-backend mla \
+  --sampling-backend greedy \
+  --router-topk torch \
+  --ep-dispatch-algorithm static_with_zero_expert \
+  --expert-distribution-recorder-mode stat \
+  --all2all-backend none \
+  --mla-lora-scale folded \
+  --trust-remote-code \
+  --disable-kvstore \
+  --tensor-parallel-size 8 \
+  --world-size 8 \
+  --ep-size 8 \
+  --moe-tp-size 1 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --max-model-len 8192 \
+  --enable-prefix-caching \
+  --chunked-prefill-size 128 \
+  --enable-metrics \
+  --gpu-memory-utilization 0.88 \
+  --cudagraph-capture-sizes 64 32 16 8 4 2 1
+```
+
+`<longcat-checkpoint>` is the local path to the LongCat-Flash-Lite checkpoint.
+The checkpoint is distributed out-of-tree (its `LongcatFlashNgramForCausalLM`
+architecture is registered by the in-tree `longcat_ngram` plugin), so
+substitute the actual weights path; there is no public Hub ID. Pass
+`--trust-remote-code` because the checkpoint ships its own
+`configuration_longcat_ngram` remote code for parsing `config.json`.
+
+LongCat-Flash-Lite keeps prefill eager for a model reason: its N-gram
+embedding reads the request's token-history predecessor windows, which are
+not fixed-shape, so pass `--disable-prefill-graph`. PDL (programmatic
+dependent launch) is not supported on NPU, so `--disable-pdl` is mandatory.
+Do not pass `--enforce-eager`, because that also disables the decode ACL
+Graph. Although the graph flags retain their CUDA-oriented names for CLI
+compatibility, they control ACL Graph capture on an NPU. The `mla` attention
+backend and the `greedy` sampling backend are the validated Ascend choices.
+LongCat's MLA attention and zero-expert MoE additionally require
+`--mla-lora-scale folded`, `--router-topk torch`, and
+`--ep-dispatch-algorithm static_with_zero_expert` with
+`--expert-distribution-recorder-mode stat` and `--all2all-backend none`. The
+command above captures decode batches 64, 32, 16, 8, 4, 2, and 1 as ACL
+Graphs (all seven validated). Scale `--max-model-len`, the KV pool
+(`--gpu-memory-utilization`), and the capture sizes together when growing the
+deployment.
+
+The current Ascend sampling path is validated with greedy decoding. Because
+`--sampling-backend greedy` always performs argmax, send `temperature=0` and
+do not expect request-level `top_p` or `top_k` to take effect.
+
+Multi-card deployments use tensor parallelism, validated on 8 NPUs. The world
+size must satisfy the model's standard divisibility constraints; context,
+pipeline, and data parallel sizes remain 1. Set `--world-size N` and
+`--tensor-parallel-size N` and expose `N` NPUs, for example
+`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` with `--world-size 8`. The MoE
+runs expert-parallel over the same group with `--ep-size N --moe-tp-size 1`.
+
+Verify the OpenAI-compatible endpoint with the served model name rather than
+the checkpoint path:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "longcat-flash-lite",
+    "messages": [{"role": "user", "content": "The capital of France is"}],
+    "temperature": 0,
+    "max_tokens": 64
+  }'
+```
+
 ## Qwen3.8
 
 Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer

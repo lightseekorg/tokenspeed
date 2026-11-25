@@ -588,6 +588,24 @@ the model context.
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
 
+### Device graphs on NPU
+
+On an NPU, the device-graph flags keep their CUDA-oriented names for CLI
+compatibility but control ACL Graph capture. `--enforce-eager` disables ACL
+Graph execution entirely; `--disable-prefill-graph` keeps prefill eager while
+leaving the decode ACL Graphs enabled; `--max-cudagraph-capture-size` and
+`--cudagraph-capture-sizes` select the decode batch shapes to capture. PDL
+(programmatic dependent launch) is not supported on NPU, so `--disable-pdl`
+is mandatory for `--device npu` and startup refuses the launch without it.
+
+Prefill graphs are unlocked on NPU through BreakableCapture piecewise capture,
+but a model whose forward reads request-level history keeps prefill eager. That
+is why LongCat-Flash-Lite — whose N-gram embedding reads each request's
+token-history predecessor windows — passes `--disable-prefill-graph`: the
+windows are not fixed-shape. Its decode graphs still capture (validated at
+seven capture sizes). Do not pass `--enforce-eager` on an NPU deployment
+unless you intend to disable the decode ACL Graphs as well.
+
 ## Parallelism
 
 | Parameter | Purpose |
