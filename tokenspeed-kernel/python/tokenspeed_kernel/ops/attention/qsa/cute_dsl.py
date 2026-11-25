@@ -545,6 +545,7 @@ def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
             page_table.shape[1] * page_size,
             queries_per_request,
             max_partial_bytes,
+            _PLATFORM.sm_count,
         )
         is not None
     )
