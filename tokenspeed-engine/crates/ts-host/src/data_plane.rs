@@ -497,6 +497,7 @@ impl DataPlane for PythonDataPlane {
                     "LoadBackDoneEvent" => CacheEventKind::LoadBackDone,
                     "SnapshotDoneEvent" => CacheEventKind::SnapshotDone,
                     "RestoreDoneEvent" => CacheEventKind::RestoreDone,
+                    "StateCommitDoneEvent" => CacheEventKind::StateCommitDone,
                     _ => return Err(self.fail(format!("unknown cache event {kind}"))),
                 };
                 Ok(CacheEvent { kind, op_id })
@@ -1012,13 +1013,14 @@ type Completed = (
         Option<TopLogprobBuffers>,
     )>,
     Option<Py<PyAny>>,
+    Option<Vec<i32>>,
 );
 
 /// A launched forward's results, once they landed.
 fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardResult> {
     let value = plane.call_method1("complete", (launched,))?;
     let tuple = value.cast::<PyTuple>()?;
-    if tuple.len() != 9 && tuple.len() != 10 {
+    if tuple.len() != 10 && tuple.len() != 11 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "invalid completed result length",
         ));
@@ -1033,7 +1035,8 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         grammar_terminated_at,
         logprobs,
         output_token_cumulative_probs,
-    ): Completed = tuple.get_slice(0, 9).extract()?;
+        request_ends,
+    ): Completed = tuple.get_slice(0, 10).extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
     let py = plane.py();
@@ -1048,6 +1051,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         output_logprobs: output_logprobs.map(floats).transpose()?,
         output_token_cumulative_probs: output_token_cumulative_probs.map(floats).transpose()?,
         nan_flags,
+        request_ends,
         next_input_ids,
         serving_compiles,
         grammar_terminated_at,
@@ -1055,10 +1059,10 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         input_top_logprobs: input_top_logprobs.map(top).transpose()?,
         output_top_logprobs: output_top_logprobs.map(top).transpose()?,
     };
-    if tuple.len() == 10 {
+    if tuple.len() == 11 {
         // Optional diagnostics cannot fail a valid ordinary result. The frozen
         // native forward lease marks missing observations as invalid evidence.
-        result.execution_observation = completed_execution_observation(&tuple.get_item(9)?).ok();
+        result.execution_observation = completed_execution_observation(&tuple.get_item(10)?).ok();
     }
     Ok(result)
 }

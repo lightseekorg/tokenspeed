@@ -130,7 +130,9 @@ def _token_streams(seed: int, tokens: int) -> dict[int, dict[str, torch.Tensor]]
 class _Server:
     """A real scheduler and a KDA backend over a three-group contract pool."""
 
-    def __init__(self, params, *, in_forward: bool):
+    def __init__(
+        self, params, *, in_forward: bool, recurrent_dtype: torch.dtype = torch.float32
+    ):
         self.params = params
         self.contract = _stub_contract(prefix_granularity=PAGE, usable_pages=32)
         self.pool = _StubContractPool(
@@ -140,6 +142,7 @@ class _Server:
             width=WIDTH,
             num_heads=HEADS,
             head_dim=DIM,
+            recurrent_dtype=recurrent_dtype,
         )
         self.backend = KdaAttnBackend(
             *_backend_config("cuda"),
@@ -292,12 +295,15 @@ def _prompt(server, request_id, tokens, streams, *, bucket=None):
 
 
 @requires_cuda
-def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves():
+@pytest.mark.parametrize("recurrent_dtype", [torch.float32, torch.bfloat16])
+def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves(
+    recurrent_dtype,
+):
     params = _layer_params(11)
     streams = _token_streams(12, PROMPT)
     tokens = list(range(PROMPT))
 
-    server = _Server(params, in_forward=True)
+    server = _Server(params, in_forward=True, recurrent_dtype=recurrent_dtype)
     first, second = _prompt(server, "x", tokens, streams)
     assert first[:3] == (0, BUDGET, [0])
     assert second[:3] == (BUDGET, PROMPT, [BOUNDARY - BUDGET]), "no extra chunk"
@@ -306,7 +312,7 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves():
 
     # A forward that ends at the boundary with the same chunking: its live
     # slot is the reference, bit for bit.
-    reference = _Server(params, in_forward=False)
+    reference = _Server(params, in_forward=False, recurrent_dtype=recurrent_dtype)
     *_, ending = _prompt(reference, "r", tokens[:BOUNDARY], streams)
     expected = reference.states(ending[3], STATE_LIVE_SLOT)
     for key, state in server.states(tables, STATE_CHECKPOINT_SLOT).items():
@@ -314,7 +320,7 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves():
 
     # Storing the checkpoint leaves the spanning forward's own output and
     # final state as they are without it.
-    plain = _Server(params, in_forward=False)
+    plain = _Server(params, in_forward=False, recurrent_dtype=recurrent_dtype)
     *_, unchanged = _prompt(plain, "p", tokens, streams)
     assert unchanged[:3] == (BUDGET, PROMPT, [0])
     for layer in LAYERS:
@@ -354,13 +360,15 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
     lengths, offsets = [300, 200], [256, 128]
     streams = _token_streams(22, sum(lengths))
     server = _Server(params, in_forward=True)
+    # A decode-capable engine keeps accepted counts beside its slot records.
+    server.backend.preallocate_verify_workspace(4, 1)
     tables = {group: [[0, 1, 2], [0, 3, 4]] for group in KIMI_STATE_GROUPS}
     tables["full_attention"] = [[1, 2, 3], [4, 5, 0]]
     lengths_cpu = torch.tensor(lengths, dtype=torch.int32)
     server.backend.init_forward_metadata(
         bs=2,
         num_extends=2,
-        req_pool_indices=torch.arange(2, dtype=torch.int32, device="cuda"),
+        req_pool_indices=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         seq_lens=lengths_cpu.to("cuda"),
         forward_mode=ForwardMode.EXTEND,
         block_tables=block_tables_for(server.contract, tables, "cuda"),
@@ -375,7 +383,9 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
         query_shard=None,
     )
     for layer in LAYERS:
+        server.backend._retained_lengths[layer][1:3].fill_(3)
         server.forward(layer, streams[layer], 0, sum(lengths), bs=2)
+        assert not server.backend._retained_lengths[layer][1:3].any()
     torch.cuda.synchronize()
 
     starts = [0, lengths[0]]

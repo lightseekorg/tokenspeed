@@ -201,11 +201,9 @@ def _load_builtin_generators() -> None:
         prepare_prepared_fp32_router_gemv,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
-        prepare_kda_fused_paged_decode,
         prepare_kda_fused_paged_verify,
-        prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
-        prepare_kda_replay_commit,
+        prepare_kda_retained_commit,
     )
     from tokenspeed_kernel.benchmark.generators.layernorm import (
         prepare_weightless_rmsnorm_gated_sigmoid,
@@ -249,19 +247,13 @@ def _load_builtin_generators() -> None:
     )
 
     _BENCHMARK_GENERATORS.setdefault(
-        ("attention", "kda_paged_decode"), prepare_kda_paged_decode
-    )
-    _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
-    )
-    _BENCHMARK_GENERATORS.setdefault(
-        ("attention", "kda_fused_paged_decode"), prepare_kda_fused_paged_decode
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_fused_paged_verify"), prepare_kda_fused_paged_verify
     )
     _BENCHMARK_GENERATORS.setdefault(
-        ("attention", "kda_replay_commit"), prepare_kda_replay_commit
+        ("attention", "kda_retained_commit"), prepare_kda_retained_commit
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kpool_prefill_write"), prepare_kpool_prefill_write

@@ -296,6 +296,7 @@ def _disk_scheduler():
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
             max_consecutive_prefill_rounds=0,
+            prefill_interval_min_decoding=0,
             cache_groups=[
                 ts.CacheGroupConfig(
                     group_id="full",

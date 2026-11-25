@@ -20,7 +20,7 @@
 
 """Full garbage collections of a rank's data plane, out of the way of serving.
 
-The control plane runs in Rust (``ts-host``); the interpreter it embeds runs
+The control plane runs in Rust (``ts-host``); the rank's interpreter runs
 the data plane, and startup leaves millions of long-lived Python objects
 there: imported modules, the model's modules and parameters, captured graphs,
 kernel and compile caches. A full (generation 2) collection walks all of

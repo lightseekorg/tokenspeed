@@ -250,7 +250,7 @@ class Plane:
             raise RuntimeError("the completion failed")
         from array import array
         cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
-        return ([launched], [1], None, None, None, None, None, None, cumulative)
+        return ([launched], [1], None, None, None, None, None, None, cumulative, [0])
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -403,6 +403,8 @@ fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
     let result = data_plane.complete(forward).unwrap();
     assert_eq!(result.output_tokens, [100]);
     assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
+    // The device's per-row request ends ride the same result.
+    assert_eq!(result.request_ends, Some(vec![0]));
 }
 
 #[test]
@@ -872,11 +874,12 @@ fn landed_execution_metadata_crosses_the_completion_boundary() {
     interpreter();
     Python::attach(|py| {
         let scope = pyo3::types::PyDict::new(py);
-        py.run(c"from array import array\nobservations = array('i', [5, 0])\nclass ObservedPlane:\n def complete(self, pending):\n  return ([3,4,5,6,7,8,9,10], [2], None, None, None, None, None, None, None, (((71,), 'decode_graph', 8, 1, 4, 32, 1), memoryview(observations).cast('B').cast('i', shape=[1, 2])))\nplane = ObservedPlane()", Some(&scope), None).unwrap();
+        py.run(c"from array import array\nobservations = array('i', [5, 0])\nclass ObservedPlane:\n def complete(self, pending):\n  return ([3,4,5,6,7,8,9,10], [2], None, None, None, None, None, None, None, [1], (((71,), 'decode_graph', 8, 1, 4, 32, 1), memoryview(observations).cast('B').cast('i', shape=[1, 2])))\nplane = ObservedPlane()", Some(&scope), None).unwrap();
         let plane = scope.get_item("plane").unwrap().unwrap();
         let result = super::complete(&plane, &py.None()).unwrap();
         py.run(c"observations[0] = 1", Some(&scope), None).unwrap();
         assert_eq!(result.output_lengths, [2]);
+        assert_eq!(result.request_ends, Some(vec![1]));
         let observation = result.execution_observation.unwrap();
         assert_eq!(observation.admission_ids, [71]);
         assert_eq!(observation.verify_width, 8);
@@ -906,7 +909,7 @@ landed.set_result(None)
 ordinary = (
     [3, 4, 5, 6, 7, 8, 9, 10], [2], array('d', [-0.5] * 8),
     [0], [[3, 4]], (2, 0.25), [-1],
-    (array('f', [-1.0, -2.0]), None, None), array('f', [0.5] * 8),
+    (array('f', [-1.0, -2.0]), None, None), array('f', [0.5] * 8), [1],
 )
 plane = CompletedPlane(ordinary)
 metadata = ((71,), 'decode_graph', 8, 1, 4, 32, 1)
@@ -929,7 +932,8 @@ invalid_ordinary = [
     ('invalid tokens', (['not a token'],) + ordinary[1:]),
     ('invalid lengths', ordinary[:1] + (None,) + ordinary[2:]),
     ('invalid logprob dtype', ordinary[:2] + (array('i', [0] * 8),) + ordinary[3:]),
-    ('invalid cumulative-probability rank', ordinary[:8] + (verification,)),
+    ('invalid cumulative-probability rank', ordinary[:8] + (verification,) + ordinary[9:]),
+    ('invalid request ends', ordinary[:9] + (['not a request end'],)),
 ]
 invalid_results = [
     (name + suffix, result + tail)
@@ -962,6 +966,7 @@ fn completion_diagnostic_errors_preserve_the_ordinary_result() {
         assert_eq!(ordinary.output_lengths, [2]);
         assert_eq!(ordinary.output_logprobs, Some(vec![-0.5; 8]));
         assert_eq!(ordinary.output_token_cumulative_probs, Some(vec![0.5; 8]));
+        assert_eq!(ordinary.request_ends, Some(vec![1]));
         assert!(ordinary.execution_observation.is_none());
 
         let cases = scope.get_item("malformed_results").unwrap().unwrap();

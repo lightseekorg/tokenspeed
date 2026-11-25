@@ -78,6 +78,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
         output_lengths=torch.tensor([1], dtype=torch.int32, device="cpu"),
         output_logprobs=torch.tensor([-0.5], dtype=torch.float32, device="cpu"),
         output_nan_flags=torch.tensor([0], dtype=torch.int32, device="cpu"),
+        output_request_ends=torch.tensor([1], dtype=torch.int32, device="cpu"),
         next_input_ids=torch.tensor([[1, 2]], dtype=torch.int32, device="cpu"),
         input_token_logprobs=torch.tensor(
             [-0.25, -1.0], dtype=torch.float32, device="cpu"
@@ -113,6 +114,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     del result
     gc.collect()
     assert exported[8].tolist() == [0.875]
+    assert exported[9] == [1]
 
 
 def test_completed_result_keeps_absent_columns_absent():
@@ -123,7 +125,7 @@ def test_completed_result_keeps_absent_columns_absent():
     exported = completed_result(
         result, serving_compiles=None, grammar_terminated_at=None
     )
-    assert exported == ([7], [1], None, None, None, None, None, None, None)
+    assert exported == ([7], [1], None, None, None, None, None, None, None, None)
 
 
 def test_execution_observation_is_appended_after_the_same_fence():
@@ -134,6 +136,7 @@ def test_execution_observation_is_appended_after_the_same_fence():
     result = ModelExecutionResult(
         output_tokens=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
         output_lengths=torch.tensor([3]),
+        output_request_ends=torch.tensor([1], dtype=torch.int32),
         copy_event=event,
         execution_observation=receipt,
         verification_observation=torch.tensor([[5, 0]], dtype=torch.int32),
@@ -144,12 +147,13 @@ def test_execution_observation_is_appended_after_the_same_fence():
     )
     assert event.waits == 1
     assert exported[1] == [3]
-    assert exported[9][0] == ((27,), "decode_graph", 8, 1, 4, 32, 1)
-    assert exported[9][1].tolist() == [[5, 0]]
+    assert exported[9] == [1]
+    assert exported[10][0] == ((27,), "decode_graph", 8, 1, 4, 32, 1)
+    assert exported[10][1].tolist() == [[5, 0]]
     result.execution_observation = None
     assert (
         len(completed_result(result, serving_compiles=None, grammar_terminated_at=None))
-        == 9
+        == 10
     )
 
 
@@ -166,7 +170,7 @@ def test_no_work_has_explicit_host_sentinels_and_execution_cannot_omit_its_buffe
     payload = completed_result(
         result, serving_compiles=None, grammar_terminated_at=None
     )
-    assert payload[9][1].tolist() == [[-1, 0], [-1, 0]]
+    assert payload[10][1].tolist() == [[-1, 0], [-1, 0]]
     result.execution_observation = TargetExecution("eager", 1, 2, 2, 0).payload(
         (11, 12)
     )

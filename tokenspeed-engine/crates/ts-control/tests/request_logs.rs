@@ -44,6 +44,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 1,
                 None,
                 Role::Decode,
+                false,
                 FinishLog {
                     enabled: true,
                     request_stats,

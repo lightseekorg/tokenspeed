@@ -21,8 +21,10 @@ publisher and engine identity. Invalid opt-in values fail startup. The CPU-only
 `tokenspeed_engine._host.execution_observation_protocol()` reports
 `tokenspeed-execution-observations-v1`; it initializes no model or device.
 
-When off, the Python completion tuple remains its original nine elements,
+When off, the Python completion tuple retains its ten ordinary elements,
 wire snapshots are absent, and no observation GPU buffer is allocated.
+When enabled, diagnostics are appended after the request-end column; that
+column and every other ordinary result retain their positions and semantics.
 When on, the executor owns int32 `[max_batch_size, 2]` scratch in the existing
 CPU-backed `runtime_states` named region. It is batch scratch, not request-slot
 state and not a retraction image. Every sampler invocation overwrites its rows.
@@ -66,7 +68,7 @@ buffer reader validates exact int32 `[live_requests, 2]` shape and copies into
 owned vectors before the result's reuse lease retires. Control performs no new
 device query. The zero-input no-forward arm uses explicit host sentinels.
 Malformed optional diagnostics invalidate the frozen lease's evidence while
-preserving the ordinary nine-field result and token commit. Ordinary result
+preserving the ordinary result, request-end signals and token commit. Ordinary result
 decoding and completion-fence failures remain fatal.
 
 ## Admission ownership and closure

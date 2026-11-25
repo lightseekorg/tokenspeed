@@ -80,6 +80,7 @@ fn invalid_optional_diagnostics_commit_tokens_but_invalidate_closed_wire_evidenc
                 1,
                 Some(4096),
                 Role::Plain,
+                true,
                 FinishLog {
                     enabled: false,
                     request_stats: false,

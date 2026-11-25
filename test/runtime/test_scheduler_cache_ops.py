@@ -233,6 +233,7 @@ def _config(**overrides):
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
         num_disk_pages=0,
         disk_config=None,

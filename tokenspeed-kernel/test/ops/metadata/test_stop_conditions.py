@@ -24,7 +24,7 @@ from dataclasses import replace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.metadata import apply_stop_conditions
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, apply_stop_conditions
 from tokenspeed_kernel.ops.metadata.stop_conditions import (
     _apply_stop_conditions_kernel,
     _apply_stop_conditions_torch,
@@ -75,6 +75,7 @@ def test_ascend_selects_portable_fallback_and_prefers_device_plugin(
     assert selected.name == "test_ascend_stop_conditions"
     state = _state(3)
     accepts = torch.tensor([3], dtype=torch.int32)
+    ends = torch.full((1,), -1, dtype=torch.int32)
     selected(
         torch.tensor([1], dtype=torch.int64),
         torch.tensor([5, _STOP, 5], dtype=torch.int32),
@@ -82,6 +83,7 @@ def test_ascend_selects_portable_fallback_and_prefers_device_plugin(
         torch.tensor([3], dtype=torch.int32),
         torch.empty(0, dtype=torch.int32),
         *state,
+        ends,
         0,
         0,
         3,
@@ -89,6 +91,7 @@ def test_ascend_selects_portable_fallback_and_prefers_device_plugin(
     )
     assert accepts.tolist() == [2]
     assert state[3].tolist() == [False, True, False]
+    assert ends.tolist() == [REQUEST_ENDED]
 
 
 def _state(pool, device="cpu"):
@@ -103,7 +106,10 @@ def _state(pool, device="cpu"):
 
 
 def _apply(slots, tokens, accepts, inputs, prompts, state, *, extends, outputs, width):
+    """Apply the conditions; return each row's ``request_ends`` entry."""
     valid, stop_ids, limits, stopped = state
+    # Every row must be written: start from a value the op never reports.
+    ends = torch.full(slots.shape, -1, dtype=torch.int32, device=slots.device)
     apply_stop_conditions(
         slots,
         tokens,
@@ -114,11 +120,13 @@ def _apply(slots, tokens, accepts, inputs, prompts, state, *, extends, outputs, 
         stop_ids,
         limits,
         stopped,
+        ends,
         num_extends=extends,
         num_prefill_outputs=outputs,
         decode_width=width,
         padding_index=valid.shape[0] - 1,
     )
+    return ends
 
 
 def test_decode_rows_keep_through_the_stop_token_and_within_the_budget():
@@ -141,7 +149,7 @@ def test_decode_rows_keep_through_the_stop_token_and_within_the_budget():
     accepts = torch.tensor([4, 3, 4, 4, 4], dtype=torch.int32)
     inputs = torch.full((5,), width, dtype=torch.int32)
 
-    _apply(
+    ends = _apply(
         slots,
         tokens,
         accepts,
@@ -155,6 +163,8 @@ def test_decode_rows_keep_through_the_stop_token_and_within_the_budget():
 
     assert accepts.tolist() == [2, 3, 2, 0, 4]
     assert stopped.tolist() == [False, True, False, True, True, False, False, False]
+    # A request stopped by an earlier round still reports its end; padding none.
+    assert ends.tolist() == [REQUEST_ENDED, 0, REQUEST_ENDED, REQUEST_ENDED, 0]
 
 
 def test_only_a_prompt_completing_extend_row_stops():
@@ -168,7 +178,7 @@ def test_only_a_prompt_completing_extend_row_stops():
     inputs = torch.tensor([8, 2, 6], dtype=torch.int32)
     prompts = torch.tensor([10, 6, 6], dtype=torch.int32)  # row 0 is mid-prompt
 
-    _apply(
+    ends = _apply(
         slots,
         tokens,
         accepts,
@@ -182,6 +192,7 @@ def test_only_a_prompt_completing_extend_row_stops():
 
     assert accepts.tolist() == [1, 1, 1]
     assert stopped[1:4].tolist() == [False, True, True]
+    assert ends.tolist() == [0, REQUEST_ENDED, REQUEST_ENDED]
 
 
 requires_cuda = pytest.mark.skipif(
@@ -221,12 +232,17 @@ def test_kernel_matches_the_tensor_path(batch, extends, outputs, width):
     gpu_args = [t.cuda() for t in cpu_args]
     gpu_state = tuple(t.cuda() for t in cpu_state)
 
-    _apply(*cpu_args, cpu_state, extends=extends, outputs=outputs, width=width)
-    _apply(*gpu_args, gpu_state, extends=extends, outputs=outputs, width=width)
+    cpu_ends = _apply(
+        *cpu_args, cpu_state, extends=extends, outputs=outputs, width=width
+    )
+    gpu_ends = _apply(
+        *gpu_args, gpu_state, extends=extends, outputs=outputs, width=width
+    )
     torch.cuda.synchronize()
 
     assert torch.equal(gpu_args[2].cpu(), cpu_args[2])
     assert torch.equal(gpu_state[3].cpu(), cpu_state[3])
+    assert torch.equal(gpu_ends.cpu(), cpu_ends)
 
 
 @requires_cuda

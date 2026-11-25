@@ -499,6 +499,10 @@ class ServerArgs:
     # The most back-to-back prefill rounds an overdue prompt may suspend the
     # interval for; 0 keeps the unbounded suspension.
     max_consecutive_prefill_rounds: int = 0
+    # The interval is owed only while at least this many requests are ready
+    # to decode; below it --max-consecutive-prefill-rounds still ends a run of
+    # prefill rounds that hold a decode back. 0 always owes the interval.
+    prefill_interval_min_decoding: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -709,6 +713,9 @@ class ServerArgs:
     attention_backend: str | None = None
     min_kv_split: int | None = None
     kda_backend: str = "auto"
+    # Records a request keeps per KDA layer between dense-state folds,
+    # including the verify window; None keeps max(16, draft tokens).
+    kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
@@ -3276,6 +3283,17 @@ class ServerArgs:
                 "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
                 "it bounds how long an overdue prompt suspends the interval"
             )
+        if self.prefill_interval_min_decoding < 0:
+            raise ValueError("--prefill-interval-min-decoding must be non-negative")
+        if (
+            self.prefill_interval_min_decoding
+            and not self.max_consecutive_prefill_rounds
+        ):
+            raise ValueError(
+                "--prefill-interval-min-decoding needs "
+                "--max-consecutive-prefill-rounds: below the threshold the round "
+                "cap is what still bounds how long running decodes stall"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3728,6 +3746,19 @@ class ServerArgs:
             "interval again, and a prompt's held-back count restarts whenever "
             "one of its chunks runs. 0 (the default) keeps the unbounded "
             "suspension.",
+        )
+        parser.add_argument(
+            "--prefill-interval-min-decoding",
+            type=int,
+            default=ServerArgs.prefill_interval_min_decoding,
+            help="With --max-consecutive-prefill-rounds (which needs "
+            "--prefill-decode-interval): owe the "
+            "--prefill-decode-interval and --prefill-decode-min-interval decode "
+            "rounds only while at least this many requests are ready to decode. "
+            "With fewer, waiting prompts are prefilled at once, but once "
+            "--max-consecutive-prefill-rounds prefill rounds in a row have held "
+            "a decode back, the next round decodes. Aggregated serving only. "
+            "0 (the default) always owes them.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
@@ -4527,6 +4558,17 @@ class ServerArgs:
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "FlashInfer CuTe DSL KDA prefill kernel on SM100/SM103. 'cudnn' uses FlashInfer's "
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
+        )
+        parser.add_argument(
+            "--kda-history-capacity",
+            type=int,
+            default=ServerArgs.kda_history_capacity,
+            help="Accepted KDA records each request keeps per layer between "
+            "dense-state folds, counting the verify window (the speculative draft "
+            "tokens). Default: max(16, draft tokens); it must be at least the "
+            "draft tokens. A smaller capacity shrinks the per-request verify "
+            "workspace but folds the records into the dense state more often: at "
+            "the draft tokens themselves, every round that accepts any.",
         )
         parser.add_argument(
             "--drafter-attention-backend",

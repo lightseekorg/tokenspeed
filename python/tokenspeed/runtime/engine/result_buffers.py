@@ -92,6 +92,11 @@ def completed_result(
         grammar_terminated_at,
         logprobs,
         result_buffer(results.output_token_cumulative_probs),
+        (
+            results.output_request_ends.tolist()
+            if results.output_request_ends is not None
+            else None
+        ),
     )
 
     if results.execution_observation is None:

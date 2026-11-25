@@ -1255,6 +1255,19 @@ the image as the split planned:
   `snapshot_slot`), ride one `SnapshotStoreOperation`; the op may carry zero
   page rows, the blob always.
 
+A State group may defer its decode state
+(`CacheGroupConfig::deferred_decode_state`: the runtime commits a decoding
+request's state to slot 1 only at its end or at this retraction, first thing
+in the plan). The retraction lists a decoded victim's slot-1 block in each
+such group in the plan's `state_folds`, as (request pool index, page id),
+once its publication is done and before the split: a victim whose image the
+split then refuses is aborted, but the publication stands and still needs
+the fold. A block the publication swapped for another request's equal entry
+is left out. Local readers order behind the fold on the device, but a peer
+does not: with peers, the slot-1 blocks this publication put into the index
+for a decoded victim join the plan's `state_commit_fence`, and
+`PeerPagesMatch` refuses them until `cache::StateCommitDone`.
+
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that
@@ -1837,6 +1850,31 @@ alone, so each chunk of an overdue prompt waits the interval. The counters follo
 rank, like the interval's. With both `K` and the minimum interval `M`, a
 round owes decodes when `M` has rounds left or when the interval does and no
 overdue prompt may suspend it.
+
+**Decode threshold** (`prefill_interval_min_decoding` `T`, requires `K`; fused
+role only; `0` is off): `N` and `M` are owed only while at least `T` requests
+are ready to decode (`PrefillDone` or `Decoding`) before the round. With
+fewer, the interval and `M` are waived, but not `K`'s bound on the run: once
+`K` prefill rounds in a row have held a decode back, the next round owes one
+decode round, not the whole interval, and no overdue prompt suspends it.
+That round ends the run, so the few decodes stall at most `K` prefill rounds
+at a time instead of for a whole queue of prompts. Below `T` the decode-side
+guarantees therefore weaken: `M`'s "no prefill round directly follows
+another" becomes `K` prefill rounds, then one decode round. Below `T` a
+waiting prompt is held back at most one decode round per `K` prefill rounds;
+its held-back count may pass `N`. A held interval survives the waiver and is
+owed in full once `T` is met. The threshold adds no state: it is a function
+of the candidates, so the counters, held-back counts and run count follow
+the plans, identical on every rank, like the interval's; under attention DP
+each replica compares its own ready decodes with `T`. A retracted or
+restoring request is not ready to decode, so a retraction can drop the count
+below `T` and waive the rest of the interval: from the round it is planned
+for a forced retraction, which runs before the count, and from the next
+round for a capacity retraction, which runs after it. In mixed mode a round
+below `T` runs its prefill beside the decodes, which ends the run, so `K`
+never forces a round there. While few
+requests decode, this trades their token latency for first-token latency; at
+or above `T`, and with `T` unset, every plan is unchanged.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is

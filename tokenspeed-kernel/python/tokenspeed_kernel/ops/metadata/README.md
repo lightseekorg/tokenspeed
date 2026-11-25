@@ -3,11 +3,16 @@
 `apply_stop_conditions` validates tensors and dispatches the in-place update
 through `metadata / apply_stop_conditions`. NVIDIA, AMD and Ascend retain the
 portable Triton leaf; higher-priority Ascend plugins can override it. CPU retains
-the scalar reference. Device leaves accept the public function's nine tensors
+the scalar reference. Device leaves accept the public function's ten tensors
 followed by `num_extends`, `num_prefill_outputs`, `decode_width` and `padding_index`,
 all passed positionally. Device leaves must preserve EOS, token budgets,
 speculative width truncation, stopped requests, unfinished prefill and padding
-semantics, without host tensor reads during graph capture or replay.
+semantics, without host tensor reads during graph capture or replay. Every row
+also gets its `request_ends` entry: `REQUEST_ENDED` once the device ended its
+request (in this forward or an earlier one), else 0, padding included. A commit
+that defers decode state raises a row whose state it could not complete to
+`REQUEST_ENDED_INCOMPLETE`; the control plane publishes such a state only on
+`REQUEST_ENDED` and stops on the incomplete report.
 
 # Block-table rows
 
