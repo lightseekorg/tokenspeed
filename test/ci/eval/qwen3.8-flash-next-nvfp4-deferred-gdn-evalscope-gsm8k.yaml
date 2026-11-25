@@ -14,7 +14,7 @@ model_sources:
   - python/tokenspeed/runtime/models/qwen4_exp_monokernel.py
 runner:
   labels:
-    - gb200-2gpu
+    - b200-2gpu
 env:
   CI: "true"
 install:

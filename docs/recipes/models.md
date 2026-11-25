@@ -1325,7 +1325,7 @@ the start of FC1:
 
 A 16k-token prefill chunk is unchanged.
 
-The GSM8K CI task serves the NVFP4 checkpoint on two GB200 GPUs with MTP3
+The GSM8K CI task serves the NVFP4 checkpoint on two B200 GPUs with MTP3
 and BF16 recurrent state. It enables `--enable-deferred-gdn-state` and
 requires at least 96% accuracy on the GSM8K test split.
 [Task configuration](../../test/ci/eval/qwen3.8-flash-next-nvfp4-deferred-gdn-evalscope-gsm8k.yaml)
