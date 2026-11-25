@@ -1214,9 +1214,9 @@ def _synthetic_received_experts(profile_name, counts):
 
 
 def _selector_cases():
-    """Every decode count r0002-f3 measured, and rows 1-64 in both layouts:
-    DP4 (all rows on one rank) and tp4ep4 (replicated rows split in
-    ceil(R/4) chunks), for the target and the DSpark draft."""
+    """Rows 1-64 (every decode count) in both layouts: DP4 (all rows on one
+    rank) and tp4ep4 (replicated rows split in ceil(R/4) chunks), for the
+    target and the DSpark draft."""
     cases = []
     for profile in ("dsv41_flash", "dsv41_flash_dspark"):
         for rows in range(1, 65):
@@ -1266,7 +1266,7 @@ def test_stage1_n128_selector_right_at_synthetic_counts() -> None:
     collision-free count) never takes N=128 where the rule at the delivered
     per-rank count says N=256, at rows 1-64 in DP4 and tp4ep4 for the target
     and the draft; it keeps the measured wins (DP4/tp4ep4 b1, b4) and fixes
-    the measured loss (R=64: estimate 61, delivered 96, r0002-f3)."""
+    the measured loss (R=64: estimate 61, delivered 96)."""
     table = selector_table()
     for profile, layout, counts, _, high, delivered, _, new, right in table:
         if new:
