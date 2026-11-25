@@ -1163,6 +1163,8 @@ setup(
             # Vendored FlashInfer/Cake Kimi-K3 front programs, JIT-built like the router.
             "csrc/kimi3_latent_front/*.cu",
             "csrc/kimi3_latent_front/*.h",
+            # Vendored vLLM fused index scoring + top-k, JIT-built against DeepGEMM.
+            "csrc/fused_mqa_topk/*",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",

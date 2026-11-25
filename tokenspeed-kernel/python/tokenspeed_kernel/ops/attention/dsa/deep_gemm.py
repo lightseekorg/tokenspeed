@@ -424,6 +424,63 @@ def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
     )
 
 
+def _fused_scoring_topk(
+    q_fp8: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    dense_rows: int,
+    max_row_keys: int,
+    ranks_every_candidate: bool,
+) -> bool:
+    """Select a prefill chunk's top-k with the fused scoring + top-k kernel
+    where it applies and is the faster path; False leaves ``out`` untouched.
+
+    The kernel ranks every candidate by score alone (no forced tokens) and
+    takes ties at the k-th score in launch order, so it is neither the forced
+    selection nor batch invariant. Its restrictions are the shapes it is built
+    for; the row and key thresholds are measured.
+    """
+    from tokenspeed_kernel.thirdparty.cuda import fused_mqa_topk
+
+    keys = kv_fp8[0].shape[0]
+    if not (
+        ranks_every_candidate
+        and _MX_SCORING
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and tuple(q_fp8.shape[1:]) == (fused_mqa_topk.HEADS, fused_mqa_topk.HEAD_DIM)
+        and out.shape[1] in fused_mqa_topk.TOPKS
+        and out.is_contiguous()
+        and fused_mqa_topk.available(q_fp8.device)
+    ):
+        return False
+    # Built by the first chunk of any size, so the startup forward compiles it
+    # rather than the first long-context request.
+    fused_mqa_topk.build()
+    if not fused_mqa_topk.beats_dense(
+        q_fp8.device,
+        rows=q_fp8.shape[0],
+        dense_rows=dense_rows,
+        keys=keys,
+        max_row_keys=max_row_keys,
+        topk=out.shape[1],
+    ):
+        return False
+    fused_mqa_topk.fused_mqa_topk_prefill(
+        q_fp8,
+        kv_fp8[0],
+        fused_mqa_topk.key_scales(kv_fp8[1]),
+        weights.contiguous(),
+        row_starts,
+        row_ends,
+        out,
+    )
+    return True
+
+
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
     import deep_gemm
@@ -774,7 +831,24 @@ if _HAS_DEEP_GEMM:
         else:
             max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
         local_starts_i32 = torch.zeros_like(row_starts)
-        for start in range(0, tokens, max_query_rows):
+        fused = _fused_scoring_topk(
+            q_fp8,
+            kv_fp8,
+            scaled_weights,
+            row_starts,
+            row_ends,
+            out,
+            dense_rows=max_query_rows,
+            max_row_keys=(
+                int(candidate_lens_cpu.max())
+                if candidate_lens_cpu is not None
+                else int(candidate_lens.max())
+            ),
+            ranks_every_candidate=(
+                not batch_invariant and initial_tokens == 0 and local_tokens == 0
+            ),
+        )
+        for start in () if fused else range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
             tile_max_seqlen_k = _resolve_prefill_tile_max_seqlen_k(
                 candidate_lens,

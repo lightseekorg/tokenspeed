@@ -280,6 +280,20 @@ rows probes that selection at construction with
 `dsa.select_dsa_prefill_topk_for_rows(index_k_format=, ...)`, which makes a
 platform without a declaring leaf a startup error.
 
+On the SM100 family the DeepGEMM `dsa_prefill_topk` leaf hands a chunk to the
+fused scoring + top-k kernel (`thirdparty/cuda/fused_mqa_topk.py`, vendored
+from vLLM, JIT-built against the installed DeepGEMM headers by the first
+chunk), which selects each row's top-k without materializing the
+`[rows, keys]` scores. It takes the chunks it is built for and measured
+faster on: FP8 queries of 32 heads by 128, top-k 512, 1024 or 2048, at most
+2^20 gathered keys, a longest row of at least 32K keys (64K for top-2048), and
+a last wave of 8-row blocks on at least half the SMs unless the separate path
+needs several scoring launches. It ranks every candidate by score (no forced
+initial or local tokens) and breaks ties at the k-th score in launch order, so
+`batch_invariant` selections and forced selections stay on the separate
+scoring and top-k. The selection is exact up to ties at the k-th score to the
+24 bits of score the kernel ranks.
+
 A `dsa_decode_topk` leaf bounds every query row itself: row `j` of a request
 scored with `q_len_per_req` rows (spec verify, a multi-depth draft's k-row
 window) selects over the first `seq_lens[req] - (q_len_per_req - 1) + j`
