@@ -345,6 +345,36 @@ def _dsa_store_output(
 
 
 # The split count and LSE strides follow the batch; output strides stay 16-aligned.
+@gluon.jit
+def _load_kv_tile_to_shared(dest, kv, offs, valid, KV_BUFFER_LOAD: gl.constexpr):
+    """Copy the selected KV rows ``kv + offs`` (int64 element offsets,
+    ``[dim, keys]``) to ``dest``. A buffer load takes 32-bit offsets from the
+    view's base, so it is used only when the launcher proved the view's byte
+    span is under 2**31; otherwise a truncated offset would wrap and the
+    out-of-range rows would read as zeros."""
+    if KV_BUFFER_LOAD:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=dest,
+            ptr=kv,
+            offsets=offs.to(tl.int32),
+            mask=valid[None, :],
+        )
+    else:
+        gl.amd.cdna4.async_copy.global_load_to_shared(
+            dest,
+            kv + offs,
+            mask=valid[None, :],
+        )
+
+
+def _kv_buffer_load(kv_cache: torch.Tensor) -> bool:
+    """Whether 32-bit buffer offsets reach every byte of ``kv_cache``."""
+    span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(kv_cache.shape, kv_cache.stride())
+    )
+    return min(kv_cache.shape, default=1) == 0 or span * kv_cache.element_size() < 2**31
+
+
 @gluon.jit(
     do_not_specialize=(
         "stride_lse_t",
@@ -401,6 +431,9 @@ def _dsa_dense_mfma_kv_kernel(
     SPLIT_KV: gl.constexpr,
     STORE_LSE: gl.constexpr,
     Q_LOCAL_HEADS: gl.constexpr,
+    # 32-bit buffer offsets address the KV view only when its byte span is
+    # under 2**31; a larger serving pool gathers through 64-bit pointers.
+    KV_BUFFER_LOAD: gl.constexpr,
 ):
     # CDNA4 exposes the FP8 MFMA at K=32. Keeping FP8 operands native halves
     # the score/value instruction count and avoids per-tile BF16 expansion.
@@ -742,18 +775,12 @@ def _dsa_dense_mfma_kv_kernel(
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
     else:
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=smem_klora.index(0),
-            ptr=kv,
-            offsets=klora_offs.to(tl.int32),
-            mask=valid_klora[None, :],
+        _load_kv_tile_to_shared(
+            smem_klora.index(0), kv, klora_offs, valid_klora, KV_BUFFER_LOAD
         )
         if HAS_ROPE:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                dest=smem_krope.index(0),
-                ptr=kv,
-                offsets=krope_offs.to(tl.int32),
-                mask=valid_krope[None, :],
+            _load_kv_tile_to_shared(
+                smem_krope.index(0), kv, krope_offs, valid_krope, KV_BUFFER_LOAD
             )
         gl.amd.cdna4.async_copy.commit_group()
         gl.amd.cdna4.async_copy.wait_group(1)
@@ -815,18 +842,20 @@ def _dsa_dense_mfma_kv_kernel(
             krope_offs_next = safe_krope_next[None, :].to(tl.int64) * stride_kv_t + (
                 D_V + offs_r_krope[:, None]
             ).to(tl.int64)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                dest=smem_klora.index(next_buf),
-                ptr=kv,
-                offsets=klora_offs_next.to(tl.int32),
-                mask=valid_klora_next[None, :],
+            _load_kv_tile_to_shared(
+                smem_klora.index(next_buf),
+                kv,
+                klora_offs_next,
+                valid_klora_next,
+                KV_BUFFER_LOAD,
             )
             if HAS_ROPE:
-                gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                    dest=smem_krope.index(next_buf),
-                    ptr=kv,
-                    offsets=krope_offs_next.to(tl.int32),
-                    mask=valid_krope_next[None, :],
+                _load_kv_tile_to_shared(
+                    smem_krope.index(next_buf),
+                    kv,
+                    krope_offs_next,
+                    valid_krope_next,
+                    KV_BUFFER_LOAD,
                 )
             gl.amd.cdna4.async_copy.commit_group()
             gl.amd.cdna4.async_copy.wait_group(1)
@@ -1067,6 +1096,7 @@ def _dsa_sparse_prefill_fp8_kernel(
     NATIVE_E5M2: gl.constexpr,
     SPLIT_KV: gl.constexpr,
     STORE_LSE: gl.constexpr,
+    KV_BUFFER_LOAD: gl.constexpr,
 ):
     """Native-FP8 sparse MLA for prefill rows, one key tile at a time.
 
@@ -1259,18 +1289,8 @@ def _dsa_sparse_prefill_fp8_kernel(
         krope_offs = gl.where(valid_r, idx_r, 0)[None, :].to(tl.int64) * stride_kv_t + (
             D_V + offs_r_krope[:, None]
         ).to(tl.int64)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=smem_klora,
-            ptr=kv,
-            offsets=klora_offs.to(tl.int32),
-            mask=valid_k[None, :],
-        )
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=smem_krope,
-            ptr=kv,
-            offsets=krope_offs.to(tl.int32),
-            mask=valid_r[None, :],
-        )
+        _load_kv_tile_to_shared(smem_klora, kv, klora_offs, valid_k, KV_BUFFER_LOAD)
+        _load_kv_tile_to_shared(smem_krope, kv, krope_offs, valid_r, KV_BUFFER_LOAD)
         gl.amd.cdna4.async_copy.commit_group()
         idx_m = _load_selected(topk_indices, idx_row, idx_base + local_offs_mma, TOPK)
         valid_mma = live & ((tile * TILE_K + local_offs_mma) < valid_len) & (idx_m >= 0)
@@ -2126,6 +2146,9 @@ def _launch_dense_kv(
         num_kv_splits,
     )
     store_lse = (lse is not None or records) and num_kv_splits == 1
+    # A serving pool's per-layer view can exceed 2**31 bytes (GLM-5.3 Flash
+    # TP8: 512 B per slot past slot 4,194,304); small views keep buffer loads.
+    kv_buffer_load = _kv_buffer_load(kv_cache)
     if is_prefill and native_fp8 and qk_rope_head_dim == 64 and not records:
         _dsa_sparse_prefill_fp8_kernel[grid](
             *buffers,
@@ -2140,6 +2163,7 @@ def _launch_dense_kv(
             NATIVE_E5M2=q.dtype == torch.float8_e5m2,
             SPLIT_KV=num_kv_splits > 1,
             STORE_LSE=store_lse,
+            KV_BUFFER_LOAD=kv_buffer_load,
             num_warps=4,
             # Four CTAs per CU: their LDS fits, and 128 VGPRs hold the loop.
             waves_per_eu=4,
@@ -2168,6 +2192,7 @@ def _launch_dense_kv(
             STORE_LSE=store_lse,
             # A model's heads per rank: one more binary for the records.
             Q_LOCAL_HEADS=q_local_heads if records else 0,
+            KV_BUFFER_LOAD=kv_buffer_load,
             BLOCK_H=16,
             TILE_K=tile_k,
             num_warps=4,

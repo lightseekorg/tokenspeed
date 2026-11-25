@@ -2869,3 +2869,118 @@ def test_dsa_glm52_selected_attention_cases(case: _DSACase) -> None:
     assert out.shape == (tokens, case.num_heads, case.kv_lora_rank)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the dense DSA KV gather is gfx950's")
+def test_dsa_dense_kv_buffer_load_follows_the_view_span() -> None:
+    """Buffer loads take 32-bit offsets, so only a view under 2**31 bytes may
+    use them; a serving pool's per-layer view is often larger."""
+    rows = 2**31 // 512
+    small = torch.empty((rows - 1, 512), dtype=torch.float8_e4m3fn, device="meta")
+    large = torch.empty((rows, 512), dtype=torch.float8_e4m3fn, device="meta")
+    bf16 = torch.empty((rows // 2, 512), dtype=torch.bfloat16, device="meta")
+    # 512-wide rows of a 1,024-byte stride: the span ends 512 bytes past the
+    # last row's start, so 2**21 rows stay under 2**31 and one more crosses.
+    strided = torch.empty((rows // 2 + 1, 1024), dtype=torch.uint8, device="meta")
+    assert gfx950_dsa_backend._kv_buffer_load(small)
+    assert not gfx950_dsa_backend._kv_buffer_load(large)
+    assert not gfx950_dsa_backend._kv_buffer_load(bf16)
+    assert gfx950_dsa_backend._kv_buffer_load(strided[: rows // 2, :512])
+    assert not gfx950_dsa_backend._kv_buffer_load(strided[:, :512])
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the dense DSA KV gather is gfx950's")
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode, id="decode"),
+        pytest.param(gluon_dsa_prefill, id="prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("qk_rope_head_dim", "qk_nope_head_dim"),
+    [
+        # GLM-5.3 Flash: 512-wide native-FP8 latent, no RoPE part.
+        pytest.param(0, 256, id="glm53-flash"),
+        # 576-wide rows; native-FP8 prefill takes the sparse-prefill kernel.
+        pytest.param(64, 192, id="rope64"),
+    ],
+)
+def test_dsa_dense_fp8_reads_slots_past_2gib(
+    api, qk_rope_head_dim: int, qk_nope_head_dim: int
+) -> None:
+    """Selected rows whose byte offset in the KV view is past 2**31 (GLM-5.3
+    Flash's TP8 pool: slot 4,194,304 of 512 B rows) must count; a truncated
+    32-bit offset wraps and the rows read as zeros."""
+    device = "cuda"
+    num_heads = 16
+    kv_lora_rank = 512
+    topk = 2048
+    width = kv_lora_rank + qk_rope_head_dim
+    limit = 2**31 // width
+    num_slots = 2**31 // 512 + 4096
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 1203)
+
+    kv_cache = torch.zeros((num_slots, width), dtype=torch.float8_e4m3fn, device=device)
+    assert kv_cache.numel() > 2**31
+    # Rows below and above the 2**31-byte boundary, plus the view's last rows.
+    candidates = torch.cat(
+        (
+            torch.arange(0, 512, device=device),
+            torch.arange(limit - 1024, limit + 2048, device=device),
+            torch.arange(num_slots - 512, num_slots, device=device),
+        )
+    )
+    kv_cache[candidates] = _randn_bf16(
+        (candidates.numel(), width), device=device, generator=gen
+    ).to(torch.float8_e4m3fn)
+    # Row 0 selects only keys past the boundary (a wrapped offset zeroes its
+    # whole output), row 1 mixes both sides, row 2 has a few keys past it.
+    above = candidates[candidates >= limit]
+    pools = (above, candidates, above)
+    valid_lengths = (2048, 1500, 64)
+    tokens = len(valid_lengths)
+    q = _randn_bf16((tokens, num_heads, width), device=device, generator=gen).to(
+        torch.float8_e4m3fn
+    )
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    for token, (pool, count) in enumerate(zip(pools, valid_lengths)):
+        perm = torch.randperm(pool.numel(), device=device, generator=gen)
+        topk_slots[token, :count] = pool[perm[:count]].to(torch.int32)
+    assert ((topk_slots >= limit).sum(dim=1) > 0).all()
+    topk_lens = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=1,
+    )
+
+    # The reference reads the selected rows from a compact copy.
+    compact = kv_cache[candidates]
+    position = torch.full((num_slots,), -1, device=device, dtype=torch.int64)
+    position[candidates] = torch.arange(candidates.numel(), device=device)
+    compact_slots = torch.where(
+        topk_slots >= 0, position[topk_slots.clamp(min=0).long()], -1
+    ).to(torch.int32)
+    ref = torch_dsa_sparse_attention(
+        q,
+        compact[:, :kv_lora_rank],
+        compact[:, kv_lora_rank:] if qk_rope_head_dim else None,
+        compact_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    del kv_cache
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
