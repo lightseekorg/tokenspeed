@@ -194,12 +194,14 @@ def retained_reset_length_kernel(
         "slot_count",
         "length_stride",
         "start_stride",
+        "fault_stride",
         "pages",
     ]
 )
 def retained_snapshot_kernel(
     length,
     start,
+    faults,
     record_slots,
     lives,
     rows,
@@ -210,14 +212,17 @@ def retained_snapshot_kernel(
     slot_count,
     length_stride,
     start_stride,
+    fault_stride,
     pages,
     BLOCK: tl.constexpr,
+    FAULT: tl.constexpr,
 ):
     """Copy each prefill row's count to its start, then clear stored rows' counts.
 
     A row's scan stores a dense state into its live page in every group or,
     as a padding row, in none: the count the groups share cannot describe a
-    partial store, so a row with live pages in some groups only fails.
+    partial store, so a row with live pages in some groups only keeps its
+    count and has its slot's fault set to FAULT.
     """
     row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     in_batch = row < rows
@@ -236,11 +241,32 @@ def retained_snapshot_kernel(
         ).to(tl.int64)
         stored_groups += ((live > 0) & (live < pages)).to(tl.int32)
     stored = stored_groups == group_count
-    tl.device_assert(
-        stored | (stored_groups == 0) | (resident == 0),
-        "a prefill row has live pages in some state groups only",
-    )
+    partial = resident & (stored_groups > 0) & (stored_groups < group_count)
+    tl.store(faults + slot * fault_stride, FAULT, mask=partial)
     tl.store(length + slot * length_stride, 0, mask=resident & stored)
+
+
+@triton.jit(do_not_specialize=["rows", "slot_stride", "slot_count", "fault_stride"])
+def retained_report_faults_kernel(
+    request_ends,
+    faults,
+    record_slots,
+    rows,
+    slot_stride,
+    slot_count,
+    fault_stride,
+    BLOCK: tl.constexpr,
+):
+    """Raise each row's ``request_ends`` entry to its record slot's fault."""
+    row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    in_batch = row < rows
+    slot = tl.load(record_slots + row * slot_stride, mask=in_batch, other=-1).to(
+        tl.int64
+    )
+    resident = in_batch & (slot >= 0) & (slot < slot_count)
+    fault = tl.load(faults + slot * fault_stride, mask=resident, other=0)
+    end = tl.load(request_ends + row, mask=resident, other=0)
+    tl.store(request_ends + row, tl.maximum(end, fault), mask=resident & (fault > 0))
 
 
 @triton.jit
@@ -586,6 +612,7 @@ def retained_batched_conv_kernel(
         "record_slot_stride",
         "length_stride",
         "start_stride",
+        "fault_stride",
         "verdict_stride",
         "stopped_count",
     ]
@@ -597,6 +624,7 @@ def retained_batched_publish_kernel(
     request_stopped,
     replay_length,
     replay_start,
+    faults,
     verdicts,
     request_ends,
     layers,
@@ -605,21 +633,25 @@ def retained_batched_publish_kernel(
     record_slot_stride,
     length_stride,
     start_stride,
+    fault_stride,
     verdict_stride,
     stopped_count,
     WINDOW: tl.constexpr,
     LAYERS: tl.constexpr,
     INCOMPLETE: tl.constexpr,
+    INCONSISTENT: tl.constexpr,
 ):
     """Publish one request row's count from every layer's commit verdict.
 
     Every layer's records follow the one count the request's slot keeps, so
-    it advances only when every layer accepted the round. A request still
-    decoding whose commit some layers accepted and others did not fails here
-    rather than replay records some layers never wrote. A request that ended
-    in this forward keeps the ``request_ends`` contract instead: a layer that
-    carried it but rejected its commit left its records outside the live
-    page, so the row reports ``INCOMPLETE``.
+    it advances only when every layer accepted the round and the round's
+    prepare found the slot sound. A request still decoding whose commit some
+    layers accepted and others did not, or whose slot holds a fault, reports
+    ``INCONSISTENT`` instead of replaying records some layers never wrote. A
+    request that ended in this forward keeps the ``request_ends`` contract: a
+    layer that carried it but rejected its commit left its records outside
+    the live page, so the row reports ``INCOMPLETE``. A row's entry is only
+    raised, never lowered.
     """
     row = tl.program_id(0).to(tl.int64)
     lanes = tl.arange(0, LAYERS)
@@ -645,17 +677,21 @@ def retained_batched_publish_kernel(
         mask=carried & (record_slot < stopped_count),
         other=0,
     )
-    tl.device_assert(
-        (stopped != 0) | (accepting == 0) | (accepting == layers),
-        "a retained commit accepted by some KDA layers only",
-    )
-    if accepting == layers:
+    fault = tl.load(faults + record_slot * fault_stride, mask=carried, other=0)
+    split = (stopped == 0) & (accepting > 0) & (accepting < layers)
+    if (accepting == layers) & (fault == 0):
         # An ended request's records are folded into its live page.
         tl.store(
             replay_length + record_slot * length_stride,
             tl.where(stopped != 0, 0, old + take).to(tl.int32),
         )
-    tl.store(request_ends + row, INCOMPLETE, mask=(stopped != 0) & (rejecting > 0))
+    code = tl.where(
+        split | (fault != 0),
+        INCONSISTENT,
+        tl.where((stopped != 0) & (rejecting > 0), INCOMPLETE, 0),
+    )
+    if code > 0:
+        tl.store(request_ends + row, tl.maximum(tl.load(request_ends + row), code))
 
 
 # Readying retained history for a verify forward, every layer in one launch.
@@ -673,6 +709,7 @@ _PREPARE_RUNTIME_ARGUMENTS = [
     "record_slot_count",
     "length_stride",
     "start_stride",
+    "fault_stride",
 ]
 
 
@@ -686,6 +723,7 @@ def retained_batched_prepare_kernel(
     record_slots,
     replay_length,
     replay_start,
+    faults,
     correction,
     retained_key,
     retained_decay,
@@ -699,11 +737,13 @@ def retained_batched_prepare_kernel(
     record_slot_count,
     length_stride,
     start_stride,
+    fault_stride,
     correction_strides,
     key_strides,
     decay_strides,
     CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
+    FAULT: tl.constexpr,
     GROUPS: tl.constexpr,
     STATE: tl.constexpr,
     HEADS: tl.constexpr,
@@ -726,7 +766,9 @@ def retained_batched_prepare_kernel(
     in ROWS x KEYS tiles; KEYS is DIM rounded up to a power of two. The
     first program of a row stores the round's start count -- 0 after a fold,
     else L -- which the verify and the commit read; the count itself and the
-    records stay untouched.
+    records stay untouched. A row whose L or T is out of range starts from 0
+    records, so its verify stays inside the history, and has its slot's
+    fault set to FAULT, which its commit reports.
     """
     layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     pages = tl.load(descriptors + layer * _DESCRIPTOR_COLUMNS + _PAGES).to(tl.int64)
@@ -765,11 +807,11 @@ def retained_batched_prepare_kernel(
     valid = (count >= 0) & (count <= CAPACITY) & (tokens > 0) & (tokens <= CAPACITY)
     fold = active & valid & (moved | (count + tl.maximum(tokens, WINDOW) > CAPACITY))
     if (layer == 0) & (tl.program_id(2) == 0):
-        tl.device_assert(valid | (active == 0), "invalid retained history interval")
+        tl.store(faults + slot * fault_stride, FAULT, mask=active & (valid == 0))
         tl.store(
             replay_start + slot * start_stride,
-            tl.where(fold, 0, count),
-            mask=active & valid,
+            tl.where(fold | (valid == 0), 0, count),
+            mask=active,
         )
     mine = group_lanes == tl.load(groups + layer)
     if not (fold & (tl.sum((mine & paged).to(tl.int32), 0) > 0)):

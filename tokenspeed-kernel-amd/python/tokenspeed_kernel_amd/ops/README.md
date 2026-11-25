@@ -2053,10 +2053,11 @@ prepare kernel with `max-ilp`.
 ### KDA retained history (gfx950 / gfx1250)
 
 Each physical page holds only a V-major FP32 or BF16 dense base. Each resident
-request slot holds FP32 correction U, normalized K and multiplicative decay,
-plus an INT32 accepted length L: the records accepted since the dense base of
-the request's page. Verify uses the row's physical page indices for dense
-state, and its record slot for L, all L accepted updates and new candidates.
+request slot holds every layer's FP32 correction U, normalized K and
+multiplicative decay, plus one INT32 accepted count that all its layers share:
+the records accepted since the dense base of the request's pages. Verify uses
+the row's physical page indices for dense state, and its record slot for the
+round's start count L, all L accepted updates and new candidates.
 Reconstruction accumulates in FP32 and rounds when writing the dense base.
 Shared source pages are immutable dense checkpoints. Each active request has a
 private live page.
@@ -2072,11 +2073,13 @@ architectures use supplied raw gate inputs directly.
 
 Before the verify forward, the caller runs the batched retained prepare that
 `tokenspeed-kernel` shares across vendors (`kda_retained_prepare`), once for
-every layer: a source-to-live transition or L + T greater than capacity C
-consolidates the accepted endpoint into the live dense base, and a second,
-ordered launch resets those slots' lengths. T is the actual packed request
-length. L + T equal to C still fits. Empty requests and padding pages leave
-page storage and lengths unchanged.
+every layer, in one launch: a source-to-live transition in any State group
+or L + T greater than capacity C consolidates the accepted endpoint into every
+layer's live dense base, and the launch stores the round's start count, 0
+after a fold. T is the actual packed request length. L + T equal to C still
+fits. Empty requests and padding pages leave page storage and counts
+unchanged; an out-of-range L or T starts from no record and sets the slot's
+fault.
 
 Verify reconstructs the accepted endpoint from the live base and history, then
 writes candidate U, K and decay at L + token offset. It preserves L and the
@@ -2086,18 +2089,24 @@ activation-dtype rounding, gate projection and state-panel scheduling are shared
 by one-token and speculative windows. The registered activation dtype is BF16.
 
 Retained commit clamps the accepted count to the actual window and configured
-bound, updates convolution from the caller's original QKV, then publishes the
-slot's new length. It does not replay dense state or copy retained records. Zero
-acceptance still copies source convolution history to a distinct live page.
-Invalid accepted stamps prevent both convolution writes and length publication.
+bound, updates convolution from the caller's original QKV and stores each
+layer's verdict on each row; a second launch reduces a row's verdicts and
+writes its count once, the start count plus the acceptance, when every layer
+accepted and its slot holds no fault. A still-decoding row that some layers
+reject, or a faulted slot, raises the row's `request_ends` entry to
+`REQUEST_DECODE_STATE_INCONSISTENT` instead. It does not replay dense state or
+copy retained records, except to fold a request that ended. Zero acceptance
+still copies source convolution history to a distinct live page. Invalid
+accepted stamps prevent that layer's convolution writes.
 Stamps validate the current candidate window; accepted history is independent
 of stamp-ring reuse.
 
 The public adapter accepts `KdaRetainedRecords`, including its
 `KdaRetainedHistory`; the AMD package receives the tensors explicitly and has
-no dependency on `tokenspeed-kernel`. Batched commit uses a 14-column
-descriptor: QKV, convolution and length pointers, the page count, per-layer
-element strides, then the v-major recurrent-state pointer and its strides.
+no dependency on `tokenspeed-kernel`. Batched commit uses a 12-column
+descriptor: QKV and convolution pointers, the page count, per-layer element
+strides, then the v-major recurrent-state pointer and its strides; the counts,
+start counts and faults are `[slots, 1]` tensors of their own.
 Record slots select the lengths. One launch updates all layers' convolution;
 the next publishes lengths. A request whose slot is set in `request_stopped`
 ended in this forward: the convolution launch also folds its records into

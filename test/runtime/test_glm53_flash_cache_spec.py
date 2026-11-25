@@ -394,12 +394,12 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> No
     conv_channels = 3 * heads * dim
     # 24 resident requests plus the two reserved request slots each hold FP32
     # U/K/decay records per layer, plus one INT32 accepted count every layer
-    # shares and one INT32 round-start count. Each batch row keeps one INT8
-    # commit verdict per layer.
+    # shares, one INT32 round-start count and one INT32 fault. Each batch row
+    # keeps one INT8 commit verdict per layer.
     slots = 26
     expected = (
         layers * batch * width * conv_channels * 2
-        + slots * (layers * 3 * heads * (width + 12) * dim * 4 + 2 * 4)
+        + slots * (layers * 3 * heads * (width + 12) * dim * 4 + 3 * 4)
         + layers * (12 * 8 + 4)
         + groups * 4 * 8
         + (2 * groups + 1) * batch * 4

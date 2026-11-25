@@ -25,12 +25,11 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.kda import (
     KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS as DESCRIPTOR_COLUMNS,
 )
-from tokenspeed_kernel.ops.metadata.stop_conditions import REQUEST_ENDED_INCOMPLETE
+from tokenspeed_kernel.ops.metadata.stop_conditions import (
+    REQUEST_DECODE_STATE_INCONSISTENT,
+    REQUEST_ENDED_INCOMPLETE,
+)
 from tokenspeed_kernel.platform import current_platform
-
-# The launches whose kernels assert on the device compile their asserts without
-# the integer-overflow checks a debug build adds to every operation.
-_ASSERTING = {"debug": True, "sanitize_overflow": False}
 
 
 def _kernels():
@@ -150,14 +149,15 @@ def reset_length(length, *, write_indices, record_slots, page_count):
     )
 
 
-def snapshot_length(length, start, *, record_slots, live_indices, page_count):
+def snapshot_length(length, start, faults, *, record_slots, live_indices, page_count):
     """Copy prefill rows' counts to their start, then clear stored rows' counts.
 
-    length and start are INT32 [record slots, 1]; record_slots holds each
-    prefill row's slot and live_indices the [groups, rows] live pages the
-    scan stores into. A row whose live page lies in the pool in every group
-    has its count cleared; one with none keeps it; one with some fails a
-    device assertion.
+    length, start and faults are INT32 [record slots, 1]; record_slots holds
+    each prefill row's slot and live_indices the [groups, rows] live pages
+    the scan stores into. A row whose live page lies in the pool in every
+    group has its count cleared; one with none keeps it; one with some keeps
+    it and has its slot's fault set to ``REQUEST_DECODE_STATE_INCONSISTENT``
+    (report_faults raises its row's ``request_ends`` entry).
     """
     if (
         isinstance(page_count, bool)
@@ -167,8 +167,9 @@ def snapshot_length(length, start, *, record_slots, live_indices, page_count):
         raise ValueError("page_count must be a positive page-pool size")
     _check_count("length", length, device=length.device)
     _check_count("start", start, device=length.device)
-    if start.shape != length.shape:
-        raise ValueError("start must match length")
+    _check_count("faults", faults, device=length.device)
+    if start.shape != length.shape or faults.shape != length.shape:
+        raise ValueError("start and faults must match length")
     rows = record_slots.numel()
     if (
         record_slots.ndim != 1
@@ -191,6 +192,7 @@ def snapshot_length(length, start, *, record_slots, live_indices, page_count):
     retained.retained_snapshot_kernel[(triton.cdiv(rows, 256),)](
         length,
         start,
+        faults,
         record_slots,
         live_indices,
         rows,
@@ -200,10 +202,47 @@ def snapshot_length(length, start, *, record_slots, live_indices, page_count):
         length.shape[0],
         length.stride(0),
         start.stride(0),
+        faults.stride(0),
         page_count,
         BLOCK=256,
+        FAULT=REQUEST_DECODE_STATE_INCONSISTENT,
         num_warps=4,
-        **_ASSERTING,
+    )
+
+
+def report_faults(request_ends, faults, *, record_slots):
+    """Raise each row's ``request_ends`` entry to its record slot's fault.
+
+    request_ends is the contiguous INT32 [rows] stop-condition report,
+    faults the INT32 [record slots, 1] faults and record_slots each row's
+    slot. Entries are only raised; rows whose slot holds no fault keep theirs.
+    """
+    _check_count("faults", faults, device=faults.device)
+    rows = record_slots.numel()
+    if (
+        request_ends.shape != (rows,)
+        or request_ends.dtype != torch.int32
+        or not request_ends.is_contiguous()
+        or record_slots.ndim != 1
+        or record_slots.dtype not in (torch.int32, torch.int64)
+        or any(x.device != faults.device for x in (request_ends, record_slots))
+    ):
+        raise ValueError("request ends must be contiguous INT32, one per slot row")
+    if rows == 0:
+        return
+    # Both vendors share this Triton kernel.
+    from tokenspeed_kernel.ops.attention.kda._triton import retained
+
+    retained.retained_report_faults_kernel[(triton.cdiv(rows, 256),)](
+        request_ends,
+        faults,
+        record_slots,
+        rows,
+        record_slots.stride(0),
+        faults.shape[0],
+        faults.stride(0),
+        BLOCK=256,
+        num_warps=4,
     )
 
 
@@ -224,6 +263,7 @@ def batched_commit(
     retained_decay,
     replay_length,
     replay_start,
+    replay_faults,
     commit_verdicts,
     request_stopped,
     request_ends,
@@ -264,9 +304,12 @@ def batched_commit(
     contiguous-row INT8 [rows >= requests, layers] scratch: the first launch
     stores each layer's verdict on each request's commit, and the second
     reduces a request's verdicts and writes its count once, to
-    replay_start + accepted when every layer accepted. A request still
-    decoding that some layers accept and others reject fails a device
-    assertion: its count cannot describe both. request_stopped is a bool per
+    replay_start + accepted when every layer accepted and the request's
+    replay_faults entry (INT32 [record slots, 1], set by the prepare) is 0.
+    A request still decoding that some layers accept and others reject, or
+    whose slot holds a fault, has its request_ends entry raised to
+    ``REQUEST_DECODE_STATE_INCONSISTENT``, and its count stays: one count
+    cannot describe both. request_stopped is a bool per
     request slot, set for a request that ended in this forward. Such a
     request's accepted records, through this round's acceptance, are folded
     into its live page's dense state, and its count is cleared instead of
@@ -366,6 +409,7 @@ def batched_commit(
     for name, count in (
         ("replay_length", replay_length),
         ("replay_start", replay_start),
+        ("replay_faults", replay_faults),
     ):
         _check_count(name, count, device=descriptors.device)
         if count.shape[0] != record_slot_count:
@@ -458,6 +502,7 @@ def batched_commit(
         request_stopped,
         replay_length,
         replay_start,
+        replay_faults,
         commit_verdicts,
         request_ends,
         layers,
@@ -466,14 +511,15 @@ def batched_commit(
         record_slots.stride(0),
         replay_length.stride(0),
         replay_start.stride(0),
+        replay_faults.stride(0),
         commit_verdicts.stride(0),
         request_stopped.numel(),
         WINDOW=draft_token_num,
         LAYERS=triton.next_power_of_2(layers),
         INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
+        INCONSISTENT=REQUEST_DECODE_STATE_INCONSISTENT,
         num_warps=4,
         **options,
-        **_ASSERTING,
     )
 
 
@@ -491,6 +537,7 @@ def batched_prepare(
     retained_decay,
     replay_length,
     replay_start,
+    replay_faults,
     history_capacity,
     draft_token_num,
     num_heads,
@@ -519,8 +566,10 @@ def batched_prepare(
     else L. The verify and the commit read it; the commit alone writes the
     count. Padding rows (pages at or below 0 or at or past the pool in every
     group, an empty window or a slot outside the record slots) keep their
-    pages and start counts; an L or T out of range on any other row fails a
-    device assertion.
+    pages and start counts. Any other row whose L or T is out of range starts
+    from no record, so its verify stays inside the history, and has its
+    replay_faults entry set to ``REQUEST_DECODE_STATE_INCONSISTENT``, which
+    its commit reports.
     """
     if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
         raise ValueError(
@@ -575,6 +624,7 @@ def batched_prepare(
     for name, count in (
         ("replay_length", replay_length),
         ("replay_start", replay_start),
+        ("replay_faults", replay_faults),
     ):
         _check_count(name, count, device=descriptors.device)
         if count.shape[0] != record_slot_count:
@@ -605,6 +655,7 @@ def batched_prepare(
         record_slots,
         replay_length,
         replay_start,
+        replay_faults,
         *records,
         groups,
         *source_indices.stride(),
@@ -614,9 +665,11 @@ def batched_prepare(
         record_slot_count,
         replay_length.stride(0),
         replay_start.stride(0),
+        replay_faults.stride(0),
         *(x.stride() for x in records),
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
+        FAULT=REQUEST_DECODE_STATE_INCONSISTENT,
         GROUPS=triton.next_power_of_2(groups),
         STATE=states[recurrent_state_dtype],
         HEADS=num_heads,
@@ -624,6 +677,4 @@ def batched_prepare(
         KEYS=keys,
         ROWS=min(triton.next_power_of_2(head_dim), max(1, 2048 // keys)),
         num_warps=4,
-        # Keeps the interval assertion.
-        **_ASSERTING,
     )

@@ -754,6 +754,7 @@ def kda_reset_retained_length(
 def kda_snapshot_retained_length(
     length: torch.Tensor,
     start: torch.Tensor,
+    faults: torch.Tensor,
     *,
     record_slots: torch.Tensor,
     live_indices: torch.Tensor,
@@ -767,11 +768,14 @@ def kda_snapshot_retained_length(
     and clears it for each row whose scan stores a dense state: one whose live
     page lies in the pool in every state group. A row with live pages in no
     group (padding) keeps its count; one with live pages in some groups only
-    fails a device assertion, as one count cannot describe both.
+    keeps it too and has its slot's fault set to
+    ``REQUEST_DECODE_STATE_INCONSISTENT``, as one count cannot describe both
+    (kda_report_retained_faults reports it).
 
     Args:
         length: The shared INT32 [slot, 1] counts.
         start: INT32 [slot, 1] counts the forward's readers apply.
+        faults: INT32 [slot, 1] faults; only raised.
         record_slots: Each prefill row's record slot.
         live_indices: Integer [groups, rows] live pages of the prefill rows.
         page_count: The State pool's page count.
@@ -781,10 +785,34 @@ def kda_snapshot_retained_length(
     snapshot_length(
         length,
         start,
+        faults,
         record_slots=record_slots,
         live_indices=live_indices,
         page_count=page_count,
     )
+
+
+def kda_report_retained_faults(
+    request_ends: torch.Tensor,
+    faults: torch.Tensor,
+    *,
+    record_slots: torch.Tensor,
+) -> None:
+    """Raise rows' ``request_ends`` entries to their slots' retained faults.
+
+    Run after the forward's stop conditions wrote ``request_ends``: they
+    overwrite every row, so a fault found before them (the prefill snapshot)
+    reaches the control plane only through this. The decode commit reports
+    its rows' faults itself.
+
+    Args:
+        request_ends: The forward's contiguous INT32 per-row report.
+        faults: INT32 [slot, 1] retained faults.
+        record_slots: Each row's record slot.
+    """
+    from tokenspeed_kernel.ops.attention.kda._retained import report_faults
+
+    report_faults(request_ends, faults, record_slots=record_slots)
 
 
 def resolve_kda_batched_retained_commit(
@@ -800,8 +828,10 @@ def resolve_kda_batched_retained_commit(
     every layer shares, and replay_start, the count the round's prepare left.
     The commit writes a request's count once, after every layer's verdict
     (commit_verdicts): replay_start plus its acceptance when every layer
-    accepted; a request still decoding that some layers reject fails a device
-    assertion. A request whose slot is set in request_stopped ended in this
+    accepted and replay_faults holds no fault for its slot; a request still
+    decoding that some layers reject, or whose slot holds a fault, is
+    reported as ``REQUEST_DECODE_STATE_INCONSISTENT`` in request_ends and
+    keeps its count. A request whose slot is set in request_stopped ended in this
     forward: its accepted records are folded into its live page and its count
     is cleared. One whose commit a layer that carried it rejects instead is
     reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's
@@ -833,7 +863,9 @@ def resolve_kda_batched_retained_prepare(
     each request's round-start count in replay_start: 0 after a fold, else L.
     The verify reads it, so it sees at most capacity - draft_token_num
     records a request, and the commit derives the new count from it; the
-    launch leaves replay_length to the commit. Run it once per verify round,
+    launch leaves replay_length to the commit. A request whose count or
+    window is out of range starts from no record and has its replay_faults
+    entry set, which the commit reports. Run it once per verify round,
     after the round's pages, boundaries and record slots are refreshed and
     before any layer's verify: a second run would copy the unchanged source
     over the fold.
@@ -959,6 +991,7 @@ __all__ = [
     "kda_materialize_retained_state",
     "kda_reset_retained_length",
     "kda_snapshot_retained_length",
+    "kda_report_retained_faults",
     "resolve_kda_batched_retained_commit",
     "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",

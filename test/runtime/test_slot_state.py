@@ -783,6 +783,9 @@ def test_kda_recycled_and_restored_slots_start_without_accepted_records():
     counts = backend._replay_length
     assert counts.shape == (backend._record_slot_count, 1)
     counts.fill_(5)
+    # A fault a previous owner left is no new owner's either.
+    faults = backend._replay_faults
+    faults.fill_(3)
     # Slots 2 and 4 start serving new admissions (RuntimeStates.bind_stop_criteria).
     backend.reset_request_workspace(torch.tensor([2, 4]), stream=None)
     # A restore imports no KDA rows; the restored slot starts empty too.
@@ -792,6 +795,7 @@ def test_kda_recycled_and_restored_slots_start_without_accepted_records():
     for slot in range(counts.shape[0]):
         expected = 0 if slot in (2, 4, 6) else 5
         assert counts[slot].item() == expected, slot
+        assert faults[slot].item() == (0 if slot in (2, 4, 6) else 3), slot
 
 
 @pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)

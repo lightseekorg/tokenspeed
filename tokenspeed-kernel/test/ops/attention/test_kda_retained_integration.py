@@ -21,16 +21,15 @@
 """Retained serving contract: batched prepare, public verify, gathered endpoints,
 batched commit."""
 
-import os
-import subprocess
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention import kda
-from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, REQUEST_ENDED_INCOMPLETE
+from tokenspeed_kernel.ops.metadata import (
+    REQUEST_DECODE_STATE_INCONSISTENT,
+    REQUEST_ENDED,
+    REQUEST_ENDED_INCOMPLETE,
+)
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -324,6 +323,7 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         retained_decay=records[2],
         replay_length=length,
         replay_start=start_count,
+        replay_faults=torch.zeros(4, 1, device="cuda", dtype=torch.int32),
         # Scratch rows for the largest batch a test commits.
         commit_verdicts=torch.empty(64, layers, device="cuda", dtype=torch.int8),
         request_stopped=request_stopped,
@@ -404,35 +404,34 @@ def test_batched_retained_commit_folds_ended_requests(window, stale, state_dtype
         torch.testing.assert_close(state, expected_state, **tolerance)
 
 
-def _commit_rejected_by_one_layer(window):
-    """Run a commit one layer of a still-decoding request rejects (a child)."""
-    args, keepalive, _, _ = _commit_case(window, stale=True)
-    _resolve_commit()(**args)
-    torch.cuda.synchronize()
-
-
 @pytest.mark.parametrize("window", [1, 4])
-def test_a_commit_some_layers_reject_fails_on_the_device(window):
+def test_a_commit_some_layers_reject_reports_an_inconsistent_state(window):
     """Every layer shares a request's count, so it cannot advance for some
     layers and not others: a still-decoding request whose stale stamps one
-    layer rejects stops the process instead of drifting."""
-    child = (
-        "import sys; sys.path[:0] = sys.argv[1].split(';'); "
-        "import test_kda_retained_integration as case; "
-        "case._commit_rejected_by_one_layer(int(sys.argv[2]))"
-    )
-    paths = [str(Path(__file__).parent), *(path for path in sys.path if path)]
-    done = subprocess.run(
-        [sys.executable, "-c", child, ";".join(paths), str(window)],
-        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    assert done.returncode != 0, done.stdout[-2000:]
-    assert (
-        "a retained commit accepted by some KDA layers only" in done.stderr
-    ), done.stderr[-4000:]
+    layer rejects keeps its count, and its row reports the state
+    inconsistent; the other rows commit as usual."""
+    args, keepalive, actual, expected = _commit_case(window, stale=True)
+    _resolve_commit()(**args)
+    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
+    torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+    # Row 1's slot 3 keeps the count it had before the round.
+    assert int(actual[1][3]) == 7
+
+
+def test_a_slot_the_prepare_flagged_reports_an_inconsistent_state():
+    """A fault the prepare left in a slot reaches the row's report at the
+    commit, and its count stays; a higher code than a row's end report wins."""
+    args, keepalive, actual, expected = _commit_case(4, stopped_slots=(0,))
+    args["replay_faults"][[1, 0]] = REQUEST_DECODE_STATE_INCONSISTENT
+    _resolve_commit()(**args)
+    assert args["request_ends"].tolist() == [
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        0,
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        0,
+    ]
+    # Slots 1 and 0 keep their counts; slot 3 commits.
+    assert actual[1][:, 0].tolist() == [7, 7, 7, 2 + 3]
 
 
 @pytest.mark.parametrize(
@@ -928,6 +927,7 @@ def _prepare_case(window, *, state_dtype=torch.float32):
         retained_decay=records[2],
         replay_length=length,
         replay_start=start_count,
+        replay_faults=torch.zeros(slots, 1, device="cuda", dtype=torch.int32),
         history_capacity=capacity,
         draft_token_num=window,
         num_heads=heads,
@@ -1016,6 +1016,52 @@ def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
                     record_slots=torch.zeros(batch, device="cuda", dtype=torch.int64),
                 )
             )
+
+
+def test_a_count_past_the_capacity_flags_its_slot_and_starts_from_no_record():
+    """The prepare cannot fold records past the history; the row starts from
+    no record, so its verify stays inside the history, its pages stay as
+    they are, and its slot's fault reports the state inconsistent."""
+    args, states, (expected_states, expected_start) = _prepare_case(4)
+    # Row 2 (slot 0) fits exactly in the case; make its count overflow.
+    args["replay_length"][0] = 9
+    before = [state.clone() for state in states]
+    _resolve_prepare()(**args)
+    assert args["replay_faults"][:, 0].tolist() == [
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        *[0] * 7,
+    ]
+    assert int(args["replay_start"][0]) == 0
+    assert int(args["replay_length"][0]) == 9
+    for layer, state in enumerate(states):
+        page = 3 if layer == 1 else 7
+        torch.testing.assert_close(state[page], before[layer][page], atol=0, rtol=0)
+
+
+def test_a_prefill_snapshot_clears_counts_once_and_flags_partial_rows():
+    """Rows whose live pages lie in every group start from their counts,
+    which clear; a padding row keeps its count; a row with live pages in one
+    group only keeps its count and has its slot flagged, which the report
+    raises its row's request end to."""
+    length = torch.tensor([[4], [5], [6], [7]], device="cuda", dtype=torch.int32)
+    start = torch.full_like(length, -1)
+    faults = torch.zeros_like(length)
+    slots = torch.tensor([2, 0, 3], device="cuda", dtype=torch.int64)
+    live = torch.tensor([[5, -1, 6], [7, -1, -1]], device="cuda", dtype=torch.int32)
+    kda.kda_snapshot_retained_length(
+        length, start, faults, record_slots=slots, live_indices=live, page_count=8
+    )
+    assert start[:, 0].tolist() == [4, -1, 6, 7]
+    assert length[:, 0].tolist() == [4, 5, 0, 7]
+    assert faults[:, 0].tolist() == [0, 0, 0, REQUEST_DECODE_STATE_INCONSISTENT]
+    # The stop conditions wrote every row since; the report raises the third.
+    request_ends = torch.tensor([REQUEST_ENDED, 0, 0], device="cuda", dtype=torch.int32)
+    kda.kda_report_retained_faults(request_ends, faults, record_slots=slots)
+    assert request_ends.tolist() == [
+        REQUEST_ENDED,
+        0,
+        REQUEST_DECODE_STATE_INCONSISTENT,
+    ]
 
 
 def test_far_pages_of_a_pool_past_int32_prepare_like_near_ones():

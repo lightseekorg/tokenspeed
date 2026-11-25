@@ -821,6 +821,7 @@ def prepare_kda_retained_commit(
     # Every layer shares a request's count; its verify read the round's start.
     replay_length = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
     replay_start = torch.zeros_like(replay_length)
+    replay_faults = torch.zeros_like(replay_length)
     layer_inputs, descriptors, before = [], [], []
     for layer_idx in range(layers):
         layer = _retained_benchmark_layer(
@@ -896,6 +897,7 @@ def prepare_kda_retained_commit(
             retained_decay=records[2],
             replay_length=replay_length,
             replay_start=replay_start,
+            replay_faults=replay_faults,
             commit_verdicts=verdicts,
             request_stopped=request_stopped,
             request_ends=request_ends,

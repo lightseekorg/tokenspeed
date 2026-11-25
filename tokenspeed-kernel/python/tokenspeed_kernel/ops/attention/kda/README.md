@@ -56,8 +56,10 @@ request's. The convolution launch stores each layer's verdict on each row
 (it does not carry the row, rejects its commit or accepts it) in an INT8
 `[rows, layers]` scratch, and the count launch reduces a row's verdicts and
 writes its count once: the start count plus the acceptance, when every layer
-accepted. A request still decoding that some layers accept and others reject
-fails a device assertion instead of letting its layers drift. A request whose
+accepted. A request still decoding that some layers accept and others reject,
+or whose slot holds a fault (below), keeps its count, and its `request_ends`
+entry rises to `REQUEST_DECODE_STATE_INCONSISTENT` instead of letting its
+layers drift; the control plane stops and names the request. A request whose
 slot is set in `request_stopped` ended in this forward: the convolution launch
 also folds its records, through this round's acceptance, into its live page
 (each program of a row takes some heads), and the count launch clears its
@@ -120,8 +122,10 @@ groups and kept in others. The verify kernels read at most capacity minus the
 verify window records, so a request with a shorter window folds as soon as a
 full one would. The first program of a request stores its start count, 0 after
 a fold and L otherwise, which the verify and the commit read; the count itself
-changes only in the commit. Padding rows keep their pages and start counts; an
-out-of-range L or T fails a device assertion. The launch takes the commit's
+changes only in the commit. Padding rows keep their pages and start counts. A
+row whose L or T is out of range starts from no record, so its verify stays
+inside the history, and its slot's fault (an INT32 `[slots, 1]` tensor) is set
+for the commit to report. The launch takes the commit's
 per-layer descriptors, which must share the page count, the layer-to-group map
 and `[groups, requests]` source and live page tables. The fold splits a
 request's heads across programs only when few requests and layers would leave
@@ -161,7 +165,10 @@ and cuDNN graph paths. Before the forward, `kda_snapshot_retained_length`
 copies the prefill rows' counts to their start counts and clears, once, the
 counts of the rows whose scans store a dense live page in every group; it skips
 padding rows (a live page at or below 0, or at or past the pool's
-`page_count`). Each layer's retained source is then gathered and reconstructed
+`page_count`), and a row with live pages in some groups only keeps its count
+and has its slot's fault set. The stop conditions rewrite every row's
+`request_ends` entry after that, so `kda_report_retained_faults` raises the
+extend rows' entries to their faults once they have run. Each layer's retained source is then gathered and reconstructed
 in FP32 from the start counts before its scan. Final/checkpoint dense stores
 use the selected base dtype. Before a retraction stores its image or anything
 reads the endpoint it published, `kda_materialize_retained_pages` folds each

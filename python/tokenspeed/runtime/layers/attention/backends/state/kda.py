@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
 )
 from tokenspeed_kernel.ops.attention.kda import (
+    kda_report_retained_faults,
     kda_reset_retained_length,
     kda_retained_supported,
     kda_snapshot_retained_length,
@@ -181,11 +182,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
     # Retraction folds accepted records into the dense page before slot reuse
     # (fold_deferred_state). A recycled or restored slot starts with an
     # accepted count of zero. A forward's start counts live only within it:
-    # its prepare or prefill snapshot writes them before any reader.
+    # its prepare or prefill snapshot writes them before any reader. A fault
+    # stops the engine at the forward that reports it; a new owner clears it.
     workspace_slot_state = (
         "_retained_records",
         "_replay_length",
         "_replay_start",
+        "_replay_faults",
     )
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
@@ -268,6 +271,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # verify and commit of a round (after its prepare's fold) and every
         # layer's prefill gather -- written once before the forward's layers.
         self._replay_start: torch.Tensor | None = None
+        # INT32 [request slots, 1]: REQUEST_DECODE_STATE_INCONSISTENT once a
+        # prepare or prefill snapshot found the slot's retained history
+        # unsound; the commit or report_request_faults raises the row's
+        # request_ends entry to it, after the stop conditions wrote that.
+        self._replay_faults: torch.Tensor | None = None
         # INT8 [max_bs, layers]: each layer's verdict on each row's commit,
         # which the commit reduces before it writes a request's count.
         self._commit_verdicts: torch.Tensor | None = None
@@ -529,6 +537,24 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if num_extends and not forward_mode.is_idle():
             self._snapshot_prefill_lengths(num_extends)
 
+    @override
+    def report_request_faults(
+        self, request_ends: torch.Tensor, *, num_extends: int
+    ) -> None:
+        if (
+            not num_extends
+            or self._replay_faults is None
+            or not self._replay_faults.is_cuda
+        ):
+            # No extend row, or no decode workspace (prefill-only engines,
+            # CPU-only metadata tests): no snapshot ran.
+            return
+        kda_report_retained_faults(
+            request_ends[:num_extends],
+            self._replay_faults,
+            record_slots=self.forward_metadata.req_pool_indices[:num_extends],
+        )
+
     def _snapshot_prefill_lengths(self, num_extends: int) -> None:
         """Hand the extend rows' counts to every layer's gather, clearing them.
 
@@ -545,6 +571,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         kda_snapshot_retained_length(
             self._replay_length,
             self._replay_start,
+            self._replay_faults,
             record_slots=metadata.req_pool_indices[:num_extends],
             live_indices=torch.stack(
                 [
@@ -569,10 +596,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         super().reset_request_workspace(request_slots, stream=stream)
         if self._replay_length is not None and request_slots.numel():
             with stream_scope(stream):
-                counts = self._replay_length
-                counts.index_fill_(
-                    0, request_slots.to(device=counts.device, dtype=torch.int64), 0
-                )
+                slots = request_slots.to(device=self.device, dtype=torch.int64)
+                self._replay_length.index_fill_(0, slots, 0)
+                self._replay_faults.index_fill_(0, slots, 0)
 
     @override
     def import_slot_state(
@@ -587,6 +613,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._replay_length is not None:
             with stream_scope(stream):
                 self._replay_length[slot].zero_()
+                self._replay_faults[slot].zero_()
 
     def _allocate_replay_workspace(self) -> None:
         """Allocate max_bs * T original QKV rows before eager or graph execution.
@@ -641,6 +668,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 (self._record_slot_count, 1), dtype=torch.int32, device=self.device
             )
             self._replay_start = torch.zeros_like(self._replay_length)
+            self._replay_faults = torch.zeros_like(self._replay_length)
             self._commit_verdicts = torch.zeros(
                 (self.max_bs, len(layer_ids)), dtype=torch.int8, device=self.device
             )
@@ -892,6 +920,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_decay=decay,
             replay_length=self._replay_length,
             replay_start=self._replay_start,
+            replay_faults=self._replay_faults,
             history_capacity=capacity,
             draft_token_num=self.speculative_num_draft_tokens,
             num_heads=heads,
@@ -956,6 +985,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             + self._retained_records.nbytes
             + self._replay_length.nbytes
             + self._replay_start.nbytes
+            + self._replay_faults.nbytes
         )
         metadata_bytes = sum(
             tensor.nbytes
@@ -1155,8 +1185,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # token. A layer whose verify did not run this round therefore fails
         # the generation-stamp check and leaves its cache fields unchanged;
         # every layer of a request shares its count, so a request still
-        # decoding that some layers accept and others reject fails the
-        # commit's device assertion instead of advancing. A request that
+        # decoding that some layers accept and others reject, or whose slot
+        # the prepare found unsound, keeps its count, and its row in
+        # request_ends says its state is inconsistent. A request that
         # ended in this forward has its records folded into its live block,
         # which its finish publishes; if a layer that carried it rejects its
         # commit, its row in request_ends says the block is incomplete.
@@ -1178,6 +1209,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_decay=decay,
             replay_length=self._replay_length,
             replay_start=self._replay_start,
+            replay_faults=self._replay_faults,
             commit_verdicts=self._commit_verdicts,
             request_stopped=self._request_stopped,
             request_ends=self._request_ends[first_row : first_row + bs],

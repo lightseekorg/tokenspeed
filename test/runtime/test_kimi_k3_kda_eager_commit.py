@@ -1,7 +1,6 @@
 """Retained KDA runtime commitment, graph replay and PyTorch references."""
 
 import os
-import subprocess
 import sys
 
 import numpy as np
@@ -2314,35 +2313,67 @@ def test_an_ended_request_some_layers_reject_reports_incomplete():
     assert harness.backend._replay_length[1].item() == T
 
 
-_DISAGREEING_COMMIT = """
-import sys
-
-sys.path[:0] = sys.argv[1].split(";")
-import torch
-from test.runtime.test_kimi_k3_kda_eager_commit import _STATE_GROUPS, T, _Harness
-
-harness = _Harness(draft_tokens=T, seed=1703)
-# Only the first layer verifies; the others keep the previous round's stamps.
-harness.layer_ids = harness.layer_ids[:1]
-pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
-harness.round([1], pages, [8 + T], 1703, [T])
-torch.cuda.synchronize()
-"""
-
-
-def test_a_decoding_request_some_layers_reject_fails_explicitly():
+def test_a_decoding_request_some_layers_reject_reports_an_inconsistent_state():
     """Every layer of a request shares its count, so a commit that some
     layers accept and others reject cannot be published for a request still
-    decoding: the commit stops the process instead of letting layers drift."""
-    paths = [path for path in sys.path if path]
-    done = subprocess.run(
-        [sys.executable, "-c", _DISAGREEING_COMMIT, ";".join(paths)],
-        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-        capture_output=True,
-        text=True,
-        timeout=900,
+    decoding: its row reports the state inconsistent, which stops the
+    engine, and its count stays instead of letting layers drift."""
+    from tokenspeed_kernel.ops.metadata import REQUEST_DECODE_STATE_INCONSISTENT
+
+    harness = _Harness(draft_tokens=T, seed=1703)
+    pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
+    harness.round([1], pages, [8 + T], 1703, [T])
+    # Only the first layer verifies; the others keep the last round's stamps.
+    harness.layer_ids = harness.layer_ids[:1]
+    harness.round([1], pages, [8 + 2 * T], 1704, [T])
+    assert harness.request_ends[0].item() == REQUEST_DECODE_STATE_INCONSISTENT
+    assert harness.backend._replay_length[1].item() == T
+
+
+def test_an_extend_row_with_live_pages_in_some_groups_reports_inconsistent():
+    """An extend's metadata cannot clear one count for a row whose scan
+    stores into some groups' live pages only: the row keeps its count, and
+    the report after the stop conditions raises its request end."""
+    from tokenspeed_kernel.ops.metadata import (
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        REQUEST_ENDED,
     )
-    assert done.returncode != 0, done.stdout[-2000:]
-    assert (
-        "a retained commit accepted by some KDA layers only" in done.stderr
-    ), done.stderr[-4000:]
+
+    harness = _Harness(draft_tokens=4)
+    _seed_retained_history(harness, slot=1, length=3)
+    _seed_retained_history(harness, slot=2, length=3)
+    prefix = torch.tensor([8, 8], dtype=torch.int32)
+    new_tokens = torch.tensor([1, 1], dtype=torch.int32)
+    tables = {
+        group: np.asarray([[2 + index, 2 + index], [0, 5 + index]], dtype=np.int32)
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    delivered = _tables_for(harness.contract, tables, DEV)
+    # Row 1 (slot 2) keeps a live page in the first group only.
+    for group in _STATE_GROUPS[1:]:
+        delivered[group][1, 1] = -1
+    harness.backend.init_forward_metadata(
+        2,
+        2,
+        torch.tensor([1, 2], device=DEV, dtype=torch.int32),
+        (prefix + new_tokens).to(DEV),
+        ForwardMode.EXTEND,
+        block_tables=delivered,
+        extend_seq_lens=new_tokens.to(DEV),
+        extend_seq_lens_cpu=new_tokens,
+        extend_prefix_lens=prefix.to(DEV),
+        extend_prefix_lens_cpu=prefix,
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=prefix + new_tokens,
+        extend_with_prefix=True,
+        extend_state_checkpoint_lens_cpu=torch.zeros_like(prefix),
+        query_shard=None,
+    )
+    assert harness.backend._replay_length[[1, 2]].flatten().tolist() == [0, 3]
+    # The stop conditions overwrite every row; the report runs after them.
+    harness.request_ends[:2] = torch.tensor([REQUEST_ENDED, 0], dtype=torch.int32)
+    harness.backend.report_request_faults(harness.request_ends[:2], num_extends=2)
+    assert harness.request_ends[:2].tolist() == [
+        REQUEST_ENDED,
+        REQUEST_DECODE_STATE_INCONSISTENT,
+    ]

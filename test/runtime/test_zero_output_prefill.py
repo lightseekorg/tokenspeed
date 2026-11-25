@@ -584,8 +584,13 @@ def test_drafter_future_inputs_keep_original_request_rows():
         dspark_context_producer=None,
         attn_backend=SimpleNamespace(
             prepare_cache_batch=lambda *args, **kwargs: None,
+            report_request_faults=lambda request_ends, *, num_extends: None,
             writeback_accepted_kv=lambda *args: None,
         ),
+        # One stop-condition report per batch row, as __init__ sizes it.
+        request_ends=torch.zeros(4, dtype=torch.int32),
+        # The drafter branch reads whether next-round inputs overlap.
+        forward_step=SimpleNamespace(draft_overlap=None),
         device_module=SimpleNamespace(current_stream=lambda: None),
         drafter=SimpleNamespace(
             prepare_target_forward=lambda ctx: None,

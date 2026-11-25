@@ -354,6 +354,22 @@ class CachePoolBinding:
         for child in self.child_backends():
             child.bind_request_stop_flags(stopped, request_ends)
 
+    def report_request_faults(
+        self, request_ends: torch.Tensor, *, num_extends: int
+    ) -> None:
+        """Raise the extend rows' ``request_ends`` entries to their faults.
+
+        The executor calls this right after the stop conditions wrote
+        ``request_ends`` (``[rows]`` INT32) for the forward's rows, the
+        ``num_extends`` extend rows leading. A node that found an extend
+        row's deferred decode state inconsistent before the stop conditions
+        ran raises its entry to ``REQUEST_DECODE_STATE_INCONSISTENT``; a
+        decode commit reports its own rows. Broadcast to child backends; a
+        node without deferred state does nothing.
+        """
+        for child in self.child_backends():
+            child.report_request_faults(request_ends, num_extends=num_extends)
+
     def fold_deferred_state(
         self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
     ) -> None:

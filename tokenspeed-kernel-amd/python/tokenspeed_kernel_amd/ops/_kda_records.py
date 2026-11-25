@@ -742,6 +742,7 @@ def retained_batched_conv_kernel(
         "record_slot_stride",
         "length_stride",
         "start_stride",
+        "fault_stride",
         "verdict_stride",
         "stopped_count",
     ],
@@ -753,6 +754,7 @@ def retained_batched_publish_kernel(
     request_stopped,
     replay_length,
     replay_start,
+    faults,
     verdicts,
     request_ends,
     layers,
@@ -761,22 +763,26 @@ def retained_batched_publish_kernel(
     record_slot_stride,
     length_stride,
     start_stride,
+    fault_stride,
     verdict_stride,
     stopped_count,
     WINDOW: gl.constexpr,
     LAYERS: gl.constexpr,
     INCOMPLETE: gl.constexpr,
+    INCONSISTENT: gl.constexpr,
     WAVE: gl.constexpr,
 ):
     """Publish one request row's count from every layer's commit verdict.
 
     Every layer's records follow the one count the request's slot keeps, so
-    it advances only when every layer accepted the round. A request still
-    decoding whose commit some layers accepted and others did not fails here
-    rather than replay records some layers never wrote. A request that ended
-    in this forward keeps the ``request_ends`` contract instead: a layer that
-    carried it but rejected its commit left its records outside the live
-    page, so the row reports ``INCOMPLETE``.
+    it advances only when every layer accepted the round and the round's
+    prepare found the slot sound. A request still decoding whose commit some
+    layers accepted and others did not, or whose slot holds a fault, reports
+    ``INCONSISTENT`` instead of replaying records some layers never wrote. A
+    request that ended in this forward keeps the ``request_ends`` contract: a
+    layer that carried it but rejected its commit left its records outside
+    the live page, so the row reports ``INCOMPLETE``. A row's entry is only
+    raised, never lowered.
     """
     row = gl.program_id(0).to(gl.int64)
     lanes = gl.arange(0, LAYERS, layout=gl.BlockedLayout([1], [WAVE], [4], [0]))
@@ -802,14 +808,18 @@ def retained_batched_publish_kernel(
         mask=carried & (record_slot < stopped_count),
         other=0,
     )
-    gl.device_assert(
-        (stopped != 0) | (accepting == 0) | (accepting == layers),
-        "a retained commit accepted by some KDA layers only",
-    )
-    if accepting == layers:
+    fault = gl.load(faults + record_slot * fault_stride, mask=carried, other=0)
+    split = (stopped == 0) & (accepting > 0) & (accepting < layers)
+    if (accepting == layers) & (fault == 0):
         # An ended request's records are folded into its live page.
         gl.store(
             replay_length + record_slot * length_stride,
             gl.where(stopped != 0, 0, old + take).to(gl.int32),
         )
-    gl.store(request_ends + row, INCOMPLETE, mask=(stopped != 0) & (rejecting > 0))
+    code = gl.where(
+        split | (fault != 0),
+        INCONSISTENT,
+        gl.where((stopped != 0) & (rejecting > 0), INCOMPLETE, 0),
+    )
+    if code > 0:
+        gl.store(request_ends + row, gl.maximum(gl.load(request_ends + row), code))

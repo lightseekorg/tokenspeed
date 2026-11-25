@@ -118,6 +118,18 @@ def make_case(
     )
 
 
+# Each history's INT32 [slots, 1] retained faults, kept for graph capture.
+_FAULTS: dict[tuple, torch.Tensor] = {}
+
+
+def retained_faults(history):
+    """The retained faults the prepare and commit keep beside ``history``."""
+    key = (history.length.data_ptr(), tuple(history.length.shape))
+    if key not in _FAULTS:
+        _FAULTS[key] = torch.zeros_like(history.length)
+    return _FAULTS[key]
+
+
 # One layer's (descriptor, group index, accepted counts) per layout, kept for
 # graph capture.
 _PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -169,6 +181,7 @@ def prepare_history(
         retained_decay=history.decay[:, None],
         replay_length=counts,
         replay_start=history.length,
+        replay_faults=retained_faults(history),
         history_capacity=history.correction.shape[2],
         draft_token_num=draft_token_num,
         num_heads=heads,
@@ -442,6 +455,7 @@ def _run_commit(
         retained_decay=history.decay[:, None],
         replay_length=history.length,
         replay_start=history.length,
+        replay_faults=retained_faults(history),
         commit_verdicts=commit_verdicts,
         request_stopped=request_stopped,
         request_ends=request_ends,

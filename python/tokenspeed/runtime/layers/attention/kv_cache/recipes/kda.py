@@ -169,7 +169,7 @@ def kda_request_slot_bytes(
     Returns:
         Bytes of the slot's FP32 correction, key and decay records for each
         KDA layer, plus its INT32 accepted count, which every layer shares,
-        and the INT32 count a forward's readers apply.
+        the INT32 count a forward's readers apply and its INT32 fault.
     """
     linear = config.component(LinearAttnConfig)
     heads, value_dim, key_dim = linear.temporal_state_shape
@@ -179,7 +179,7 @@ def kda_request_slot_bytes(
         * kda_history_capacity(config, draft_token_num)
         * (value_dim + 2 * key_dim)
         * torch.float32.itemsize
-        + 2 * torch.int32.itemsize
+        + 3 * torch.int32.itemsize
     )
 
 

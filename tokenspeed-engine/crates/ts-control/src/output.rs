@@ -51,6 +51,12 @@ pub const REQUEST_ENDED: i32 = 1;
 /// The entry when the device ended the request but could not complete a
 /// decode state it defers (`REQUEST_ENDED_INCOMPLETE`).
 pub const REQUEST_ENDED_INCOMPLETE: i32 = 2;
+/// The entry when the device found a request's deferred decode state
+/// inconsistent, whether or not it ended the request
+/// (`REQUEST_DECODE_STATE_INCONSISTENT`): KDA layers that disagree on a commit
+/// they share one accepted count for, or a retained history whose interval
+/// or pages no layer can read.
+pub const REQUEST_DECODE_STATE_INCONSISTENT: i32 = 3;
 
 /// One forward's results, read once its device-to-host copy landed.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -70,7 +76,8 @@ pub struct ForwardResult {
     pub nan_flags: Option<Vec<i32>>,
     /// Per row, whether the device ended the request ([`REQUEST_ENDED`],
     /// [`REQUEST_ENDED_INCOMPLETE`]) or not (0): what a cache that defers
-    /// decode state (`OutputProcessor::defers_decode_state`) publishes on.
+    /// decode state (`OutputProcessor::defers_decode_state`) publishes on;
+    /// [`REQUEST_DECODE_STATE_INCONSISTENT`] when that state is unsound.
     pub request_ends: Option<Vec<i32>>,
     /// P role: each row's sampled token and the drafter's candidates, the
     /// bootstrap payload a completed prompt's remote decode carries; `None`
@@ -400,6 +407,10 @@ pub enum CommitError {
     /// it defers: the state its finish would publish lacks accepted tokens.
     #[error("request {0} ended with a deferred decode state the device did not complete")]
     IncompleteDecodeState(String),
+    /// The device found a request's retained decode state inconsistent: its
+    /// layers disagree on the state they share, so no state of it is sound.
+    #[error("request {0} has an inconsistent retained decode state")]
+    InconsistentDecodeState(String),
     /// A cache that defers decode state needs the device's request ends.
     #[error("forward result lacks {0}")]
     MissingColumn(&'static str),
@@ -1631,6 +1642,9 @@ impl OutputProcessor {
             let request_end = result.request_ends.as_ref().map_or(0, |ends| ends[i]);
             if request_end == REQUEST_ENDED_INCOMPLETE {
                 return Err(CommitError::IncompleteDecodeState(rid.to_owned()));
+            }
+            if request_end == REQUEST_DECODE_STATE_INCONSISTENT {
+                return Err(CommitError::InconsistentDecodeState(rid.to_owned()));
             }
 
             let Some(state) = self.states.get_mut(rid) else {
@@ -4441,6 +4455,28 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, CommitError::IncompleteDecodeState(rid) if rid == "s"));
+    }
+
+    #[test]
+    fn an_inconsistent_retained_state_is_an_engine_error() {
+        // The device found the request's retained decode state inconsistent
+        // while it still runs: no state it holds may be published or kept.
+        let mut p = deferring_processor(None);
+        register(&mut p, "s", 2, 10, &[7]);
+        p.commit(&batch(&[("s", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        let error = p
+            .commit(
+                &batch(&[("s", 1, 0, 2)], 0),
+                None,
+                &ended(&[4], &[1], REQUEST_DECODE_STATE_INCONSISTENT),
+            )
+            .unwrap_err();
+        assert!(matches!(&error, CommitError::InconsistentDecodeState(rid) if rid == "s"));
+        assert_eq!(
+            error.to_string(),
+            "request s has an inconsistent retained decode state"
+        );
     }
 
     #[test]

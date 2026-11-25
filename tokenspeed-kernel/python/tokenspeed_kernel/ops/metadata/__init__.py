@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.metadata.block_table_rows import (
 from tokenspeed_kernel.ops.metadata.k_row_lengths import expand_k_row_lengths
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.stop_conditions import (
+    REQUEST_DECODE_STATE_INCONSISTENT,
     REQUEST_ENDED,
     REQUEST_ENDED_INCOMPLETE,
     apply_stop_conditions,
@@ -38,6 +39,7 @@ from tokenspeed_kernel.ops.metadata.stop_conditions import (
 __all__ = [
     "BLOCK_TABLE_ROW_FIELDS",
     "PrepTape",
+    "REQUEST_DECODE_STATE_INCONSISTENT",
     "REQUEST_ENDED",
     "REQUEST_ENDED_INCOMPLETE",
     "Reg",

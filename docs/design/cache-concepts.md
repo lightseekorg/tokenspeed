@@ -488,7 +488,15 @@ it publishes nothing, as for a numerically corrupted forward, and the slot's
 next admission clears the count (`reset_request_workspace`). A request the
 device ended but could not complete -- records left outside the live block --
 is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
-rather than publish an incomplete state.
+rather than publish an incomplete state. So is a request, ended or not, whose
+deferred state the device found inconsistent
+(`REQUEST_DECODE_STATE_INCONSISTENT`, `CommitError::InconsistentDecodeState`,
+which names the request): a retained-history interval out of range, the KDA
+layers of a decode round disagreeing on its commit, or an extend storing into
+some State groups' live blocks only. A per-slot fault carries what the prepare
+or the extend's metadata finds past the stop conditions, which rewrite each
+row's entry; the decode commit, and for extend rows a report right after the
+stop conditions, raise the entry to it.
 
 A retraction publishes and images the victim's computed frontier. The
 backend declares its State groups as deferring their decode state
@@ -625,8 +633,9 @@ state. It appends candidates after that accepted prefix. Commit sets the
 slot's count to the round's start count (below) plus the accepted count and
 updates the convolution windows; it is the count's only writer in a decode
 round and writes it once, after checking every layer's commit. A request still
-decoding whose commit some layers accept and others reject stops the engine
-on a device assertion: its one count cannot describe both. For example, after
+decoding whose commit some layers accept and others reject keeps its count
+and reports `REQUEST_DECODE_STATE_INCONSISTENT` in `request_ends`: its one
+count cannot describe both. For example, after
 four candidates and two acceptances, the next verify starts writing at index
 two. Generation stamps identify candidates from the current round. Eager
 execution and CUDA graphs use the same page and request-slot routing.
