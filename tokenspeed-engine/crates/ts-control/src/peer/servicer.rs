@@ -101,6 +101,17 @@ impl Holder {
         }
     }
 
+    pub(super) fn matches_stamp(&self, stamp: &Stamp) -> bool {
+        self.stamp == *stamp
+    }
+
+    pub(super) fn layout(&self) -> Reply {
+        Reply::Layout {
+            stamp: self.stamp.clone(),
+            ranks: self.ranks.clone(),
+        }
+    }
+
     /// Answer as the namespace `identity` from now on.
     pub fn set_identity(&mut self, identity: String) {
         self.stamp.identity = identity;
@@ -115,13 +126,7 @@ impl Holder {
     ) -> (String, Reply) {
         self.records.retain(|_, record| now < record.expires);
         match request {
-            Request::Layout { reply_to } => (
-                reply_to,
-                Reply::Layout {
-                    stamp: self.stamp.clone(),
-                    ranks: self.ranks.clone(),
-                },
-            ),
+            Request::Layout { reply_to } => (reply_to, self.layout()),
             Request::Lookup { lease, prompt } => {
                 let lookup = prompt.lookup_event(&lease);
                 let answer = cache.answer_lookup(&lookup);
@@ -136,6 +141,10 @@ impl Holder {
                     },
                 );
                 self.reply(lease, answer)
+            }
+            Request::CheckpointPin { checkpoint, .. } => {
+                let answer = self.answer(&checkpoint.lease, PeerAnswerKind::Pin);
+                self.reply(checkpoint.lease, answer)
             }
             Request::Pin { lease } => {
                 let mut answer = self.answer(&lease, PeerAnswerKind::Pin);
@@ -187,6 +196,10 @@ impl Holder {
         }
     }
 
+    pub(super) fn finish_record(&mut self, lease: &PeerLeaseView) {
+        self.records.remove(lease);
+    }
+
     /// The changes answered since the last take, in order, for the next head.
     pub fn take_changes(&mut self) -> Vec<PeerEventView> {
         std::mem::take(&mut self.changes)
@@ -197,7 +210,7 @@ impl Holder {
         self.records.len()
     }
 
-    fn answer(&self, lease: &PeerLeaseView, kind: PeerAnswerKind) -> PeerAnswerView {
+    pub(super) fn answer(&self, lease: &PeerLeaseView, kind: PeerAnswerKind) -> PeerAnswerView {
         PeerAnswerView {
             lease: lease.clone(),
             kind,
@@ -207,7 +220,7 @@ impl Holder {
         }
     }
 
-    fn reply(&self, lease: PeerLeaseView, answer: PeerAnswerView) -> (String, Reply) {
+    pub(super) fn reply(&self, lease: PeerLeaseView, answer: PeerAnswerView) -> (String, Reply) {
         (
             lease.reader,
             Reply::Answer {
@@ -232,6 +245,11 @@ pub fn empty_event() -> PeerEventView {
         pages: Vec::new(),
         demote: false,
         num_tokens: 0,
+        dispatch_us: 0,
+        writable_us: 0,
+        terminal_us: 0,
+        grant_source: 0,
+        checkpoint: Vec::new(),
         request_id: String::new(),
     }
 }

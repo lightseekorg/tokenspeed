@@ -94,7 +94,8 @@ void recordPrefillBypass(std::span<Request* const> candidates, const Request* ad
             break;
         }
         if (auto* waiting = older->GetIf<fsm::Submitted>()) {
-            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
+            waiting->admission.prefill_bypasses =
+                std::min(kMaxPrefillBypasses, waiting->admission.prefill_bypasses + 1);
             break;
         }
     }
@@ -554,8 +555,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
                                      : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
                                                                            : 0;
-    if (source == fsm::PrefillSource::kPeer &&
-        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
+    if (source == fsm::PrefillSource::kPeer && (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens ||
+                                                landing_end > kv_token_limit || landing_end - hit_tokens > remaining)) {
         return FirstChunkOutcome{};
     }
     // KV coverage beyond the state checkpoint the hit resumes from is the
@@ -1130,10 +1131,13 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
         }
         return std::nullopt;
     }
+    const bool local_over_peer = adaptive_device_peer_ && request->GetIf<fsm::Submitted>() &&
+                                 request->GetIf<fsm::Submitted>()->admission.peer_hit.has_value();
     FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
                                                           kv_token_limit, yield_tokens, must_complete,
                                                           /*peer_landing_tokens=*/0);
     if (outcome.event) {
+        if (local_over_peer) spdlog::info("[PeerChoice] rid={} local", request->Id());
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
         return operation;
@@ -1931,8 +1935,8 @@ PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending) {
     // min_element preserves submission order for equal work or protected requests.
     const auto selected =
         std::min_element(pending.begin(), pending.end(), [](const PendingPrefill& a, const PendingPrefill& b) {
-            const bool aged_a = a.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
-            const bool aged_b = b.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
+            const bool aged_a = a.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
+            const bool aged_b = b.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
             if (aged_a != aged_b) {
                 return aged_a;
             }
@@ -2185,7 +2189,11 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             }
             // A prompt whose peer landing waits for room is admitted only as one.
             if (!resident && request->GetIf<fsm::Submitted>()->admission.peer_hit) {
-                continue;
+                if (!adaptive_device_peer_) continue;
+                // Respect the normal priority order before committing pages.
+                if (!grant_first_peer_)
+                    schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
+                if (build.Scheduled(*request)) continue;
             }
             if (!prefillAllowed(*request, build)) {
                 // Recheck after every admission: a resident's final chunk or
@@ -2222,6 +2230,11 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 for (const WholePrompt& prompt : carried) {
                     yield_tokens += prompt.tokens;
                 }
+            }
+            if (grant_first_peer_ && !resident && yield_tokens == 0 &&
+                request->GetIf<fsm::Submitted>()->admission.peer_hit) {
+                schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
+                if (build.Scheduled(*request)) continue;
             }
             feedback.admission_failed = false;
             feedback.chunk_gave_way = false;
@@ -2363,8 +2376,10 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
+    if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
     scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
+    if (adaptive_device_peer_ && !grant_first_peer_ && build.Full(config_.max_batch_size))
+        schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2507,8 +2522,10 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
-        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+        if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+        if (adaptive_device_peer_ && !grant_first_peer_ && build.Full(config_.max_batch_size))
+            schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

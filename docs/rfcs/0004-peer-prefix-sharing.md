@@ -455,3 +455,86 @@ pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
 Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
 A reader process that dies before terminal observation cannot report a completed
 sample; frontend failures and holder expiry remain independently observable.
+
+### Experimental independent Host transfers
+
+Set `TOKENSPEED_ASYNC_HOST_PEER=1` on both endpoints to give a single-member
+replica with Host landings a peer progress thread. The default is the
+round-driven protocol. The two modes have distinct cache namespaces. A
+multi-member replica requires coordinated page grants and retirement across
+its shards and cannot enable this switch.
+
+The scheduler issues a revocable Host reservation grant for the lookup and
+consumes the terminal result in a normal round. The protocol worker tries the
+cache lock to reserve unpublished destinations up to the granted boundary.
+The lookup deadline applies to reply arrival. After a timely hit the worker retries
+cache contention and unavailable Host credits, and the normal admission pass may
+schedule the prompt locally until a destination is reserved. Committing local
+admission or cancelling the request revokes the outstanding grant. Tier copies
+and peer reads may overlap on separate pages. Each ticket retains its existing
+block references through DMA retirement. Publishing a duplicate key adopts the
+canonical Host reference. An aborted transfer releases its unpublished blocks
+on retirement. Only the scheduler can
+publish a completed landing for its owning request.
+
+The existing servicer timestamps and forwards incoming messages to the existing
+Host protocol worker. A pending lookup, PIN or reservation yields on cache
+contention. RELEASE uses a capability bound to the hard lease's existing
+source references. It drops their strong counts before acknowledging, including
+while DP is waiting in a forward. Only the cache owner runs uniqueness observers,
+demotes cache entries and returns unused storage to its pool. Duplicate releases
+receive the same answer during the record lifetime. No extra thread is needed.
+
+Hard-pinned source pages remain held until an explicit release. If the remote
+peer dies or a release is permanently lost, that lease can remain charged
+against the configured lease limit until teardown. Deployment across multiple
+replica members and reclaiming abandoned hard pins after proven transport
+retirement need separate validation before enabling this mode broadly.
+
+### Experimental independent Device transfers
+
+For single-member replicas using Device landings, set
+`TOKENSPEED_DEVICE_PEER_POLICY=adaptive` on both endpoints. The holder
+revalidates the lookup and pins its sources. The scheduler grants the reader
+pages in a normal admission round. The peer worker starts the PIN exchange
+only after the grant's Device fence. Its lookup deadline is measured at reply
+arrival. The normal plan consumes the completed READ and RELEASE.
+
+Adaptive admission probes the local prefix again when the request reaches
+its place in the prefill queue. It compares the compute saved on the additional
+prefix with the estimated exposed wait for a landing, including failed attempts.
+The estimate starts with experimental Lite17B values and updates from retired
+attempts on this reader, grouped by source tier and locality. Successful
+samples price the interval from writable pages through RELEASE acknowledgement.
+The first sample replaces the prior. After eight samples the update weight is
+1/8. The scheduler separately measures dispatch to writable pages and RELEASE
+to the first scheduled prefill round. It adds the median combined local wait
+of the last five completed admissions with the same batch condition (empty,
+partially occupied, or full), then subtracts the estimated time before a local
+prefill slot once. Before five such samples it assumes zero local delay.
+On an idle reader, a stable request-ID hash assigns one in sixteen eligible
+borderline cases to try a READ when a fourfold cheaper landing would clear
+the same 20 ms margin. Fresh local matches and capacity checks still apply.
+Regular local
+admission may commit first; a request still waiting for capacity can be
+reconsidered next round. The existing block references hold committed landing
+destinations through transfer retirement and cancellation.
+
+Use `TOKENSPEED_DEVICE_PEER_POLICY=eager` for a comparison with the same
+protocol and ordinary eager Device admission. Leave it unset for the default
+round-driven Device protocol. Independent Device and independent Host modes
+have different namespaces and cannot be enabled together.
+
+Use `TOKENSPEED_DEVICE_PEER_POLICY=repin` on both endpoints to keep adaptive
+admission and allow PIN after the lookup's soft lease expires. The reader
+includes the original checkpoint in the PIN. The holder resolves that
+checkpoint, acquires references, and verifies the prefix length and page
+mapping. The reader validates the reply against the lookup and its writable
+destination grant before starting DMA. Eviction or a changed mapping falls
+back to local prefill. This mode uses the original lookup timeout and adds
+no second lookup.
+
+The experimental `grant-first` policy reserves Device pages during normal
+admission and then issues lookup for the authorized boundary. It requires an
+exact boundary match. A holder publishing a different recoverable boundary
+can cause frequent local fallbacks with this policy.

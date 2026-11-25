@@ -772,7 +772,17 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     }
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
+    // During this build the cache guard is exclusive. Offer an answered but
+    // unreserved request to normal admission; only a committed local admission
+    // revokes the weak grant seen by the peer worker.
+    std::vector<std::pair<Request*, std::shared_ptr<fsm::PeerHostGrant>>> local_candidates;
     for (const auto& request : requests_) {
+        auto* looking = request->GetIf<fsm::PeerLooking>();
+        if (forward_allowed_ && looking && looking->host_grant && looking->host_grant->lookup_answered &&
+            !looking->host_grant->landing) {
+            local_candidates.emplace_back(request.get(), std::move(looking->host_grant));
+            request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
+        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());
@@ -792,6 +802,12 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         built = buildForwardOperations(plan, std::move(candidates), write_back_operations, options);
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
+    }
+    for (auto& [request, grant] : local_candidates) {
+        if (request->Is<fsm::Submitted>()) {
+            request->Apply(fsm::StartPeerLookupEvent{grant->lookup.lease, grant->lookup.deadline_us});
+            request->GetIf<fsm::PeerLooking>()->host_grant = std::move(grant);
+        }
     }
     // What the build's admissions and restores evicted under the write-back
     // policy goes to the Host in this plan: their pages may already be granted

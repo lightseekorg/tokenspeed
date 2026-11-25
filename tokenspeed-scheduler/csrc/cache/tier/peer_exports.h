@@ -22,6 +22,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -32,6 +34,21 @@
 #include "cache/tier/peer.h"
 
 namespace tokenspeed {
+
+// Only Release runs on the peer thread. The cache owner revokes the span
+// before touching its references or returning storage to a pool.
+class PeerPinRelease {
+public:
+    explicit PeerPinRelease(std::span<CacheBlockRef> pins) : pins_(pins) {}
+    bool Release() const noexcept;
+    void Close() noexcept;
+    bool Released() const noexcept { return released_.load(); }
+
+private:
+    mutable std::mutex mutex_;
+    std::span<CacheBlockRef> pins_;
+    mutable std::atomic<bool> released_{false};
+};
 
 // The holder's half of peer prefix sharing. Answers are reads: the
 // replica's first member gives them as soon as a message arrives, while the
@@ -58,11 +75,14 @@ public:
     static bool Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages);
     // Whether the lease's pin holds its pages now.
+    bool HasLease(const PeerLeaseId& lease) const { return leases_.contains(lease); }
     bool Held(const PeerLeaseId& lease) const;
+    std::shared_ptr<PeerPinRelease> ReleaseHandle(const PeerLeaseId& lease);
 
     // The changes, applied at the head.
     void Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us);
-    void Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us);
+    void Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us,
+             const cache::PeerLookup* checkpoint = nullptr);
     // A release that asks for it, after a pin that held, demotes the pinned
     // prefix's leaf chain (CacheCoordinator::DemoteExportedChain): the
     // reader has its own copy now.
@@ -70,9 +90,9 @@ public:
     // Lets every lease past its deadline go: a soft pin is forgotten, a hard
     // pin's blocks go back and its tombstone stays for one more hard-pin
     // lifetime.
-    void Expire(std::int64_t now_us);
+    void Expire(std::int64_t now_us, bool retain_hard = false);
 
-    std::size_t NumLeases() const { return leases_.size(); }
+    std::size_t NumLeases() const;
     std::size_t NumPinnedBlocks() const;
     struct PinSample {
         std::int64_t held_us;
@@ -89,6 +109,16 @@ private:
     enum class Phase { kSoft, kHard, kExpired };
     bool observe_pins_{false};
     std::vector<PinSample> pin_samples_;
+    struct Pins {
+        std::vector<CacheBlockRef> blocks;
+        std::shared_ptr<PeerPinRelease> handle;
+        Pins() = default;
+        Pins(Pins&&) noexcept = default;
+        ~Pins() { Close(); }
+        void Close() {
+            if (handle) handle->Close();
+        }
+    };
     struct Lease {
         Phase phase{Phase::kSoft};
         std::int64_t pinned_us{0};
@@ -100,7 +130,7 @@ private:
         std::int32_t num_tokens{0};
         // A hard pin's blocks, their entries' keys and the access epoch the
         // pin dated them with.
-        std::vector<CacheBlockRef> pins;
+        Pins pins;
         std::vector<CacheKey> keys;
         std::uint64_t access_epoch{0};
     };

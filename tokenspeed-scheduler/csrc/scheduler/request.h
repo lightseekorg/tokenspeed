@@ -46,6 +46,13 @@ class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap);
 
+    // Cleared on the first actual prefill admission after a successful adaptive READ.
+    struct PeerDispatchSample {
+        std::int64_t fence_wait_us;
+        std::int64_t release_us;
+        std::size_t batch_class;
+    };
+    std::optional<PeerDispatchSample> peer_dispatch_sample;
     const std::string& Id() const { return id_; }
     std::uint64_t AdmissionId() const { return admission_id_; }
     std::uint64_t NextRestoreSequence() {
@@ -56,6 +63,7 @@ public:
     }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
+    std::int32_t PeerExpectedTokens() const { return peer_expected_tokens_; }
     const std::string& PeerHolder() const { return peer_holder_; }
     std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
     // The registration of its group/session owner under the access epoch that
@@ -420,6 +428,7 @@ private:
     std::string session_id_;
     std::string cache_group_id_;
     std::string peer_holder_;
+    std::int32_t peer_expected_tokens_;
     std::vector<std::int32_t> shared_prefix_tokens_;
     SessionAccess session_access_;
     TokenContainer token_container_;

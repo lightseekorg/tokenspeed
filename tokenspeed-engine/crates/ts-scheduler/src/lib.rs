@@ -106,6 +106,8 @@ mod ffi {
         /// The replica expected to hold this prompt's prefix, empty for
         /// none (peer prefix sharing).
         peer_holder: String,
+        /// Router estimate of additional peer tokens, zero when absent.
+        peer_expected_tokens: i32,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -634,6 +636,8 @@ mod ffi {
         tokens: Vec<i32>,
         /// The bound on the prefix.
         max_tokens: i32,
+        /// Allowed source-tier masks for a pre-authorized HBM landing.
+        allowed_sources: u32,
     }
 
     /// What a holder's answer answers.
@@ -677,6 +681,11 @@ mod ffi {
         end_tokens: i32,
         /// The blocks it fills.
         destinations: Vec<PeerPageView>,
+        /// Original holder answer for an exact re-PIN after admission.
+        checkpoint: Vec<u8>,
+        /// Exact checkpoint prompt, populated only on a re-PIN fetch.
+        prefix_hashes: Vec<String>,
+        tokens: Vec<i32>,
     }
 
     /// The kind of a [`PeerEventView`].
@@ -715,6 +724,16 @@ mod ffi {
         /// Pin: the boundary the holder's answer named; LookupAnswered: the
         /// holder's boundary; FetchDone: the boundary confirmed.
         num_tokens: i32,
+        /// Reader-local monotonic times for adaptive Device feedback (zero when absent).
+        dispatch_us: i64,
+        /// First instant when the device fence and the fetch plan are both ready.
+        writable_us: i64,
+        /// RELEASE arrival on success, or protocol retirement on failure.
+        terminal_us: i64,
+        /// Source tiers of an executed grant-first transfer.
+        grant_source: u32,
+        /// Reader-local original lookup answer.
+        checkpoint: Vec<u8>,
         /// FetchDone: the landing request.
         request_id: String,
     }
@@ -791,6 +810,31 @@ mod ffi {
             now_us: i64,
             events: &[PeerEventView],
         ) -> Result<()>;
+        #[namespace = "tokenspeed"]
+        type PeerPinRelease;
+        fn peer_release_handle(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+        ) -> SharedPtr<PeerPinRelease>;
+        #[rust_name = "release"]
+        fn Release(self: &PeerPinRelease) -> bool;
+        fn enable_async_host_peer(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn enable_async_device_peer(
+            scheduler: Pin<&mut Scheduler>,
+            adaptive: bool,
+            grant_first: bool,
+        ) -> bool;
+        fn reserve_peer_host(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+            tokens: i32,
+            retry: &mut bool,
+        ) -> Result<Vec<PeerFetchView>>;
+        fn apply_peer_export(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
         fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
         fn peer_pages_match(
@@ -1011,7 +1055,25 @@ pub struct Scheduler {
 // `&mut self`.
 unsafe impl Send for Scheduler {}
 
+// Unpin and owner-side revocation synchronize inside the ticket.
+/// A revocable handle to one native lease's existing strong references.
+pub struct PeerReleaseHandle(cxx::SharedPtr<ffi::PeerPinRelease>);
+impl PeerReleaseHandle {
+    /// Returns after all of this lease's strong references were dropped.
+    pub fn release(&self) -> bool {
+        self.0.as_ref().is_some_and(|ticket| ticket.release())
+    }
+}
+use ffi::PeerPinRelease;
+unsafe impl Send for PeerPinRelease {}
+unsafe impl Sync for PeerPinRelease {}
+
 impl Scheduler {
+    /// A revocable, thread-safe release handle for an existing hard pin.
+    pub fn peer_release_handle(&mut self, lease: &PeerLeaseView) -> PeerReleaseHandle {
+        PeerReleaseHandle(ffi::peer_release_handle(self.pinned(), lease))
+    }
+
     /// Drive the scheduler a Python `tokenspeed_scheduler.Scheduler` owns.
     pub fn from_python(object: &Bound<'_, PyAny>) -> PyResult<Self> {
         // SAFETY: the GIL is held (`Bound`), and the returned pointer lives as
@@ -1103,6 +1165,39 @@ impl Scheduler {
     ) -> Result<(), cxx::Exception> {
         let _span = profile::span("Scheduler::advance_peer");
         ffi::advance_peer(self.pinned(), now_us, events)
+    }
+
+    /// Give a single Host replica's peer driver ownership of lookup deadlines.
+    pub fn enable_async_device_peer(&mut self, adaptive: bool) -> bool {
+        ffi::enable_async_device_peer(self.pinned(), adaptive, false)
+    }
+
+    /// Allocate runnable Device destinations before asking the holder.
+    pub fn enable_grant_first_peer(&mut self) -> bool {
+        ffi::enable_async_device_peer(self.pinned(), true, true)
+    }
+    /// Enable independent reservations into the host landing tier.
+    pub fn enable_async_host_peer(&mut self) -> bool {
+        ffi::enable_async_host_peer(self.pinned())
+    }
+
+    /// Reserve unpublished Host pages for a live reader lease.
+    pub fn reserve_peer_host(
+        &mut self,
+        lease: &PeerLeaseView,
+        tokens: i32,
+        retry: &mut bool,
+    ) -> Result<Vec<PeerFetchView>, cxx::Exception> {
+        ffi::reserve_peer_host(self.pinned(), lease, tokens, retry)
+    }
+
+    /// Change only the holder's export ledger while holding the cache mutex.
+    pub fn apply_peer_export(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::apply_peer_export(self.pinned(), event, now_us)
     }
 
     /// A reader's lookups since the last take, to send to their holders.

@@ -32,6 +32,8 @@
 //! from the holder's member of the same index, once its plan's device work
 //! has run.
 
+mod autonomous;
+pub use autonomous::Peer;
 pub mod geometry;
 pub mod landing;
 pub mod net;
@@ -83,6 +85,14 @@ pub struct PeerSettings {
     pub deployment_id: String,
     /// The weight version the namespace starts at.
     pub weight_version: String,
+    /// Independently progress single-member Host transfers.
+    pub autonomous_host: bool,
+    /// Single-member Device landings. Some(false) keeps eager admission for comparison.
+    pub device_admission: Option<bool>,
+    /// Device pages are owned before the authoritative lookup.
+    pub grant_first: bool,
+    /// Reacquire the original checkpoint after a soft lease expires.
+    pub checkpoint_pin: bool,
     /// The waits a landing allows itself.
     pub timeouts: Timeouts,
     /// How long a holder keeps a lease's record past its last request.
@@ -92,7 +102,14 @@ pub struct PeerSettings {
 impl PeerSettings {
     /// The namespace: only a holder of the same identity is read.
     fn identity(&self) -> String {
-        namespace(&self.deployment_id, &self.weight_version)
+        let ns = namespace(&self.deployment_id, &self.weight_version);
+        if self.device_admission.is_some() {
+            format!("async-device-v1:{ns}")
+        } else if self.autonomous_host {
+            format!("async-host-v1:{ns}")
+        } else {
+            ns
+        }
     }
 }
 
@@ -115,6 +132,12 @@ pub enum PeerError {
     /// The local replica leaders could not exchange endpoints.
     #[error("peer node listener setup: {0}")]
     Mesh(#[from] ts_collective::Error),
+    /// Autonomous transfers need a single replica member and Host destinations.
+    #[error("autonomous Host peer requires a single-member replica with Host landings")]
+    HostTopology,
+    /// Incompatible Device landing or replica configuration.
+    #[error("independent Device peer needs single-member Device landings without Host mode")]
+    DeviceTopology,
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -334,7 +357,10 @@ impl PeerListener {
 struct Endpoint {
     net: Arc<PeerNet>,
     holder: Arc<Mutex<Holder>>,
-    replies: mpsc::Receiver<Reply>,
+    replies: Arc<Mutex<VecDeque<(Instant, Reply)>>>,
+    driver: Arc<std::sync::OnceLock<thread::Thread>>,
+    requests: Arc<Mutex<VecDeque<(Instant, Request)>>>,
+    control: Arc<Mutex<VecDeque<Request>>>,
     _servicer: thread::JoinHandle<()>,
 }
 
@@ -343,18 +369,18 @@ struct Endpoint {
 /// granted, its copies and zeroing, the forwards in flight. Only then may the
 /// holder's pages be read into the plan's blocks.
 #[derive(Debug, Clone)]
-pub struct PeerFence(mpsc::Sender<()>);
+pub struct PeerFence(mpsc::Sender<Instant>);
 
 impl PeerFence {
     /// The oldest such plan not yet reported ran its device work.
     pub fn ready(&self) {
         // A stopped loop has nothing left to read.
-        let _ = self.0.send(());
+        let _ = self.0.send(Instant::now());
     }
 }
 
 /// One member's peer sharing.
-pub struct Peer {
+struct Protocol {
     settings: PeerSettings,
     /// The namespace this member reads and serves under; a weight update
     /// moves it.
@@ -372,7 +398,7 @@ pub struct Peer {
     /// has not reported done.
     fences: VecDeque<Vec<String>>,
     fence: PeerFence,
-    fenced_plans: mpsc::Receiver<()>,
+    fenced_plans: mpsc::Receiver<Instant>,
     /// Landings whose plan's device work has run on this member.
     fenced: HashSet<String>,
     /// Landings this member started reading.
@@ -383,13 +409,11 @@ pub struct Peer {
     // Only the endpoint owner measures logical attempts.
     lookup_times: HashMap<u64, (String, Instant, i64)>,
     decisions: Vec<(String, &'static str)>,
-    next_sample_us: i64,
-    previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
     unplaced: Vec<(String, bool)>,
 }
 
-impl Peer {
+impl Protocol {
     /// Start one member with every member's geometry in `replica`.
     /// The first (`member` 0) must supply the bound `listener` and serves
     /// `scheduler` as a holder; other members must supply `None`. The
@@ -410,8 +434,9 @@ impl Peer {
             return Err(PeerError::Listener);
         }
         let (fence, fenced_plans) = mpsc::channel();
+        let origin = Instant::now();
         let endpoint = listener
-            .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
+            .map(|listener| start_endpoint(&settings, replica, listener, scheduler, origin))
             .transpose()?;
         Ok(Self {
             identity: settings.identity(),
@@ -420,7 +445,7 @@ impl Peer {
             members,
             geometry,
             endpoint,
-            origin: Instant::now(),
+            origin,
             layouts: HashMap::new(),
             asked: HashMap::new(),
             landings: BTreeMap::new(),
@@ -433,8 +458,6 @@ impl Peer {
             read_metrics: None,
             lookup_times: HashMap::new(),
             decisions: Vec::new(),
-            next_sample_us: 0,
-            previous_totals: [0; 2],
             reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
@@ -448,34 +471,6 @@ impl Peer {
     ) {
         self.metrics = logical;
         self.read_metrics = physical;
-    }
-
-    /// The native counters survive gaps between scrapes; gauges are sampled once per second.
-    pub fn sample_scheduler(&mut self, scheduler: &mut Scheduler, now_us: i64) {
-        let Some(metrics) = self.metrics.as_ref().filter(|_| self.member == 0) else {
-            return;
-        };
-        for sample in scheduler.take_peer_pin_samples() {
-            metrics.pin(sample.held_us, sample.remaining_us, sample.expired);
-        }
-        if now_us < self.next_sample_us {
-            return;
-        }
-        self.next_sample_us = now_us.saturating_add(1_000_000);
-        let stats = scheduler.peer_stats();
-        for (name, n) in [
-            ("leases", stats.leases),
-            ("pinned_blocks", stats.pinned_blocks),
-            ("looking_requests", stats.looking_requests),
-            ("landing_requests", stats.landing_requests),
-        ] {
-            metrics.snapshot(name, n);
-        }
-        let totals = [stats.landed_tokens, stats.failed_landings];
-        for (i, name) in ["landed_tokens", "failed_landings"].iter().enumerate() {
-            metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
-        }
-        self.previous_totals = totals;
     }
 
     /// Drop an unanswered lookup when its owning request terminates.
@@ -507,7 +502,7 @@ impl Peer {
         };
         if let Some(endpoint) = &self.endpoint {
             report.changes = endpoint.holder.lock().take_changes();
-            report.replies = endpoint.replies.try_iter().collect();
+            report.replies = endpoint.replies.lock().drain(..).map(|(_, r)| r).collect();
         }
         report.encode()
     }
@@ -520,6 +515,10 @@ impl Peer {
             .iter()
             .map(|bytes| Report::decode(bytes).ok_or(PeerError::Report))
             .collect::<Result<Vec<_>, _>>()?;
+        self.advance_reports(&reports)
+    }
+
+    fn advance_reports(&mut self, reports: &[Report]) -> Result<PeerRound, PeerError> {
         let first = reports.first().ok_or(PeerError::Report)?;
         let now_us = first.now_us;
         self.asked.retain(|_, deadline_us| now_us < *deadline_us);
@@ -548,6 +547,11 @@ impl Peer {
             }
         }
         for (request, landing) in &mut self.landings {
+            if (self.settings.autonomous_host || self.settings.device_admission.is_some())
+                && landing.unanswered_pin(now_us)
+            {
+                actions.push((request.clone(), Action::SendRelease { demote: false }));
+            }
             landing.tick(now_us);
             if self.layouts.contains_key(&landing.fetch().holder) {
                 if let Some(action) = landing.layout_known(now_us) {
@@ -577,12 +581,18 @@ impl Peer {
             self.reading.remove(&request);
             events.push(PeerEventView {
                 kind: PeerEventKind::FetchDone,
+                dispatch_us: landing.device_times.unwrap_or_default().0,
+                writable_us: landing.device_times.unwrap_or_default().1,
+                terminal_us: landing
+                    .device_times
+                    .map_or(0, |_| landing.phase_started_us()),
+                grant_source: landing.grant_source,
                 request_id: request,
                 num_tokens,
                 ..empty_event()
             });
         }
-        while self.fenced_plans.try_recv().is_ok() {
+        while !self.fences.is_empty() && self.fenced_plans.try_recv().is_ok() {
             if let Some(requests) = self.fences.pop_front() {
                 self.fenced.extend(requests);
             }
@@ -604,35 +614,7 @@ impl Peer {
         lookups: Vec<PeerLookupView>,
         now_us: i64,
     ) {
-        if !fetches.is_empty() {
-            self.fences.push_back(
-                fetches
-                    .iter()
-                    .map(|fetch| fetch.request_id.clone())
-                    .collect(),
-            );
-        }
-        let mut actions = Vec::new();
-        for fetch in fetches {
-            let known = self.layouts.contains_key(&fetch.holder);
-            let request = fetch.request_id.clone();
-            tracing::debug!(
-                request,
-                holder = fetch.holder,
-                begin = fetch.begin_tokens,
-                end = fetch.end_tokens,
-                layout_known = known,
-                "peer landing started"
-            );
-            let (mut landing, action) =
-                Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
-            if self.member == 0 {
-                landing.observe_with(self.metrics.clone());
-            }
-            self.landings.insert(request.clone(), landing);
-            actions.push((request, action));
-        }
-        self.send(actions, now_us);
+        self.start_landings(fetches, now_us, true, None);
         if let Some(endpoint) = &self.endpoint {
             for lookup in lookups {
                 if self.metrics.is_some() {
@@ -655,6 +637,55 @@ impl Peer {
                 }
             }
         }
+    }
+
+    // Only destinations granted directly by ReservePeerHost can be ready
+    // without a device plan. Device landings still wait on their plan fence.
+    fn start_landings(
+        &mut self,
+        fetches: Vec<PeerFetchView>,
+        now_us: i64,
+        wait_for_plan: bool,
+        device_times: Option<(i64, i64)>,
+    ) {
+        if wait_for_plan && !fetches.is_empty() {
+            self.fences.push_back(
+                fetches
+                    .iter()
+                    .map(|fetch| fetch.request_id.clone())
+                    .collect(),
+            );
+        }
+        let mut actions = Vec::new();
+        for fetch in fetches {
+            if !wait_for_plan {
+                // The independent Device driver calls here only after the plan fence.
+                debug_assert!(
+                    self.settings.device_admission.is_some()
+                        || fetch.destinations.iter().all(|d| d.tier == PeerTier::Host)
+                );
+                self.fenced.insert(fetch.request_id.clone());
+            }
+            let known = self.layouts.contains_key(&fetch.holder);
+            let request = fetch.request_id.clone();
+            tracing::debug!(
+                request,
+                holder = fetch.holder,
+                begin = fetch.begin_tokens,
+                end = fetch.end_tokens,
+                layout_known = known,
+                "peer landing started"
+            );
+            let (mut landing, action) =
+                Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
+            landing.device_times = device_times;
+            if self.member == 0 {
+                landing.observe_with(self.metrics.clone());
+            }
+            self.landings.insert(request.clone(), landing);
+            actions.push((request, action));
+        }
+        self.send(actions, now_us);
     }
 
     /// Where this member's data plane reports its plans' device work; the
@@ -731,6 +762,19 @@ impl Peer {
                         }
                         events.push(PeerEventView {
                             kind: PeerEventKind::LookupAnswered,
+                            checkpoint: if self.settings.checkpoint_pin
+                                && stamp.identity == self.identity
+                                && answer.num_tokens > 0
+                            {
+                                reply.encode()
+                            } else {
+                                Vec::new()
+                            },
+                            pages: if self.settings.device_admission == Some(true) {
+                                answer.pages.clone()
+                            } else {
+                                Vec::new()
+                            },
                             lease: answer.lease.clone(),
                             // A holder of another namespace holds nothing of ours.
                             num_tokens: if stamp.identity == self.identity {
@@ -754,7 +798,15 @@ impl Peer {
                                 num_tokens = answer.num_tokens,
                                 "peer pin answered"
                             );
-                            if let Some(action) = landing.pinned(answer.clone(), trusted, now_us) {
+                            let same_checkpoint = !self.settings.checkpoint_pin
+                                || matches!(
+                                Reply::decode(&landing.fetch().checkpoint),
+                                Ok(Reply::Answer { stamp: original, answer: expected })
+                                    if original == *stamp && expected.lease == answer.lease
+                                    && expected.num_tokens == answer.num_tokens && expected.pages == answer.pages);
+                            if let Some(action) =
+                                landing.pinned(answer.clone(), trusted && same_checkpoint, now_us)
+                            {
                                 actions.push((request.clone(), action));
                             }
                         }
@@ -813,6 +865,33 @@ impl Peer {
                         reply_to: self.settings.name.clone(),
                     }
                 }
+                Action::SendPin if self.settings.checkpoint_pin => {
+                    let fetch = landing.fetch();
+                    let Ok(Reply::Answer { stamp, answer }) = Reply::decode(&fetch.checkpoint)
+                    else {
+                        continue;
+                    };
+                    if answer.kind != PeerAnswerKind::Lookup
+                        || answer.lease != lease
+                        || answer.num_tokens != fetch.end_tokens
+                        || stamp.identity != self.identity
+                    {
+                        continue;
+                    }
+                    Request::CheckpointPin {
+                        stamp,
+                        checkpoint: PeerEventView {
+                            kind: PeerEventKind::Pin,
+                            lease,
+                            num_tokens: fetch.end_tokens,
+                            max_tokens: fetch.end_tokens,
+                            prefix_hashes: fetch.prefix_hashes.clone(),
+                            tokens: fetch.tokens.clone(),
+                            pages: answer.pages,
+                            ..empty_event()
+                        },
+                    }
+                }
                 Action::SendPin => Request::Pin { lease },
                 Action::SendRelease { demote } => Request::Release { lease, demote },
             };
@@ -822,6 +901,11 @@ impl Peer {
                 }
                 // The landing's wait ends at its deadline.
                 tracing::warn!(holder, %error, "peer request not sent");
+            } else if self.settings.autonomous_host || self.settings.device_admission.is_some() {
+                self.landings
+                    .get_mut(&request)
+                    .unwrap()
+                    .sent(self.origin.elapsed().as_micros() as i64);
             }
         }
     }
@@ -923,6 +1007,7 @@ fn start_endpoint(
     replica: Vec<RankGeometry>,
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
+    _origin: Instant,
 ) -> Result<Endpoint, PeerError> {
     let PeerListener { net, received } = listener;
     let holder = Arc::new(Mutex::new(Holder::new(
@@ -934,20 +1019,38 @@ fn start_endpoint(
         replica,
         settings.record_lifetime,
     )));
-    let (replied, replies) = mpsc::channel();
+    let replies = Arc::new(Mutex::new(VecDeque::new()));
+    let driver = Arc::new(std::sync::OnceLock::<thread::Thread>::new());
+    let autonomous = settings.autonomous_host || settings.device_admission.is_some();
+    let requests = Arc::new(Mutex::new(VecDeque::new()));
+    let control = Arc::new(Mutex::new(VecDeque::new()));
     let servicer = {
+        let (requests, control) = (requests.clone(), control.clone());
+        let (incoming, wake) = (replies.clone(), driver.clone());
         let (net, holder) = (Arc::downgrade(&net), holder.clone());
         thread::Builder::new()
             .name("ts-peer-servicer".to_owned())
             .spawn(move || {
                 for frames in received {
                     match Inbound::decode(&frames) {
+                        Ok(Inbound::Request(request)) if autonomous => {
+                            if matches!(request, Request::Release { .. } | Request::Layout { .. }) {
+                                control.lock().push_back(request);
+                            } else {
+                                requests.lock().push_back((Instant::now(), request));
+                            }
+                            if let Some(worker) = wake.get() {
+                                worker.unpark();
+                            }
+                        }
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's
                             // scheduler work; answers between rounds.
                             let (to, reply) = {
                                 let scheduler = scheduler.lock();
-                                holder.lock().handle(&*scheduler, request, Instant::now())
+                                let mut holder = holder.lock();
+                                let now = Instant::now();
+                                holder.handle(&*scheduler, request, now)
                             };
                             let Some(net) = net.upgrade() else { return };
                             if let Err(error) = net.reply(&to, &reply) {
@@ -955,8 +1058,9 @@ fn start_endpoint(
                             }
                         }
                         Ok(Inbound::Reply(reply)) => {
-                            if replied.send(reply).is_err() {
-                                return;
+                            incoming.lock().push_back((Instant::now(), reply));
+                            if let Some(worker) = wake.get() {
+                                worker.unpark();
                             }
                         }
                         Err(_) => tracing::warn!("a malformed peer message dropped"),
@@ -968,6 +1072,9 @@ fn start_endpoint(
         net,
         holder,
         replies,
+        driver,
+        requests,
+        control,
         _servicer: servicer,
     })
 }

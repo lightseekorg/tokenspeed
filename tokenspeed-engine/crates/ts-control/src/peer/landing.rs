@@ -99,6 +99,8 @@ pub struct Landing {
     metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
     /// None unless a profile records.
     timeline: Option<Timeline>,
+    pub(super) grant_source: u32,
+    pub(super) device_times: Option<(i64, i64)>,
     started_us: i64,
     failure: Option<&'static str>,
     phase_us: i64,
@@ -138,6 +140,8 @@ impl Landing {
                         phase_ns: now_ns,
                     }
                 }),
+                grant_source: 0,
+                device_times: None,
                 started_us: now_us,
                 failure: None,
                 phase_us: now_us,
@@ -294,6 +298,21 @@ impl Landing {
         }
     }
 
+    pub(super) fn sent(&mut self, at: i64) {
+        if matches!(
+            self.phase,
+            Phase::Layout | Phase::Pin | Phase::Release { .. }
+        ) {
+            self.deadline_us = deadline(at, self.timeouts.answer_us);
+        }
+    }
+
+    /// A pin that never acknowledged cannot have started a read. Its
+    /// holder may nevertheless have applied it and needs an explicit release.
+    pub(super) fn unanswered_pin(&self, now_us: i64) -> bool {
+        self.phase == Phase::Pin && now_us >= self.deadline_us
+    }
+
     /// The agreed clock moved to `now_us`: a wait past its deadline ends.
     pub fn tick(&mut self, now_us: i64) {
         match self.phase {
@@ -381,6 +400,9 @@ mod tests {
             begin_tokens: 0,
             end_tokens: 8,
             destinations: vec![page(0), page(1)],
+            checkpoint: vec![],
+            prefix_hashes: vec![],
+            tokens: vec![],
         }
     }
 

@@ -995,7 +995,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && memory_resident {
-                    self.data_plane.idle_forward(&dp)?;
+                    if self.peer.as_ref().is_some_and(Peer::autonomous) {
+                        ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                            self.data_plane.idle_forward(&dp)
+                        })?;
+                    } else {
+                        self.data_plane.idle_forward(&dp)?;
+                    }
                     forwarded = true;
                 }
             }
@@ -1018,6 +1024,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The forward-result feedback point: everything committed this round
         // reaches the scheduler before the next round plans.
         if !events.is_empty() {
+            if let Some(peer) = self.peer.as_mut() {
+                for event in &events {
+                    if event.kind == ForwardEventKind::Abort {
+                        peer.cancel_grant(&event.request_id);
+                    }
+                }
+            }
             // An ended request's transfer stops; its pages wait for that
             // (PdEvent::Stopped) unless it succeeds first.
             if let Some(transfer) = self.transfer.as_mut() {
@@ -1213,7 +1226,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut forwarded = idle_forward;
         let device_work = plan.needs_device() || idle_forward;
         if device_work {
-            if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
+            let pending = if self.peer.as_ref().is_some_and(Peer::autonomous) {
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    self.data_plane.execute(plan, &dispatch)
+                })?
+            } else {
+                self.data_plane.execute(plan, &dispatch)?
+            };
+            if let Some(pending) = pending {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
@@ -2858,6 +2878,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     usage.disposition = result;
                     if result == "admission" {
                         usage.admission_at = Some(Instant::now());
+                    } else if result == "landing" {
+                        usage.admission_at = None;
                     } else if let Some(start) = usage.lookup_at.take() {
                         metrics.peer.stage(
                             "lookup_to_ready",
@@ -2966,7 +2988,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = self.ranks.mesh.all_gather_i64(world, &row)?;
+        let rows = if self.peer.as_ref().is_some_and(Peer::autonomous) {
+            ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                self.ranks.mesh.all_gather_i64(world, &row)
+            })?
+        } else {
+            self.ranks.mesh.all_gather_i64(world, &row)?
+        };
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -240,6 +241,9 @@ public:
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages) const;
+    std::shared_ptr<PeerPinRelease> PeerReleaseHandle(const PeerLeaseId& id) {
+        return peer_exports_->ReleaseHandle(id);
+    }
     bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
     // Plans built so far: no cache entry leaves between two plans.
     std::int64_t PlanCalls() const { return plan_calls_; }
@@ -252,6 +256,13 @@ public:
         std::uint64_t failed_landings{0};
     };
     PeerStats GetPeerStats() const;
+    bool EnableAsyncHostPeer();
+    bool EnableAsyncDevicePeer(bool adaptive, bool grant_first = false);
+    std::optional<PeerFetchOperation> ReservePeerHost(const PeerLeaseId& lease, std::int32_t num_tokens, bool& retry);
+    bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
+    void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us,
+                         const cache::PeerLookup* checkpoint = nullptr);
+    void ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us);
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
     }
@@ -612,6 +623,38 @@ private:
     // The answered prompt's landing into Host blocks before its admission:
     // it waits in Prefetching, or is admitted from its local hit when the
     // Host cannot take the whole answered prefix.
+    bool async_host_peer_{false};
+    bool async_device_peer_{false};
+    bool adaptive_device_peer_{false};
+    bool grant_first_peer_{false};
+    // Feedback by source tier/locality. Arrays have fixed cardinality even as holders churn.
+    struct LandingCost {
+        int samples{0};
+        double scale{1.0};
+        double success_rate{1.0};
+        double failure_us{0.0};  // unconditional expected wasted wait per attempt
+    };
+    std::array<LandingCost, 8> device_landing_cost_{};
+    // Median of five complete admissions in the same local batch condition.
+    // A single unusually long forward must not set the next reader's local price.
+    struct DispatchWait {
+        std::array<std::int64_t, 5> recent{};
+        std::size_t next{};
+        bool ready{};
+        void Observe(std::int64_t us);
+        double Estimate() const;
+    };
+    std::array<DispatchWait, 3> device_dispatch_wait_{};
+    void recordPeerDispatch(Request& request);
+    struct DeviceAttempt {
+        std::size_t path;
+        double nominal_us;
+        std::size_t batch_class;
+        std::int32_t end_tokens;
+    };
+    std::unordered_map<std::string, DeviceAttempt> device_attempts_;
+    std::optional<PeerHostLandings::Started> reservePeerHost(Request& request, const fsm::PeerHit& hit,
+                                                             std::optional<TailPublication>& tail);
     void startPeerHostLanding(Request& request);
     // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
     // request's tables: a token-spanned group's from the block holding
@@ -666,6 +709,7 @@ private:
     // sees this struct -- it receives build.plan and an AdmissionFeedback --
     // so batch and budget accounting stay behind pushOperation.
     struct PlanBuild {
+        std::int32_t granted_peer_tokens{0};
         PlanBuild(ExecutionPlan& output_plan, PlanOptions plan_options) : plan{output_plan}, options{plan_options} {}
 
         ExecutionPlan& plan;
@@ -710,12 +754,13 @@ private:
     // Work handed to the transfer peer takes neither budget nor a batch
     // slot, so it bypasses this (but still marks the request scheduled).
     template <typename Operation>
-    void pushOperation(PlanBuild& build, const Request& request, Operation operation) {
+    void pushOperation(PlanBuild& build, Request& request, Operation operation) {
         build.scheduled.insert(&request);
         // The D role budgets prompt tokens only: its prefills are the peer's
         // work (they ride plan.remote_prefill and never reach here), so its
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
+            if (request.peer_dispatch_sample) recordPeerDispatch(request);
             build.token_budget -= operation.input_length;
             if (config_.max_kv_page_num > 0) {
                 const std::int64_t end =
@@ -941,6 +986,7 @@ private:
     // otherwise. The fetches started since the last plan go out with it.
     std::unique_ptr<PeerHostLandings> peer_host_landings_;
     std::vector<PeerFetchOperation> peer_host_fetches_;
+    std::unordered_map<PeerLeaseId, std::weak_ptr<fsm::PeerHostGrant>, PeerLeaseIdHash> peer_host_grants_;
     std::int64_t peer_now_us_{0};
     std::uint64_t next_peer_lease_{0};
     std::vector<PeerLookupRequest> peer_lookups_;

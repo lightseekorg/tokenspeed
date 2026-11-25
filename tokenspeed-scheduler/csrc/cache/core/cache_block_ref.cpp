@@ -36,22 +36,25 @@ CacheBlock::~CacheBlock() noexcept {
 namespace internal_cache_block_ref {
 
 void CacheBlockControl::retain() noexcept {
-    FatalCheck(strong_count_ != 0 && strong_count_ != std::numeric_limits<std::uint32_t>::max(),
-               "cannot retain a destroyed or saturated CacheBlockControl");
-    ++strong_count_;
+    const auto count = strong_count_.fetch_add(1) & ~kPending;
+    FatalCheck(count != 0 && count < kPending - 1, "cannot retain a destroyed or saturated CacheBlockControl");
 }
 
 void CacheBlockControl::release() noexcept {
-    FatalCheck(strong_count_ != 0, "CacheBlockControl release requires a live reference");
-    --strong_count_;
-    if (strong_count_ == 0) {
+    const auto prior = strong_count_.fetch_sub(1);
+    FatalCheck((prior & ~kPending) != 0, "CacheBlockControl release requires a live reference");
+    finishRelease(prior - 1);
+}
+
+void CacheBlockControl::finishRelease(std::uint32_t state) noexcept {
+    if (state == 0) {
         while (unique_observers_ != nullptr) {
             unique_observers_->Reset();
         }
         object_.OwnerPool().destroyBlockControl(this);
         return;
     }
-    if (strong_count_ == 1 && unique_observers_ != nullptr) {
+    if (state == 1 && unique_observers_ != nullptr) {
         // Detach before callbacks: a callback can cancel another observer or
         // release the last owner, including destroying this control.
         CacheBlockUniqueObserver* pending = std::exchange(unique_observers_, nullptr);
@@ -109,6 +112,28 @@ void CacheBlockRef::reset() noexcept {
     internal_cache_block_ref::CacheBlockControl* control = std::exchange(control_, nullptr);
     if (control != nullptr) {
         control->release();
+    }
+}
+
+// Only the peer holding this particular ref calls this. The one ref that
+// sets kPending retains the control address for the cache owner's callback.
+void CacheBlockRef::releaseFromPeer() noexcept {
+    if (!control_) return;
+    auto& count = control_->strong_count_;
+    const auto pending = control_->kPending;
+    auto prior = count.load();
+    do {
+        FatalCheck((prior & ~pending) != 0, "cannot unpin a released block");
+    } while (!count.compare_exchange_weak(prior, (prior - 1) | pending));
+    if (prior & pending) control_ = nullptr;
+}
+
+void CacheBlockRef::finishPeerRelease() noexcept {
+    if (auto* control = std::exchange(control_, nullptr)) {
+        const auto pending = control->kPending;
+        const auto prior = control->strong_count_.fetch_and(~pending);
+        FatalCheck((prior & pending) != 0, "peer release needs a pending callback");
+        control->finishRelease(prior & ~pending);
     }
 }
 

@@ -100,6 +100,7 @@ fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
         cache_group_id: String::new(),
         shared_prefix_tokens: Vec::new(),
         peer_holder: String::new(),
+        peer_expected_tokens: 0,
         request_id: request_id.to_owned(),
         tokens,
         max_new_tokens: 4,

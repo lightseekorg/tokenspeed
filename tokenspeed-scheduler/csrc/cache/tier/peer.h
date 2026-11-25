@@ -114,6 +114,9 @@ struct PeerLookupRequest {
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
 
+    // Allowed source-tier masks for a grant issued before lookup.
+    std::uint32_t allowed_sources{0};
+
     bool operator==(const PeerLookupRequest&) const = default;
 };
 
@@ -144,6 +147,9 @@ struct PeerFetchOperation {
     std::int32_t begin_tokens{0};
     std::int32_t end_tokens{0};
     std::vector<PeerPage> destinations;
+    std::vector<std::uint8_t> checkpoint;
+    std::vector<std::string> prefix_hashes;
+    std::vector<std::int32_t> tokens;
 
     bool operator==(const PeerFetchOperation&) const = default;
 };
@@ -184,10 +190,16 @@ struct PeerRelease {
 struct PeerLookupAnswered {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
+    unsigned source_mask{0};  // Device=1, Host=2, mixed=3.
+    std::vector<std::uint8_t> checkpoint;
 };
 struct PeerFetchDone {
     std::string request_id;
     std::int32_t num_tokens{0};
+    std::int64_t dispatch_us{0};
+    std::int64_t writable_us{0};
+    std::int64_t terminal_us{0};
+    std::uint32_t grant_source{0};
 };
 
 }  // namespace cache

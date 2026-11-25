@@ -36,6 +36,7 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool 
       session_id_{spec.session_id},
       cache_group_id_{spec.cache_group_id},
       peer_holder_{spec.peer_holder},
+      peer_expected_tokens_{spec.peer_expected_tokens},
       shared_prefix_tokens_{spec.shared_prefix_tokens},
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
