@@ -1657,7 +1657,13 @@ impl TransferPeer for DecodePeer {
                 let bootstrap_token = landed.bootstrap_token.ok_or_else(|| {
                     PdError::Peer(format!("{rid}'s KV landed without its first token"))
                 })?;
+                let wait_started = state.waiting_since.get(&receiver.room).copied();
                 drop(state);
+                if replica.index() == 0 {
+                    if let (Some(metrics), Some(started)) = (&self.shared.metrics, wait_started) {
+                        metrics.observe_decode_kv_wait(started.elapsed().as_secs_f64());
+                    }
+                }
                 tracing::info!(
                     rid,
                     bootstrap_room = receiver.room,

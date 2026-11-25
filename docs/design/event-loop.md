@@ -1573,6 +1573,20 @@ Admission failures prepare their final output before logging completion, as the
 other terminal paths do. Preparing that output consumes a sampled TTFT trace;
 completion logging therefore emits no second breakdown for the same request.
 
+### Request-level PD transfer metrics
+
+The first prefill replica member reports one `tokenspeed:kv_handoffs_total`
+increment at the replica-agreed terminal transition. A timeout awaiting the
+decode landing manifest, or rejected registration/preallocation,
+is labeled `handshake_failed`; other failures (including cancelled transfers)
+are labeled `failed`. Cleanup and per-rank write retries do not add outcomes.
+On success, `tokenspeed:prefill_kv_handoff_seconds` starts at the final prompt
+handoff and ends when the replica can retire the transfer. Earlier layerwise
+writes can overlap compute. The first decode member observes
+`tokenspeed:decode_kv_wait_seconds` from local landing-manifest submission
+to replica-agreed full KV arrival; time waiting for an execution slot after
+KV arrival is measured separately.
+
 ## Recurrent-state materialization feedback
 
 The data plane retires replay for snapshot and abort slots before running
