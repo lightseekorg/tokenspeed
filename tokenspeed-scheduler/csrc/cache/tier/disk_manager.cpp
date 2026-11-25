@@ -39,6 +39,9 @@ void DiskConfig::Validate() const {
     if (max_write_host_blocks > max_host_blocks) {
         throw std::invalid_argument("Disk tier write credits must not exceed its Host credits");
     }
+    if (min_clean_tokens < 0) {
+        throw std::invalid_argument("Disk tier min_clean_tokens must be non-negative");
+    }
 }
 
 DiskTransferManager::DiskTransferManager(CacheCoordinator& coordinator, DiskConfig config)
@@ -60,6 +63,19 @@ bool DiskTransferManager::HasProgressPending() const {
 
 std::size_t DiskTransferManager::NumHeldHostBlocks() const {
     return heldHostBlocks(DiskOpKind::kRead) + heldHostBlocks(DiskOpKind::kWrite);
+}
+
+std::size_t DiskTransferManager::numOperations(DiskOpKind kind) const {
+    std::size_t count = 0;
+    for (const auto& [id, ticket] : operations_) {
+        if (ticket.kind == kind) ++count;
+    }
+    return count;
+}
+
+bool DiskTransferManager::HasReadCredits() const {
+    return operations_.size() < static_cast<std::size_t>(config_.max_operations) &&
+           NumHeldHostBlocks() < static_cast<std::size_t>(config_.max_host_blocks);
 }
 
 std::size_t DiskTransferManager::heldHostBlocks(DiskOpKind kind) const {
@@ -96,18 +112,34 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     return op;
 }
 
-StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
-    if (operations_.size() >= static_cast<std::size_t>(config_.max_operations)) return {};
+DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const PromptPrefix& prompt,
+                                                                       std::int32_t local_tokens) {
+    const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
+    if (hits.empty()) return {.retryable = false};
+    if (local_tokens < 0) {
+        const PrefixProbe local_probe = coordinator_.Prober().ProbePromptPrefix(prompt);
+        local_tokens = std::max(local_probe.device.num_common_tokens, local_probe.host.num_common_tokens);
+    }
+    // Only report `retryable = true` when Disk actually extends the resumable
+    // prefix beyond `local_tokens`; when the Disk keys are already covered on
+    // Device/Host or lack a required State checkpoint, no retry can gain tokens.
+    if (coordinator_.Storage().ResumableStorageTokens(prompt, hits) <= local_tokens) {
+        return {.retryable = false};
+    }
+    if (!HasReadCredits()) return {.retryable = true};
     const std::size_t held = NumHeldHostBlocks();
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
-    if (held >= limit) return {};
-    const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
-    if (hits.empty()) return {};
     // The Disk's keys stand in as Host hits for the Host-suffix probe; every
     // key the boundary needs and the Host lacks is then one the Disk holds.
-    StorageReservation reservation = coordinator_.Storage().ReserveStoragePrefix(
-        prompt, hits, std::min(limit - held, static_cast<std::size_t>(config_.max_blocks_per_operation)));
-    if (reservation.keys.empty()) return {};
+    const std::size_t available_blocks = limit - held;
+    const auto max_op_blocks = static_cast<std::size_t>(config_.max_blocks_per_operation);
+    StorageReservation reservation =
+        coordinator_.Storage().ReserveStoragePrefix(prompt, hits, std::min(available_blocks, max_op_blocks));
+    if (reservation.keys.empty() || reservation.num_tokens <= local_tokens) {
+        // If Host-block credits were partially consumed by other in-flight
+        // operations, let the caller retry once credits return.
+        return {.retryable = available_blocks < max_op_blocks && held > 0};
+    }
     Ticket ticket{.kind = DiskOpKind::kRead,
                   .keys = std::move(reservation.keys),
                   .host_blocks = std::move(reservation.blocks),
@@ -123,7 +155,11 @@ StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
     const std::uint64_t id = nextId();
     commands_.push_back(command(id, ticket));
     operations_.emplace(id, std::move(ticket));
-    return StorageLease{*this, id};
+    return {.lease = StorageLease{*this, id}, .retryable = false};
+}
+
+StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
+    return TryStartRead(prompt).lease;
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
@@ -142,7 +178,13 @@ void DiskTransferManager::DropCleaning() {
 }
 
 void DiskTransferManager::StartCleaning() {
-    if (cleaning_.empty() || operations_.size() >= static_cast<std::size_t>(config_.max_operations)) return;
+    const auto max_ops = static_cast<std::size_t>(config_.max_operations);
+    const std::size_t max_write_ops = std::max<std::size_t>(1, max_ops / 4);
+    const std::size_t read_reserve = max_ops > 1 ? 1 : 0;
+    if (cleaning_.empty() || operations_.size() + read_reserve >= max_ops ||
+        numOperations(DiskOpKind::kWrite) >= max_write_ops) {
+        return;
+    }
     const std::size_t held = NumHeldHostBlocks();
     const std::size_t write_held = heldHostBlocks(DiskOpKind::kWrite);
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
@@ -161,14 +203,47 @@ void DiskTransferManager::StartCleaning() {
         return coordinator_.Host().ContainsHostCachedBlock(key) && !coordinator_.Disk().ContainsDiskCachedBlock(key) &&
                !writing.contains(key);
     };
-    // The dirty Host entries of a boundary node, every group's.
+    const auto skip_cleaning = [&](const CacheKey& key) {
+        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        if (!loc) return true;
+        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        return !meta || coordinator_.Evictor().IsDemotedEntry(*meta) ||
+               meta->eviction.last_access_epoch == CacheStore::kSupersededAccessEpoch;
+    };
+    // The dirty Host entries of a boundary node, every group's. Skip demoted or
+    // superseded State checkpoints, while keeping ancestor KV entries needed by
+    // non-demoted descendants so no prefix gap opens.
     const auto dirty_keys_of = [&](const BoundaryTree::Node& node) {
         std::vector<CacheKey> keys;
         for (const CacheStore::NodeEntry& entry : store.NodeEntries(host_pool, node)) {
             std::optional<CacheKey> key = store.Groups()[entry.group_id].Index().KeyOf(host_pool, entry.location);
-            if (key && dirty(*key)) keys.push_back(std::move(*key));
+            if (!key || !dirty(*key)) continue;
+            if (store.GroupIsState(entry.group_id) && skip_cleaning(*key)) continue;
+            keys.push_back(std::move(*key));
         }
         return keys;
+    };
+
+    // Admission filter applied to the branch tip (`cleaning_.front()`): skips
+    // short branches and single-hit cold tails without breaking ancestor chains
+    // of qualifying long/reused branches.
+    const auto rejected_by_admission = [&](const CacheKey& key, const BoundaryTree::Node& node) {
+        if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return false;
+        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        if (!loc) return true;
+        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        if (!meta) return true;
+        if (config_.require_reuse_for_cleaning && !meta->eviction.was_acquired) return true;
+        if (config_.min_clean_tokens > 0) {
+            std::int64_t branch_tokens = node.boundary_tokens;
+            if (branch_tokens <= 0 && meta->eviction.logical_block_index >= 0) {
+                const std::int32_t group_granularity = store.Groups()[key.group_id].Spec().block_granularity;
+                const std::int64_t span = group_granularity > 0 ? group_granularity : store.PrefixGranularity();
+                branch_tokens = (static_cast<std::int64_t>(meta->eviction.logical_block_index) + 1) * span;
+            }
+            if (branch_tokens > 0 && branch_tokens < config_.min_clean_tokens) return true;
+        }
+        return false;
     };
 
     Ticket ticket{.kind = DiskOpKind::kWrite};
@@ -176,8 +251,13 @@ void DiskTransferManager::StartCleaning() {
     while (!cleaning_.empty() && ticket.keys.size() < credits) {
         const CacheKey front = cleaning_.front();
         const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
-        if (node == nullptr || !dirty(front) || chosen.contains(front)) {
+        if (node == nullptr || !dirty(front) || skip_cleaning(front) || chosen.contains(front)) {
             cleaning_.pop_front();
+            continue;
+        }
+        if (rejected_by_admission(front, *node)) {
+            cleaning_.pop_front();
+            ++dropped_cleanings_;
             continue;
         }
         // The pages above it first, nearest the root first, so a cleaned page

@@ -256,9 +256,11 @@ rust::Vec<rust::String> ToRustStrings(const std::vector<std::string>& values) {
 }  // namespace
 
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events) {
-    // The agreed clock first, then the events in the order they arrived.
+    // Advance peer_now_us_ first (without expiring) so events answered against
+    // the pre-tick state (Pin, Release, LookupAnswered) stamp against now_us
+    // and promote/deliver before PeerExports::Expire sweeps stale leases.
     tokenspeed::ExecutionEvent execution_event;
-    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us});
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = false});
     for (const PeerEventView& event : events) {
         switch (event.kind) {
             case PeerEventKind::Lookup:
@@ -283,16 +285,22 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                 break;
         }
     }
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = true});
     scheduler.Advance(execution_event);
 }
 
-PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup) {
-    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup)));
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
+                                  std::size_t pending_new_leases) {
+    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup), pending_new_leases));
 }
 
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
                       rust::Slice<const PeerPageView> pages) {
     return scheduler.PeerPagesMatch(LookupFromView(lookup), num_tokens, FromView(pages));
+}
+
+bool peer_lease_can_pin(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
+    return scheduler.PeerLeaseCanPin(FromView(lease));
 }
 
 bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
@@ -846,6 +854,15 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
         const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
         if (cache == nullptr || (!std::holds_alternative<tokenspeed::StorageOperation>(*cache) &&
                                  !std::holds_alternative<tokenspeed::DiskOperation>(*cache))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool plan_has_pages_to_copy(const tokenspeed::ExecutionPlan& plan) {
+    for (const auto& [group_id, pairs] : plan.pages_to_copy) {
+        if (!pairs.empty()) {
             return true;
         }
     }

@@ -284,10 +284,15 @@ engine can unregister its memory.
   peer-to-peer path), selected by the transfer engine from the two endpoints.
 
 Control messages (lookup, pin, release) travel between the replicas'
-servicers over ZMQ, not through the data plane. A holder's name is its
+servicers over ZMQ, not through the data plane. A fast demux thread delivers
+replies and answers layout queries without waiting on the scheduler lock,
+while the servicer thread drains queued lookup, pin and release RPCs in batches.
+A holder's name is its
 logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
-its incarnation and identity, and per rank its transfer engine session and
+its incarnation and identity, and per rank its transfer engine session,
+registered Device and Host memory-region boundaries (used to split batched
+one-sided reads so no single batch crosses registered MR segments), and
 the field geometry of its Device arena and Host pool for every cache group.
 The first member owns the bound listener continuously through startup. A
 caller using an OS-selected port binds before constructing the replica's name

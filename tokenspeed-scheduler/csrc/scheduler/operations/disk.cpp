@@ -64,6 +64,7 @@ void Scheduler::handleEvent(const cache::DiskDone& event) {
 }
 
 void Scheduler::prepareDisk(Request& request) {
+    static constexpr std::uint8_t kMaxDiskReadRetries = 4;
     const DiskConfig& limits = disk_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
         if (!state->lease.IssuedBy(*disk_transfers_)) return;
@@ -82,11 +83,29 @@ void Scheduler::prepareDisk(Request& request) {
         return;
     }
 
+    if (request.Is<fsm::PeerLooking>()) return;
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
-    admission->storage_prepared = true;
+    if (admission->peer_hit.has_value()) {
+        admission->storage_prepared = true;
+        return;
+    }
     // Decode receives its prompt from its PD peer.
-    if (config_.role == Role::kD) return;
+    if (config_.role == Role::kD) {
+        admission->storage_prepared = true;
+        return;
+    }
+    if (coordinator_.Disk().NumDiskCachedBlocks() == 0) {
+        admission->storage_prepared = true;
+        return;
+    }
+    // Check read credits and any partial-credit backoff watermark BEFORE
+    // hashing and prefix probing so saturated queues stay O(1) per plan.
+    if (!disk_transfers_->HasReadCredits()) return;
+    if (admission->disk_retry_below_held_blocks.has_value() &&
+        disk_transfers_->NumHeldHostBlocks() >= *admission->disk_retry_below_held_blocks) {
+        return;
+    }
     const auto grain = config_.prefix_granularity;
     const auto max_tokens = cacheablePrefixTokens(request);
     const auto cached_hashes = request.PromptPrefixHashes(max_tokens / grain);
@@ -105,15 +124,28 @@ void Scheduler::prepareDisk(Request& request) {
                         .shared_prefix_tokens = request.SharedPrefixTokens()};
     const PrefixProbe probe = coordinator_.Prober().ProbePromptPrefix(prompt);
     const auto local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
-    if (max_tokens - local < limits.min_prefetch_tokens) return;
+    if (max_tokens - local < limits.min_prefetch_tokens) {
+        admission->storage_prepared = true;
+        return;
+    }
     prompt.prepared_keys = probe.group_keys;
-    StorageLease lease = disk_transfers_->StartRead(prompt);
-    if (!lease) return;
+    DiskTransferManager::ReadStartResult started = disk_transfers_->TryStartRead(prompt, local);
+    if (!started.lease) {
+        if (!started.retryable || admission->disk_read_retries >= kMaxDiskReadRetries) {
+            admission->storage_prepared = true;
+        } else {
+            ++admission->disk_read_retries;
+            admission->disk_retry_below_held_blocks = disk_transfers_->NumHeldHostBlocks();
+        }
+        return;
+    }
+    admission->storage_prepared = true;
     spdlog::debug("[Disk] rid={} op_id={} local_tokens={} bound_tokens={} prefetch read enqueued", request.Id(),
-                  lease.OperationId(), local, max_tokens);
+                  started.lease.OperationId(), local, max_tokens);
     const auto deadline =
         storage_now_us_ + std::min(limits.wait_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-    request.Apply(fsm::StartPrefetchEvent{std::move(lease), deadline, std::move(hashes), max_tokens, std::move(tail)});
+    request.Apply(
+        fsm::StartPrefetchEvent{std::move(started.lease), deadline, std::move(hashes), max_tokens, std::move(tail)});
 }
 
 }  // namespace tokenspeed

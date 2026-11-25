@@ -21,15 +21,33 @@
 //! The thread-pool backend, for hosts whose policy refuses io_uring: each
 //! of `queue_depth` threads issues one blocking `pread`/`pwrite` at a time.
 
-use std::{io, os::fd::RawFd};
-
-use crate::{
-    dispatch::{self, Chunk, Shared},
-    executor::{Direction, IoError},
-    file::DiskFile,
+use std::{
+    io,
+    os::fd::RawFd,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
 };
 
-pub(crate) fn run(shared: &Shared, file: &DiskFile) {
+use crate::{
+    dispatch::{Chunk, Shared},
+    executor::{Direction, IoError},
+    file::{DiskFile, ALIGNMENT},
+    memory::Memory,
+};
+
+/// Upper bound on transient `EINTR`/`EAGAIN` retries per chunk so a broken
+/// device cannot livelock `Executor::close`.
+const MAX_TRANSIENT_RETRIES: u8 = 16;
+
+static LOGGED_BOUNCE_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize, force_bounce: bool) {
+    let mut bounce: Option<Memory> = if force_bounce {
+        shared.set_bounce_active();
+        Some(Memory::map(max_io_bytes).expect("allocate psync bounce buffer"))
+    } else {
+        None
+    };
     loop {
         let chunk = {
             let mut queues = shared.queues.lock();
@@ -43,44 +61,136 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile) {
                 shared.work.wait(&mut queues);
             }
         };
-        let result = transfer(file.raw_fd(), chunk);
+        let result = transfer(file.raw_fd(), chunk, &mut bounce, max_io_bytes, shared);
         let finished = shared.queues.lock().finish(chunk, result);
         shared.work.notify_all();
-        dispatch::report(finished.into_iter().collect());
+        if let Some((done, report)) = finished {
+            done(report);
+        }
     }
 }
 
-fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
-    let offset = libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
-    loop {
+fn transfer(
+    fd: RawFd,
+    chunk: Chunk,
+    bounce: &mut Option<Memory>,
+    max_io_bytes: usize,
+    shared: &Shared,
+) -> Result<(), IoError> {
+    match bounce.as_ref() {
+        Some(buf) => transfer_bounced(fd, chunk, buf),
+        None => match transfer_raw(fd, chunk) {
+            Err(IoError::Os(libc::EFAULT)) => {
+                let buf_size = max_io_bytes.max(chunk.len);
+                match Memory::map(buf_size) {
+                    Ok(buf) => {
+                        shared.set_bounce_active();
+                        if !LOGGED_BOUNCE_FALLBACK.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                bounce_bytes = buf_size,
+                                "psync O_DIRECT hit EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
+                                 staging through per-worker anonymous mmap bounce buffer"
+                            );
+                        }
+                        let res = transfer_bounced(fd, chunk, &buf);
+                        *bounce = Some(buf);
+                        res
+                    }
+                    Err(err) => Err(IoError::Os(err.raw_os_error().unwrap_or(libc::ENOMEM))),
+                }
+            }
+            other => other,
+        },
+    }
+}
+
+fn transfer_bounced(fd: RawFd, chunk: Chunk, bounce: &Memory) -> Result<(), IoError> {
+    debug_assert!(chunk.len <= bounce.size());
+    if chunk.direction == Direction::Write {
+        // SAFETY: source is caller's mapped memory; dest is worker-owned bounce buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.address as *const u8,
+                bounce.address() as *mut u8,
+                chunk.len,
+            );
+        }
+    }
+    let bounce_chunk = Chunk {
+        address: bounce.address(),
+        ..chunk
+    };
+    transfer_raw(fd, bounce_chunk)?;
+    if chunk.direction == Direction::Read {
+        // SAFETY: bounce holds the bytes read from disk; dest is caller's mapped memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bounce.address() as *const u8,
+                chunk.address as *mut u8,
+                chunk.len,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn transfer_raw(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
+    let base_offset = libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
+    let mut moved = 0usize;
+    let mut retries = 0u8;
+    while moved < chunk.len {
+        let remaining = chunk.len - moved;
+        let offset = base_offset + moved as libc::off_t;
         // SAFETY: the chunk lies in memory the executor's caller keeps mapped
         // (`Executor::start`); the file stays open while this thread runs.
         let done = unsafe {
             match chunk.direction {
-                Direction::Read => {
-                    libc::pread(fd, chunk.address as *mut libc::c_void, chunk.len, offset)
-                }
-                Direction::Write => {
-                    libc::pwrite(fd, chunk.address as *const libc::c_void, chunk.len, offset)
-                }
+                Direction::Read => libc::pread(
+                    fd,
+                    (chunk.address + moved) as *mut libc::c_void,
+                    remaining,
+                    offset,
+                ),
+                Direction::Write => libc::pwrite(
+                    fd,
+                    (chunk.address + moved) as *const libc::c_void,
+                    remaining,
+                    offset,
+                ),
             }
         };
         let Ok(done) = usize::try_from(done) else {
             let errno = io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EIO);
-            if errno == libc::EINTR {
+            if (errno == libc::EINTR || errno == libc::EAGAIN) && retries < MAX_TRANSIENT_RETRIES {
+                retries += 1;
+                if errno == libc::EAGAIN {
+                    thread::yield_now();
+                }
                 continue;
             }
             return Err(IoError::Os(errno));
         };
-        return if done == chunk.len {
-            Ok(())
-        } else {
-            Err(IoError::Short {
+        if done == 0 {
+            return Err(IoError::Short {
                 expected: chunk.len,
-                done,
-            })
-        };
+                done: moved,
+            });
+        }
+        if done > remaining {
+            return Err(IoError::Os(libc::EIO));
+        }
+        moved += done;
+        retries = 0;
+        // O_DIRECT cannot resume from an unaligned offset; report the real
+        // short I/O rather than letting the next syscall fail with EINVAL.
+        if moved < chunk.len && done % ALIGNMENT != 0 {
+            return Err(IoError::Short {
+                expected: chunk.len,
+                done: moved,
+            });
+        }
     }
+    Ok(())
 }

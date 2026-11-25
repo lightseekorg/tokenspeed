@@ -27,6 +27,8 @@
 //! group from the holder's tier to the reader's (its Device field, or its
 //! packed Host block).
 
+use std::collections::HashMap;
+
 use ts_scheduler::{PeerPageView, PeerTier};
 
 use crate::peer::push::{PushItem, PushSpan};
@@ -69,6 +71,9 @@ pub struct HostPool {
     pub address: u64,
     /// Each cache group, in the scheduler's order.
     pub groups: Vec<HostGroup>,
+    /// Consecutive registered memory region (MR) lengths covering this pool,
+    /// starting at `address`. Empty when unsegmented / unknown.
+    pub region_lengths: Vec<u64>,
 }
 
 /// What a peer needs to read a rank's cache, or to land into it.
@@ -78,6 +83,9 @@ pub struct RankGeometry {
     pub session: String,
     /// Every Device field, in the order the rank lists them.
     pub device: Vec<DeviceField>,
+    /// Registered Device memory regions `(address, length)` covering `device`
+    /// fields; empty when unsegmented / single-region.
+    pub device_regions: Vec<(u64, u64)>,
     /// The Host pool; absent without one. A Disk tier packs its blocks the
     /// same way (`docs/rfcs/0006-disk-tier.md`).
     pub host: Option<HostPool>,
@@ -110,6 +118,28 @@ pub enum GeometryError {
     /// An address computation overflowed.
     #[error("a peer read address overflows")]
     Overflow,
+    /// A transfer slice lies outside the tier's registered memory regions.
+    #[error("slice {addr:#x}+{len:#x} is outside registered {tier:?} memory regions")]
+    Uncovered {
+        /// Tier whose MR table rejected the slice.
+        tier: PeerTier,
+        /// Start address of the slice.
+        addr: u64,
+        /// Byte length of the slice.
+        len: u64,
+    },
+    /// A transfer slice straddles two registered memory regions.
+    #[error("slice {addr:#x}+{len:#x} straddles {tier:?} MR boundary at {region_end:#x}")]
+    Straddle {
+        /// Tier whose MR boundary was crossed.
+        tier: PeerTier,
+        /// Start address of the slice.
+        addr: u64,
+        /// Byte length of the slice.
+        len: u64,
+        /// Exclusive end address of the MR containing `addr`.
+        region_end: u64,
+    },
 }
 
 /// One read's copies, as the transfer engine takes them: span i copies
@@ -213,15 +243,359 @@ impl RankGeometry {
     }
 }
 
+/// Tier-scoped MR identifier so Device MRs and Host MRs never alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MrKey {
+    Device(u32),
+    Host(u32),
+}
+
+/// Sorted, non-overlapping registered memory regions `[start, end)` for one tier.
+#[derive(Debug, Clone)]
+pub struct RegionIndex {
+    tier: PeerTier,
+    /// `(start, end, original_index)` sorted by `start`, with `start < end`.
+    intervals: Vec<(u64, u64, u32)>,
+}
+
+impl RegionIndex {
+    /// Build a `Host` `RegionIndex` from `pool.region_lengths` (returns `Ok(None)`
+    /// when `pool` is `None` or unsegmented).
+    pub fn from_host(pool: Option<&HostPool>) -> Result<Option<Self>, GeometryError> {
+        let Some(pool) = pool else {
+            return Ok(None);
+        };
+        if pool.region_lengths.is_empty() {
+            return Ok(None);
+        }
+        let mut intervals = Vec::with_capacity(pool.region_lengths.len());
+        let mut cursor = pool.address;
+        for (idx, &len) in pool.region_lengths.iter().enumerate() {
+            if len == 0 {
+                return Err(GeometryError::Uncovered {
+                    tier: PeerTier::Host,
+                    addr: cursor,
+                    len: 0,
+                });
+            }
+            let end = cursor.checked_add(len).ok_or(GeometryError::Overflow)?;
+            intervals.push((cursor, end, idx as u32));
+            cursor = end;
+        }
+        Ok(Some(Self {
+            tier: PeerTier::Host,
+            intervals,
+        }))
+    }
+
+    /// Build a `Device` `RegionIndex` from explicit `(address, length)` MRs
+    /// (returns `Ok(None)` when `regions` is empty / unsegmented).
+    pub fn from_device(regions: &[(u64, u64)]) -> Result<Option<Self>, GeometryError> {
+        if regions.is_empty() {
+            return Ok(None);
+        }
+        let mut intervals = Vec::with_capacity(regions.len());
+        for (idx, &(addr, len)) in regions.iter().enumerate() {
+            if len == 0 {
+                return Err(GeometryError::Uncovered {
+                    tier: PeerTier::Device,
+                    addr,
+                    len: 0,
+                });
+            }
+            let end = addr.checked_add(len).ok_or(GeometryError::Overflow)?;
+            intervals.push((addr, end, idx as u32));
+        }
+        intervals.sort_unstable_by_key(|&(start, _, _)| start);
+        for pair in intervals.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                return Err(GeometryError::Straddle {
+                    tier: PeerTier::Device,
+                    addr: pair[1].0,
+                    len: pair[1].1 - pair[1].0,
+                    region_end: pair[0].1,
+                });
+            }
+        }
+        Ok(Some(Self {
+            tier: PeerTier::Device,
+            intervals,
+        }))
+    }
+
+    /// Resolve `[addr, addr + len - 1]` to its single enclosing MR index, or
+    /// fail closed on uncovered addresses or cross-MR straddles.
+    pub fn region_of(&self, addr: u64, len: u64) -> Result<u32, GeometryError> {
+        if len == 0 {
+            return Err(GeometryError::Uncovered {
+                tier: self.tier,
+                addr,
+                len,
+            });
+        }
+        let last = addr.checked_add(len - 1).ok_or(GeometryError::Overflow)?;
+        let pos = self
+            .intervals
+            .partition_point(|&(start, _, _)| start <= addr);
+        if pos == 0 {
+            return Err(GeometryError::Uncovered {
+                tier: self.tier,
+                addr,
+                len,
+            });
+        }
+        let (_start, end, region_id) = self.intervals[pos - 1];
+        if addr >= end {
+            return Err(GeometryError::Uncovered {
+                tier: self.tier,
+                addr,
+                len,
+            });
+        }
+        if last >= end {
+            return Err(GeometryError::Straddle {
+                tier: self.tier,
+                addr,
+                len,
+                region_end: end,
+            });
+        }
+        Ok(region_id)
+    }
+}
+
+/// Per-tier (`Device` and `Host`) MR indexes for one rank.
+struct TierRegions {
+    device: Option<RegionIndex>,
+    host: Option<RegionIndex>,
+    host_base: Option<u64>,
+}
+
+impl TierRegions {
+    fn from_geometry(geometry: &RankGeometry) -> Result<Self, GeometryError> {
+        Ok(Self {
+            device: RegionIndex::from_device(&geometry.device_regions)?,
+            host: RegionIndex::from_host(geometry.host.as_ref())?,
+            host_base: geometry.host.as_ref().map(|h| h.address),
+        })
+    }
+
+    fn is_unsegmented(&self) -> bool {
+        self.device.is_none() && self.host.is_none()
+    }
+
+    fn key_for_tier(&self, tier: PeerTier, addr: u64, len: u64) -> Result<MrKey, GeometryError> {
+        if len == 0 {
+            return Err(GeometryError::Uncovered { tier, addr, len });
+        }
+        let _last = addr.checked_add(len - 1).ok_or(GeometryError::Overflow)?;
+        match tier {
+            PeerTier::Device => match &self.device {
+                Some(idx) => idx.region_of(addr, len).map(MrKey::Device),
+                None => Ok(MrKey::Device(0)),
+            },
+            PeerTier::Host => match &self.host {
+                Some(idx) => idx.region_of(addr, len).map(MrKey::Host),
+                None => {
+                    let base = self.host_base.ok_or(GeometryError::NoHost)?;
+                    if addr < base {
+                        return Err(GeometryError::Uncovered { tier, addr, len });
+                    }
+                    Ok(MrKey::Host(0))
+                }
+            },
+            _ => Err(GeometryError::Tier),
+        }
+    }
+
+    /// Infer the tier + MR key of `[addr, addr + len - 1]` when splitting raw
+    /// `Spans` without explicit per-span tier tags.
+    fn key_for_address(
+        &self,
+        geometry: &RankGeometry,
+        addr: u64,
+        len: u64,
+    ) -> Result<MrKey, GeometryError> {
+        if len == 0 {
+            return Err(GeometryError::Uncovered {
+                tier: PeerTier::Device,
+                addr,
+                len,
+            });
+        }
+        let _last = addr.checked_add(len - 1).ok_or(GeometryError::Overflow)?;
+        if let Some(host_idx) = &self.host {
+            if let Ok(id) = host_idx.region_of(addr, len) {
+                return Ok(MrKey::Host(id));
+            }
+            // If `addr` starts inside the Host pool's registered range, it
+            // straddled an MR boundary — fail closed immediately!
+            let first_start = host_idx.intervals[0].0;
+            let last_end = host_idx.intervals.last().expect("non-empty").1;
+            if addr >= first_start && addr < last_end {
+                return host_idx.region_of(addr, len).map(MrKey::Host);
+            }
+        }
+        if let Some(dev_idx) = &self.device {
+            return dev_idx.region_of(addr, len).map(MrKey::Device);
+        }
+        // When `device_regions` is unsegmented (`None`), verify `addr` belongs
+        // to a Device field if `host` is segmented; otherwise fail closed so an
+        // uncovered Host tail (past `last_end`) never silently aliases Device MR 0!
+        if self.host.is_some() {
+            let matches_device_field = geometry.device.iter().any(|field| {
+                addr >= field.address
+                    && field.page_stride > 0
+                    && (addr - field.address) % field.page_stride == 0
+                    && len == field.bytes
+            });
+            if !matches_device_field {
+                return Err(GeometryError::Uncovered {
+                    tier: PeerTier::Host,
+                    addr,
+                    len,
+                });
+            }
+            return Ok(MrKey::Device(0));
+        }
+        if let Some(host_base) = self.host_base {
+            if addr >= host_base {
+                return Ok(MrKey::Host(0));
+            }
+        }
+        Ok(MrKey::Device(0))
+    }
+}
+
+/// Split `spans` strictly along registered `Device` and `Host` MR boundaries
+/// so every returned `Spans` batch has all source spans inside ONE MR and all
+/// destination spans inside ONE MR. Fails closed (`Err`) if any span is
+/// uncovered or straddles an MR boundary.
+pub fn split_spans_by_mr(
+    spans: &Spans,
+    holder: &RankGeometry,
+    reader: &RankGeometry,
+) -> Result<Vec<Spans>, GeometryError> {
+    if spans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let src_regions = TierRegions::from_geometry(holder)?;
+    let dst_regions = TierRegions::from_geometry(reader)?;
+    if src_regions.is_unsegmented() && dst_regions.is_unsegmented() {
+        return Ok(vec![spans.clone()]);
+    }
+
+    let mut buckets: Vec<Spans> = Vec::new();
+    let mut index_by_pair: HashMap<(MrKey, MrKey), usize> = HashMap::new();
+    let all_host = spans.host_bytes == spans.total_bytes();
+
+    for ((&src, &dst), &len) in spans
+        .sources
+        .iter()
+        .zip(&spans.destinations)
+        .zip(&spans.lengths)
+    {
+        let s_key = src_regions.key_for_address(holder, src, len)?;
+        let d_key = dst_regions.key_for_address(reader, dst, len)?;
+        let bucket_idx = *index_by_pair.entry((s_key, d_key)).or_insert_with(|| {
+            let idx = buckets.len();
+            buckets.push(Spans::default());
+            idx
+        });
+        let bucket = &mut buckets[bucket_idx];
+        bucket.sources.push(src);
+        bucket.destinations.push(dst);
+        bucket.lengths.push(len);
+        if matches!(s_key, MrKey::Host(_)) && (src_regions.host.is_some() || all_host) {
+            bucket.host_bytes += len;
+        }
+    }
+
+    if buckets.len() == 1 {
+        buckets[0].host_bytes = spans.host_bytes;
+    }
+    Ok(buckets)
+}
+
+/// Compute `read_spans` and split them into MR-homogeneous `Spans` batches
+/// using each page's exact `(source.tier, destination.tier)` `RegionIndex`.
+pub fn read_batches(
+    holder: &RankGeometry,
+    reader: &RankGeometry,
+    pages: &[(PeerPageView, PeerPageView)],
+) -> Result<(u64, Vec<Spans>), GeometryError> {
+    if pages.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let src_regions = TierRegions::from_geometry(holder)?;
+    let dst_regions = TierRegions::from_geometry(reader)?;
+    if src_regions.is_unsegmented() && dst_regions.is_unsegmented() {
+        let spans = read_spans(holder, reader, pages)?;
+        let total = spans.total_bytes();
+        let batches = if spans.is_empty() {
+            Vec::new()
+        } else {
+            vec![spans]
+        };
+        return Ok((total, batches));
+    }
+
+    let mut buckets: Vec<Spans> = Vec::new();
+    let mut index_by_pair: HashMap<(MrKey, MrKey), usize> = HashMap::new();
+    let mut total_bytes = 0u64;
+
+    for (source, destination) in pages {
+        if destination.group_id != source.group_id
+            || source.tier == PeerTier::Disk
+            || destination.tier == PeerTier::Disk
+        {
+            return Err(GeometryError::Tier);
+        }
+        let group = source.group_id;
+        if source.block_id <= 0 || destination.block_id <= 0 {
+            return Err(GeometryError::Block {
+                group,
+                block: source.block_id.min(destination.block_id),
+            });
+        }
+        for field in holder.device.iter().filter(|field| field.group_id == group) {
+            let src_addr = holder.field_address(source, field)?;
+            let dst_addr = reader.field_address(destination, field)?;
+            let len = field.bytes;
+            let s_key = src_regions.key_for_tier(source.tier, src_addr, len)?;
+            let d_key = dst_regions.key_for_tier(destination.tier, dst_addr, len)?;
+            let bucket_idx = *index_by_pair.entry((s_key, d_key)).or_insert_with(|| {
+                let idx = buckets.len();
+                buckets.push(Spans::default());
+                idx
+            });
+            let bucket = &mut buckets[bucket_idx];
+            bucket.sources.push(src_addr);
+            bucket.destinations.push(dst_addr);
+            bucket.lengths.push(len);
+            if source.tier == PeerTier::Host {
+                bucket.host_bytes += len;
+            }
+            total_bytes += len;
+        }
+    }
+    Ok((total_bytes, buckets))
+}
+
 /// The pushes that land `pages` whose holder pages are on its Disk tier:
 /// per page, every field of the page's group, at its offset in the holder's
 /// packed block (a Disk block packs like a Host block), to the reader's tier.
+///
+/// Validates every destination span against the reader's per-tier (`Host` or
+/// `Device`) `RegionIndex`, failing closed on uncovered or straddling ranges,
+/// and splits spans across destination MRs when needed.
 pub fn push_items(
     holder: &RankGeometry,
     reader: &RankGeometry,
     pages: &[(PeerPageView, PeerPageView)],
 ) -> Result<Vec<PushItem>, GeometryError> {
     let pool = holder.host.as_ref().ok_or(GeometryError::NoHost)?;
+    let reader_regions = TierRegions::from_geometry(reader)?;
     let mut items = Vec::with_capacity(pages.len());
     for (source, destination) in pages {
         if destination.group_id != source.group_id
@@ -244,7 +618,8 @@ pub fn push_items(
                 group,
                 block: source.block_id,
             })?;
-        let mut spans = Vec::new();
+        let mut grouped: Vec<Vec<PushSpan>> = Vec::new();
+        let mut by_mr: HashMap<MrKey, usize> = HashMap::new();
         for field in holder.device.iter().filter(|field| field.group_id == group) {
             let offset = host
                 .field_offsets
@@ -252,17 +627,35 @@ pub fn push_items(
                 .find(|(id, _)| *id == field.field_id)
                 .map(|(_, offset)| *offset)
                 .ok_or_else(|| GeometryError::Field(field.field_id.clone()))?;
-            spans.push(PushSpan {
+            let address = reader.field_address(destination, field)?;
+            let length = field.bytes;
+            let key = reader_regions.key_for_tier(destination.tier, address, length)?;
+            let idx = *by_mr.entry(key).or_insert_with(|| {
+                let i = grouped.len();
+                grouped.push(Vec::new());
+                i
+            });
+            grouped[idx].push(PushSpan {
                 offset,
-                address: reader.field_address(destination, field)?,
-                length: field.bytes,
+                address,
+                length,
             });
         }
-        items.push(PushItem {
-            group,
-            block: source.block_id,
-            spans,
-        });
+        if grouped.is_empty() {
+            items.push(PushItem {
+                group,
+                block: source.block_id,
+                spans: Vec::new(),
+            });
+        } else {
+            for mr_spans in grouped {
+                items.push(PushItem {
+                    group,
+                    block: source.block_id,
+                    spans: mr_spans,
+                });
+            }
+        }
     }
     Ok(items)
 }
@@ -340,6 +733,7 @@ mod tests {
                     bytes: 60,
                 },
             ],
+            device_regions: Vec::new(),
             host,
             push: None,
         }
@@ -354,6 +748,7 @@ mod tests {
                 block_bytes: 100,
                 field_offsets: vec![("layer.0.k".into(), 0), ("layer.0.v".into(), 40)],
             }],
+            region_lengths: Vec::new(),
         }
     }
 
@@ -488,5 +883,149 @@ mod tests {
             ),
             Err(GeometryError::Overflow)
         );
+    }
+
+    #[test]
+    fn multi_mr_reads_and_pushes_split_cleanly_by_src_and_dst_mr() {
+        let mut hh = host_pool(10_000_000);
+        hh.region_lengths = vec![600; 60];
+        let mut rh = host_pool(20_000_000);
+        rh.region_lengths = vec![1_200; 30];
+        let (holder, reader) = (geometry(1_000_000, Some(hh)), geometry(2_000_000, Some(rh)));
+        let pages = vec![
+            (page(0, 0, HOST, 1), page(0, 0, HOST, 1)),
+            (page(0, 1, HOST, 4), page(0, 1, HOST, 4)),
+            (page(0, 2, HOST, 7), page(0, 2, HOST, 7)),
+            (page(0, 3, HOST, 358), page(0, 3, HOST, 358)),
+            (page(0, 4, DEVICE, 7), page(0, 4, HOST, 13)),
+            (page(0, 5, HOST, 8), page(0, 5, DEVICE, 3)),
+        ];
+        let spans = read_spans(&holder, &reader, &pages).unwrap();
+        let (total, batches) = read_batches(&holder, &reader, &pages).unwrap();
+        assert_eq!((total, batches.len()), (spans.total_bytes(), 5));
+        assert_eq!(
+            batches.iter().map(|b| b.host_bytes).sum::<u64>(),
+            spans.host_bytes
+        );
+        let (sr, dr) = (
+            TierRegions::from_geometry(&holder).unwrap(),
+            TierRegions::from_geometry(&reader).unwrap(),
+        );
+        let mut got = Vec::new();
+        for b in &batches {
+            let pair = (
+                sr.key_for_address(&holder, b.sources[0], b.lengths[0])
+                    .unwrap(),
+                dr.key_for_address(&reader, b.destinations[0], b.lengths[0])
+                    .unwrap(),
+            );
+            for ((&s, &d), &l) in b.sources.iter().zip(&b.destinations).zip(&b.lengths) {
+                assert_eq!(
+                    (
+                        sr.key_for_address(&holder, s, l).unwrap(),
+                        dr.key_for_address(&reader, d, l).unwrap()
+                    ),
+                    pair
+                );
+                got.push((s, d, l));
+            }
+        }
+        let mut want: Vec<_> = spans
+            .sources
+            .iter()
+            .copied()
+            .zip(spans.destinations.iter().copied())
+            .zip(spans.lengths.iter().copied())
+            .map(|((s, d), l)| (s, d, l))
+            .collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want);
+
+        // Cross-MR host landing splits PushItems by destination MR.
+        let mut split_h = host_pool(20_000_000);
+        split_h.region_lengths = vec![40, 260];
+        let items = push_items(
+            &holder,
+            &geometry(2_000_000, Some(split_h)),
+            &[(page(0, 0, PeerTier::Disk, 1), page(0, 0, HOST, 1))],
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            (items[0].spans[0].address, items[1].spans[0].address),
+            (20_000_000, 20_000_040)
+        );
+    }
+
+    #[test]
+    fn region_index_rejects_uncovered_and_straddling_host_and_device() {
+        let mut hh = host_pool(10_000_000);
+        hh.region_lengths = vec![300];
+        let holder = geometry(1_000_000, Some(hh));
+        assert!(matches!(
+            read_batches(
+                &holder,
+                &geometry(2_000_000, Some(host_pool(20_000_000))),
+                &[(page(0, 0, HOST, 4), page(0, 0, DEVICE, 1))]
+            ),
+            Err(GeometryError::Uncovered {
+                tier: PeerTier::Host,
+                addr: 10_000_300,
+                len: 40
+            })
+        ));
+
+        let mut straddle_h = host_pool(20_000_000);
+        straddle_h.region_lengths = vec![30, 270];
+        let straddle_r = geometry(2_000_000, Some(straddle_h));
+        assert!(matches!(
+            push_items(
+                &holder,
+                &straddle_r,
+                &[(page(0, 0, PeerTier::Disk, 1), page(0, 0, HOST, 1))]
+            ),
+            Err(GeometryError::Straddle {
+                tier: PeerTier::Host,
+                addr: 20_000_000,
+                len: 40,
+                region_end: 20_000_030
+            })
+        ));
+
+        let mut dev_r = geometry(2_000_000, None);
+        dev_r.device_regions = vec![(2_000_000, 1_000), (2_010_000, 1_000)];
+        assert_eq!(
+            read_batches(
+                &geometry(1_000_000, None),
+                &dev_r,
+                &[(page(0, 0, DEVICE, 2), page(0, 0, DEVICE, 3))]
+            )
+            .unwrap()
+            .1
+            .len(),
+            2
+        );
+        assert_eq!(
+            push_items(
+                &holder,
+                &dev_r,
+                &[(page(0, 0, PeerTier::Disk, 1), page(0, 0, DEVICE, 3))]
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        assert!(matches!(
+            read_batches(
+                &geometry(1_000_000, None),
+                &dev_r,
+                &[(page(0, 0, DEVICE, 2), page(0, 0, DEVICE, 20))]
+            ),
+            Err(GeometryError::Uncovered {
+                tier: PeerTier::Device,
+                ..
+            })
+        ));
     }
 }

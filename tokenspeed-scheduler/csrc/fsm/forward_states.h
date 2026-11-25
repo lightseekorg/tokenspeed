@@ -139,6 +139,11 @@ struct AdmissionResources {
     // The request has asked its peer holder once (or has none to ask), and
     // what the holder answered.
     bool peer_prepared{false};
+    std::int32_t disk_wait_plans{0};
+    // Backoff gate when a partial Host-credit reservation retries in prepareDisk:
+    // skip re-probing until held Host blocks drop below this watermark, capped.
+    std::optional<std::size_t> disk_retry_below_held_blocks;
+    std::uint8_t disk_read_retries{0};
     std::optional<PeerHit> peer_hit;
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.

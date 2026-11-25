@@ -88,6 +88,7 @@ pub struct Settings {
     ib_device: String,
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
+    device_regions: Vec<(u64, u64)>,
     host: HostPool,
 }
 
@@ -122,8 +123,12 @@ impl Settings {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let host = geometry.getattr("host")?;
+        let host_address: u64 = host.getattr("address")?.extract()?;
+        let regions: Vec<(usize, usize)> = geometry.getattr("regions")?.extract()?;
+        let region_lengths: Vec<u64> = host.getattr("region_lengths")?.extract()?;
+        let device_regions: Vec<(u64, u64)> = geometry.getattr("device_regions")?.extract()?;
         let host = HostPool {
-            address: host.getattr("address")?.extract()?,
+            address: host_address,
             groups: host
                 .getattr("groups")?
                 .try_iter()?
@@ -137,7 +142,9 @@ impl Settings {
                     })
                 })
                 .collect::<PyResult<Vec<_>>>()?,
+            region_lengths,
         };
+        let protocol: String = settings.getattr("protocol")?.extract()?;
         Ok(Some(Self {
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
@@ -162,10 +169,11 @@ impl Settings {
             push_host: settings.getattr("push_host")?.extract()?,
             library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
             local_ip: settings.getattr("local_ip")?.extract()?,
-            protocol: settings.getattr("protocol")?.extract()?,
+            protocol,
             ib_device: settings.getattr("ib_device")?.extract()?,
-            regions: geometry.getattr("regions")?.extract()?,
+            regions,
             device,
+            device_regions,
             host,
         }))
     }
@@ -214,22 +222,16 @@ pub fn start(
         settings.peer.incarnation,
     )
     .map_err(|error| error.to_string())?;
-    if let Some((executor, disk_layout, ring, slot_bytes)) = disk.and_then(DiskTier::push_source) {
+    let push_source = disk.and_then(DiskTier::push_source);
+    if let Some((_, _, ref ring, _)) = push_source {
         engine
             .register(ring.address(), ring.size())
             .map_err(|error| error.to_string())?;
-        push.serve(PushSource {
-            executor,
-            disk_layout,
-            ring,
-            slot_bytes,
-            writer: Arc::new(EngineWriter(engine.clone())),
-        })
-        .map_err(|error| error.to_string())?;
     }
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
+        device_regions: settings.device_regions,
         host: Some(settings.host),
         push: Some(push.name().to_owned()),
     };
@@ -241,6 +243,16 @@ pub fn start(
         .map(|bytes| RankGeometry::decode(bytes))
         .collect::<Option<Vec<_>>>()
         .ok_or("a replica member's peer geometry does not decode")?;
+    if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
+        push.serve(PushSource {
+            executor,
+            disk_layout,
+            ring,
+            slot_bytes,
+            writer: Arc::new(EngineWriter(engine.clone())),
+        })
+        .map_err(|error| error.to_string())?;
+    }
     tracing::debug!(
         regions = ?settings
             .regions

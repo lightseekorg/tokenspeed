@@ -90,7 +90,7 @@ fn interpreter() {
 /// A fused scheduler with peer sharing: the holder's with eight usable
 /// Device blocks over a write-back Host tier and a Disk tier, the reader's
 /// with a Device cache alone.
-fn scheduler(name: &str, holder: bool) -> Scheduler {
+fn scheduler(name: &str, incarnation: u64, holder: bool) -> Scheduler {
     interpreter();
     let tiers = if holder {
         format!(
@@ -131,7 +131,7 @@ cfg.max_resident_requests = 8
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full", block_granularity={PAGE},
                                         total_pages=device_pages, attn_kind=ts.AttnKind.Full,
                                         transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
-cfg.peer_config = ts.PeerConfig(name="{name}", incarnation=1, max_leases=8,
+cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_leases=8,
                                 soft_pin_us=1_000_000, hard_pin_us=1_000_000,
                                 lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE},
                                 landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0,
@@ -172,6 +172,7 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
             page_stride: BLOCK_BYTES as u64,
             bytes: BLOCK_BYTES as u64,
         }],
+        device_regions: Vec::new(),
         host: Some(HostPool {
             address: 0,
             groups: vec![HostGroup {
@@ -180,6 +181,7 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
                 block_bytes: BLOCK_BYTES as u64,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
+            region_lengths: Vec::new(),
         }),
         push: Some(push.to_owned()),
     }
@@ -217,10 +219,10 @@ impl Drop for ScratchFile {
     }
 }
 
-fn settings(name: &str) -> PeerSettings {
+fn settings(name: &str, incarnation: u64) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
-        incarnation: 1,
+        incarnation,
         deployment_id: "deployment".into(),
         weight_version: "v1".into(),
         timeouts: Timeouts {
@@ -250,9 +252,10 @@ struct Replica {
 
 impl Replica {
     fn start(holder: bool, arena: &Arena) -> Self {
+        let incarnation = if holder { 1 } else { 2 };
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let name = format!("127.0.0.1:{}", listener.port());
-        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 1).unwrap();
+        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", incarnation).unwrap();
         let disk = holder.then(|| {
             let dir = std::env::var_os("TS_DISK_TEST_DIR")
                 .map(PathBuf::from)
@@ -296,11 +299,11 @@ impl Replica {
             .unwrap();
             (tier, host, file)
         });
-        let scheduler = Arc::new(Mutex::new(scheduler(&name, holder)));
+        let scheduler = Arc::new(Mutex::new(scheduler(&name, incarnation, holder)));
         // The holder's Device pages are never read: its prefix is on Disk.
         let base = if holder { 1 << 30 } else { READER_BASE };
         let peer = Peer::start(
-            settings(&name),
+            settings(&name, incarnation),
             0,
             vec![geometry(base, push.name())],
             Some(listener),

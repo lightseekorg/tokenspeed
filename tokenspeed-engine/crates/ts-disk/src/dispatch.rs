@@ -29,6 +29,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     os::fd::{AsRawFd, OwnedFd},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -312,6 +313,8 @@ pub(crate) struct Shared {
     pub(crate) limits: Limits,
     /// The io_uring thread's wake-up: it waits in the kernel, not on `work`.
     pub(crate) eventfd: Option<OwnedFd>,
+    /// Whether the active backend is staging O_DIRECT through an anonymous mmap bounce pool.
+    pub(crate) bounce_active: AtomicBool,
 }
 
 impl Shared {
@@ -321,7 +324,16 @@ impl Shared {
             work: Condvar::new(),
             limits,
             eventfd,
+            bounce_active: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_bounce_active(&self) {
+        self.bounce_active.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_bounce_active(&self) -> bool {
+        self.bounce_active.load(Ordering::Acquire)
     }
 
     /// Tell every thread the queues changed.
@@ -420,6 +432,16 @@ mod tests {
         }
     }
 
+    fn admit_chunks(
+        queues: &mut Queues,
+        direction: Direction,
+        chunks: impl IntoIterator<Item = Chunk>,
+        done: Done,
+        now: Instant,
+    ) -> u64 {
+        queues.admit(direction, chunks, done, now)
+    }
+
     type Outcomes = std::sync::Arc<Mutex<Vec<Result<(), IoError>>>>;
 
     fn recorder() -> (Done, Outcomes) {
@@ -441,7 +463,8 @@ mod tests {
         let mut queues = Queues::default();
         let now = Instant::now();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1), chunk(Direction::Write, 1)],
             done,
@@ -450,7 +473,13 @@ mod tests {
         queues.release_write();
         queues.release_write();
         let (done, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        admit_chunks(
+            &mut queues,
+            Direction::Read,
+            [chunk(Direction::Read, 1)],
+            done,
+            now,
+        );
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Read);
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Write);
         // One write in flight is the share, though a slot is free.
@@ -461,7 +490,8 @@ mod tests {
     fn a_job_reports_once_after_its_last_chunk_and_keeps_the_first_error() {
         let mut queues = Queues::default();
         let (done, seen) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Read,
             [
                 chunk(Direction::Read, 1),
@@ -488,7 +518,8 @@ mod tests {
     fn a_cancelled_job_waits_for_its_chunks_in_flight() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        let job = queues.admit(
+        let job = admit_chunks(
+            &mut queues,
             Direction::Read,
             [chunk(Direction::Read, 1), chunk(Direction::Read, 1)],
             done,
@@ -506,7 +537,8 @@ mod tests {
     fn closing_cancels_what_is_queued() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1)],
             done,

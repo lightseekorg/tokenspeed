@@ -149,6 +149,7 @@ fn geometry(base: u64) -> RankGeometry {
             page_stride: PAGE_BYTES,
             bytes: PAGE_BYTES,
         }],
+        device_regions: Vec::new(),
         host: None,
         push: None,
     }
@@ -166,6 +167,7 @@ fn geometry_with_host(base: u64, host_base: u64) -> RankGeometry {
                 block_bytes: PAGE_BYTES,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
+            region_lengths: Vec::new(),
         }),
         ..geometry(base)
     }
@@ -181,9 +183,11 @@ impl PagePusher for NoPushes {
 }
 
 fn settings(name: &str, weight_version: &str) -> PeerSettings {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
     PeerSettings {
         name: name.to_owned(),
-        incarnation: 1,
+        incarnation: NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed),
         deployment_id: "deployment".into(),
         weight_version: weight_version.to_owned(),
         timeouts: Timeouts {
@@ -254,7 +258,12 @@ impl Replica {
         role: &str,
         landing: Landing,
     ) -> Self {
-        let scheduler = Arc::new(Mutex::new(scheduler(&settings.name, 1, role, landing)));
+        let scheduler = Arc::new(Mutex::new(scheduler(
+            &settings.name,
+            settings.incarnation,
+            role,
+            landing,
+        )));
         let name = settings.name.clone();
         let peer = Peer::start(
             settings,
@@ -480,23 +489,43 @@ fn sibling_receives_requests_while_public_scheduler_is_locked() {
     let sibling = replica(31, private, HOLDER_BASE);
     let (incoming, replies) = mpsc::channel();
     let client = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let client_addr = format!("127.0.0.1:{}", client.port());
     let layout = Request::Layout {
-        reply_to: format!("127.0.0.1:{}", client.port()),
+        reply_to: client_addr.clone(),
     };
-    let receive_holder = || {
+    let receive_layout = || {
         let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
         let Inbound::Reply(Reply::Layout { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
             panic!("expected a layout reply");
         };
         stamp.name
     };
-    // Both messages enter the same public socket in FIFO order.
+    let receive_pin = || {
+        let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Inbound::Reply(Reply::Answer { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
+            panic!("expected a pin answer reply");
+        };
+        stamp.name
+    };
+    // 1. `Request::Layout` on `owner` answers immediately WITHOUT locking `owner.scheduler`!
     let lock = owner.scheduler.lock();
     client.request(&owner.name, &layout).unwrap();
-    client.request(&sibling.name, &layout).unwrap();
-    assert_eq!(receive_holder(), sibling.name);
+    assert_eq!(receive_layout(), owner.name);
+
+    // 2. Both `Request::Pin` messages enter the same public socket in FIFO order;
+    //    `owner`'s servicer waits on `owner.scheduler.lock()`, while `ts-peer-router`
+    //    forwards `sibling`'s request without head-of-line blocking!
+    let pin = Request::Pin {
+        lease: ts_scheduler::PeerLeaseView {
+            reader: client_addr,
+            id: 77,
+        },
+    };
+    client.request(&owner.name, &pin).unwrap();
+    client.request(&sibling.name, &pin).unwrap();
+    assert_eq!(receive_pin(), sibling.name);
     drop(lock);
-    assert_eq!(receive_holder(), owner.name);
+    assert_eq!(receive_pin(), owner.name);
 }
 
 fn read_through_node_port(public_reads: bool) {
@@ -894,4 +923,102 @@ fn a_holder_that_moved_to_new_weights_is_no_longer_read() {
         .unwrap();
     let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
     assert_eq!((prefix, landings.len()), (0, 0));
+}
+
+#[test]
+fn servicer_demux_avoids_hol_blocking_and_dp0_aliases_and_late_layout_succeed() {
+    use ts_control::peer::{normalize_peer_holder, wire::Prompt};
+    use ts_scheduler::{PeerAnswerKind, PeerLeaseView};
+
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/0"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/00"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/+0"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("[::1]:7100/00"), "[::1]:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/1"), "10.0.0.1:7100/1");
+
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let prefix: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &prefix, &arena);
+
+    // 1. Non-canonical "/0" hint normalizes and arrived Reply::Layout past answer_us advances to Pin cleanly.
+    let rl = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let rname = format!("127.0.0.1:{}", rl.port());
+    let mut rs = settings(&rname, "v1");
+    rs.timeouts.answer_us = 40_000;
+    let mut reader = Replica::with_listener(rs, rl, READER_BASE, &arena, "Fused");
+    let mut prompt = prefix.clone();
+    prompt.extend(95_000..95_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec(
+            "slash0-late-layout",
+            prompt,
+            &format!("{}/0", holder.name),
+        )])
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        holder.round();
+        if !reader.round().1.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(80)); // > answer_us, Reply::Layout already arrived
+    let (hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), "slash0-late-layout");
+    assert!(hit >= 5 * PAGE);
+
+    // 2. ts-peer-demux delivers Layout + Inbound::Reply while scheduler.lock() is held behind queued Lookups.
+    let seed_r: Vec<i32> = (500..500 + 4 * PAGE).collect();
+    holder_computes(&mut reader, &seed_r, &arena);
+    let (ext_tx, ext_rx) = mpsc::channel();
+    let ext = PeerNet::start("127.0.0.1", 0, ext_tx).unwrap();
+    let ext_addr = format!("127.0.0.1:{}", ext.port());
+    let lookup_prompt = {
+        let mut s = scheduler("scratch", 99, "Fused", Landing::Device);
+        let mut t = seed_r;
+        t.extend(88_000..88_000 + PAGE);
+        s.submit_requests(&[spec("s", t, "target")]).unwrap();
+        let _ = s.next_execution_plan(true, false);
+        let l = s.take_peer_lookups().pop().unwrap();
+        Prompt {
+            prefix_hashes: l.prefix_hashes,
+            tokens: l.tokens,
+            max_tokens: l.max_tokens,
+        }
+    };
+    let guard = reader.scheduler.lock();
+    for i in 0..3u64 {
+        ext.request(
+            &reader.name,
+            &Request::Lookup {
+                lease: PeerLeaseView {
+                    reader: ext_addr.clone(),
+                    id: 500 + i,
+                },
+                prompt: lookup_prompt.clone(),
+            },
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(15));
+    ext.request(&reader.name, &Request::Layout { reply_to: ext_addr })
+        .unwrap();
+    let layout_frame = ext_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("Layout was HOL-blocked behind scheduler.lock()");
+    assert!(matches!(
+        Inbound::decode(&layout_frame).unwrap(),
+        Inbound::Reply(Reply::Layout { .. })
+    ));
+    drop(guard);
+    for _ in 0..3 {
+        let f = ext_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(Inbound::decode(&f).unwrap(), Inbound::Reply(Reply::Answer { answer, .. }) if answer.kind == PeerAnswerKind::Lookup && answer.num_tokens == 4 * PAGE)
+        );
+    }
 }

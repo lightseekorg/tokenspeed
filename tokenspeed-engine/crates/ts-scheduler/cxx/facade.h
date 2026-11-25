@@ -76,9 +76,11 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                   rust::Slice<const CacheEvent> cache_events);
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
-PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
+                                  std::size_t pending_new_leases);
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
                       rust::Slice<const PeerPageView> pages);
+bool peer_lease_can_pin(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler);
 rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler);
@@ -133,6 +135,7 @@ std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
+bool plan_has_pages_to_copy(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<TransferBatchView> plan_forward_transfer(const tokenspeed::ExecutionPlan& plan);

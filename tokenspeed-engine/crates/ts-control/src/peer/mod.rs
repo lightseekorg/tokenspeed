@@ -59,7 +59,7 @@ use ts_scheduler::{
 use crate::{
     codec::{Reader, Writer},
     peer::{
-        geometry::{push_items, read_spans, RankGeometry},
+        geometry::{push_items, read_batches, RankGeometry},
         landing::{Action, Landing, Timeouts},
         net::{Inbound, PeerNet},
         push::PagePusher,
@@ -70,6 +70,8 @@ use crate::{
 };
 
 const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Maximum holder RPCs drained per single `scheduler.lock()` acquisition in `ts-peer-servicer`.
+const MAX_SERVICER_BATCH: usize = 64;
 
 /// What a replica's peer sharing runs with.
 #[derive(Debug, Clone)]
@@ -98,6 +100,26 @@ impl PeerSettings {
 
 fn namespace(deployment_id: &str, weight_version: &str) -> String {
     format!("{deployment_id}/{weight_version}")
+}
+
+/// Canonicalize DP0's non-canonical `"<host>:<port>/0"`, `"/00"`, `"/+0"`, etc.
+/// aliases to `"<host>:<port>"`, matching `PeerNet::send` `u32::parse` routing.
+pub fn normalize_peer_holder(endpoint: &str) -> &str {
+    match endpoint.split_once('/') {
+        Some((base, rank)) if !base.is_empty() && rank.parse::<u32>() == Ok(0) => base,
+        _ => endpoint,
+    }
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let addr = endpoint.split_once('/').map_or(endpoint, |(base, _)| base);
+    crate::peer::net::split_endpoint(addr)
+        .ok()
+        .map(|(host, _)| host)
+}
+
+fn same_peer_host(a: &str, b: &str) -> bool {
+    matches!((endpoint_host(a), endpoint_host(b)), (Some(ha), Some(hb)) if ha == hb)
 }
 
 /// A round's agreement could not be reached.
@@ -335,6 +357,7 @@ struct Endpoint {
     net: Arc<PeerNet>,
     holder: Arc<Mutex<Holder>>,
     replies: mpsc::Receiver<Reply>,
+    _demux: thread::JoinHandle<()>,
     _servicer: thread::JoinHandle<()>,
 }
 
@@ -387,6 +410,8 @@ pub struct Peer {
     previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
     unplaced: Vec<(String, bool)>,
+    /// Synthetic miss answers for self-lookups short-circuited locally.
+    self_lookup_answers: Vec<PeerEventView>,
 }
 
 impl Peer {
@@ -396,7 +421,7 @@ impl Peer {
     /// member reads through `reader` and has holders' Disk pages pushed
     /// through `pusher` (its rank's push endpoint).
     pub fn start(
-        settings: PeerSettings,
+        mut settings: PeerSettings,
         member: usize,
         replica: Vec<RankGeometry>,
         listener: Option<PeerListener>,
@@ -404,6 +429,7 @@ impl Peer {
         reader: Arc<dyn PageReader>,
         pusher: Arc<dyn PagePusher>,
     ) -> Result<Self, PeerError> {
+        settings.name = normalize_peer_holder(&settings.name).to_owned();
         let members = replica.len();
         let geometry = replica.get(member).cloned().ok_or(PeerError::Report)?;
         if listener.is_some() != (member == 0) {
@@ -437,7 +463,42 @@ impl Peer {
             previous_totals: [0; 2],
             reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
+            self_lookup_answers: Vec::new(),
         })
+    }
+
+    /// Drain queued holder changes on the endpoint owner (empty on other members).
+    pub fn take_holder_changes(&self) -> Vec<PeerEventView> {
+        self.endpoint
+            .as_ref()
+            .map_or_else(Vec::new, |endpoint| endpoint.holder.lock().take_changes())
+    }
+
+    /// Encode holder changes for intra-replica broadcast.
+    pub fn encode_changes(changes: &[PeerEventView]) -> Vec<u8> {
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Writer::new();
+        out.count(changes.len());
+        for change in changes {
+            write_change(&mut out, change);
+        }
+        out.finish()
+    }
+
+    /// Decode holder changes from intra-replica broadcast.
+    pub fn decode_changes(bytes: &[u8]) -> Result<Vec<PeerEventView>, PeerError> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reader = Reader::new(bytes);
+        let count = reader.count().ok_or(PeerError::Report)?;
+        let mut changes = Vec::with_capacity(count.min(1 << 16));
+        for _ in 0..count {
+            changes.push(read_change(&mut reader).ok_or(PeerError::Report)?);
+        }
+        reader.finish(changes).ok_or(PeerError::Report)
     }
 
     /// Enable logical measurements on member zero and physical measurements on every member.
@@ -532,6 +593,7 @@ impl Peer {
         let now_us = first.now_us;
         self.asked.retain(|_, deadline_us| now_us < *deadline_us);
         let mut events = first.changes.clone();
+        events.append(&mut self.self_lookup_answers);
         let mut actions = Vec::new();
         for reply in &first.replies {
             self.take_reply(reply, now_us, &mut events, &mut actions);
@@ -556,12 +618,12 @@ impl Peer {
             }
         }
         for (request, landing) in &mut self.landings {
-            landing.tick(now_us);
             if self.layouts.contains_key(&landing.fetch().holder) {
                 if let Some(action) = landing.layout_known(now_us) {
                     actions.push((request.clone(), action));
                 }
             }
+            landing.tick(now_us);
         }
         self.send(actions, now_us);
         let done: Vec<(String, i32)> = self
@@ -621,7 +683,8 @@ impl Peer {
             );
         }
         let mut actions = Vec::new();
-        for fetch in fetches {
+        for mut fetch in fetches {
+            fetch.holder = normalize_peer_holder(&fetch.holder).to_owned();
             let known = self.layouts.contains_key(&fetch.holder);
             let request = fetch.request_id.clone();
             tracing::debug!(
@@ -641,8 +704,18 @@ impl Peer {
             actions.push((request, action));
         }
         self.send(actions, now_us);
-        if let Some(endpoint) = &self.endpoint {
-            for lookup in lookups {
+        for mut lookup in lookups {
+            lookup.holder = normalize_peer_holder(&lookup.holder).to_owned();
+            if lookup.holder == self.settings.name {
+                self.self_lookup_answers.push(PeerEventView {
+                    kind: PeerEventKind::LookupAnswered,
+                    lease: lookup.lease,
+                    num_tokens: 0,
+                    ..empty_event()
+                });
+                continue;
+            }
+            if let Some(endpoint) = &self.endpoint {
                 if self.metrics.is_some() {
                     self.lookup_times.insert(
                         lookup.lease.id,
@@ -680,6 +753,7 @@ impl Peer {
         self.identity = self.settings.identity();
         self.layouts.clear();
         self.asked.clear();
+        self.self_lookup_answers.clear();
         if let Some(endpoint) = &self.endpoint {
             endpoint.holder.lock().set_identity(self.identity.clone());
         }
@@ -688,6 +762,12 @@ impl Peer {
     /// Landings in flight.
     pub fn num_landings(&self) -> usize {
         self.landings.len()
+    }
+
+    fn is_self_stamp(&self, stamp: &Stamp) -> bool {
+        normalize_peer_holder(&stamp.name) == self.settings.name
+            || (stamp.incarnation == self.settings.incarnation
+                && same_peer_host(&stamp.name, &self.settings.name))
     }
 
     fn take_reply(
@@ -699,10 +779,18 @@ impl Peer {
     ) {
         match reply {
             Reply::Layout { stamp, ranks } => {
+                let holder_name = normalize_peer_holder(&stamp.name).to_owned();
+                self.asked.remove(&holder_name);
                 self.asked.remove(&stamp.name);
-                if stamp.identity == self.identity && ranks.len() == self.members {
+                if self.is_self_stamp(stamp) {
+                    tracing::warn!(
+                        holder = stamp.name,
+                        incarnation = stamp.incarnation,
+                        "ignoring peer layout reply from self"
+                    );
+                } else if stamp.identity == self.identity && ranks.len() == self.members {
                     self.layouts.insert(
-                        stamp.name.clone(),
+                        holder_name,
                         Layout {
                             incarnation: stamp.incarnation,
                             ranks: ranks.clone(),
@@ -716,13 +804,22 @@ impl Peer {
                 }
             }
             Reply::Answer { stamp, answer } => {
+                let self_reply = self.is_self_stamp(stamp);
                 let trusted = self.trust(stamp);
                 match answer.kind {
                     PeerAnswerKind::Lookup => {
+                        let valid_peer = stamp.identity == self.identity && !self_reply;
+                        if self_reply {
+                            tracing::warn!(
+                                holder = stamp.name,
+                                incarnation = stamp.incarnation,
+                                "ignoring peer lookup reply from self"
+                            );
+                        }
                         if let (Some(metrics), Some((rid, start, _))) =
                             (&self.metrics, self.lookup_times.remove(&answer.lease.id))
                         {
-                            let outcome = if stamp.identity != self.identity {
+                            let outcome = if !valid_peer {
                                 "incompatible"
                             } else if answer.num_tokens == 0 {
                                 "miss"
@@ -740,12 +837,8 @@ impl Peer {
                         events.push(PeerEventView {
                             kind: PeerEventKind::LookupAnswered,
                             lease: answer.lease.clone(),
-                            // A holder of another namespace holds nothing of ours.
-                            num_tokens: if stamp.identity == self.identity {
-                                answer.num_tokens
-                            } else {
-                                0
-                            },
+                            // A holder of another namespace or self holds nothing of ours.
+                            num_tokens: if valid_peer { answer.num_tokens } else { 0 },
                             ..empty_event()
                         });
                     }
@@ -782,15 +875,16 @@ impl Peer {
     }
 
     /// Whether an answer comes from the holder whose layout is known, in the
-    /// same incarnation and namespace; a stale layout is forgotten.
+    /// same incarnation and namespace; a stale layout or self-reply is rejected.
     fn trust(&mut self, stamp: &Stamp) -> bool {
-        if stamp.identity != self.identity {
+        if stamp.identity != self.identity || self.is_self_stamp(stamp) {
             return false;
         }
-        match self.layouts.get(&stamp.name) {
+        let holder_name = normalize_peer_holder(&stamp.name);
+        match self.layouts.get(holder_name) {
             Some(layout) if layout.incarnation == stamp.incarnation => true,
             Some(_) => {
-                self.layouts.remove(&stamp.name);
+                self.layouts.remove(holder_name);
                 false
             }
             None => false,
@@ -878,8 +972,9 @@ impl Peer {
             let job = holder
                 .ok_or_else(|| "no layout of the holder".to_owned())
                 .and_then(|holder| {
-                    let spans = read_spans(holder, &self.geometry, &read_pages)
-                        .map_err(|error| error.to_string())?;
+                    let (total_read_bytes, batches) =
+                        read_batches(holder, &self.geometry, &read_pages)
+                            .map_err(|error| error.to_string())?;
                     let push = if disk_pages.is_empty() {
                         None
                     } else {
@@ -893,23 +988,23 @@ impl Peer {
                                 .map_err(|error| error.to_string())?,
                         })
                     };
-                    Ok((holder.session.clone(), spans, push))
+                    Ok((holder.session.clone(), total_read_bytes, batches, push))
                 });
             self.reading.insert(request.clone());
             match job {
-                Ok((session, spans, push)) => {
+                Ok((session, total_read_bytes, batches, push)) => {
                     let observation = self.read_metrics.as_ref().map(|metrics| {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
+                            total_read_bytes + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(
                         ReadJob {
                             request_id: request.clone(),
                             session,
-                            spans,
+                            batches,
                             push,
                         },
                         observation,
@@ -943,23 +1038,26 @@ fn start_endpoint(
         settings.record_lifetime,
     )));
     let (replied, replies) = mpsc::channel();
-    let servicer = {
+    let (holder_tx, holder_rx) = mpsc::channel::<Request>();
+    // Fast non-blocking demux thread: delivers `Inbound::Reply` and answers
+    // `Request::Layout` immediately without ever blocking on `scheduler.lock()`.
+    let demux = {
         let (net, holder) = (Arc::downgrade(&net), holder.clone());
         thread::Builder::new()
-            .name("ts-peer-servicer".to_owned())
+            .name("ts-peer-demux".to_owned())
             .spawn(move || {
                 for frames in received {
                     match Inbound::decode(&frames) {
-                        Ok(Inbound::Request(request)) => {
-                            // Waits while the control thread runs a round's
-                            // scheduler work; answers between rounds.
-                            let (to, reply) = {
-                                let scheduler = scheduler.lock();
-                                holder.lock().handle(&*scheduler, request, Instant::now())
-                            };
+                        Ok(Inbound::Request(Request::Layout { reply_to })) => {
+                            let reply = holder.lock().layout_reply();
                             let Some(net) = net.upgrade() else { return };
-                            if let Err(error) = net.reply(&to, &reply) {
-                                tracing::warn!(to, %error, "peer reply not sent");
+                            if let Err(error) = net.reply(&reply_to, &reply) {
+                                tracing::warn!(to = reply_to, %error, "peer layout reply not sent");
+                            }
+                        }
+                        Ok(Inbound::Request(request)) => {
+                            if holder_tx.send(request).is_err() {
+                                return;
                             }
                         }
                         Ok(Inbound::Reply(reply)) => {
@@ -972,10 +1070,42 @@ fn start_endpoint(
                 }
             })?
     };
+    // Holder RPC worker: waits for `scheduler.lock()` between control-loop
+    // rounds and batch-drains all queued `Lookup`/`Pin`/`Release` RPCs under
+    // one single lock acquisition before sending replies outside the lock.
+    let servicer = {
+        let (net, holder) = (Arc::downgrade(&net), holder.clone());
+        thread::Builder::new()
+            .name("ts-peer-servicer".to_owned())
+            .spawn(move || {
+                let mut batch = Vec::new();
+                while let Ok(first) = holder_rx.recv() {
+                    batch.clear();
+                    {
+                        let scheduler = scheduler.lock();
+                        let mut holder = holder.lock();
+                        batch.push(holder.handle(&*scheduler, first, Instant::now()));
+                        while batch.len() < MAX_SERVICER_BATCH {
+                            let Ok(next) = holder_rx.try_recv() else {
+                                break;
+                            };
+                            batch.push(holder.handle(&*scheduler, next, Instant::now()));
+                        }
+                    }
+                    let Some(net) = net.upgrade() else { return };
+                    for (to, reply) in batch.drain(..) {
+                        if let Err(error) = net.reply(&to, &reply) {
+                            tracing::warn!(to, %error, "peer reply not sent");
+                        }
+                    }
+                }
+            })?
+    };
     Ok(Endpoint {
         net,
         holder,
         replies,
+        _demux: demux,
         _servicer: servicer,
     })
 }

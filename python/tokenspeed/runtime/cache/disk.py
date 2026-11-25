@@ -84,6 +84,8 @@ class DiskTierTuning:
     wait_timeout_ms: int = 10000
     ready_timeout_ms: int = 5000
     push_ring_mb: int = 512
+    min_clean_tokens: int = 0
+    require_reuse_for_cleaning: bool = False
 
     @classmethod
     def from_json(cls, text: str | None) -> DiskTierTuning:
@@ -109,6 +111,8 @@ class DiskTierTuning:
             raise ValueError("write_host_blocks_fraction must be in (0, 1]")
         if tuning.push_ring_mb <= 0:
             raise ValueError("push_ring_mb must be positive")
+        if tuning.min_clean_tokens < 0:
+            raise ValueError("min_clean_tokens must be non-negative")
         return tuning
 
 
@@ -142,6 +146,8 @@ def disk_scheduler_config(tuning: DiskTierTuning, *, num_host_blocks: int):
         min_prefetch_tokens=tuning.min_prefetch_tokens,
         wait_timeout_us=tuning.wait_timeout_ms * 1000,
         ready_timeout_us=tuning.ready_timeout_ms * 1000,
+        min_clean_tokens=tuning.min_clean_tokens,
+        require_reuse_for_cleaning=tuning.require_reuse_for_cleaning,
     )
 
 
@@ -190,8 +196,8 @@ class DiskSettings:
 
 
 def disk_file_path(server_args, *, global_rank: int) -> str:
-    """This rank's file: one directory per drive, ranks spread over them;
-    the port keeps engines on one node apart."""
+    """This rank's file: one directory per drive, ranks spread over them,
+    and the port and rank keep engines apart."""
     directory = server_args.disk_tier_paths[
         global_rank % len(server_args.disk_tier_paths)
     ]

@@ -109,7 +109,9 @@ file and registered memory. It has two backends, chosen explicitly:
 
 - **io_uring**: one thread owns a ring with the Host pool (and the push ring)
   registered as fixed buffers, in pieces of at most 1 GiB; no request crosses
-  a piece. The file is not registered and SQPOLL is not used: the kernels and
+  a piece. When a platform disallows `O_DIRECT` DMA directly against device-pinned
+  host memory (`EFAULT`), `ts-disk` falls back to registered bounce buffers for
+  those chunks. The file is not registered and SQPOLL is not used: the kernels and
   container policies in use refuse fixed files and unprivileged SQPOLL.
 - **psync**: a pool of threads calling `pread`/`pwrite`, for hosts whose
   policy refuses io_uring.
@@ -125,7 +127,10 @@ a job's blocks stay held until it reports.
 Every plan, if the Host tier's free plus clean capacity is below a watermark,
 the scheduler picks the oldest dirty Host-only entries, in Host eviction
 order, within the operation credits, and writes them to Disk blocks it
-allocates (evicting Disk entries if needed). The write holds its Host sources
+allocates (evicting Disk entries if needed). Cleaning admission can further
+gate writes by minimum entry reuse (`--disk-tier-clean-min-reuse`) and
+minimum prefix length (`--disk-tier-clean-min-tokens`) to curb write
+amplification on one-shot prefixes. The write holds its Host sources
 and Disk destinations; when every rank retired it, the Disk entries are
 published with the Host entries' metadata (access epoch, logical position,
 boundary kind) and the Host entries become clean. Entries already on Disk, a

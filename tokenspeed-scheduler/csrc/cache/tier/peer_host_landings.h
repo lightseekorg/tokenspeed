@@ -75,6 +75,10 @@ public:
     // Whether a landing is still in flight.
     bool HasProgressPending() const;
     std::size_t NumHeldHostBlocks() const;
+    // The Host blocks landings hold (in-flight unpublished destinations and
+    // published Ready holds). A cache clear drains or detaches them
+    // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
+    std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
 
 private:
     struct Landing {

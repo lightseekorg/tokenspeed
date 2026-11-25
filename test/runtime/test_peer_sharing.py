@@ -182,10 +182,30 @@ def test_the_geometry_addresses_the_bytes_the_cache_holds():
             )
             assert field.address + page * field.page_stride == expected
             assert field.bytes == layout_field.payload_bytes
-    # Both memories are registered for the transfer engine.
+    # Both memories are registered for the transfer engine, with explicit region metadata.
+    assert geometry.host.region_lengths == (storage.host_buffer_bytes,)
+    assert geometry.device_regions == ((device.data_ptr(), device.numel()),)
     assert geometry.regions == (
         (device.data_ptr(), device.numel()),
         (host_base, storage.host_buffer_bytes),
+    )
+
+    split_first = 2 * storage.host_lcm_block_bytes
+    split_rest = storage.host_buffer_bytes - split_first
+    split_geometry = build_peer_geometry(
+        scheduler_group_ids=("full", "swa"),
+        groups=groups,
+        field_addresses=field_addresses,
+        device_regions=((device.data_ptr(), device.numel()),),
+        host_storage=storage,
+        host_region_planner=lambda length, parent: (2 * parent, length - 2 * parent),
+    )
+    assert split_geometry.host.region_lengths == (split_first, split_rest)
+    assert split_geometry.device_regions == ((device.data_ptr(), device.numel()),)
+    assert split_geometry.regions == (
+        (device.data_ptr(), device.numel()),
+        (host_base, split_first),
+        (host_base + split_first, split_rest),
     )
 
 
@@ -221,6 +241,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.kvstore_storage_backend = None
     args.pipeline_parallel_size = 1
     args.query_context_parallel_size = 1
+    args.enable_memory_saver = False
     args.mapping = Mapping(rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2)
     for name, value in overrides.items():
         setattr(args, name, value)
@@ -263,6 +284,49 @@ def test_host_landings_take_a_share_of_the_host_blocks():
     assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
 
 
+def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeout():
+    pytest.importorskip("tokenspeed_engine.scheduler")
+    base = {
+        "name": "10.0.0.2:7100",
+        "incarnation": 3,
+        "min_fetch_tokens": 256,
+        "num_host_blocks": 100,
+    }
+    # 50 ms: soft_pin = max(2.0, 2*0.05 + 2.0) = 2.1s, host_ready = max(5.0, 0.05 + 5.0) = 5.05s
+    low = peer_scheduler_config(landing_tier="host", answer_timeout_ms=50, **base)
+    assert low.soft_pin_us == 2_100_000
+    assert low.host_ready_timeout_us == 5_050_000
+    assert low.lookup_timeout_us == 50_000
+
+    # 1000 ms: soft_pin = 4.0s, host_ready = 6.0s
+    mid = peer_scheduler_config(landing_tier="host", answer_timeout_ms=1000, **base)
+    assert mid.soft_pin_us == 4_000_000
+    assert mid.host_ready_timeout_us == 6_000_000
+    assert mid.lookup_timeout_us == 1_000_000
+
+    # 5000 ms: soft_pin = 12.0s (> 2.0s hardcoded floor!), host_ready = 10.0s
+    high = peer_scheduler_config(landing_tier="host", answer_timeout_ms=5000, **base)
+    assert high.soft_pin_us == 12_000_000
+    assert high.host_ready_timeout_us == 10_000_000
+    assert high.lookup_timeout_us == 5_000_000
+
+    # Device landing raises soft_pin floor to max(8.0s, 6.0 * answer_timeout_s)
+    # while leaving host_ready_timeout_us == 0.
+    dev_low = peer_scheduler_config(landing_tier="device", answer_timeout_ms=50, **base)
+    assert dev_low.soft_pin_us == 8_000_000
+    assert dev_low.host_ready_timeout_us == 0
+
+    dev_mid = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=1000, **base
+    )
+    assert dev_mid.soft_pin_us == 8_000_000
+    assert dev_mid.host_ready_timeout_us == 0
+
+    dev = peer_scheduler_config(landing_tier="device", answer_timeout_ms=5000, **base)
+    assert dev.soft_pin_us == 30_000_000
+    assert dev.host_ready_timeout_us == 0
+
+
 @pytest.mark.parametrize(
     "overrides,refused",
     [
@@ -271,6 +335,7 @@ def test_host_landings_take_a_share_of_the_host_blocks():
         ({"kvstore_storage_backend": "mooncake"}, "--kvstore-storage-backend"),
         ({"pipeline_parallel_size": 2}, "--pipeline-parallel-size"),
         ({"query_context_parallel_size": 2}, "--query-context-parallel-size"),
+        ({"enable_memory_saver": True}, "--enable-memory-saver.*Mooncake MRs"),
     ],
 )
 def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):

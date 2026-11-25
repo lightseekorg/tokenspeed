@@ -85,6 +85,9 @@ public:
     // (warm Host hits counted). Empty when no boundary fits.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
+    // Longest boundary that `hits` (with Device and Host) can resume under the
+    // Host-suffix rule, without allocating blocks or spending Host credits.
+    std::int32_t ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const;
     // Peer sharing with a Disk tier (docs/rfcs/0006-disk-tier.md): what a
     // holder lists when `disk_hits`, keys its Disk holds, extend its local
     // hit -- the longest boundary the Device, the Host and the Disk resume

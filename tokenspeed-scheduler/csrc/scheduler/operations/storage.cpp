@@ -228,6 +228,7 @@ void Scheduler::prepareStorage(Request& request) {
         return;
     }
 
+    if (request.Is<fsm::PeerLooking>()) return;
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
     admission->storage_prepared = true;

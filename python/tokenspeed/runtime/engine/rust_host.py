@@ -1305,7 +1305,7 @@ def _peer_sharing_settings(
     host_cache,
     geometry,
 ) -> PeerSharingSettings:
-    """Build the live cache namespace and agree on the TP replica's incarnation."""
+    """Build the live cache namespace and agree on the TP replica's settings."""
     mapping = server_args.mapping
     deployment_id = cache_deployment_id(
         server_args,
@@ -1315,6 +1315,7 @@ def _peer_sharing_settings(
         world_cpu_group=None,
         for_peer=True,
     )
+    protocol = mooncake_protocol()
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
         dist.broadcast_object_list(
@@ -1351,7 +1352,7 @@ def _peer_sharing_settings(
         library=mooncake_library(),
         local_ip=local_ip,
         push_host=host,
-        protocol=mooncake_protocol(),
+        protocol=protocol,
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
     )

@@ -20,15 +20,34 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cache/core/cache_types.h"
 
 namespace tokenspeed {
+
+// Canonicalize DP0's non-canonical "<host>:<port>/0", "/00", "/+0", etc.
+// aliases to "<host>:<port>", matching Rust `u32::parse() == Ok(0)`.
+inline std::string_view CanonicalPeerEndpoint(std::string_view endpoint) {
+    const std::size_t slash = endpoint.find('/');
+    if (slash == 0 || slash == std::string_view::npos) {
+        return endpoint;
+    }
+    std::string_view rank = endpoint.substr(slash + 1);
+    if (rank.starts_with('+')) {
+        rank.remove_prefix(1);
+    }
+    if (!rank.empty() && std::ranges::all_of(rank, [](char c) { return c == '0'; })) {
+        return endpoint.substr(0, slash);
+    }
+    return endpoint;
+}
 
 // Sharing cached prefixes between engine replicas
 // (docs/rfcs/0004-peer-prefix-sharing.md). A reader asks a holder for a
@@ -151,8 +170,12 @@ struct PeerFetchOperation {
 namespace cache {
 
 // The peer clock, agreed by the replica's members; it times leases and waits.
+// Setting expire=false advances peer_now_us_ without sweeping leases/waits yet
+// so events answered against the pre-tick state (Pin, Release, LookupAnswered)
+// can be applied at now_us before expiration runs.
 struct PeerTick {
     std::int64_t now_us{0};
+    bool expire{true};
 };
 
 // Holder: a reader's lookup, pin and release, as every member applies them

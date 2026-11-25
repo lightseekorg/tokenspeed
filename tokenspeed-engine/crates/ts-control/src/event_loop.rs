@@ -835,6 +835,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             self.startup_cache_clear = true;
             loop {
+                self.sync_peer_holder_changes()?;
                 if self.clear_cache()? == Some(true) {
                     break;
                 }
@@ -1089,6 +1090,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // The storage tick disabled forward planning: scheduler aborts arise
             // only in that build, and frozen rounds reset the no-progress streak.
             self.record_scheduler_metrics(None, &cache_ops, 0);
+            let frozen_has_copies = plan.has_pages_to_copy();
             let device_work = plan.needs_device() || retirement_id.is_some();
             busy |= device_work;
             if device_work {
@@ -1101,9 +1103,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 )?;
             }
             let mut forwarded = false;
-            if let Some(dp) = self.dp_round(None, &mut stop)? {
+            if let Some(dp) = self.dp_round(None, &mut stop, !frozen_has_copies)? {
                 if dp.idle_forward && memory_resident {
-                    self.data_plane.idle_forward(&dp)?;
+                    if frozen_has_copies {
+                        self.data_plane.idle_forward(&dp)?;
+                    } else {
+                        let data_plane = &mut self.data_plane;
+                        ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                            data_plane.idle_forward(&dp)
+                        })?;
+                    }
                     forwarded = true;
                 }
             }
@@ -1211,6 +1220,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
+        let has_device_copies = plan.has_pages_to_copy();
         let sample_ttft = self.outputs.ttft_sampling_enabled();
         let debug = tracing::enabled!(tracing::Level::DEBUG);
         // Reading the batch crosses FFI and copies its arrays.
@@ -1264,7 +1274,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        let dp = self.dp_round(forward.as_ref(), stop)?;
+        // Never unlock `self.scheduler` here: `next_execution_plan` above may
+        // already have relocated compacted Device blocks (`pages_to_copy`) or
+        // published overlapping prefill pages into `PrefixCacheIndex` before
+        // `data_plane.execute` submits their GPU work.
+        let dp = self.dp_round(forward.as_ref(), stop, false)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
             // Padding for a peer is not a local request batch.
             forward = None;
@@ -1334,7 +1348,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut forwarded = idle_forward;
         let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
-            if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
+            let executed = if idle_forward && !has_device_copies {
+                let data_plane = &mut self.data_plane;
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    data_plane.execute(plan, &dispatch)
+                })?
+            } else {
+                self.data_plane.execute(plan, &dispatch)?
+            };
+            if let Some(pending) = executed {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
@@ -2088,7 +2110,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -key,
                 if reload_ready { -1 } else { 0 },
             ];
-            let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
+            let reduced = if self.ranks.replica.size() == 1 {
+                let reduced = {
+                    let mesh = &mut self.ranks.mesh;
+                    ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                        mesh.all_reduce(world, &row, Reduce::Max)
+                    })?
+                };
+                // Any peer Lookup/Pin/Release answered while waiting on sibling DP
+                // ranks in `all_reduce` must be applied to `self.scheduler` before
+                // `clear_cache` or `next_execution_plan` runs in this round.
+                // Limited to single-member replicas so TP/PP adds no per-round broadcast.
+                self.sync_peer_holder_changes()?;
+                reduced
+            } else {
+                self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?
+            };
             // A resume reaches DP engines independently. None may forward
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
@@ -2722,6 +2759,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     && self.transfers_idle()
                     && self.cache_ops.open() == 0,
             )?;
+        // Sync any peer Lookup/Pin/Release answered while `self.scheduler` was
+        // unlocked earlier in this round before `storage_non_storage_clearable`
+        // or `clear_l1_cache` inspects hard pins. Only runs when a Reload or
+        // Release drain is actually active, adding zero per-round collectives.
+        if self.controls.reload_pending() && self.peer.is_some() && self.replica_any(drained)? {
+            self.sync_peer_holder_changes()?;
+        }
         let Some(drain) = self.controls.drain() else {
             return Ok(());
         };
@@ -2738,8 +2782,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            if tags.iter().any(|tag| tag == "kv_cache") && !self.scheduler.clear_l1_cache() {
-                return Ok(());
+            if tags.iter().any(|tag| tag == "kv_cache") {
+                self.sync_peer_holder_changes()?;
+                if !self.scheduler.clear_l1_cache() {
+                    return Ok(());
+                }
             }
         }
         match self.controls.take_drain().expect("checked above") {
@@ -3059,10 +3106,37 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
     /// With attention DP, every rank's batch this round, and whether any
     /// rank is stopping.
+    /// Drain any holder changes answered on `ts-peer-servicer` while
+    /// `self.scheduler` was unlocked, share them across the replica so every
+    /// TP/PP member applies the exact same sequence, and advance `self.scheduler`.
+    fn sync_peer_holder_changes(&mut self) -> Result<(), LoopError> {
+        let Some(peer) = &self.peer else {
+            return Ok(());
+        };
+        let changes = if self.ranks.replica.size() == 1 {
+            peer.take_holder_changes()
+        } else {
+            let payload = if self.owns_frontend() {
+                Peer::encode_changes(&peer.take_holder_changes())
+            } else {
+                Vec::new()
+            };
+            let shared = self.ranks.mesh.broadcast(&self.ranks.replica, 0, payload)?;
+            Peer::decode_changes(&shared)?
+        };
+        if !changes.is_empty() {
+            self.scheduler
+                .advance_peer(self.peer_now_us, &changes)
+                .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        }
+        Ok(())
+    }
+
     fn dp_round(
         &mut self,
         forward: Option<&ForwardBatchView>,
         stop: &mut bool,
+        allow_unlock: bool,
     ) -> Result<Option<DpRound>, LoopError> {
         let (num_tokens, batch_size, num_extends) = match forward {
             Some(batch) => {
@@ -3105,7 +3179,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = self.ranks.mesh.all_gather_i64(world, &row)?;
+        let rows = if allow_unlock && self.in_flight.is_empty() {
+            let mesh = &mut self.ranks.mesh;
+            ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
+        } else {
+            self.ranks.mesh.all_gather_i64(world, &row)?
+        };
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;
