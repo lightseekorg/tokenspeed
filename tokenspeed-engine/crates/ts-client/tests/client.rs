@@ -854,3 +854,39 @@ async fn a_scheduler_takes_no_encode_requests() {
     let error = client.encode(encode_request("item-0")).await.unwrap_err();
     assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
 }
+
+#[test]
+fn consuming_output_rows_preserves_request_timing_and_legacy_missing_values() {
+    use ts_wire::BatchTokenIDOutSlim;
+    let hex = include_str!("../../ts-wire/tests/fixtures/output_slim_timing.hex");
+    let frames = hex
+        .lines()
+        .map(|line| {
+            bytes::Bytes::from(
+                (0..line.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+                    .collect::<Vec<u8>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut batch: BatchTokenIDOutSlim = ts_wire::decode_frames(&frames).unwrap();
+    let timing = batch.request_timing[0].take().unwrap();
+    batch.request_timing.clear();
+    let legacy = OutputChunk::from_batch(batch.clone())
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert!(legacy
+        .iter()
+        .all(|(_, chunk)| chunk.request_timing.is_none()));
+    batch.request_timing = vec![None, Some(timing.clone())];
+    let borrowed = batch
+        .requests()
+        .unwrap()
+        .map(|row| (row.rid.to_owned(), OutputChunk::from(&row)))
+        .collect::<Vec<_>>();
+    let consumed = OutputChunk::from_batch(batch).unwrap().collect::<Vec<_>>();
+    assert_eq!(consumed, borrowed);
+    assert_eq!(consumed[1].1.request_timing, Some(timing));
+    assert_eq!(consumed[0].1.request_timing, None);
+}

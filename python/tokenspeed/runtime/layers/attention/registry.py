@@ -929,6 +929,11 @@ def _gdn_linear_attn_backend(
         writes_state_checkpoints_in_forward=(
             server_args.writes_state_checkpoints_in_forward
         ),
+        defer_recurrent_state=(
+            server_args.enable_deferred_gdn_state
+            and not server_args.decode_monokernel
+            and server_args.pipeline_parallel_size == 1
+        ),
     )
 
 

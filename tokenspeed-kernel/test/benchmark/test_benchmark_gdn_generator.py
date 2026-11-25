@@ -95,7 +95,11 @@ def test_gdn_decode_generators_select_like_the_operations(
             _request("gdn_decode_step", batch=4), None
         )
     with pytest.raises(RuntimeError, match="selection captured"):
-        gdn_ops.gdn_decode_mtp(**_decode_args(4, 4), tree_ancestors=None)
+        gdn_ops.gdn_decode_mtp(
+            **_decode_args(4, 4),
+            tree_ancestors=None,
+            pending_replay=None,
+        )
     with pytest.raises(RuntimeError, match="selection captured"):
         gdn_generator.prepare_gdn_decode_mtp(
             _request("gdn_decode_mtp", batch=4, tokens=4, state_writes="none"), None

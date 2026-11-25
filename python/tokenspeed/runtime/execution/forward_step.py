@@ -1656,6 +1656,16 @@ class ForwardStepRunner:
             ctx.output_layout = live_output_layout
 
         if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            if self.runtime_states is not None:
+                self.attn_backend.prepare_recurrent_state_acceptance(
+                    self.runtime_states.stopped,
+                    self.runtime_states.valid_cache_lengths,
+                    allow_defer=(
+                        ctx.forward_mode.is_decode()
+                        and ctx.num_extends == 0
+                        and ctx.output_layout.decode_width == 4
+                    ),
+                )
             self.attn_backend.commit_state_after_acceptance(
                 result[1],
                 num_extends=ctx.num_extends,
