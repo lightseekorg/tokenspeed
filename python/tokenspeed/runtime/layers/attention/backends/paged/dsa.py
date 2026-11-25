@@ -515,6 +515,9 @@ class DSABackend(PagedAttentionBackend):
         self._dcp_records_core: bool = False
         # Whether that selection runs the trtllm-gen core, which takes a padded query.
         self._dcp_padded_query: bool = False
+        # Whether the unsharded prefill builds that core's padded query itself;
+        # resolved by its first forward.
+        self._prefill_padded_query: bool | None = None
         # The head-sharded KVP decode's solution pin, probed with the prefill's.
         self._kvp_decode_solution: str | None = None
         # Whether every KVP decode selection runs gfx950's dense core on an
@@ -731,6 +734,45 @@ class DSABackend(PagedAttentionBackend):
             return False
         for _, mode, signature, traits, solution, _ in self._sparse_leaf_probes():
             if mode != "dsa_prefill" or not traits["return_lse"]:
+                continue
+            try:
+                core = select_kernel(
+                    "attention", mode, signature, traits=traits, solution=solution
+                )
+            except NoKernelFoundError:
+                return False
+            return core.name == "flashinfer_trtllm_dsa_prefill"
+        return False
+
+    def _pads_prefill_query(self) -> bool:
+        """Whether the unsharded sparse prefill builds the trtllm-gen core's
+        padded query itself.
+
+        That core runs 65..127 heads (K3.1's 96) as 128. Padded inside the
+        leaf, every query row is copied into the padded query and every
+        output row out of the padded output; a caller-built padded query
+        costs one pass and leaves the output a view of the padded rows. Only
+        where the forward's LSE-free ``dsa_prefill`` selection picks
+        ``flashinfer_trtllm_dsa_prefill`` without a plan.
+        """
+        if self._prefill_padded_query is not None:
+            return self._prefill_padded_query
+        self._prefill_padded_query = self._selects_trtllm_prefill_core()
+        return self._prefill_padded_query
+
+    def _selects_trtllm_prefill_core(self) -> bool:
+        """Whether the unsharded, LSE-free ``dsa_prefill`` selection picks the
+        trtllm-gen core."""
+        if (
+            len(self.kvp_group) > 1
+            or len(self.qcp_group) > 1
+            or self.prefill_kernel_plan is not None
+            or self.kernel_solution not in (None, "flashinfer_trtllm")
+            or current_platform().is_npu
+        ):
+            return False
+        for _, mode, signature, traits, solution, _ in self._sparse_leaf_probes():
+            if mode != "dsa_prefill" or traits["return_lse"]:
                 continue
             try:
                 core = select_kernel(
@@ -2213,6 +2255,15 @@ class DSABackend(PagedAttentionBackend):
                 live_heads = gathered_heads
             elif not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
+        elif self._pads_prefill_query():
+            core_heads = trtllm_sparse_mla_query_heads(heads)
+            if core_heads != heads:
+                # Independent heads make zero padding exact.
+                pad_heads = q_view.new_zeros(
+                    (q_view.shape[0], core_heads - heads, q_view.shape[2])
+                )
+                q_view = torch.cat([q_view, pad_heads], dim=1)
+                live_heads = heads
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -2250,6 +2301,8 @@ class DSABackend(PagedAttentionBackend):
                 sink=None,
                 keep_all_heads=keep_all_heads,
             )
+        elif live_heads is not None:
+            out = out[:, :live_heads]
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
         # normal PD readiness hook. Publish the layer only after the dependent

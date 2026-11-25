@@ -217,6 +217,7 @@ _K31_SPARSE_LEAF = dict(
     kvp_prefill_query_layout=False,
     _dcp_records_core=False,
     _dcp_padded_query=False,
+    _prefill_padded_query=False,
     _kvp_decode_solution=None,
     _dcp_decode_records_core=False,
     _row_shard_prefill=False,
@@ -944,3 +945,74 @@ def test_dcp_decode_records_core_on_the_real_k31_selection(monkeypatch, solution
         block_granularity=128, virtual_block_count=17, shard_count=8
     )
     assert backend._dcp_decode_records_core is (solution != "triton")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform().is_nvidia
+    or current_platform().arch_version < ArchVersion(10, 0),
+    reason="needs the trtllm-gen sparse MLA core on an NVIDIA GPU",
+)
+@pytest.mark.parametrize("heads", [64, 96])
+def test_unsharded_sparse_prefill_pads_the_query_for_the_trtllm_core(heads):
+    """K3.1's 96 heads run the trtllm-gen core as 128: a query the backend
+    pads itself attends like the one the core's leaf pads, and 64 heads,
+    which that core runs as they are, take no padding."""
+    torch.manual_seed(7)
+    dsa = backends.dsa
+    rows, dim, pages = 12, 576, 32
+    backend = object.__new__(dsa.DSABackend)
+    for name, value in dict(
+        _K31_SPARSE_LEAF,
+        device="cuda",
+        data_type=torch.float8_e4m3fn,
+        is_draft=False,
+        num_local_heads=heads,
+        num_attention_heads=heads,
+        qcp_group=(0,),
+        history_prefill=None,
+        query_shard_metadata=None,
+        step_counter=None,
+    ).items():
+        setattr(backend, name, value)
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        head_dim=dim,
+        v_head_dim=512,
+        scaling=192**-0.5,
+        logit_cap=0.0,
+    )
+    kv = (torch.randn(pages * 64, dim, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+    pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda layer_id: kv)
+    q = (torch.randn(rows, heads, dim, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    counts = torch.tensor(
+        [1, 3, 63, 64, 65, 127, 128, 500, 1000, 2047, 2048, 2048],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.full((rows, 2048), -1, device="cuda", dtype=torch.int32)
+    for row, count in enumerate(counts.tolist()):
+        slots[row, :count] = torch.randperm(pages * 64, device="cuda")[:count].to(
+            torch.int32
+        )
+
+    def attend(padded):
+        backend._prefill_padded_query = padded
+        return backend.forward_sparse_prefill(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=pool,
+            kv_seq_lens=torch.full_like(counts, pages * 64),
+            topk_slots=slots,
+            topk_lens=counts,
+            max_seq_len=pages * 64,
+        )
+
+    reference = attend(False)
+    # None: the backend resolves the selection itself, to the trtllm-gen core.
+    padded = attend(None)
+    assert backend._prefill_padded_query is True
+    assert padded.shape == reference.shape == (rows, heads * 512)
+    assert torch.equal(padded, reference)
+    assert padded.is_contiguous() is (heads == 64)

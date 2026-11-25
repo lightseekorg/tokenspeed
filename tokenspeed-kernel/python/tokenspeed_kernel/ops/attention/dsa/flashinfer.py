@@ -296,10 +296,12 @@ def _flashinfer_trtllm_dsa_impl(
     kernel_heads = trtllm_sparse_mla_query_heads(num_heads)
     if kernel_heads != num_heads:
         # Independent heads make zero padding exact; scratch stays call-local.
-        padded_q = q_kernel.new_empty((num_tokens, 1, kernel_heads, q_kernel.shape[-1]))
-        padded_q[:, :, num_heads:].zero_()
-        padded_q[:, :, :num_heads].copy_(q_kernel)
-        q_kernel = padded_q
+        # torch.cat writes the padded rows in one vectorized pass; a copy into
+        # a head slice runs as a strided byte-wise kernel.
+        pad_heads = q_kernel.new_zeros(
+            (num_tokens, 1, kernel_heads - num_heads, q_kernel.shape[-1])
+        )
+        q_kernel = torch.cat([q_kernel, pad_heads], dim=2)
     if topk_slots.dim() != 2 or topk_slots.shape[0] != num_tokens:
         raise ValueError(
             "topk_slots must be [query_tokens, topk], got "
