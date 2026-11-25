@@ -1138,6 +1138,9 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
             let _plan = scheduler.next_execution_plan(true, false);
             let lookup = scheduler.take_peer_lookups().pop().expect("X lookup");
             drop(scheduler);
+            // Empty rounds can hand the cache to a parked holder without
+            // otherwise unlocking it. LOOKUP must participate in that handoff.
+            let mut round = cache.lock();
             x.request(
                 &endpoint,
                 &Request::Lookup {
@@ -1150,10 +1153,18 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
                 },
             )
             .unwrap();
-            assert!(
-                matches!(Inbound::decode(&rx.recv_timeout(Duration::from_secs(2)).unwrap()),
-                Ok(Inbound::Reply(Reply::Answer{answer,..})) if answer.num_tokens == tokens.len() as i32)
-            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let reply = loop {
+                parking_lot::MutexGuard::bump(&mut round);
+                if let Ok(reply) = rx.try_recv() {
+                    break reply;
+                }
+                assert!(Instant::now() < deadline, "holder missed the lock handoff");
+                std::thread::yield_now();
+            };
+            drop(round);
+            assert!(matches!(Inbound::decode(&reply),
+                Ok(Inbound::Reply(Reply::Answer{answer,..})) if answer.num_tokens == tokens.len() as i32));
             scope.spawn(move || {
                 let ready = lock_at_read.recv_timeout(Duration::from_secs(2)).unwrap();
                 let guard = cache.lock();

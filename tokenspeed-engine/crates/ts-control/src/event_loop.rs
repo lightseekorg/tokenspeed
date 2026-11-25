@@ -872,13 +872,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
-        // A peer servicer answers from the scheduler between rounds, and the
-        // loop releases it only while it waits on the device or on an idle
-        // frontend. A loop waiting on a transfer -- a prefill engine on its
-        // PD sends, a landing on its reads -- does neither and spins
-        // through empty rounds, so it hands the scheduler to a waiting
-        // servicer once per round; with none waiting this costs one atomic
-        // read.
+        // Hand off to a waiting servicer even in rounds with no device,
+        // transfer or frontend wait. With no waiter this is one atomic read.
         ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
@@ -3128,7 +3123,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         };
         let _span = profile::span("EventLoop::poll_transfers");
-        let polled = transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)?;
+        // Decode may be waiting for KV from a Prefill that needs a lookup
+        // from this same Decode. Only the transport participates in this poll.
+        let polled = ArcMutexGuard::unlocked(&mut self.scheduler, || {
+            transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)
+        })?;
         for event in polled {
             tracing::debug!(?event, "transfer event");
             match event {

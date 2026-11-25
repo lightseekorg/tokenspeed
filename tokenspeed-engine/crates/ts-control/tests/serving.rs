@@ -438,6 +438,8 @@ struct Wire {
 
 #[derive(Default)]
 struct WireRoom {
+    /// One-shot observation made while the transport is polling this room.
+    on_poll: Option<Box<dyn FnOnce() + Send>>,
     /// The decode engine connected to the room.
     decode_registered: bool,
     /// The decode engine admitted the pages, in this slot.
@@ -519,6 +521,9 @@ impl TransferPeer for FakePeer {
                 .iter()
                 .flat_map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
+                    if let Some(observe) = room.on_poll.take() {
+                        observe();
+                    }
                     let poll = if room.fails
                         || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
@@ -4577,13 +4582,10 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     }
 }
 
-/// A peer servicer answers from the scheduler between rounds. A loop waiting
-/// on a transfer -- here a decode engine waiting for its prefill peer's KV --
-/// runs neither a forward nor an idle frontend wait, the two points that
-/// release the scheduler, so it hands the scheduler to a waiting servicer
-/// once per round instead.
+/// While Decode waits for Prefill's KV, the transfer poll must leave the
+/// scheduler available to a holder serving Prefill's prefix lookup.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer() {
+async fn a_decode_waiting_for_kv_leaves_the_scheduler_available_during_poll() {
     let wire = Arc::new(Mutex::new(Wire {
         prefill_ranks: 1,
         ..Wire::default()
@@ -4623,14 +4625,16 @@ async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer(
     .expect("decode allocated its KV landing pages and waits for them");
 
     let scheduler = handle.lock().unwrap().clone().unwrap();
-    let held = tokio::task::spawn_blocking(move || {
-        scheduler.try_lock_for(Duration::from_secs(5)).is_some()
-    })
-    .await
-    .unwrap();
+    let (observed, available) = tokio::sync::oneshot::channel();
+    wire.lock().unwrap().rooms.get_mut(&70).unwrap().on_poll = Some(Box::new(move || {
+        let _ = observed.send(scheduler.try_lock().is_some());
+    }));
     assert!(
-        held,
-        "the servicer waited past five seconds of empty rounds"
+        tokio::time::timeout(Duration::from_secs(5), available)
+            .await
+            .expect("decode continued polling for KV")
+            .unwrap(),
+        "PD polling held the scheduler needed by the holder"
     );
 }
 

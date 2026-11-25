@@ -362,11 +362,17 @@ impl Exports {
             send(reply);
         }
 
+        // Register a waiter for the scheduler's round-boundary handoff on
+        // contention. Bound the wait once per pass so RELEASE can progress.
+        let mut handoff_wait = Some(Duration::from_micros(100));
         for _ in 0..16 {
             if self.cleanup.is_empty() && endpoint.requests.lock().is_empty() {
                 break;
             }
-            let Some(mut cache) = scheduler.try_lock() else {
+            let Some(mut cache) = scheduler
+                .try_lock()
+                .or_else(|| scheduler.try_lock_for(handoff_wait.take()?))
+            else {
                 return true;
             };
             if let Some((event, at)) = self.cleanup.pop_front() {
