@@ -103,6 +103,14 @@ pub enum PeerProgress {
 }
 
 impl PeerProgress {
+    fn identity_prefix(self) -> &'static str {
+        match self {
+            Self::Host => "async-host-v1:",
+            Self::Device => "async-device-v2:",
+            Self::Coordinated => "",
+        }
+    }
+
     /// Configure the scheduler and select the matching protocol owner before startup.
     pub fn for_replica(members: usize, scheduler: &mut Scheduler) -> Result<Self, PeerError> {
         match members {
@@ -116,13 +124,31 @@ impl PeerProgress {
 }
 
 impl PeerSettings {
+    fn mismatch_reason(&self, progress: PeerProgress, other: &str) -> &'static str {
+        let (mode, namespace) = other
+            .split_once(':')
+            .filter(|(m, _)| m.starts_with("async-host-v") || m.starts_with("async-device-v"))
+            .unwrap_or(("", other));
+        if mode != progress.identity_prefix().trim_end_matches(':') {
+            "protocol_mismatch"
+        } else if namespace
+            .strip_prefix(&self.deployment_id)
+            .is_some_and(|s| s.starts_with('/'))
+        {
+            "weight_mismatch"
+        } else if namespace
+            .strip_suffix(&self.weight_version)
+            .is_some_and(|s| s.ends_with('/'))
+        {
+            "deployment_mismatch"
+        } else {
+            "namespace_mismatch"
+        }
+    }
+
     fn identity(&self, progress: PeerProgress) -> String {
         let ns = namespace(&self.deployment_id, &self.weight_version);
-        match progress {
-            PeerProgress::Host => format!("async-host-v1:{ns}"),
-            PeerProgress::Device => format!("async-device-v2:{ns}"),
-            PeerProgress::Coordinated => ns,
-        }
+        format!("{}{ns}", progress.identity_prefix())
     }
 }
 
@@ -217,6 +243,8 @@ impl Report {
 /// events in order (`Scheduler::advance_peer`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerRound {
+    /// Local receipt times of positive lookups on the independent owner.
+    lookup_received: Vec<Instant>,
     /// The agreed peer clock.
     pub now_us: i64,
     /// The holder's changes first, then the reader's answers and landings.
@@ -484,6 +512,9 @@ impl Protocol {
         logical: Option<Arc<ts_metrics::PeerMetrics>>,
         physical: Option<Arc<ts_metrics::PeerMetrics>>,
     ) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.holder.lock().metrics.clone_from(&logical);
+        }
         self.metrics = logical;
         self.read_metrics = physical;
     }
@@ -611,6 +642,7 @@ impl Protocol {
         }
         self.start_reads(now_us);
         Ok(PeerRound {
+            lookup_received: Vec::new(),
             now_us,
             events,
             landed,
@@ -758,6 +790,10 @@ impl Protocol {
                             (&self.metrics, self.lookup_times.remove(&answer.lease.id))
                         {
                             let outcome = if stamp.identity != self.identity {
+                                metrics.decision(
+                                    self.settings
+                                        .mismatch_reason(self.progress, &stamp.identity),
+                                );
                                 "incompatible"
                             } else if answer.num_tokens == 0 {
                                 "miss"
@@ -1059,12 +1095,19 @@ fn start_endpoint(
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's
                             // scheduler work; answers between rounds.
-                            let (to, reply) = {
+                            let read = matches!(&request, Request::Release { demote: true, .. });
+                            let ((to, reply), metrics) = {
                                 let scheduler = scheduler.lock();
                                 let mut holder = holder.lock();
                                 let now = Instant::now();
-                                holder.handle(&*scheduler, request, now)
+                                (
+                                    holder.handle(&*scheduler, request, now),
+                                    holder.metrics.clone(),
+                                )
                             };
+                            if let Some(m) = metrics {
+                                reply.observe_holder(&m, read);
+                            }
                             let Some(net) = net.upgrade() else { return };
                             if let Err(error) = net.reply(&to, &reply) {
                                 tracing::warn!(to, %error, "peer reply not sent");
@@ -1090,4 +1133,37 @@ fn start_endpoint(
         control,
         _servicer: servicer,
     })
+}
+
+#[cfg(test)]
+mod identity_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_identity_components_visible_in_lookup_replies() {
+        let settings = PeerSettings {
+            name: "reader".into(),
+            incarnation: 1,
+            deployment_id: "model".into(),
+            weight_version: "one".into(),
+            record_lifetime: Duration::from_secs(2),
+            timeouts: Timeouts {
+                answer_us: 10,
+                quarantine_us: 20,
+                push_us: 30,
+            },
+        };
+        for (other, reason) in [
+            ("model/one", "protocol_mismatch"),
+            ("async-host-v1:model/one", "protocol_mismatch"),
+            ("async-device-v2:model/two", "weight_mismatch"),
+            ("async-device-v2:other/one", "deployment_mismatch"),
+            ("async-device-v2:other/two", "namespace_mismatch"),
+        ] {
+            assert_eq!(
+                settings.mismatch_reason(PeerProgress::Device, other),
+                reason
+            );
+        }
+    }
 }

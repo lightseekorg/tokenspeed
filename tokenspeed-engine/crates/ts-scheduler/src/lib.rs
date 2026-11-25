@@ -486,6 +486,8 @@ mod ffi {
         device_hit_tokens: u64,
         /// Tokens the Host loads (L2 including anything L3 supplied).
         host_hit_tokens: u64,
+        /// Remote Device prefix used beyond the local hit.
+        peer_hit_tokens: u64,
         /// Token spans of successful storage keys (L3), counted per cache group.
         l3_hit_tokens: u64,
     }
@@ -662,7 +664,16 @@ mod ffi {
         held: bool,
     }
 
-    /// A reader's landing in a plan (`tokenspeed::PeerFetchOperation`).
+    /// Why a hinted request entered local prefill.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerLocalChoice {
+        /// Scheduler request ID.
+        request_id: String,
+        /// Bounded scheduler decision code.
+        reason: String,
+    }
+
+    /// A peer fetch admitted by the scheduler.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerFetchView {
         /// The landing request.
@@ -909,6 +920,7 @@ mod ffi {
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
         fn plan_disk_ops(plan: &ExecutionPlan) -> Vec<DiskOpView>;
+        fn plan_peer_local_choices(plan: &ExecutionPlan) -> Vec<PeerLocalChoice>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         /// Install the scheduler's profile span sink, which forwards to
@@ -1604,7 +1616,12 @@ impl ExecutionPlan {
         ffi::plan_disk_ops(&self.0)
     }
 
-    /// The peer prefix landings the plan admitted, in plan order.
+    /// Hinted requests this plan admitted locally, with their last decision.
+    pub fn peer_local_choices(&self) -> Vec<ffi::PeerLocalChoice> {
+        ffi::plan_peer_local_choices(&self.0)
+    }
+
+    /// Reads granted by the scheduler.
     pub fn peer_fetches(&self) -> Vec<PeerFetchView> {
         ffi::plan_peer_fetches(&self.0)
     }

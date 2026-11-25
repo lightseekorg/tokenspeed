@@ -253,6 +253,7 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         request->Apply(fsm::PeerLandedEvent{});
         return;
     }
+    request->pending_peer_hit.reset();
     spdlog::debug("[Peer] rid={} landing confirmed {} of [{}, {}); admitted again from the local hit", request->Id(),
                   event.num_tokens, landing->window.begin, end);
     ++peer_failed_landings_;
@@ -385,9 +386,13 @@ std::optional<PeerHostLandings::Started> Scheduler::reservePeerHost(Request& req
                               .shared_prefix_tokens = request.SharedPrefixTokens()};
     const PrefixProbe probe = coordinator_.Prober().ProbePromptPrefix(prompt);
     const std::int32_t local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
-    return local < hit.num_tokens
-               ? peer_host_landings_->Start(prompt, request.Id(), hit.lease, request.PeerHolder(), local)
-               : std::nullopt;
+    if (local >= hit.num_tokens) {
+        request.peer_local_reason = "local_caught_up";
+        return std::nullopt;
+    }
+    auto landing = peer_host_landings_->Start(prompt, request.Id(), hit.lease, request.PeerHolder(), local);
+    if (!landing) request.peer_local_reason = "host_reservation";
+    return landing;
 }
 
 void Scheduler::startPeerHostLanding(Request& request) {
@@ -437,6 +442,7 @@ void Scheduler::preparePeer(Request& request) {
     // The D role computes no prompt: what it lacks comes from its PD peer,
     // so it never reads from a holder, whatever the request names.
     if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
+        if (holder == limits.name && !holder.empty()) request.peer_local_reason = "self_holder";
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;
@@ -450,6 +456,7 @@ void Scheduler::preparePeer(Request& request) {
                                                  .shared_prefix_tokens = request.SharedPrefixTokens()});
     const std::int32_t local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
     if (max_tokens - local < limits.min_fetch_tokens) {
+        request.peer_local_reason = "lookup_below_min";
         return;
     }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
@@ -503,7 +510,10 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         double local_wait_us = 0.0;
         if (adaptive_device_peer_) {
             const auto match = matchPrefixAtAdmission(request);
-            if (match.waits_for_eviction_store) continue;
+            if (match.waits_for_eviction_store) {
+                request->peer_local_reason = "eviction_pending";
+                continue;
+            }
             const int local = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
             const int extra = std::max(0, hit.num_tokens - local);
             const auto host = [](const std::string& endpoint) {
@@ -529,7 +539,10 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             const double exposed = std::max(0.0, local_wait_us + nominal_us * cost.scale - wait_for_local);
             const double peer_us = cost.success_rate * exposed + cost.failure_us;
             const double saved_us = cost.success_rate * extra * compute_us_per_token;
-            if (extra < config_.peer_config->min_fetch_tokens) continue;
+            if (extra < config_.peer_config->min_fetch_tokens) {
+                request->peer_local_reason = extra == 0 ? "local_caught_up" : "below_min_fetch";
+                continue;
+            }
             // Explore plausible near-boundary reads only on an idle reader.
             // Stable assignment avoids repeated draws across admission retries.
             const double optimistic_us =
@@ -538,6 +551,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             probe = saved_us <= peer_us + margin_us && saved_us > optimistic_us + margin_us &&
                     device_attempts_.empty() && std::hash<std::string>{}(request->Id()) % 16 == 0;
             if (saved_us <= peer_us + margin_us && !probe) {
+                request->peer_local_reason = "adaptive_recompute";
                 // Let regular admission try. If it cannot commit, keep the
                 // hit for another round; no holder is pinned while waiting.
                 continue;
@@ -550,6 +564,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         if (!outcome.event) {
             if (feedback.admission_failed) {
                 // It waits for room, keeping its hit; its soft pin may lapse.
+                request->peer_local_reason = "page_capacity";
                 feedback.NoteCapacityBlocked(request);
                 return;
             }
@@ -587,6 +602,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             fetch.prefix_hashes.assign(hashes.begin(), hashes.end());
             fetch.tokens.assign(tokens.begin(), tokens.end());
         }
+        request->peer_local_reason = nullptr;
         build.plan.peer_fetches.push_back(std::move(fetch));
     }
 }

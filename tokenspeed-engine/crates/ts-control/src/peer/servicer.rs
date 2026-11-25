@@ -38,6 +38,29 @@ use crate::peer::{
     wire::{Reply, Request, Stamp},
 };
 
+impl Reply {
+    pub(super) fn observe_holder(&self, metrics: &ts_metrics::PeerMetrics, read: bool) {
+        if let Self::Answer { answer, .. } = self {
+            if let Some(outcome) = holder_outcome(answer, read) {
+                metrics.holder_event(outcome);
+            }
+        }
+    }
+}
+
+fn holder_outcome(answer: &PeerAnswerView, read: bool) -> Option<&'static str> {
+    Some(match answer.kind {
+        PeerAnswerKind::Lookup if answer.num_tokens > 0 => "lookup_hit",
+        PeerAnswerKind::Lookup => "lookup_miss",
+        PeerAnswerKind::Pin if answer.held => "pin_ok",
+        PeerAnswerKind::Pin => "pin_rejected",
+        PeerAnswerKind::Release if !answer.held => "release_rejected",
+        PeerAnswerKind::Release if read => "read_released",
+        PeerAnswerKind::Release => "cleanup_released",
+        _ => return None,
+    })
+}
+
 /// The reads a holder answers with (`Scheduler`'s peer reads).
 pub trait HolderCache {
     /// A lookup's answer.
@@ -80,6 +103,7 @@ struct Record {
 
 /// The holder's half: answers, the leases' records and the queued changes.
 pub struct Holder {
+    pub(super) metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
     stamp: Stamp,
     ranks: Vec<RankGeometry>,
     records: HashMap<PeerLeaseView, Record>,
@@ -93,6 +117,7 @@ impl Holder {
     /// A holder answering as `stamp`, with its replica's geometries.
     pub fn new(stamp: Stamp, ranks: Vec<RankGeometry>, record_lifetime: Duration) -> Self {
         Self {
+            metrics: None,
             stamp,
             ranks,
             records: HashMap::new(),
@@ -250,5 +275,32 @@ pub fn empty_event() -> PeerEventView {
         terminal_us: 0,
         checkpoint: Vec::new(),
         request_id: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod holder_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn counts_the_reply_sent_and_separates_read_from_cleanup() {
+        for (kind, tokens, held, read, expected) in [
+            (PeerAnswerKind::Lookup, 64, false, false, "lookup_hit"),
+            (PeerAnswerKind::Lookup, 0, false, false, "lookup_miss"),
+            (PeerAnswerKind::Pin, 0, false, false, "pin_rejected"),
+            (PeerAnswerKind::Pin, 64, true, false, "pin_ok"),
+            (PeerAnswerKind::Release, 0, true, true, "read_released"),
+            (PeerAnswerKind::Release, 0, true, false, "cleanup_released"),
+            (PeerAnswerKind::Release, 0, false, true, "release_rejected"),
+        ] {
+            let answer = PeerAnswerView {
+                kind,
+                num_tokens: tokens,
+                held,
+                lease: empty_event().lease,
+                pages: vec![],
+            };
+            assert_eq!(holder_outcome(&answer, read), Some(expected));
+        }
     }
 }

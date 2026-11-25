@@ -461,6 +461,7 @@ pub struct EngineMetrics {
     prefix_prompt_tokens: Metric,
     prefix_device_hit_tokens: Metric,
     prefix_host_hit_tokens: Metric,
+    prefix_peer_hit_tokens: Metric,
     prefix_l3_hit_tokens: Metric,
     /// Serving-time compile totals already exported.
     exported_compiles: u64,
@@ -837,6 +838,12 @@ impl EngineMetrics {
                 "Admitted prompt tokens served from the Device prefix cache (L1).",
                 names,
             ),
+            prefix_peer_hit_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_peer_hit_tokens",
+                "Additional Device peer tokens used at first prefill dispatch.",
+                names,
+            ),
             prefix_host_hit_tokens: Metric::counter(
                 exporter,
                 "tokenspeed:prefix_host_hit_tokens",
@@ -1124,14 +1131,36 @@ impl EngineMetrics {
         host_hit_tokens: u64,
         l3_hit_tokens: u64,
     ) {
+        self.record_prefix_hits_with_peer(
+            prompt_tokens,
+            device_hit_tokens,
+            host_hit_tokens,
+            l3_hit_tokens,
+            0,
+        );
+    }
+
+    /// Report local tier hits and additional Device peer hits against the same prompt count.
+    pub fn record_prefix_hits_with_peer(
+        &self,
+        prompt_tokens: u64,
+        device_hit_tokens: u64,
+        host_hit_tokens: u64,
+        l3_hit_tokens: u64,
+        peer_hit_tokens: u64,
+    ) {
         let labels = self.labels();
+        if peer_hit_tokens > 0 {
+            self.prefix_peer_hit_tokens
+                .inc(&labels, peer_hit_tokens as f64);
+        }
         if prompt_tokens > 0 {
             self.prefix_prompt_tokens.inc(&labels, prompt_tokens as f64);
             // One weighted event keeps numerator and denominator atomic.
             for (metric, hit) in [
                 (
                     &self.prefix_cache_hit_ratio,
-                    device_hit_tokens + host_hit_tokens,
+                    device_hit_tokens + host_hit_tokens + peer_hit_tokens,
                 ),
                 (&self.prefix_device_hit_ratio, device_hit_tokens),
                 (&self.prefix_host_hit_ratio, host_hit_tokens),

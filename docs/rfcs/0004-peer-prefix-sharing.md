@@ -532,3 +532,29 @@ Coordinated replicas keep their existing namespace. Single-member Host
 replicas use the existing Host namespace. Single-member Device replicas use
 a new protocol namespace so an older endpoint cannot satisfy a validated
 checkpoint PIN. An incompatible lookup is treated as a miss during rollout.
+
+
+Reader decision details are available in `tokenspeed:peer_decisions_total`.
+Local admission and no-attempt reasons count once at request termination and
+describe the last observed choice. Incompatible lookup replies are classified
+when received, using their existing progress protocol and namespace identity.
+
+Each holder owner exports `tokenspeed:peer_holder_events_total` on its own
+replica. The outcomes are lookup hit or miss, PIN accepted or rejected, and
+RELEASE after a successful READ, cleanup, or rejection. A read release
+confirms that the holder accepted the reader's success indication. Only the
+reader observes how much KV its following forward uses. These metrics need
+no changes to the peer messages.
+
+At first prefill dispatch, the total prefix hit ratio includes the confirmed
+Device peer interval that the forward skips beyond the reader's local hit.
+`tokenspeed:prefix_peer_hit_tokens_total` counts these additional tokens.
+A peer landing on Host already contributes through the normal Host cache hit.
+A failed Device landing contributes only the local retry's hit and prompt.
+Decode's local admission ratio measures its own cache independently.
+
+On the independent reader, `lookup_reply_to_scheduler` times a positive reply
+from arrival to collection by the control loop. Device landings with complete
+timestamps also expose `grant_to_writable`, `writable_to_terminal`, and
+`terminal_to_scheduler` through the stage histogram. The writable-to-terminal
+interval includes the protocol work that follows the destination fence.

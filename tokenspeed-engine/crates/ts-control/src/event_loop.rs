@@ -1332,6 +1332,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     peer.end_lookup(&rid, outcome);
                 }
             }
+            for reason in request.peer_local_reasons {
+                metrics.peer.decision(&reason);
+            }
             for (expected, actual, outcome) in request.peer_usage {
                 metrics.peer.usage(expected, actual, outcome);
             }
@@ -1366,11 +1369,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     delta.device_hit_tokens + delta.host_hit_tokens,
                 );
             }
-            metrics.record_prefix_hits(
+            metrics.record_prefix_hits_with_peer(
                 delta.prompt_tokens,
                 delta.device_hit_tokens,
                 delta.host_hit_tokens,
                 delta.l3_hit_tokens,
+                delta.peer_hit_tokens,
             );
         }
 
@@ -2909,6 +2913,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let fetches = plan.peer_fetches();
             let lookups = self.scheduler.take_peer_lookups();
             if let Some(metrics) = &self.metrics {
+                for choice in plan.peer_local_choices() {
+                    if let Some(usage) = self.outputs.peer_usage(&choice.request_id) {
+                        usage.local_reason = Some(choice.reason);
+                    }
+                }
                 let now = Instant::now();
                 for lookup in &lookups {
                     if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
@@ -3504,6 +3513,7 @@ fn prefix_hit_delta(
     let last = std::mem::replace(previous, hits);
     ts_scheduler::PrefixHitView {
         prompt_tokens: hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+        peer_hit_tokens: hits.peer_hit_tokens.saturating_sub(last.peer_hit_tokens),
         device_hit_tokens: hits
             .device_hit_tokens
             .saturating_sub(last.device_hit_tokens),
@@ -3523,6 +3533,7 @@ mod tests {
             prompt_tokens: 48,
             device_hit_tokens: 16,
             host_hit_tokens: 8,
+            peer_hit_tokens: 12,
             l3_hit_tokens: 4,
         };
         assert_eq!(prefix_hit_delta(&mut previous, hits), hits);

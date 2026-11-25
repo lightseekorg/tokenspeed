@@ -555,9 +555,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
                                      : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
                                                                            : 0;
-    if (source == fsm::PrefillSource::kPeer &&
-        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
-        return FirstChunkOutcome{};
+    if (source == fsm::PrefillSource::kPeer) {
+        if (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens) {
+            request->peer_local_reason = landing_end <= hit_tokens ? "local_caught_up" : "below_min_fetch";
+            return FirstChunkOutcome{};
+        }
+        if (landing_end > kv_token_limit) {
+            request->peer_local_reason = "kv_budget";
+            return FirstChunkOutcome{};
+        }
     }
     // KV coverage beyond the state checkpoint the hit resumes from is the
     // junction: the first chunk is cut there so its natural checkpoint lands
@@ -754,9 +760,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         spdlog::info("[PrefixCacheDiagnostic] {} device_hit_tokens={} host_hit_tokens={} host_gain_tokens={}",
                      match.prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
     }
-    prefix_hit_stats_.prompt_tokens += request->PrefillSize();
-    prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
-    prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
+    if (source == fsm::PrefillSource::kPeer) {
+        request->pending_peer_hit = Request::PeerPrefixHit{hit_tokens, host_hit_tokens, landing_end};
+    } else {
+        prefix_hit_stats_.prompt_tokens += request->PrefillSize();
+        prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
+        prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
+    }
     prefix_hit_stats_.host_gain_tokens += host_gain_tokens;
     prefix_hit_stats_.unresumable_kv_tokens += junction_tokens > 0 ? junction_tokens - hit_tokens : 0;
 
@@ -1137,8 +1147,16 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
                                                           kv_token_limit, yield_tokens, must_complete,
                                                           /*peer_landing_tokens=*/0);
     if (outcome.event) {
-        if (local_over_peer) spdlog::info("[PeerChoice] rid={} local", request->Id());
+        if (local_over_peer && !request->peer_local_reason) request->peer_local_reason = "local_scheduled_first";
+        const auto* reason = std::exchange(request->peer_local_reason, nullptr);
+        if (reason) plan.peer_local_choices.emplace_back(request->Id(), reason);
+        const auto holder_tokens =
+            local_over_peer ? request->GetIf<fsm::Submitted>()->admission.peer_hit->num_tokens : 0;
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
+        if (local_over_peer) {
+            spdlog::info("[PeerChoice] rid={} local reason={} local_tokens={} holder_tokens={}", request->Id(), reason,
+                         operation.extend_prefix_len, holder_tokens);
+        }
         operation.state_prefix_cached = outcome.state_prefix_cached;
         return operation;
     }

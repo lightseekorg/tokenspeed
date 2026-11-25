@@ -69,6 +69,7 @@ class StagedCacheProgress;
 struct PrefixHitStats {
     std::uint64_t prompt_tokens{0};
     std::uint64_t device_hit_tokens{0};
+    std::uint64_t peer_hit_tokens{0};
     std::uint64_t host_hit_tokens{0};
     std::uint64_t host_gain_tokens{0};
     std::uint64_t unresumable_kv_tokens{0};
@@ -758,6 +759,15 @@ private:
         // work (they ride plan.remote_prefill and never reach here), so its
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
+            if (const auto hit = std::exchange(request.pending_peer_hit, std::nullopt)) {
+                const auto used = std::min(operation.extend_prefix_len, hit->end);
+                const auto local = std::min(used, hit->local);
+                const auto device = std::min(local, hit->local - hit->host);
+                prefix_hit_stats_.prompt_tokens += request.PrefillSize();
+                prefix_hit_stats_.device_hit_tokens += device;
+                prefix_hit_stats_.host_hit_tokens += local - device;
+                prefix_hit_stats_.peer_hit_tokens += used - local;
+            }
             if (request.peer_dispatch_sample) recordPeerDispatch(request);
             build.token_budget -= operation.input_length;
             if (config_.max_kv_page_num > 0) {

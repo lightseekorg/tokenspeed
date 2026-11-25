@@ -505,6 +505,8 @@ pub struct FinishLog {
 /// Per-request latency samples and token totals since the last drain.
 #[derive(Debug, Default)]
 pub struct RequestMetrics {
+    /// Detail for admission/no-attempt terminal samples.
+    pub peer_local_reasons: Vec<String>,
     /// Expected and actually consumed remote tokens per finished hinted request.
     pub peer_usage: Vec<(Option<u64>, u64, &'static str)>,
     /// Unfinished lookup/admission intervals closed by request completion.
@@ -555,6 +557,7 @@ pub struct OutputProcessor {
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
     peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
+    peer_local_reasons: Vec<String>,
     peer_samples: Vec<(Option<u64>, u64, &'static str)>,
     generated_tokens: u64,
     prompt_tokens: u64,
@@ -602,6 +605,7 @@ impl OutputProcessor {
             metrics_enabled,
             trace,
             peer_stops: Vec::new(),
+            peer_local_reasons: Vec::new(),
             peer_samples: Vec::new(),
             generated_tokens: 0,
             prompt_tokens: 0,
@@ -621,6 +625,7 @@ impl OutputProcessor {
     pub fn take_request_metrics(&mut self) -> RequestMetrics {
         RequestMetrics {
             peer_stops: std::mem::take(&mut self.peer_stops),
+            peer_local_reasons: std::mem::take(&mut self.peer_local_reasons),
             peer_usage: std::mem::take(&mut self.peer_samples),
             ttft_seconds: std::mem::take(&mut self.ttft_seconds),
             request_seconds: std::mem::take(&mut self.request_seconds),
@@ -699,6 +704,14 @@ impl OutputProcessor {
                 } else {
                     usage.disposition
                 };
+                if matches!(outcome, "admission" | "not_attempted") {
+                    self.peer_local_reasons.push(
+                        usage
+                            .local_reason
+                            .clone()
+                            .unwrap_or_else(|| format!("{outcome}_unknown")),
+                    );
+                }
                 self.peer_samples.push((usage.expected, actual, outcome));
             }
             // Cache and prompt totals feed the derived cache metrics.
@@ -2897,6 +2910,34 @@ mod tests {
             vec![(Some(8), 4, "used")]
         );
         assert!(p.take_request_metrics().peer_usage.is_empty());
+    }
+
+    #[test]
+    fn a_hinted_request_reports_one_terminal_local_reason() {
+        let mut p = processor(None);
+        for (outcome, reason, expected) in [
+            (
+                "admission",
+                Some("adaptive_recompute"),
+                Some("adaptive_recompute"),
+            ),
+            ("not_attempted", None, Some("not_attempted_unknown")),
+            ("pin", Some("adaptive_recompute"), None),
+        ] {
+            register(&mut p, "r", 12, 1, &[]);
+            let mut state = p.states.remove("r").unwrap();
+            state.peer_usage = Some(crate::request::PeerUsage {
+                disposition: outcome,
+                local_reason: reason.map(str::to_owned),
+                ..Default::default()
+            });
+            p.log_end("r", &state);
+            assert_eq!(
+                p.take_request_metrics().peer_local_reasons,
+                expected.into_iter().collect::<Vec<_>>()
+            );
+            assert!(p.take_request_metrics().peer_local_reasons.is_empty());
+        }
     }
 
     #[test]

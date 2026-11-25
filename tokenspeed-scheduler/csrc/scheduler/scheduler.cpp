@@ -807,6 +807,8 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         if (request->Is<fsm::Submitted>()) {
             request->Apply(fsm::StartPeerLookupEvent{grant->lookup.lease, grant->lookup.deadline_us});
             request->GetIf<fsm::PeerLooking>()->host_grant = std::move(grant);
+        } else if (request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone>()) {
+            plan.peer_local_choices.emplace_back(request->Id(), "host_wait_local");
         }
     }
     // What the build's admissions and restores evicted under the write-back

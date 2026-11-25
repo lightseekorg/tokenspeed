@@ -160,6 +160,33 @@ impl Peer {
                                     && (w.device || e.num_tokens == 0))
                         })
                         .count();
+                    if let Some(metrics) = &self.metrics {
+                        for at in round.lookup_received {
+                            metrics.stage(
+                                "lookup_reply_to_scheduler",
+                                "ok",
+                                at.elapsed().as_secs_f64(),
+                            );
+                        }
+                        let now = self.origin.elapsed().as_micros() as i64;
+                        for e in &round.events {
+                            if e.kind == PeerEventKind::FetchDone
+                                && e.dispatch_us > 0
+                                && e.dispatch_us <= e.writable_us
+                                && e.writable_us <= e.terminal_us
+                                && e.terminal_us <= now
+                            {
+                                let outcome = if e.num_tokens > 0 { "ok" } else { "fallback" };
+                                for (stage, us) in [
+                                    ("grant_to_writable", e.writable_us - e.dispatch_us),
+                                    ("writable_to_terminal", e.terminal_us - e.writable_us),
+                                    ("terminal_to_scheduler", now - e.terminal_us),
+                                ] {
+                                    metrics.stage(stage, outcome, us as f64 / 1e6);
+                                }
+                            }
+                        }
+                    }
                     out.events.extend(round.events);
                     out.decisions.extend(round.decisions);
                     out.landed.extend(round.landed);
@@ -306,6 +333,7 @@ impl Exports {
                 _ => unreachable!("cache-dependent holder request in control queue"),
             };
             let mut holder = endpoint.holder.lock();
+            let replay = self.finished.contains_key(&lease);
             let held = if let Some((_, held)) = self.finished.get(&lease) {
                 *held
             } else {
@@ -326,7 +354,14 @@ impl Exports {
             };
             let mut answer = holder.answer(&lease, PeerAnswerKind::Release);
             answer.held = held;
-            send(holder.reply(lease, answer));
+            let reply = holder.reply(lease, answer);
+            drop(holder);
+            if !replay {
+                if let Some(m) = &p.metrics {
+                    reply.1.observe_holder(m, demote);
+                }
+            }
+            send(reply);
         }
 
         for _ in 0..16 {
@@ -370,6 +405,9 @@ impl Exports {
                 let reply = holder.reply(lease.clone(), answer);
                 drop(holder);
                 drop(cache);
+                if let Some(m) = &p.metrics {
+                    reply.1.observe_holder(m, false);
+                }
                 send(reply);
                 continue;
             }
@@ -405,6 +443,9 @@ impl Exports {
             }
             drop(holder);
             drop(cache);
+            if let Some(m) = &p.metrics {
+                reply.observe_holder(m, false);
+            }
             send((to, reply));
         }
         !self.cleanup.is_empty()
@@ -514,6 +555,9 @@ fn drive(
                     p.take_reply(&reply, now, &mut events, &mut Vec::new());
                     let hit = events.pop().expect("lookup answer");
                     if hit.num_tokens > 0 {
+                        if p.metrics.is_some() {
+                            out.lookup_received.push(at);
+                        }
                         if p.progress == PeerProgress::Host {
                             reservations.push_back((attempt, hit.num_tokens, at));
                         }

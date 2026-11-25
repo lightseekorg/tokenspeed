@@ -58,6 +58,7 @@ struct PeerEventView;
 struct PeerAnswerView;
 struct PeerLookupView;
 struct PeerFetchView;
+struct PeerLocalChoice;
 struct PinSampleView;
 struct PeerStatsView;
 struct PeerLeaseView;
@@ -147,6 +148,7 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<DiskOpView> plan_disk_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<PeerLocalChoice> plan_peer_local_choices(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan);
 
 void set_profile_span_sink(bool installed);

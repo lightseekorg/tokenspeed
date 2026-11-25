@@ -695,6 +695,7 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
         .prompt_tokens = stats.prefix_hits.prompt_tokens,
         .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
         .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .peer_hit_tokens = stats.prefix_hits.peer_hit_tokens,
         .l3_hit_tokens = stats.storage_query_hit_tokens,
     };
 }
@@ -1067,6 +1068,12 @@ bool apply_peer_export(tokenspeed::Scheduler& scheduler, const PeerEventView& ev
         }
         default: throw std::invalid_argument("expected holder event");
     }
+}
+
+rust::Vec<PeerLocalChoice> plan_peer_local_choices(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<PeerLocalChoice> out;
+    for (const auto& [id, reason] : plan.peer_local_choices) out.push_back({rust::String(id), rust::String(reason)});
+    return out;
 }
 
 rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan) {

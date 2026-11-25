@@ -407,7 +407,16 @@ TEST(DevicePeerChoice, ColdBoundaryProbeRequiresPlausibleSavings) {
             ASSERT_EQ(lookups.size(), 1u);
             Send(reader, cache::PeerLookupAnswered{.lease = lookups[0].lease, .num_tokens = prefix, .source_mask = 1});
             const auto plan = Plan(reader);
-            EXPECT_EQ(plan.peer_fetches.size(), prefix == 672 && probe ? 1u : 0u);
+            if (prefix == 672 && probe) {
+                EXPECT_EQ(plan.peer_fetches.size(), 1u);
+                EXPECT_TRUE(plan.peer_local_choices.empty());
+            } else {
+                EXPECT_TRUE(plan.peer_fetches.empty());
+                ASSERT_EQ(plan.peer_local_choices.size(), 1u);
+                EXPECT_EQ(plan.peer_local_choices.front().first, id);
+                EXPECT_EQ(plan.peer_local_choices.front().second, "adaptive_recompute");
+                EXPECT_TRUE(Plan(reader).peer_local_choices.empty());
+            }
         }
     }
 }
@@ -458,8 +467,14 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
     }
     EXPECT_TRUE(PrefillRows(Plan(reader_)).empty()) << "nothing reads a landing's pages";
 
+    EXPECT_EQ(reader_.GetHostCacheStats().prefix_hits.prompt_tokens, 0u);
     EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true, /*head_between=*/true), fetch.end_tokens);
+    EXPECT_EQ(reader_.GetHostCacheStats().prefix_hits.peer_hit_tokens, 0u);
     EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
+    const auto hits = reader_.GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(hits.prompt_tokens, longer.size());
+    EXPECT_EQ(hits.peer_hit_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
+    EXPECT_EQ(hits.device_hit_tokens + hits.host_hit_tokens, 0u);
     EXPECT_EQ(reader_.GetPeerStats().landed_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
 }
@@ -498,6 +513,9 @@ TEST_P(PeerSchedulerTest, ALandedPromptEndingInsideAPagePublishesItsEnd) {
     const auto rows = PrefillRows(Plan(reader_));
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_GE(rows.front().second, static_cast<std::int32_t>(tokens.size()));
+    const auto hits = reader_.GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(hits.peer_hit_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
+    EXPECT_EQ(hits.prompt_tokens, longer.size() + again.size());
 }
 
 TEST_P(PeerSchedulerTest, AShortLandingIsAdmittedAgainFromTheLocalHit) {
@@ -514,6 +532,8 @@ TEST_P(PeerSchedulerTest, AShortLandingIsAdmittedAgainFromTheLocalHit) {
     EXPECT_EQ(Fetch(landing_plan.peer_fetches.front(), /*read_succeeds=*/false), 0);
     const ExecutionPlan plan = Plan(reader_);
     EXPECT_EQ(PrefillRows(plan), (std::vector<std::pair<std::string, std::int32_t>>{{"r", 0}}));
+    EXPECT_EQ(reader_.GetHostCacheStats().prefix_hits.prompt_tokens, longer.size());
+    EXPECT_EQ(reader_.GetHostCacheStats().prefix_hits.peer_hit_tokens, 0u);
     EXPECT_TRUE(plan.peer_fetches.empty()) << "it asked its holder once";
     EXPECT_TRUE(reader_.TakePeerLookups().empty());
     EXPECT_EQ(reader_.GetPeerStats().failed_landings, 1u);
@@ -568,6 +588,7 @@ TEST_P(PeerSchedulerTest, AnAbortWhileLandingWaitsForTheFetchToEnd) {
     Plan(reader_);
     EXPECT_EQ(reader_.ActiveLcmBlocks(), 0);
     EXPECT_EQ(reader_.GetPeerStats().landing_requests, 0u);
+    EXPECT_EQ(reader_.GetHostCacheStats().prefix_hits.peer_hit_tokens, 0u);
 }
 
 TEST_P(PeerSchedulerTest, AHolderAnswersBetweenRoundsAndItsPinHoldsAcrossAPlan) {
@@ -911,6 +932,9 @@ TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
     const ExecutionPlan admitted = Plan(reader_);
     EXPECT_EQ(PrefillRows(admitted), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}))
         << "the landed prefix is a Host hit";
+    const auto hits = reader_.GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(hits.host_hit_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
+    EXPECT_EQ(hits.peer_hit_tokens, 0u);
     EXPECT_FALSE(CacheOpIds<LoadBackBatch>(admitted).empty()) << "loaded to the Device";
     EXPECT_EQ(reader_.GetPeerStats().landed_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
@@ -1072,7 +1096,10 @@ TEST_F(AsyncHostReservationTest, BypassedLocalAdmissionRetainsGrantAndCommittedA
     reader.NextExecutionPlan({.allow_prefill = false, .apply_prefill_watermark = false});
     Send(reader, cache::PeerTick{.now_us = 100'000});
     EXPECT_EQ(reader.GetPeerStats().looking_requests, 1u);
-    EXPECT_EQ(PrefillRows(Plan(reader)), (std::vector<std::pair<std::string, std::int32_t>>{{"peer", 0}}));
+    const auto local = Plan(reader);
+    EXPECT_EQ(PrefillRows(local), (std::vector<std::pair<std::string, std::int32_t>>{{"peer", 0}}));
+    ASSERT_EQ(local.peer_local_choices.size(), 1u);
+    EXPECT_EQ(local.peer_local_choices.front().second, "host_wait_local");
     bool retry = true;
     EXPECT_FALSE(reader.ReservePeerHost(lookup.lease, prefix.size(), retry));
     EXPECT_FALSE(retry);
