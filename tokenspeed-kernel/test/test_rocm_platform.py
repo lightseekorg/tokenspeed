@@ -105,3 +105,53 @@ def test_unknown_amd_architecture_is_rejected(detect_amd):
         RuntimeError, match="unsupported AMD GPU architecture 'gfx9999'"
     ):
         detect_amd("gfx9999")
+
+
+def test_loaded_hip_runtime_path_reads_the_mapped_library(tmp_path):
+    maps = tmp_path / "maps"
+    maps.write_text(
+        "7f0000000000-7f0000001000 r--p 00000000 00:2a 11 /usr/lib/libc.so.6\n"
+        "7f0000002000-7f0000003000 r-xp 00000000 00:00 0 [heap]\n"
+        "7f0000004000-7f0000005000 r--p 00000000 00:2a 12 "
+        "/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7\n"
+    )
+    assert (
+        platform_module._loaded_hip_runtime_path(str(maps))
+        == "/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7"
+    )
+
+
+def test_loaded_hip_runtime_path_without_hip_mapping(tmp_path):
+    maps = tmp_path / "maps"
+    maps.write_text(
+        "7f0000000000-7f0000001000 r--p 00000000 00:2a 11 /usr/lib/libc.so.6\n"
+    )
+    assert platform_module._loaded_hip_runtime_path(str(maps)) is None
+    assert platform_module._loaded_hip_runtime_path(str(tmp_path / "missing")) is None
+
+
+def test_hip_runtime_prefers_the_mapped_library(tmp_path):
+    maps = tmp_path / "maps"
+    maps.write_text(
+        "7f0000004000-7f0000005000 r--p 00000000 00:2a 12 /rocm/lib/libamdhip64.so.7\n"
+    )
+    opened = []
+
+    def cdll(name):
+        opened.append(name)
+        return SimpleNamespace(hipHostGetDevicePointer=SimpleNamespace())
+
+    platform_module._get_hip_runtime.cache_clear()
+    try:
+        with (
+            patch.object(
+                platform_module,
+                "_loaded_hip_runtime_path",
+                return_value="/rocm/lib/libamdhip64.so.7",
+            ),
+            patch.object(platform_module.ctypes, "CDLL", side_effect=cdll),
+        ):
+            platform_module._get_hip_runtime()
+    finally:
+        platform_module._get_hip_runtime.cache_clear()
+    assert opened == ["/rocm/lib/libamdhip64.so.7"]

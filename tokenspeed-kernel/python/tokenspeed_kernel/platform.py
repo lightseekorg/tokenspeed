@@ -855,10 +855,31 @@ def _check_nvlink_available() -> bool:
     return _detect_cuda_nvlink_topology() is not None
 
 
+def _loaded_hip_runtime_path(maps_path: str = "/proc/self/maps") -> str | None:
+    """Path of the HIP runtime this process already mapped (torch's), if any.
+
+    ROCm SDK wheels ship only the versioned ``libamdhip64.so.N`` outside the
+    loader's search path, so the bare name does not resolve there; opening the
+    mapped file also binds the same runtime instance torch uses.
+    """
+    try:
+        with open(maps_path) as maps:
+            for line in maps:
+                fields = line.split()
+                if len(fields) >= 6 and "libamdhip64.so" in Path(fields[-1]).name:
+                    return fields[-1]
+    except OSError:
+        pass
+    return None
+
+
 @lru_cache(maxsize=1)
 def _get_hip_runtime():
     lib_name = "libamdhip64.so"
     candidates = []
+    loaded_hip_path = _loaded_hip_runtime_path()
+    if loaded_hip_path is not None:
+        candidates.append(loaded_hip_path)
     torch_hip_path = Path(torch.__file__).resolve().parent / "lib" / lib_name
     if torch_hip_path.exists():
         candidates.append(str(torch_hip_path))
