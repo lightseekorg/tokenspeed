@@ -1567,6 +1567,7 @@ class TestStorageRuntimeConfigTest:
                 json.dumps({"async": {"metadata_entries": 128, name: 2**31}}),
                 host_blocks=2**32,
                 prefix_granularity=2,
+                restore_to_host=True,
             )
 
     @pytest.mark.parametrize(
@@ -1581,12 +1582,18 @@ class TestStorageRuntimeConfigTest:
     def test_pressure_rejects_invalid_hysteresis(self, overrides):
         with pytest.raises(ValueError):
             StorageRuntimeConfig.from_extra_config(
-                json.dumps({"async": overrides}), host_blocks=32, prefix_granularity=2
+                json.dumps({"async": overrides}),
+                host_blocks=32,
+                prefix_granularity=2,
+                restore_to_host=True,
             )
 
     def test_one_credit_pressure_can_recover_on_an_empty_queue(self):
         config = StorageRuntimeConfig.from_extra_config(
-            '{"async":{"max_operations":1}}', host_blocks=32, prefix_granularity=2
+            '{"async":{"max_operations":1}}',
+            host_blocks=32,
+            prefix_granularity=2,
+            restore_to_host=True,
         )
         assert config.scheduler.pressure_high.queued_operations == 1
         assert config.scheduler.pressure_low.queued_operations == 0

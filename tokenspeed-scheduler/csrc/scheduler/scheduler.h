@@ -219,6 +219,23 @@ public:
     // without one.
     DiskStats GetDiskStats() const;
     bool SharedPrefixStorageEnabled() const;
+    // Read-only text-prefix match using the same all-group rules as admission.
+    // Unlike KV events, this includes State checkpoints and sliding windows.
+    std::int32_t GetLocalPrefixTokens(std::span<const std::int32_t> tokens, std::int32_t max_prefix_tokens) const;
+    std::int32_t GetLocalPrefixTokensFromHashes(std::span<const std::int32_t> tokens,
+                                                std::span<const std::string> hashes,
+                                                std::int32_t max_prefix_tokens) const;
+    // Exact immutable dependencies for an on-demand storage query. This is
+    // metadata only, not evidence that storage holds the objects or a grant
+    // of cache capacity. Illegal boundaries and key-budget exhaustion stay
+    // distinct in StoragePrefixPlan::max_tokens.
+    StoragePrefixPlan GetStoragePrefixPlan(std::span<const std::int32_t> tokens, std::int32_t max_prefix_tokens,
+                                           std::size_t max_keys) const;
+    // Preserve the reader's content chain (including non-token cache identity).
+    // Only full prefix pages are accepted: this API has no partial-tail salt.
+    StoragePrefixPlan GetStoragePrefixPlanFromHashes(std::span<const std::int32_t> tokens,
+                                                     std::span<const std::string> hashes,
+                                                     std::int32_t max_prefix_tokens, std::size_t max_keys) const;
     struct SharedPrefixPublication {
         std::string status;
         std::int32_t confirmed_prefix_tokens{0};
@@ -613,6 +630,7 @@ private:
     // it waits in Prefetching, or is admitted from its local hit when the
     // Host cannot take the whole answered prefix.
     void startPeerHostLanding(Request& request);
+    std::vector<PeerPageSlot> peerReusablePages(Request& request, std::int32_t hot_tokens) const;
     // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
     // request's tables: a token-spanned group's from the block holding
     // hit_tokens through the one holding the end, a State group's live slot.

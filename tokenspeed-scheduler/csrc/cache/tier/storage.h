@@ -47,6 +47,9 @@ struct StoragePressure {
 // a held block can keep its parent from recycling, so the credits are a share
 // of the pool.
 struct StorageConfig {
+    // Host restoration uses StorageQuery/Get. Direct restoration uses ordinary
+    // peer admission; the storage manager still owns write-back PUTs.
+    bool restore_to_host;
     std::int32_t max_operations;
     std::int32_t max_keys_per_operation;
     std::int32_t max_host_blocks;

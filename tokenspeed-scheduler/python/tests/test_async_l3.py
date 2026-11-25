@@ -38,6 +38,7 @@ def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(
+        True,
         8,
         32,
         max(1, (host - 1) // 2),
@@ -441,6 +442,7 @@ def mixed_replay_scheduler():
     cfg.enable_mixed_prefill_decode = True
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(
+        True,
         8,
         32,
         15,

@@ -37,12 +37,47 @@ use crate::peer::{
     push::{PagePusher, PushItem},
 };
 
+/// Completion and native retirement are separate facts. An error after submission
+/// need not mean that the NIC stopped writing the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// All copies completed and retired.
+    Complete,
+    /// No successful prefix, but no native access can remain.
+    FailedRetired,
+    /// Native access may still be in flight; destinations must stay owned.
+    Unretired,
+}
+
+impl ReadOutcome {
+    /// Whether every requested byte was copied successfully.
+    pub fn succeeded(self) -> bool {
+        self == Self::Complete
+    }
+    /// Whether native accesses are known to have stopped.
+    pub fn retired(self) -> bool {
+        self != Self::Unretired
+    }
+}
+
 /// What moves a read's bytes.
 pub trait PageReader: Send + Sync {
-    /// Copy `spans` from the memory registered under `session`; returns once
-    /// every copy retired, or the failure. May be called concurrently for
+    /// Copy `spans` from memory registered under `session`. Success proves all
+    /// copies retired; an error alone carries no retirement guarantee. May be called concurrently for
     /// separate jobs, as the transfer engine's entry points allow.
     fn read(&self, session: &str, spans: &Spans) -> Result<(), String>;
+
+    /// A backend may report a retired failure only with an actual retirement
+    /// guarantee. The native bridge currently proves retirement on success only.
+    fn read_outcome(&self, session: &str, spans: &Spans) -> ReadOutcome {
+        match self.read(session, spans) {
+            Ok(()) => ReadOutcome::Complete,
+            Err(error) => {
+                tracing::warn!(%error, "native read retirement is unproven");
+                ReadOutcome::Unretired
+            }
+        }
+    }
 }
 
 /// The transfer engine's one-sided READs.
@@ -61,11 +96,10 @@ impl PageReader for EngineReader {
 pub struct ReadJob {
     /// The landing request.
     pub request_id: String,
-    /// The holder rank's transfer session.
-    pub session: String,
-    /// What to copy.
-    pub spans: Spans,
-    /// The Disk pages the holder rank pushes into this member's pages.
+    /// Real source sessions and their spans. Storage objects can live at more
+    /// than one provider; the member reports once for the whole landing.
+    pub sources: Vec<(String, Spans)>,
+    /// Optional Disk pages pushed by the same holder.
     pub push: Option<PushJob>,
 }
 
@@ -95,7 +129,7 @@ impl PushJob {
 /// The member's bounded read workers: jobs in, outcomes out.
 pub struct Reads {
     jobs: Option<mpsc::Sender<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>>,
-    outcomes: mpsc::Receiver<(String, bool)>,
+    outcomes: mpsc::Receiver<(String, ReadOutcome)>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -127,61 +161,60 @@ impl Reads {
             );
             let worker = thread::Builder::new()
                 .name(format!("ts-peer-read-{index}"))
-                .spawn(move || loop {
-                    // Release the queue lock before the blocking transfer.
-                    let job = incoming.lock().recv();
-                    let Ok((job, observation)) = job else {
-                        return;
-                    };
-                    let started = std::time::Instant::now();
-                    tracing::debug!(
-                        request = job.request_id,
-                        spans = job.spans.lengths.len(),
-                        "peer read started"
-                    );
-                    let mut outcome = if job.spans.is_empty() {
-                        Ok(())
-                    } else {
-                        reader.read(&job.session, &job.spans)
-                    };
-                    // The push holds the landing too: a failed read still
-                    // waits for it, so no write trails the outcome.
-                    let mut disk_bytes = 0;
-                    if let Some(push) = job.push {
-                        disk_bytes = push.bytes();
-                        let pushed =
-                            pusher.push(&push.endpoint, &push.session, push.budget, push.items);
-                        outcome = outcome.and(pushed);
-                    }
-                    if let Some(observation) = observation {
-                        observation.finish(
-                            started,
-                            started.elapsed(),
-                            job.spans.host_bytes,
-                            disk_bytes,
-                            outcome.is_ok(),
-                        );
-                    }
-                    tracing::debug!(
-                        request = job.request_id,
-                        ok = outcome.is_ok(),
-                        elapsed_us = started.elapsed().as_micros() as u64,
-                        "peer read ended"
-                    );
-                    if let Err(error) = &outcome {
-                        let spans = &job.spans;
-                        tracing::warn!(
+                .spawn(move || {
+                    loop {
+                        // Release the queue lock before the blocking transfer.
+                        let job = incoming.lock().recv();
+                        let Ok((job, observation)) = job else {
+                            return;
+                        };
+                        let started = std::time::Instant::now();
+                        let mut outcome = ReadOutcome::Complete;
+                        let host_bytes =
+                            job.sources.iter().map(|(_, spans)| spans.host_bytes).sum();
+                        for (session, spans) in &job.sources {
+                            if spans.is_empty() {
+                                continue;
+                            }
+                            outcome = reader.read_outcome(session, spans);
+                            if !outcome.succeeded() {
+                                break;
+                            }
+                        }
+                        let disk_bytes = job.push.as_ref().map_or(0, PushJob::bytes);
+                        // A push starts only after the memory reads retire. No
+                        // new native operation follows an unretired failure.
+                        if outcome.retired() {
+                            if let Some(push) = job.push {
+                                if let Err(error) = pusher.push(
+                                    &push.endpoint,
+                                    &push.session,
+                                    push.budget,
+                                    push.items,
+                                ) {
+                                    tracing::warn!(%error, "Disk push retirement is unproven");
+                                    outcome = ReadOutcome::Unretired;
+                                }
+                            }
+                        }
+                        if let Some(observation) = observation {
+                            observation.finish(
+                                started,
+                                started.elapsed(),
+                                host_bytes,
+                                disk_bytes,
+                                outcome.succeeded(),
+                            );
+                        }
+                        tracing::debug!(
                             request = job.request_id,
-                            %error,
-                            spans = spans.lengths.len(),
-                            first_source = spans.sources.first().map(|a| format!("{a:#x}")),
-                            first_destination = spans.destinations.first().map(|a| format!("{a:#x}")),
-                            last_destination = spans.destinations.last().map(|a| format!("{a:#x}")),
-                            "peer read failed"
+                            ?outcome,
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            "peer read ended"
                         );
-                    }
-                    if done.send((job.request_id, outcome.is_ok())).is_err() {
-                        return;
+                        if done.send((job.request_id, outcome)).is_err() {
+                            return;
+                        }
                     }
                 })?;
             reads.workers.push(worker);
@@ -205,7 +238,7 @@ impl Reads {
     }
 
     /// The reads that ended since the last poll, by landing request.
-    pub fn poll(&self) -> Vec<(String, bool)> {
+    pub fn poll(&self) -> Vec<(String, ReadOutcome)> {
         self.outcomes.try_iter().collect()
     }
 }
@@ -247,6 +280,15 @@ impl Arena {
 }
 
 impl PageReader for Arena {
+    fn read_outcome(&self, session: &str, spans: &Spans) -> ReadOutcome {
+        // Synchronous CPU copies leave no native work on either result.
+        if self.read(session, spans).is_ok() {
+            ReadOutcome::Complete
+        } else {
+            ReadOutcome::FailedRetired
+        }
+    }
+
     fn read(&self, _session: &str, spans: &Spans) -> Result<(), String> {
         let mut memory = self.0.lock().unwrap_or_else(|e| e.into_inner());
         for ((&source, &destination), &length) in spans
@@ -310,7 +352,7 @@ mod tests {
         }
     }
 
-    fn wait_for(reads: &Reads) -> Vec<(String, bool)> {
+    fn wait_for(reads: &Reads) -> Vec<(String, ReadOutcome)> {
         let start = Instant::now();
         loop {
             let polled = reads.poll();
@@ -333,16 +375,21 @@ mod tests {
         .unwrap();
         reads.submit(ReadJob {
             request_id: "r".into(),
-            session: "s".into(),
-            spans: Spans {
-                sources: vec![4],
-                destinations: vec![32],
-                lengths: vec![8],
-                host_bytes: 0,
-            },
+            sources: vec![(
+                "s".into(),
+                Spans {
+                    sources: vec![4],
+                    destinations: vec![32],
+                    lengths: vec![8],
+                    host_bytes: 0,
+                },
+            )],
             push: None,
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("r".to_owned(), ReadOutcome::Complete)]
+        );
         assert_eq!(arena.read_bytes(32, 8), vec![7; 8]);
         assert_eq!(arena.read_bytes(40, 8), vec![0; 8]);
     }
@@ -370,16 +417,21 @@ mod tests {
         .unwrap();
         reads.submit(ReadJob {
             request_id: "r".into(),
-            session: "s".into(),
-            spans: Spans {
-                sources: vec![4],
-                destinations: vec![32],
-                lengths: vec![8],
-                host_bytes: 0,
-            },
+            sources: vec![(
+                "s".into(),
+                Spans {
+                    sources: vec![4],
+                    destinations: vec![32],
+                    lengths: vec![8],
+                    host_bytes: 0,
+                },
+            )],
             push: Some(push()),
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("r".to_owned(), ReadOutcome::Complete)]
+        );
         assert_eq!(
             *pushes.0.lock().unwrap(),
             vec![("holder:7200".to_owned(), 1)]
@@ -393,33 +445,40 @@ mod tests {
         .unwrap();
         reads.submit(ReadJob {
             request_id: "r".into(),
-            session: "s".into(),
-            spans: Spans::default(),
+            sources: vec![("s".into(), Spans::default())],
             push: Some(push()),
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("r".to_owned(), ReadOutcome::Unretired)]
+        );
     }
 
     #[test]
     fn a_failed_read_reports_its_failure() {
-        for reader in [
-            Arc::new(Failing) as Arc<dyn PageReader>,
-            Arc::new(Arena::new(4)),
+        for (reader, outcome) in [
+            (
+                Arc::new(Failing) as Arc<dyn PageReader>,
+                ReadOutcome::Unretired,
+            ),
+            (Arc::new(Arena::new(4)), ReadOutcome::FailedRetired),
         ] {
             let reads =
                 Reads::start(reader, Arc::new(NoPushes), NonZeroUsize::new(2).unwrap()).unwrap();
             reads.submit(ReadJob {
                 request_id: "r".into(),
-                session: "s".into(),
-                spans: Spans {
-                    sources: vec![1],
-                    destinations: vec![2],
-                    lengths: vec![8],
-                    host_bytes: 0,
-                },
+                sources: vec![(
+                    "s".into(),
+                    Spans {
+                        sources: vec![1],
+                        destinations: vec![2],
+                        lengths: vec![8],
+                        host_bytes: 0,
+                    },
+                )],
                 push: None,
             });
-            assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
+            assert_eq!(wait_for(&reads), vec![("r".to_owned(), outcome)]);
         }
     }
 
@@ -457,13 +516,15 @@ mod tests {
     fn read_job(request: &str, session: &str, destination: u64) -> ReadJob {
         ReadJob {
             request_id: request.into(),
-            session: session.into(),
-            spans: Spans {
-                sources: vec![0],
-                destinations: vec![destination],
-                lengths: vec![8],
-                host_bytes: 0,
-            },
+            sources: vec![(
+                session.into(),
+                Spans {
+                    sources: vec![0],
+                    destinations: vec![destination],
+                    lengths: vec![8],
+                    host_bytes: 0,
+                },
+            )],
             push: None,
         }
     }
@@ -488,11 +549,17 @@ mod tests {
             "paused"
         );
         reads.submit(read_job("fast", "ready", 32));
-        assert_eq!(wait_for(&reads), vec![("fast".to_owned(), true)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("fast".to_owned(), ReadOutcome::Complete)]
+        );
         assert_eq!(arena.read_bytes(32, 8), vec![7; 8]);
         assert_eq!(arena.read_bytes(16, 8), vec![0; 8]);
         drop(release);
-        assert_eq!(wait_for(&reads), vec![("slow".to_owned(), true)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("slow".to_owned(), ReadOutcome::Complete)]
+        );
         assert_eq!(arena.read_bytes(16, 8), vec![7; 8]);
     }
 

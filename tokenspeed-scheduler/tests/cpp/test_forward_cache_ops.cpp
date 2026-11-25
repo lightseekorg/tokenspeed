@@ -901,8 +901,17 @@ TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     config.host_allocator.total_pages = 32;
     config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.enable_l3_storage = true;
-    config.storage_config = StorageConfig{
-        8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
+    config.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                          8,
+                                          32,
+                                          4,
+                                          32,
+                                          16,
+                                          2,
+                                          100,
+                                          100,
+                                          StoragePressure{8, 1048576, 1000},
+                                          StoragePressure{4, 524288, 500}};
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
@@ -921,8 +930,17 @@ TEST(SchedulerConfigValidateTest, L3HostCreditsCountBlocksOfTheDensestGroup) {
     config = WithHostPackingFromDevice(config);
     ASSERT_EQ(config.HostBlockCapacity(), 8 * 4);
     const auto credits = [](std::int32_t blocks) {
-        return StorageConfig{
-            8, 32, blocks, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
+        return StorageConfig{/*restore_to_host=*/true,
+                             8,
+                             32,
+                             blocks,
+                             32,
+                             16,
+                             2,
+                             100,
+                             100,
+                             StoragePressure{8, 1048576, 1000},
+                             StoragePressure{4, 524288, 500}};
     };
     config.storage_config = credits(32);
     EXPECT_NO_THROW(config.Validate()) << "more credits than parents";
@@ -989,7 +1007,9 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRole) {
     EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(decode)});
     SchedulerConfig l3 = prefill();
     l3.enable_l3_storage = true;
-    l3.storage_config = StorageConfig{4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
+    l3.storage_config =
+        StorageConfig{/*restore_to_host=*/true, 4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000},
+                      {4, 524288, 500}};
     ExpectRejectedNamingGroup(l3, "excludes L3 storage");
     SchedulerConfig sharded = prefill();
     sharded.cache_groups[0].cache_blocks_per_lcm_block = 2;

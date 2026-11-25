@@ -28,7 +28,7 @@ use ts_mooncake::store::StoreSetup;
 
 use crate::{
     executor::{monotonic_clock, Executor, ExecutorConfig, Namespace},
-    layout::HostLayout,
+    layout::{HostLayout, Range},
     mooncake::MooncakeStore,
     store::{process_memory_store, HostBuffer, Store},
 };
@@ -45,6 +45,8 @@ pub enum StoreSettings {
         library: PathBuf,
         /// How the client connects.
         setup: StoreSetup,
+        /// Optional backend limit on one registration of the Host pool.
+        registration_max_bytes: Option<usize>,
     },
 }
 
@@ -66,13 +68,35 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Native registration boundaries for this Host pool. A peer engine sharing
+    /// the allocation must use these exact regions: partially overlapping
+    /// registrations can be rejected even when both plans work separately.
+    pub fn host_registrations(&self) -> Result<Vec<Range>, ts_mooncake::Error> {
+        let maximum = match &self.store {
+            StoreSettings::Mooncake {
+                registration_max_bytes,
+                ..
+            } => *registration_max_bytes,
+            StoreSettings::Memory => None,
+        };
+        crate::mooncake::registration_regions(self.host, self.layout.lcm_block_bytes, maximum)
+    }
+
     /// Connect the store and start the workers.
     pub fn start(&self) -> Result<Executor, ts_mooncake::Error> {
         let store: Box<dyn Store> = match &self.store {
             StoreSettings::Memory => Box::new(process_memory_store()),
-            StoreSettings::Mooncake { library, setup } => {
-                Box::new(MooncakeStore::connect(library, setup, self.host)?)
-            }
+            StoreSettings::Mooncake {
+                library,
+                setup,
+                registration_max_bytes,
+            } => Box::new(MooncakeStore::connect(
+                library,
+                setup,
+                self.host,
+                self.layout.lcm_block_bytes,
+                *registration_max_bytes,
+            )?),
         };
         Ok(Executor::start(
             store,
@@ -145,6 +169,9 @@ impl Settings {
                 let mooncake = settings.getattr("mooncake")?;
                 StoreSettings::Mooncake {
                     library: PathBuf::from(mooncake.getattr("library")?.extract::<String>()?),
+                    registration_max_bytes: mooncake
+                        .getattr("registration_max_bytes")?
+                        .extract()?,
                     setup: StoreSetup {
                         local_hostname: mooncake.getattr("local_hostname")?.extract()?,
                         metadata_server: mooncake.getattr("metadata_server")?.extract()?,
@@ -162,7 +189,7 @@ impl Settings {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unsupported L3 store {other:?}"
-                )))
+                )));
             }
         };
         Ok(Self {

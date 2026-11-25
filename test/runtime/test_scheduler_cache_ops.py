@@ -275,7 +275,7 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 
     limits = StorageRuntimeConfig.from_extra_config(
-        None, host_blocks=7, prefix_granularity=2
+        None, host_blocks=7, prefix_granularity=2, restore_to_host=True
     ).scheduler
     with pytest.raises(ValueError, match="storage_config"):
         _config(storage_config=limits)

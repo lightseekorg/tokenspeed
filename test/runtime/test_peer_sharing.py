@@ -219,6 +219,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.enable_kvstore = True
     args.enable_prefix_caching = True
     args.kvstore_storage_backend = None
+    args.enable_kvstore_storage_direct = False
     args.pipeline_parallel_size = 1
     args.query_context_parallel_size = 1
     args.mapping = Mapping(rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2)

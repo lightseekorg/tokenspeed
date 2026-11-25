@@ -18,6 +18,19 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 | `HostCacheStorage` | Shared pinned Host allocation and CPU-only block geometry; holds no device buffers or transfer layout |
 | `DeviceHandle` / `HostCacheExecutor` | Ordered D2H/H2D and device completion fences |
 
+The optional Mooncake `registration_max_bytes` connection setting bounds one
+native Host memory registration; omission keeps one registration for the pool.
+The executor rounds the limit down to whole Host LCM blocks and rejects a limit
+smaller than one block. Consequently no stored object crosses a registration
+boundary. This accommodates transports that reject one large registration while
+accepting the same pool in several regions, without reducing L2 capacity or
+adding staging copies. Registration and deregistration remain startup/shutdown
+work; reads and writes retain their ordinary object ranges.
+When peer sharing uses the same allocation, startup supplies the Store's exact
+Host registration regions to the peer engine, preserving its Device regions.
+Separate overlapping partitions of one Host allocation can fail native memory
+registration even when each partition succeeds independently.
+
 The C++ cache subsystem selects reusable prefixes, allocates blocks and owns
 their references. The executor's workers receive immutable keys and Host byte
 ranges; they call neither the scheduler nor GPU APIs or collectives, and no
@@ -669,8 +682,9 @@ Existing model, backend and QCP/DCP role restrictions still apply; storage
 support does not establish validation of every model/parallel configuration.
 Fused and PD-prefill roles can prepare L3 hits. Ordinary PD-decode remote
 landing keeps its Device-only prefix contract; local recovery uses the existing
-matcher. This version adds no PD handshake, direct L3-to-Device DMA, shared
-read deduplication or layer-wise GET publication.
+matcher. The Host-restoration path adds no PD handshake, shared read
+deduplication or layer-wise GET publication. Optional direct-to-Device
+restoration uses the prepared-source contract described below.
 
 Scheduler tests exercise mixed block granularities, sliding windows, sparse
 state, partial results, deadline expiry, cancellation, ID reuse and ownership.
@@ -747,3 +761,132 @@ scheduler built from matching source even when storage is disabled.
 L3 preparation preserves Decode destination publication and receiver lifetime:
 restored Host data enters the existing H2D, forward and PD transfer path.
 Storage adds no model-specific forward or attention implementations.
+
+
+## Direct-landing preparation primitives
+
+The source offers a bounded, on-demand text metadata query (`l3q1`/`l3r1`).
+Its reply identifies the source incarnation, complete prefix length and byte
+counts; querying neither prepares source buffers nor allocates reader pages.
+No L3 inventory is published to the router. A busy or stale offer is advisory
+and cannot bypass ordinary admission. This query contract accepts text only:
+multimodal routing requires the media-aware content chain. Actual restores
+preserve the reader's supplied prefix hashes rather than rehashing token IDs,
+so identical placeholder IDs cannot alias different media.
+
+`SharedPrefixObjects` describes one exact storage boundary using the same
+Full, sliding-window, tail and State rules as publication. Each immutable
+object carries its absolute logical slot, with the peer State slot for a
+checkpoint. The query acquires no Device or Host references. A positive
+`max_tokens` describes a complete dependency; zero means an illegal boundary
+and negative means that the key budget could not describe it completely.
+It does not assert that storage has the objects. The engine exposes this
+metadata through `Scheduler::storage_prefix_plan`; external callers remain
+bounded by token and key limits.
+
+`peer::prepared::read_spans` maps prepared objects into Device destinations
+already granted by ordinary admission. Each object names its actual source
+session and address; sources do not masquerade as a Host pool. The reader's
+namespace supplies the packed field layout. Fields scatter directly into
+the admitted Device pages, grouped by source session, without acquiring an
+inference Host destination. Missing dependencies, duplicate slots, mismatched
+sizes and overflowing addresses reject the whole plan before submission.
+
+`ts-mooncake::offload` provides the optional native metadata/prepare/release
+client. Prepared source ownership transfers to a read guard before addresses
+are exposed. Cancelling an unused lease releases it; a read without retirement
+proof sends no early release and leaves source cleanup to the provider TTL.
+Only a retired read may request the release acknowledgment used to validate
+its source lifetime. Destination ownership remains with ordinary admission.
+
+The optional `--enable-kvstore-storage-direct` selects direct restoration for
+Mooncake-backed Prefill workers with peer sharing and explicit
+`--peer-prefix-landing-tier device`. Direct storage restoration does not support
+a Host destination. With it disabled, the usual
+Host restoration policy remains unchanged. With it enabled,
+`restore_to_host=false` keeps PUT/write-back but suppresses Host QUERY/GET jobs.
+Dynamo uses its ordinary hot-cache/load/capacity placement and sends no L3 probe.
+After placement, the Prefill scheduler checks its actual all-group local prefix
+and the existing remote-hot-cache hint. A confirmed remote hot hit remains a
+candidate while a bounded, one-shot L3 lookup checks for a longer prefix, only
+when at least 4096 additional tokens could be recovered beyond both the local
+and remote hot hits. L3 replaces the hot candidate only if its complete prefix
+adds at least that many tokens; a miss, shorter hit or lookup timeout retains
+the hot candidate. When both sources contribute, immutable whole history pages
+covered by the hot prefix come from that peer, and L3 supplies their complement
+at the final boundary. The storage query, source-byte budget and SSD preparation
+exclude those hot pages. State always comes from the final boundary; a sliding
+window uses only pages retained at both boundaries, never an expired hot page.
+Partial packed pages are also left to L3. The same prompt hashes and namespace
+identify both sources. If the longer landing cannot pass ordinary admission, the
+scheduler tries the retained hot candidate before waiting for capacity. The
+lookup holds no destination pages or source buffers.
+Ordinary admission allocates the complete final destination set once. Its
+disjoint hot and storage source operations pin and read independently, so the
+hot read may overlap SSD preparation and the suffix read. Every replica member
+tracks both leases; the request receives one completion only after all source
+reads retire and their releases are acknowledged. A completed part alone never
+publishes a resumable prefix. A failed part waits for the other part to retire
+before returning the entire landing to ordinary recomputation; an unretired
+part still fails the worker without recycling destinations. A remote-hot-cache
+miss may also fall through to L3. Decode and shorter requests do not start
+storage lookups. This composition changes no hot-peer or Mooncake RPC protocol.
+
+This external Store path complements the native local Disk tier (RFC 0006).
+Ordinary peer Device/Host reads, Disk pushes and Host landing keep their existing
+transport and placement paths;
+external L3 uses the same shared peer listener and destination admission. The
+local Disk tier and external Store remain mutually exclusive on one worker.
+
+The source coordinator is an in-process I/O thread with a bounded queue, not a
+separate process or TCP service. Lookup queries complete persistent dependencies
+and retains metadata only: it allocates neither Device pages nor source buffers.
+After a hit, ordinary peer admission reserves Device destinations under the
+existing capacity rules. Pin then reserves source credits and asks SSD providers
+to prepare the data. Prepared buffers are outside the inference Host cache.
+Complete reads, all-owner agreement and successful source-release acknowledgments
+are required before publishing Device pages. An unretired native read fails the
+owning worker coherently without returning destinations to the allocator.
+
+The direct reader inherits the Store master/discovery entry, tenant and object
+namespace. The native bridge is found beside the Store library, or through
+`TOKENSPEED_MOONCAKE_OFFLOAD_LIBRARY`. `--kvstore-storage-direct-config` is now
+optional advanced JSON overrides; it cannot select a different master or tenant.
+There is no separate L3 query port. Defaults are a 500 ms scheduler lookup wait,
+2 s per native RPC, 15 s record lifetime, 5 s required remaining read lifetime,
+4096 minimum extra tokens, at most 65536 restored tokens (also bounded by model
+context), 1024 query keys, 8 candidate boundaries, 4 retained records, a 256 MiB
+source budget and per-request cap, and 128 MiB source batches (at most 8).
+These limits are conservative defaults, not predictions of every model's cost.
+A no-hit, timeout, source-budget rejection or retired read failure resumes the
+ordinary compute path without repeatedly querying the same request.
+
+For HA, the inherited master entry may be `etcd://https://host:port,...`.
+The discovery adapter uses the installed Mooncake SDK's cluster namespace,
+TLS authentication and ready-leader view. It re-resolves the Master for each
+metadata query; an existing provider lease keeps its original connection.
+`MOONCAKE_ETCD_CERT_DIR` may contain a CA bundle (`ca*.crt`), one client
+certificate and one private key (`*.key`). TokenSpeed resolves it into the
+SDK's `MOONCAKE_ETCD_CA_CERT`, `MOONCAKE_ETCD_CLIENT_CERT` and
+`MOONCAKE_ETCD_CLIENT_KEY`; explicit file variables take precedence.
+The Master uses those same SDK variables and must share `MC_STORE_CLUSTER_ID`.
+The scheduler wait is a soft deadline: native SDK I/O can finish later and its
+stale reply is ignored. No network call holds the scheduler lock.
+
+Checkpoint identity preserves the existing content/snapshot scheme by default.
+Deployments with immutable publisher IDs may explicitly select
+`TOKENSPEED_CHECKPOINT_IDENTITY_MODE=release` and supply
+`TOKENSPEED_CHECKPOINT_RELEASES` as a JSON mapping from absolute model paths to
+release IDs. Every change to the published weights must change that ID; a
+missing ID fails startup. This opt-in avoids scanning weight files.
+
+Weight-version changes invalidate pending records; old stamped replies cannot
+authorize a new-generation read. Unused preparations release source buffers.
+Cancelling a submitted read does not prove retirement: source credits remain
+quarantined until restart and native sources use their provider TTL. Each
+provider must enforce its own aggregate arena and lifetime bounds across readers.
+
+L3 object inventory is never published to the hot-cache routing index. A metadata
+hit or completed SSD read alone is not a reusable Device prefix. Model-level
+benefits require end-to-end measurement; CPU tests establish admission, identity
+and lifetime behavior only.

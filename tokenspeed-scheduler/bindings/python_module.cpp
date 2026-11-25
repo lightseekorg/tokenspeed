@@ -307,11 +307,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("queued_bytes", &tokenspeed::StoragePressure::queued_bytes)
         .def_ro("oldest_operation_us", &tokenspeed::StoragePressure::oldest_operation_us);
     nb::class_<tokenspeed::StorageConfig>(m, "StorageConfig")
-        .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
-                      std::int64_t, tokenspeed::StoragePressure, tokenspeed::StoragePressure>(),
-             nb::arg("max_operations"), nb::arg("max_keys_per_operation"), nb::arg("max_host_blocks"),
-             nb::arg("metadata_entries"), nb::arg("max_prefetch_tokens"), nb::arg("min_prefetch_tokens"),
-             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("pressure_high"), nb::arg("pressure_low"))
+        .def(nb::init<bool, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t,
+                      std::int64_t, std::int64_t, tokenspeed::StoragePressure, tokenspeed::StoragePressure>(),
+             nb::arg("restore_to_host"), nb::arg("max_operations"), nb::arg("max_keys_per_operation"),
+             nb::arg("max_host_blocks"), nb::arg("metadata_entries"), nb::arg("max_prefetch_tokens"),
+             nb::arg("min_prefetch_tokens"), nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"),
+             nb::arg("pressure_high"), nb::arg("pressure_low"))
+        .def_ro("restore_to_host", &tokenspeed::StorageConfig::restore_to_host)
         .def_ro("max_operations", &tokenspeed::StorageConfig::max_operations)
         .def_ro("max_keys_per_operation", &tokenspeed::StorageConfig::max_keys_per_operation)
         .def_ro("max_host_blocks", &tokenspeed::StorageConfig::max_host_blocks)
@@ -358,10 +360,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("Host", tokenspeed::PeerLandingTier::kHost);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
         .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t,
-                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t>(),
+                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t, std::int32_t, std::int32_t,
+                      std::int64_t>(),
              nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
              nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"), nb::arg("landing_tier"),
-             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"))
+             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"),
+             nb::arg("storage_min_fetch_tokens") = 0, nb::arg("storage_max_tokens") = 0,
+             nb::arg("storage_lookup_timeout_us") = 0)
         .def_ro("name", &tokenspeed::PeerConfig::name)
         .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
@@ -371,7 +376,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens)
         .def_ro("landing_tier", &tokenspeed::PeerConfig::landing_tier)
         .def_ro("max_host_landing_blocks", &tokenspeed::PeerConfig::max_host_landing_blocks)
-        .def_ro("host_ready_timeout_us", &tokenspeed::PeerConfig::host_ready_timeout_us);
+        .def_ro("host_ready_timeout_us", &tokenspeed::PeerConfig::host_ready_timeout_us)
+        .def_ro("storage_min_fetch_tokens", &tokenspeed::PeerConfig::storage_min_fetch_tokens)
+        .def_ro("storage_max_tokens", &tokenspeed::PeerConfig::storage_max_tokens)
+        .def_ro("storage_lookup_timeout_us", &tokenspeed::PeerConfig::storage_lookup_timeout_us);
     scheduler_config.def_rw("peer_config", &tokenspeed::SchedulerConfig::peer_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)

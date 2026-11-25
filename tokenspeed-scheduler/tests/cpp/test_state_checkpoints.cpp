@@ -2039,7 +2039,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DropShortPromptEndsSuite::MakeConfig();
         cfg.enable_l3_storage = true;
-        cfg.storage_config = StorageConfig{16,
+        cfg.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                           16,
                                            32,
                                            cfg.host_allocator.total_pages - 1,
                                            64,
@@ -3242,6 +3243,9 @@ TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageIt
     Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
     PlanAndDrain();  // plan 4: o's prefill; the image's store has not landed
     ASSERT_TRUE(Stored({5, 6, 7, 101})) << "evicting State alone preserves the full-history page event";
+    const std::vector<std::int32_t> replay{1, 2, 3, 4, 5, 6, 7, 101};
+    EXPECT_LT(scheduler_->GetLocalPrefixTokens(replay, 8), 8)
+        << "routing history alone cannot suppress a storage lookup after State eviction";
     SendForwardDone("o", {300});
     SendFinish("o");
     AckImageStores(retraction);

@@ -312,7 +312,11 @@ rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
-                                     .max_tokens = lookup.max_tokens});
+                                     .max_tokens = lookup.max_tokens,
+                                     .reused_pages = {}});
+        for (const auto& page : lookup.reused_pages) {
+            out.back().reused_pages.push_back(PeerPageSlotView{.group_id = page.group_id, .slot = page.slot});
+        }
     }
     return out;
 }
@@ -483,6 +487,57 @@ std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_i
 
 bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
     return scheduler.SharedPrefixStorageEnabled();
+}
+
+std::int32_t local_prefix_tokens(const tokenspeed::Scheduler& scheduler, rust::Slice<const std::int32_t> input_ids,
+                                 std::int32_t max_prefix_tokens) {
+    return scheduler.GetLocalPrefixTokens({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+}
+
+std::int32_t local_prefix_tokens_from_hashes(const tokenspeed::Scheduler& scheduler,
+                                             rust::Slice<const std::int32_t> input_ids,
+                                             rust::Slice<const rust::String> hashes, std::int32_t max_prefix_tokens) {
+    std::vector<std::string> chain;
+    chain.reserve(hashes.size());
+    for (const auto& hash : hashes) chain.emplace_back(hash);
+    return scheduler.GetLocalPrefixTokensFromHashes({input_ids.data(), input_ids.size()}, chain, max_prefix_tokens);
+}
+
+StoragePrefixPlanView storage_prefix_plan(const tokenspeed::Scheduler& scheduler,
+                                          rust::Slice<const std::int32_t> input_ids, std::int32_t max_prefix_tokens,
+                                          std::size_t max_keys) {
+    const auto plan = scheduler.GetStoragePrefixPlan({input_ids.data(), input_ids.size()}, max_prefix_tokens, max_keys);
+    StoragePrefixPlanView out;
+    out.max_tokens = plan.max_tokens;
+    out.objects.reserve(plan.objects.size());
+    for (const auto& object : plan.objects) {
+        out.objects.push_back(StoragePrefixObjectView{
+            StorageKeyView{object.key.group_id, rust::String(object.key.content_hash.ToString()),
+                           object.key.page_offset},
+            object.slot});
+    }
+    return out;
+}
+
+StoragePrefixPlanView storage_prefix_plan_from_hashes(const tokenspeed::Scheduler& scheduler,
+                                                      rust::Slice<const std::int32_t> input_ids,
+                                                      rust::Slice<const rust::String> hashes,
+                                                      std::int32_t max_prefix_tokens, std::size_t max_keys) {
+    std::vector<std::string> chain;
+    chain.reserve(hashes.size());
+    for (const auto& hash : hashes) chain.emplace_back(hash);
+    const auto plan = scheduler.GetStoragePrefixPlanFromHashes({input_ids.data(), input_ids.size()}, chain,
+                                                               max_prefix_tokens, max_keys);
+    StoragePrefixPlanView out;
+    out.max_tokens = plan.max_tokens;
+    out.objects.reserve(plan.objects.size());
+    for (const auto& object : plan.objects) {
+        out.objects.push_back(StoragePrefixObjectView{
+            StorageKeyView{object.key.group_id, rust::String(object.key.content_hash.ToString()),
+                           object.key.page_offset},
+            object.slot});
+    }
+    return out;
 }
 
 SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,

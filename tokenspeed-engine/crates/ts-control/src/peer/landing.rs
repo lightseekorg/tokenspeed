@@ -31,6 +31,8 @@ use ts_scheduler::{
     PeerAnswerView, PeerFetchView, PeerLeaseView,
 };
 
+use crate::peer::{prepared::PreparedObject, read::ReadOutcome};
+
 /// How long each wait may last, in the agreed peer clock's microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
@@ -58,6 +60,8 @@ enum Phase {
     Release { read: bool },
     /// A read failed: the destinations are held until `until_us`.
     Quarantine { until_us: i64 },
+    /// At least one member cannot prove retirement. No timer releases pages.
+    Unretired,
     /// Finished with this boundary.
     Done(i32),
 }
@@ -106,9 +110,11 @@ pub struct Landing {
     deadline_us: i64,
     timeouts: Timeouts,
     /// Each member's read outcome, once reported.
-    outcomes: Vec<Option<bool>>,
+    outcomes: Vec<Option<ReadOutcome>>,
     /// The pin's pages, once it held.
     pinned: Option<PeerAnswerView>,
+    /// Prepared storage sources have no cache block ids.
+    prepared: bool,
 }
 
 impl Landing {
@@ -146,6 +152,7 @@ impl Landing {
                 timeouts,
                 outcomes: vec![None; members],
                 pinned: None,
+                prepared: false,
             },
             action,
         )
@@ -165,6 +172,7 @@ impl Landing {
             Phase::Read => "read_agreement",
             Phase::Release { .. } => "release",
             Phase::Quarantine { .. } => "quarantine",
+            Phase::Unretired => "unretired",
             Phase::Done(_) => return,
         };
         if let Some(timeline) = &mut self.timeline {
@@ -257,6 +265,40 @@ impl Landing {
         }
     }
 
+    /// Validate a prepared prefix using logical dependencies only. No source
+    /// address is interpreted as a cache-pool block id.
+    pub fn pinned_prepared(
+        &mut self,
+        num_tokens: i32,
+        ranks: &[Vec<PreparedObject>],
+        trusted: bool,
+        now_us: i64,
+    ) -> Option<Action> {
+        if self.phase != Phase::Pin {
+            return None;
+        }
+        let covers = ranks.len() == self.outcomes.len()
+            && ranks.iter().all(|objects| {
+                self.fetch.destinations.iter().all(|destination| {
+                    objects.iter().any(|object| {
+                        object.group_id == destination.group_id && object.slot == destination.slot
+                    })
+                })
+            });
+        if trusted && num_tokens == self.fetch.end_tokens && covers {
+            self.prepared = true;
+            self.transition(Phase::Read, "ok", now_us);
+            None
+        } else {
+            self.release(false, now_us)
+        }
+    }
+
+    /// Pinned cache pages or prepared source objects may now be read.
+    pub fn ready_to_read(&self) -> bool {
+        self.phase == Phase::Read
+    }
+
     /// The pages to read, once the pin held and while the members read.
     pub fn pages_to_read(&self) -> Option<&PeerAnswerView> {
         (self.phase == Phase::Read)
@@ -265,16 +307,27 @@ impl Landing {
     }
 
     /// `member`'s read ended.
-    pub fn read(&mut self, member: usize, ok: bool, now_us: i64) -> Option<Action> {
+    pub fn read(&mut self, member: usize, outcome: ReadOutcome, now_us: i64) -> Option<Action> {
         if self.phase != Phase::Read {
             return None;
         }
         let slot = self.outcomes.get_mut(member)?;
-        slot.get_or_insert(ok);
+        slot.get_or_insert(outcome);
         if self.outcomes.iter().any(Option::is_none) {
             return None;
         }
-        let read = self.outcomes.iter().all(|outcome| *outcome == Some(true));
+        if self
+            .outcomes
+            .iter()
+            .any(|outcome| *outcome == Some(ReadOutcome::Unretired))
+        {
+            self.transition(Phase::Unretired, "unretired", now_us);
+            return None;
+        }
+        let read = self
+            .outcomes
+            .iter()
+            .all(|outcome| *outcome == Some(ReadOutcome::Complete));
         self.release(read, now_us)
     }
 
@@ -312,6 +365,12 @@ impl Landing {
         }
     }
 
+    /// A member reported a native failure without retirement proof. The owner
+    /// must fail closed while keeping the scheduler's destinations allocated.
+    pub fn unretired(&self) -> bool {
+        self.phase == Phase::Unretired
+    }
+
     /// The boundary the landing ended at, once it ended.
     pub fn done(&self) -> Option<i32> {
         match self.phase {
@@ -331,7 +390,7 @@ impl Landing {
     }
 
     fn settle(&mut self, read: bool, vouched: bool, outcome: &str, now_us: i64) {
-        let failed_read = self.pinned.is_some() && !read;
+        let failed_read = (self.pinned.is_some() || self.prepared) && !read;
         let next = if failed_read {
             Phase::Quarantine {
                 until_us: deadline(now_us, self.timeouts.quarantine_us),
@@ -415,11 +474,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unretired_read_never_releases_sources_or_destinations_on_a_timer() {
+        let mut landing = pinned_landing();
+        assert_eq!(landing.read(0, ReadOutcome::Unretired, 1), None);
+        assert_eq!(landing.read(1, ReadOutcome::Complete, 2), None);
+        assert!(landing.unretired());
+        landing.tick(i64::MAX);
+        assert_eq!(landing.done(), None);
+        // A late response cannot turn an unproven transfer into a completed one.
+        landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 3);
+        assert_eq!(landing.done(), None);
+    }
+
+    #[test]
     fn a_landing_every_member_read_and_the_holder_vouched_for_keeps_its_end() {
         let mut landing = pinned_landing();
-        assert_eq!(landing.read(1, true, 5), None, "one member still reads");
         assert_eq!(
-            landing.read(0, true, 6),
+            landing.read(1, ReadOutcome::Complete, 5),
+            None,
+            "one member still reads"
+        );
+        assert_eq!(
+            landing.read(0, ReadOutcome::Complete, 6),
             Some(Action::SendRelease { demote: true })
         );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 7);
@@ -462,9 +538,9 @@ mod tests {
     #[test]
     fn a_failed_read_holds_its_destinations_through_the_quarantine() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
+        landing.read(0, ReadOutcome::Complete, 1);
         assert_eq!(
-            landing.read(1, false, 2),
+            landing.read(1, ReadOutcome::FailedRetired, 2),
             Some(Action::SendRelease { demote: false })
         );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 3);
@@ -478,8 +554,8 @@ mod tests {
     #[test]
     fn an_unvouched_or_unanswered_release_gives_a_complete_read_up() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(1, true, 1);
+        landing.read(0, ReadOutcome::Complete, 1);
+        landing.read(1, ReadOutcome::Complete, 1);
         landing.released(&answer(PeerAnswerKind::Release, false, 0, vec![]), true, 2);
         assert_eq!(
             landing.done(),
@@ -488,8 +564,8 @@ mod tests {
         );
 
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(1, true, 1);
+        landing.read(0, ReadOutcome::Complete, 1);
+        landing.read(1, ReadOutcome::Complete, 1);
         landing.tick(101);
         assert_eq!(landing.done(), Some(0), "no answer vouches for nothing");
     }
@@ -497,13 +573,13 @@ mod tests {
     #[test]
     fn a_member_reports_once_and_reports_outside_a_read_change_nothing() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(0, false, 1);
+        landing.read(0, ReadOutcome::Complete, 1);
+        landing.read(0, ReadOutcome::FailedRetired, 1);
         assert_eq!(
-            landing.read(1, true, 1),
+            landing.read(1, ReadOutcome::Complete, 1),
             Some(Action::SendRelease { demote: true })
         );
-        assert_eq!(landing.read(1, true, 1), None);
-        assert_eq!(landing.read(5, true, 1), None);
+        assert_eq!(landing.read(1, ReadOutcome::Complete, 1), None);
+        assert_eq!(landing.read(5, ReadOutcome::Complete, 1), None);
     }
 }

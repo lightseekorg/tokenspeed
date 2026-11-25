@@ -855,8 +855,17 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
         .attn_kind = AttnKind::kFull,
     });
     SetTestSnapshotPool(config);
-    config.storage_config = StorageConfig{
-        8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
+    config.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                          8,
+                                          32,
+                                          4,
+                                          32,
+                                          16,
+                                          2,
+                                          100,
+                                          100,
+                                          StoragePressure{8, 1048576, 1000},
+                                          StoragePressure{4, 524288, 500}};
     EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(std::move(config))});
 }
 
@@ -982,8 +991,9 @@ protected:
         {CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}}};
     CacheCoordinator coordinator{MakeCoordinator(specs, 2, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
                                                  /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0)};
-    StorageTransferManager storage{coordinator,
-                                   StorageConfig{4, 16, 4, 3, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+    StorageTransferManager storage{
+        coordinator,
+        StorageConfig{/*restore_to_host=*/true, 4, 16, 4, 3, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     std::vector<std::string> hashes{"h0", "h1", "h2"};
     CacheKey key(const std::string& hash) { return CacheKey{.group_id = 0, .content_hash = ContentHash{hash}}; }
 };
@@ -1003,8 +1013,9 @@ protected:
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
     CacheCoordinator coordinator{MakeCoordinator(specs, 4, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
                                                  /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0)};
-    StorageTransferManager storage{coordinator,
-                                   StorageConfig{4, 64, 32, 16, 64, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+    StorageTransferManager storage{
+        coordinator,
+        StorageConfig{/*restore_to_host=*/true, 4, 64, 32, 16, 64, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     std::vector<std::int32_t> tokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     std::vector<std::string> hashes{
         HashPrefixPage(std::span{tokens}.first(4), ""),
@@ -1310,7 +1321,8 @@ TEST_F(AsyncStorageTransactionTest, PutPinsOnlyAtDispatchAndFailureKeepsL2) {
 
 TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveHostCreditsForAnUnrelatedRead) {
     StorageTransferManager transfers{
-        coordinator, StorageConfig{4, 16, 4, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+        coordinator,
+        StorageConfig{/*restore_to_host=*/true, 4, 16, 4, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     std::vector<CacheKey> backup_keys;
     for (int i = 0; i < 4; ++i) {
         auto ref = host.AcquireBlock(0);
@@ -1413,7 +1425,8 @@ TEST_F(AsyncStorageTransactionTest, BackupQueueIsBoundedAndCleanupCountsOnlyQueu
 
 TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveOperationCreditsForQueries) {
     StorageTransferManager transfers{
-        coordinator, StorageConfig{4, 16, 16, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+        coordinator,
+        StorageConfig{/*restore_to_host=*/true, 4, 16, 16, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     for (int i = 0; i < 4; ++i) {
         auto ref = host.AcquireBlock(0);
         const auto cache_key = key("backup" + std::to_string(i));
@@ -1430,7 +1443,8 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveOperationCreditsForQueries) 
 
 TEST_F(AsyncStorageTransactionTest, AOneCreditBudgetStillAllowsReads) {
     StorageTransferManager transfers{
-        coordinator, StorageConfig{1, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+        coordinator,
+        StorageConfig{/*restore_to_host=*/true, 1, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     auto ref = host.AcquireBlock(0);
     coordinator.Host().CacheHostBlock(ref, key("backup"), std::nullopt);
     ref.reset();
@@ -1449,9 +1463,17 @@ TEST_F(AsyncStorageTransactionTest, AOneCreditBudgetStillAllowsReads) {
 
 TEST_F(AsyncStorageTransactionTest, EitherZeroWriteBudgetRejectsCandidatesImmediately) {
     for (const auto [operations, blocks] : std::array{std::pair{1, 4}, std::pair{4, 1}}) {
-        StorageTransferManager transfers{
-            coordinator,
-            StorageConfig{operations, 16, blocks, 3, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+        StorageTransferManager transfers{coordinator, StorageConfig{/*restore_to_host=*/true,
+                                                                    operations,
+                                                                    16,
+                                                                    blocks,
+                                                                    3,
+                                                                    32,
+                                                                    2,
+                                                                    100,
+                                                                    100,
+                                                                    {8, 1048576, 1000},
+                                                                    {4, 524288, 500}}};
         transfers.QueueBackups(coordinator.Store().ExpandPrefixKeys(hashes));
         transfers.StartBackups();
         EXPECT_EQ(transfers.NumBackupCandidates(), 0u);
@@ -1560,7 +1582,9 @@ TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmissio
                                            /*write_back_evictions=*/false,
                                            /*checkpoint_retention_requests=*/0);
         StorageTransferManager storage{
-            coordinator, StorageConfig{4, 32, 16, 16, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+            coordinator,
+            StorageConfig{
+                /*restore_to_host=*/true, 4, 32, 16, 16, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
         const std::array<std::string, 3> hashes{"h0", "h1", "h2"};
         StorageLease read = storage.StartRead(StoragePrompt(hashes, 4), coordinator.Store().ExpandPrefixKeys(hashes));
         ASSERT_TRUE(read);
@@ -2016,7 +2040,9 @@ TEST(CacheOperationTest, RetainingClearKeepsMixedPackingIoLocationsIdenticalAcro
                                                      /*write_back_evictions=*/false,
                                                      /*checkpoint_retention_requests=*/0)};
         StorageTransferManager storage{
-            coordinator, StorageConfig{8, 32, 16, 32, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+            coordinator,
+            StorageConfig{
+                /*restore_to_host=*/true, 8, 32, 16, 32, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
         CacheKey put_key{.group_id = 0, .content_hash = ContentHash{"put"}};
         StorageLease read;
         CacheBlockLocation put_location;

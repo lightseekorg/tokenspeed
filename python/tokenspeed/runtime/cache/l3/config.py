@@ -52,7 +52,12 @@ class StorageRuntimeConfig:
 
     @classmethod
     def from_extra_config(
-        cls, raw: str | None, *, host_blocks: int, prefix_granularity: int
+        cls,
+        raw: str | None,
+        *,
+        host_blocks: int,
+        prefix_granularity: int,
+        restore_to_host: bool,
     ) -> StorageRuntimeConfig:
         """The L3 settings ``--kvstore-storage-backend-extra-config`` tunes.
 
@@ -143,6 +148,7 @@ class StorageRuntimeConfig:
             raise ValueError("L3 minimum prefetch must fit the maximum")
         return cls(
             scheduler=StorageConfig(
+                restore_to_host,
                 values["max_operations"],
                 values["max_keys_per_operation"],
                 values["max_host_blocks"],
@@ -295,6 +301,9 @@ class MooncakeStoreSettings:
         device_name: The RDMA devices; empty for all.
         master_server_address: The master's address.
         tenant_id: The tenant whose objects this client sees.
+        registration_max_bytes: Optional backend limit per memory registration;
+            None leaves the Host pool in one registration. Regions contain whole
+            LCM blocks, so a stored object never crosses a registration boundary.
     """
 
     library: str
@@ -306,6 +315,7 @@ class MooncakeStoreSettings:
     device_name: str
     master_server_address: str
     tenant_id: str
+    registration_max_bytes: int | None
 
     @classmethod
     def resolve(
@@ -320,6 +330,19 @@ class MooncakeStoreSettings:
         which mount equal shares of the configured segment, loading the
         store through ``library``."""
         config = MooncakeStoreConfig.from_mapping(extra_config)
+        if config.master_server_address.startswith("etcd://"):
+            from tokenspeed.runtime.cache.l3.tls import configure_etcd_tls
+
+            configure_etcd_tls()
+
+        registration_max_bytes = (extra_config or {}).get("registration_max_bytes")
+        if registration_max_bytes is not None and (
+            type(registration_max_bytes) is not int
+            or not 0 < registration_max_bytes <= 2**63 - 1
+        ):
+            raise ValueError(
+                "registration_max_bytes must be a positive integer or null"
+            )
         tp_size = max(int(tp_size), 1)
         pp_size = max(int(pp_size), 1)
         per_rank_segment = config.global_segment_size // (tp_size * pp_size)
@@ -343,6 +366,7 @@ class MooncakeStoreSettings:
             device_name=config.device_name,
             master_server_address=config.master_server_address,
             tenant_id=config.tenant_id,
+            registration_max_bytes=registration_max_bytes,
         )
 
 

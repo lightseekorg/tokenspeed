@@ -39,6 +39,7 @@ use std::{
     sync::Arc,
 };
 
+pub mod offload;
 pub mod store;
 
 #[cfg(test)]
@@ -97,6 +98,9 @@ pub enum Error {
     /// The library lacks the one-sided READ entries.
     #[error("{0} has no one-sided READ entry points")]
     NoReads(PathBuf),
+    /// The SDK's C ABI cannot select the requested non-default store tenant.
+    #[error("Mooncake SDK lacks tenant-aware setup for tenant {0}")]
+    NoTenantSetup(String),
     /// A transfer failed or timed out.
     #[error("transfer to {target} failed ({status})")]
     Transfer {

@@ -35,6 +35,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "cache/tier/peer.h"
 #include "cache/tier/storage_manager.h"
 
 namespace tokenspeed::test {
@@ -94,7 +95,8 @@ public:
           coordinator{MakeCoordinator(specs, grain, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
                                       /*write_back_evictions=*/false,
                                       /*checkpoint_retention_requests=*/0)},
-          storage{coordinator, StorageConfig{8,
+          storage{coordinator, StorageConfig{/*restore_to_host=*/true,
+                                             8,
                                              256,
                                              host_credits.value_or(parents),
                                              256,
@@ -228,6 +230,49 @@ TEST(SharedPrefixPublicationTest, RequestLocalHintsDiscoverRemoteTailsWithoutInv
     QueryCache divergent(4, FullAndStates(4, 2, 1), 32);
     long_prompt.tokens[6] = 999;
     EXPECT_FALSE(Has(divergent.coordinator.Storage().MissingStorageKeys(prefix, 256).keys, checkpoint));
+}
+
+TEST(StoragePrefixPlanTest, DescribesFullWindowAndStateWithoutReservingCache) {
+    auto specs = FullAndStates(4, 2, 2);
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 4,
+                     .cache_blocks_per_lcm_block = 2,
+                     .block_granularity = 2});
+    QueryCache cache(4, specs, 64);
+    const QueryPrompt prompt(11, 4);
+    const auto prefix = prompt.Prefix(11, true);
+    const auto plan = cache.coordinator.Storage().SharedPrefixObjects(prefix, 10);
+    ASSERT_EQ(plan.max_tokens, 11);
+    ASSERT_EQ(plan.objects.size(), 10u);
+    std::vector<std::vector<std::int32_t>> slots(4);
+    std::vector<CacheKey> keys;
+    for (const auto& object : plan.objects) {
+        slots[object.key.group_id].push_back(object.slot);
+        keys.push_back(object.key);
+    }
+    EXPECT_EQ(slots[0], (std::vector<std::int32_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(slots[1], (std::vector<std::int32_t>{kPeerStateSlot}));
+    EXPECT_EQ(slots[2], (std::vector<std::int32_t>{kPeerStateSlot}));
+    EXPECT_EQ(slots[3], (std::vector<std::int32_t>{4, 5}));
+    EXPECT_EQ(keys, cache.coordinator.Storage().SharedPrefixKeys(prefix, 10).keys);
+    EXPECT_EQ(cache.device.NumEmptyLcmBlocks(), 64);
+    EXPECT_EQ(cache.host.NumEmptyLcmBlocks(), 64);
+    EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(prefix).device.num_common_tokens, 0);
+    EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 0);
+}
+
+TEST(StoragePrefixPlanTest, RejectsIncompleteDescriptionsAndIllegalCheckpoints) {
+    auto specs = FullAndStates(4, 2, 1);
+    specs.back().checkpoint_granularity = 4;
+    QueryCache cache(4, specs, 16);
+    const QueryPrompt prompt(11, 4);
+    const auto& storage = cache.coordinator.Storage();
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(8, false), 4).max_tokens, -1);
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(8, false), 0).max_tokens, -1);
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(8, false), 5).max_tokens, 8);
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(11, true), 256).max_tokens, 0);
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(11, false), 256).max_tokens, 0);
+    EXPECT_EQ(storage.SharedPrefixObjects(prompt.Prefix(0, false), 256).max_tokens, 0);
 }
 
 TEST(SharedPrefixPublicationTest, RespectsRestrictedCheckpointGeometry) {

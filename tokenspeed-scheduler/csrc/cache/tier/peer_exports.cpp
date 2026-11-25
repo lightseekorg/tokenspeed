@@ -60,6 +60,15 @@ void PeerConfig::Validate() const {
         throw std::invalid_argument(
             "peer Host landings need positive Host block credits and a ready timeout, and Device landings neither");
     }
+    if (storage_min_fetch_tokens > 0 && landing_tier != PeerLandingTier::kDevice) {
+        throw std::invalid_argument("direct storage restoration requires Device peer landings");
+    }
+    if (storage_min_fetch_tokens < 0 ||
+        (storage_min_fetch_tokens > 0 &&
+         (storage_max_tokens <= 0 || storage_max_tokens > 65536 || storage_lookup_timeout_us <= 0)) ||
+        (storage_min_fetch_tokens == 0 && (storage_max_tokens != 0 || storage_lookup_timeout_us != 0))) {
+        throw std::invalid_argument("invalid local storage lookup bounds");
+    }
     // Lease ids count up from incarnation << 32: a wider incarnation would lose
     // the bits that tell two runs of the reader apart.
     if (incarnation == 0 || incarnation > std::numeric_limits<std::uint32_t>::max()) {

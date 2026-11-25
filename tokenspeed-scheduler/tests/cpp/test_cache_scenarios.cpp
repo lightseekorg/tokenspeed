@@ -2230,7 +2230,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
         cfg.enable_l3_storage = true;
-        cfg.storage_config = StorageConfig{16,
+        cfg.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                           16,
                                            32,
                                            cfg.host_allocator.total_pages - 1,
                                            64,
@@ -2393,7 +2394,8 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.role = Role::kD;
         cfg.enable_l3_storage = true;
-        cfg.storage_config = StorageConfig{16,
+        cfg.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                           16,
                                            32,
                                            cfg.host_allocator.total_pages - 1,
                                            64,
@@ -2462,7 +2464,8 @@ protected:
             group.total_pages = cfg.device_allocator.total_pages;
         }
         cfg.enable_l3_storage = true;
-        cfg.storage_config = StorageConfig{16,
+        cfg.storage_config = StorageConfig{/*restore_to_host=*/true,
+                                           16,
                                            32,
                                            cfg.host_allocator.total_pages - 1,
                                            64,

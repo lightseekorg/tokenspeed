@@ -127,6 +127,7 @@ struct StorageReadyHold {
 struct PeerHit {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
+    std::string holder;
 };
 
 struct AdmissionResources {
@@ -140,6 +141,8 @@ struct AdmissionResources {
     // what the holder answered.
     bool peer_prepared{false};
     std::optional<PeerHit> peer_hit;
+    // Retained until a longer storage candidate passes ordinary admission.
+    std::optional<PeerHit> peer_fallback;
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;

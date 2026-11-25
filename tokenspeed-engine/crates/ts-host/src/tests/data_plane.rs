@@ -118,7 +118,7 @@ def settings(extra):
     try:
         return config.L3Settings(
             runtime=config.StorageRuntimeConfig.from_extra_config(
-                extra, host_blocks=8, prefix_granularity=1),
+                extra, host_blocks=8, prefix_granularity=1, restore_to_host=True),
             deployment_id='clear-budget-bridge', has_draft=False, weight_version='v1',
             host_buffer=host_buffer, host_buffer_bytes=64,
             groups=((1, 8, 1),), lcm_block_bytes=8, num_lcm_blocks=8,

@@ -361,3 +361,14 @@ number of passed iterations still says nothing about RDMA behavior, GPU
 byte movement, model outputs, availability under sustained load, or
 production tail latency. Those belong to G2–G4 and remain pending until
 their evidence exists.
+
+### Direct L3 source deadlines
+
+The opt-in `kvstore_storage_direct_config` accepts omitted timing fields:
+`rpc_timeout_ms` defaults to 2000, `record_lifetime_ms` to 15000, and
+`read_budget_ms` to 5000. Explicit values override these defaults. Read time
+must remain strictly below the source-record lifetime, including when only
+one of the two values is overridden. Address, identity and resource budgets
+remain explicit; the defaults do not enable L3 or bypass normal L1 admission.
+The routing layer separately decides whether an additional prefix is long
+enough to justify querying L3.

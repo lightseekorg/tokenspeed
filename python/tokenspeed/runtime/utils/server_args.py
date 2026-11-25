@@ -660,6 +660,8 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    enable_kvstore_storage_direct: bool = False
+    kvstore_storage_direct_config: str | None = None
     # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
     # the node's replica leaders share for external control messages;
     # None turns it off.
@@ -2785,7 +2787,8 @@ class ServerArgs:
                 ("--disable-prefix-caching", not self.enable_prefix_caching),
                 (
                     "--kvstore-storage-backend",
-                    self.kvstore_storage_backend is not None,
+                    self.kvstore_storage_backend is not None
+                    and not self.enable_kvstore_storage_direct,
                 ),
                 (
                     "--pipeline-parallel-size > 1",
@@ -2861,6 +2864,27 @@ class ServerArgs:
     def validate_cache_options(self):
         self.validate_peer_prefix_options()
         self.validate_disk_tier_options()
+        if (
+            self.kvstore_storage_direct_config is not None
+            and not self.enable_kvstore_storage_direct
+        ):
+            raise ValueError(
+                "--kvstore-storage-direct-config requires --enable-kvstore-storage-direct"
+            )
+        if self.enable_kvstore_storage_direct:
+            if self.peer_prefix_landing_tier != "device":
+                raise ValueError("Direct L3 requires --peer-prefix-landing-tier device")
+            if (
+                self.kvstore_storage_backend != "mooncake"
+                or self.peer_prefix_port is None
+            ):
+                raise ValueError(
+                    "Direct L3 requires Mooncake storage and --peer-prefix-port"
+                )
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "Direct L3 source preparation currently requires the prefill role"
+                )
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -2906,7 +2930,8 @@ class ServerArgs:
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                     (
                         "--kvstore-storage-backend",
-                        self.kvstore_storage_backend is not None,
+                        self.kvstore_storage_backend is not None
+                        and not self.enable_kvstore_storage_direct,
                     ),
                     (
                         "--query-context-parallel-size > 1",
@@ -3909,6 +3934,17 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--enable-kvstore-storage-direct",
+            action="store_true",
+            help="Let Prefill restore long missing prefixes from L3 directly into admitted L1 pages.",
+        )
+        parser.add_argument(
+            "--kvstore-storage-direct-config",
+            type=str,
+            default=None,
+            help="Optional JSON overrides for direct L3 limits; connection settings are inherited from the storage backend.",
         )
         parser.add_argument(
             "--peer-prefix-port",

@@ -1762,6 +1762,18 @@ Its responsibilities:
   helpers, even when the weights reside in an immutable hub snapshot. The
   definition path uses the loader's process-working-directory resolution.
 
+  The isolated S13 startup validation adds an explicit identity policy via
+  `TOKENSPEED_CHECKPOINT_IDENTITY_MODE`: `content` keeps the algorithm above;
+  `release` uses a publisher-guaranteed immutable release id from the JSON
+  object `TOKENSPEED_CHECKPOINT_RELEASES`, keyed by absolute model path.
+  A release id must uniquely identify all selected weights, metadata and
+  local model code; changing any of them requires a new id. Target and draft
+  paths require their own entries. Release mode skips weight fingerprinting
+  but still includes load format, loader extra config and extensible code.
+  Missing modes or release entries and invalid ids fail explicitly. Directory
+  names alone are not treated as evidence of immutability. This test patch
+  does not change the official image or validate a publisher's immutability.
+
   `L3_RUNTIME_COMPAT` is the explicit compatibility epoch for built-in model,
   positional-encoding or kernel changes that alter KV without changing the
   checkpoint, layout or recorded producer choices. A git SHA would split
@@ -3347,6 +3359,17 @@ use the same batch, access, and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
 
 ## Diagnosing prefix cache misses
+
+Routing history events are locality estimates, not proof that every cache group
+can resume at that boundary. A direct-storage text probe can request
+`local_prefix_contract: 1` with a positive `min_extra_tokens`. The selected
+Prefill uses `GetLocalPrefixTokens` and the admission prefix matcher to include
+State checkpoints, windows and the Device/Host suffix rule. If the remaining
+gap is below the threshold, the broker returns without querying storage.
+Otherwise it offers only a complete L3 prefix extending that local match by
+the requested minimum. The probe acquires no pages, changes no recency, and
+prepares no source buffers. It remains a snapshot: actual admission and source
+lookup revalidate before any transfer.
 
 For a diagnostic replay, setting `TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS` emits
 one `PrefixCacheDiagnostic` line per successful first admission. The snapshot

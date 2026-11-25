@@ -59,6 +59,20 @@ struct StorageQuery {
     std::int32_t max_tokens{0};
 };
 
+// An immutable storage object and its logical destination in a prefix. Slots
+// are absolute block indices, including holes before an SWA window; State
+// uses kPeerStateSlot, like ordinary peer admission. These are not pool ids.
+struct StoragePrefixObject {
+    CacheKey key;
+    std::int32_t slot;
+};
+struct StoragePrefixPlan {
+    std::vector<StoragePrefixObject> objects;
+    // Positive for a complete boundary, 0 for an illegal boundary, -1 when
+    // the complete dependency exceeds the caller's key budget.
+    std::int32_t max_tokens{0};
+};
+
 class StorageQueries {
 public:
     // `enabled` says whether the engine runs an L3 storage tier (it needs a
@@ -79,6 +93,9 @@ public:
     // already in Device/Host. max_tokens is 0 for an illegal boundary and -1
     // when the bounded key budget cannot describe the complete dependency.
     StorageQuery SharedPrefixKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
+    // The same complete dependency with logical slots for a direct Device
+    // landing. Pure metadata: neither Host nor Device references are acquired.
+    StoragePrefixPlan SharedPrefixObjects(const PromptPrefix& prompt, std::size_t max_keys) const;
     // Host destinations for a storage read: the longest boundary that the
     // storage `hits` (with the Host) extend the Device-only hit to, under the
     // Host-suffix rule, whose missing keys get Host blocks within max_blocks
