@@ -676,13 +676,6 @@ def retained_batched_conv_kernel(
             WAVE,
         )
     )
-    if not valid:
-        if gl.program_id(2) == 0:
-            # The publish launch reduces every layer's verdict on the row; an
-            # accepting layer leaves its zero in place.
-            verdict = gl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
-            gl.store(verdicts + row * verdict_stride + layer, verdict.to(gl.int8))
-        return
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     original = gl.load(base + _QKV).to(gl.pointer_type(ACTIVATION))
     conv = gl.load(base + _CONV).to(gl.pointer_type(CONV))
@@ -694,7 +687,7 @@ def retained_batched_conv_kernel(
         gl.program_id(2) * BLOCK
         + gl.arange(0, BLOCK, layout=gl.BlockedLayout([1], [WAVE], [4], [0]))
     ).to(gl.int64)
-    mask = channel < CHANNELS
+    mask = (channel < CHANNELS) & valid
     ptr = conv + source * conv_stride + channel * channel_stride
     h0 = gl.load(ptr, mask=mask, other=0)
     h1 = gl.load(ptr + tap_stride, mask=mask, other=0)
@@ -708,6 +701,17 @@ def retained_batched_conv_kernel(
         h0 = gl.where(token < take, h1, h0)
         h1 = gl.where(token < take, h2, h1)
         h2 = gl.where(token < take, x, h2)
+    # Reject only after the window loads, which ``valid`` masks off for a
+    # rejected row: a store ahead of them, even on the rejecting branch, makes
+    # LLVM AMDGPU fetch the uniform descriptor fields with vector instead of
+    # scalar loads, an extra memory round trip in every program.
+    if not valid:
+        if gl.program_id(2) == 0:
+            # The publish launch reduces every layer's verdict on the row; an
+            # accepting layer leaves its zero in place.
+            verdict = gl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
+            gl.store(verdicts + row * verdict_stride + layer, verdict.to(gl.int8))
+        return
     ptr = conv + target * conv_stride + channel * channel_stride
     gl.store(ptr, h0, mask=mask)
     gl.store(ptr + tap_stride, h1, mask=mask)
