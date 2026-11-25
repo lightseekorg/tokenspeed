@@ -34,6 +34,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from runtime.cache_pool_test_utils import make_mha_pool_for_groups  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -54,6 +55,9 @@ from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
 )
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 from tokenspeed.runtime.layers.attention import utils as attn_utils  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
+)
 
 MIB = 1 << 20
 GIB = 1 << 30
@@ -612,20 +616,48 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     assert dummies == [(48, 2, "draft backend")]
 
 
-def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
+def test_the_boot_step_measures_releases_rebuilds_then_publishes(monkeypatch) -> None:
+    group = CacheGroupSpec(
+        group_id="full_attention",
+        attn_kind="full_history",
+        rows_per_page=16,
+        entry_stride_tokens=1,
+        replayable=False,
+    )
+    probe_pool = make_mha_pool_for_groups((group,), device="cpu")
+    retained_view = probe_pool.get_key_buffer(0)
+    assert retained_view.untyped_storage().nbytes() > 0
+
     order = []
+
+    def release_graphs():
+        assert retained_view.untyped_storage().nbytes() > 0
+        order.append(("release",))
+
     executor = SimpleNamespace(
         attn_backend="target backend",
         draft_attn_backend="draft backend",
-        release_graphs=lambda: order.append(("release",)),
+        token_to_kv_pool=probe_pool,
+        release_graphs=release_graphs,
         set_cache_pool=lambda target, draft: order.append(("adopt", target, draft)),
     )
-    built = SimpleNamespace(token_to_kv_pool="pool", draft_token_to_kv_pool="draft")
 
     def build_components(**kwargs):
         order.append(("build", kwargs))
-        return built
+        assert retained_view.untyped_storage().nbytes() == 0
+        return SimpleNamespace(
+            token_to_kv_pool=make_mha_pool_for_groups((group,), device="cpu"),
+            draft_token_to_kv_pool="draft",
+        )
 
+    server_args = SimpleNamespace(device="cpu")
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda _device: SimpleNamespace(
+            synchronize=lambda _gpu_id: None, empty_cache=lambda: None
+        ),
+    )
     with mock.patch.object(
         cudagraph_memory,
         "probe_cudagraph_memory",
@@ -637,15 +669,14 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
         rebuilt = reserve_and_rebind(
             executor,
             build_components,
-            "args",
+            server_args,
             3,
             profiled_cache_bytes=9000,
             startup_resident_bytes=500,
         )
-    assert rebuilt is built
 
     assert order == [
-        ("probe", "args", 3, 500),
+        ("probe", server_args, 3, 500),
         ("release",),
         (
             "build",
@@ -657,8 +688,11 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
                 reuse_draft_backend="draft backend",
             ),
         ),
-        ("adopt", "pool", "draft"),
+        ("adopt", rebuilt.token_to_kv_pool, "draft"),
     ]
+    serving_view = rebuilt.token_to_kv_pool.get_key_buffer(0)
+    serving_view.fill_(1)
+    assert (serving_view == 1).all()
 
 
 @pytest.mark.parametrize(
