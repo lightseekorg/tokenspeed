@@ -56,6 +56,12 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
 )
+from tokenspeed.runtime.engine.request_timing import (
+    RequestClock,
+    RequestTimestamp,
+    RequestTiming,
+    RequestTimingEvents,
+)
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -441,8 +447,40 @@ def _output_slim_tail() -> list[bytes]:
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
 
-def _output_execution() -> list[bytes]:
+def _output_slim_timing() -> list[bytes]:
     batch = msgspec.msgpack.decode(_output_slim_tail()[0], type=BatchTokenIDOutSlim)
+    batch.request_timing = [
+        RequestTiming(
+            role="decode",
+            dp_rank=2,
+            tp_rank=3,
+            clock=RequestClock(
+                host_id="worker-a",
+                process_instance_id="process-a",
+                clock_sync="unknown",
+                clock_uncertainty_ns="17",
+            ),
+            events=RequestTimingEvents(
+                accepted=RequestTimestamp(
+                    ts_unix_ns="1700000000000000001", ts_mono_ns="9007199254740993"
+                ),
+                kv_ready=RequestTimestamp(
+                    ts_unix_ns="1700000000200000002", ts_mono_ns="9007199454740994"
+                ),
+                finished=RequestTimestamp(
+                    ts_unix_ns="1700000000500000003", ts_mono_ns="9007199754740995"
+                ),
+            ),
+            kv_output_tokens=1,
+            e2e_latency_s=0.75,
+        ),
+        None,
+    ]
+    return [bytes(f) for f in _ENCODER.encode(batch)]
+
+
+def _output_execution() -> list[bytes]:
+    batch = msgspec.msgpack.decode(_output_slim_timing()[0], type=BatchTokenIDOutSlim)
     batch.execution_observations = [
         dict(
             version=1,
@@ -584,6 +622,15 @@ def _output_pre_execution() -> list[bytes]:
     ]
 
 
+def _output_pre_observation_timing() -> list[bytes]:
+    # Frozen producer with timing metadata, before execution observations.
+    return [
+        bytes.fromhex(
+            "dc001db34261746368546f6b656e49444f7574536c696d92a161a162929107910892a473746f70a561626f72749203029201019200009291cbbfd0000000000000909291079000000000009282a474797065a473746f70a76d6174636865640784a474797065a561626f7274a76d657373616765b9496e76616c696420726571756573743a20746f6f206d616e79a86572725f74797065cd020aab7374617475735f636f6465cd019092020092cb3ff8000000000000c09293c0cbbff0000000000000cbc004000000000000909293010203909293c092cbbfe0000000000000cbbff000000000000092cbbfe8000000000000cbc004000000000000909293c092090292040390929192cbbfd0000000000000cbc00800000000000090929192070190009291cb3fe800000000000090920100c0c09287a4726f6c65a66465636f6465a764705f72616e6b02a774705f72616e6b03a5636c6f636b84a7686f73745f6964a8776f726b65722d61b370726f636573735f696e7374616e63655f6964a970726f636573732d61aa636c6f636b5f73796e63a7756e6b6e6f776eb4636c6f636b5f756e6365727461696e74795f6e73a23137a66576656e747383a8616363657074656482aa74735f756e69785f6e73b331373030303030303030303030303030303031aa74735f6d6f6e6f5f6e73b039303037313939323534373430393933a86b765f726561647982aa74735f756e69785f6e73b331373030303030303030323030303030303032aa74735f6d6f6e6f5f6e73b039303037313939343534373430393934a866696e697368656482aa74735f756e69785f6e73b331373030303030303030353030303030303033aa74735f6d6f6e6f5f6e73b039303037313939373534373430393935b06b765f6f75747075745f746f6b656e7301ad6532655f6c6174656e63795f73cb3fe8000000000000c0"
+        ),
+    ]
+
+
 FIXTURES = {
     "generate_minimal": _generate_minimal,
     "generate_text": _generate_text,
@@ -601,8 +648,10 @@ FIXTURES = {
     "control_output_internal_state": _control_output_internal_state,
     "output_slim": _output_slim,
     "output_slim_tail": _output_slim_tail,
+    "output_slim_timing": _output_slim_timing,
     "output_execution": _output_execution,
     "output_pre_execution": _output_pre_execution,
+    "output_pre_observation_timing": _output_pre_observation_timing,
     "output_slim_prefix9": _output_slim_prefix9,
     "handshake_hello": _handshake_hello,
     "handshake_init": _handshake_init,

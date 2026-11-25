@@ -86,6 +86,7 @@ from tokenspeed.runtime.cache.peer import (
     peer_incarnation,
     peer_scheduler_config,
 )
+from tokenspeed.runtime.cache.transfer.ops import SnapshotOp
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -679,6 +680,9 @@ class _AdmittedRequest:
     multimodal_inputs: MultimodalInputs | None
     # Its grammar's matcher in the host, once compiled; None without one.
     grammar: HostGrammar | None = None
+    # The slot whose last decode could have left replay. Retraction ends
+    # that ownership even though the request's admission stays alive.
+    replay_slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -712,8 +716,11 @@ class HostDataPlane:
         epd_publisher,
         starting: bool,
         record_cache_observations: bool = False,
+        *,
+        defer_recurrent_state: bool,
     ) -> None:
         self._device = handle
+        self._defer_recurrent_state = defer_recurrent_state
         self._record_cache_observations = record_cache_observations
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
@@ -810,6 +817,22 @@ class HostDataPlane:
     def _admission_id(self, rid: str) -> int:
         return self._requests[rid].admission_id
 
+    def _retiring_replay_slots(self, plan, cache_ops) -> list[int]:
+        slots = []
+        for operation in cache_ops:
+            if isinstance(operation, SnapshotOp):
+                request = self._requests[operation.request_id]
+                if request.replay_slot is not None:
+                    slots.append(operation.request_pool_index)
+                    request.replay_slot = None
+        for abort in plan.aborts:
+            request = self._requests.get(abort.request_id)
+            if request is not None and request.replay_slot is not None:
+                # A retraction can publish a checkpoint before it fails.
+                slots.append(request.replay_slot)
+                request.replay_slot = None
+        return slots
+
     def execute(
         self,
         plan,
@@ -818,6 +841,7 @@ class HostDataPlane:
         grammar_advance: list[bool] | None,
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
         history: tuple[list[int], list[int], list[list[int]]] | None,
+        retirement_id: int | None = None,
     ) -> _Dispatched | None:
         """Run one round's plan; the forward to complete later, if one ran.
 
@@ -838,6 +862,7 @@ class HostDataPlane:
                 committed prefixes the batch seeds (``RequestHistorySeeds``'
                 slots, prefix lengths and tokens); None when no row needs
                 one.
+            retirement_id: The host's fence for snapshots and scheduler aborts.
         """
         dp_metadata = None
         idle_forward = False
@@ -921,10 +946,31 @@ class HostDataPlane:
             request_admission=self._admission_id,
             record_observations=self._record_cache_observations,
         )
+        retirement_slots = (
+            self._retiring_replay_slots(plan, cache_ops.device)
+            if retirement_id is not None
+            else ()
+        )
+        if (
+            self._defer_recurrent_state
+            and planned is not None
+            and planned.forward_op.num_extends() == 0
+            and any(request.replay_slot is None for request in requests)
+        ):
+            for request, slot in zip(
+                requests, planned.forward_op.request_pool_indices, strict=True
+            ):
+                request.replay_slot = slot
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
         with kernel_warmup(enabled=self._starting):
-            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            results = self._device.execute(
+                plan,
+                planned,
+                cache_ops=cache_ops.device,
+                retirement_slots=retirement_slots,
+                retirement_id=retirement_id,
+            )
             if idle_forward:
                 self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
@@ -989,12 +1035,27 @@ class HostDataPlane:
         """
         return self._device.poll_cache_observations()
 
-    def release(self, rids: list[str]) -> None:
+    def poll_replay_retirement(self) -> int:
+        """Report the last completed replay fence to the host."""
+        return self._device.poll_replay_retirement()
+
+    def replay_retirement_enabled(self) -> bool:
+        """Whether the host needs to order replay retirement work."""
+        return self._defer_recurrent_state
+
+    def release(self, rids: list[str], retirement_id: int | None = None) -> None:
         """Forget requests that ended. Their grammar matchers and
         shared-memory features go behind every forward launched before this,
         the ones that may read them."""
         requests = [(rid, self._requests.pop(rid)) for rid in rids]
-        if any(
+        retirement_slots = []
+        if retirement_id is not None:
+            retirement_slots = [
+                request.replay_slot
+                for _, request in requests
+                if request.replay_slot is not None
+            ]
+        if retirement_slots or any(
             request.grammar is not None
             or (
                 request.multimodal_inputs is not None
@@ -1005,6 +1066,8 @@ class HostDataPlane:
             # A release is a data-plane task: it runs behind a drafter's
             # pending round.
             self._device.settle()
+        if retirement_id is not None:
+            self._device.retire_replay(retirement_id, retirement_slots)
         for rid, request in requests:
             if request.grammar is not None:
                 request.grammar.release()
@@ -1783,6 +1846,7 @@ class HostBootstrap:
                 ),
                 starting=server_args.enable_startup_requests,
                 record_cache_observations=device.specs.cache_observation_capacity > 0,
+                defer_recurrent_state=server_args.enable_deferred_gdn_state,
             )
             self._device = device.handle
 

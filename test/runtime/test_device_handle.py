@@ -1118,11 +1118,12 @@ def test_shutdown_cache_closes_the_host_cache():
     assert trace == ["l2_shutdown"]
 
 
-def test_cache_polling_without_a_host_cache_reports_nothing_pending():
-    """Without --enable-kvstore or a snapshot pool there is no Host transfer
-    to acknowledge; the poll answers with nothing instead of failing, since
-    the state commit fences it also reports need no Host cache."""
-    assert _handle([]).poll_cache_results() == []
+def test_device_without_a_host_cache_polls_idle_and_rejects_host_cache_ops(wire_ops):
+    handle = _handle([])
+    assert handle.poll_cache_results() == []
+    plan = _plan(cache=[_WriteBackOp("store")])
+    with pytest.raises(RuntimeError, match="require a Host cache executor"):
+        _execute(handle, plan, None)
 
 
 # ----------------------------------------------------------------------

@@ -271,7 +271,15 @@ impl DataPlane for InstantDevice {
         Ok(Vec::new())
     }
 
-    fn release(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        false
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        unreachable!("no recurrent State in the benchmark")
+    }
+
+    fn release(&mut self, _: &[String], _: Option<u64>) -> Result<(), DataPlaneError> {
         Ok(())
     }
 

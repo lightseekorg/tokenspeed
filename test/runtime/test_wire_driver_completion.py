@@ -176,3 +176,28 @@ def test_explicit_budget_omission_keeps_ordinary_tokens_and_invalidates_evidence
     assert completion.finish_reason == "length"
     assert completion.execution_observations == omitted
     assert not completion.execution_observations["evidence_valid"]
+
+
+def test_completion_preserves_terminal_request_timing():
+    import msgspec
+
+    from tokenspeed.runtime.engine.io_struct import BatchTokenIDOutSlim, MsgpackDecoder
+
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "tokenspeed-engine/crates/ts-wire/tests/fixtures/output_slim_timing.hex"
+    )
+    batch = MsgpackDecoder(BatchTokenIDOutSlim).decode(
+        [bytes.fromhex(line) for line in fixture.read_text().splitlines()]
+    )
+    completion = Completion()
+    completion.add(_chunk([7], [], [], None))
+    assert completion.request_timing is None
+    terminal = _chunk([], [], [], "stop")
+    terminal["request_timing"] = msgspec.to_builtins(batch.request_timing[0])
+    terminal["execution_observations"] = _execution_snapshot()
+    completion.add(terminal)
+    assert completion.request_timing == batch.request_timing[0]
+    assert completion.execution_observations == _execution_snapshot()
+    assert completion.output_ids == [7]
+    assert completion.finish_reason == "stop"

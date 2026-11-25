@@ -264,6 +264,7 @@ fn actual_host_preserves_ack_and_labels_completed_physical_copy() {
             Python::attach(|py| plane.clone_ref(py)),
             None,
             Some(context.clone()),
+            false,
         )
         .unwrap();
         assert!(host.poll_cache_events().unwrap().is_empty());
@@ -311,7 +312,7 @@ fn malformed_or_lost_observation_invalidates_evidence_without_changing_ack() {
             plane.setattr(py, "ready", true).unwrap();
             plane.setattr(py, mode, 1).unwrap();
         });
-        let mut host = PythonDataPlane::start(plane, None, Some(context.clone())).unwrap();
+        let mut host = PythonDataPlane::start(plane, None, Some(context.clone()), false).unwrap();
         let ack = host.poll_cache_events().unwrap();
         assert_eq!(ack.len(), 1);
         assert_eq!(ack[0].op_id, 7);

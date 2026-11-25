@@ -731,6 +731,11 @@ class TritonSamplingBackend(SamplingBackend):
             return _TOP_K_TOP_P_SMALL_PAD
         return _TOP_K_TOP_P_PAD
 
+    def reads_sparse_draft_q(self) -> bool:
+        # Block verification reads the dense q the chain drafters record; every
+        # other triton verify (the tree and DFlash2 chain) reads the sparse one.
+        return not self._block_verify
+
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
         return SpeculativeSamplingPools(
             temperature=self._temperature_pool,

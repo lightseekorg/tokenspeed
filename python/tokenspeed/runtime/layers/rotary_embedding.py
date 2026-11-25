@@ -106,6 +106,11 @@ class RotaryEmbedding(torch.nn.Module):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+    @property
+    def position_capacity(self) -> int:
+        """Exclusive upper bound for raw positions passed to the attention prologue."""
+        return self.cos_sin_cache.shape[0]
+
     def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
         """Compute the inverse frequency."""
         #  To exactly match the HF implementation, we need to
@@ -523,6 +528,11 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         )
         self.register_buffer("cos_sin_cache", rope_cache, persistent=False)
 
+    @property
+    def position_capacity(self) -> int:
+        # Long positions index past the short-context prefix of the packed buffer.
+        return self.max_position_embeddings
+
     def _compute_inv_freq(self, rescale_factors: list[float]) -> torch.Tensor:
         rescale_factors = torch.tensor(rescale_factors, dtype=torch.float32)
         inv_freq = 1.0 / (
@@ -559,6 +569,17 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         return Rotary(self.cos_sin_cache, positions + offset, RopeStyle.NEOX, None)
 
 
+def _effective_yarn_cache_limit(
+    checkpoint_positions: int, factor: float, limit: int | None
+) -> int | None:
+    if limit is None:
+        return None
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("cache_position_limit must be a positive integer")
+    # A limit that leaves every row in place shares the full table's cache key.
+    return limit if limit < checkpoint_positions * factor else None
+
+
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
@@ -584,6 +605,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         device: str | None = None,
         ramp_device: str,
         frequency_device: str,
+        cache_position_limit: int | None = None,
     ) -> None:
         """
         Args:
@@ -593,7 +615,12 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             ramp_device: Device that computes the YaRN linear ramp mask.
             frequency_device: Device that computes the powers, divisions and
                 interpolation. The ramp is transferred here before combining.
+            cache_position_limit: Maximum number of table rows to materialize.
+                The checkpoint context still determines the YaRN frequencies.
         """
+        self.cache_position_limit = _effective_yarn_cache_limit(
+            max_position_embeddings, scaling_factor, cache_position_limit
+        )
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
@@ -654,8 +681,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
+        extent = self.max_position_embeddings * self.scaling_factor
+        if self.cache_position_limit is not None:
+            extent = min(extent, self.cache_position_limit)
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor,
+            extent,
             device=self.device,
             dtype=torch.float32,
         )
@@ -1073,16 +1103,18 @@ class RopeScaling:
         ),
     }
 
+    @staticmethod
+    def type_from_dict(raw: dict[str, Any]) -> str:
+        if "rope_type" in raw:
+            return raw["rope_type"]
+        if "type" in raw:
+            return raw["type"]
+        raise ValueError("Unknown RoPE scaling type")
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RopeScaling":
         """Parse and validate a checkpoint's ``rope_scaling`` dict."""
-        if "rope_type" in raw:
-            rope_type = raw["rope_type"]
-        elif "type" in raw:
-            rope_type = raw["type"]
-        else:
-            raise ValueError("Unknown RoPE scaling type")
-
+        rope_type = cls.type_from_dict(raw)
         known = {f.name for f in dataclasses.fields(cls)} - {"rope_type"}
         scaling = cls(
             rope_type=rope_type, **{k: v for k, v in raw.items() if k in known}
@@ -1110,6 +1142,7 @@ class _RopeCommonArgs:
     base: int
     is_neox_style: bool
     dtype: torch.dtype
+    cache_position_limit: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1230,6 +1263,7 @@ def _build_deepseek_yarn(
         args.dtype,
         ramp_device=yarn.ramp_device,
         frequency_device=yarn.frequency_device,
+        cache_position_limit=args.cache_position_limit,
         extrapolation_factor=scaling.extrapolation_factor,
         attn_factor=scaling.attn_factor,
         beta_fast=scaling.beta_fast,
@@ -1282,7 +1316,22 @@ def get_rope(
     rope_scaling: dict[str, Any] | None = None,
     dtype: torch.dtype | None = None,
     partial_rotary_factor: float = 1.0,
+    *,
+    cache_position_limit: int | None = None,
 ) -> RotaryEmbedding:
+    """Reuse a RoPE table, optionally capping the rows built for DeepSeek YaRN."""
+    scaling = None
+    if cache_position_limit is not None:
+        scaling = (
+            RopeScaling.from_dict(rope_scaling) if rope_scaling is not None else None
+        )
+        if scaling is None or scaling.rope_type != "deepseek_yarn":
+            raise ValueError("cache_position_limit is only supported for deepseek_yarn")
+        cache_position_limit = _effective_yarn_cache_limit(
+            scaling.original_max_position_embeddings,
+            scaling.factor,
+            cache_position_limit,
+        )
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
@@ -1311,6 +1360,7 @@ def get_rope(
         dtype,
         yarn_ramp_mask_device,
         yarn_frequency_device,
+        cache_position_limit,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1320,13 +1370,19 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        scaling = RopeScaling.from_dict(rope_scaling)
+        scaling = scaling or RopeScaling.from_dict(rope_scaling)
         builder = _ROPE_BUILDERS.get(scaling.rope_type)
         if builder is None:
             raise ValueError(f"Unknown RoPE scaling type {scaling.rope_type}")
         rotary_emb = builder(
             _RopeCommonArgs(
-                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                cache_position_limit,
             ),
             scaling,
             _YarnDevices(yarn_ramp_mask_device, yarn_frequency_device),

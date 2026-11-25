@@ -163,6 +163,9 @@ native Python conversion and cumulative Completion validation. The frozen full
 `output_pre_execution.hex` frame remains alongside the new execution fixture;
 its absent observation is unavailable, not zero. A frozen old Python decoder
 also reads the new frame's old columns while ignoring the added tail.
+The observation column follows the already-published terminal request-timing
+column. A frozen timing-only producer and a combined timing/observation frame
+check both compatibility and preservation of the two independent metadata kinds.
 Engram input-capacity and model-input regressions use the real executor
 configuration to check that disabled observations preserve those contracts.
 

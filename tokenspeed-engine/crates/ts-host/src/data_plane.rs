@@ -75,6 +75,7 @@ struct Execution {
     grammar_advance: Option<Vec<bool>>,
     logprobs: Option<LogprobPlan>,
     history: Option<HistorySeeds>,
+    retirement_id: Option<u64>,
 }
 
 /// EPD: one landed item as the data plane's `epd_publish` takes it: the
@@ -93,7 +94,7 @@ enum Op {
     Barrier {
         reply: mpsc::SyncSender<Result<(), String>>,
     },
-    Release(Vec<String>),
+    Release(Vec<String>, Option<u64>),
     Land {
         spec_candidates: Option<(i32, Vec<i32>)>,
         cache_slot: Option<i32>,
@@ -159,7 +160,7 @@ impl Op {
             Op::AttachGrammars(_) => "Op::AttachGrammars",
             Op::Committed(_) => "Op::Committed",
             Op::Barrier { .. } => "Op::Barrier",
-            Op::Release(_) => "Op::Release",
+            Op::Release(..) => "Op::Release",
             Op::Land { .. } => "Op::Land",
             Op::IdleForward { .. } => "Op::IdleForward",
             Op::CheckWeightUpdate { .. } => "Op::CheckWeightUpdate",
@@ -295,6 +296,7 @@ pub struct PythonDataPlane {
     shared: Arc<Shared>,
     next_forward: ForwardId,
     cache_events: Option<CacheEvents>,
+    replay_retirement: bool,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -307,6 +309,7 @@ impl PythonDataPlane {
         plane: Py<PyAny>,
         streams: Option<Streams>,
         cache_events: Option<CacheEvents>,
+        replay_retirement: bool,
     ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
@@ -323,6 +326,7 @@ impl PythonDataPlane {
             shared: shared.clone(),
             next_forward: 0,
             cache_events,
+            replay_retirement,
             thread: None,
         };
         let thread = thread::Builder::new()
@@ -461,6 +465,7 @@ impl DataPlane for PythonDataPlane {
             grammar_advance: dispatch.grammar_advance.map(<[bool]>::to_vec),
             logprobs: dispatch.logprobs.cloned(),
             history: dispatch.history.cloned(),
+            retirement_id: dispatch.retirement_id,
         })))?;
         if idle_forward {
             // An idle forward leaves nothing to commit, so no later call
@@ -505,8 +510,20 @@ impl DataPlane for PythonDataPlane {
             .collect()
     }
 
-    fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
-        self.queue(Op::Release(rids.to_vec()))
+    fn replay_retirement_enabled(&self) -> bool {
+        self.replay_retirement
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        self.query(|plane| plane.call_method0("poll_replay_retirement")?.extract())
+    }
+
+    fn release(
+        &mut self,
+        rids: &[String],
+        retirement_id: Option<u64>,
+    ) -> Result<(), DataPlaneError> {
+        self.queue(Op::Release(rids.to_vec(), retirement_id))
     }
 
     fn land(
@@ -713,7 +730,7 @@ fn forward_loop(
                 Op::Admit(_)
                 | Op::Execute(_)
                 | Op::Committed(_)
-                | Op::Release(_)
+                | Op::Release(..)
                 | Op::Land { .. }
                 | Op::EpdPublish(_)
                 | Op::AttachGrammars(_) => {}
@@ -774,6 +791,7 @@ fn run(
                 grammar_advance,
                 logprobs,
                 history,
+                retirement_id,
             } = *execution;
             if let Some(queued_at) = queued_at {
                 let batches = plan.forward_batches();
@@ -819,12 +837,26 @@ fn run(
                 )
             });
             let history = history.map(|seeds| (seeds.slots, seeds.prefix_lengths, seeds.tokens));
-            let launched = plane
-                .call_method1(
+            let launched = if let Some(retirement_id) = retirement_id {
+                plane.call_method1(
+                    "execute",
+                    (
+                        plan,
+                        dp,
+                        ngram,
+                        grammar_advance,
+                        logprobs,
+                        history,
+                        retirement_id,
+                    ),
+                )
+            } else {
+                plane.call_method1(
                     "execute",
                     (plan, dp, ngram, grammar_advance, logprobs, history),
                 )
-                .map_err(python)?;
+            }
+            .map_err(python)?;
             if let Some(streams) = streams {
                 streams.after_execute()?;
             }
@@ -847,8 +879,13 @@ fn run(
         Op::Barrier { reply } => {
             answer(reply, Ok(()))?;
         }
-        Op::Release(rids) => {
-            plane.call_method1("release", (rids,)).map_err(python)?;
+        Op::Release(rids, retirement_id) => {
+            if let Some(retirement_id) = retirement_id {
+                plane.call_method1("release", (rids, retirement_id))
+            } else {
+                plane.call_method1("release", (rids,))
+            }
+            .map_err(python)?;
         }
         Op::Land {
             spec_candidates,
