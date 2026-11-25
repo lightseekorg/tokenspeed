@@ -1035,7 +1035,7 @@ TEST(DiskTierTest, HybridStateDiskOnlyResidencyAndHotDescendantVisibility) {
     cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn1)).op_id, .success = true});
     cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn2)).op_id, .success = true});
 
-    // Evicting P1 State while descendant P3 State stays on Host keeps RAM visibility (TS-R4-P1-1).
+    // Evicting P1 State while descendant P3 State stays on Host keeps RAM visibility.
     const ContentHash p1{turn1.hashes[1]}, p3{turn2.hashes[3]};
     cache.EvictFromHost(std::vector<CacheKey>{CacheKey{.group_id = 1, .content_hash = p1}});
     for (const auto& h : turn2.hashes) {

@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 //! CPU `EventLoop` regression tests for peer prefix sharing scheduler-lock and
-//! hard-pin invariants (`TS-R2-P0-1`, `TS-R4-P0-1`, `TS-R8-P0-1`).
+//! hard-pin invariants.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -859,7 +859,7 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
     t0.join().unwrap();
     t1.join().unwrap();
 
-    // TS-R8-P0-1: Pin straddling soft_pin_us promotes to Phase::kHard BEFORE Expire runs.
+    // A Pin straddling soft_pin_us promotes to Phase::kHard before Expire runs.
     let mut sched = peer_scheduler("holder", 40_000);
     let tokens: Vec<i32> = (1..=4 * PAGE).collect();
     sched

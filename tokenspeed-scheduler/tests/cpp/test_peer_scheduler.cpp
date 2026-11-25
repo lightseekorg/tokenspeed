@@ -1256,7 +1256,7 @@ TEST(PeerDiskInterleavingTest, DiskReadyHoldSurvivesASuccessfulPeerHostLandingUn
     EXPECT_EQ(reader.GetDiskStats().ready_requests, 0u);
 }
 
-TEST(PeerSchedulerRound7Test, ExpiredSoftPinMaxLeasesOverflowAndFusedAbortSafety) {
+TEST(PeerSchedulerLeaseSafetyTest, ExpiredSoftPinMaxLeasesOverflowAndFusedAbortSafety) {
     // 1. max_leases overflow & expired soft pin never phantom-pin or vouch across ClearCache.
     SchedulerConfig cfg = PeerConfigFor("holder");
     cfg.peer_config->max_leases = 2;

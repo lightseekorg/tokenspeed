@@ -850,7 +850,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         disk_operations = disk_transfers_->TakeCommands();
         // StartCleaning() may evict a last Disk State checkpoint via Disk LRU,
         // leaving checkpoint-less Host History entries dead; collect them in the
-        // same round before DrainKvEventBatch reconciles residency (TS-R4-P2-1).
+        // same round before DrainKvEventBatch reconciles residency.
         coordinator_.CollectDeadEntries();
     }
 
