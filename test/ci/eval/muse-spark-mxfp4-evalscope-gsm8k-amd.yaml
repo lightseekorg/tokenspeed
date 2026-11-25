@@ -1,0 +1,81 @@
+api_version: ci.tokenspeed.io/v1
+# GSM8K accuracy for Muse Spark Open (Quark MXFP4, no speculation, BF16 KV) on
+# eight MI35x GPUs: the server is amd-tracking's attention-TP8 / MoE-TP8 recipe
+# (apps/inference_engine_benchmark/recipes/muse-spark-open/tokenspeed-mxfp4-moetp8ep1.sh);
+# the same eval command serves its EP8 layouts.
+#
+# Muse Spark has no thinking switch: after "<|start|>assistant" the model picks
+# its channel, reasoning privately in "self" before answering in "user", at
+# the "Reasoning strength" its chat template renders from reasoning_effort
+# (default medium = 64). "minimal" (strength 1) keeps the self channel of a
+# grade-school problem short enough for a boxed answer within max_tokens, and
+# force_nonempty_content makes an unterminated self channel visible content.
+# Greedy decoding keeps TP8 and EP8 comparable answer by answer.
+name: eval-muse-spark-mxfp4-gsm8k-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/muse_spark.py
+  - python/tokenspeed/runtime/models/muse_spark_monokernel.py
+  - python/tokenspeed/runtime/models/muse_spark_audio.py
+  - python/tokenspeed/runtime/models/muse_spark_vision.py
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4
+    --served-model-name muse-spark-open
+    --tp 8
+    --moe-tp-size 8
+    --ep-size 1
+    --dtype bfloat16
+    --quantization mxfp4
+    --moe-backend gluon
+    --max-model-len 1048576
+    --max-num-seqs 64
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+    --max-cudagraph-capture-size 64
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --sampling-backend triton
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --disable-prefix-caching
+    --disable-health-check
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3600
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-muse-spark && python3 -m uv pip install --python /tmp/evalscope-muse-spark/bin/python 'evalscope[perf]==1.11.1'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-muse-spark/bin/evalscope eval
+    --model muse-spark-open
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 32
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"minimal","force_nonempty_content":true}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

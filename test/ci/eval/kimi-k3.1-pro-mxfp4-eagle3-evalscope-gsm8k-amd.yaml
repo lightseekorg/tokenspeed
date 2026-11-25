@@ -1,0 +1,85 @@
+api_version: ci.tokenspeed.io/v1
+# GSM8K accuracy for Kimi K3.1 Pro (MXFP4, EAGLE3 3 steps / 4 draft tokens with
+# the lightseekorg/kimi-k3-eagle3.1-mla draft, FP8 KV) on eight MI35x GPUs: the
+# server is amd-tracking's TP8 recipe with RECIPE_KIMI_CHECKPOINT=k3.1-pro
+# (apps/inference_engine_benchmark/recipes/kimi-k3/tokenspeed-eagle3-tp8ep1.sh);
+# the same eval command serves its EP8 layouts.
+#
+# Kimi K3.1 Pro thinks by default (at thinking_effort max); its encoder reads
+# the "thinking" chat-template option and, when it is false, opens the
+# response channel instead of the think channel, so the model answers directly
+# and a grade-school answer fits max_tokens. Greedy decoding keeps TP8 and EP8
+# comparable answer by answer.
+name: eval-kimi-k3.1-pro-mxfp4-eagle3-gsm8k-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+  KIMI_K31_GATEWAY_TOKENIZER: /cache/huggingface/kimi-k3.1-gateway-tokenizer
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3.1-Pro
+    --tokenizer ${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}
+    --served-model-name kimi-k3
+    --tp 8
+    --ep-size 1
+    --init-expert-location trivial
+    --moe-backend auto
+    --attention-backend dsa
+    --mm-encoder-tp-mode data
+    --kv-cache-dtype fp8
+    --max-model-len 65536
+    --max-num-seqs 16
+    --chunked-prefill-size 8192
+    --max-prefill-tokens 8192
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --disable-prefix-caching
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla
+    --speculative-draft-model-quantization unquant
+    --speculative-eagle-topk 1
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --drafter-attention-backend gluon
+    --disable-health-check
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3600
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 32
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"thinking":false}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

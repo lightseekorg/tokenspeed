@@ -1,0 +1,80 @@
+api_version: ci.tokenspeed.io/v1
+# GSM8K accuracy for GLM-5.3-Flash (block FP8, MTP 3 steps / 4 draft tokens)
+# on eight MI35x GPUs: the server is amd-tracking's TP8 recipe
+# (apps/inference_engine_benchmark/recipes/glm-5.3-flash/tokenspeed-mtp4-tp8ep1.sh);
+# the same eval command serves its EP8 layouts.
+#
+# GLM-5.3-Flash always reasons: its chat template opens "<think>" after
+# "<|assistant|>" with no switch to turn it off, and renders reasoning_effort
+# (low/high, otherwise max) into the system turn. "low" keeps the reasoning of
+# a grade-school problem short enough for a boxed answer within max_tokens;
+# greedy decoding keeps TP8 and EP8 comparable answer by answer.
+name: eval-glm-5.3-flash-fp8-mtp-gsm8k-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/deepseek_v3.py
+  - python/tokenspeed/runtime/models/glm5.py
+  - python/tokenspeed/runtime/models/glm53_flash.py
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model zai-org/GLM-5.3-Flash
+    --served-model-name glm-5.3-flash
+    --trust-remote-code
+    --tp 8
+    --ep-size 1
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --max-model-len 65536
+    --chunked-prefill-size 65536
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --draft-model-path-use-base
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0
+    --disable-prefix-caching
+    --disable-health-check
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3600
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model glm-5.3-flash
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 32
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"low"}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

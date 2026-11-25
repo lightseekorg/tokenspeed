@@ -26,6 +26,7 @@ on:
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26-amd.yaml
+          - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-gsm8k-amd.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond-amd.yaml
           - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
@@ -37,9 +38,11 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-aime26-amd.yaml
+          - test/ci/eval/kimi-k3.1-pro-mxfp4-eagle3-evalscope-gsm8k-amd.yaml
           - test/ci/eval/kimi-k3.1-pro-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/muse-spark-mxfp4-evalscope-gsm8k-amd.yaml
           - test/ci/eval/muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml
           - test/ci/eval/muse-spark-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
