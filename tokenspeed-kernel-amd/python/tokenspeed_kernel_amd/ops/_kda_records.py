@@ -37,11 +37,18 @@ _STATE_PAGE_STRIDE = gl.constexpr(8)
 _STATE_HEAD_STRIDE = gl.constexpr(9)
 _STATE_VALUE_STRIDE = gl.constexpr(10)
 _STATE_KEY_STRIDE = gl.constexpr(11)
-# A layer's verdict on a request row's commit: the layer does not carry the
-# row, rejects its commit, or accepts it.
-_VERDICT_IDLE = gl.constexpr(0)
+# A layer's verdict on a request row's commit: the layer accepts it, rejects
+# it, or does not carry the row. Accepted is zero: only a layer that did not
+# accept stores its verdict, and the publish launch clears the row it read, so
+# the scratch stays zero across commits.
+_VERDICT_ACCEPTED = gl.constexpr(0)
 _VERDICT_REJECTED = gl.constexpr(1)
-_VERDICT_ACCEPTED = gl.constexpr(2)
+_VERDICT_IDLE = gl.constexpr(2)
+# The publish launch reduces a row to the set of verdicts its layers gave, one
+# bit per verdict, so no number of layers can overflow the reduction.
+_SEEN_ACCEPTED = gl.constexpr(1)
+_SEEN_REJECTED = gl.constexpr(2)
+_SEEN_IDLE = gl.constexpr(4)
 
 
 def kda_records_launch_metadata(grid, kernel, args):
@@ -669,13 +676,12 @@ def retained_batched_conv_kernel(
             WAVE,
         )
     )
-    if gl.program_id(2) == 0:
-        # The publish launch reduces every layer's verdict on the row.
-        verdict = gl.where(
-            valid, _VERDICT_ACCEPTED, gl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
-        )
-        gl.store(verdicts + row * verdict_stride + layer, verdict.to(gl.int8))
     if not valid:
+        if gl.program_id(2) == 0:
+            # The publish launch reduces every layer's verdict on the row; an
+            # accepting layer leaves its zero in place.
+            verdict = gl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
+            gl.store(verdicts + row * verdict_stride + layer, verdict.to(gl.int8))
         return
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     original = gl.load(base + _QKV).to(gl.pointer_type(ACTIVATION))
@@ -733,6 +739,11 @@ def retained_batched_conv_kernel(
         )
 
 
+@gluon.jit
+def _either(a, b):
+    return a | b
+
+
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=[
@@ -745,6 +756,7 @@ def retained_batched_conv_kernel(
         "fault_stride",
         "verdict_stride",
         "stopped_count",
+        "record_slot_count",
     ],
 )
 def retained_batched_publish_kernel(
@@ -766,6 +778,7 @@ def retained_batched_publish_kernel(
     fault_stride,
     verdict_stride,
     stopped_count,
+    record_slot_count,
     WINDOW: gl.constexpr,
     LAYERS: gl.constexpr,
     INCOMPLETE: gl.constexpr,
@@ -785,35 +798,60 @@ def retained_batched_publish_kernel(
     carries reports nothing. A row's entry is only raised, never lowered.
     """
     row = gl.program_id(0).to(gl.int64)
-    lanes = gl.arange(0, LAYERS, layout=gl.BlockedLayout([1], [WAVE], [4], [0]))
-    verdict = gl.load(
-        verdicts + row * verdict_stride + lanes,
-        mask=lanes < layers,
-        other=_VERDICT_IDLE,
-    )
-    accepting = gl.sum((verdict == _VERDICT_ACCEPTED).to(gl.int32), 0)
-    rejecting = gl.sum((verdict == _VERDICT_REJECTED).to(gl.int32), 0)
-    # A layer that carries the row validated its record slot.
-    carried = (accepting + rejecting) > 0
+    # One wave reduces the row: its verdicts fit in a few registers per lane.
+    lanes = gl.arange(0, LAYERS, layout=gl.BlockedLayout([1], [WAVE], [1], [0]))
+    listed = lanes < layers
+    # The row's slot state loads beside its verdicts; a carried row's slot is
+    # resident (a layer that carries the row validated it).
     record_slot = gl.load(record_slots + row * record_slot_stride).to(gl.int64)
+    resident = (record_slot >= 0) & (record_slot < record_slot_count)
+    verdict = gl.load(
+        verdicts + row * verdict_stride + lanes, mask=listed, other=_VERDICT_ACCEPTED
+    )
+    # One reduction: which verdicts the row's layers gave; unlisted lanes give
+    # none.
+    seen = gl.reduce(
+        gl.where(
+            listed,
+            gl.where(
+                verdict == _VERDICT_REJECTED,
+                _SEEN_REJECTED,
+                gl.where(verdict == _VERDICT_IDLE, _SEEN_IDLE, _SEEN_ACCEPTED),
+            ),
+            0,
+        ),
+        0,
+        _either,
+    )
+    # The next commit starts from a clean row.
+    gl.store(
+        verdicts + row * verdict_stride + lanes,
+        verdict - verdict,
+        mask=listed & (verdict != _VERDICT_ACCEPTED),
+    )
+    # Some layer carries the row: it accepted or rejected its commit.
+    carried = (seen & (_SEEN_ACCEPTED | _SEEN_REJECTED)) != 0
     begin = gl.load(starts + row * query_stride).to(gl.int64)
     count = gl.load(starts + (row + 1) * query_stride).to(gl.int64) - begin
     take = gl.minimum(
         gl.maximum(gl.load(accepted + row * accepted_stride), 0),
         gl.minimum(count, WINDOW),
     )
-    old = gl.load(replay_start + record_slot * start_stride, mask=carried, other=0)
+    old = gl.load(replay_start + record_slot * start_stride, mask=resident, other=0)
     stopped = gl.load(
         request_stopped + record_slot,
-        mask=carried & (record_slot < stopped_count),
+        mask=resident & (record_slot < stopped_count),
         other=0,
     )
-    fault = gl.load(faults + record_slot * fault_stride, mask=carried, other=0)
+    stopped = gl.where(carried, stopped, 0)
+    fault = gl.load(faults + record_slot * fault_stride, mask=resident, other=0)
+    # Only a row some layer carries reports its slot's fault here.
+    fault = gl.where(carried, fault, 0)
     # A carried row some layer did not accept: rejected outright, or never
     # reached because its group's pages were invalid. A row no layer carries
     # (graph padding, a masked overlap row, a slot not resident) says nothing.
-    unaccepted = carried & (accepting < layers)
-    if (accepting == layers) & (fault == 0):
+    unaccepted = carried & (seen != _SEEN_ACCEPTED)
+    if (seen == _SEEN_ACCEPTED) & (fault == 0):
         # An ended request's records are folded into its live page.
         gl.store(
             replay_length + record_slot * length_stride,

@@ -276,8 +276,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # unsound; the commit or report_request_faults raises the row's
         # request_ends entry to it, after the stop conditions wrote that.
         self._replay_faults: torch.Tensor | None = None
-        # INT8 [max_bs, layers]: each layer's verdict on each row's commit,
-        # which the commit reduces before it writes a request's count.
+        # INT8 [max_bs, layers]: the layers that do not accept a row's commit,
+        # which the commit reduces before it writes a request's count. Zero
+        # means accepted; the commit leaves it zero, so it is allocated zeroed.
+        # A commit that raises between its two launches leaves it dirty; any
+        # forward error stops the engine, so no later commit reads it.
         self._commit_verdicts: torch.Tensor | None = None
         self._record_slots: torch.Tensor | None = None
         # The recurrent state dtype every layer shares (validate_cache_pool).

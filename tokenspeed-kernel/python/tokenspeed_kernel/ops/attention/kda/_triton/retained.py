@@ -37,11 +37,18 @@ _STATE_PAGE_STRIDE = tl.constexpr(8)
 _STATE_HEAD_STRIDE = tl.constexpr(9)
 _STATE_VALUE_STRIDE = tl.constexpr(10)
 _STATE_KEY_STRIDE = tl.constexpr(11)
-# A layer's verdict on a request row's commit (commit_verdicts): the layer does
-# not carry the row, rejects its commit, or accepts it.
-_VERDICT_IDLE = tl.constexpr(0)
+# A layer's verdict on a request row's commit (commit_verdicts): the layer
+# accepts it, rejects it, or does not carry the row. Accepted is zero: only a
+# layer that did not accept stores its verdict, and the publish launch clears
+# the row it read, so the scratch stays zero across commits.
+_VERDICT_ACCEPTED = tl.constexpr(0)
 _VERDICT_REJECTED = tl.constexpr(1)
-_VERDICT_ACCEPTED = tl.constexpr(2)
+_VERDICT_IDLE = tl.constexpr(2)
+# The publish launch reduces a row to the set of verdicts its layers gave, one
+# bit per verdict, so no number of layers can overflow the reduction.
+_SEEN_ACCEPTED = tl.constexpr(1)
+_SEEN_REJECTED = tl.constexpr(2)
+_SEEN_IDLE = tl.constexpr(4)
 # Records a fold applies per unrolled step, so their loads issue together.
 _FOLD_RECORDS = tl.constexpr(8)
 
@@ -544,13 +551,12 @@ def retained_batched_conv_kernel(
             WINDOW,
         )
     )
-    if tl.program_id(2) == 0:
-        # The publish launch reduces every layer's verdict on the row.
-        verdict = tl.where(
-            valid, _VERDICT_ACCEPTED, tl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
-        )
-        tl.store(verdicts + row * verdict_stride + layer, verdict.to(tl.int8))
     if not valid:
+        if tl.program_id(2) == 0:
+            # The publish launch reduces every layer's verdict on the row; an
+            # accepting layer leaves its zero in place.
+            verdict = tl.where(live, _VERDICT_REJECTED, _VERDICT_IDLE)
+            tl.store(verdicts + row * verdict_stride + layer, verdict.to(tl.int8))
         return
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     original = tl.load(base + _QKV).to(tl.pointer_type(ACTIVATION))
@@ -604,6 +610,11 @@ def retained_batched_conv_kernel(
         )
 
 
+@triton.jit
+def _either(a, b):
+    return a | b
+
+
 @triton.jit(
     do_not_specialize=[
         "layers",
@@ -615,6 +626,7 @@ def retained_batched_conv_kernel(
         "fault_stride",
         "verdict_stride",
         "stopped_count",
+        "record_slot_count",
     ]
 )
 def retained_batched_publish_kernel(
@@ -636,6 +648,7 @@ def retained_batched_publish_kernel(
     fault_stride,
     verdict_stride,
     stopped_count,
+    record_slot_count,
     WINDOW: tl.constexpr,
     LAYERS: tl.constexpr,
     INCOMPLETE: tl.constexpr,
@@ -655,34 +668,58 @@ def retained_batched_publish_kernel(
     """
     row = tl.program_id(0).to(tl.int64)
     lanes = tl.arange(0, LAYERS)
-    verdict = tl.load(
-        verdicts + row * verdict_stride + lanes,
-        mask=lanes < layers,
-        other=_VERDICT_IDLE,
-    )
-    accepting = tl.sum((verdict == _VERDICT_ACCEPTED).to(tl.int32), 0)
-    rejecting = tl.sum((verdict == _VERDICT_REJECTED).to(tl.int32), 0)
-    # A layer that carries the row validated its record slot.
-    carried = (accepting + rejecting) > 0
+    listed = lanes < layers
+    # The row's slot state loads beside its verdicts; a carried row's slot is
+    # resident (a layer that carries the row validated it).
     record_slot = tl.load(record_slots + row * record_slot_stride).to(tl.int64)
+    resident = (record_slot >= 0) & (record_slot < record_slot_count)
+    verdict = tl.load(
+        verdicts + row * verdict_stride + lanes, mask=listed, other=_VERDICT_ACCEPTED
+    )
+    # One reduction: which verdicts the row's layers gave; unlisted lanes give
+    # none.
+    seen = tl.reduce(
+        tl.where(
+            listed,
+            tl.where(
+                verdict == _VERDICT_REJECTED,
+                _SEEN_REJECTED,
+                tl.where(verdict == _VERDICT_IDLE, _SEEN_IDLE, _SEEN_ACCEPTED),
+            ),
+            0,
+        ),
+        0,
+        _either,
+    )
+    # The next commit starts from a clean row.
+    tl.store(
+        verdicts + row * verdict_stride + lanes,
+        verdict - verdict,
+        mask=listed & (verdict != _VERDICT_ACCEPTED),
+    )
+    # Some layer carries the row: it accepted or rejected its commit.
+    carried = (seen & (_SEEN_ACCEPTED | _SEEN_REJECTED)) != 0
     begin = tl.load(starts + row * query_stride).to(tl.int64)
     count = tl.load(starts + (row + 1) * query_stride).to(tl.int64) - begin
     take = tl.minimum(
         tl.maximum(tl.load(accepted + row * accepted_stride), 0),
         tl.minimum(count, WINDOW),
     )
-    old = tl.load(replay_start + record_slot * start_stride, mask=carried, other=0)
+    old = tl.load(replay_start + record_slot * start_stride, mask=resident, other=0)
     stopped = tl.load(
         request_stopped + record_slot,
-        mask=carried & (record_slot < stopped_count),
+        mask=resident & (record_slot < stopped_count),
         other=0,
     )
-    fault = tl.load(faults + record_slot * fault_stride, mask=carried, other=0)
+    stopped = tl.where(carried, stopped, 0)
+    fault = tl.load(faults + record_slot * fault_stride, mask=resident, other=0)
+    # Only a row some layer carries reports its slot's fault here.
+    fault = tl.where(carried, fault, 0)
     # A carried row some layer did not accept: rejected outright, or never
     # reached because its group's pages were invalid. A row no layer carries
     # (graph padding, a masked overlap row, a slot not resident) says nothing.
-    unaccepted = carried & (accepting < layers)
-    if (accepting == layers) & (fault == 0):
+    unaccepted = carried & (seen != _SEEN_ACCEPTED)
+    if (seen == _SEEN_ACCEPTED) & (fault == 0):
         # An ended request's records are folded into its live page.
         tl.store(
             replay_length + record_slot * length_stride,

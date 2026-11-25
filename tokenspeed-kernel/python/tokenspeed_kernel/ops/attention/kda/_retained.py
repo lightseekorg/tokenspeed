@@ -301,11 +301,18 @@ def batched_commit(
     count of records accepted since each request's dense base, and
     replay_start the count the round's prepare left -- the records its verify
     read before its candidates -- in the same layout. commit_verdicts is
-    contiguous-row INT8 [rows >= requests, layers] scratch: the first launch
-    stores each layer's verdict on each request's commit, and the second
-    reduces a request's verdicts and writes its count once, to
+    contiguous-row INT8 [rows >= requests, layers] scratch that must hold
+    zeros (every layer accepted) when the commit starts, as a zeroed
+    allocation does; each commit leaves it zero. The first launch stores the
+    verdict of each layer that does not accept a request's commit (it rejects
+    it, or does not carry the row), and the second reduces a request's
+    verdicts, clears them, and writes its count once, to
     replay_start + accepted when every layer accepted and the request's
     replay_faults entry (INT32 [record slots, 1], set by the prepare) is 0.
+    The two launches are one operation: if this call raises after the first
+    and before the second, the scratch keeps that commit's verdicts and must
+    be zeroed before another commit uses it (serving stops the engine on any
+    forward error, so it never reuses one).
     A request still decoding that some layers accept and others reject, or
     whose slot holds a fault, has its request_ends entry raised to
     ``REQUEST_DECODE_STATE_INCONSISTENT``, and its count stays: one count
@@ -514,11 +521,12 @@ def batched_commit(
         replay_faults.stride(0),
         commit_verdicts.stride(0),
         request_stopped.numel(),
+        record_slot_count,
         WINDOW=draft_token_num,
         LAYERS=triton.next_power_of_2(layers),
         INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
         INCONSISTENT=REQUEST_DECODE_STATE_INCONSISTENT,
-        num_warps=4,
+        num_warps=1,
         **options,
     )
 

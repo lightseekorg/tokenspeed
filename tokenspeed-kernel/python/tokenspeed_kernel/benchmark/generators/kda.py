@@ -855,7 +855,8 @@ def prepare_kda_retained_commit(
         before.append(conv.clone())
     descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
     initial_count = replay_length.clone()
-    verdicts = torch.empty(batch, layers, device="cuda", dtype=torch.int8)
+    # Zero means every layer accepted; each commit leaves the scratch zero.
+    verdicts = torch.zeros(batch, layers, device="cuda", dtype=torch.int8)
     group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
         layers // groups
     )

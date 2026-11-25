@@ -827,8 +827,12 @@ def resolve_kda_batched_retained_commit(
     record_slots selects each request's slot in replay_length, the count
     every layer shares, and replay_start, the count the round's prepare left.
     The commit writes a request's count once, after every layer's verdict
-    (commit_verdicts): replay_start plus its acceptance when every layer
-    accepted and replay_faults holds no fault for its slot; a request still
+    (commit_verdicts, INT8 [rows >= requests, layers] scratch): replay_start
+    plus its acceptance when every layer accepted and replay_faults holds no
+    fault for its slot. commit_verdicts must be all zeros when a commit
+    starts (allocate it with ``torch.zeros``); a commit that returns leaves
+    it zero, so the next commit reuses it as is. A commit that raises leaves
+    it undefined until zeroed. A request still
     decoding that some layers reject, or whose slot holds a fault, is
     reported as ``REQUEST_DECODE_STATE_INCONSISTENT`` in request_ends and
     keeps its count. A request whose slot is set in request_stopped ended in this

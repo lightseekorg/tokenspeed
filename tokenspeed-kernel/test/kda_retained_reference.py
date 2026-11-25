@@ -507,7 +507,7 @@ def commit(case, accepted, *, ended_slots):
         record_stamps=records.stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
-        commit_verdicts=torch.empty(
+        commit_verdicts=torch.zeros(
             accepted.numel(), 1, device="cuda", dtype=torch.int8
         ),
         activation_dtype=qkv.dtype,
@@ -591,7 +591,8 @@ def publish(
             torch.zeros(1, device=device, dtype=torch.int32),
             torch.zeros(history.length.shape[0], device=device, dtype=torch.bool),
             torch.zeros(batch, device=device, dtype=torch.int32),
-            torch.empty(batch, 1, device=device, dtype=torch.int8),
+            # Verdict scratch: zero means every layer accepted.
+            torch.zeros(batch, 1, device=device, dtype=torch.int8),
         )
     (
         qkv,

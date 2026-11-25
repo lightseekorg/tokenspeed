@@ -2089,8 +2089,9 @@ activation-dtype rounding, gate projection and state-panel scheduling are shared
 by one-token and speculative windows. The registered activation dtype is BF16.
 
 Retained commit clamps the accepted count to the actual window and configured
-bound, updates convolution from the caller's original QKV and stores each
-layer's verdict on each row; a second launch reduces a row's verdicts and
+bound, updates convolution from the caller's original QKV and stores the
+verdict of each layer that does not accept a row (the zeroed scratch means
+accepted); a second, one-wave launch reduces and clears a row's verdicts and
 writes its count once, the start count plus the acceptance, when every layer
 accepted and its slot holds no fault. A still-decoding row that a layer
 rejects or leaves idle, or a faulted slot, raises the row's `request_ends`

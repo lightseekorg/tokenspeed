@@ -474,7 +474,7 @@ def _case(
             replay_length=history.length,
             replay_start=history.length,
             replay_faults=torch.zeros_like(history.length),
-            commit_verdicts=torch.empty(batch, 1, device="cuda", dtype=torch.int8),
+            commit_verdicts=torch.zeros(batch, 1, device="cuda", dtype=torch.int8),
             # No request ends in these rounds.
             request_stopped=torch.zeros(
                 history.length.shape[0], device="cuda", dtype=torch.bool

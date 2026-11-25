@@ -52,10 +52,11 @@ the QKV and conv pointers, the page count, four strides, then the v-major
 recurrent-state pointer and its page, head, value and key strides; they carry
 no raw key/gate pointers. The count and the start count are not a layer's:
 the commit takes them as `[slots, 1]` tensors, and `record_slots` selects each
-request's. The convolution launch stores each layer's verdict on each row
-(it does not carry the row, rejects its commit or accepts it) in an INT8
-`[rows, layers]` scratch, and the count launch reduces a row's verdicts and
-writes its count once: the start count plus the acceptance, when every layer
+request's. The convolution launch records which layers do not accept a row
+(one rejects its commit, or does not carry the row) in an INT8 `[rows,
+layers]` scratch that holds zeros, meaning accepted, on the common path, and
+the count launch reduces and clears a row's verdicts and writes its count
+once: the start count plus the acceptance, when every layer
 accepted. A request still decoding that some layers accept and others reject,
 or that any layer it carries rejects, or that some layer leaves idle (its
 group's pages invalid), or whose slot holds a fault (below), keeps its count,

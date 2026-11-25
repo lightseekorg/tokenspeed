@@ -325,7 +325,7 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         replay_start=start_count,
         replay_faults=torch.zeros(4, 1, device="cuda", dtype=torch.int32),
         # Scratch rows for the largest batch a test commits.
-        commit_verdicts=torch.empty(64, layers, device="cuda", dtype=torch.int8),
+        commit_verdicts=torch.zeros(64, layers, device="cuda", dtype=torch.int8),
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=window,
@@ -458,9 +458,46 @@ def test_rows_some_layers_never_carry(pages, stopped, end):
     groups = [0] if pages == "one group" else [0, 1]
     args["read_indices"][groups, 1] = -1
     args["write_indices"][groups, 1] = -1
+    if pages == "every group":
+        # A row no layer carries reports nothing, not even its slot's fault.
+        args["replay_faults"][3] = REQUEST_DECODE_STATE_INCONSISTENT
     _resolve_commit()(**args)
     assert args["request_ends"].tolist()[1] == end
     assert int(length[3]) == 7
+
+
+@pytest.mark.parametrize("case", ["accepted", "stale", "partial_pages", "padding"])
+def test_a_commit_leaves_its_verdict_scratch_zero(case):
+    """Only layers that do not accept a row store a verdict, and the publish
+    launch clears the rows it read: whatever the round held -- every layer
+    accepting, a stale layer, a row one group never carries, padding rows no
+    layer carries -- the next commit starts from zeros."""
+    # actual keeps every layer's tensors the descriptors point at alive.
+    args, keepalive, actual, _ = _commit_case(4, stale=case == "stale")
+    if case == "partial_pages":
+        args["read_indices"][0, 1] = -1
+        args["write_indices"][0, 1] = -1
+    if case == "padding":
+        args["read_indices"][:, 2] = -1
+        args["write_indices"][:, 2] = -1
+    _resolve_commit()(**args)
+    assert not args["commit_verdicts"].any()
+
+
+def test_a_row_rejected_in_one_round_commits_in_the_next():
+    """A layer's rejection holds for its round only: once the stamps match
+    again, the same row commits and its count advances."""
+    args, keepalive, actual, _ = _commit_case(4, stale=True)
+    length = actual[1]
+    commit = _resolve_commit()
+    commit(**args)
+    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
+    assert int(length[3]) == 7
+    args["record_stamps"][1, 0, 11 % 7, 1] = 8
+    args["request_ends"].zero_()
+    commit(**args)
+    assert args["request_ends"].tolist() == [0, 0, 0, 0]
+    assert int(length[3]) == 2 + 3
 
 
 def test_a_slot_the_prepare_flagged_reports_an_inconsistent_state():
