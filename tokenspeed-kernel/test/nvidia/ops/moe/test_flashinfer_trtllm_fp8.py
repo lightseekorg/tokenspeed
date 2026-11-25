@@ -376,9 +376,12 @@ def test_apply_quantizes_into_the_kernel_scale_layout(tokens: int) -> None:
     _reason is not None or not current_platform().is_blackwell,
     reason=str(_reason or "the TRT-LLM FP8 block-scale MoE runs on Blackwell"),
 )
+@pytest.mark.parametrize("do_finalize", [True, False])
 @pytest.mark.parametrize("tokens", [1, 16, 257])
 @pytest.mark.parametrize("routing", ["renormalize", "deepseek_v3"])
-def test_apply_routes_bf16_logits_as_given(routing: str, tokens: int) -> None:
+def test_apply_routes_bf16_logits_as_given(
+    routing: str, tokens: int, do_finalize: bool
+) -> None:
     from flashinfer.fused_moe import RoutingMethodType
     from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_fp8_moe_apply,
@@ -415,9 +418,9 @@ def test_apply_routes_bf16_logits_as_given(routing: str, tokens: int) -> None:
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
     logits = torch.randn(tokens, experts, device="cuda").to(torch.bfloat16)
 
-    def apply(router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(router_logits: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         return flashinfer_trtllm_fp8_moe_apply(
-            {}, x, weights, router_logits=router_logits
+            {}, x, weights, router_logits=router_logits, do_finalize=do_finalize
         )
 
     output = apply(logits)
@@ -429,5 +432,18 @@ def test_apply_routes_bf16_logits_as_given(routing: str, tokens: int) -> None:
     # The kernel reads BF16 logits as given; no PyTorch kernel converts them.
     names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
     assert not [n for n in names if "at::native" in n]
-    # BF16 logits route exactly as their FP32 values do.
-    assert torch.equal(output, apply(logits.float()))
+    expected = apply(logits.float())
+    if do_finalize:
+        # BF16 logits route exactly as their FP32 values do.
+        assert torch.equal(output, expected)
+    else:
+        # Compare each route's gemm2 row; the permuted buffer's padding and order vary per run.
+        (rows, route_weights), (want_rows, want_weights) = [
+            (gemm2_out[expanded_idx.long().view(-1)], expert_weights)
+            for gemm2_out, expert_weights, expanded_idx in (output, expected)
+        ]
+        # Deferred finalize hands back BF16 route weights for either logits dtype.
+        assert route_weights.dtype == want_weights.dtype == torch.bfloat16
+        assert route_weights.shape == want_weights.shape == (tokens, top_k)
+        assert torch.equal(route_weights, want_weights)
+        assert torch.equal(rows, want_rows)
