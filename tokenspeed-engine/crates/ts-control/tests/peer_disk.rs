@@ -42,7 +42,7 @@ use ts_control::{
         landing::Timeouts,
         push::{PageWriter, PushEndpoint, PushSource},
         read::Arena,
-        Peer, PeerListener, PeerSettings,
+        Peer, PeerListener, PeerProgress, PeerSettings,
     },
 };
 use ts_disk::{Backend, ExecutorConfig, Memory};
@@ -219,10 +219,6 @@ impl Drop for ScratchFile {
 
 fn settings(name: &str) -> PeerSettings {
     PeerSettings {
-        autonomous_host: false,
-        device_admission: None,
-        grant_first: false,
-        checkpoint_pin: false,
         name: name.to_owned(),
         incarnation: 1,
         deployment_id: "deployment".into(),
@@ -305,6 +301,7 @@ impl Replica {
         let base = if holder { 1 << 30 } else { READER_BASE };
         let peer = Peer::start(
             settings(&name),
+            PeerProgress::Coordinated,
             0,
             vec![geometry(base, push.name())],
             Some(listener),
@@ -410,7 +407,6 @@ impl Replica {
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
                 peer_holder: holder.to_owned(),
-                peer_expected_tokens: 0,
                 tokens,
                 max_new_tokens: 1,
                 max_cached_prefix_tokens: i32::MAX,

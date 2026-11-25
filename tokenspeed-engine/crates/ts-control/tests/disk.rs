@@ -300,7 +300,6 @@ impl Replica {
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
                 peer_holder: String::new(),
-                peer_expected_tokens: 0,
                 tokens,
                 max_new_tokens: 1,
                 max_cached_prefix_tokens: i32::MAX,

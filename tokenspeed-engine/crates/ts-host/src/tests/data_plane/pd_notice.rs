@@ -138,7 +138,6 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
                 peer_holder: String::new(),
-                peer_expected_tokens: 0,
                 request_id: rid.to_owned(),
                 tokens: (0..tokens).map(|t| 1000 * room as i32 + t).collect(),
                 max_new_tokens: 4,

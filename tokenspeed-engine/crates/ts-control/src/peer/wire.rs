@@ -503,7 +503,6 @@ pub(crate) fn read_change(reader: &mut Reader<'_>) -> Option<PeerEventView> {
         dispatch_us: 0,
         writable_us: 0,
         terminal_us: 0,
-        grant_source: 0,
         checkpoint: Vec::new(),
         request_id: String::new(),
     })
@@ -524,7 +523,6 @@ impl Prompt {
             dispatch_us: 0,
             writable_us: 0,
             terminal_us: 0,
-            grant_source: 0,
             checkpoint: Vec::new(),
             request_id: String::new(),
         }

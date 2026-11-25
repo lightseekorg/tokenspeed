@@ -177,11 +177,9 @@ void Scheduler::recordPeerDispatch(Request& request) {
 
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     Request* request = findRequest(event.request_id);
-    if (auto attempt = device_attempts_.extract(event.request_id);
-        !attempt.empty() && (!grant_first_peer_ || event.grant_source != 0)) {
+    if (auto attempt = device_attempts_.extract(event.request_id); !attempt.empty()) {
         const auto& a = attempt.mapped();
-        const auto sample_path = a.path + (event.grant_source & 3);
-        auto& cost = device_landing_cost_[sample_path];
+        auto& cost = device_landing_cost_[a.path];
         const bool ok = event.num_tokens == a.end_tokens;
         if (event.dispatch_us > 0 && event.dispatch_us <= event.writable_us && event.writable_us <= event.terminal_us &&
             event.terminal_us <= peer_now_us_) {
@@ -197,7 +195,7 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
             }
             cost.failure_us += 0.125 * ((ok ? 0.0 : protocol_us) - cost.failure_us);
             spdlog::info("[PeerFeedback] rid={} path={} ok={} fence_us={} protocol_us={} consume_us={} scale={:.4f}",
-                         event.request_id, sample_path, ok, event.writable_us - event.dispatch_us, protocol_us,
+                         event.request_id, a.path, ok, event.writable_us - event.dispatch_us, protocol_us,
                          peer_now_us_ - event.terminal_us, cost.scale);
         }
         cost.success_rate += 0.125 * ((ok ? 1.0 : 0.0) - cost.success_rate);
@@ -308,11 +306,10 @@ void Scheduler::excludeLandedPages(AdmissionResult& admission, std::span<const P
     }
 }
 
-bool Scheduler::EnableAsyncDevicePeer(bool adaptive, bool grant_first) {
+bool Scheduler::EnableAsyncDevicePeer(bool adaptive) {
     if (!peer_exports_ || peer_host_landings_) return false;
     async_device_peer_ = true;
     adaptive_device_peer_ = adaptive;
-    grant_first_peer_ = grant_first;
     return true;
 }
 
@@ -395,7 +392,7 @@ std::optional<PeerHostLandings::Started> Scheduler::reservePeerHost(Request& req
 
 void Scheduler::startPeerHostLanding(Request& request) {
     auto& admission = request.GetIf<fsm::Submitted>()->admission;
-    const fsm::PeerHit hit = *std::exchange(admission.peer_hit, std::nullopt);
+    fsm::PeerHit hit = *std::exchange(admission.peer_hit, std::nullopt);
     std::optional<TailPublication> tail;
     auto started = reservePeerHost(request, hit, tail);
     if (!started) {
@@ -456,15 +453,6 @@ void Scheduler::preparePeer(Request& request) {
         return;
     }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
-    if (grant_first_peer_) {
-        // A router hint authorizes no I/O. The normal prefill queue decides whether
-        // this request can own pages this round. A missing estimate uses local compute.
-        const auto estimate = std::min(max_tokens - local, request.PeerExpectedTokens());
-        if (estimate >= limits.min_fetch_tokens) {
-            submitted->admission.peer_hit = fsm::PeerHit{.lease = lease, .num_tokens = local + estimate};
-        }
-        return;
-    }
     peer_lookups_.push_back(PeerLookupRequest{.request_id = request.Id(),
                                               .deadline_us = Deadline(peer_now_us_, limits.lookup_timeout_us),
                                               .lease = lease,
@@ -510,7 +498,6 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         fsm::PeerHit hit = *submitted->admission.peer_hit;
         std::size_t path = 0;
         double nominal_us = 0;
-        unsigned allowed_sources = 0;
         bool probe = false;
         std::size_t batch_class = 0;
         double local_wait_us = 0.0;
@@ -518,15 +505,6 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             const auto match = matchPrefixAtAdmission(request);
             if (match.waits_for_eviction_store) continue;
             const int local = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-            if (grant_first_peer_) {
-                // Honor the same round's local token/slot budget. Never reserve from
-                // the backlog pass after the batch filled, or wait for more pages.
-                if (build.operations.size() + build.plan.peer_fetches.size() >=
-                    static_cast<size_t>(config_.max_batch_size))
-                    return;
-                const auto budget = std::max(0, build.token_budget - build.granted_peer_tokens);
-                hit.num_tokens = local + std::min(std::max(0, hit.num_tokens - local), budget);
-            }
             const int extra = std::max(0, hit.num_tokens - local);
             const auto host = [](const std::string& endpoint) {
                 return std::string_view(endpoint).substr(0, endpoint.rfind(':'));
@@ -539,6 +517,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             constexpr double margin_us = 20000.0;
             const double serialization = 1.0 + device_attempts_.size();
             nominal_us = (80000.0 + extra * (remote_node ? 30.0 : 15.0)) * serialization;
+            const auto& cost = device_landing_cost_[path];
             // When the batch is already full, A cannot compute until its
             // next turn. Only work actually placed in this plan can hide a read.
             const double scheduled_tokens = std::max(0, config_.max_scheduled_tokens - build.token_budget);
@@ -547,47 +526,29 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
                                               : 0.0;
             batch_class = build.Full(config_.max_batch_size) ? 2 : !build.operations.empty();
             local_wait_us = device_dispatch_wait_[batch_class].Estimate();
+            const double exposed = std::max(0.0, local_wait_us + nominal_us * cost.scale - wait_for_local);
+            const double peer_us = cost.success_rate * exposed + cost.failure_us;
+            const double saved_us = cost.success_rate * extra * compute_us_per_token;
             if (extra < config_.peer_config->min_fetch_tokens) continue;
-            const auto worth_reading = [&](std::size_t candidate_path) {
-                const auto& cost = device_landing_cost_[candidate_path];
-                const double wait = local_wait_us + nominal_us * cost.scale;
-                const double savings = cost.success_rate * extra * compute_us_per_token;
-                const auto worthwhile = [&](double estimate) {
-                    return savings >
-                           cost.success_rate * std::max(0.0, estimate - wait_for_local) + cost.failure_us + margin_us;
-                };
-                if (worthwhile(wait)) return true;
-                if (worthwhile(wait * 0.25) && device_attempts_.empty() &&
-                    std::hash<std::string>{}(request->Id()) % 16 == 0) {
-                    probe = true;
-                    return true;
-                }
-                return false;
-            };
-            bool take = false;
-            if (grant_first_peer_) {
-                path = remote_node ? 4 : 0;
-                for (unsigned tiers : {1u, 2u, 3u}) {
-                    if (worth_reading(path + tiers)) allowed_sources |= 1u << tiers;
-                }
-                take = allowed_sources != 0;
-            } else {
-                take = worth_reading(path);
-            }
-            if (!take) {
+            // Explore plausible near-boundary reads only on an idle reader.
+            // Stable assignment avoids repeated draws across admission retries.
+            const double optimistic_us =
+                cost.success_rate * std::max(0.0, (local_wait_us + nominal_us * cost.scale) * 0.25 - wait_for_local) +
+                cost.failure_us;
+            probe = saved_us <= peer_us + margin_us && saved_us > optimistic_us + margin_us &&
+                    device_attempts_.empty() && std::hash<std::string>{}(request->Id()) % 16 == 0;
+            if (saved_us <= peer_us + margin_us && !probe) {
                 // Let regular admission try. If it cannot commit, keep the
                 // hit for another round; no holder is pinned while waiting.
                 continue;
             }
         }
         feedback.admission_failed = false;
-        const auto remaining = grant_first_peer_ ? std::max(0, build.token_budget - build.granted_peer_tokens)
-                                                 : std::numeric_limits<std::int32_t>::max();
-        FirstChunkOutcome outcome =
-            schedulePrefillFirstChunk(build.plan, feedback, request, remaining, config_.decode_input_tokens,
-                                      kv_token_limit, /*yield_tokens=*/0, /*must_complete=*/false, hit.num_tokens);
+        FirstChunkOutcome outcome = schedulePrefillFirstChunk(
+            build.plan, feedback, request, /*remaining=*/std::numeric_limits<std::int32_t>::max(),
+            config_.decode_input_tokens, kv_token_limit, /*yield_tokens=*/0, /*must_complete=*/false, hit.num_tokens);
         if (!outcome.event) {
-            if (feedback.admission_failed && !grant_first_peer_) {
+            if (feedback.admission_failed) {
                 // It waits for room, keeping its hit; its soft pin may lapse.
                 feedback.NoteCapacityBlocked(request);
                 return;
@@ -618,20 +579,6 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
                          request->Id(), hit.num_tokens - fetch.begin_tokens, path, nominal_us, local_wait_us,
                          probe ? "probe" : "score");
             device_attempts_.emplace(request->Id(), DeviceAttempt{path, nominal_us, batch_class, hit.num_tokens});
-        }
-        if (grant_first_peer_) {
-            build.granted_peer_tokens += fetch.end_tokens - fetch.begin_tokens;
-            const auto hashes = request->PromptPrefixHashes(fetch.end_tokens / config_.prefix_granularity);
-            const auto tokens = request->TokenSlice(0, fetch.end_tokens);
-            peer_lookups_.push_back(
-                PeerLookupRequest{.request_id = request->Id(),
-                                  .deadline_us = Deadline(peer_now_us_, config_.peer_config->lookup_timeout_us),
-                                  .lease = fetch.lease,
-                                  .holder = fetch.holder,
-                                  .prefix_hashes = {hashes.begin(), hashes.end()},
-                                  .tokens = {tokens.begin(), tokens.end()},
-                                  .max_tokens = fetch.end_tokens,
-                                  .allowed_sources = allowed_sources});
         }
         if (!hit.checkpoint.empty()) {
             fetch.checkpoint = std::move(hit.checkpoint);

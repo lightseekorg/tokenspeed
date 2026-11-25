@@ -1024,13 +1024,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The forward-result feedback point: everything committed this round
         // reaches the scheduler before the next round plans.
         if !events.is_empty() {
-            if let Some(peer) = self.peer.as_mut() {
-                for event in &events {
-                    if event.kind == ForwardEventKind::Abort {
-                        peer.cancel_grant(&event.request_id);
-                    }
-                }
-            }
             // An ended request's transfer stops; its pages wait for that
             // (PdEvent::Stopped) unless it succeeds first.
             if let Some(transfer) = self.transfer.as_mut() {

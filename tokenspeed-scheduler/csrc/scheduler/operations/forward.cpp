@@ -555,8 +555,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
                                      : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
                                                                            : 0;
-    if (source == fsm::PrefillSource::kPeer && (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens ||
-                                                landing_end > kv_token_limit || landing_end - hit_tokens > remaining)) {
+    if (source == fsm::PrefillSource::kPeer &&
+        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
         return FirstChunkOutcome{};
     }
     // KV coverage beyond the state checkpoint the hit resumes from is the
@@ -2191,8 +2191,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (!resident && request->GetIf<fsm::Submitted>()->admission.peer_hit) {
                 if (!adaptive_device_peer_) continue;
                 // Respect the normal priority order before committing pages.
-                if (!grant_first_peer_)
-                    schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
+                schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
                 if (build.Scheduled(*request)) continue;
             }
             if (!prefillAllowed(*request, build)) {
@@ -2230,11 +2229,6 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 for (const WholePrompt& prompt : carried) {
                     yield_tokens += prompt.tokens;
                 }
-            }
-            if (grant_first_peer_ && !resident && yield_tokens == 0 &&
-                request->GetIf<fsm::Submitted>()->admission.peer_hit) {
-                schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
-                if (build.Scheduled(*request)) continue;
             }
             feedback.admission_failed = false;
             feedback.chunk_gave_way = false;
@@ -2378,7 +2372,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
 
     if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
     scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
-    if (adaptive_device_peer_ && !grant_first_peer_ && build.Full(config_.max_batch_size))
+    if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
         schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
 }
 
@@ -2524,7 +2518,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // scattering across rounds.
         if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
-        if (adaptive_device_peer_ && !grant_first_peer_ && build.Full(config_.max_batch_size))
+        if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
             schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
     }
 

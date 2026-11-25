@@ -18,14 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The single-member Host driver owns protocol progress while the control thread
+//! The single-member peer driver owns protocol progress while the control thread
 //! waits for device work. Only completed attempts cross back into request admission.
 use super::*;
 
 enum Command {
     Lookup(Vec<PeerLookupView>, i64),
-    DevicePlan(Vec<PeerFetchView>, Vec<PeerLookupView>, Instant, i64),
-    CancelGrant(String),
+    DevicePlan(Vec<PeerFetchView>, Instant),
     Metrics(
         Option<Arc<ts_metrics::PeerMetrics>>,
         Option<Arc<ts_metrics::PeerMetrics>>,
@@ -40,7 +39,6 @@ struct Worker {
     thread: thread::JoinHandle<()>,
     pending: usize,
     device: bool,
-    grant_first: bool,
 }
 impl Worker {
     fn send(&self, command: Command) {
@@ -78,6 +76,7 @@ impl Peer {
     /// Start the configured protocol owner.
     pub fn start(
         settings: PeerSettings,
+        progress: PeerProgress,
         member: usize,
         replica: Vec<RankGeometry>,
         listener: Option<PeerListener>,
@@ -85,28 +84,14 @@ impl Peer {
         reader: Arc<dyn PageReader>,
         pusher: Arc<dyn PagePusher>,
     ) -> Result<Self, PeerError> {
-        let device = settings.device_admission.is_some();
-        let grant_first = settings.grant_first;
-        if let Some(adaptive) = settings.device_admission {
-            if settings.autonomous_host
-                || replica.len() != 1
-                || !(if grant_first {
-                    scheduler.lock().enable_grant_first_peer()
-                } else {
-                    scheduler.lock().enable_async_device_peer(adaptive)
-                })
-            {
-                return Err(PeerError::DeviceTopology);
-            }
-        }
-        let background = settings.autonomous_host || device;
-        if settings.autonomous_host
-            && (replica.len() != 1 || !scheduler.lock().enable_async_host_peer())
-        {
-            return Err(PeerError::HostTopology);
+        let device = progress == PeerProgress::Device;
+        let background = progress != PeerProgress::Coordinated;
+        if background && replica.len() != 1 {
+            return Err(PeerError::Topology);
         }
         let protocol = Protocol::start(
             settings,
+            progress,
             member,
             replica,
             listener,
@@ -130,7 +115,6 @@ impl Peer {
                 thread,
                 pending: 0,
                 device,
-                grant_first,
             })
         } else {
             Driver::Rounds(Box::new(protocol))
@@ -195,27 +179,10 @@ impl Peer {
         match &mut self.driver {
             Driver::Rounds(p) => p.dispatch(fetches, lookups, now_us),
             Driver::Background(w) => {
-                if w.grant_first {
-                    assert_eq!(
-                        fetches.len(),
-                        lookups.len(),
-                        "one lookup per granted request"
-                    );
-                    if !fetches.is_empty() {
-                        w.pending += fetches.len();
-                        w.send(Command::DevicePlan(
-                            fetches,
-                            lookups,
-                            Instant::now(),
-                            now_us,
-                        ));
-                    }
-                    return;
-                }
                 if !fetches.is_empty() {
                     assert!(w.device, "Host reservations do not come from device plans");
                     w.pending += fetches.len();
-                    w.send(Command::DevicePlan(fetches, vec![], Instant::now(), now_us));
+                    w.send(Command::DevicePlan(fetches, Instant::now()));
                 }
                 if !lookups.is_empty() {
                     w.pending += lookups.len();
@@ -224,15 +191,6 @@ impl Peer {
             }
         }
     }
-    /// Withdraw an unstarted grant. Transfers already using the pages retire normally.
-    pub fn cancel_grant(&mut self, rid: &str) {
-        if let Driver::Background(w) = &self.driver {
-            if w.grant_first {
-                w.send(Command::CancelGrant(rid.to_owned()));
-            }
-        }
-    }
-
     /// The port of this replica member.
     pub fn port(&self) -> Option<u16> {
         self.port
@@ -300,22 +258,6 @@ impl Peer {
             metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
         }
         self.previous_totals = totals;
-    }
-}
-
-struct DeviceGrant {
-    fetch: PeerFetchView,
-    allowed: u32,
-    deadline: i64,
-    times: (i64, i64),
-}
-
-fn unused_grant(fetch: PeerFetchView) -> PeerEventView {
-    PeerEventView {
-        kind: PeerEventKind::FetchDone,
-        request_id: fetch.request_id,
-        num_tokens: fetch.begin_tokens,
-        ..empty_event()
     }
 }
 
@@ -413,7 +355,7 @@ impl Exports {
                     continue;
                 }
                 let mut answer = holder.answer(lease, PeerAnswerKind::Pin);
-                if p.settings.checkpoint_pin
+                if p.progress == PeerProgress::Device
                     && holder.matches_stamp(&stamp)
                     && cache
                         .apply_peer_export(&checkpoint, micros)
@@ -480,11 +422,7 @@ fn drive(
     let mut pending = HashMap::new();
     let mut exports = Exports::default();
     let mut reservations = VecDeque::new();
-    let mut device_plans: VecDeque<(Vec<PeerFetchView>, Vec<PeerLookupView>, Instant, i64)> =
-        VecDeque::new();
-    let mut grants: HashMap<u64, DeviceGrant> = HashMap::new();
-    let mut cancelled = HashSet::new();
-    let mut completions = Vec::new();
+    let mut device_plans = VecDeque::new();
     let mut stopping = false;
     loop {
         loop {
@@ -506,24 +444,8 @@ fn drive(
                         p.dispatch(vec![], vec![l], sent);
                     }
                 }
-                Ok(Command::DevicePlan(fetches, lookups, dispatch, tick)) => {
-                    device_plans.push_back((fetches, lookups, dispatch, tick))
-                }
-                Ok(Command::CancelGrant(rid)) => {
-                    if device_plans
-                        .iter()
-                        .any(|(fs, _, _, _)| fs.iter().any(|f| f.request_id == rid))
-                    {
-                        cancelled.insert(rid);
-                    } else if let Some(id) = grants
-                        .iter()
-                        .find(|(_, g)| g.fetch.request_id == rid)
-                        .map(|(id, _)| *id)
-                    {
-                        let g = grants.remove(&id).unwrap();
-                        p.end_lookup(&rid, "cancelled");
-                        completions.push(unused_grant(g.fetch));
-                    }
+                Ok(Command::DevicePlan(fetches, dispatch)) => {
+                    device_plans.push_back((fetches, dispatch))
                 }
                 Ok(Command::Metrics(logical, physical)) => p.set_metrics(logical, physical),
                 Ok(Command::Version(version)) => p.set_weight_version(&version),
@@ -547,39 +469,16 @@ fn drive(
             let Ok(fence) = p.fenced_plans.try_recv() else {
                 break;
             };
-            let (fetches, lookups, dispatch, tick) = device_plans.pop_front().unwrap();
+            let (fetches, dispatch) = device_plans.pop_front().unwrap();
             // The data plane can signal before the driver receives the plan.
             // The peer can start only after both sides of the handoff are ready.
-            let times = (p.settings.device_admission == Some(true)).then(|| {
+            let times = (p.progress == PeerProgress::Device).then(|| {
                 (
                     dispatch.duration_since(p.origin).as_micros() as i64,
                     fence.max(dispatch).duration_since(p.origin).as_micros() as i64,
                 )
             });
-            if lookups.is_empty() {
-                p.start_landings(fetches, p.origin.elapsed().as_micros() as i64, false, times);
-                continue;
-            }
-            for (fetch, mut lookup) in fetches.into_iter().zip(lookups) {
-                assert_eq!(fetch.lease, lookup.lease);
-                if cancelled.remove(&fetch.request_id) {
-                    completions.push(unused_grant(fetch));
-                    continue;
-                }
-                let sent = p.origin.elapsed().as_micros() as i64;
-                lookup.deadline_us =
-                    sent.saturating_add(lookup.deadline_us.saturating_sub(tick).max(0));
-                grants.insert(
-                    lookup.lease.id,
-                    DeviceGrant {
-                        fetch,
-                        allowed: lookup.allowed_sources,
-                        deadline: lookup.deadline_us,
-                        times: times.expect("adaptive device fence"),
-                    },
-                );
-                p.dispatch(vec![], vec![lookup], sent);
-            }
+            p.start_landings(fetches, p.origin.elapsed().as_micros() as i64, false, times);
         }
         let holder_work = exports.advance(&p, &scheduler);
         // Take the clock and queue under the same lock used to stamp arrivals.
@@ -591,7 +490,6 @@ fn drive(
             )
         };
         let mut out = PeerRound::default();
-        out.events.append(&mut completions);
         let mut report = Report {
             now_us: now,
             outcomes: std::mem::take(&mut p.unplaced),
@@ -601,50 +499,6 @@ fn drive(
         for (at, reply) in inbox {
             if let Reply::Answer { stamp, answer } = &reply {
                 if answer.kind == PeerAnswerKind::Lookup {
-                    if let Some(grant) = grants.get(&answer.lease.id) {
-                        if stamp.name != grant.fetch.holder || answer.lease != grant.fetch.lease {
-                            continue;
-                        }
-                        let grant = grants.remove(&answer.lease.id).unwrap();
-                        let arrival = at.duration_since(p.origin).as_micros() as i64;
-                        let rid = grant.fetch.request_id.clone();
-                        let tiers = answer.pages.iter().fold(0u32, |mask, page| {
-                            mask | if page.tier == PeerTier::Device { 1 } else { 2 }
-                        });
-                        let outcome = if arrival >= grant.deadline {
-                            "timeout"
-                        } else if stamp.identity != p.identity || answer.num_tokens == 0 {
-                            "miss"
-                        } else if answer.num_tokens != grant.fetch.end_tokens {
-                            "boundary"
-                        } else if grant.allowed & (1 << tiers) == 0 {
-                            "cost"
-                        } else {
-                            "ok"
-                        };
-                        if outcome == "timeout" {
-                            p.end_lookup(&rid, "timeout");
-                        } else {
-                            // The protocol owns the answer. No request FSM transition or scheduler lock here.
-                            p.take_reply(&reply, arrival, &mut Vec::new(), &mut Vec::new());
-                        }
-                        if let Some(metrics) = &p.metrics {
-                            metrics.stage(
-                                "grant_lookup",
-                                outcome,
-                                (arrival - grant.times.1).max(0) as f64 / 1e6,
-                            );
-                        }
-                        if outcome == "ok" {
-                            p.decisions.push((rid.clone(), "landing"));
-                            p.start_landings(vec![grant.fetch], now, false, Some(grant.times));
-                            p.landings.get_mut(&rid).unwrap().grant_source = tiers;
-                        } else {
-                            p.decisions.push((rid, outcome));
-                            out.events.push(unused_grant(grant.fetch));
-                        }
-                        continue;
-                    }
                     let Some(attempt) = pending.get(&answer.lease.id) else {
                         continue;
                     };
@@ -660,7 +514,7 @@ fn drive(
                     p.take_reply(&reply, now, &mut events, &mut Vec::new());
                     let hit = events.pop().expect("lookup answer");
                     if hit.num_tokens > 0 {
-                        if p.settings.autonomous_host {
+                        if p.progress == PeerProgress::Host {
                             reservations.push_back((attempt, hit.num_tokens, at));
                         }
                         out.events.push(hit);
@@ -725,25 +579,6 @@ fn drive(
                 p.start_landings(fetches, p.origin.elapsed().as_micros() as i64, false, None);
             }
         }
-        let expired: Vec<_> = grants
-            .iter()
-            .filter(|(_, g)| now >= g.deadline)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            let grant = grants.remove(&id).unwrap();
-            p.end_lookup(&grant.fetch.request_id, "timeout");
-            p.decisions
-                .push((grant.fetch.request_id.clone(), "lookup_timeout"));
-            if let Some(metrics) = &p.metrics {
-                metrics.stage(
-                    "grant_lookup",
-                    "timeout",
-                    (now - grant.times.1) as f64 / 1e6,
-                );
-            }
-            out.events.push(unused_grant(grant.fetch));
-        }
         pending.retain(|_, l| {
             if now < l.deadline {
                 true
@@ -766,7 +601,6 @@ fn drive(
         if !holder_work
             && device_plans.is_empty()
             && reservations.is_empty()
-            && grants.is_empty()
             && pending.is_empty()
             && p.landings.is_empty()
         {

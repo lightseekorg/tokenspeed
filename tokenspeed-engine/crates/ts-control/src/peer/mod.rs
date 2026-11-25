@@ -85,30 +85,43 @@ pub struct PeerSettings {
     pub deployment_id: String,
     /// The weight version the namespace starts at.
     pub weight_version: String,
-    /// Independently progress single-member Host transfers.
-    pub autonomous_host: bool,
-    /// Single-member Device landings. Some(false) keeps eager admission for comparison.
-    pub device_admission: Option<bool>,
-    /// Device pages are owned before the authoritative lookup.
-    pub grant_first: bool,
-    /// Reacquire the original checkpoint after a soft lease expires.
-    pub checkpoint_pin: bool,
     /// The waits a landing allows itself.
     pub timeouts: Timeouts,
     /// How long a holder keeps a lease's record past its last request.
     pub record_lifetime: Duration,
 }
 
+/// The owner of protocol progress for this replica's destination tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerProgress {
+    /// All shards advance the same landing in their shared scheduling round.
+    Coordinated,
+    /// A single member reserves Host destinations on its protocol worker.
+    Host,
+    /// A single member receives writable Device grants from its scheduler.
+    Device,
+}
+
+impl PeerProgress {
+    /// Configure the scheduler and select the matching protocol owner before startup.
+    pub fn for_replica(members: usize, scheduler: &mut Scheduler) -> Result<Self, PeerError> {
+        match members {
+            0 => Err(PeerError::Report),
+            1 if scheduler.enable_async_host_peer() => Ok(Self::Host),
+            1 if scheduler.enable_async_device_peer(true) => Ok(Self::Device),
+            1 => Err(PeerError::Topology),
+            _ => Ok(Self::Coordinated),
+        }
+    }
+}
+
 impl PeerSettings {
-    /// The namespace: only a holder of the same identity is read.
-    fn identity(&self) -> String {
+    fn identity(&self, progress: PeerProgress) -> String {
         let ns = namespace(&self.deployment_id, &self.weight_version);
-        if self.device_admission.is_some() {
-            format!("async-device-v1:{ns}")
-        } else if self.autonomous_host {
-            format!("async-host-v1:{ns}")
-        } else {
-            ns
+        match progress {
+            PeerProgress::Host => format!("async-host-v1:{ns}"),
+            PeerProgress::Device => format!("async-device-v2:{ns}"),
+            PeerProgress::Coordinated => ns,
         }
     }
 }
@@ -132,12 +145,9 @@ pub enum PeerError {
     /// The local replica leaders could not exchange endpoints.
     #[error("peer node listener setup: {0}")]
     Mesh(#[from] ts_collective::Error),
-    /// Autonomous transfers need a single replica member and Host destinations.
-    #[error("autonomous Host peer requires a single-member replica with Host landings")]
-    HostTopology,
-    /// Incompatible Device landing or replica configuration.
-    #[error("independent Device peer needs single-member Device landings without Host mode")]
-    DeviceTopology,
+    /// The configured peer driver cannot serve this replica.
+    #[error("incompatible peer landing tier or replica size")]
+    Topology,
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -381,6 +391,7 @@ impl PeerFence {
 
 /// One member's peer sharing.
 struct Protocol {
+    progress: PeerProgress,
     settings: PeerSettings,
     /// The namespace this member reads and serves under; a weight update
     /// moves it.
@@ -421,6 +432,7 @@ impl Protocol {
     /// through `pusher` (its rank's push endpoint).
     pub fn start(
         settings: PeerSettings,
+        progress: PeerProgress,
         member: usize,
         replica: Vec<RankGeometry>,
         listener: Option<PeerListener>,
@@ -436,11 +448,14 @@ impl Protocol {
         let (fence, fenced_plans) = mpsc::channel();
         let origin = Instant::now();
         let endpoint = listener
-            .map(|listener| start_endpoint(&settings, replica, listener, scheduler, origin))
+            .map(|listener| {
+                start_endpoint(&settings, progress, replica, listener, scheduler, origin)
+            })
             .transpose()?;
         Ok(Self {
-            identity: settings.identity(),
+            identity: settings.identity(progress),
             settings,
+            progress,
             member,
             members,
             geometry,
@@ -547,9 +562,7 @@ impl Protocol {
             }
         }
         for (request, landing) in &mut self.landings {
-            if (self.settings.autonomous_host || self.settings.device_admission.is_some())
-                && landing.unanswered_pin(now_us)
-            {
+            if self.progress != PeerProgress::Coordinated && landing.unanswered_pin(now_us) {
                 actions.push((request.clone(), Action::SendRelease { demote: false }));
             }
             landing.tick(now_us);
@@ -586,7 +599,6 @@ impl Protocol {
                 terminal_us: landing
                     .device_times
                     .map_or(0, |_| landing.phase_started_us()),
-                grant_source: landing.grant_source,
                 request_id: request,
                 num_tokens,
                 ..empty_event()
@@ -661,7 +673,7 @@ impl Protocol {
             if !wait_for_plan {
                 // The independent Device driver calls here only after the plan fence.
                 debug_assert!(
-                    self.settings.device_admission.is_some()
+                    self.progress == PeerProgress::Device
                         || fetch.destinations.iter().all(|d| d.tier == PeerTier::Host)
                 );
                 self.fenced.insert(fetch.request_id.clone());
@@ -700,7 +712,7 @@ impl Protocol {
     /// fetched again, so none of the old namespace is read.
     pub fn set_weight_version(&mut self, weight_version: &str) {
         self.settings.weight_version = weight_version.to_owned();
-        self.identity = self.settings.identity();
+        self.identity = self.settings.identity(self.progress);
         self.layouts.clear();
         self.asked.clear();
         if let Some(endpoint) = &self.endpoint {
@@ -762,7 +774,7 @@ impl Protocol {
                         }
                         events.push(PeerEventView {
                             kind: PeerEventKind::LookupAnswered,
-                            checkpoint: if self.settings.checkpoint_pin
+                            checkpoint: if self.progress == PeerProgress::Device
                                 && stamp.identity == self.identity
                                 && answer.num_tokens > 0
                             {
@@ -770,7 +782,7 @@ impl Protocol {
                             } else {
                                 Vec::new()
                             },
-                            pages: if self.settings.device_admission == Some(true) {
+                            pages: if self.progress == PeerProgress::Device {
                                 answer.pages.clone()
                             } else {
                                 Vec::new()
@@ -798,7 +810,7 @@ impl Protocol {
                                 num_tokens = answer.num_tokens,
                                 "peer pin answered"
                             );
-                            let same_checkpoint = !self.settings.checkpoint_pin
+                            let same_checkpoint = self.progress != PeerProgress::Device
                                 || matches!(
                                 Reply::decode(&landing.fetch().checkpoint),
                                 Ok(Reply::Answer { stamp: original, answer: expected })
@@ -865,7 +877,7 @@ impl Protocol {
                         reply_to: self.settings.name.clone(),
                     }
                 }
-                Action::SendPin if self.settings.checkpoint_pin => {
+                Action::SendPin if self.progress == PeerProgress::Device => {
                     let fetch = landing.fetch();
                     let Ok(Reply::Answer { stamp, answer }) = Reply::decode(&fetch.checkpoint)
                     else {
@@ -901,7 +913,7 @@ impl Protocol {
                 }
                 // The landing's wait ends at its deadline.
                 tracing::warn!(holder, %error, "peer request not sent");
-            } else if self.settings.autonomous_host || self.settings.device_admission.is_some() {
+            } else if self.progress != PeerProgress::Coordinated {
                 self.landings
                     .get_mut(&request)
                     .unwrap()
@@ -1004,6 +1016,7 @@ impl Protocol {
 
 fn start_endpoint(
     settings: &PeerSettings,
+    progress: PeerProgress,
     replica: Vec<RankGeometry>,
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
@@ -1014,14 +1027,14 @@ fn start_endpoint(
         Stamp {
             name: settings.name.clone(),
             incarnation: settings.incarnation,
-            identity: settings.identity(),
+            identity: settings.identity(progress),
         },
         replica,
         settings.record_lifetime,
     )));
     let replies = Arc::new(Mutex::new(VecDeque::new()));
     let driver = Arc::new(std::sync::OnceLock::<thread::Thread>::new());
-    let autonomous = settings.autonomous_host || settings.device_admission.is_some();
+    let autonomous = progress != PeerProgress::Coordinated;
     let requests = Arc::new(Mutex::new(VecDeque::new()));
     let control = Arc::new(Mutex::new(VecDeque::new()));
     let servicer = {

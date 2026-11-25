@@ -308,35 +308,6 @@ TEST_P(PeerSchedulerTest, LookupBoundCanExcludeAPublishedTailCheckpoint) {
     EXPECT_LT(bounded, wide);
 }
 
-TEST(DevicePeerGrant, OnlyTheAdmittedRequestGetsPagesAndALookup) {
-    auto cfg = PeerConfigFor("127.0.0.1:1000");
-    cfg.max_batch_size = 1;
-    cfg.max_resident_requests = 1;
-    cfg.max_scheduled_tokens = 2048;
-    cfg.device_allocator.total_pages = 4096;
-    cfg.cache_groups.front().total_pages = 4096;
-    Scheduler reader{cfg};
-    ASSERT_TRUE(reader.EnableAsyncDevicePeer(true, true));
-    const auto tokens = MakeAlignedTokens(4096 / kP + 1, kP);
-    reader.SubmitRequests(
-        {RequestSpec{
-             .request_id = "front", .peer_holder = "127.0.0.1:1001", .peer_expected_tokens = 4096, .tokens = tokens},
-         RequestSpec{
-             .request_id = "back", .peer_holder = "127.0.0.1:1001", .peer_expected_tokens = 4096, .tokens = tokens}});
-    reader.NextExecutionPlan({.allow_prefill = false, .apply_prefill_watermark = false});
-    ASSERT_TRUE(reader.TakePeerLookups().empty());
-    const auto granted = Plan(reader);
-    const auto lookups = reader.TakePeerLookups();
-    ASSERT_EQ(granted.peer_fetches.size(), 1u);
-    ASSERT_EQ(lookups.size(), 1u);
-    EXPECT_EQ(granted.peer_fetches.front().request_id, lookups.front().request_id);
-    EXPECT_EQ(lookups.front().request_id, "front");
-    EXPECT_EQ(lookups.front().max_tokens, 2048);
-    EXPECT_FALSE(granted.peer_fetches.front().destinations.empty());
-    EXPECT_TRUE(Plan(reader).peer_fetches.empty());
-    EXPECT_TRUE(reader.TakePeerLookups().empty());
-}
-
 TEST(DevicePeerChoice, TimelyLongHitAfterFourSecondRoundUsesReaderDevicePages) {
     auto cfg = PeerConfigFor("reader");
     cfg.device_allocator.total_pages = 4096;

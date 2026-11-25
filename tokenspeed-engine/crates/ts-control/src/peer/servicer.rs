@@ -248,7 +248,6 @@ pub fn empty_event() -> PeerEventView {
         dispatch_us: 0,
         writable_us: 0,
         terminal_us: 0,
-        grant_source: 0,
         checkpoint: Vec::new(),
         request_id: String::new(),
     }

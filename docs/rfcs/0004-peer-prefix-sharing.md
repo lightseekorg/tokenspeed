@@ -456,13 +456,17 @@ Scheduler gauges track leases, hard-pinned blocks and requests looking or landin
 A reader process that dies before terminal observation cannot report a completed
 sample; frontend failures and holder expiry remain independently observable.
 
-### Experimental independent Host transfers
+### Protocol progress by replica topology
 
-Set `TOKENSPEED_ASYNC_HOST_PEER=1` on both endpoints to give a single-member
-replica with Host landings a peer progress thread. The default is the
-round-driven protocol. The two modes have distinct cache namespaces. A
-multi-member replica requires coordinated page grants and retirement across
-its shards and cannot enable this switch.
+When peer prefix sharing is enabled, the runtime selects the protocol owner
+from the number of members in the replica and the scheduler's configured
+landing tier. A multi-member replica advances transfers in coordinated rounds.
+Each shard owns part of the KV and reports its fence and READ outcome before
+the replica releases the source or publishes the prefix. A single-member
+replica uses a peer worker for Host or Device landings. Multiple independent
+replicas can share a machine and still use the single-member path.
+
+### Single-member Host landings
 
 The scheduler issues a revocable Host reservation grant for the lookup and
 consumes the terminal result in a normal round. The protocol worker tries the
@@ -487,15 +491,12 @@ receive the same answer during the record lifetime. No extra thread is needed.
 
 Hard-pinned source pages remain held until an explicit release. If the remote
 peer dies or a release is permanently lost, that lease can remain charged
-against the configured lease limit until teardown. Deployment across multiple
-replica members and reclaiming abandoned hard pins after proven transport
-retirement need separate validation before enabling this mode broadly.
+against the configured lease limit until teardown. Reclaiming abandoned hard pins requires proof that the transport has retired.
 
-### Experimental independent Device transfers
+### Single-member Device landings
 
-For single-member replicas using Device landings, set
-`TOKENSPEED_DEVICE_PEER_POLICY=adaptive` on both endpoints. The holder
-revalidates the lookup and pins its sources. The scheduler grants the reader
+Device (HBM) landings use adaptive admission and checkpoint-validated PIN.
+The scheduler grants the reader
 pages in a normal admission round. The peer worker starts the PIN exchange
 only after the grant's Device fence. Its lookup deadline is measured at reply
 arrival. The normal plan consumes the completed READ and RELEASE.
@@ -520,21 +521,14 @@ admission may commit first; a request still waiting for capacity can be
 reconsidered next round. The existing block references hold committed landing
 destinations through transfer retirement and cancellation.
 
-Use `TOKENSPEED_DEVICE_PEER_POLICY=eager` for a comparison with the same
-protocol and ordinary eager Device admission. Leave it unset for the default
-round-driven Device protocol. Independent Device and independent Host modes
-have different namespaces and cannot be enabled together.
+The reader includes the original checkpoint in the PIN. If the lookup's
+soft lease has expired, the holder resolves the same checkpoint and acquires
+references in the same exchange. The reader checks the holder incarnation,
+namespace, prefix length and full source-page mapping against the lookup
+and its writable grant before issuing DMA. Eviction or a changed mapping
+falls back to local prefill without a second lookup.
 
-Use `TOKENSPEED_DEVICE_PEER_POLICY=repin` on both endpoints to keep adaptive
-admission and allow PIN after the lookup's soft lease expires. The reader
-includes the original checkpoint in the PIN. The holder resolves that
-checkpoint, acquires references, and verifies the prefix length and page
-mapping. The reader validates the reply against the lookup and its writable
-destination grant before starting DMA. Eviction or a changed mapping falls
-back to local prefill. This mode uses the original lookup timeout and adds
-no second lookup.
-
-The experimental `grant-first` policy reserves Device pages during normal
-admission and then issues lookup for the authorized boundary. It requires an
-exact boundary match. A holder publishing a different recoverable boundary
-can cause frequent local fallbacks with this policy.
+Coordinated replicas keep their existing namespace. Single-member Host
+replicas use the existing Host namespace. Single-member Device replicas use
+a new protocol namespace so an older endpoint cannot satisfy a validated
+checkpoint PIN. An incompatible lookup is treated as a miss during rollout.

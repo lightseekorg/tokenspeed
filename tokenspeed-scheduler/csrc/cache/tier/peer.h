@@ -114,9 +114,6 @@ struct PeerLookupRequest {
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
 
-    // Allowed source-tier masks for a grant issued before lookup.
-    std::uint32_t allowed_sources{0};
-
     bool operator==(const PeerLookupRequest&) const = default;
 };
 
@@ -199,7 +196,6 @@ struct PeerFetchDone {
     std::int64_t dispatch_us{0};
     std::int64_t writable_us{0};
     std::int64_t terminal_us{0};
-    std::uint32_t grant_source{0};
 };
 
 }  // namespace cache

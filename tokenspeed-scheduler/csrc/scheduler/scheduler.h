@@ -257,7 +257,7 @@ public:
     };
     PeerStats GetPeerStats() const;
     bool EnableAsyncHostPeer();
-    bool EnableAsyncDevicePeer(bool adaptive, bool grant_first = false);
+    bool EnableAsyncDevicePeer(bool adaptive);
     std::optional<PeerFetchOperation> ReservePeerHost(const PeerLeaseId& lease, std::int32_t num_tokens, bool& retry);
     bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
     void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us,
@@ -626,7 +626,6 @@ private:
     bool async_host_peer_{false};
     bool async_device_peer_{false};
     bool adaptive_device_peer_{false};
-    bool grant_first_peer_{false};
     // Feedback by source tier/locality. Arrays have fixed cardinality even as holders churn.
     struct LandingCost {
         int samples{0};
@@ -709,7 +708,6 @@ private:
     // sees this struct -- it receives build.plan and an AdmissionFeedback --
     // so batch and budget accounting stay behind pushOperation.
     struct PlanBuild {
-        std::int32_t granted_peer_tokens{0};
         PlanBuild(ExecutionPlan& output_plan, PlanOptions plan_options) : plan{output_plan}, options{plan_options} {}
 
         ExecutionPlan& plan;

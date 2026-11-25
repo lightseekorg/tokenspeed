@@ -39,7 +39,7 @@ use ts_control::{
         landing::Timeouts,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        Peer, PeerFence, PeerListener, PeerSettings,
+        Peer, PeerFence, PeerListener, PeerProgress, PeerSettings,
     },
 };
 use ts_scheduler::Scheduler;
@@ -140,25 +140,6 @@ impl Settings {
         };
         Ok(Some(Self {
             peer: PeerSettings {
-                checkpoint_pin: std::env::var("TOKENSPEED_DEVICE_PEER_POLICY").as_deref() == Ok("repin"),
-                grant_first: std::env::var("TOKENSPEED_DEVICE_PEER_POLICY").as_deref() == Ok("grant-first"),
-                device_admission: match std::env::var("TOKENSPEED_DEVICE_PEER_POLICY").as_deref() {
-                    Ok("eager") => Some(false),
-                    Ok("adaptive") | Ok("grant-first") | Ok("repin") => Some(true),
-                    Err(std::env::VarError::NotPresent) => None,
-                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                        "TOKENSPEED_DEVICE_PEER_POLICY must be eager, adaptive, grant-first or repin")),
-                },
-                autonomous_host: match std::env::var("TOKENSPEED_ASYNC_HOST_PEER") {
-                    Ok(v) if v == "1" => true,
-                    Ok(v) if v == "0" => false,
-                    Err(std::env::VarError::NotPresent) => false,
-                    _ => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "TOKENSPEED_ASYNC_HOST_PEER must be 0 or 1",
-                        ))
-                    }
-                },
                 name: settings.getattr("name")?.extract()?,
                 incarnation: settings.getattr("incarnation")?.extract()?,
                 deployment_id: settings.getattr("deployment_id")?.extract()?,
@@ -273,9 +254,13 @@ pub fn start(
             .collect::<Vec<_>>(),
         "peer geometry"
     );
+    let progress = PeerProgress::for_replica(geometries.len(), &mut scheduler.lock())
+        .map_err(|error| error.to_string())?;
     // Replicas read only holders of the same namespace; a mismatch answers
     // as a miss, so the namespace is worth seeing in the log.
     tracing::info!(
+        ?progress,
+        members = geometries.len(),
         name = settings.peer.name,
         session = engine.session_id(),
         incarnation = settings.peer.incarnation,
@@ -299,6 +284,7 @@ pub fn start(
     };
     let peer = Peer::start(
         settings.peer,
+        progress,
         replica.index(),
         geometries,
         listener,

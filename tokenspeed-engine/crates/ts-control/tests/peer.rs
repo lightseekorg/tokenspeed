@@ -38,7 +38,7 @@ use ts_control::peer::{
     push::{PagePusher, PushItem},
     read::Arena,
     wire::{Reply, Request},
-    Peer, PeerListener, PeerSettings,
+    Peer, PeerListener, PeerProgress, PeerSettings,
 };
 use ts_scheduler::{
     ForwardEvent, ForwardEventKind, PeerFetchView, PeerTier, RequestSpec, Scheduler,
@@ -189,22 +189,33 @@ impl PagePusher for NoPushes {
     }
 }
 
-fn settings(name: &str, weight_version: &str) -> PeerSettings {
-    PeerSettings {
-        autonomous_host: false,
-        device_admission: None,
-        grant_first: false,
-        checkpoint_pin: false,
-        name: name.to_owned(),
-        incarnation: 1,
-        deployment_id: "deployment".into(),
-        weight_version: weight_version.to_owned(),
-        timeouts: Timeouts {
-            answer_us: 1_000_000,
-            quarantine_us: 10_000,
-            push_us: 1_000_000,
+#[derive(Clone, Copy)]
+enum TestDriver {
+    Coordinated,
+    Automatic,
+    Eager,
+}
+
+struct FixtureSettings {
+    driver: TestDriver,
+    peer: PeerSettings,
+}
+
+fn settings(name: &str, weight_version: &str) -> FixtureSettings {
+    FixtureSettings {
+        driver: TestDriver::Coordinated,
+        peer: PeerSettings {
+            name: name.to_owned(),
+            incarnation: 1,
+            deployment_id: "deployment".into(),
+            weight_version: weight_version.to_owned(),
+            timeouts: Timeouts {
+                answer_us: 1_000_000,
+                quarantine_us: 10_000,
+                push_us: 1_000_000,
+            },
+            record_lifetime: Duration::from_secs(5),
         },
-        record_lifetime: Duration::from_secs(5),
     }
 }
 
@@ -229,7 +240,7 @@ impl Replica {
     }
 
     fn with_listener(
-        settings: PeerSettings,
+        settings: FixtureSettings,
         listener: PeerListener,
         base: u64,
         arena: &Arena,
@@ -260,7 +271,7 @@ impl Replica {
     }
 
     fn with_landing(
-        settings: PeerSettings,
+        settings: FixtureSettings,
         listener: PeerListener,
         geometry: RankGeometry,
         arena: &Arena,
@@ -278,21 +289,21 @@ impl Replica {
     }
 
     fn with_reader(
-        settings: PeerSettings,
+        settings: FixtureSettings,
         listener: PeerListener,
         geometry: RankGeometry,
         reader: Arc<dyn PageReader>,
         role: &str,
         landing: Landing,
     ) -> Self {
-        let pages = if settings.grant_first { 512 } else { PAGES };
+        let pages = PAGES;
         Self::with_reader_pages(
             settings, listener, geometry, reader, role, landing, pages, 1_000_000,
         )
     }
 
     fn with_reader_pages(
-        settings: PeerSettings,
+        settings: FixtureSettings,
         listener: PeerListener,
         geometry: RankGeometry,
         reader: Arc<dyn PageReader>,
@@ -302,17 +313,30 @@ impl Replica {
         soft_pin_us: i64,
     ) -> Self {
         let scheduler = Arc::new(Mutex::new(scheduler(
-            &settings.name,
+            &settings.peer.name,
             1,
             role,
             landing,
-            settings.timeouts.answer_us,
+            settings.peer.timeouts.answer_us,
             pages,
             soft_pin_us,
         )));
-        let name = settings.name.clone();
+        let name = settings.peer.name.clone();
+        let progress = match settings.driver {
+            TestDriver::Coordinated => PeerProgress::Coordinated,
+            TestDriver::Automatic | TestDriver::Eager => {
+                let mut scheduler = scheduler.lock();
+                let mode = PeerProgress::for_replica(1, &mut scheduler).unwrap();
+                if matches!(settings.driver, TestDriver::Eager) {
+                    assert_eq!(mode, PeerProgress::Device);
+                    assert!(scheduler.enable_async_device_peer(false));
+                }
+                mode
+            }
+        };
         let peer = Peer::start(
-            settings,
+            settings.peer,
+            progress,
             0,
             vec![geometry],
             Some(listener),
@@ -412,7 +436,6 @@ fn spec(request_id: &str, tokens: Vec<i32>, holder: &str) -> RequestSpec {
         cache_group_id: String::new(),
         shared_prefix_tokens: Vec::new(),
         peer_holder: holder.to_owned(),
-        peer_expected_tokens: 0,
         tokens,
         max_new_tokens: 4,
         max_cached_prefix_tokens: i32::MAX,
@@ -615,8 +638,12 @@ fn independent_device_choice(adaptive: bool) {
     let replica = |base| {
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
-        cfg.device_admission = Some(adaptive);
-        cfg.timeouts.answer_us = 50_000;
+        cfg.driver = if adaptive {
+            TestDriver::Automatic
+        } else {
+            TestDriver::Eager
+        };
+        cfg.peer.timeouts.answer_us = 50_000;
         Replica::with_listener(cfg, listener, base, &arena, "Fused")
     };
     let mut holder = replica(HOLDER_BASE);
@@ -1032,8 +1059,12 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
     let address = |port| format!("127.0.0.1:{port}");
     let config = |name: &str| {
         let mut cfg = settings(name, "v1");
-        cfg.autonomous_host = autonomous;
-        cfg.timeouts.answer_us = 50_000;
+        cfg.driver = if autonomous {
+            TestDriver::Automatic
+        } else {
+            TestDriver::Coordinated
+        };
+        cfg.peer.timeouts.answer_us = 50_000;
         cfg
     };
     let listener = bound();
@@ -1297,7 +1328,7 @@ fn an_aborted_host_read_keeps_its_pages_until_retirement_without_publishing() {
     let start = |base, host, reader: Arc<dyn PageReader>| {
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let mut config = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
-        config.autonomous_host = true;
+        config.driver = TestDriver::Automatic;
         Replica::with_reader(
             config,
             listener,
@@ -1350,214 +1381,15 @@ fn an_aborted_host_read_keeps_its_pages_until_retirement_without_publishing() {
     assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
 }
 
-fn grant_replica(base: u64, memory: Arc<dyn PageReader>) -> Replica {
-    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
-    let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
-    cfg.device_admission = Some(true);
-    cfg.grant_first = true;
-    cfg.timeouts.answer_us = 150_000;
-    Replica::with_reader(
-        cfg,
-        listener,
-        geometry(base),
-        memory,
-        "Fused",
-        Landing::Device,
-    )
-}
-
-// Stop before the data-plane fence. Ownership of the ordinary HBM pages is
-// committed; no handler at the holder should yet know about this request.
-fn grant_without_fence(
-    reader: &mut Replica,
-    holder: &Replica,
-    id: &str,
-    prefix: &[i32],
-) -> PeerFetchView {
-    let mut tokens = prefix.to_vec();
-    tokens.extend(50000..50000 + PAGE);
-    let mut request = spec(id, tokens, &holder.name);
-    request.peer_expected_tokens = prefix.len() as i32;
-    let mut scheduler = reader.scheduler.lock();
-    scheduler.submit_requests(&[request]).unwrap();
-    let plan = scheduler.next_execution_plan(true, false);
-    let fetches = plan.peer_fetches();
-    let lookups = scheduler.take_peer_lookups();
-    assert_eq!(fetches.len(), 1);
-    assert_eq!(lookups.len(), 1);
-    assert!(plan
-        .forward_batches()
-        .iter()
-        .all(|batch| !batch.request_ids.iter().any(|rid| rid == id)));
-    let fetch = fetches[0].clone();
-    assert_eq!(fetch.end_tokens, prefix.len() as i32);
-    drop(scheduler);
-    reader.peer.dispatch(fetches, lookups, 0);
-    fetch
-}
-
-#[test]
-fn reciprocal_device_grants_complete_without_another_scheduler_round() {
-    let arena = Arena::new(200_000);
-    let mut a = grant_replica(HOLDER_BASE, Arc::new(arena.clone()));
-    let mut b = grant_replica(READER_BASE, Arc::new(arena.clone()));
-    let left: Vec<i32> = (1..=2048).collect();
-    let right: Vec<i32> = (9001..=11048).collect();
-    holder_computes(&mut a, &left, &arena);
-    holder_computes(&mut b, &right, &arena);
-    for i in 1..512 {
-        arena.write(HOLDER_BASE + i * PAGE_BYTES, &[17; PAGE_BYTES as usize]);
-        arena.write(READER_BASE + i * PAGE_BYTES, &[29; PAGE_BYTES as usize]);
-    }
-    let af = grant_without_fence(&mut a, &b, "a", &right);
-    let bf = grant_without_fence(&mut b, &a, "b", &left);
-    std::thread::sleep(Duration::from_millis(210));
-    assert_eq!(a.scheduler.lock().peer_stats().leases, 0);
-    assert_eq!(b.scheduler.lock().peer_stats().leases, 0);
-    a.peer.fence().ready();
-    b.peer.fence().ready();
-    // Neither scheduler takes a round during the simulated long forward.
-    std::thread::sleep(Duration::from_secs(4));
-    for (replica, fetch, base, byte) in
-        [(&mut a, af, HOLDER_BASE, 29), (&mut b, bf, READER_BASE, 17)]
-    {
-        let addr = base + fetch.destinations[0].block_id as u64 * PAGE_BYTES;
-        assert_eq!(arena.read_bytes(addr, 1), vec![byte]);
-        assert_eq!(replica.scheduler.lock().peer_stats().pinned_blocks, 0);
-        assert_eq!(replica.round().0, vec![(fetch.request_id, 2048)]);
-    }
-}
-
-#[test]
-fn device_grant_abort_retires_only_after_its_fence_or_dma() {
-    struct GatedRead(Arena, mpsc::Sender<()>, Mutex<mpsc::Receiver<()>>);
-    impl PageReader for GatedRead {
-        fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
-            self.1.send(()).unwrap();
-            self.2.lock().recv_timeout(Duration::from_secs(4)).unwrap();
-            self.0.read(session, spans)
-        }
-    }
-    for before_fence in [true, false] {
-        let arena = Arena::new(200_000);
-        let (posted, reading) = mpsc::channel();
-        let (resume, gate) = mpsc::channel();
-        let mut holder = grant_replica(HOLDER_BASE, Arc::new(arena.clone()));
-        let mut reader = grant_replica(
-            READER_BASE,
-            Arc::new(GatedRead(arena.clone(), posted, Mutex::new(gate))),
-        );
-        let prefix: Vec<i32> = (1..=2048).collect();
-        holder_computes(&mut holder, &prefix, &arena);
-        grant_without_fence(&mut reader, &holder, "abort", &prefix);
-        if !before_fence {
-            reader.peer.fence().ready();
-            reading
-                .recv_timeout(Duration::from_secs(2))
-                .expect("DMA posted");
-        }
-        reader.advance(&[event(ForwardEventKind::Abort, "abort", vec![])]);
-        reader.peer.cancel_grant("abort");
-        let report = reader.peer.report();
-        assert!(reader.peer.agree(&[report]).unwrap().events.is_empty());
-        if before_fence {
-            reader.peer.fence().ready();
-        } else {
-            assert!(holder.scheduler.lock().peer_stats().pinned_blocks > 0);
-            resume.send(()).unwrap();
-        }
-        let until = Instant::now() + Duration::from_secs(3);
-        loop {
-            assert!(Instant::now() < until, "cancelled grant did not retire");
-            let report = reader.peer.report();
-            let round = reader.peer.agree(&[report]).unwrap();
-            let retired = round
-                .events
-                .iter()
-                .any(|e| e.kind == ts_scheduler::PeerEventKind::FetchDone);
-            reader
-                .scheduler
-                .lock()
-                .advance_peer(round.now_us, &round.events)
-                .unwrap();
-            if retired {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(reader.round().0.is_empty());
-        if before_fence {
-            assert!(reading.try_recv().is_err());
-        }
-        assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
-    }
-}
-
-#[test]
-fn device_grant_returns_to_local_when_holder_cannot_answer() {
-    let arena = Arena::new(200_000);
-    let holder = grant_replica(HOLDER_BASE, Arc::new(arena.clone()));
-    let mut reader = grant_replica(READER_BASE, Arc::new(arena));
-    let prefix: Vec<i32> = (1..=2048).collect();
-    grant_without_fence(&mut reader, &holder, "timeout", &prefix);
-    let holder_lock = holder.scheduler.lock();
-    reader.peer.fence().ready();
-    let until = Instant::now() + Duration::from_secs(2);
-    loop {
-        assert!(
-            Instant::now() < until,
-            "reader waited for the holder's scheduler"
-        );
-        let (rows, fetches) = reader.round();
-        assert!(fetches.is_empty(), "reissued an expired grant");
-        if !rows.is_empty() {
-            assert_eq!(rows, vec![("timeout".to_owned(), 0)]);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(reader.scheduler.lock().peer_stats().landing_requests, 0);
-    assert!(reader
-        .decisions
-        .contains(&("timeout".to_owned(), "lookup_timeout")));
-    drop(holder_lock);
-}
-
-#[test]
-fn shorter_holder_prefix_cannot_write_a_longer_device_grant() {
-    struct UnexpectedRead;
-    impl PageReader for UnexpectedRead {
-        fn read(&self, _: &str, _: &Spans) -> Result<(), String> {
-            panic!("partial prefix started a DMA into an incompatible grant");
-        }
-    }
-    let arena = Arena::new(200_000);
-    let mut holder = grant_replica(HOLDER_BASE, Arc::new(arena.clone()));
-    let mut reader = grant_replica(READER_BASE, Arc::new(UnexpectedRead));
-    let prefix: Vec<i32> = (1..=2048).collect();
-    holder_computes(&mut holder, &prefix[..1024], &arena);
-    grant_without_fence(&mut reader, &holder, "partial", &prefix);
-    reader.peer.fence().ready();
-    let (used, subsequent) = rounds_until_prefill(&mut reader, None, "partial");
-    assert_eq!(used, 0);
-    assert!(subsequent.is_empty());
-    assert!(reader
-        .decisions
-        .contains(&("partial".to_owned(), "boundary")));
-    assert_eq!(reader.scheduler.lock().peer_stats().landing_requests, 0);
-    assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
-}
-
-fn delayed_checkpoint_pin(repin: bool, evict: bool) {
+fn delayed_checkpoint_pin(evict: bool) {
     let arena = Arena::new(200_000);
     let replica = |base| {
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
-        cfg.device_admission = Some(true);
-        cfg.checkpoint_pin = repin;
-        cfg.timeouts.answer_us = 50_000;
+        cfg.driver = TestDriver::Automatic;
+        cfg.peer.timeouts.answer_us = 50_000;
         // Also expire the Rust holder's lookup metadata before the PIN.
-        cfg.record_lifetime = Duration::from_secs(if repin { 2 } else { 60 });
+        cfg.peer.record_lifetime = Duration::from_secs(2);
         Replica::with_reader_pages(
             cfg,
             listener,
@@ -1605,7 +1437,7 @@ fn delayed_checkpoint_pin(repin: bool, evict: bool) {
     );
     let fetch = &fetches[0];
     let addr = READER_BASE + fetch.destinations[0].block_id as u64 * PAGE_BYTES;
-    if repin && !evict {
+    if !evict {
         assert_eq!(prefix, 2048);
         assert_eq!(arena.read_bytes(addr, 1), vec![29]);
     } else {
@@ -1614,19 +1446,59 @@ fn delayed_checkpoint_pin(repin: bool, evict: bool) {
     }
     assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
     println!(
-        "delayed PIN repin={repin} evict={evict} forward_ms=4000 fetches={} consumed={prefix}",
+        "delayed PIN evict={evict} forward_ms=4000 fetches={} consumed={prefix}",
         fetches.len()
     );
 }
 #[test]
 fn expired_checkpoint_pin_keeps_an_unchanged_prefix() {
-    delayed_checkpoint_pin(true, false);
+    delayed_checkpoint_pin(false);
 }
 #[test]
 fn expired_checkpoint_pin_rejects_an_evicted_prefix() {
-    delayed_checkpoint_pin(true, true);
+    delayed_checkpoint_pin(true);
 }
+
 #[test]
-fn original_adaptive_loses_the_expired_pin() {
-    delayed_checkpoint_pin(false, false);
+fn topology_selects_the_protocol_owner() {
+    for (landing, expected) in [
+        (Landing::Host, PeerProgress::Host),
+        (Landing::Device, PeerProgress::Device),
+    ] {
+        let mut scheduler = scheduler("test", 1, "Fused", landing, 50_000, PAGES, 2_000_000);
+        assert_eq!(
+            PeerProgress::for_replica(2, &mut scheduler).unwrap(),
+            PeerProgress::Coordinated
+        );
+        assert_eq!(
+            PeerProgress::for_replica(1, &mut scheduler).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn a_device_reader_rejects_the_previous_device_namespace() {
+    let arena = Arena::new(200_000);
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let mut old = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
+    // The coordinated fixture advertises this literal deployment/weight stamp.
+    old.peer.deployment_id = "async-device-v1:deployment".into();
+    let mut holder = Replica::with_listener(old, listener, HOLDER_BASE, &arena, "Fused");
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let mut current = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
+    current.driver = TestDriver::Automatic;
+    let mut reader = Replica::with_listener(current, listener, READER_BASE, &arena, "Fused");
+    reader.enable_logical_metrics();
+    let mut tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    tokens.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", tokens, &holder.name)])
+        .unwrap();
+    let (prefix, fetches) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert!(reader.decisions.contains(&("r".into(), "incompatible")));
+    assert_eq!((prefix, fetches.len()), (0, 0));
 }

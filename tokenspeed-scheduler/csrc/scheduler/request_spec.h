@@ -41,7 +41,6 @@ struct RequestSpec {
     // The replica the router expects to hold this prompt's prefix
     // (PeerConfig::name there); empty for none. A hint: the holder confirms.
     std::string peer_holder;
-    std::int32_t peer_expected_tokens{0};
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
     // Upper bound on the prompt prefix the first admission's probe may claim

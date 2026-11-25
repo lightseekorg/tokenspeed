@@ -106,8 +106,6 @@ mod ffi {
         /// The replica expected to hold this prompt's prefix, empty for
         /// none (peer prefix sharing).
         peer_holder: String,
-        /// Router estimate of additional peer tokens, zero when absent.
-        peer_expected_tokens: i32,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -636,8 +634,6 @@ mod ffi {
         tokens: Vec<i32>,
         /// The bound on the prefix.
         max_tokens: i32,
-        /// Allowed source-tier masks for a pre-authorized HBM landing.
-        allowed_sources: u32,
     }
 
     /// What a holder's answer answers.
@@ -683,8 +679,9 @@ mod ffi {
         destinations: Vec<PeerPageView>,
         /// Original holder answer for an exact re-PIN after admission.
         checkpoint: Vec<u8>,
-        /// Exact checkpoint prompt, populated only on a re-PIN fetch.
+        /// Prefix hashes at the original lookup boundary.
         prefix_hashes: Vec<String>,
+        /// Prompt tokens through that boundary for exact checkpoint revalidation.
         tokens: Vec<i32>,
     }
 
@@ -730,8 +727,6 @@ mod ffi {
         writable_us: i64,
         /// RELEASE arrival on success, or protocol retirement on failure.
         terminal_us: i64,
-        /// Source tiers of an executed grant-first transfer.
-        grant_source: u32,
         /// Reader-local original lookup answer.
         checkpoint: Vec<u8>,
         /// FetchDone: the landing request.
@@ -819,11 +814,7 @@ mod ffi {
         #[rust_name = "release"]
         fn Release(self: &PeerPinRelease) -> bool;
         fn enable_async_host_peer(scheduler: Pin<&mut Scheduler>) -> bool;
-        fn enable_async_device_peer(
-            scheduler: Pin<&mut Scheduler>,
-            adaptive: bool,
-            grant_first: bool,
-        ) -> bool;
+        fn enable_async_device_peer(scheduler: Pin<&mut Scheduler>, adaptive: bool) -> bool;
         fn reserve_peer_host(
             scheduler: Pin<&mut Scheduler>,
             lease: &PeerLeaseView,
@@ -1167,16 +1158,11 @@ impl Scheduler {
         ffi::advance_peer(self.pinned(), now_us, events)
     }
 
-    /// Give a single Host replica's peer driver ownership of lookup deadlines.
+    /// Enable independent Device reads with the supplied admission behavior.
     pub fn enable_async_device_peer(&mut self, adaptive: bool) -> bool {
-        ffi::enable_async_device_peer(self.pinned(), adaptive, false)
+        ffi::enable_async_device_peer(self.pinned(), adaptive)
     }
-
-    /// Allocate runnable Device destinations before asking the holder.
-    pub fn enable_grant_first_peer(&mut self) -> bool {
-        ffi::enable_async_device_peer(self.pinned(), true, true)
-    }
-    /// Enable independent reservations into the host landing tier.
+    /// Enable independent reservations into the Host landing tier.
     pub fn enable_async_host_peer(&mut self) -> bool {
         ffi::enable_async_host_peer(self.pinned())
     }

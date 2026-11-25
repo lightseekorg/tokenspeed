@@ -99,7 +99,6 @@ pub struct Landing {
     metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
     /// None unless a profile records.
     timeline: Option<Timeline>,
-    pub(super) grant_source: u32,
     pub(super) device_times: Option<(i64, i64)>,
     started_us: i64,
     failure: Option<&'static str>,
@@ -140,7 +139,6 @@ impl Landing {
                         phase_ns: now_ns,
                     }
                 }),
-                grant_source: 0,
                 device_times: None,
                 started_us: now_us,
                 failure: None,

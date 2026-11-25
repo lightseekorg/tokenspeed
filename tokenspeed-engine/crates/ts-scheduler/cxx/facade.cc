@@ -146,7 +146,6 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
                 .cache_group_id = std::string(spec.cache_group_id),
                 .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
                 .peer_holder = std::string(spec.peer_holder),
-                .peer_expected_tokens = spec.peer_expected_tokens,
                 .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
                 .max_new_tokens = spec.max_new_tokens,
                 .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
@@ -288,8 +287,7 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                                                                       .num_tokens = event.num_tokens,
                                                                       .dispatch_us = event.dispatch_us,
                                                                       .writable_us = event.writable_us,
-                                                                      .terminal_us = event.terminal_us,
-                                                                      .grant_source = event.grant_source});
+                                                                      .terminal_us = event.terminal_us});
                 break;
         }
     }
@@ -322,8 +320,7 @@ rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
-                                     .max_tokens = lookup.max_tokens,
-                                     .allowed_sources = lookup.allowed_sources});
+                                     .max_tokens = lookup.max_tokens});
     }
     return out;
 }
@@ -1044,7 +1041,7 @@ std::shared_ptr<tokenspeed::PeerPinRelease> peer_release_handle(tokenspeed::Sche
 }
 
 bool enable_async_host_peer(tokenspeed::Scheduler& scheduler) { return scheduler.EnableAsyncHostPeer(); }
-bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive, bool grant_first) { return scheduler.EnableAsyncDevicePeer(adaptive, grant_first); }
+bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive) { return scheduler.EnableAsyncDevicePeer(adaptive); }
 
 rust::Vec<PeerFetchView> reserve_peer_host(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int32_t tokens, bool& retry) {
     rust::Vec<PeerFetchView> out;
