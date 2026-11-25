@@ -37,7 +37,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ts_collective::{Group, Mesh, Reduce};
@@ -1658,6 +1658,7 @@ impl TransferPeer for DecodePeer {
                     PdError::Peer(format!("{rid}'s KV landed without its first token"))
                 })?;
                 drop(state);
+                let kv_ready_at = (SystemTime::now(), Instant::now());
                 tracing::info!(
                     rid,
                     bootstrap_room = receiver.room,
@@ -1673,6 +1674,7 @@ impl TransferPeer for DecodePeer {
                     bootstrap_logprob: landed.bootstrap_logprob,
                     spec_candidate_ids: landed.spec_candidate_ids,
                     request_pool_index,
+                    kv_ready_at,
                 }));
                 ended.push(rid.clone());
             }

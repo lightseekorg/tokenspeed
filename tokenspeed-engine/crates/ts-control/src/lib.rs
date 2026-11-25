@@ -44,6 +44,7 @@ pub mod peer;
 pub mod relay;
 pub mod request;
 pub mod request_stats;
+mod rollout_perf;
 pub mod sampling;
 pub mod startup;
 pub mod trace;

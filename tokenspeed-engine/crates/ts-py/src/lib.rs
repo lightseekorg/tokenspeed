@@ -463,6 +463,15 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
             })
             .transpose()?,
     )?;
+    let rollout_perf = chunk.rollout_perf.map_or(Value::Nil, |perf| {
+        Value::Map(
+            perf.0
+                .into_iter()
+                .map(|(key, value)| (Value::Str(key), value))
+                .collect(),
+        )
+    });
+    dict.set_item("rollout_perf", value_to_py(py, rollout_perf)?)?;
     dict.set_item("prompt_tokens", chunk.prompt_tokens)?;
     dict.set_item("completion_tokens", chunk.completion_tokens)?;
     dict.set_item("cached_tokens", chunk.cached_tokens)?;

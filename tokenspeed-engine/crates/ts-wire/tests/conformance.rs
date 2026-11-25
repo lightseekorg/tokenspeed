@@ -535,6 +535,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         reasoning_tokens: vec![],
         num_resident_tokens: None,
         num_waiting_uncached_tokens: None,
+        rollout_perf: vec![],
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
@@ -840,4 +841,46 @@ fn shared_prefix_publication_nonce_rank_and_namespace_cross_python_wire() {
             cache_epoch: 7,
         }),
     );
+}
+
+#[test]
+fn output_without_rollout_perf_preserves_the_existing_load_tail() {
+    let frames = fixture("output_slim");
+    let expected: BatchTokenIDOutSlim = decode_frames(&frames).unwrap();
+    let Value::Array(mut fields) = decode_frames::<Value>(&frames).unwrap() else {
+        panic!("output messages must be arrays");
+    };
+    assert_eq!(fields.pop(), Some(Value::Array(vec![])));
+    assert_eq!(fields.last(), Some(&Value::from(3_000_000_000_i64)));
+    let legacy_frames = encode_frames(&Value::Array(fields));
+    let decoded: BatchTokenIDOutSlim = decode_frames(&legacy_frames).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(decoded.num_resident_tokens, Some(5_000_000_000));
+    assert_eq!(decoded.num_waiting_uncached_tokens, Some(3_000_000_000));
+    assert!(decoded.rollout_perf.is_empty());
+}
+
+#[test]
+fn rollout_perf_tail_roundtrips_and_rejects_ragged_columns() {
+    let mut batch: BatchTokenIDOutSlim = decode_frames(&fixture("output_slim_tail")).unwrap();
+    let perf = Dict(vec![
+        (s("wire_request_id"), Value::from("a")),
+        (s("kv_output_tokens"), Value::from(1_i64)),
+        (
+            s("events"),
+            Value::Map(vec![(Value::from("accepted"), Value::Nil)]),
+        ),
+    ]);
+    batch.rollout_perf = vec![Some(perf.clone()), None];
+    let decoded: BatchTokenIDOutSlim = decode_frames(&encode_frames(&batch)).unwrap();
+    let rows: Vec<_> = decoded.requests().unwrap().collect();
+    assert_eq!(rows[0].rollout_perf, Some(&perf));
+    assert_eq!(rows[1].rollout_perf, None);
+    batch.rollout_perf.pop();
+    assert!(batch
+        .requests()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("rollout_perf"));
 }

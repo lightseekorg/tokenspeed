@@ -66,3 +66,29 @@ execution permit, and `decode_process` / `tpot` start after it.
 - **Stage spans.** One span per request, not per round or per stage; PD
   roles each trace their own request lifetimes, as they each measure their
   own queue wait.
+
+## Response timing metadata
+
+The native output wire also returns `rollout_perf` once, on a request's terminal
+output. This is response metadata, independent of trace sampling, metrics and
+request logging; it adds no log records. Intermediate outputs omit the column.
+Older wire producers decode with no timing metadata.
+
+The output processor records acceptance at registration. For disaggregated
+decode, the transfer peer captures readiness after both KV and the bootstrap
+token have arrived and before publishing its completion event. For ordinary
+execution, readiness is the first completed prefill output. The recorded
+`kv_output_tokens` is the actual committed output count at that boundary;
+consumers must not assume one token. Retraction does not replace the first
+readiness boundary. Missing boundaries, including failed transfers, stay null.
+
+The existing processor-release completion point supplies the terminal timestamp
+and the existing `e2e_latency_s` definition: completion minus the frontend's
+`created_time`, clamped as in the native finish log. It is not acceptance-to-finish
+time. Rejected requests that never registered have no acceptance timestamp.
+
+Timestamps carry nanosecond decimal strings, a process identity, sequence and
+host identity. Monotonic values are comparable only within their process;
+wall-clock synchronization is unknown unless independently established. DP and
+attention-TP identities come from the host configuration. Metadata contains no
+prompt text, generated text, token arrays or credentials.

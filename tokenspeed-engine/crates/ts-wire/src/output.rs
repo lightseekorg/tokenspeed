@@ -102,6 +102,8 @@ wire_struct! {
         pub num_resident_tokens: Option<i64> = None,
         /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
         pub num_waiting_uncached_tokens: Option<i64> = None,
+        /// Request timing metadata only on terminal rows; absent on older producers.
+        pub rollout_perf: Vec<Option<Dict<String, Value>>> = Vec::new(),
     }
 }
 
@@ -160,6 +162,8 @@ pub struct RequestOutput<'a> {
     /// This step's tokens' top-k alternatives, when the request asked for
     /// them.
     pub output_top_logprobs: Option<TopLogprobRows<'a>>,
+    /// The terminal request boundaries, when the producer reports them.
+    pub rollout_perf: Option<&'a Dict<String, Value>>,
 }
 
 impl BatchTokenIDOutSlim {
@@ -216,6 +220,7 @@ impl BatchTokenIDOutSlim {
                 self.output_token_cumulative_probs_val.len(),
             ),
             ("reasoning_tokens", self.reasoning_tokens.len()),
+            ("rollout_perf", self.rollout_perf.len()),
         ];
         if let Some((name, found)) = optional
             .iter()
@@ -247,6 +252,7 @@ impl BatchTokenIDOutSlim {
             Some((values.get(i)?.as_slice(), ids.get(i)?.as_slice())).filter(|(v, _)| !v.is_empty())
         }
         Ok((0..len).map(move |i| RequestOutput {
+            rollout_perf: self.rollout_perf.get(i).and_then(Option::as_ref),
             rid: &rids[i],
             output_ids: &self.output_ids[i],
             finish_reason: Some(self.finished_reasons[i].as_str()).filter(|r| !r.is_empty()),

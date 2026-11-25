@@ -603,6 +603,10 @@ impl TransferPeer for FakePeer {
                             _ => PdEvent::RemotePrefillDone(RemotePrefill {
                                 rid: rid.clone(),
                                 bootstrap_token: room.sent.expect("sent with the KV"),
+                                kv_ready_at: (
+                                    std::time::SystemTime::now(),
+                                    std::time::Instant::now(),
+                                ),
                                 cached_tokens: 0,
                                 bootstrap_logprob: None,
                                 spec_candidate_ids: None,

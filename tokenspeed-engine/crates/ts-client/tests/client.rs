@@ -854,3 +854,36 @@ async fn a_scheduler_takes_no_encode_requests() {
     let error = client.encode(encode_request("item-0")).await.unwrap_err();
     assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
 }
+
+#[test]
+fn consuming_output_rows_preserves_rollout_perf_and_legacy_missing_values() {
+    use ts_wire::{BatchTokenIDOutSlim, Dict, Value};
+    let hex = include_str!("../../ts-wire/tests/fixtures/output_slim_tail.hex");
+    let frames = hex
+        .lines()
+        .map(|line| {
+            bytes::Bytes::from(
+                (0..line.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+                    .collect::<Vec<u8>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut batch: BatchTokenIDOutSlim = ts_wire::decode_frames(&frames).unwrap();
+    let legacy = OutputChunk::from_batch(batch.clone())
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert!(legacy.iter().all(|(_, chunk)| chunk.rollout_perf.is_none()));
+    let perf = Dict(vec![("wire_request_id".to_owned(), Value::from("b"))]);
+    batch.rollout_perf = vec![None, Some(perf.clone())];
+    let borrowed = batch
+        .requests()
+        .unwrap()
+        .map(|row| (row.rid.to_owned(), OutputChunk::from(&row)))
+        .collect::<Vec<_>>();
+    let consumed = OutputChunk::from_batch(batch).unwrap().collect::<Vec<_>>();
+    assert_eq!(consumed, borrowed);
+    assert_eq!(consumed[1].1.rollout_perf, Some(perf));
+    assert_eq!(consumed[0].1.rollout_perf, None);
+}

@@ -87,6 +87,8 @@ pub struct OutputChunk {
     pub input_top_logprobs: Option<PromptTopLogprobs>,
     /// This step's tokens' top-k alternatives, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Request boundaries returned once on the terminal chunk.
+    pub rollout_perf: Option<ts_wire::Dict<String, ts_wire::Value>>,
 }
 
 impl OutputChunk {
@@ -120,6 +122,7 @@ impl OutputChunk {
         Ok(rids.into_iter().enumerate().map(move |(i, rid)| {
             let reason = take(&mut batch.finished_reasons, i);
             let chunk = Self {
+                rollout_perf: take(&mut batch.rollout_perf, i),
                 output_ids: take(&mut batch.output_ids, i),
                 finish_reason: (!reason.is_empty()).then_some(reason),
                 prompt_tokens: batch.prompt_tokens[i],
@@ -161,6 +164,7 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             pair.map(|(a, b)| (a.to_vec(), b.to_vec()))
         }
         Self {
+            rollout_perf: row.rollout_perf.cloned(),
             output_ids: row.output_ids.to_vec(),
             finish_reason: row.finish_reason.map(str::to_owned),
             prompt_tokens: row.prompt_tokens,

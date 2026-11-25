@@ -950,7 +950,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         config.finish_log,
         metrics.is_some(),
         trace,
-    );
+    )
+    .with_perf_ranks(config.metrics.labels.dp_rank, config.metrics.tp_rank);
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,
