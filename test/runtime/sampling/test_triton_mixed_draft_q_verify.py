@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton verify of the DFlash2 sparse draft q on a batch that mixes filter
-kinds (the generic route): each request verifies as it would in a batch of its
-own kind, so a mixed batch keeps the rejection rule instead of falling back to
-the target-only rule for every request."""
+"""Triton verify of the DFlash2 sparse draft q on batches that mix filter
+kinds (the generic and the top-p-only routes): each request verifies as it
+would in a batch of its own kind, so a mixed batch keeps the rejection rule
+instead of falling back to the target-only rule for every request."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
+    CUDA_GRAPH_VARIANT_TRITON_TOP_P,
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import (  # noqa: E402
@@ -68,6 +69,9 @@ RIDS = ["no-filter", "top-k", "greedy", "top-p"]
 # The top-k request keeps 2 tokens, so drafts of a row's third best token are
 # rejected under its rule but not under the no-filter rule.
 MIXED = [(-1, 1.0), (2, 0.9), (1, 1.0), (-1, 0.8)]
+# No request with a top-k, one with top-p: the top-p-only route.
+TOP_P_MIXED = [(-1, 1.0), (-1, 1.0), (-1, 1.0), (-1, 0.8)]
+TOP_P_ONLY = (-1, 0.8)
 BS = len(MIXED)
 
 
@@ -156,43 +160,57 @@ def _verify(filters, logits, draft_q, candidates) -> list[list[int]]:
 
 
 @requires_cuda
-def test_each_request_of_a_mixed_batch_verifies_as_its_own_kind() -> None:
+@pytest.mark.parametrize("batch", [MIXED, TOP_P_MIXED], ids=["generic", "top_p"])
+def test_each_request_of_a_mixed_batch_verifies_as_its_own_kind(batch) -> None:
     logits = _logits()
     q, candidates = _draft_q(logits)
-    mixed = _verify(MIXED, logits, q, candidates)
+    mixed = _verify(batch, logits, q, candidates)
+    target_only = _verify(batch, logits, None, candidates)
 
-    # The no-filter, top-k and greedy requests: what a batch of only that
-    # kind (the no-filter or top-k route, with the rejection rule) emits.
-    uniform = [_verify([MIXED[b]] * BS, logits, q, candidates) for b in range(3)]
-    for b in range(3):
-        assert mixed[b] == uniform[b][b], RIDS[b]
-    # The data tells the kinds apart: under the no-filter rule the top-k and
-    # greedy requests would emit something else.
-    assert uniform[0][1] != uniform[1][1]
-    assert uniform[0][2] != uniform[2][2]
-    # The top-p-only request has no exact filtered distribution: the
-    # target-only rule, as when the batch carries no q at all.
-    assert mixed[3] == _verify(MIXED, logits, None, candidates)[3]
+    for b, kind in enumerate(batch):
+        if kind == TOP_P_ONLY:
+            # No exact filtered distribution: the target-only rule, as when
+            # the batch carries no q at all.
+            assert mixed[b] == target_only[b], f"request {b} {kind}"
+        else:
+            # What a batch of only this kind (the no-filter or top-k route,
+            # with the rejection rule) emits.
+            uniform = _verify([kind] * BS, logits, q, candidates)
+            assert mixed[b] == uniform[b], f"request {b} {kind}"
+    # The data tells the rules apart: the no-filter request reads its q
+    # instead of the target-only rule, and on the generic route the top-k
+    # and greedy requests emit something else under the no-filter rule.
+    assert mixed[0] != target_only[0]
+    if batch is MIXED:
+        no_filter = _verify([MIXED[0]] * BS, logits, q, candidates)
+        assert mixed[1] != no_filter[1]
+        assert mixed[2] != no_filter[2]
     # The windows were neither all accepted nor all rejected.
     lengths = [len(tokens) for tokens in mixed]
     assert min(lengths) < N and max(lengths) > 1
 
 
 @requires_cuda
-def test_a_mixed_batch_verify_replays_from_a_cuda_graph() -> None:
-    """Serving's order: capture the default variant (generic route, top-k pad
-    128), then replay after a step that admitted the mixed batch (pad 64)."""
+@pytest.mark.parametrize(
+    "batch,variant",
+    [
+        (MIXED, CUDA_GRAPH_VARIANT_DEFAULT),
+        (TOP_P_MIXED, CUDA_GRAPH_VARIANT_TRITON_TOP_P),
+    ],
+    ids=["generic", "top_p"],
+)
+def test_a_mixed_batch_verify_replays_from_a_cuda_graph(batch, variant) -> None:
+    """Serving's order: capture the route's graph variant (top-k pad 128),
+    then replay after a step that admitted the mixed batch."""
     logits = _logits()
     q, candidates = _draft_q(logits)
-    eager = _verify(MIXED, logits, q, candidates)
+    eager = _verify(batch, logits, q, candidates)
 
     backend = _backend()
-    req_pool_indices = _prepare(backend, MIXED)
+    req_pool_indices = _prepare(backend, batch)
     info = _info(req_pool_indices, q)
     output = LogitsProcessorOutput(next_token_logits=logits.clone())
-    backend.prepare_capture_variant(
-        bs=BS, num_tokens_per_req=N, variant=CUDA_GRAPH_VARIANT_DEFAULT
-    )
+    backend.prepare_capture_variant(bs=BS, num_tokens_per_req=N, variant=variant)
     # Warm the kernels outside the capture, as serving's startup does.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -203,7 +221,7 @@ def test_a_mixed_batch_verify_replays_from_a_cuda_graph() -> None:
     with torch.cuda.graph(graph):
         predict, accept_length = backend.verify(output, info, candidates, tree=None)
 
-    _prepare(backend, MIXED)
+    _prepare(backend, batch)
     predict.zero_()
     accept_length.zero_()
     graph.replay()

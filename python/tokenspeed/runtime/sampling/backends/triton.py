@@ -1139,9 +1139,8 @@ class TritonSamplingBackend(SamplingBackend):
         Rows whose node has a recorded q run rejection sampling against their
         request's filtered target distribution (accept with ``min(1, p/q)``,
         else a residual draw from ``norm(max(p - q, 0))``); rows without one
-        (slot ``-1``) and greedy rows keep the target-only rule. The no-filter,
-        top-k and mixed routes only: the caller keeps the top-p-only route on
-        the target-only path.
+        (slot ``-1``), greedy rows and top-p-only requests keep the
+        target-only rule.
         """
         bs, num_tokens_per_req = candidates.shape
         rows = bs * num_tokens_per_req
@@ -1189,7 +1188,10 @@ class TritonSamplingBackend(SamplingBackend):
                 row_accept,
                 row_token,
             )
-        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_GENERIC:
+        if self._sample_route in (
+            _SAMPLE_ROUTE_GUMBEL_GENERIC,
+            _SAMPLE_ROUTE_GUMBEL_TOP_P,
+        ):
             return self._verify_mixed_rows(
                 logits, req_pool_indices, offsets_pool, candidates, draft_q
             )
@@ -1279,15 +1281,18 @@ class TritonSamplingBackend(SamplingBackend):
         candidates: torch.Tensor,
         draft_q: DraftTreeQ,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-request rules for a batch that mixes filter kinds (the generic route).
+        """Per-request rules for a batch that may mix filter kinds (the
+        generic and top-p-only routes).
 
         Each request verifies by its own kind: no filter (top-k disabled,
         ``top_p = 1``) by the no-filter kernel, a finite top-k (greedy
-        included) by the top-k kernel, and top-p only by the target-only rule
-        against the generic sampler's draw. All three run over the whole
-        batch, so the step's kernels do not depend on its composition and
-        capture in one graph; each request then takes its own kind's rows.
-        This costs two more sampling passes than a single-kind route, small
+        included; generic route only) by the top-k kernel, and top-p only by
+        the target-only rule against the route's own draw: there is no exact
+        top-p distribution here, and the DFlash2 walk proposes the best lane
+        for these requests. Every rule runs over the whole batch, so the
+        step's kernels do not depend on its composition and capture in one
+        graph per route; each request then takes its own kind's rows. This
+        costs one or two more sampling passes than a single-kind route, small
         next to the verify forward. The top-k kernel reads a disabled top-k
         as ``top_k_pad``, so its rows for the other kinds are well defined,
         and discarded.
@@ -1305,15 +1310,6 @@ class TritonSamplingBackend(SamplingBackend):
             draft_q,
             self._row_accept[:rows],
             self._row_token[:rows],
-        )
-        top_k_accept, top_k_token = self._verify_top_k_rows(
-            logits,
-            req_pool_indices,
-            offsets_pool,
-            candidates,
-            draft_q,
-            self._top_k_row_accept[:rows],
-            self._top_k_row_token[:rows],
         )
         target_sampled = self._sample_verify_targets(
             logits,
@@ -1339,14 +1335,26 @@ class TritonSamplingBackend(SamplingBackend):
         pool = req_pool_indices[:bs].long()
         top_k = self._top_k_pool[pool]
         top_p = self._top_p_pool[pool]
-        finite_top_k = (top_k != _TOP_K_DISABLED).repeat_interleave(num_tokens_per_req)
-        top_p_only = (
-            (top_k == _TOP_K_DISABLED) & (top_p < 1.0 - _SAMPLING_EPS)
-        ).repeat_interleave(num_tokens_per_req)
-        for keep, accept, token in (
-            (finite_top_k, top_k_accept, top_k_token),
-            (top_p_only, target_accept, target_sampled),
-        ):
+        kinds = [
+            (
+                (top_k == _TOP_K_DISABLED) & (top_p < 1.0 - _SAMPLING_EPS),
+                target_accept,
+                target_sampled,
+            )
+        ]
+        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_GENERIC:
+            top_k_accept, top_k_token = self._verify_top_k_rows(
+                logits,
+                req_pool_indices,
+                offsets_pool,
+                candidates,
+                draft_q,
+                self._top_k_row_accept[:rows],
+                self._top_k_row_token[:rows],
+            )
+            kinds.append((top_k != _TOP_K_DISABLED, top_k_accept, top_k_token))
+        for request_kind, accept, token in kinds:
+            keep = request_kind.repeat_interleave(num_tokens_per_req)
             torch.where(keep, accept, row_accept, out=row_accept)
             torch.where(keep, token.to(torch.int32), row_token, out=row_token)
         return row_accept, row_token
@@ -1529,6 +1537,7 @@ class TritonSamplingBackend(SamplingBackend):
             _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
             _SAMPLE_ROUTE_GUMBEL_TOP_K,
             _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+            _SAMPLE_ROUTE_GUMBEL_TOP_P,
             _SAMPLE_ROUTE_GUMBEL_GENERIC,
         ):
             row_accept, row_token = self._verify_rows_with_draft_q(
@@ -1549,10 +1558,9 @@ class TritonSamplingBackend(SamplingBackend):
             )
             accept_length += 1
         else:
-            # Without a draft q, and on the top-p-only route (no exact
-            # filtered distribution), every row keeps the target-only rule:
-            # a draft is kept iff it equals the target's own keyed draw at
-            # that position.
+            # Without a draft q every row keeps the target-only rule: a draft
+            # is kept iff it equals the target's own keyed draw at that
+            # position.
             target_sampled = self._sample_verify_targets(
                 logits,
                 selected,

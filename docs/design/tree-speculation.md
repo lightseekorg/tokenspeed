@@ -243,9 +243,8 @@ Its random streams stay disjoint: the residual and bonus draws reuse the plain
 stream's position keys, while the walk's draft noise and the accept coins
 use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
 requests without an exact filtered distribution (top-p only) keep the
-plain-decoding draw; so does every request of a batch whose sampling route is
-top-p only. A batch that mixes finite top-k with disabled top-k verifies each
-request by its own kind's rule.
+plain-decoding draw. A batch that mixes filter kinds verifies each request by
+its own kind's rule.
 The `sonic` backend draws every node row the way its `sample` draws
 (`sonic.tree_targets`): Philox noise keyed by the request's offset and the
 node's depth, and penalties counting the tokens of the node's path on top of

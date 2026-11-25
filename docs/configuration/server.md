@@ -956,14 +956,13 @@ request's temperature, top-k and top-p, the one the Triton backend serves.
   rejection rule runs for requests with no filter (top-k disabled,
   `top_p = 1`) and for requests with a finite top-k, with any `top_p`.
   Under the flag the top-k requests always use the two-stage top-k kernel,
-  at every row count. A batch mixing requests with a finite top-k and requests
-  with top-k disabled (for example greedy next to no-filter requests) verifies
-  each request by its own kind's rule. Requests with top-p only (top-k
-  disabled, `top_p < 1`) have no exact `p'` and verify every row by the
-  target-only rule, and so does every request of a batch in which no request
-  has a finite top-k and some request has top-p only, no-filter requests
-  included. There a sampled draft is kept with probability `sum(p * q)`, which
-  can be below the greedy draft's `p(argmax q)`.
+  at every row count. A batch that mixes kinds (for example greedy or top-p
+  only next to no-filter requests) verifies each request by its own kind's
+  rule. Requests with top-p only (top-k disabled, `top_p < 1`) have no exact
+  `p'`: the walk proposes their best edge and verify keeps the target-only
+  rule for them, because a draft sampled from `q` would be kept with
+  probability `sum(p * q)`, which can be below the best edge's
+  `p(argmax q)`.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
