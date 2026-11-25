@@ -1,5 +1,22 @@
 // Copyright (c) 2026 LightSeek Foundation
-// SPDX-License-Identifier: MIT
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 //! CPU `EventLoop` regression tests for peer prefix sharing scheduler-lock and
 //! hard-pin invariants (`TS-R2-P0-1`, `TS-R4-P0-1`, `TS-R8-P0-1`).
@@ -121,7 +138,6 @@ fn rank_geometry(base: u64) -> RankGeometry {
             page_stride: PAGE_BYTES,
             bytes: PAGE_BYTES,
         }],
-        device_regions: Vec::new(),
         host: None,
         push: None,
     }
@@ -624,7 +640,8 @@ fn unlocked_gate_idle_forward_and_overlap_complete_answer_peer() {
         (la.num_tokens, pa.held)
     };
 
-    // 1. Unlocked gate() with 1 un-overlapped batch in flight (TS-R4-P0-1).
+    // 1a. gate() keeps scheduler LOCKED while in_flight is non-empty so a peer
+    //     reader cannot be handed Device pages from an uncompleted batch.
     h0.execute.arm();
     h1.execute.arm();
     fe0.push(add_req("r0-gate", (400..400 + 2 * PAGE).collect(), 2));
@@ -635,9 +652,39 @@ fn unlocked_gate_idle_forward_and_overlap_complete_answer_peer() {
     h1.execute.release();
     fe1.receive_hook.wait_entered();
     thread::sleep(Duration::from_millis(15));
+    client
+        .request(
+            &holder_name,
+            &Request::Lookup {
+                lease: PeerLeaseView {
+                    reader: caddr.clone(),
+                    id: 100,
+                },
+                prompt: prompt.clone(),
+            },
+        )
+        .unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(80)).is_err());
+    fe1.receive_hook.release();
+    let Inbound::Reply(Reply::Answer { answer: la, .. }) =
+        Inbound::decode(&rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(la.num_tokens, 3 * PAGE);
+    fe0.wait_finished("r0-gate");
+
+    // 1b. gate() unlocks scheduler when in_flight is empty and no copies are pending.
+    h1.execute.arm();
+    fe1.push(add_req("r1-gate", (450..450 + 2 * PAGE).collect(), 2));
+    h1.execute.wait_entered();
+    fe1.receive_hook.arm();
+    h1.execute.release();
+    fe1.receive_hook.wait_entered();
+    thread::sleep(Duration::from_millis(15));
     assert_eq!(ask_pin(101), (3 * PAGE, true));
     fe1.receive_hook.release();
-    fe0.wait_finished("r0-gate");
+    fe1.wait_finished("r1-gate");
 
     // 2. Unlocked idle_forward answers Lookup+Pin immediately.
     fe0.push(EngineRequest::Control(Box::new(

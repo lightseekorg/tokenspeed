@@ -235,7 +235,7 @@ public:
     // A holder's answers: reads of the cache as it stands, which the runtime
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
-    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases = 0) const {
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases) const {
         if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
             return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
         }

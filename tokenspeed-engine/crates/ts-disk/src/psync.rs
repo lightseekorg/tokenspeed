@@ -41,13 +41,8 @@ const MAX_TRANSIENT_RETRIES: u8 = 16;
 
 static LOGGED_BOUNCE_FALLBACK: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize, force_bounce: bool) {
-    let mut bounce: Option<Memory> = if force_bounce {
-        shared.set_bounce_active();
-        Some(Memory::map(max_io_bytes).expect("allocate psync bounce buffer"))
-    } else {
-        None
-    };
+pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize) {
+    let mut bounce: Option<Memory> = None;
     loop {
         let chunk = {
             let mut queues = shared.queues.lock();
@@ -61,7 +56,7 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize, force_b
                 shared.work.wait(&mut queues);
             }
         };
-        let result = transfer(file.raw_fd(), chunk, &mut bounce, max_io_bytes, shared);
+        let result = transfer(file.raw_fd(), chunk, &mut bounce, max_io_bytes);
         let finished = shared.queues.lock().finish(chunk, result);
         shared.work.notify_all();
         if let Some((done, report)) = finished {
@@ -75,7 +70,6 @@ fn transfer(
     chunk: Chunk,
     bounce: &mut Option<Memory>,
     max_io_bytes: usize,
-    shared: &Shared,
 ) -> Result<(), IoError> {
     match bounce.as_ref() {
         Some(buf) => transfer_bounced(fd, chunk, buf),
@@ -84,7 +78,6 @@ fn transfer(
                 let buf_size = max_io_bytes.max(chunk.len);
                 match Memory::map(buf_size) {
                     Ok(buf) => {
-                        shared.set_bounce_active();
                         if !LOGGED_BOUNCE_FALLBACK.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 bounce_bytes = buf_size,

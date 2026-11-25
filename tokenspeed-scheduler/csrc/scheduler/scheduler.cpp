@@ -40,6 +40,7 @@
 #include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
+#include "fsm/storage_events.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/operations/admission.h"
 #include "scheduler/operations/forward.h"
@@ -230,7 +231,20 @@ void Scheduler::CancelStorageBackups() {
 }
 
 void Scheduler::CancelStorageForClear() {
-    for (auto& request : requests_) releaseStorage(*request);
+    for (auto& request : requests_) {
+        releaseStorage(*request);
+        if (peer_host_landings_) {
+            if (const auto* prefetch = request->GetIf<fsm::Prefetching>();
+                prefetch != nullptr && prefetch->lease.IssuedBy(*peer_host_landings_)) {
+                request->Apply(fsm::FinishPrefetchEvent{std::nullopt});
+            }
+            if (auto* admission = request->AdmissionResourcesPtr();
+                admission != nullptr && admission->storage_hold &&
+                admission->storage_hold->lease.IssuedBy(*peer_host_landings_)) {
+                admission->storage_hold.reset();
+            }
+        }
+    }
     CancelStorageBackups();
 }
 

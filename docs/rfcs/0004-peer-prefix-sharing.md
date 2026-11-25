@@ -121,13 +121,17 @@ while it waits for the previous forward (`complete`), which for a long
 prefill chunk is hundreds of milliseconds; answering at the next round would
 make every lookup and pin wait that long. The scheduler is therefore shared
 with the servicer under a lock that the control thread holds through a
-round's scheduler work and releases while it waits on the device or on an
-idle frontend. A loop waiting on a transfer -- a prefill replica on its PD
-sends, a landing on its reads -- does neither and spins through
-empty rounds, so the control thread also hands the lock to a waiting servicer
-once per round. The servicer answers with reads only (`AnswerPeerLookup`,
-`PeerPagesMatch`, `PeerLeaseHeld`, `PlanCalls`): an answer costs a network
-round trip plus at most the rest of a round's scheduler work.
+round's scheduler work and releases while it waits on the device, on an idle
+frontend, on a paused round's sleep (when no device copies were just queued),
+or on an attention-DP collective (`gate`'s `all_reduce` on single-member
+replicas and `dp_round`'s `all_gather` on frozen rounds) or idle forward when
+no forward or device copy batch is still queued on the device. A loop waiting
+on a transfer -- a prefill replica on its PD sends, a landing on its reads --
+does none of those and spins through empty rounds, so the control thread also
+hands the lock to a waiting servicer once per round. The servicer answers with
+reads only (`AnswerPeerLookup`, `PeerPagesMatch`, `PeerLeaseHeld`,
+`PlanCalls`), dropping and retaking the lock per RPC: an answer costs a
+network round trip plus at most the rest of a round's scheduler work.
 
 **Changes at the head.** What a message changes -- a lookup's soft pin, a
 pin's block references, a release's demotion -- is not applied by the
@@ -136,7 +140,12 @@ results the round feeds back, it would interleave differently from the
 other members' and their access epochs, hence their eviction orders, would
 diverge. The servicer queues each change instead; the round's relay carries
 the queue to every member, and each applies it at the next head before any
-other event, in the order the answers were given (`advance_peer`).
+other event, in the order the answers were given (`advance_peer`). Mid-round
+points that follow an unlocked window before planning, flushing, or draining
+(`gate`, `finish_drain` when a reload or `kv_cache` release drain is active,
+and warm-up cache clears) also drain and share queued holder changes across
+the replica (`sync_peer_holder_changes`) so hard pins are visible before a
+cache clear or next plan runs.
 
 The answers hold until then because nothing leaves a holder's cache outside
 a plan: eviction, dead-entry collection and compaction run only while one is
@@ -154,8 +163,10 @@ boundary its SWA window and State checkpoints can resume from, and lists the
 pages a reader's table would hold at each slot. A soft pin holds no block
 reference: the lookup's change refreshes the entries, as a hit does, so they
 leave last, and keeps the prompt up to the answered boundary. A soft pin
-expires after a short deadline (hundreds of milliseconds). Soft pins never
-cost the holder capacity it needs.
+expires after a bounded deadline (2 s at the default 50 ms answer timeout,
+scaled with `--peer-prefix-answer-timeout-ms` and capped at the 30 s hard-pin
+lifetime so a hard pin never shortens it and the servicer's record lifetime
+always outlives it). Soft pins never cost the holder capacity it needs.
 
 **Admission.** The reader admits the request against its own Device
 capacity, treating the peer span as tokens that will arrive rather than be
@@ -286,13 +297,12 @@ engine can unregister its memory.
 Control messages (lookup, pin, release) travel between the replicas'
 servicers over ZMQ, not through the data plane. A fast demux thread delivers
 replies and answers layout queries without waiting on the scheduler lock,
-while the servicer thread drains queued lookup, pin and release RPCs in batches.
+while the servicer thread drains queued lookup, pin and release RPCs, releasing
+the scheduler lock after each RPC so a burst does not delay the control loop.
 A holder's name is its
 logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
-its incarnation and identity, and per rank its transfer engine session,
-registered Device and Host memory-region boundaries (used to split batched
-one-sided reads so no single batch crosses registered MR segments), and
+its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
 The first member owns the bound listener continuously through startup. A
 caller using an OS-selected port binds before constructing the replica's name

@@ -29,7 +29,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     os::fd::{AsRawFd, OwnedFd},
-    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -313,8 +312,6 @@ pub(crate) struct Shared {
     pub(crate) limits: Limits,
     /// The io_uring thread's wake-up: it waits in the kernel, not on `work`.
     pub(crate) eventfd: Option<OwnedFd>,
-    /// Whether the active backend is staging O_DIRECT through an anonymous mmap bounce pool.
-    pub(crate) bounce_active: AtomicBool,
 }
 
 impl Shared {
@@ -324,16 +321,7 @@ impl Shared {
             work: Condvar::new(),
             limits,
             eventfd,
-            bounce_active: AtomicBool::new(false),
         }
-    }
-
-    pub(crate) fn set_bounce_active(&self) {
-        self.bounce_active.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_bounce_active(&self) -> bool {
-        self.bounce_active.load(Ordering::Acquire)
     }
 
     /// Tell every thread the queues changed.

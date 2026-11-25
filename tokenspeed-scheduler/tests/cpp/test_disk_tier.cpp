@@ -914,9 +914,9 @@ TEST(DiskTierTest, PartialHostCreditExhaustionRetryableAndInt32BlockBound) {
     cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(k2).op_id, .success = true});
     cache.EvictFromHost(k1);
     cache.EvictFromHost(k2);
-    const auto r1 = cache.disks.TryStartRead(p1.Prefix());
+    const auto r1 = cache.disks.TryStartRead(p1.Prefix(), /*local_tokens=*/0);
     ASSERT_TRUE(r1.lease);
-    const auto r2 = cache.disks.TryStartRead(p2.Prefix());
+    const auto r2 = cache.disks.TryStartRead(p2.Prefix(), /*local_tokens=*/0);
     EXPECT_FALSE(r2.lease);
     EXPECT_TRUE(r2.retryable);
 

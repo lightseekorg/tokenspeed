@@ -275,9 +275,6 @@ void Scheduler::startPeerHostLanding(Request& request) {
     }
     spdlog::debug("[Peer] rid={} lands [{}, {}) from {} into Host ({} blocks)", request.Id(), local, hit.num_tokens,
                   request.PeerHolder(), started->fetch.destinations.size());
-    // Release any prior Disk/storage Ready hold before entering PeerHostLandings
-    // Prefetching so the request never holds two StorageLeases simultaneously.
-    admission.storage_hold.reset();
     peer_host_fetches_.push_back(std::move(started->fetch));
     // The runtime always reports the landing (PeerFetchDone), after its
     // answers' deadlines or its quarantine: no soft deadline of its own.

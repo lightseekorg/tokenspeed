@@ -69,7 +69,7 @@ public:
     // the longest boundary Disk extends the local hit to under the
     // Host-suffix rule -- into Host blocks it allocates, holding the Disk
     // sources. Distinguishes a permanent miss from transient credit exhaustion.
-    ReadStartResult TryStartRead(const PromptPrefix& prompt, std::int32_t local_tokens = -1);
+    ReadStartResult TryStartRead(const PromptPrefix& prompt, std::int32_t local_tokens);
     // Convenience wrapper returning only the lease.
     StorageLease StartRead(const PromptPrefix& prompt);
     // Whether the operation finished; an unknown operation counts as finished.

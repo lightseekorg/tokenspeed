@@ -635,7 +635,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Held for the whole round. A peer holder's endpoint answers from the
     /// scheduler between rounds, so the loop lets go of it only where it
     /// waits on something else: a forward's result, an idle frontend, a
-    /// paused round's sleep.
+    /// paused round's sleep (when no device copies were just queued), or an
+    /// attention-DP collective / idle forward when no forward or device copy
+    /// batch is still queued on the device.
     scheduler: ArcMutexGuard<RawMutex, Scheduler>,
     data_plane: D,
     frontend: F,
@@ -666,6 +668,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     history: Option<HistoryRows>,
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
+    /// Whether the last dispatched plan carried `pages_to_copy` whose device
+    /// execution has not yet been confirmed by a subsequent commit.
+    last_plan_had_copies: bool,
     cache_ops: CacheOps,
     replay_retirements: Option<ReplayRetirements>,
     controls: Controls,
@@ -774,6 +779,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             grammar_queue: Vec::new(),
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
+            last_plan_had_copies: false,
             cache_ops: CacheOps::new(),
             cache_clear_started: None,
             startup_cache_clear: false,
@@ -958,12 +964,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
         // A peer servicer answers from the scheduler between rounds, and the
-        // loop releases it only while it waits on the device or on an idle
-        // frontend. A loop waiting on a transfer -- a prefill engine on its
-        // PD sends, a landing on its reads -- does neither and spins
-        // through empty rounds, so it hands the scheduler to a waiting
-        // servicer once per round; with none waiting this costs one atomic
-        // read.
+        // loop releases it only while it waits on the device, an idle frontend,
+        // or (when no forward or copy batch is queued on the device) an
+        // attention-DP collective or idle forward. A loop waiting on a transfer
+        // -- a prefill engine on its PD sends, a landing on its reads -- does
+        // none of those and spins through empty rounds, so it hands the
+        // scheduler to a waiting servicer once per round; with none waiting
+        // this costs one atomic read.
         ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
@@ -1102,6 +1109,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     },
                 )?;
             }
+            self.last_plan_had_copies = device_work && frozen_has_copies;
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop, !frozen_has_copies)? {
                 if dp.idle_forward && memory_resident {
@@ -1118,9 +1126,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             busy |= forwarded;
             self.note_forward(forwarded);
-            ArcMutexGuard::unlocked(&mut self.scheduler, || {
+            if frozen_has_copies {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
-            });
+            } else {
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    std::thread::sleep(PAUSED_IDLE_SLEEP);
+                });
+            }
         } else {
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
@@ -1364,6 +1376,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 forwarded = true;
             }
         }
+        self.last_plan_had_copies = device_work && has_device_copies;
         self.note_forward(forwarded);
 
         // Commit from the head once the queue exceeds the depth; a round with
@@ -2110,7 +2123,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -key,
                 if reload_ready { -1 } else { 0 },
             ];
-            let reduced = if self.ranks.replica.size() == 1 {
+            let reduced = if self.ranks.replica.size() == 1
+                && self.in_flight.is_empty()
+                && !self.last_plan_had_copies
+            {
                 let reduced = {
                     let mesh = &mut self.ranks.mesh;
                     ArcMutexGuard::unlocked(&mut self.scheduler, || {
@@ -2120,7 +2136,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 // Any peer Lookup/Pin/Release answered while waiting on sibling DP
                 // ranks in `all_reduce` must be applied to `self.scheduler` before
                 // `clear_cache` or `next_execution_plan` runs in this round.
-                // Limited to single-member replicas so TP/PP adds no per-round broadcast.
+                // Limited to single-member replicas so TP/PP adds no per-round broadcast,
+                // and only when no forward or copy batch is still queued on the device.
                 self.sync_peer_holder_changes()?;
                 reduced
             } else {
@@ -3104,8 +3121,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
-    /// With attention DP, every rank's batch this round, and whether any
-    /// rank is stopping.
     /// Drain any holder changes answered on `ts-peer-servicer` while
     /// `self.scheduler` was unlocked, share them across the replica so every
     /// TP/PP member applies the exact same sequence, and advance `self.scheduler`.
@@ -3132,6 +3147,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
+    /// With attention DP, every rank's batch this round, and whether any
+    /// rank is stopping. When `allow_unlock` is true and no forward is in
+    /// flight, releases `self.scheduler` across the DP `all_gather` so
+    /// `ts-peer-servicer` can answer while waiting on sibling DP ranks.
     fn dp_round(
         &mut self,
         forward: Option<&ForwardBatchView>,
@@ -3400,6 +3419,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let data_plane = &mut self.data_plane;
             let result =
                 ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
+            if self.in_flight.is_empty() {
+                self.last_plan_had_copies = false;
+            }
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;
             let Committed {

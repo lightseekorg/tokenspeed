@@ -70,7 +70,6 @@ PUSH_TIMEOUT_S = 10.0
 # request's admission.
 HOST_LANDING_BLOCKS_FRACTION = 0.5
 HOST_READY_S = 5.0
-DEVICE_SOFT_PIN_FLOOR_S = 8.0
 
 
 def peer_incarnation() -> int:
@@ -123,10 +122,10 @@ def peer_scheduler_config(
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
     answer_timeout_s = max(0.0, answer_timeout_ms / 1000.0)
-    if host:
-        soft_pin_s = max(SOFT_PIN_S, 2.0 * answer_timeout_s + 2.0)
-    else:
-        soft_pin_s = max(DEVICE_SOFT_PIN_FLOOR_S, 6.0 * answer_timeout_s)
+    soft_pin_s = min(
+        HARD_PIN_S,
+        max(SOFT_PIN_S, (2.0 if host else 4.0) * answer_timeout_s + 2.0),
+    )
     host_ready_s = max(HOST_READY_S, answer_timeout_s + 5.0)
     return PeerConfig(
         name=name,
@@ -171,12 +170,11 @@ class PeerHostGroup:
 
 @dataclass(frozen=True, slots=True)
 class PeerHostPool:
-    """The Host pool: its address, every cache group in the scheduler's order,
-    and the lengths of consecutive registered memory regions (MRs) covering it."""
+    """The Host pool: its address and every cache group, in the scheduler's
+    order."""
 
     address: int
     groups: tuple[PeerHostGroup, ...]
-    region_lengths: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +185,6 @@ class PeerGeometry:
     device: tuple[PeerDeviceField, ...]
     host: PeerHostPool
     regions: tuple[tuple[int, int], ...]
-    device_regions: tuple[tuple[int, int], ...] = ()
 
 
 def peer_host_regions(
@@ -281,21 +278,13 @@ def build_peer_geometry(
         host_storage.host_lcm_block_bytes,
         host_region_planner,
     )
-    normalized_device_regions = tuple(
-        (int(address), int(length)) for address, length in device_regions
-    )
     return PeerGeometry(
         device=tuple(device),
-        host=PeerHostPool(
-            address=host_address,
-            groups=tuple(host_groups),
-            region_lengths=tuple(int(length) for _, length in host_regions),
-        ),
+        host=PeerHostPool(address=host_address, groups=tuple(host_groups)),
         regions=(
-            *normalized_device_regions,
+            *((int(address), int(length)) for address, length in device_regions),
             *host_regions,
         ),
-        device_regions=normalized_device_regions,
     )
 
 

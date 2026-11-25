@@ -105,7 +105,8 @@ fn scheduler(name: &str, incarnation: u64, holder: bool) -> Scheduler {
              cfg.disk_config = ts.DiskConfig(max_operations=4, max_blocks_per_operation=64,\n\
                                              max_host_blocks=4, max_write_host_blocks=2,\n\
                                              max_queued_cleanings=64, min_prefetch_tokens=1,\n\
-                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000)\n\
+                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000,\n\
+                                             min_clean_tokens=0, require_reuse_for_cleaning=False)\n\
              device_pages = {DEVICE_PAGES}",
             host_pages = HOST_BLOCKS + 1,
             disk_pages = DISK_BLOCKS + 1,
@@ -172,7 +173,6 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
             page_stride: BLOCK_BYTES as u64,
             bytes: BLOCK_BYTES as u64,
         }],
-        device_regions: Vec::new(),
         host: Some(HostPool {
             address: 0,
             groups: vec![HostGroup {
@@ -181,7 +181,6 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
                 block_bytes: BLOCK_BYTES as u64,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
-            region_lengths: Vec::new(),
         }),
         push: Some(push.to_owned()),
     }

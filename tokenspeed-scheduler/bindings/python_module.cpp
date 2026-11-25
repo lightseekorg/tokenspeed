@@ -328,8 +328,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                       std::int64_t, std::int32_t, bool>(),
              nb::arg("max_operations"), nb::arg("max_blocks_per_operation"), nb::arg("max_host_blocks"),
              nb::arg("max_write_host_blocks"), nb::arg("max_queued_cleanings"), nb::arg("min_prefetch_tokens"),
-             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("min_clean_tokens") = 0,
-             nb::arg("require_reuse_for_cleaning") = false)
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("min_clean_tokens"),
+             nb::arg("require_reuse_for_cleaning"))
         .def_ro("max_operations", &tokenspeed::DiskConfig::max_operations)
         .def_ro("max_blocks_per_operation", &tokenspeed::DiskConfig::max_blocks_per_operation)
         .def_ro("max_host_blocks", &tokenspeed::DiskConfig::max_host_blocks)

@@ -1037,7 +1037,8 @@ TEST(PeerDiskInterleavingTest, DiskCreditsAndLookingReadyHoldCoordinateCleanlyWi
     const auto lookups = reader.TakePeerLookups();
     ASSERT_EQ(lookups.size(), 1u);
 
-    // Holder answers 16 tokens -> startPeerHostLanding clears Disk storage_hold (no dual leases!).
+    // Holder answers 16 tokens -> startPeerHostLanding keeps Disk storage_hold
+    // alive while landing [4, 16) so [0, 4) cannot be evicted under Host pressure.
     HolderServicer servicer{holder};
     const PeerAnswer ans = servicer.Lookup(lookups[0]);
     Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
@@ -1049,7 +1050,16 @@ TEST(PeerDiskInterleavingTest, DiskCreditsAndLookingReadyHoldCoordinateCleanlyWi
     ASSERT_EQ(p_land.peer_fetches.size(), 1u);
     EXPECT_EQ(p_land.peer_fetches[0].begin_tokens, 4);
     EXPECT_EQ(p_land.peer_fetches[0].end_tokens, 16);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 1u);
+
+    // Expiring the Disk Ready hold via StorageTick releases only the Disk hold
+    // and leaves the in-flight peer Host landing untouched.
+    Send(reader, cache::StorageTick{.now_us = 100, .allow_forward = true, .allow_storage = true});
     EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
+    EXPECT_EQ(reader.GetDiskStats().ready_expirations, 1u);
+    EXPECT_EQ(reader.GetDiskStats().wait_timeouts, 0u);
+    EXPECT_EQ(reader.GetPeerStats().landing_requests, 1u);
 
     // PeerFetchDone Ready hold allows CanPrepareStorageClear() -> ClearCache().
     Send(reader, cache::PeerFetchDone{.request_id = "r-peer", .num_tokens = 16});
@@ -1057,6 +1067,93 @@ TEST(PeerDiskInterleavingTest, DiskCreditsAndLookingReadyHoldCoordinateCleanlyWi
     EXPECT_TRUE(reader.CanPrepareStorageClear());
     reader.CancelStorageForClear();
     EXPECT_TRUE(reader.ClearCache());
+}
+
+TEST(PeerDiskInterleavingTest, DiskReadyHoldSurvivesFailedPeerHostLandingAsFallback) {
+    Scheduler holder{PeerConfigFor("holder")};
+    const std::vector<std::int32_t> full_prefix = MakeAlignedTokens(4, kP);
+    WarmOnHolder(holder, full_prefix);
+
+    SchedulerConfig cfg = HostLandingConfigFor("reader", /*hybrid=*/false);
+    cfg.device_allocator.total_pages = 17;
+    cfg.cache_groups.front().total_pages = 17;
+    cfg.host_allocator.total_pages = 33;
+    cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    cfg.disk_allocator.total_pages = 33;
+    cfg.disk_config = DiskConfig{.max_operations = 4,
+                                 .max_blocks_per_operation = 32,
+                                 .max_host_blocks = 8,
+                                 .max_write_host_blocks = 4,
+                                 .max_queued_cleanings = 32,
+                                 .min_prefetch_tokens = kP,
+                                 .wait_timeout_us = 10'000,
+                                 .ready_timeout_us = 10'000};
+    cfg.max_batch_size = 1;
+    cfg.max_resident_requests = 1;
+    SetTestSnapshotPool(cfg);
+    Scheduler reader{cfg};
+
+    Send(reader, cache::StorageTick{.now_us = 1, .allow_forward = true, .allow_storage = true});
+    const std::vector<std::int32_t> short_prefix(full_prefix.begin(), full_prefix.begin() + 2 * kP);
+    SeedAndCleanToDisk(reader, {{"s1", short_prefix}});
+    ASSERT_TRUE(SchedulerTestAccess::Coordinator(reader).ClearDeviceCache());
+    EvictHostTokens(reader, short_prefix);
+
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "blk", .tokens = MakeAlignedTokens(2, kP, 8000), .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(reader)).size(), 1u);
+
+    std::vector<std::int32_t> peer_toks = full_prefix;
+    peer_toks.insert(peer_toks.end(), {9001, 9002});
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "r-fb", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
+    const auto reads = ExtractDiskOps(Plan(reader));
+    ASSERT_EQ(reads.size(), 1u);
+    Send(reader, cache::DiskDone{.op_id = reads[0].op_id, .success = true});
+    Plan(reader);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+
+    HolderServicer servicer{holder};
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan p_land = Plan(reader);
+    ASSERT_EQ(p_land.peer_fetches.size(), 1u);
+    EXPECT_EQ(p_land.peer_fetches[0].begin_tokens, 4);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+
+    // Under Host eviction pressure while the peer Host landing is in flight,
+    // the Disk-prefetched [0, 4) Host blocks stay pinned and cannot be evicted.
+    {
+        CacheCoordinator& coord = SchedulerTestAccess::Coordinator(reader);
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t off = 0; off < short_prefix.size(); off += kP) {
+            pages.emplace_back(short_prefix.data() + off, kP);
+        }
+        for (const CacheKey& key : coord.Store().KeysForGroup(ComputePrefixHashes(pages, ""), 0)) {
+            const auto loc = coord.Store().LocationOf(*coord.Store().HostPool(), 0, key);
+            ASSERT_TRUE(loc.has_value());
+            EXPECT_FALSE(coord.Evictor().EvictHostCachedBlock(0, *loc, &CacheEvictor::HostEvictionStats::lru));
+        }
+    }
+
+    // Peer Host landing fails -> Disk Ready hold stays intact as fallback.
+    Send(reader, cache::PeerFetchDone{.request_id = "r-fb", .num_tokens = 0});
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 1u);
+
+    // Release blocker and admit r-fb: it reuses the Disk-prefetched [0, 4) Host hit.
+    while (SchedulerTestAccess::ResultsInFlight(reader, "blk") > 0) {
+        Send(reader, forward::ExtendResult{.request_id = "blk", .tokens = {7}});
+    }
+    Send(reader, forward::Finish{.request_id = "blk"});
+    const ExecutionPlan admitted = Plan(reader);
+    const auto rows = PrefillRows(admitted);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].first, "r-fb");
+    EXPECT_EQ(rows[0].second, 4);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
 }
 
 TEST(PeerSchedulerRound7Test, ExpiredSoftPinMaxLeasesOverflowAndFusedAbortSafety) {

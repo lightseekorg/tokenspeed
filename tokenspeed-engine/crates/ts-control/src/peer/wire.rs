@@ -221,11 +221,6 @@ fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
         out.u64(field.page_stride);
         out.u64(field.bytes);
     }
-    out.count(geometry.device_regions.len());
-    for &(address, length) in &geometry.device_regions {
-        out.u64(address);
-        out.u64(length);
-    }
     out.option(geometry.push.as_ref(), |out, endpoint| {
         out.bytes(endpoint.as_bytes())
     });
@@ -242,10 +237,6 @@ fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
                 out.u64(*offset);
             }
         }
-        out.count(pool.region_lengths.len());
-        for &length in &pool.region_lengths {
-            out.u64(length);
-        }
     });
 }
 
@@ -261,11 +252,6 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
             page_stride: reader.u64()?,
             bytes: reader.u64()?,
         });
-    }
-    let num_device_regions = reader.count()?;
-    let mut device_regions = Vec::with_capacity(num_device_regions.min(1 << 16));
-    for _ in 0..num_device_regions {
-        device_regions.push((reader.u64()?, reader.u64()?));
     }
     let push = reader.option(read_str)?;
     let host = reader.option(|reader| {
@@ -288,21 +274,11 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
                 field_offsets,
             });
         }
-        let num_regions = reader.count()?;
-        let mut region_lengths = Vec::with_capacity(num_regions.min(1 << 16));
-        for _ in 0..num_regions {
-            region_lengths.push(reader.u64()?);
-        }
-        Some(HostPool {
-            address,
-            groups,
-            region_lengths,
-        })
+        Some(HostPool { address, groups })
     })?;
     Some(RankGeometry {
         session,
         device,
-        device_regions,
         host,
         push,
     })
@@ -571,7 +547,6 @@ mod tests {
                 page_stride: 4096,
                 bytes: 2048,
             }],
-            device_regions: vec![(1 << 40, 1 << 20)],
             host: Some(HostPool {
                 address: 1 << 41,
                 groups: vec![HostGroup {
@@ -580,7 +555,6 @@ mod tests {
                     block_bytes: 4096,
                     field_offsets: vec![("layer.3.k".into(), 0)],
                 }],
-                region_lengths: vec![4096, 4096],
             }),
             push: Some("10.0.0.2:7300".into()),
         };

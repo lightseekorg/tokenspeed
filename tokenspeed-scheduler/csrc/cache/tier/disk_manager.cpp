@@ -116,10 +116,6 @@ DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const Pro
                                                                        std::int32_t local_tokens) {
     const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
     if (hits.empty()) return {.retryable = false};
-    if (local_tokens < 0) {
-        const PrefixProbe local_probe = coordinator_.Prober().ProbePromptPrefix(prompt);
-        local_tokens = std::max(local_probe.device.num_common_tokens, local_probe.host.num_common_tokens);
-    }
     // Only report `retryable = true` when Disk actually extends the resumable
     // prefix beyond `local_tokens`; when the Disk keys are already covered on
     // Device/Host or lack a required State checkpoint, no retry can gain tokens.
@@ -159,7 +155,10 @@ DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const Pro
 }
 
 StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
-    return TryStartRead(prompt).lease;
+    const PrefixProbe local_probe = coordinator_.Prober().ProbePromptPrefix(prompt);
+    const std::int32_t local_tokens =
+        std::max(local_probe.device.num_common_tokens, local_probe.host.num_common_tokens);
+    return TryStartRead(prompt, local_tokens).lease;
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
@@ -251,7 +250,8 @@ void DiskTransferManager::StartCleaning() {
     while (!cleaning_.empty() && ticket.keys.size() < credits) {
         const CacheKey front = cleaning_.front();
         const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
-        if (node == nullptr || !dirty(front) || skip_cleaning(front) || chosen.contains(front)) {
+        if (node == nullptr || !dirty(front) || (store.GroupIsState(front.group_id) && skip_cleaning(front)) ||
+            chosen.contains(front)) {
             cleaning_.pop_front();
             continue;
         }

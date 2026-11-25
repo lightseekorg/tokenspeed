@@ -56,31 +56,17 @@ impl PageReader for EngineReader {
     }
 }
 
-/// One read to run: the landing it serves, the holder's session, the
-/// MR-homogeneous span batches to copy, and the push of the holder's Disk
-/// pages, if any.
+/// One read to run: the landing it serves, the holder's session and the
+/// spans, and the push of the holder's Disk pages, if any.
 pub struct ReadJob {
     /// The landing request.
     pub request_id: String,
     /// The holder rank's transfer session.
     pub session: String,
-    /// MR-homogeneous batches of spans; every batch stays within one source MR
-    /// and one destination MR so `TransferSync` never mixes MRs in a single op.
-    pub batches: Vec<Spans>,
+    /// What to copy.
+    pub spans: Spans,
     /// The Disk pages the holder rank pushes into this member's pages.
     pub push: Option<PushJob>,
-}
-
-impl ReadJob {
-    /// Total spans across all MR-homogeneous batches.
-    pub fn total_spans(&self) -> usize {
-        self.batches.iter().map(|b| b.lengths.len()).sum()
-    }
-
-    /// Total bytes backed by pinned holder Host memory across all batches.
-    pub fn host_bytes(&self) -> u64 {
-        self.batches.iter().map(|b| b.host_bytes).sum()
-    }
 }
 
 /// A push the holder rank runs for a read (`push`).
@@ -148,25 +134,23 @@ impl Reads {
                         return;
                     };
                     let started = std::time::Instant::now();
-                    let total_spans = job.total_spans();
-                    let host_bytes = job.host_bytes();
                     let ReadJob {
                         request_id,
                         session,
-                        batches,
+                        spans,
                         push,
                     } = job;
+                    let total_spans = spans.lengths.len();
+                    let host_bytes = spans.host_bytes;
                     tracing::debug!(
                         request = request_id,
                         spans = total_spans,
-                        mr_batches = batches.len(),
                         "peer read started"
                     );
-                    let has_read_batches = batches.iter().any(|b| !b.is_empty());
-                    // Overlap `PushJob` concurrently with MR-split `READ` batches,
+                    // Overlap `PushJob` concurrently with one-sided `READ`,
                     // joining both before reporting the landing outcome so no
                     // transfer trails behind settlement.
-                    let (outcome, disk_bytes) = match (push, has_read_batches) {
+                    let (outcome, disk_bytes) = match (push, !spans.is_empty()) {
                         (Some(push), true) => {
                             let bytes = push.bytes();
                             let PushJob {
@@ -178,16 +162,7 @@ impl Reads {
                             let (read_res, push_res) = std::thread::scope(|scope| {
                                 let push_handle = scope
                                     .spawn(|| pusher.push(&endpoint, &push_session, budget, items));
-                                let mut read_res = Ok(());
-                                for batch in &batches {
-                                    if batch.is_empty() {
-                                        continue;
-                                    }
-                                    if let Err(err) = reader.read(&session, batch) {
-                                        read_res = Err(err);
-                                        break;
-                                    }
-                                }
+                                let read_res = reader.read(&session, &spans);
                                 let push_res = push_handle.join().unwrap_or_else(|_| {
                                     Err("peer push worker panicked".to_owned())
                                 });
@@ -201,19 +176,8 @@ impl Reads {
                                 pusher.push(&push.endpoint, &push.session, push.budget, push.items);
                             (res, bytes)
                         }
-                        (None, _) => {
-                            let mut read_res = Ok(());
-                            for batch in &batches {
-                                if batch.is_empty() {
-                                    continue;
-                                }
-                                if let Err(err) = reader.read(&session, batch) {
-                                    read_res = Err(err);
-                                    break;
-                                }
-                            }
-                            (read_res, 0)
-                        }
+                        (None, true) => (reader.read(&session, &spans), 0),
+                        (None, false) => (Ok(()), 0),
                     };
                     let ok = outcome.is_ok();
                     if let Some(observation) = observation {
@@ -226,22 +190,15 @@ impl Reads {
                         "peer read ended"
                     );
                     if let Err(error) = outcome {
-                        let first_batch = batches.first();
-                        let last_batch = batches.last();
                         tracing::warn!(
                             request = request_id,
                             %error,
                             spans = total_spans,
-                            mr_batches = batches.len(),
-                            first_source = first_batch
-                                .and_then(|s| s.sources.first())
-                                .map(|a| format!("{a:#x}")),
-                            first_destination = first_batch
-                                .and_then(|s| s.destinations.first())
-                                .map(|a| format!("{a:#x}")),
-                            last_destination = last_batch
-                                .and_then(|s| s.destinations.last())
-                                .map(|a| format!("{a:#x}")),
+                            first_source = spans.sources.first().map(|a| format!("{a:#x}")),
+                            first_destination =
+                                spans.destinations.first().map(|a| format!("{a:#x}")),
+                            last_destination =
+                                spans.destinations.last().map(|a| format!("{a:#x}")),
                             "peer read failed"
                         );
                     }
@@ -399,12 +356,12 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            batches: vec![Spans {
+            spans: Spans {
                 sources: vec![4],
                 destinations: vec![32],
                 lengths: vec![8],
                 host_bytes: 0,
-            }],
+            },
             push: None,
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
@@ -436,12 +393,12 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            batches: vec![Spans {
+            spans: Spans {
                 sources: vec![4],
                 destinations: vec![32],
                 lengths: vec![8],
                 host_bytes: 0,
-            }],
+            },
             push: Some(push()),
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
@@ -459,14 +416,14 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            batches: Vec::new(),
+            spans: Spans::default(),
             push: Some(push()),
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
     }
 
     #[test]
-    fn push_and_mr_batches_overlap_concurrently() {
+    fn push_and_read_overlap_concurrently() {
         use std::sync::Barrier;
         struct BReader {
             arena: Arena,
@@ -475,12 +432,8 @@ mod tests {
         }
         impl PageReader for BReader {
             fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
-                let mut c = self.calls.lock().unwrap();
-                c.push(spans.lengths.len());
-                if c.len() == 1 {
-                    self.barrier.wait();
-                }
-                drop(c);
+                self.calls.lock().unwrap().push(spans.lengths.len());
+                self.barrier.wait();
                 self.arena.read(session, spans)
             }
         }
@@ -527,24 +480,16 @@ mod tests {
             reads.submit(ReadJob {
                 request_id: "j".into(),
                 session: "s".into(),
-                batches: vec![
-                    Spans {
-                        sources: vec![0],
-                        destinations: vec![24],
-                        lengths: vec![8],
-                        host_bytes: 0,
-                    },
-                    Spans {
-                        sources: vec![8],
-                        destinations: vec![32],
-                        lengths: vec![8],
-                        host_bytes: 0,
-                    },
-                ],
+                spans: Spans {
+                    sources: vec![0, 8],
+                    destinations: vec![24, 32],
+                    lengths: vec![8, 8],
+                    host_bytes: 0,
+                },
                 push: Some(push()),
             });
             assert_eq!(wait_for(&reads), vec![("j".into(), want)]);
-            assert_eq!(*reader.calls.lock().unwrap(), vec![1, 1]);
+            assert_eq!(*reader.calls.lock().unwrap(), vec![2]);
         }
         assert_eq!(arena.read_bytes(24, 8), vec![9; 8]);
         assert_eq!(arena.read_bytes(32, 8), vec![4; 8]);
@@ -561,12 +506,12 @@ mod tests {
             reads.submit(ReadJob {
                 request_id: "r".into(),
                 session: "s".into(),
-                batches: vec![Spans {
+                spans: Spans {
                     sources: vec![1],
                     destinations: vec![2],
                     lengths: vec![8],
                     host_bytes: 0,
-                }],
+                },
                 push: None,
             });
             assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
@@ -608,12 +553,12 @@ mod tests {
         ReadJob {
             request_id: request.into(),
             session: session.into(),
-            batches: vec![Spans {
+            spans: Spans {
                 sources: vec![0],
                 destinations: vec![destination],
                 lengths: vec![8],
                 host_bytes: 0,
-            }],
+            },
             push: None,
         }
     }

@@ -23,7 +23,7 @@
 
 use std::{
     io,
-    os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::fd::{FromRawFd, OwnedFd},
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -295,7 +295,6 @@ pub struct Executor {
     shared: Arc<Shared>,
     pieces: Pieces,
     file_size: u64,
-    file_fd: RawFd,
     max_io_bytes: usize,
     /// The threads and their exit notices; `close` takes them once. The
     /// executor is shared (a Disk tier and its peer pushes submit to it), so
@@ -319,26 +318,6 @@ impl Executor {
         memory: &[(usize, usize)],
         config: ExecutorConfig,
     ) -> Result<Self, StartError> {
-        Self::start_inner(file, memory, config, false)
-    }
-
-    /// Like [`Executor::start`], but forces staging every `O_DIRECT` transfer
-    /// through the anonymous mmap bounce pool (identical to the Ascend
-    /// `VM_PFNMAP`/`VM_IO` `EFAULT` fallback path).
-    pub fn start_bounced(
-        file: DiskFile,
-        memory: &[(usize, usize)],
-        config: ExecutorConfig,
-    ) -> Result<Self, StartError> {
-        Self::start_inner(file, memory, config, true)
-    }
-
-    fn start_inner(
-        file: DiskFile,
-        memory: &[(usize, usize)],
-        config: ExecutorConfig,
-        force_bounce: bool,
-    ) -> Result<Self, StartError> {
         if config.queue_depth == 0 || config.queue_depth > 4096 {
             return Err(StartError::Config("queue_depth must be in [1, 4096]"));
         }
@@ -361,7 +340,6 @@ impl Executor {
             ));
         }
         let pieces = Pieces::new(memory)?;
-        let file_fd = file.raw_fd();
         let file = Arc::new(file);
         let limits = Limits {
             depth: config.queue_depth,
@@ -377,7 +355,6 @@ impl Executor {
             shared: shared.clone(),
             pieces: pieces.clone(),
             file_size: file.size(),
-            file_fd,
             max_io_bytes: config.max_io_bytes,
             lifecycle: Mutex::new(Lifecycle {
                 threads: Vec::new(),
@@ -398,17 +375,9 @@ impl Executor {
         };
         match config.backend {
             Backend::IoUring => {
-                let ring = uring::Ring::new_with_mode(
-                    &file,
-                    &pieces,
-                    config.queue_depth,
-                    config.max_io_bytes,
-                    force_bounce,
-                )
-                .map_err(StartError::Ring)?;
-                if ring.is_bounce() {
-                    shared.set_bounce_active();
-                }
+                let ring =
+                    uring::Ring::new(&file, &pieces, config.queue_depth, config.max_io_bytes)
+                        .map_err(StartError::Ring)?;
                 let (shared, file) = (shared.clone(), file.clone());
                 executor.lifecycle.lock().threads.push(spawn(
                     "ts-disk-uring".to_owned(),
@@ -420,15 +389,12 @@ impl Executor {
                 )?);
             }
             Backend::Psync => {
-                if force_bounce {
-                    shared.set_bounce_active();
-                }
                 let max_io_bytes = config.max_io_bytes;
                 for index in 0..config.queue_depth {
                     let (shared, file) = (shared.clone(), file.clone());
                     executor.lifecycle.lock().threads.push(spawn(
                         format!("ts-disk-io-{index}"),
-                        Box::new(move || psync::run(&shared, &file, max_io_bytes, force_bounce)),
+                        Box::new(move || psync::run(&shared, &file, max_io_bytes)),
                     )?);
                 }
             }
@@ -507,17 +473,6 @@ impl Executor {
     /// so those jobs never report and their memory stays held.
     pub fn broken(&self) -> bool {
         self.shared.queues.lock().broken()
-    }
-
-    /// Whether the backend is currently staging `O_DIRECT` I/O through an
-    /// anonymous `mmap` bounce pool.
-    pub fn uses_bounce_pool(&self) -> bool {
-        self.shared.is_bounce_active()
-    }
-
-    /// Backing file descriptor owned by this executor.
-    pub fn raw_fd(&self) -> RawFd {
-        self.file_fd
     }
 
     /// Cancel what is queued, wait up to `timeout` for what is in flight to

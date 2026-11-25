@@ -149,7 +149,6 @@ fn geometry(base: u64) -> RankGeometry {
             page_stride: PAGE_BYTES,
             bytes: PAGE_BYTES,
         }],
-        device_regions: Vec::new(),
         host: None,
         push: None,
     }
@@ -167,7 +166,6 @@ fn geometry_with_host(base: u64, host_base: u64) -> RankGeometry {
                 block_bytes: PAGE_BYTES,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
-            region_lengths: Vec::new(),
         }),
         ..geometry(base)
     }

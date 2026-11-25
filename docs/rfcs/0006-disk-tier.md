@@ -116,21 +116,27 @@ file and registered memory. It has two backends, chosen explicitly:
 - **psync**: a pool of threads calling `pread`/`pwrite`, for hosts whose
   policy refuses io_uring.
 
-Reads go ahead of writes. Writes pass a token bucket set to the configured
-byte budget, which protects the drive's endurance, and take at most a bounded
-share of the requests in flight. A job reports once, after every request it
-issued retired; neither backend can stop a request the kernel already has, so
-a job's blocks stay held until it reports.
+Reads go ahead of writes; on `io_uring`, read SQEs are tagged best-effort
+priority 0 (`IOPRIO_CLASS_BE`, level 0) and write SQEs best-effort priority 7
+(lowest best-effort level, avoiding idle-class starvation under BFQ or
+mq-deadline). Writes pass a token bucket set to the configured byte budget,
+which protects the drive's endurance, and take at most a bounded share of the
+requests in flight. A job reports once, after every request it issued retired;
+neither backend can stop a request the kernel already has, so a job's blocks
+stay held until it reports.
 
 ### Cleaning
 
 Every plan, if the Host tier's free plus clean capacity is below a watermark,
 the scheduler picks the oldest dirty Host-only entries, in Host eviction
-order, within the operation credits, and writes them to Disk blocks it
-allocates (evicting Disk entries if needed). Cleaning admission can further
-gate writes by minimum entry reuse (`--disk-tier-clean-min-reuse`) and
-minimum prefix length (`--disk-tier-clean-min-tokens`) to curb write
-amplification on one-shot prefixes. The write holds its Host sources
+order, within the operation credits (at most `max(1, max_operations / 4)`
+concurrent write operations, leaving one operation reserved for reads whenever
+`max_operations > 1`), and writes them to Disk blocks it allocates (evicting
+Disk entries if needed). Cleaning admission can further gate writes via the
+`--disk-tier-config` JSON keys `require_reuse_for_cleaning` (boolean; requires
+a Host entry to have been reused before cleaning) and `min_clean_tokens`
+(minimum branch prefix length in tokens) to curb write amplification on
+one-shot or short prefixes. The write holds its Host sources
 and Disk destinations; when every rank retired it, the Disk entries are
 published with the Host entries' metadata (access epoch, logical position,
 boundary kind) and the Host entries become clean. Entries already on Disk, a

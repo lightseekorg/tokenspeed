@@ -182,9 +182,7 @@ def test_the_geometry_addresses_the_bytes_the_cache_holds():
             )
             assert field.address + page * field.page_stride == expected
             assert field.bytes == layout_field.payload_bytes
-    # Both memories are registered for the transfer engine, with explicit region metadata.
-    assert geometry.host.region_lengths == (storage.host_buffer_bytes,)
-    assert geometry.device_regions == ((device.data_ptr(), device.numel()),)
+    # Both memories are registered for the transfer engine.
     assert geometry.regions == (
         (device.data_ptr(), device.numel()),
         (host_base, storage.host_buffer_bytes),
@@ -200,8 +198,6 @@ def test_the_geometry_addresses_the_bytes_the_cache_holds():
         host_storage=storage,
         host_region_planner=lambda length, parent: (2 * parent, length - 2 * parent),
     )
-    assert split_geometry.host.region_lengths == (split_first, split_rest)
-    assert split_geometry.device_regions == ((device.data_ptr(), device.numel()),)
     assert split_geometry.regions == (
         (device.data_ptr(), device.numel()),
         (host_base, split_first),
@@ -310,21 +306,34 @@ def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeou
     assert high.host_ready_timeout_us == 10_000_000
     assert high.lookup_timeout_us == 5_000_000
 
-    # Device landing raises soft_pin floor to max(8.0s, 6.0 * answer_timeout_s)
-    # while leaving host_ready_timeout_us == 0.
+    # Device landing scales soft_pin without raising the 50 ms floor or
+    # exceeding HARD_PIN_S, while leaving host_ready_timeout_us == 0.
     dev_low = peer_scheduler_config(landing_tier="device", answer_timeout_ms=50, **base)
-    assert dev_low.soft_pin_us == 8_000_000
+    assert dev_low.soft_pin_us == 2_200_000
     assert dev_low.host_ready_timeout_us == 0
 
     dev_mid = peer_scheduler_config(
         landing_tier="device", answer_timeout_ms=1000, **base
     )
-    assert dev_mid.soft_pin_us == 8_000_000
+    assert dev_mid.soft_pin_us == 6_000_000
     assert dev_mid.host_ready_timeout_us == 0
 
-    dev = peer_scheduler_config(landing_tier="device", answer_timeout_ms=5000, **base)
-    assert dev.soft_pin_us == 30_000_000
-    assert dev.host_ready_timeout_us == 0
+    dev_high = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=5000, **base
+    )
+    assert dev_high.soft_pin_us == 22_000_000
+    assert dev_high.host_ready_timeout_us == 0
+
+    # Large answer timeouts clamp soft_pin to HARD_PIN_S (30 s) so a Pin never
+    # shortens a lease and RECORD_LIFETIME_S always outlives it.
+    dev_clamped = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=12000, **base
+    )
+    assert dev_clamped.soft_pin_us == 30_000_000 == dev_clamped.hard_pin_us
+    host_clamped = peer_scheduler_config(
+        landing_tier="host", answer_timeout_ms=20000, **base
+    )
+    assert host_clamped.soft_pin_us == 30_000_000 == host_clamped.hard_pin_us
 
 
 @pytest.mark.parametrize(

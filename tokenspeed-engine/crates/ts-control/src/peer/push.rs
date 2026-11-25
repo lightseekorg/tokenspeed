@@ -272,6 +272,7 @@ fn max_inflight_slots_per_job(total_slots: usize) -> usize {
 
 /// The ring's free slots.
 struct Slots {
+    #[cfg(test)]
     total: usize,
     max_per_job: usize,
     free: Mutex<Vec<usize>>,
@@ -312,6 +313,7 @@ impl Slots {
         self.returned.notify_one();
     }
 
+    #[cfg(test)]
     fn free_count(&self) -> usize {
         self.free.lock().len()
     }
@@ -517,6 +519,7 @@ impl Holder {
         let state = Arc::new(HolderState {
             source,
             slots: Slots {
+                #[cfg(test)]
                 total: slots,
                 max_per_job: max_inflight_slots_per_job(slots),
                 free: Mutex::new((0..slots).collect()),
@@ -699,8 +702,8 @@ impl HolderState {
         }
 
         // Pre-validate every item before issuing any disk read or RDMA write,
-        // and group MR-split PushItems by unique `(group, block)` so each Disk
-        // block is read from NVMe once regardless of how many destination MRs
+        // and group PushItems by unique `(group, block)` so each Disk
+        // block is read from NVMe once even if multiple items refer to it.
         // its fields span on the reader.
         struct UniqueBlock<'a> {
             range: ts_l3::Range,
@@ -996,6 +999,7 @@ impl PushEndpoint {
     }
 
     /// `(free, total)` staging-ring slot counts on the active holder, if serving.
+    #[cfg(test)]
     pub fn push_ring_slot_counts(&self) -> Option<(usize, usize)> {
         let holder = self.holder.lock().clone()?;
         let free = holder.state.slots.free_count();
@@ -1003,6 +1007,7 @@ impl PushEndpoint {
     }
 
     /// Number of currently registered active push jobs on the holder.
+    #[cfg(test)]
     pub fn active_push_jobs(&self) -> usize {
         self.holder
             .lock()

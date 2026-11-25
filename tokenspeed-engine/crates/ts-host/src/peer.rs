@@ -88,7 +88,6 @@ pub struct Settings {
     ib_device: String,
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
-    device_regions: Vec<(u64, u64)>,
     host: HostPool,
 }
 
@@ -123,12 +122,8 @@ impl Settings {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let host = geometry.getattr("host")?;
-        let host_address: u64 = host.getattr("address")?.extract()?;
-        let regions: Vec<(usize, usize)> = geometry.getattr("regions")?.extract()?;
-        let region_lengths: Vec<u64> = host.getattr("region_lengths")?.extract()?;
-        let device_regions: Vec<(u64, u64)> = geometry.getattr("device_regions")?.extract()?;
         let host = HostPool {
-            address: host_address,
+            address: host.getattr("address")?.extract()?,
             groups: host
                 .getattr("groups")?
                 .try_iter()?
@@ -142,9 +137,7 @@ impl Settings {
                     })
                 })
                 .collect::<PyResult<Vec<_>>>()?,
-            region_lengths,
         };
-        let protocol: String = settings.getattr("protocol")?.extract()?;
         Ok(Some(Self {
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
@@ -169,11 +162,10 @@ impl Settings {
             push_host: settings.getattr("push_host")?.extract()?,
             library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
             local_ip: settings.getattr("local_ip")?.extract()?,
-            protocol,
+            protocol: settings.getattr("protocol")?.extract()?,
             ib_device: settings.getattr("ib_device")?.extract()?,
-            regions,
+            regions: geometry.getattr("regions")?.extract()?,
             device,
-            device_regions,
             host,
         }))
     }
@@ -231,7 +223,6 @@ pub fn start(
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
-        device_regions: settings.device_regions,
         host: Some(settings.host),
         push: Some(push.name().to_owned()),
     };

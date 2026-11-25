@@ -59,7 +59,7 @@ use ts_scheduler::{
 use crate::{
     codec::{Reader, Writer},
     peer::{
-        geometry::{push_items, read_batches, RankGeometry},
+        geometry::{push_items, read_spans, RankGeometry},
         landing::{Action, Landing, Timeouts},
         net::{Inbound, PeerNet},
         push::PagePusher,
@@ -70,8 +70,6 @@ use crate::{
 };
 
 const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-/// Maximum holder RPCs drained per single `scheduler.lock()` acquisition in `ts-peer-servicer`.
-const MAX_SERVICER_BATCH: usize = 64;
 
 /// What a replica's peer sharing runs with.
 #[derive(Debug, Clone)]
@@ -972,9 +970,8 @@ impl Peer {
             let job = holder
                 .ok_or_else(|| "no layout of the holder".to_owned())
                 .and_then(|holder| {
-                    let (total_read_bytes, batches) =
-                        read_batches(holder, &self.geometry, &read_pages)
-                            .map_err(|error| error.to_string())?;
+                    let spans = read_spans(holder, &self.geometry, &read_pages)
+                        .map_err(|error| error.to_string())?;
                     let push = if disk_pages.is_empty() {
                         None
                     } else {
@@ -988,23 +985,23 @@ impl Peer {
                                 .map_err(|error| error.to_string())?,
                         })
                     };
-                    Ok((holder.session.clone(), total_read_bytes, batches, push))
+                    Ok((holder.session.clone(), spans, push))
                 });
             self.reading.insert(request.clone());
             match job {
-                Ok((session, total_read_bytes, batches, push)) => {
+                Ok((session, spans, push)) => {
                     let observation = self.read_metrics.as_ref().map(|metrics| {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            total_read_bytes + push.as_ref().map_or(0, PushJob::bytes),
+                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(
                         ReadJob {
                             request_id: request.clone(),
                             session,
-                            batches,
+                            spans,
                             push,
                         },
                         observation,
@@ -1070,33 +1067,27 @@ fn start_endpoint(
                 }
             })?
     };
-    // Holder RPC worker: waits for `scheduler.lock()` between control-loop
-    // rounds and batch-drains all queued `Lookup`/`Pin`/`Release` RPCs under
-    // one single lock acquisition before sending replies outside the lock.
+    // Holder RPC worker: answers `Lookup`/`Pin`/`Release` RPCs between
+    // control-loop rounds, releasing `scheduler.lock()` after each RPC so a
+    // burst of probes does not stall the holder's next plan or commit.
     let servicer = {
         let (net, holder) = (Arc::downgrade(&net), holder.clone());
         thread::Builder::new()
             .name("ts-peer-servicer".to_owned())
             .spawn(move || {
-                let mut batch = Vec::new();
                 while let Ok(first) = holder_rx.recv() {
-                    batch.clear();
-                    {
-                        let scheduler = scheduler.lock();
-                        let mut holder = holder.lock();
-                        batch.push(holder.handle(&*scheduler, first, Instant::now()));
-                        while batch.len() < MAX_SERVICER_BATCH {
-                            let Ok(next) = holder_rx.try_recv() else {
-                                break;
-                            };
-                            batch.push(holder.handle(&*scheduler, next, Instant::now()));
-                        }
-                    }
-                    let Some(net) = net.upgrade() else { return };
-                    for (to, reply) in batch.drain(..) {
+                    let mut next = Some(first);
+                    while let Some(request) = next {
+                        let (to, reply) = {
+                            let scheduler = scheduler.lock();
+                            let mut holder = holder.lock();
+                            holder.handle(&*scheduler, request, Instant::now())
+                        };
+                        let Some(net) = net.upgrade() else { return };
                         if let Err(error) = net.reply(&to, &reply) {
                             tracing::warn!(to, %error, "peer reply not sent");
                         }
+                        next = holder_rx.try_recv().ok();
                     }
                 }
             })?
