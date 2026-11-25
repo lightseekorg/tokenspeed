@@ -115,6 +115,13 @@ def _interleave_gate_up_rows(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.stack((gate, up), dim=dim + 1).reshape(shape).contiguous()
 
 
+def _append_filled(t: torch.Tensor, dim: int, extra: int, value: int) -> torch.Tensor:
+    """Append ``extra`` entries of ``value`` to ``t`` along ``dim``."""
+    shape = list(t.shape)
+    shape[dim] = extra
+    return torch.cat([t, t.new_full(shape, value)], dim=dim).contiguous()
+
+
 def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
     original_n = int(w.w2_weight.shape[-2])
     w._w2_logical_n = original_n
@@ -123,37 +130,11 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
 
     n_padded = (original_n + block_n - 1) // block_n * block_n
     extra_n = n_padded - original_n
-    w2_weight = w.w2_weight.data
-    w2_scale = w.w2_weight_scale.data
     w.w2_weight = torch.nn.Parameter(
-        torch.cat(
-            [
-                w2_weight,
-                torch.zeros(
-                    *w2_weight.shape[:-2],
-                    extra_n,
-                    w2_weight.shape[-1],
-                    dtype=w2_weight.dtype,
-                    device=w2_weight.device,
-                ),
-            ],
-            dim=-2,
-        ),
-        requires_grad=False,
+        _append_filled(w.w2_weight.data, -2, extra_n, 0), requires_grad=False
     )
     w.w2_weight_scale = torch.nn.Parameter(
-        torch.cat(
-            [
-                w2_scale,
-                torch.full(
-                    (*w2_scale.shape[:-2], extra_n, w2_scale.shape[-1]),
-                    127,
-                    dtype=w2_scale.dtype,
-                    device=w2_scale.device,
-                ),
-            ],
-            dim=-2,
-        ),
+        _append_filled(w.w2_weight_scale.data, -2, extra_n, 127),
         requires_grad=False,
     )
 
@@ -190,17 +171,12 @@ def _pad_intermediate_to_block_n(
             f"cannot pad W13 N={n} to {n_padded} in whole MXFP4 blocks of the intermediate"
         )
 
-    def pad(t: torch.Tensor, dim: int, extra: int, value: int) -> torch.Tensor:
-        shape = list(t.shape)
-        shape[dim] = extra
-        return torch.cat([t, t.new_full(shape, value)], dim=dim).contiguous()
-
-    w13_weight = pad(w13_weight, -2, n_padded - n, 0)
-    w13_scale = pad(w13_scale, -2, n_padded - n, 127)
+    w13_weight = _append_filled(w13_weight, -2, n_padded - n, 0)
+    w13_scale = _append_filled(w13_scale, -2, n_padded - n, 127)
     if w13_bias is not None:
-        w13_bias = pad(w13_bias, -1, n_padded - n, 0)
-    w2_weight = pad(w2_weight, -1, extra_i // 2, 0)
-    w2_scale = pad(w2_scale, -1, extra_i // _MXFP_BLOCK_SIZE, 127)
+        w13_bias = _append_filled(w13_bias, -1, n_padded - n, 0)
+    w2_weight = _append_filled(w2_weight, -1, extra_i // 2, 0)
+    w2_scale = _append_filled(w2_scale, -1, extra_i // _MXFP_BLOCK_SIZE, 127)
     return w13_weight, w13_scale, w13_bias, w2_weight, w2_scale
 
 
