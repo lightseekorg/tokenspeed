@@ -633,6 +633,11 @@ impl OutputProcessor {
     }
 
     /// Install before admissions; the sink owns no scheduler or device resources.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any request is currently registered. Install the sink before
+    /// admitting requests so every observed admission has its complete lifetime.
     pub fn observe_execution(&mut self, sink: Arc<dyn crate::execution_observation::Sink>) {
         assert!(self.states.is_empty());
         self.execution_sink = Some(sink);
@@ -1564,6 +1569,22 @@ impl OutputProcessor {
     }
 
     /// Commit ordinary results and record execution under their frozen lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommitError::Shape`] or [`CommitError::TokenColumn`] for result
+    /// columns with mismatched lengths, [`CommitError::MissingColumn`] when
+    /// deferred decode state lacks request-end signals, and
+    /// [`CommitError::IncompleteDecodeState`] when an ended request's deferred
+    /// state is incomplete. Request invariants can fail with
+    /// [`CommitError::EmptyDecode`] (no kept decode token),
+    /// [`CommitError::InputLogprobs`] (invalid prompt-logprob positions),
+    /// [`CommitError::PhysicalExtent`] (commit past the physical KV extent),
+    /// [`CommitError::GrammarRejected`] (a sampled token violates the grammar),
+    /// or [`CommitError::BootstrapMismatch`] (prefill and draft tokens disagree).
+    /// These errors make serving unsafe to continue; earlier rows may already
+    /// have been committed. Invalid optional observations instead invalidate
+    /// evidence while preserving ordinary token commit.
     pub fn commit_observed(
         &mut self,
         batch: &ForwardBatchView,

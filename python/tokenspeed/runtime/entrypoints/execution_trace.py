@@ -79,7 +79,29 @@ def request_key(record):
 
 
 class ExecutionTrace:
-    """Closed evidence, with no credit inferred from configuration or time."""
+    """Validate and index closed native execution and cache evidence.
+
+    ``records`` is an iterable of decoded native event dictionaries for the
+    ``EXECUTION`` and ``CACHE`` protocols. Each record supplies ``protocol``,
+    ``event``, ``instance_id``, ``role``, ``dp_rank``, ``physical_rank``,
+    ``scope``, ``record_sequence``, ``publication_order``, ``log_dropped_lines``,
+    and its event-specific fields. Admission events carry ``admission_id`` and
+    ``request_id``; dispatch/completion events carry round and row geometry,
+    and restore events carry operation identity and frozen slot/frontier data.
+
+    Preserve each rank's shared publication order across both protocols and
+    each protocol's contiguous sequence starting at zero. Every rank must have
+    both streams, each bounded by ``trace_started`` and a valid, loss-free
+    ``trace_finished``. Every admission must close after all dispatched rounds
+    complete. Different ranks may be interleaved; timestamps infer no order.
+
+    Index admissions, dispatches, completions, slots, and restore operations
+    while checking lifetimes, row geometry, acceptance counts, and restore joins.
+    Raise ``ValueError`` for unsupported protocols, invalid header or event
+    values, lost/out-of-order records, inconsistent joins, numerical corruption,
+    or missing admission/stream closure. This validates execution evidence;
+    successful output and numerical equality require separate checks.
+    """
 
     def __init__(self, records):
         self.rounds = {}
@@ -387,6 +409,18 @@ class ExecutionTrace:
         return cls(records)
 
     def check_snapshot(self, snapshot):
+        """Reconcile a version-1 cumulative wire snapshot with its native trace.
+
+        ``snapshot`` must satisfy ``validate_snapshot`` and identify a closed
+        admission with the same engine, role, ranks, request ID, admission ID,
+        and origin. Compare both histograms, completed-round count, and committed
+        tokens only through its inclusive ``through_round``; later native rounds
+        may exist. Its assigned-round count cannot exceed the native dispatches.
+
+        Return ``None`` on success. Raise ``ValueError`` for an invalid snapshot,
+        missing closed admission, differing origin, or counts/histograms that
+        disagree with this prefix. A wire snapshot alone does not prove closure.
+        """
         validate_snapshot(snapshot, None)
         if not snapshot["evidence_valid"]:
             raise ValueError("invalid execution snapshot")
