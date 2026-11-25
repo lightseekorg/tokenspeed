@@ -335,6 +335,16 @@ def test_plan_orders_sequences_and_counts_chunks(native_cuda):
         assert plan.cu_chunks.tolist() == chunks.cumsum(0).tolist()
 
 
+@pytest.mark.parametrize("heads", [12, 96])
+def test_plan_rejects_state_other_than_128x128(native_cuda, heads):
+    """The plan's handoff rows and the launch ABI hold 128x128 state only."""
+    inputs, _, bounds, cpu = _inputs("cuda", [33, 67], heads=heads)
+    state = torch.zeros(2, heads, 64, 64, device="cuda")
+    plan = build_kda_prefill_plan(bounds, heads=heads, layers=1)
+    with pytest.raises(ValueError, match="128x128 state"):
+        _actual(inputs, state, bounds, cpu, "v_major", plan)
+
+
 @pytest.mark.parametrize(
     ("lengths", "heads"),
     # Ordinary scan; persistent without and with FP32 handoffs.

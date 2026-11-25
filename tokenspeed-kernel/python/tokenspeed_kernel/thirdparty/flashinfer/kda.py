@@ -237,7 +237,7 @@ def cutedsl_kda_prefill(
         g_raw: BF16 or FP32 raw gate with the same shape as q.
         beta_logits: BF16 [1, capacity, heads] raw beta logits.
         A_log/dt_bias: FP32 per-head decay and per-channel gate bias.
-        initial_state: FP32 [sequences, heads, V, K] gathered cache state.
+        initial_state: FP32 [sequences, heads, 128, 128] gathered cache state.
         cu_seqlens: Device int64 boundaries [sequences + 1]. Live lengths may
             change on replay and their sum may be less than token capacity;
             input rows beyond the live total must be zero, as in the runtime.
@@ -257,6 +257,9 @@ def cutedsl_kda_prefill(
     heads = q.shape[2]
     if plan.heads != heads or plan.cu_chunks.numel() != cu_seqlens.numel():
         raise ValueError("KDA prefill plan was built for another batch shape")
+    # The launch ABI and the plan's handoff rows are sized for 128x128 state.
+    if initial_state.shape[2:] != (128, 128):
+        raise ValueError("CuTe KDA prefill requires a 128x128 state per head")
     sm_count = kda._device_sm_count(q.device)
     can_compile_persistent = (
         heads % 8 == 0 and g_raw.dtype == torch.bfloat16 and -5.0 <= lower_bound < 0

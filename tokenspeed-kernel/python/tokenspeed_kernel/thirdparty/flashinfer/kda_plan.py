@@ -21,7 +21,6 @@
 """Device schedules for FlashInfer's CuTe KDA prefill launch ABIs."""
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -288,9 +287,12 @@ def warm_kda_prefill_plan(heads: int) -> None:
         )
 
 
-@lru_cache(maxsize=None)
 def _sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    # FlashInfer's count sizes the persistent launch; planning with the same
+    # count keeps every worker a resident CTA.
+    from flashinfer.kda_kernels import kda_chunked_bt16 as kda
+
+    return kda._device_sm_count(device)
 
 
 def build_kda_prefill_plan(
