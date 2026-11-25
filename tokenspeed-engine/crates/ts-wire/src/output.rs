@@ -23,6 +23,7 @@
 use crate::{
     codec::Dict,
     error::{Error, Result},
+    request_timing::RequestTiming,
     value::Value,
 };
 
@@ -102,6 +103,8 @@ wire_struct! {
         pub num_resident_tokens: Option<i64> = None,
         /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
         pub num_waiting_uncached_tokens: Option<i64> = None,
+        /// Request timing metadata only on terminal rows; absent on older producers.
+        pub request_timing: Vec<Option<RequestTiming>> = Vec::new(),
     }
 }
 
@@ -160,6 +163,8 @@ pub struct RequestOutput<'a> {
     /// This step's tokens' top-k alternatives, when the request asked for
     /// them.
     pub output_top_logprobs: Option<TopLogprobRows<'a>>,
+    /// The terminal request boundaries, when the producer reports them.
+    pub request_timing: Option<&'a RequestTiming>,
 }
 
 impl BatchTokenIDOutSlim {
@@ -216,6 +221,7 @@ impl BatchTokenIDOutSlim {
                 self.output_token_cumulative_probs_val.len(),
             ),
             ("reasoning_tokens", self.reasoning_tokens.len()),
+            ("request_timing", self.request_timing.len()),
         ];
         if let Some((name, found)) = optional
             .iter()
@@ -247,6 +253,7 @@ impl BatchTokenIDOutSlim {
             Some((values.get(i)?.as_slice(), ids.get(i)?.as_slice())).filter(|(v, _)| !v.is_empty())
         }
         Ok((0..len).map(move |i| RequestOutput {
+            request_timing: self.request_timing.get(i).and_then(Option::as_ref),
             rid: &rids[i],
             output_ids: &self.output_ids[i],
             finish_reason: Some(self.finished_reasons[i].as_str()).filter(|r| !r.is_empty()),

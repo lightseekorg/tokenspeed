@@ -3506,3 +3506,17 @@ unusable State checkpoint eligible for an optimistic storage query.
 Query/GET still requires all Full, State and window
 objects; diverging prompts therefore cannot reuse a checkpoint solely because
 they share a group or boundary length.
+
+## Deferred recurrent state workspace
+
+Deferred GDN payloads are execution workspace, rather than a cache group:
+they never enter prefix matching, tier storage, retraction images or PD
+transfers. Two batch-sized banks retain replay inputs until the next forward
+consumes them or materializes dropouts. Only the small slot/generation records
+are slot state, owned by `GdnPendingState` through `SlotStateExporter`.
+Export and import reject records that still name a pending payload.
+
+The runtime retires replay before reading or reusing its old State block or
+request slot. It materializes the state at a request exit to cover published
+checkpoints and snapshots. Until then the bank and live block together
+describe the logical frontier. This adds no State slot or cache span.

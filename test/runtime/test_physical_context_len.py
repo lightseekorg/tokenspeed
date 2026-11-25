@@ -28,11 +28,14 @@ tripwire that guards the one-lingering-step assumption, and the startup warning
 for a RoPE table the pad runs past.
 """
 
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
 
 from tokenspeed.runtime.utils.server_args import _SPEC_OVERSHOOT_SPANS, ServerArgs
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 spec_context_pad = ServerArgs.spec_context_pad.fget
 
@@ -87,7 +90,8 @@ class TestRopeTableWarning:
         # The colorful logger does not propagate; let caplog see its records.
         monkeypatch.setattr(module.logger, "propagate", True)
         model_config = SimpleNamespace(
-            hf_text_config=SimpleNamespace(max_position_embeddings=4096)
+            hf_text_config=SimpleNamespace(max_position_embeddings=4096),
+            is_draft_worker=False,
         )
 
         def warn(model, physical):
@@ -100,7 +104,9 @@ class TestRopeTableWarning:
 
     def test_tables_are_assumed_to_end_at_the_derived_context(self, warning):
         model = object()
-        assert "Lower --max-model-len by at least 48" in warning(model, 4096 + 48)
+        message = warning(model, 4096 + 48)
+        assert "4096 positions of the target model's rope tables" in message
+        assert "Lower --max-model-len by at least 48" in message
         assert warning(model, 4096) == ""
 
     def test_a_model_that_sizes_its_table_is_checked_against_it(self, warning):

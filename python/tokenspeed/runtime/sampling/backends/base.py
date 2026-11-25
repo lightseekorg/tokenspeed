@@ -493,6 +493,11 @@ class SamplingBackend(ABC):
             "vocab-shard sampling to warm"
         )
 
+    def reads_sparse_draft_q(self) -> bool:
+        """Whether ``verify`` reads DFlash2's sparse ``RuntimeStates.future_draft_q``
+        rather than the dense ``RuntimeStates.draft_probs`` rows."""
+        return False
+
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits
         but each row's argmax, which they then take from

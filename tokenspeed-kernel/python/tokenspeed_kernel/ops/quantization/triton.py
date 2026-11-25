@@ -2054,3 +2054,55 @@ register_triton_warmup(
     _fp8_group32_ue8m0_quantize_swizzled,
     variants=({"GROUPS": (4, 16, 32, 64)},),
 )
+
+
+@triton.jit
+def _dequantize_fp8_block(
+    q,
+    scales,
+    out,
+    size,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    SN: tl.constexpr,
+    SK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    col = index % K
+    row = index // K % N
+    expert = index // (N * K)
+    code = tl.load(q + index, index < size, other=0.0).to(tl.float32)
+    scale = tl.load(
+        scales + (expert * SN + row // 128) * SK + col // 128, index < size, other=0.0
+    )
+    tl.store(out + index, (code * scale).to(tl.bfloat16), index < size)
+
+
+@register_kernel(
+    "quantization",
+    "dequantize_fp8_block",
+    name="triton_dequantize_fp8_block",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures("x", "dense", (torch.float8_e4m3fn,)),
+    features={"batch_invariant", "cuda_graph"},
+    priority=Priority.REFERENCE,
+)
+def triton_dequantize_fp8_block(codes, scales):
+    """Decode E4M3 block weights through an FP32 product into temporary BF16."""
+    out = torch.empty(codes.shape, dtype=torch.bfloat16, device=codes.device)
+    n, k = codes.shape[-2:]
+    if out.numel():
+        _dequantize_fp8_block[(triton.cdiv(out.numel(), 1024),)](
+            codes,
+            scales,
+            out,
+            out.numel(),
+            n,
+            k,
+            (n + 127) // 128,
+            (k + 127) // 128,
+            1024,
+        )
+    return out

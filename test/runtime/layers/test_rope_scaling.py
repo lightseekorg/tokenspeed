@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import math
+from functools import partial
+from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 import torch
@@ -43,6 +45,8 @@ from tokenspeed.runtime.layers.rotary_embedding import (
     get_rope,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 HEAD_SIZE = 128
 ROTARY_DIM = 64
@@ -292,3 +296,37 @@ class TestDeepseekYarnDeviceDefault:
         expected = "npu" if current_platform().is_npu else "cuda"
         assert rope.device == expected
         assert rope.cos_sin_cache.device.type == expected
+
+
+def test_deepseek_yarn_cache_position_limit(fresh_rope_cache, monkeypatch):
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(
+            rotary_module,
+            "DeepseekScalingRotaryEmbedding",
+            partial(DeepseekScalingRotaryEmbedding, device="cpu"),
+        )
+    monkeypatch.setitem(global_server_args_dict, "yarn_ramp_mask_device", "cpu")
+    monkeypatch.setitem(global_server_args_dict, "yarn_frequency_device", "cpu")
+    scaling = {
+        "type": "deepseek_yarn",
+        "original_max_position_embeddings": 17,
+        "factor": 1.5,
+    }
+    full = _get_rope(scaling)
+    assert full.cos_sin_cache.shape[0] == 26  # arange(25.5)
+    for limit in (1, 9, 26, 32):
+        bounded = _get_rope(scaling, cache_position_limit=limit)
+        assert (bounded is full) == (limit >= full.cos_sin_cache.shape[0])
+        assert bounded is _get_rope(scaling, cache_position_limit=limit)
+        assert torch.equal(bounded.cos_sin_cache, full.cos_sin_cache[:limit])
+    for limit in (0, -1, True, 1.0, 1.5):
+        with pytest.raises(
+            ValueError, match="cache_position_limit must be a positive integer"
+        ):
+            _get_rope(scaling, cache_position_limit=limit)
+
+
+@pytest.mark.parametrize("scaling", [None, {"rope_type": "linear", "factor": 2.0}])
+def test_cache_position_limit_rejects_unsupported_scaling(scaling):
+    with pytest.raises(ValueError, match="only supported for deepseek_yarn"):
+        _get_rope(scaling, cache_position_limit=8)

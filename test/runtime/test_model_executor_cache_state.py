@@ -232,11 +232,13 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter(spec_num_tokens=4)
+    executor.forward_step = SimpleNamespace(draft_overlap=None)
     executor.tree_spec = None
     executor.dspark_context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
+        valid_cache_lengths=torch.zeros(1, dtype=torch.int32),
         mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
         vocab_size=32,
     )

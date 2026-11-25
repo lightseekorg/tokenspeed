@@ -1164,6 +1164,9 @@ impl EngineMetrics {
 pub struct KvTransferMetrics {
     labels: [String; 2],
     latency: Metric,
+    handoffs: Metric,
+    prefill_handoff: Metric,
+    decode_wait: Metric,
     size_bytes: Metric,
     request_size_bytes: Metric,
     timeouts: Metric,
@@ -1174,8 +1177,28 @@ impl KvTransferMetrics {
     /// The metrics for `model_name` / `app_key`, exported through `exporter`.
     pub fn new(exporter: &Arc<Exporter>, model_name: &str, app_key: &str) -> Self {
         let names = ["model_name", "app_key"];
+        let handoff_duration = |name, help| {
+            Metric::histogram(
+                exporter,
+                name,
+                help,
+                &names,
+                &[
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0,
+                ],
+            )
+        };
         Self {
             labels: [model_name.to_owned(), app_key.to_owned()],
+            handoffs: Metric::counter(
+                exporter, "tokenspeed:kv_handoffs",
+                "Registered prefill rooms reaching a replica-agreed terminal state, once per request.",
+                &["model_name", "app_key", "outcome"],
+            ),
+            prefill_handoff: handoff_duration("tokenspeed:prefill_kv_handoff_seconds",
+                "Final prompt handoff on prefill to replica-agreed successful transfer retirement."),
+            decode_wait: handoff_duration("tokenspeed:decode_kv_wait_seconds",
+                "Decode landing manifest submission to replica-agreed complete KV arrival."),
             latency: Metric::histogram(
                 exporter,
                 "tokenspeed:kv_transfer_latency_seconds",
@@ -1213,6 +1236,24 @@ impl KvTransferMetrics {
                 &names,
             ),
         }
+    }
+
+    /// One terminal handoff, emitted by the prefill replica's first member.
+    pub fn record_handoff(&self, outcome: &'static str) {
+        self.handoffs
+            .inc(&[&self.labels[0], &self.labels[1], outcome], 1.0);
+    }
+
+    /// Successful handoff duration, excluding compute before the final chunk.
+    pub fn observe_prefill_handoff(&self, seconds: f64) {
+        self.prefill_handoff
+            .observe(&[&self.labels[0], &self.labels[1]], seconds);
+    }
+
+    /// Wait for a request's complete KV after decode issued its manifest.
+    pub fn observe_decode_kv_wait(&self, seconds: f64) {
+        self.decode_wait
+            .observe(&[&self.labels[0], &self.labels[1]], seconds);
     }
 
     /// One send's wall time.
