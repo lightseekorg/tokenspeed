@@ -158,6 +158,52 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
     )
 
 
+def _pad_intermediate_to_block_n(
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_bias: torch.Tensor | None,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Zero-pad the expert intermediate size so W13's N (2 * I) is block_n-aligned.
+
+    The dispatch (W13) GEMM reads W without a per-element N mask, preshuffled
+    or not: an intermediate size whose 2 * I is not a multiple of block_n
+    (DeepSeek V4.1 Flash at MoE TP8: I = 2304 / 8 = 288, N = 576) reads past
+    the weight and faults. Takes the gate/up-interleaved W13 rows
+    ``[E, 2I, H/2]`` / scales ``[E, 2I, H/32]`` / bias ``[E, 2I]`` and the down
+    weight ``[E, H, I/2]`` / scales ``[E, H, I/32]``; appends zero gate/up row
+    pairs and zero down columns (scales 127 = 2^0). A zero gate gives a zero
+    SwiGLU output (silu(0) = 0) whatever up, alpha, beta or the clamp are, and
+    the padded down columns are zero, so the MoE output is unchanged. Padding
+    whole 32-wide MXFP4 blocks leaves the intermediate's existing activation
+    blocks (and their scales) as they were.
+    """
+    n = int(w13_weight.shape[-2])
+    n_padded = (n + block_n - 1) // block_n * block_n
+    if n_padded == n:
+        return w13_weight, w13_scale, w13_bias, w2_weight, w2_scale
+    extra_i = (n_padded - n) // 2
+    if (n_padded - n) % 2 or extra_i % _MXFP_BLOCK_SIZE:
+        raise ValueError(
+            f"cannot pad W13 N={n} to {n_padded} in whole MXFP4 blocks of the intermediate"
+        )
+
+    def pad(t: torch.Tensor, dim: int, extra: int, value: int) -> torch.Tensor:
+        shape = list(t.shape)
+        shape[dim] = extra
+        return torch.cat([t, t.new_full(shape, value)], dim=dim).contiguous()
+
+    w13_weight = pad(w13_weight, -2, n_padded - n, 0)
+    w13_scale = pad(w13_scale, -2, n_padded - n, 127)
+    if w13_bias is not None:
+        w13_bias = pad(w13_bias, -1, n_padded - n, 0)
+    w2_weight = pad(w2_weight, -1, extra_i // 2, 0)
+    w2_scale = pad(w2_scale, -1, extra_i // _MXFP_BLOCK_SIZE, 127)
+    return w13_weight, w13_scale, w13_bias, w2_weight, w2_scale
+
+
 def shuffle_weight_for_gluon_dot_layout(
     w: torch.Tensor,
     *,
@@ -344,6 +390,35 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         w2_weight_bias = w.w2_weight_bias.to(torch.float32)
         w._gluon_w2_bias_is_zero = not bool(torch.count_nonzero(w2_weight_bias).item())
         w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+
+    (
+        w13_weight_data,
+        w13_weight_scale_data,
+        w13_bias_data,
+        w2_weight_data,
+        w2_weight_scale_data,
+    ) = _pad_intermediate_to_block_n(
+        w13_weight.data,
+        w13_weight_scale.data,
+        w.w13_weight_bias.data if hasattr(w, "w13_weight_bias") else None,
+        w.w2_weight.data,
+        w.w2_weight_scale.data,
+        _GLUON_COMBINE_BLOCK_N,
+    )
+    if w13_weight_data is not w13_weight.data:
+        w._gluon_logical_intermediate_size = int(w13_weight.shape[-2]) // 2
+        w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
+        w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale_data, requires_grad=False
+        )
+        _release_parameter(w, "w13_weight")
+        _release_parameter(w, "w13_weight_scale")
+        if w13_bias_data is not None:
+            w.w13_weight_bias = torch.nn.Parameter(w13_bias_data, requires_grad=False)
+        w.w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
+        w.w2_weight_scale = torch.nn.Parameter(
+            w2_weight_scale_data, requires_grad=False
+        )
 
     num_warps = 8
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(

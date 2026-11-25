@@ -65,6 +65,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_precomputed_mxfp4_fused_moe,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
+    _pad_intermediate_to_block_n,
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
@@ -312,6 +313,121 @@ def test_dynamic_mxfp4_activation_moe(
                 partial * topk_weights[token, slot].to(torch.bfloat16)
             ).float()
 
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_pad_intermediate_to_block_n_appends_zero_gate_up_pairs() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20261125)
+    raw = make_mxfp4_moe_weights(
+        num_experts=2, hidden_size=256, intermediate_size=288, generator=generator
+    )
+    bias = torch.randn(2, 576, device="cuda", generator=generator)
+    w13, w13_scale, w13_bias, w2, w2_scale = _pad_intermediate_to_block_n(
+        raw["w13_weight"],
+        raw["w13_scale"],
+        bias,
+        raw["w2_weight"],
+        raw["w2_scale"],
+        128,
+    )
+    # I = 288 -> 320: W13 N 576 -> 640, down K 288 -> 320 (packed 144 -> 160).
+    assert w13.shape == (2, 640, 128) and w13_scale.shape == (2, 640, 8)
+    assert w13_bias.shape == (2, 640) and w2.shape == (2, 256, 160)
+    assert w2_scale.shape == (2, 256, 10)
+    torch.testing.assert_close(w13[:, :576], raw["w13_weight"], atol=0, rtol=0)
+    torch.testing.assert_close(w2[..., :144], raw["w2_weight"], atol=0, rtol=0)
+    assert not w13[:, 576:].any() and not w13_bias[:, 576:].any()
+    assert not w2[..., 144:].any() and bool((w2_scale[..., 9:] == 127).all())
+    assert bool((w13_scale[:, 576:] == 127).all())
+    # Aligned shapes (TP4's I = 576) pass through untouched.
+    aligned = make_mxfp4_moe_weights(
+        num_experts=1, hidden_size=256, intermediate_size=576, generator=generator
+    )
+    out = _pad_intermediate_to_block_n(
+        aligned["w13_weight"],
+        aligned["w13_scale"],
+        None,
+        aligned["w2_weight"],
+        aligned["w2_scale"],
+        128,
+    )
+    assert out[0] is aligned["w13_weight"] and out[3] is aligned["w2_weight"]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 6, 96, 4096])
+def test_dynamic_mxfp4_precomputed_moe_unaligned_intermediate(num_tokens: int) -> None:
+    """I = 288 (DeepSeek V4.1 Flash MoE at TP8): W13 N = 576 is not a multiple of
+    the kernel's block_n 128; it faulted before the preprocess padded it."""
+    if not is_cdna4():
+        pytest.skip("Dynamic MXFP4 activation is unavailable on this GPU")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261125)
+    num_experts, hidden_size, intermediate_size, top_k = 8, 256, 288, 2
+    raw = make_mxfp4_moe_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        generator=generator,
+    )
+    module = _make_dynamic_mxfp4_moe_module(raw)
+    assert module._gluon_logical_intermediate_size == intermediate_size
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda", generator=generator)[:top_k]
+            for _ in range(num_tokens)
+        ]
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        (num_tokens, top_k), dtype=torch.float32, device="cuda", generator=generator
+    )
+    actual = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        expert_start=0,
+        global_num_experts=num_experts,
+        do_finalize=True,
+        x_quantized=None,
+        out_dtype=torch.bfloat16,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        swiglu_beta=0.0,
+        out=None,
+    )
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+
+    hidden = _dequantize_dynamic_mxfp4(hidden_states).float()
+    w13 = dequantize_mxfp4(raw["w13_weight"], raw["w13_scale"]).float()
+    w2 = dequantize_mxfp4(raw["w2_weight"], raw["w2_scale"]).float()
+    expected = torch.zeros(
+        (num_tokens, hidden_size), dtype=torch.float32, device="cuda"
+    )
+    for expert in range(num_experts):
+        token, slot = (topk_ids == expert).nonzero(as_tuple=True)
+        if token.numel() == 0:
+            continue
+        gate_up = hidden[token] @ w13[expert].T
+        gate = gate_up[:, 0::2].to(torch.bfloat16)
+        linear = gate_up[:, 1::2].to(torch.bfloat16)
+        inter = (gate.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+        inter = _dequantize_dynamic_mxfp4((inter * linear).to(torch.bfloat16)).float()
+        partial = (inter @ w2[expert].T).to(torch.bfloat16)
+        expected.index_add_(
+            0,
+            token,
+            (partial * topk_weights[token, slot, None].to(torch.bfloat16)).float(),
+        )
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
 
 
