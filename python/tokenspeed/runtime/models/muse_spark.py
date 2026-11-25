@@ -1828,6 +1828,38 @@ class MuseSparkMoE(nn.Module):
             ),
         )
         self.expert_quant_kind = self.experts._quant_kind
+        # Under --decode-monokernel with expert parallelism over the attention
+        # TP8 group, the regular path runs these EP experts and the decode
+        # monokernel reads a second, MoE TP8 copy of the experts (each rank's
+        # intermediate slice of all of them), the only split it serves. The
+        # copy costs about one TP8 expert shard of memory per GPU. The first
+        # and the last layer keep the regular path and take no copy.
+        self.monokernel_experts: MoELayer | None = None
+        if (
+            config.decode_monokernel
+            and self.quantized_experts
+            and 0 < layer_id < config.num_hidden_layers - 1
+            and self.tp_size == 1
+            and self.ep_size == mapping.attn.tp_size > 1
+            and mapping.attn.tp_group == mapping.moe.tp_ep_group
+            and not self.exchanges_rank_local_rows
+        ):
+            self.monokernel_experts = MoELayer(
+                top_k=self.topk,
+                num_experts=self.num_experts,
+                hidden_size=compressed_size,
+                intermediate_size=config.moe_intermediate_size,
+                quant_config=quant_config,
+                layer_index=layer_id,
+                prefix=add_prefix("monokernel_experts", prefix),
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                ep_rank=0,
+                ep_size=1,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                requires_deferred_finalize=True,
+            )
         if self.quantized_experts and self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
             raise ValueError(
                 "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
@@ -3777,6 +3809,60 @@ def shard_expert_projection(
     return loaded_weight.narrow(dim, tp_rank * width, width)
 
 
+def _load_monokernel_expert(
+    params: dict[str, torch.nn.Parameter],
+    moe: MuseSparkMoE,
+    name: str,
+    parameter_name: str,
+    loaded_weight: torch.Tensor,
+    expert_id: int | None,
+    half: int | None,
+) -> None:
+    """Load a checkpoint expert tensor into ``moe.monokernel_experts``, the
+    MoE TP8 copy the decode monokernel reads under EP: every expert, this
+    rank's intermediate slice. ``expert_id`` is None for a tensor that holds
+    every expert (``half`` is then None too)."""
+    copy = moe.monokernel_experts
+    copy_name = parameter_name.replace(".mlp.experts.", ".mlp.monokernel_experts.", 1)
+    parameter = params.get(copy_name)
+    if parameter is None:
+        raise ValueError(f"checkpoint tensor '{name}' has no parameter '{copy_name}'")
+    if parameter_name.endswith("_input_scale"):
+        load_expert_input_scale(parameter, loaded_weight, 0)
+        return
+    if expert_id is None:
+        gate_up = ".w13_" in parameter_name
+        if parameter_name.endswith(("_weight", "_weight_scale")):
+            loaded_weight = shard_expert_projection(
+                loaded_weight,
+                parameter,
+                copy.tp_rank,
+                copy.tp_size,
+                gate_up=gate_up,
+                fused_gate_up=gate_up,
+            )
+        default_weight_loader(parameter, loaded_weight)
+        return
+    target = parameter.data[expert_id]
+    if half is not None:
+        rows = target.shape[0] // 2
+        target = target.narrow(0, half * rows, rows)
+    loaded_weight = shard_expert_projection(
+        loaded_weight,
+        target,
+        copy.tp_rank,
+        copy.tp_size,
+        gate_up=half is not None,
+        fused_gate_up=False,
+    )
+    if target.shape != loaded_weight.shape:
+        raise ValueError(
+            f"checkpoint tensor '{name}' has shape {tuple(loaded_weight.shape)}; "
+            f"expected {tuple(target.shape)} in '{copy_name}'"
+        )
+    target.copy_(loaded_weight)
+
+
 def _iris_unprepared(mapping: Mapping, backend, group) -> str | None:
     """Why Muse's Iris collectives cannot be prepared for ``group`` on
     ``backend``, or None when they can."""
@@ -4308,6 +4394,16 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if per_expert is not None:
                 parameter_name, expert_id, half = per_expert
                 moe = self.model.layers[_layer_id(parameter_name)].mlp
+                if moe.monokernel_experts is not None:
+                    _load_monokernel_expert(
+                        params,
+                        moe,
+                        name,
+                        parameter_name,
+                        loaded_weight,
+                        expert_id,
+                        half,
+                    )
                 local_expert = expert_id - moe.expert_start
                 if not 0 <= local_expert < moe.experts_per_rank:
                     continue
@@ -4353,6 +4449,10 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 continue
             if ".mlp.experts." in parameter_name:
                 moe = self.model.layers[_layer_id(parameter_name)].mlp
+                if moe.monokernel_experts is not None:
+                    _load_monokernel_expert(
+                        params, moe, name, parameter_name, loaded_weight, None, None
+                    )
                 if parameter_name.endswith("_input_scale"):
                     load_expert_input_scale(parameter, loaded_weight, moe.expert_start)
                     continue

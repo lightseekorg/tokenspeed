@@ -44,8 +44,11 @@ other's. A draft model that taps the residual entering a layer
 (``layers_to_capture``) gets the whole row there: the fused run before that
 layer gathers it, as before a regular layer.
 
-The served MoE split is MoE TP8 / EP1: each rank holds its slice of every
-expert, which the kernel reads in place. Other splits keep the regular path.
+The kernel reads MoE TP8 experts: each rank's slice of every expert. At MoE
+TP8 / EP1 it reads the layer's experts in place; at EP8 (MoE TP1) each served
+layer keeps a MoE TP8 copy of its experts for it
+(``MuseSparkMoE.monokernel_experts``), and the regular path runs the EP8
+experts. Other splits keep the regular path.
 
 The launch boundary: rank ``r`` keeps hidden columns ``1024 r ..`` of the
 FP32 residual and the whole BF16 attention input of the next layer (normed by
@@ -124,7 +127,10 @@ KERNEL_CONSTANTS = {
 
 # Why a layer has no monokernel. The startup report groups layers by these.
 BOUNDARY_LAYER = "the first and last layers hand over to the embedding and LM head"
-NOT_TP8 = "attention and MoE are not one TP8 group with MoE TP8 / EP1"
+NOT_TP8 = (
+    "attention and MoE are not one TP8 group with MoE TP8 / EP1, or EP8 with "
+    "a MoE TP8 expert copy"
+)
 OTHER_SHAPES = "model dimensions other than the kernel's"
 OTHER_CONSTANTS = "model constants other than the kernel's"
 NOT_BF16 = "a dense projection or norm gain is not BF16"
@@ -166,13 +172,24 @@ def _experts(experts: torch.nn.Module) -> tuple[object, ...]:
     )
 
 
+def _served_experts(mlp: torch.nn.Module) -> torch.nn.Module | None:
+    """The MoE TP8 experts the kernel reads: the layer's own at MoE TP8 / EP1,
+    its TP8 copy under EP8, else None."""
+    copy = getattr(mlp, "monokernel_experts", None)
+    if copy is not None:
+        return copy
+    return mlp.experts if (mlp.tp_size, mlp.ep_size) == (WORLD, 1) else None
+
+
 def model_reasons(config, mapping) -> list[str]:
     """Why no layer of a Muse Spark backbone with ``config`` (its
     ``MuseSparkConfig``) and ``mapping`` can have a monokernel."""
     reasons = []
     if not (
         mapping.attn.tp_size == WORLD
-        and (mapping.moe.tp_size, mapping.moe.ep_size) == (WORLD, 1)
+        # Under EP8 each served layer keeps a MoE TP8 copy of its experts
+        # (``MuseSparkMoE.monokernel_experts``) for the kernel.
+        and (mapping.moe.tp_size, mapping.moe.ep_size) in ((WORLD, 1), (1, WORLD))
         and mapping.attn.tp_group == mapping.moe.tp_ep_group
         and mapping.pp_size == 1
     ):
@@ -250,7 +267,10 @@ def prepare_layer(model: torch.nn.Module, index: int) -> FusedDecodeLayer | list
         return kv_reasons(attn.attn)
     if not mlp.quantized_experts:
         return [NOT_SUPPORTED_EXPERTS]
-    experts = _experts(mlp.experts)
+    experts_module = _served_experts(mlp)
+    if experts_module is None:
+        return [NOT_TP8]
+    experts = _experts(experts_module)
     _, o, pool, post = dense
     # The fused projection may hold every rank's rows (rank major, for large
     # batches); the kernel reads this rank's q | k | v | gate rows.
@@ -284,7 +304,7 @@ def _pack(model, index, window, qkvg, o, pool, post, gains, experts):
             "router_bias": mlp.gate.e_score_correction_bias.data,
             "pool": pool,
             "experts": experts,
-            "experts_kernel": mlp.experts.plan["apply_kernel_name"],
+            "experts_kernel": _served_experts(mlp).plan["apply_kernel_name"],
             "pre_exp_gain": pre_exp_gain,
             "pen_gain": pen_gain,
             "post": post,

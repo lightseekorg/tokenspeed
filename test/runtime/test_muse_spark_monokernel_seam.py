@@ -283,14 +283,16 @@ def _mapping(moe_tp: int, moe_ep: int) -> Mapping:
     )
 
 
-def test_muse_spark_open_at_tp8_ep1_has_monokernels() -> None:
-    assert model_reasons(_config(), _mapping(8, 1)) == []
+@pytest.mark.parametrize("moe_tp, moe_ep", [(8, 1), (1, 8)])
+def test_muse_spark_open_at_tp8_or_ep8_has_monokernels(moe_tp, moe_ep) -> None:
+    """At EP8 each served layer keeps a MoE TP8 copy of its experts for the
+    kernel."""
+    assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == []
 
 
-@pytest.mark.parametrize("moe_tp, moe_ep", [(1, 8), (4, 2), (2, 4)])
+@pytest.mark.parametrize("moe_tp, moe_ep", [(4, 2), (2, 4)])
 def test_other_moe_splits_keep_the_regular_path(moe_tp, moe_ep) -> None:
-    """Only MoE TP8 / EP1 is served: on a TP1 / EP8 server a rank holds whole
-    experts, not the slice of every expert that the kernel reads."""
+    """Only MoE TP8 / EP1 and EP8 are served."""
     assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == [NOT_TP8]
 
 
