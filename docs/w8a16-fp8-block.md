@@ -13,14 +13,19 @@ Each quantized matrix has a `.weight` tensor in `float8_e4m3fn` and a
 The loader preserves codes and scales. Immediately before GEMM, the decoder
 multiplies them in FP32 and rounds once to BF16. Activations and the selected
 GEMM remain BF16. No persistent decoded weight or regenerated encoding is kept.
+The Linear method has quantized storage, so fast paths requiring an ordinary
+unquantized BF16 weight do not accept it.
 Merged projections and tensor-parallel shards require block-aligned boundaries.
 The numerical GEMM policy remains explicit through the existing kernel planner.
+The `rl-bitwise` envelope requires a batch-invariant BF16 GEMM implementation;
+when none is registered for the device and shape, layer construction fails.
 MoE execution requires a registered kernel advertising `w8a16_fp8_block`;
 unsupported backends fail selection.
 
 Complete online updates must include both codes and scales. Models using this
 format must validate loaded operands after a complete update and preserve
 canonical storage through memory release/resume. The runtime tests cover dense
-reloads; the kernel tests cover irregular shapes, expert batches and graph replay
-with changed codes/scales. Model providers own their numerical and lifecycle
-acceptance tests.
+reloads and numerical-policy admission. The shared kernel tests cover irregular
+shapes, expert batches beyond int32 element offsets and graph replay with changed
+codes/scales on supported GPU vendors. Model providers own their numerical and
+lifecycle acceptance tests.

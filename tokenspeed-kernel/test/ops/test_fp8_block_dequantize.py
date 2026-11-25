@@ -75,3 +75,24 @@ def test_rejects_malformed_scale_storage(scales):
     q = torch.ones((256, 256), device="cuda").to(torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="128x128 FP32"):
         dequantize_fp8_block(q, scales.cuda())
+
+
+def test_expert_offsets_beyond_int32():
+    # The last expert begins at 2**31 elements, where an int32 offset wraps.
+    n = k = 128
+    experts = 2**31 // (n * k) + 1
+    elements = experts * n * k
+    if torch.cuda.mem_get_info()[0] < 3 * elements + (1 << 30):
+        pytest.skip("requires 7 GiB of free GPU memory")
+    codes = torch.empty((experts, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.ones((experts, 1, 1), device="cuda", dtype=torch.float32)
+    # Only initialize and compare the far expert; avoid a multi-GiB reference.
+    tail = (torch.randn((n, k), device="cuda") * 20).to(torch.float8_e4m3fn)
+    codes[-1].copy_(tail)
+    scales[-1].fill_(0.37)
+    expected = (tail.float() * scales[-1]).bfloat16()
+
+    actual = dequantize_fp8_block(codes, scales)
+
+    assert torch.equal(actual[-1].view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(codes[-1].view(torch.uint8), tail.view(torch.uint8))

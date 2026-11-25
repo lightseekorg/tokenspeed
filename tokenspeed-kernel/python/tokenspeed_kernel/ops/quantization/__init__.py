@@ -1075,6 +1075,3 @@ def dequantize_fp8_block(codes: torch.Tensor, scales: torch.Tensor) -> torch.Ten
         solution=None,
     )
     return kernel(codes, scales)
-
-
-from tokenspeed_kernel.ops.quantization import fp8_block as _fp8_block

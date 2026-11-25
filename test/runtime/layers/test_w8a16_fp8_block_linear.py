@@ -22,14 +22,44 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.w8a16_fp8_block import W8A16Fp8BlockConfig
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_linear_preserves_storage_across_updates():
+@pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+def test_linear_preserves_storage_across_updates(monkeypatch, numerics):
+    monkeypatch.setitem(global_server_args_dict, "numerics", numerics)
+    # A device without a batch-invariant BF16 GEMM must reject this envelope.
+    requires_unavailable_plan = False
+    if numerics == "rl-bitwise":
+        try:
+            plan_dense_gemm(
+                mode="mm",
+                input_size=256,
+                output_size=256,
+                dtype=torch.bfloat16,
+                batch_size=None,
+                batch_invariant=True,
+            )
+        except NoKernelFoundError:
+            requires_unavailable_plan = True
     with torch.device("cuda"):
+        if requires_unavailable_plan:
+            with pytest.raises(NoKernelFoundError, match="batch_invariant"):
+                ReplicatedLinear(
+                    256,
+                    256,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=W8A16Fp8BlockConfig(ignored_layers=[]),
+                    prefix="ffn",
+                )
+            return
         layer = ReplicatedLinear(
             256,
             256,
@@ -56,6 +86,9 @@ def test_linear_preserves_storage_across_updates():
         expected = mm(x, expected_weight, plan=layer.quant_method.kernel_plan)
         actual, _ = layer(x)
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        if numerics == "rl-bitwise":
+            single, _ = layer(x[:1])
+            assert torch.equal(single.view(torch.int16), actual[:1].view(torch.int16))
         assert [p.data_ptr() for p in layer.parameters()] == addresses
         assert all(p.dtype != torch.bfloat16 for p in layer.parameters())
         assert torch.equal(layer.weight.view(torch.uint8), q.view(torch.uint8))

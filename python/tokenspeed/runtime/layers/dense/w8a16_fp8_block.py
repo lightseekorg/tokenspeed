@@ -24,15 +24,18 @@ import torch
 from tokenspeed_kernel.ops.gemm import mm, plan_dense_gemm
 from tokenspeed_kernel.ops.quantization import dequantize_fp8_block
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
-from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-class W8A16Fp8BlockLinearMethod(UnquantizedLinearMethod):
+class W8A16Fp8BlockLinearMethod(LinearMethodBase):
     """Keep codes/scales resident; own no persistent BF16 weight copy."""
 
     def __init__(self, quant_config):
-        super().__init__()
+        self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        self.kernel_plan = None
         self.quant_config = quant_config
         self._storage = Fp8LinearMethod(quant_config)
 
