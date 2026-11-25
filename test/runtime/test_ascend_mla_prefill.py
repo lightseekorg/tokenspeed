@@ -525,8 +525,6 @@ def _prefill_cache_and_backend(monkeypatch):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
-    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -565,12 +563,19 @@ def _prefill_cache_and_backend(monkeypatch):
         "rank": 0,
     }
     pool = MLATokenToKVPool(**kwargs)
+    return pool, _mla_backend(degree=1)
+
+
+def _mla_backend(*, degree):
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
     spec = MLAConfig(
-        backend_name=None,
-        num_attention_heads=2,
+        backend_name="tokenspeed_mla",
+        num_attention_heads=2 * degree,
         num_kv_heads=1,
         head_dim=576,
-        attn_tp_size=1,
+        attn_tp_size=degree,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
@@ -586,9 +591,27 @@ def _prefill_cache_and_backend(monkeypatch):
         context_len=512,
         max_bs=4,
         max_resident_requests=4,
+        kvp_size=degree,
+        kvp_group=tuple(range(degree)),
         components=(spec,),
     )
-    return pool, AscendMLABackend(config, spec, kernel_page_size=128)
+    return AscendMLABackend(config, spec, kernel_page_size=128)
+
+
+@pytest.mark.parametrize("degree", [1, 8])
+def test_ascend_mla_binds_arena_geometry(monkeypatch, degree):
+    pytest.importorskip("torch_npu")
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "numerics", "fast")
+    backend = _mla_backend(degree=degree)
+    for count in (65, 129):
+        backend.configure_runtime(
+            block_granularity=256, virtual_block_count=count, shard_count=degree
+        )
+        assert backend._decode_metadata.virtual_block_count == count
+        expected = CachePlacement(256, count, tuple(range(degree)), 0)
+        assert backend.cache_placement(None) == (expected if degree > 1 else None)
 
 
 @pytest.mark.parametrize("engine", ["null", "prefill", "decode"])

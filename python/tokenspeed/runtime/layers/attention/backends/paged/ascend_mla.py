@@ -224,10 +224,9 @@ class AscendMLABackend(AscendQCPPrefillBackend, MLAAttnBackend):
             begin % self.kernel_page_size : begin % self.kernel_page_size + end - begin
         ]
 
-    def configure_runtime(
-        self, *, block_granularity, virtual_block_count, shard_count, **kwargs
-    ):
-        super().configure_runtime(**kwargs)
+    def _configure_cache_geometry(
+        self, *, block_granularity: int, virtual_block_count: int, shard_count: int
+    ) -> None:
         if shard_count != self._dcp.degree:
             raise ValueError("MLA cache sharding and DCP group disagree")
         self._placement = CachePlacement(
