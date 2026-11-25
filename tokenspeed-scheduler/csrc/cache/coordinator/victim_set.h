@@ -21,16 +21,12 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <memory_resource>
 #include <vector>
 
 #include "cache/core/cache_block_ref.h"
-#include "cache/coordinator/eviction_policy.h"
-#include "cache/coordinator/gds_trace.h"
 
 namespace tokenspeed {
-struct TieredGdsPlan;
 
 // Device blocks an admission or restore plan evicts together, in the order
 // they leave: one block, or, when the coordinator evicts by segments, a
@@ -52,11 +48,6 @@ struct VictimSet {
     // Dependency plans already describe their whole loss. An implicit tail
     // cascade would release capacity and recovery points absent from the plan.
     bool exact_removal{false};
-    double gds_watermark{0};
-    GdsEvictionStats gds_stats;
-    GdsTrace gds_trace;
-    std::vector<ContentHash> fresh_rejections;
-    std::shared_ptr<const TieredGdsPlan> tiered;
 };
 
 }  // namespace tokenspeed

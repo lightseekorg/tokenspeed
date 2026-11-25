@@ -209,7 +209,7 @@ protected:
     void Fill() {
         while (device.NumEmptyLcmBlocks() > 0) pins.push_back(device.AcquireBlock(0));
     }
-    std::optional<std::vector<VictimSet>> Plan(std::int64_t count) {
+    std::optional<PlannedEviction> Plan(std::int64_t count) {
         auto& store = CacheCoordinatorTestAccess::Store(cache);
         CacheEvictionPlan capacity{device, store.Groups()};
         AdmissionCandidateConstraints constraints{&arena};
@@ -221,9 +221,9 @@ protected:
     bool Holds(const Point& point) {
         return cache.GroupPrefixIndex(1).Contains(device, CacheKey{.group_id = 1, .content_hash = point.Hash()});
     }
-    std::size_t Blocks(const std::vector<VictimSet>& plan) {
+    std::size_t Blocks(const PlannedEviction& plan) {
         std::size_t count = 0;
-        for (const auto& set : plan) count += set.members.size();
+        for (const auto& set : plan.victims) count += set.members.size();
         return count;
     }
 };
@@ -247,7 +247,7 @@ TEST_F(GdsEviction, SharedPrefixChangesTheSizeWithoutRefreshingTheStamp) {
     auto second = Plan(1);
     ASSERT_TRUE(second);
     EXPECT_EQ(Blocks(*second), 5u);
-    EXPECT_DOUBLE_EQ(second->front().gds_watermark, 0.8);
+    EXPECT_DOUBLE_EQ(second->gds->stats.watermark, 0.8);
 }
 
 TEST_F(GdsEviction, EvictsMiddleStateWithoutDiscardingSharedKV) {
@@ -269,8 +269,8 @@ TEST_F(GdsEviction, EvictsMiddleStateWithoutDiscardingSharedKV) {
     ASSERT_TRUE(plan);
     ASSERT_EQ(Blocks(*plan), 1u);
     const auto choice =
-        std::ranges::find(plan->front().gds_trace, GdsScoreObservation::Cause::kEviction, &GdsScoreObservation::cause);
-    ASSERT_NE(choice, plan->front().gds_trace.end());
+        std::ranges::find(plan->gds->trace, GdsScoreObservation::Cause::kEviction, &GdsScoreObservation::cause);
+    ASSERT_NE(choice, plan->gds->trace.end());
     EXPECT_EQ(choice->hash, r6.Hash());
     EXPECT_EQ(choice->tokens, 24);
     EXPECT_EQ(choice->fallback_tokens, 16);
@@ -288,7 +288,7 @@ TEST_F(GdsEviction, EvictsMiddleStateWithoutDiscardingSharedKV) {
     auto after = Plan(1);
     ASSERT_TRUE(after);
     EXPECT_EQ(Blocks(*after), 5u);
-    EXPECT_DOUBLE_EQ(after->front().gds_watermark, 2.8);
+    EXPECT_DOUBLE_EQ(after->gds->stats.watermark, 2.8);
     // Reproducing the middle state interns the existing KV identities.
     pins.clear();
     Publish(r6);
@@ -296,7 +296,49 @@ TEST_F(GdsEviction, EvictsMiddleStateWithoutDiscardingSharedKV) {
     auto republished = Plan(1);
     ASSERT_TRUE(republished);
     EXPECT_EQ(Blocks(*republished), 3u);
-    EXPECT_DOUBLE_EQ(republished->front().gds_watermark, 2 + 2.0 / 3);
+    EXPECT_DOUBLE_EQ(republished->gds->stats.watermark, 2 + 2.0 / 3);
+}
+
+TEST_F(GdsEviction, MovedPlansCommitEachLogicalDecisionOnceAcrossSeveralBlocks) {
+    const Point parent{16}, child{32};
+    Publish(parent);
+    Publish(child);
+    Use(parent);
+    Use(child);
+    Fill();
+    {
+        auto discarded = Plan(1);
+        ASSERT_TRUE(discarded);
+        auto moved = std::move(*discarded);
+        discarded.reset();
+    }
+    EXPECT_TRUE(Holds(parent));
+    EXPECT_TRUE(Holds(child));
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 0);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 0u);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0);
+
+    auto selected = Plan(1);
+    ASSERT_TRUE(selected);
+    auto moved = std::move(*selected);
+    selected.reset();
+    CacheCoordinatorTestAccess::CommitVictims(cache, moved);
+    EXPECT_TRUE(Holds(parent));
+    EXPECT_FALSE(Holds(child));
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 5);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 1u);
+    EXPECT_EQ(cache.GdsStats().evicted_units, 1u);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0.8);
+
+    Fill();
+    auto next = Plan(1);
+    ASSERT_TRUE(next);
+    CacheCoordinatorTestAccess::CommitVictims(cache, *next);
+    EXPECT_FALSE(Holds(parent));
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 5);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 2u);
+    EXPECT_EQ(cache.GdsStats().evicted_units, 2u);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0.8);
 }
 
 TEST_F(GdsEviction, UnpublishedMiddleCheckpointChangesScoringWithoutMutatingTheIndex) {
@@ -326,12 +368,12 @@ TEST_F(GdsEviction, UnpublishedMiddleCheckpointChangesScoringWithoutMutatingTheI
     auto plan = PlanGdsEviction(store, constraints, demand, capacity, &arena);
     ASSERT_TRUE(plan);
     EXPECT_EQ(Blocks(*plan), 3u);
-    EXPECT_DOUBLE_EQ(plan->front().gds_watermark, 2 + 2.0 / 3);
+    EXPECT_DOUBLE_EQ(plan->gds->stats.watermark, 2 + 2.0 / 3);
     EXPECT_FALSE(Holds(r6));
     EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 2);
     EXPECT_EQ(store.RecoveryDependencies().GetStats().points, before.points);
     EXPECT_EQ(store.RecoveryDependencies().GetStats().route_updates, before.route_updates);
-    for (const auto& set : *plan)
+    for (const auto& set : plan->victims)
         for (const auto& member : set.members) EXPECT_FALSE(constraints.protected_locations.contains(member.location));
     demand[1].any_bucket_blocks = 64;
     CacheEvictionPlan impossible{device, store.Groups()};
@@ -439,7 +481,7 @@ TEST_F(GdsEviction, FailedPressureAndReadOnlyProbesDoNotChangeTheCache) {
     }
     auto plan = Plan(1);
     ASSERT_TRUE(plan);
-    EXPECT_DOUBLE_EQ(plan->front().gds_watermark, 0.8);
+    EXPECT_DOUBLE_EQ(plan->gds->stats.watermark, 0.8);
 }
 
 TEST_F(GdsEviction, PinnedStateCannotBeUsedToFundCapacity) {
@@ -549,7 +591,7 @@ TEST_F(GdsEviction, MultipleBranchVictimsUpdateSharedRangeCapacity) {
     auto plan = Plan(11);
     ASSERT_TRUE(plan);
     EXPECT_EQ(Blocks(*plan), 15u);
-    EXPECT_DOUBLE_EQ(plan->front().gds_watermark, 0.8);
+    EXPECT_DOUBLE_EQ(plan->gds->stats.watermark, 0.8);
     CacheCoordinatorTestAccess::CommitVictims(cache, *plan);
     EXPECT_FALSE(Holds(shared));
     EXPECT_FALSE(Holds(left));
@@ -707,7 +749,10 @@ TEST_F(GdsWriteBack, WriteBackBecomesRecoverableOnlyAfterAckAndKeepsDeviceSource
     Fill();
     auto plan = Plan(1);
     ASSERT_TRUE(plan);
-    CacheCoordinatorTestAccess::CommitVictims(cache, *plan);
+    auto moved = std::move(*plan);
+    plan.reset();
+    CacheCoordinatorTestAccess::CommitVictims(cache, moved);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 1u);
     EXPECT_EQ(device.NumEmptyLcmBlocks(), 1);
     auto op = transfers.StartEvictionStores();
     ASSERT_TRUE(op);
@@ -731,6 +776,7 @@ TEST_F(GdsWriteBack, WriteBackBecomesRecoverableOnlyAfterAckAndKeepsDeviceSource
     transfers.CompleteWriteBack(suffix->op_id);
     EXPECT_EQ(cache.Prober().ProbePrefix(r8.hashes).host.num_common_tokens, 32);
     EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 2u);
 }
 
 TEST_F(GdsWriteBack, AdmissionPreviewPreservesTheNewPointDuringRequiredMigration) {
@@ -1027,12 +1073,15 @@ TEST_F(GdsWriteBack, HostOnlyPressureUsesTheSameLogicalRetentionDecision) {
     while (host.NumEmptyLcmBlocks()) host_pins.push_back(host.AcquireBlock(0));
     const std::array<std::uint32_t, 1> groups{1};
     const std::array<std::int32_t, 1> buckets{0};
+    const auto before = cache.GdsStats();
     auto allocated = cache.Host().AcquireHostBlocks(groups, buckets);
     ASSERT_EQ(allocated.blocks.size(), 1u);
     EXPECT_TRUE(allocated.blocks[0]);
     EXPECT_EQ(cache.Prober().ProbePrefix(point.hashes).host.num_common_tokens, 0);
     EXPECT_EQ(cache.GdsStats().logical_evictions, 1u);
     EXPECT_GT(cache.GdsStats().host_watermark, 0);
+    EXPECT_EQ(cache.GdsStats().committed_plans, before.committed_plans + 1);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), before.watermark);
 }
 
 TEST_F(GdsWriteBack, FailedJointPlanLeavesResidencyAndWatermarksUntouched) {
@@ -1182,7 +1231,7 @@ TEST_F(GdsWriteBack, CompactionMayRemoveADuplicateButNeverTheLastRoute) {
     }
     auto safe = PlanTieredCompaction(store, constraints, state, &arena);
     ASSERT_TRUE(safe);
-    CacheCoordinatorTestAccess::CommitVictims(cache, std::span{&*safe, 1});
+    CacheCoordinatorTestAccess::CommitVictims(cache, *safe);
     EXPECT_FALSE(Holds(point));
     EXPECT_EQ(cache.Prober().ProbePrefix(point.hashes).host.num_common_tokens, 16);
     EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);

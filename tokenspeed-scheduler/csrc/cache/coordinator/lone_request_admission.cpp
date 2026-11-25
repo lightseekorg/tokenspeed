@@ -92,9 +92,9 @@ public:
     // a slot the retry reclaims as the request's own: the candidate pass
     // excludes those through AdmissionCandidateConstraints, so a compaction never clears
     // them either.
-    std::optional<VictimSet> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                            const AdmissionCandidateConstraints& constraints,
-                                            AdmissionSelectionState& selection) const {
+    std::optional<PlannedEviction> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                  const AdmissionCandidateConstraints& constraints,
+                                                  AdmissionSelectionState& selection) const {
         if (!groups_[group_id].Index().UnpinnedKeyAt(pool_, location) ||
             constraints.protected_locations.contains(location) ||
             constraints.request_reclaim_locations.contains(location)) {
@@ -114,7 +114,9 @@ public:
         _assert(std::ranges::find(expanded->set.members, location, &VictimSet::Member::location) !=
                     expanded->set.members.end(),
                 "a victim set holds the candidate it was chosen for");
-        return std::move(expanded->set);
+        PlannedEviction result;
+        result.victims.push_back(std::move(expanded->set));
+        return result;
     }
 
 protected:
@@ -483,7 +485,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 std::size_t member{0};
                 CacheBlockLocation destination;
                 // The cache entry at the destination and what it takes along.
-                std::optional<VictimSet> clearing;
+                std::optional<PlannedEviction> clearing;
             };
             std::vector<Move> moves;
             std::vector<CacheBlockLocation> reserved;
@@ -512,7 +514,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                         if (!store.DevicePool().IsOccupied(candidate)) {
                             return Move{.destination = candidate};
                         }
-                        if (std::optional<VictimSet> clearing =
+                        if (std::optional<PlannedEviction> clearing =
                                 planner.PlanBlockAlone(group_id, candidate, constraints, selection)) {
                             return Move{.destination = candidate, .clearing = std::move(clearing)};
                         }
@@ -574,7 +576,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 Member& member = members[i][move.member];
                 if (move.clearing && store.DevicePool().IsOccupied(move.destination)) {
                     evictor.EvictPlanned(
-                        std::span{&*move.clearing, 1}, write_back,
+                        *move.clearing, write_back,
                         CacheEvictor::VictimReasons{.victim = &CacheEvictor::DeviceEvictionStats::compaction,
                                                     .stranded_suffix = &CacheEvictor::DeviceEvictionStats::compaction,
                                                     .request_reclaim = &CacheEvictor::DeviceEvictionStats::compaction});

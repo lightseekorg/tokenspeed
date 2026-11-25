@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
             auto plan = planAdmission(store, CheckpointAging{}, cache.Prober().ProbePrefix({}), demand, std::nullopt,
                                       std::nullopt, {}, {}, write_back);
             FatalCheck(plan.has_value(), "benchmark pressure plan fits");
-            for (const auto& set : plan->victims) victims += set.members.size();
+            for (const auto& set : plan->eviction.victims) victims += set.members.size();
         }
         if (repeat >= 2)
             timings.push_back(

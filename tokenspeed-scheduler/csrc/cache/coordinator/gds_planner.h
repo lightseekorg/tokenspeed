@@ -27,15 +27,15 @@
 
 #include "cache/coordinator/admission_candidates.h"
 #include "cache/coordinator/eviction_plan.h"
-#include "cache/coordinator/victim_set.h"
+#include "cache/coordinator/planned_eviction.h"
 
 namespace tokenspeed {
 
 // All state is plan-local. A failed preview changes neither residency nor the
 // GDS watermark. Real group/bucket placement remains CacheEvictionPlan's job.
-std::optional<std::vector<VictimSet>> PlanGdsEviction(const CacheStore& store,
-                                                      const AdmissionCandidateConstraints& constraints,
-                                                      std::span<const BlockPlacementDemand> demands,
-                                                      CacheEvictionPlan& capacity, std::pmr::memory_resource* resource);
+std::optional<PlannedEviction> PlanGdsEviction(const CacheStore& store,
+                                               const AdmissionCandidateConstraints& constraints,
+                                               std::span<const BlockPlacementDemand> demands,
+                                               CacheEvictionPlan& capacity, std::pmr::memory_resource* resource);
 
 }  // namespace tokenspeed

@@ -296,9 +296,7 @@ std::vector<CacheEvictor::UnevictedVictim> CacheEvictor::EvictPlanned(std::span<
     std::vector<UnevictedVictim> unevicted;
     VictimPrefetch prefetch{victims, store_.Groups(), store_.DevicePool()};
     for (const VictimSet& set : victims) {
-        if (set.tiered) prepareTieredPlan(*set.tiered);
-        for (const auto& hash : set.fresh_rejections) store_.Checkpoints().RejectFreshProduction(hash);
-        EvictedSegment* segment = write_back && !set.tiered ? &evicted_segments_.emplace_back() : nullptr;
+        EvictedSegment* segment = write_back ? &evicted_segments_.emplace_back() : nullptr;
         for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
             prefetch.Advance();
             DeviceEvictionCounts DeviceEvictionStats::*reason = is_request_reclaim   ? reasons.request_reclaim
@@ -316,17 +314,25 @@ std::vector<CacheEvictor::UnevictedVictim> CacheEvictor::EvictPlanned(std::span<
             }
         }
     }
-    for (const VictimSet& set : victims) {
-        if (set.tiered) {
-            store_.Checkpoints().CommitWatermark(set.tiered->stats.watermark);
-            store_.Checkpoints().CommitHostWatermark(set.tiered->stats.host_watermark);
-            store_.CommitGdsStats(set.tiered->stats);
-            CommitGdsTrace(set.tiered->trace);
-        } else if (set.exact_removal) {
-            store_.Checkpoints().CommitWatermark(set.gds_watermark);
-            store_.CommitGdsStats(set.gds_stats);
-            CommitGdsTrace(set.gds_trace);
-        }
+    return unevicted;
+}
+
+std::vector<CacheEvictor::UnevictedVictim> CacheEvictor::EvictPlanned(const PlannedEviction& plan, bool write_back,
+                                                                      const VictimReasons& reasons) {
+    if (!plan.gds) return EvictPlanned(plan.victims, write_back, reasons);
+    const auto& commit = *plan.gds;
+    if (commit.tiered) prepareTieredPlan(*commit.tiered);
+    for (const auto& hash : commit.fresh_rejections) store_.Checkpoints().RejectFreshProduction(hash);
+    auto unevicted = EvictPlanned(plan.victims, write_back && !commit.tiered, reasons);
+    if (commit.tiered) {
+        store_.Checkpoints().CommitWatermark(commit.tiered->stats.watermark);
+        store_.Checkpoints().CommitHostWatermark(commit.tiered->stats.host_watermark);
+        store_.CommitGdsStats(commit.tiered->stats);
+        CommitGdsTrace(commit.tiered->trace);
+    } else {
+        store_.Checkpoints().CommitWatermark(commit.stats.watermark);
+        store_.CommitGdsStats(commit.stats);
+        CommitGdsTrace(commit.trace);
     }
     return unevicted;
 }

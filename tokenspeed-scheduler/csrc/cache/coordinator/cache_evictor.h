@@ -40,7 +40,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_store.h"
-#include "cache/coordinator/victim_set.h"
+#include "cache/coordinator/planned_eviction.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
@@ -270,6 +270,10 @@ public:
     // an admission's, a restore's, a compaction's or a cache clear's victims;
     // it prefetches for the victims a few places ahead (hints only).
     std::vector<UnevictedVictim> EvictPlanned(std::span<const VictimSet> victims, bool write_back,
+                                              const VictimReasons& reasons);
+    // GDS prepares reservations and fresh rejections before Device removal,
+    // then commits the plan's watermarks and diagnostics once afterward.
+    std::vector<UnevictedVictim> EvictPlanned(const PlannedEviction& plan, bool write_back,
                                               const VictimReasons& reasons);
     // Device eviction of a planned or flushed victim, with its cascade (its
     // tail's companions or, for a page's KV block or one State group's

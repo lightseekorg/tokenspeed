@@ -669,13 +669,13 @@ TEST(AdmissionPlanner, RepeatedPlansReturnIndependentDecisionsWithoutChangingThe
     auto second = planner.Plan(&second_resource);
     ASSERT_TRUE(first);
     ASSERT_TRUE(second);
-    ASSERT_EQ(first->victims.size(), 1u);
-    ASSERT_EQ(second->victims.size(), 1u);
-    ASSERT_EQ(first->victims[0].members.size(), 1u);
-    ASSERT_EQ(second->victims[0].members.size(), 1u);
-    EXPECT_EQ(first->victims[0].members[0].location, second->victims[0].members[0].location);
-    first->victims.clear();
-    EXPECT_EQ(second->victims[0].members.size(), 1u);
+    ASSERT_EQ(first->eviction.victims.size(), 1u);
+    ASSERT_EQ(second->eviction.victims.size(), 1u);
+    ASSERT_EQ(first->eviction.victims[0].members.size(), 1u);
+    ASSERT_EQ(second->eviction.victims[0].members.size(), 1u);
+    EXPECT_EQ(first->eviction.victims[0].members[0].location, second->eviction.victims[0].members[0].location);
+    first->eviction.victims.clear();
+    EXPECT_EQ(second->eviction.victims[0].members.size(), 1u);
     EXPECT_EQ(request[0].NumBlocks(), 0);
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }

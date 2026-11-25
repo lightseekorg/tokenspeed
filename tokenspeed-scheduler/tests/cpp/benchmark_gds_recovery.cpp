@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
         demands[1].any_bucket_blocks = demand_count;
         auto plan = PlanGdsEviction(store, constraints, demands, capacity, &arena);
         FatalCheck(plan.has_value(), "benchmark pressure plan fits");
-        for (const auto& victim : *plan)
+        for (const auto& victim : plan->victims)
             for (const auto& member : victim.members)
                 checksum += static_cast<std::uint64_t>(member.location.lcm_block_id);
         if (repeat >= 2) timings.push_back(micros(begin));

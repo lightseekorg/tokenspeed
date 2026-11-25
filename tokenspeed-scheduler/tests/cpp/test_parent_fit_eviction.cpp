@@ -126,7 +126,7 @@ std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> CopyInsOf(const 
 
 std::vector<std::vector<Member>> VictimsOf(const AdmissionPlan& plan) {
     std::vector<std::vector<Member>> victims;
-    for (const VictimSet& set : plan.victims) {
+    for (const VictimSet& set : plan.eviction.victims) {
         std::vector<Member>& members = victims.emplace_back();
         for (const VictimSet::Member& member : set.members) {
             members.emplace_back(member.group_id, member.location.lcm_block_id, member.location.slot_index,

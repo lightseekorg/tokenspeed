@@ -607,20 +607,21 @@ private:
 };
 }  // namespace
 
-std::vector<VictimSet> TieredVictims(std::shared_ptr<const TieredGdsPlan> plan, std::pmr::memory_resource* resource) {
-    std::vector<VictimSet> result;
-    auto& set = result.emplace_back(resource);
+PlannedEviction TieredVictims(std::shared_ptr<const TieredGdsPlan> plan, std::pmr::memory_resource* resource) {
+    PlannedEviction result;
+    auto& set = result.victims.emplace_back(resource);
     set.exact_removal = true;
     for (const auto& member : plan->device_removals)
         set.members.push_back({member.group, member.location, false, member.request_reclaim});
-    set.tiered = std::move(plan);
+    result.gds = std::make_unique<GdsEvictionCommit>();
+    result.gds->tiered = std::move(plan);
     return result;
 }
 
-std::optional<std::vector<VictimSet>> PlanTieredDeviceEviction(const CacheStore& store,
-                                                               const AdmissionCandidateConstraints& constraints,
-                                                               std::span<const BlockPlacementDemand> demands,
-                                                               std::pmr::memory_resource* resource) {
+std::optional<PlannedEviction> PlanTieredDeviceEviction(const CacheStore& store,
+                                                        const AdmissionCandidateConstraints& constraints,
+                                                        std::span<const BlockPlacementDemand> demands,
+                                                        std::pmr::memory_resource* resource) {
     ProfileSpan profile_span{"Gds::TieredPlanAttempt"};
     Planner planner{store, &constraints};
     if (!planner.FitDevice(demands)) return std::nullopt;
@@ -628,13 +629,13 @@ std::optional<std::vector<VictimSet>> PlanTieredDeviceEviction(const CacheStore&
     return result;
 }
 
-std::optional<VictimSet> PlanTieredCompaction(const CacheStore& store, const AdmissionCandidateConstraints& constraints,
-                                              const CacheKey& key, std::pmr::memory_resource* resource) {
+std::optional<PlannedEviction> PlanTieredCompaction(const CacheStore& store,
+                                                    const AdmissionCandidateConstraints& constraints,
+                                                    const CacheKey& key, std::pmr::memory_resource* resource) {
     ProfileSpan profile_span{"Gds::TieredPlanAttempt"};
     Planner planner{store, &constraints};
     if (!planner.ReleaseDeviceCopy(key)) return std::nullopt;
-    auto sets = TieredVictims(planner.Finish(), resource);
-    return std::move(sets.front());
+    return TieredVictims(planner.Finish(), resource);
 }
 
 TieredHostAllocation PlanTieredHostAllocation(const CacheStore& store, std::span<const std::uint32_t> groups,

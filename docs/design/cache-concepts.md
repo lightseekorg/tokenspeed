@@ -3615,6 +3615,16 @@ Rolled-back trials discard their observations. This trace and the existing
 peer estimation-error histogram support attribution without introducing
 per-prefix Prometheus labels or a permanent decision journal.
 
+Physical victim sets carry only their members and removal semantics.
+`PlannedEviction` owns GDS commit metadata once per plan; LRU selections
+allocate none. Moving or abandoning a selection has no cache side effects.
+Commit prepares required Host reservations and records fresh rejection before
+Device removal, then applies the plan's watermarks, statistics and trace once.
+Host-only plans still commit even when they remove no Device blocks.
+The member arena outlives the selected sets, and each compaction retains its
+own plan through placement. Selection order, cascades and write-back segment
+boundaries remain the planners' decisions.
+
 `--prefix-cache-evict-policy lru` retains legacy Device and Host retention and
 segment policies. `gds` requires State groups and explicit finite prefill
 cost coefficients D > 0, E >= 0. It shares logical retention across Device

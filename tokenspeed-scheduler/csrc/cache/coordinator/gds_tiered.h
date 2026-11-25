@@ -28,7 +28,7 @@
 
 #include "cache/coordinator/admission_candidates.h"
 #include "cache/coordinator/cache_store.h"
-#include "cache/coordinator/victim_set.h"
+#include "cache/coordinator/planned_eviction.h"
 
 namespace tokenspeed {
 // The complete transaction, including Host capacity needed before Device reuse.
@@ -66,15 +66,16 @@ struct HostCleaningCandidate {
 // Stop at the write budget without expanding the remaining candidate paths.
 void VisitGdsHostCleaningCandidates(const CacheStore& store, const std::function<bool(HostCleaningCandidate)>& visit);
 
-std::vector<VictimSet> TieredVictims(std::shared_ptr<const TieredGdsPlan> plan, std::pmr::memory_resource* resource);
-std::optional<std::vector<VictimSet>> PlanTieredDeviceEviction(const CacheStore& store,
-                                                               const AdmissionCandidateConstraints& constraints,
-                                                               std::span<const BlockPlacementDemand> demands,
-                                                               std::pmr::memory_resource* resource);
+PlannedEviction TieredVictims(std::shared_ptr<const TieredGdsPlan> plan, std::pmr::memory_resource* resource);
+std::optional<PlannedEviction> PlanTieredDeviceEviction(const CacheStore& store,
+                                                        const AdmissionCandidateConstraints& constraints,
+                                                        std::span<const BlockPlacementDemand> demands,
+                                                        std::pmr::memory_resource* resource);
 // Compaction cannot choose an arbitrary logical victim to clear a fixed slot.
 // Only a duplicate or an orphan may be removed at that destination.
-std::optional<VictimSet> PlanTieredCompaction(const CacheStore& store, const AdmissionCandidateConstraints& constraints,
-                                              const CacheKey& key, std::pmr::memory_resource* resource);
+std::optional<PlannedEviction> PlanTieredCompaction(const CacheStore& store,
+                                                    const AdmissionCandidateConstraints& constraints,
+                                                    const CacheKey& key, std::pmr::memory_resource* resource);
 // A segment ends at the given exclusive row. With prefix=false a rejected
 // segment does not prevent a later one, in another bucket, from being placed.
 TieredHostAllocation PlanTieredHostAllocation(const CacheStore& store, std::span<const std::uint32_t> groups,

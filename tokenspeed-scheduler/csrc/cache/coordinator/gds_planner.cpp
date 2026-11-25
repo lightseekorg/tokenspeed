@@ -54,16 +54,15 @@ struct Unit {
 };
 }  // namespace
 
-std::optional<std::vector<VictimSet>> PlanGdsEviction(const CacheStore& store,
-                                                      const AdmissionCandidateConstraints& constraints,
-                                                      std::span<const BlockPlacementDemand> demands,
-                                                      CacheEvictionPlan& capacity,
-                                                      std::pmr::memory_resource* resource) {
+std::optional<PlannedEviction> PlanGdsEviction(const CacheStore& store,
+                                               const AdmissionCandidateConstraints& constraints,
+                                               std::span<const BlockPlacementDemand> demands,
+                                               CacheEvictionPlan& capacity, std::pmr::memory_resource* resource) {
     ProfileSpan profile_span{"Gds::PlanAttempt"};
     if (store.HostPool()) {
         auto result = PlanTieredDeviceEviction(store, constraints, demands, resource);
         if (result)
-            for (const auto& set : *result)
+            for (const auto& set : result->victims)
                 for (const auto& member : set.members) capacity.Remove(member.group_id, member.location);
         return result;
     }
@@ -348,21 +347,21 @@ std::optional<std::vector<VictimSet>> PlanGdsEviction(const CacheStore& store,
             return store.GroupIsState(components[a].group);
         return a < b;
     });
-    std::vector<VictimSet> result;
+    PlannedEviction result;
     for (auto c : selected) {
-        auto& set = result.emplace_back(resource);
+        auto& set = result.victims.emplace_back(resource);
         set.exact_removal = true;
-        set.gds_watermark = watermark;
         set.members.push_back({components[c].group, components[c].location, false, components[c].reclaim});
     }
-    if (!result.empty()) {
+    if (!result.victims.empty()) {
         stats.watermark = watermark;
         stats.committed_plans = 1;
         stats.planning_nanoseconds =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-        result.front().fresh_rejections = std::move(fresh_rejections);
-        result.front().gds_stats = stats;
-        result.front().gds_trace = std::move(trace);
+        result.gds = std::make_unique<GdsEvictionCommit>();
+        result.gds->fresh_rejections = std::move(fresh_rejections);
+        result.gds->stats = stats;
+        result.gds->trace = std::move(trace);
     }
     return result;
 }

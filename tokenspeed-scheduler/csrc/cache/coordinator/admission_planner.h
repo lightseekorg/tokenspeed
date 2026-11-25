@@ -44,7 +44,7 @@
 #include "cache/coordinator/group_geometry.h"
 #include "cache/coordinator/gds_planner.h"
 #include "cache/coordinator/shadow_occupancy.h"
-#include "cache/coordinator/victim_set.h"
+#include "cache/coordinator/planned_eviction.h"
 #include "cache/core/block_placement_demand.h"
 #include "core/profile_span.h"
 #include "utils.h"
@@ -63,9 +63,9 @@ struct CopyInReservation {
 struct AdmissionPlan {
     PrefixProbe prefix;
     // Own all member storage through commit, after the planner has died.
-    // Declared before victims so their views die before the arena does.
+    // Declared before eviction so its members die before the arena does.
     std::unique_ptr<std::pmr::monotonic_buffer_resource> member_resource;
-    std::vector<VictimSet> victims;
+    PlannedEviction eviction;
     // Per group, the copy-in blocks the admission reserves, in slot order
     // (AdmissionPlanner::copyInReservations). Empty without a copy-in point.
     std::vector<std::vector<CopyInReservation>> copy_ins;
@@ -109,7 +109,7 @@ struct AdmissionSelectionState {
         : member_resource{resource}, eviction_plan{store.DevicePool(), store.Groups()} {}
 
     std::pmr::memory_resource* const member_resource;
-    std::vector<VictimSet> victims;
+    PlannedEviction eviction;
     std::size_t next_passed_over{0};
     // The plan's lookup tables, open-addressed in this arena (FlatHashMap),
     // which frees nothing until this working set dies; returned victim vectors
@@ -153,7 +153,7 @@ struct AdmissionCapacity {
 };
 
 struct AdmissionDecisions {
-    std::vector<VictimSet> victims;
+    PlannedEviction eviction;
     std::vector<std::vector<CopyInReservation>> copy_ins;
 };
 
@@ -202,7 +202,7 @@ public:
             }
             _assert(next_pair == pair_buckets.end(), "every pair of the fit has a copy-in slot");
         }
-        return AdmissionDecisions{.victims = std::move(selection.victims), .copy_ins = std::move(capacity.copy_ins)};
+        return AdmissionDecisions{.eviction = std::move(selection.eviction), .copy_ins = std::move(capacity.copy_ins)};
     }
 
     virtual ~AdmissionPlanner() = default;
@@ -230,16 +230,17 @@ protected:
             BuildAdmissionCandidateConstraints(store_, demands_, num_computed_tokens_, prefix_,
                                                planned_claim_locations_, &selection.scratch, publication_);
         if (store_.UsesGds() && store_.NumStateGroups() > 0) {
-            auto victims =
+            auto eviction =
                 PlanGdsEviction(store_, constraints, block_demands, selection.eviction_plan, selection.member_resource);
-            if (!victims) return false;
-            selection.victims = std::move(*victims);
+            if (!eviction) return false;
+            selection.eviction = std::move(*eviction);
             return true;
         }
         if (const std::optional<std::vector<VictimCandidate>> through_fit =
                 candidatesThroughParentFit(block_demands, constraints)) {
             selectThroughParentFit(*through_fit, block_demands, constraints, selection);
-            selection.victims = selection.eviction_plan.Minimize(std::move(selection.victims), block_demands);
+            selection.eviction.victims =
+                selection.eviction_plan.Minimize(std::move(selection.eviction.victims), block_demands);
             return true;
         }
         CacheEvictionCandidates candidates{groups_, pool_, device_aging_};
@@ -277,7 +278,7 @@ protected:
                     if (!candidates_ran_out) {
                         candidates_ran_out = true;
                         FlatHashSet<const BoundaryTree::Node*> counted{&selection.scratch};
-                        for (const VictimSet& set : selection.victims) {
+                        for (const VictimSet& set : selection.eviction.victims) {
                             for (const VictimSet::Member& member : set.members) {
                                 if (!store_.GroupIsState(member.group_id)) {
                                     continue;
@@ -336,7 +337,8 @@ protected:
         });
 
         if (!fits) return false;
-        selection.victims = selection.eviction_plan.Minimize(std::move(selection.victims), block_demands);
+        selection.eviction.victims =
+            selection.eviction_plan.Minimize(std::move(selection.eviction.victims), block_demands);
         return true;
     }
 
@@ -363,7 +365,7 @@ protected:
                                   set.members.end(), candidate, &VictimSet::Member::location) != set.members.end(),
                 "a victim set holds the candidate it was chosen for");
         bool takes_request_reclaim = false;
-        const std::size_t set_index = selection.victims.size();
+        const std::size_t set_index = selection.eviction.victims.size();
         std::vector<std::size_t> absorbed;
         std::size_t absorbed_members = 0;
         for (std::size_t j = num_taken_over_members; j < set.members.size(); ++j) {
@@ -382,7 +384,7 @@ protected:
                 earlier = selection.taken_by[earlier] = selection.taken_by[selection.taken_by[earlier]];
             }
             const std::size_t position = joined->second;
-            member = selection.victims[earlier].members[position];
+            member = selection.eviction.victims[earlier].members[position];
             if (std::ranges::find(absorbed, earlier) == absorbed.end()) {
                 absorbed.push_back(earlier);
             }
@@ -390,14 +392,14 @@ protected:
             *joined = std::pair{set_index, j};
         }
         for (const std::size_t earlier : absorbed) {
-            absorbed_members -= selection.victims[earlier].members.size();
-            selection.victims[earlier] = VictimSet{selection.member_resource};
+            absorbed_members -= selection.eviction.victims[earlier].members.size();
+            selection.eviction.victims[earlier] = VictimSet{selection.member_resource};
         }
         _assert(absorbed_members == 0, "an earlier victim set lies whole inside the set that takes it");
         if (taken_over_set_index) {
             selection.taken_by[*taken_over_set_index] = set_index;
         }
-        selection.victims.push_back(std::move(set));
+        selection.eviction.victims.push_back(std::move(set));
         selection.taken_by.push_back(set_index);
         if (segment_top != nullptr) {
             selection.segment_at[segment_top] = set_index;
@@ -591,7 +593,7 @@ protected:
                                    walked.members.begin() + walked_before);
                 next_walked = walked_before;
                 const std::size_t earlier_index = *selection.segment_at.Find(child);
-                VictimSet& earlier = selection.victims[earlier_index];
+                VictimSet& earlier = selection.eviction.victims[earlier_index];
                 _assert(!earlier.members.empty(), "a segment set still starts at its top");
                 if (set.members.empty()) {
                     // First in the order: its lists become this set's.
@@ -1262,7 +1264,7 @@ std::optional<AdmissionPlan> planAdmissionWith(
     if (!decisions) return std::nullopt;
     return AdmissionPlan{.prefix = std::move(prefix),
                          .member_resource = std::move(member_resource),
-                         .victims = std::move(decisions->victims),
+                         .eviction = std::move(decisions->eviction),
                          .copy_ins = std::move(decisions->copy_ins)};
 }
 

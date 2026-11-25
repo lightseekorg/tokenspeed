@@ -39,7 +39,7 @@ namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
     static CacheStore& Store(CacheCoordinator& coordinator) { return coordinator.store_; }
-    static void CommitVictims(CacheCoordinator& coordinator, std::span<const VictimSet> victims) {
+    static void CommitVictims(CacheCoordinator& coordinator, const PlannedEviction& victims) {
         const CacheEvictor::VictimReasons reasons{
             .victim = &CacheEvictor::DeviceEvictionStats::admission,
             .stranded_suffix = &CacheEvictor::DeviceEvictionStats::admission,
