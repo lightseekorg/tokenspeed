@@ -88,6 +88,9 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+EPD encode-mode metric ownership and units are documented in
+[encoder-metrics.md](encoder-metrics.md).
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new
@@ -105,6 +108,26 @@ An id in that interval receives a 409 refusal before data-plane admission.
 The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
+
+The native frontend's `abort(rid)` only sends the ordinary wire abort. A
+client abort suppresses terminal output in the engine, so callers must not
+wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
+`Frontend.cancel`) sends that same abort and then detaches the local stream.
+The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
+`(rid, RequestCancelled)` exception value, after any already queued outputs.
+It creates no finish chunk or token/finish metrics. Only that stream and the
+client's in-flight count change; engine-reported load and slot, cache and
+transfer retirement keep their existing owners and fences.
+
+Cancellation returns `true` only when it closes the local stream. If a finish,
+stream error or another cancellation wins, its result is preserved and
+cancellation returns `false`. A failed send or a dropped cancellation future
+does not detach the stream: the caller can retry, even if the engine already
+received the abort. Stream drop and send cleanup compare the original local
+admission's channel before removing an entry. This protects a later local
+owner, but adds no wire identity: new submissions must use fresh request ids
+to avoid delayed output or abort messages reaching a reused id. Local closure
+is never evidence that engine resources are free.
 
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
@@ -1179,10 +1202,9 @@ order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
 room's prefill ranks once connected, again with every heartbeat until each
 answered (at most 256 per endpoint and beat; a beat resumes in room order at
-the first room the previous one left out, whichever endpoint's). The prefill
-peer admits a registered request (`Bootstrapped`) once its decode ranks
-announced it: every attention-TP rank of the decode replica that holds it. The
-pages-held marks and the clocks that start at them are local to a rank and
+the first room the previous one left out, whichever endpoint's). Prefill
+requests are schedulable on submission, without waiting for an announcement.
+The pages-held marks and the clocks that start at them are local to a rank and
 time-based; the members of a replica would have to agree on them, and
 `deferred` requires single-member replicas. When the plan carrying a
 request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
@@ -1198,9 +1220,9 @@ request does not hold its pages yet, fails the room, so a decode rank that
 does not follow the order fails at once. The decode scheduler sees every
 noticed request and may allocate them in any order. Timeouts: on the prefill
 side the bootstrap timeout bounds what a request waits for from its decode
-node. Not announced, it runs from registration. Admitted, it runs from the
-pages-held mark to the manifests, with none while the prompt is queued or
-computes: the decode node's waiting timeout bounds that wait. On the decode
+node. It runs from the pages-held mark to the manifests, whether or not the
+request was announced; queueing and computation before that mark consume no budget.
+A late announcement receives the pages-held notice immediately. On the decode
 side the waiting timeout runs from registration to the notice, restarted at
 the notice. A request that fails on the prefill side tells its announcing
 ranks as well as those that pre-allocated.

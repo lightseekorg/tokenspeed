@@ -307,6 +307,74 @@ class CachePoolBinding:
         del slot
         return []
 
+    def bind_request_stop_flags(
+        self, stopped: torch.Tensor, request_ends: torch.Tensor
+    ) -> None:
+        """Share the request-end flags with the nodes that read them.
+
+        ``stopped`` is ``RuntimeStates.stopped``, one bool per request slot.
+        The sampling epilogue sets it in the forward that ends a request,
+        before the decode commit runs. ``request_ends`` is the executor's
+        INT32 per-row report of a forward's requests (``apply_stop_conditions``
+        writes it in the sampling epilogue): a commit that cannot complete
+        the deferred decode state of a request that ended raises its row to
+        ``REQUEST_ENDED_INCOMPLETE``, and the control plane then stops rather
+        than publish it. The executor binds both once; their storage lives as
+        long as the executor. Broadcast to child backends; a node whose
+        commit leaves no deferred state ignores them.
+        """
+        for child in self.child_backends():
+            child.bind_request_stop_flags(stopped, request_ends)
+
+    def fold_deferred_state(
+        self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
+    ) -> None:
+        """Fold retraction victims' deferred decode state into their live blocks.
+
+        ``state_folds`` is the plan's ``state_folds``: per State group id in
+        ``deferred_decode_state_groups``, an ``(n, 2)`` int32 CPU tensor of
+        (request slot, page id), each a victim's live block, which its image
+        and every reader of the endpoint its retraction published read. The
+        data plane calls this on ``stream`` ahead of the plan's stores, device
+        copies, zeroing and forward. Broadcast to child backends; a node whose
+        pages always hold complete state does nothing. KDA folds each slot's
+        accepted decode records into the block.
+        """
+        for child in self.child_backends():
+            child.fold_deferred_state(state_folds, stream=stream)
+
+    def reset_request_workspace(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Clear the slot-keyed working state a slot's previous owner left.
+
+        ``request_slots`` holds the device indices of the slots that start
+        serving a new admission: at its first forward
+        (``RuntimeStates.bind_stop_criteria``) and, for a prompt computed on
+        another node, already at its landing, which a retraction may follow
+        before any forward. The executor calls this on ``stream`` ahead of
+        both. Broadcast to child backends; a node without such state does
+        nothing. KDA clears the accepted-record counts of an owner whose end
+        the device did not see (an abort, a finish decided on the host).
+        """
+        for child in self.child_backends():
+            child.reset_request_workspace(request_slots, stream=stream)
+
+    def deferred_decode_state_groups(self) -> frozenset[str]:
+        """State groups whose decode state reaches the live block only when
+        this node commits it at a request's end or a retraction.
+
+        A retraction's plan lists its victims' live blocks in such a group for
+        ``fold_deferred_state``, and the scheduler withholds the decoded
+        endpoint it publishes there from peers until the data plane
+        acknowledges the fold (``ExecutionPlan.state_commit_fence``); local
+        readers order behind it on the device. The union over child backends;
+        a node whose pages always hold complete state declares none.
+        """
+        return frozenset().union(
+            *(child.deferred_decode_state_groups() for child in self.child_backends())
+        )
+
     def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
         """This node and every node below it, each imaging its own rows.
 

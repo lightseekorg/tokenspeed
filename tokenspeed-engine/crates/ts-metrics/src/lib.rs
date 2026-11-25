@@ -35,6 +35,9 @@
 
 mod peer;
 pub use peer::{PeerMetrics, QueuedPeerRead};
+mod encoder;
+pub use encoder::{EncoderMetrics, EncoderTransferMetrics};
+
 mod prom;
 mod relay;
 
@@ -1219,8 +1222,7 @@ impl KvTransferMetrics {
     }
 
     /// A transfer that timed out in `stage`: on the prefill node
-    /// `bootstrapping`, or before a node under deferred allocation admitted
-    /// the request `waiting_for_announcement` (of its decode node); on the
+    /// `bootstrapping` while waiting for destination allocation; on the
     /// decode node `waiting_for_admission` before its manifest went out, then
     /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {

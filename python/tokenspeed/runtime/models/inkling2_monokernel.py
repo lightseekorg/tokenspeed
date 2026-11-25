@@ -50,12 +50,6 @@ attention TP group's Iris heap (:meth:`Inkling2Monokernel.prepare`).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.communication.iris import (
-    create_iris_heap,
-    iris_heap_bytes,
-    iris_symmetric_heap,
-    reserve_iris_heap,
-)
 from tokenspeed_kernel.ops.model.inkling2.monokernel import (
     LocalLayer,
     inkling2_full_layer_splits,
@@ -63,6 +57,7 @@ from tokenspeed_kernel.ops.model.inkling2.monokernel import (
     prepare_inkling2_full_layer,
     prepare_inkling2_local_layer,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -70,6 +65,16 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention_residual import AttentionResidualState
 from tokenspeed.runtime.models.monokernel import MonokernelState
+
+# Iris uses Gluon dtypes unavailable on Ascend. Model discovery imports this
+# module even when the serving model does not use decode monokernels.
+if not current_platform().is_npu:
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_heap,
+        iris_heap_bytes,
+        iris_symmetric_heap,
+        reserve_iris_heap,
+    )
 
 # The verify widths the launches serve: one request's verify block of
 # ``chain`` rows (DSPARK's draft tokens and the token they extend), chained.

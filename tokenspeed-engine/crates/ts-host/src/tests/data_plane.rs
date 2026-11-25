@@ -248,7 +248,7 @@ class Plane:
             raise RuntimeError("the completion failed")
         from array import array
         cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
-        return ([launched], [1], None, None, None, None, None, None, cumulative)
+        return ([launched], [1], None, None, None, None, None, None, cumulative, [0])
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -401,6 +401,8 @@ fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
     let result = data_plane.complete(forward).unwrap();
     assert_eq!(result.output_tokens, [100]);
     assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
+    // The device's per-row request ends ride the same result.
+    assert_eq!(result.request_ends, Some(vec![0]));
 }
 
 #[test]
