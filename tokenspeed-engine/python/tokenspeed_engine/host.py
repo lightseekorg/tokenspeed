@@ -43,8 +43,9 @@ def main() -> None:
         raise RuntimeError("the scheduler must be imported after host initialization")
     from tokenspeed_engine._host import run_host, scheduler
 
-    # As in the embedded host, the external Python wrapper must use the C++
-    # scheduler linked into this host, so plans share their native types.
+    # The scheduler's Python wrapper must use the C++ scheduler linked into
+    # this host, so the plans the control thread hands over share their
+    # native types.
     sys.modules["tokenspeed_scheduler.tokenspeed_scheduler_ext"] = scheduler
     run_host(args.control_fd, args.enable_async_logging == "true")
 

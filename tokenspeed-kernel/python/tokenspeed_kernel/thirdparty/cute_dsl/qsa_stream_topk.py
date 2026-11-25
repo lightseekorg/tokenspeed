@@ -22,12 +22,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk import (
     prefill,
     prefill_dense,
@@ -54,6 +55,8 @@ class StreamConfig:
     linear_bins: bool
     partition_width: int
     group_layout: Literal["aligned", "uniform", "ragged"]
+    query_group: int
+    overlap_pipeline: tuple[int, int] | None
 
 
 def _workspace_bytes(rows: int, config: StreamConfig) -> int:
@@ -68,14 +71,22 @@ def _workspace_bytes(rows: int, config: StreamConfig) -> int:
     return rows * config.splits * per_split
 
 
+def _overlap_pipeline(query_group: int, capacity: int) -> tuple[int, int]:
+    """Return K stages and score entries per row for a static query tile."""
+    if query_group == 4:
+        return 4, 1120
+    return (3, 784) if capacity >= 32768 else (2, 1120)
+
+
 def _configuration(
     rows: int,
     capacity: int,
     queries_per_request: int | None,
     max_partial_bytes: int,
+    sm_count: int,
 ) -> StreamConfig | None:
-    # Request widths only establish ownership. Geometry and power-of-two
-    # capacity buckets specialize the JIT; live lengths and row counts do not.
+    # Ownership and row counts choose among fixed tile geometries. Only that
+    # geometry and power-of-two capacity buckets specialize the JIT.
     if rows < 1 or not 0 < capacity <= 131072:
         return None
     grouped = (
@@ -99,6 +110,8 @@ def _configuration(
                 False,
                 64,
                 group_layout,
+                _QUERY_GROUP,
+                None,
             )
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
@@ -124,6 +137,8 @@ def _configuration(
                 linear_bins,
                 partition_width,
                 "aligned",  # Unused by the independent-row small-grid kernels.
+                _QUERY_GROUP,
+                None,
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config
@@ -133,7 +148,31 @@ def _configuration(
         algorithm = "dense"
     else:
         algorithm = "overlap"
-    return StreamConfig(algorithm, 1, 0, False, False, 64, group_layout)
+    query_group = _QUERY_GROUP
+    if algorithm == "overlap" and queries_per_request is not None:
+        # A four-query tile has twice the K lookahead. Wider requests may
+        # split into more CTAs when they still fit in the eight-query grid's
+        # SM waves. Shared memory limits either tile to one CTA per SM.
+        requests = rows // queries_per_request
+        groups_of_eight = requests * ((queries_per_request + 7) // 8)
+        waves_of_eight = (groups_of_eight + sm_count - 1) // sm_count
+        groups_of_four = requests * ((queries_per_request + 3) // 4)
+        if groups_of_four <= waves_of_eight * sm_count:
+            query_group = 4
+    overlap_pipeline = (
+        _overlap_pipeline(query_group, capacity) if algorithm == "overlap" else None
+    )
+    return StreamConfig(
+        algorithm,
+        1,
+        0,
+        False,
+        False,
+        64,
+        group_layout,
+        query_group,
+        overlap_pipeline,
+    )
 
 
 def _meta(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
@@ -221,9 +260,14 @@ def _compile(
                 config.group_layout,
             )
         else:
+            assert config.overlap_pipeline is not None
+            k_stages, stream_tile = config.overlap_pipeline
             op = prefill_overlap.OverlapPrefillTopK(
                 enable_pdl,
                 config.group_layout,
+                config.query_group,
+                k_stages,
+                stream_tile,
             )
         target = selected
     score = cute.compile(
@@ -253,6 +297,38 @@ def _compile(
         )
         return score, merge
     return (score,)
+
+
+def _get_compiled(
+    query,
+    keys,
+    page_table,
+    request_indices,
+    complete_blocks,
+    selected,
+    scratch,
+    queries_per_request,
+    config,
+    enable_pdl,
+):
+    """Cache one static geometry for both startup and serving calls."""
+    key = (query.device.index, request_indices.dtype, enable_pdl, config)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        compiled = _compile(
+            query,
+            keys,
+            page_table,
+            request_indices,
+            complete_blocks,
+            selected,
+            scratch,
+            queries_per_request,
+            config,
+            enable_pdl,
+        )
+        _COMPILED[key] = compiled
+    return compiled
 
 
 def warmup(
@@ -293,18 +369,38 @@ def warmup(
     # Cover _configuration's row policies: singleton, both ends of 2..8,
     # the first row above 8, and the small-grid limit 128. Above that limit,
     # cover both aligned and partial query groups. Try ragged and
-    # whole-request ownership for each row count.
+    # whole-request ownership for each row count. Width eight also covers
+    # aligned four-query tiles when both halves fit in one SM wave.
     for capacity in sorted(capacities):
         for rows in (1, 2, 8, 9, 128, 135, 136):
-            for width in (None, rows):
+            for width in (None, 1, 8, rows):
+                if width is not None and rows % width:
+                    continue
                 config = _configuration(
                     rows,
                     capacity,
                     width,
                     max_partial_bytes,
+                    current_platform().sm_count,
                 )
                 if config is not None:
                     configurations.setdefault(config, (rows, capacity, width))
+                    if (
+                        config.algorithm == "overlap"
+                        and config.query_group == 4
+                        and width is not None
+                        and width > 4
+                    ):
+                        # Larger live grids still select eight-query tiles.
+                        # Compile them with these same bounded sample buffers.
+                        configurations.setdefault(
+                            replace(
+                                config,
+                                query_group=8,
+                                overlap_pipeline=_overlap_pipeline(8, capacity),
+                            ),
+                            (rows, capacity, width),
+                        )
     sample = query.new_zeros((136, _HEADS, _HEAD_DIM))
     table = torch.zeros(
         (1, max_capacity // 64),
@@ -313,8 +409,8 @@ def warmup(
     )
     requests = request_indices.new_zeros(136)
     complete = requests.new_zeros(136, dtype=torch.int32)
-    for rows, capacity, width in configurations.values():
-        kernel(
+    for config, (rows, capacity, width) in configurations.items():
+        selected = kernel(
             sample[:rows],
             keys,
             table[:, : capacity // 64],
@@ -326,6 +422,33 @@ def warmup(
             max_partial_bytes=max_partial_bytes,
             enable_pdl=enable_pdl,
         )
+        if config != _configuration(
+            rows, capacity, width, max_partial_bytes, current_platform().sm_count
+        ):
+            compiled = _get_compiled(
+                sample[:rows],
+                keys,
+                table[:, : capacity // 64],
+                requests[:rows],
+                complete[:rows],
+                selected,
+                [],
+                width,
+                config,
+                enable_pdl,
+            )
+            compiled[0](
+                sample[:rows],
+                keys,
+                table[:, : capacity // 64],
+                requests[:rows],
+                complete[:rows],
+                selected,
+                sample.stride(0),
+                sample.stride(1),
+                int(width or 0),
+            )
+        del selected
     _WARMED.add(key)
 
 
@@ -459,6 +582,7 @@ def kernel(
         capacity,
         queries_per_request,
         max_partial_bytes,
+        current_platform().sm_count,
     )
     if config is None:
         raise ValueError(
@@ -501,22 +625,18 @@ def kernel(
                 device=query.device,
             )
             scratch.extend((candidates, candidate_ids, discarded))
-    key = (query.device.index, request_indices.dtype, enable_pdl, config)
-    compiled = _COMPILED.get(key)
-    if compiled is None:
-        compiled = _compile(
-            query,
-            key_cache,
-            page_table,
-            request_indices,
-            complete_blocks,
-            selected,
-            scratch,
-            queries_per_request,
-            config,
-            enable_pdl,
-        )
-        _COMPILED[key] = compiled
+    compiled = _get_compiled(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        selected,
+        scratch,
+        queries_per_request,
+        config,
+        enable_pdl,
+    )
     target = [selected] if not scratch else scratch
     group_width = int(queries_per_request or 0)
     group_args = [] if config.algorithm == "small" else [group_width]

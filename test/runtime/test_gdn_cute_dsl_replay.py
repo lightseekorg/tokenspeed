@@ -129,7 +129,17 @@ class VerifyCase:
         )
 
 
-def make_case(*, tokens, head_dim, value_head_dim, vheads, state_dtype, replay, tree):
+def make_case(
+    *,
+    tokens,
+    head_dim,
+    value_head_dim,
+    vheads,
+    state_dtype,
+    replay,
+    tree,
+    defer_recurrent_state,
+):
     width = 2 * _HEADS * head_dim + vheads * value_head_dim
     group = one_group(
         "linear_attention",
@@ -177,6 +187,7 @@ def make_case(*, tokens, head_dim, value_head_dim, vheads, state_dtype, replay, 
         heads=_HEADS,
         head_dim=head_dim,
         spec_tokens=tokens,
+        max_bs=_BATCH,
         device="cuda",
         replay_ssm=replay,
         draft_tree=tree,
@@ -187,9 +198,10 @@ def make_case(*, tokens, head_dim, value_head_dim, vheads, state_dtype, replay, 
         head_v_dim=value_head_dim,
     )
     backend = GdnAttnBackend(
-        replace(config, components=(spec, linear)),
+        replace(config, components=(spec, linear), max_resident_requests=8),
         spec,
         writes_state_checkpoints_in_forward=False,
+        defer_recurrent_state=defer_recurrent_state,
     )
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(_BATCH)
@@ -310,6 +322,7 @@ def test_replay_verifies_and_commits_the_accepted_path(
         state_dtype=state_dtype,
         replay=True,
         tree=tree,
+        defer_recurrent_state=False,
     )
     reference = make_case(
         tokens=tokens,
@@ -319,6 +332,7 @@ def test_replay_verifies_and_commits_the_accepted_path(
         state_dtype=torch.float32,
         replay=False,
         tree=tree,
+        defer_recurrent_state=False,
     )
     reference.state.copy_(case.state)
     for item in (case, reference):
@@ -362,6 +376,7 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
         state_dtype=state_dtype,
         replay=replay,
         tree=tree,
+        defer_recurrent_state=False,
     )
     case.refresh(actual_bs=1, read_pages=(1, 2), for_graph_replay=False)
     before = case.state.clone()
@@ -406,6 +421,7 @@ def test_replay_graph_refreshes_inputs_and_padding(tmp_path, state_dtype, tree):
         state_dtype=state_dtype,
         replay=True,
         tree=tree,
+        defer_recurrent_state=False,
     )
     reference = make_case(
         tokens=8,
@@ -415,6 +431,7 @@ def test_replay_graph_refreshes_inputs_and_padding(tmp_path, state_dtype, tree):
         state_dtype=torch.float32,
         replay=False,
         tree=tree,
+        defer_recurrent_state=False,
     )
     reference.state.copy_(case.state)
     case.refresh(actual_bs=_BATCH, read_pages=(1, 2), for_graph_replay=False)

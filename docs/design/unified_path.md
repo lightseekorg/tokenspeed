@@ -377,9 +377,10 @@ from one first bound to that pool:
   pool's specs, page counts, and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
-  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
-  slab. The backend tree covers only itself: the executor's own pool
-  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  state rows for live dense checkpoints. KDA stores its FP32 records and their
+  accepted counts by request slot in a separate allocation. The backend tree
+  covers only itself: the executor's own pool references
+  (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
   model are the caller's to re-publish, as are the graph owners' own pool
   references and the placeholder tables the decode runner sizes from the
@@ -633,8 +634,14 @@ groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
 captured `state_in` buffers and its live blocks into `state_out`, every group
 and the graph padding rows in one launch (`verify_state_groups`, up to four
-groups). The commit enqueued after the replay reads those buffers before the
-next refresh rewrites them.
+groups). Each batch size's buffers are the rows of one `[groups, bs]` table
+(`state_in_tables`, `state_out_tables`). The commit enqueued after the replay
+reads those buffers before the next refresh rewrites them. KDA's refresh then
+readies every layer's retained history in two launches, outside the graph and
+ahead of the replay, the eager forward or a mixed forward's decode rows: a
+request that moves to its live block, or would overflow the history capacity,
+folds its accepted records into that block, so verify only reads live blocks
+(`KdaAttnBackend._prepare_retained_history`).
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -2541,7 +2548,10 @@ The contract a model (in tree or a plugin) implements:
   collectives — and projects nothing.
 * The model exit hands the logits processor the shard's rows with the plan
   on `LogitsMetadata.query_shard` (`BaseCausalLM.exit_logits` is that one
-  call; a model with its own exit does the same). The shard is a parameter
+  call; a model with its own exit does the same). The eager executor computes
+  packed last-token indices in int32 within the scheduler's token budget.
+  Mixed speculative batches also store their decode verify row indices in
+  int32. The shard is a parameter
   of the processor's row selection: it scores the planned prompt rows
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
@@ -2968,3 +2978,40 @@ frontier and Engram commit remain shared. Proposal distributions belong to
 RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
 with retraction state. Query capacity does not shorten the scheduler's
 reserved write extent. The sampled path currently requires attention TP1.
+
+## Deferred GDN accepted state
+
+`--enable-deferred-gdn-state` opts NVIDIA BF16 K128/V128 chain T4 verify into
+accepted recurrent replay at the next layer's WY read. Convolution still
+commits during acceptance. Token and KV frontiers advance normally; pending
+recurrent state is a separate fact, never an artificially shortened frontier.
+
+Eager and graph decode execute the same device metadata operations. Two
+maximum-decode-batch payload banks retain `[k, v, a, b]` across forwards.
+Stable slot records carry a generation, bank/row, logical frontier and current
+batch membership. The preceding accepted pages remain in the payload bank's
+metadata. A new forward toggles the destination bank, matches its slots against
+the old generation and materializes rows absent from the new batch before
+convolution can reuse their bank. Each layer consumes the matched old row;
+acceptance retires that generation and records the new one. Padding owns no
+pending row. Batch counts, strides, bank choices and accepted lengths are
+runtime kernel inputs, including when the graph bucket changes. Acceptance
+refreshes its execution choice from the current forward. This lets graph
+replays defer acceptance again after an eager prefill.
+
+Only an in-place live state may be deferred. A first decode or checkpoint
+rotation with distinct source/destination blocks commits immediately, as do
+stopped rows. Acceptance and immediate replay use the same resolved live
+page tables as convolution commit, including when the verify graph is padded.
+Mixed, prefill, tree verification and other unsupported
+forwards materialize existing pending rows before execution. Monokernels
+keep the immediate path. Pending work is not flushed from ordinary `settle()`;
+that would remove the opportunity to share the next WY state read. The runtime
+retires replay before consumers use the live state
+([scheduler](scheduler.md#deferred-recurrent-state)).
+
+At a request exit, the device looks up the affected slots in the same records
+to select replay for writeback. The pinned slot
+uploads remain alive through the completion event. All metadata stages,
+including acceptance and exit operations outside target capture, are warmed
+before serving. Pipeline-parallel execution commits immediately.

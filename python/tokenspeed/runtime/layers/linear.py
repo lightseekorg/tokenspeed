@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.dense import (
     UnquantizedLinearMethod,
     W8A8Fp8LinearMethod,
 )
+from tokenspeed.runtime.layers.dense.w8a16_fp8_block import W8A16Fp8BlockLinearMethod
 from tokenspeed.runtime.layers.parameter import (
     BaseWeightParameter,
     BlockQuantScaleParameter,
@@ -91,7 +92,11 @@ if TYPE_CHECKING:
 
 # These methods create parameters implementing the V2 sharded-loading protocol.
 # Subclasses must preserve that contract; other methods retain the legacy loader.
-WEIGHT_LOADER_V2_METHODS = (Fp8LinearMethod, CompressedTensorsLinearMethod)
+WEIGHT_LOADER_V2_METHODS = (
+    Fp8LinearMethod,
+    CompressedTensorsLinearMethod,
+    W8A16Fp8BlockLinearMethod,
+)
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):

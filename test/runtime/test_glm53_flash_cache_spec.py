@@ -346,13 +346,17 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
             ),
         )
     )
-    # Dense MLA history plus one unaligned tail page per live request; each
-    # linear-attention state group holds its fixed per-request working set.
-    assert pages[FULL_ATTENTION] == 131_072 // 64 + 16
+    # Full history reserves an unaligned tail, prefix handover, and prompt-end
+    # copy-in page per resident request. State keeps its checkpoint and live page.
+    resident_requests = recipe.scheduler_limits.max_resident_requests
+    assert (
+        pages[FULL_ATTENTION]
+        == token_capacity // layout.prefix_granularity + 3 * resident_requests
+    )
     state_ids = [
         spec.group_id for spec in recipe._group_specs if spec.attn_kind == "state"
     ]
-    assert state_ids and all(pages[gid] == 16 * 4 for gid in state_ids)
+    assert state_ids and all(pages[gid] == 2 * resident_requests for gid in state_ids)
     expected = sum(-(-pages[gid] // packing[gid]) for gid in pages)
     assert expected == recipe.parents_needed(layout, token_capacity)
     assert expected != sum(pages.values()) // max(packing.values())
@@ -378,3 +382,44 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     recipe = _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, draft_layers=1)
     recipe.token_limit = token_limit
     assert recipe.select_num_lcm_blocks(layout, max_lcm_blocks=budgeted) == expected
+
+
+@pytest.mark.parametrize("width", [1, 4, 20])
+def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> None:
+    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    recipe.attn_config = replace(
+        recipe.attn_config, speculative_num_draft_tokens=width, max_resident_requests=24
+    )
+    layers, groups, batch, heads, dim = 34, 3, 16, 8, 128
+    conv_channels = 3 * heads * dim
+    # 24 resident requests plus the two reserved request slots each hold FP32
+    # U/K/decay records and one INT32 accepted count per layer.
+    slots = 26
+    expected = (
+        layers * batch * width * conv_channels * 2
+        + layers * slots * (3 * heads * max(16, width) * dim * 4 + 4)
+        + layers * (14 * 8 + 4)
+        + groups * 4 * 8
+        + (2 * groups + 1) * batch * 4
+        + batch * 4 * 8
+        + layers * batch * width * 2 * 8
+    )
+    assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes + expected
+    recipe.server_args.disaggregation_mode = "prefill"
+    assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes
+
+
+@pytest.mark.parametrize("width", [1, 4, 20])
+def test_glm_checkpoint_fields_are_independent_of_verify_width(width):
+    """Retained decode history stays in the request-slot workspace."""
+    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    schema = recipe.groups()
+    recipe.attn_config = replace(recipe.attn_config, speculative_num_draft_tokens=width)
+    assert recipe.groups() == schema
+    fields = {
+        field.field_id: field for _, fields in recipe.groups() for field in fields
+    }
+    assert {name for name in fields if name.startswith("layer.0.")} == {
+        "layer.0.conv_state",
+        "layer.0.recurrent_state",
+    }

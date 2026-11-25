@@ -55,6 +55,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _LOWER_BOUND,
     _assert_close,
     _KDAHarness,
+    _logical_checkpoint,
     _naive_kda_scan,
     _stub_contract,
     _StubContractPool,
@@ -202,7 +203,15 @@ class _ScheduledKDA:
         event.request_id = request_id
         self.scheduler.advance(ts.ExecutionEvent().add_event(event))
 
-    def step(self, request_id: str, streams: dict[int, dict[str, torch.Tensor]]):
+    def step(
+        self,
+        request_id: str,
+        streams: dict[int, dict[str, torch.Tensor]],
+        *,
+        ends: bool,
+    ):
+        """One scheduled forward; ``ends`` when this decode ends the request,
+        as the sampling epilogue would mark its slot before the commit."""
         plan = self.scheduler.next_execution_plan()
         batches = [batch for batch in plan.forward if batch.request_ids]
         assert len(batches) == 1
@@ -271,20 +280,29 @@ class _ScheduledKDA:
                 stream["beta_raw"][begin:end],
             )
             output = (
-                self.kernel.extend(*inputs, bs=1)
+                self.kernel.extend(*inputs, bs=1, forward_mode=ForwardMode.EXTEND)
                 if is_prefill
                 else self.kernel.decode(*inputs, bs=1)
             )
             outputs[layer] = output.clone()
         if not is_prefill:
+            slot = batch.request_pool_indices[0]
+            self.kernel.stopped[slot] = ends
             self.kernel.commit_decode(1)
         for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
             stream = streams[layer]
             state_block = tables[group][0][STATE_LIVE_SLOT]
             for component in _COMPONENTS:
-                states[layer, component] = self.pool.get_component(layer, component)[
-                    state_block
-                ].clone()
+                states[layer, component] = (
+                    _logical_checkpoint(
+                        self.kernel.backend,
+                        layer,
+                        state_block,
+                        batch.request_pool_indices[0],
+                    )
+                    if component == "recurrent_state"
+                    else self.pool.get_component(layer, component)[state_block].clone()
+                )
             # Convolution stores raw projections, not the post-convolution
             # values. This independent check also detects a wrong read/write id.
             expected_conv = stream["mixed"][
@@ -365,7 +383,7 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
 
     steps = 0
     while active.computed["source"] < _PROMPT_TOKENS:
-        actual = active.step("source", source_streams)
+        actual = active.step("source", source_streams, ends=False)
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
         steps += 1
         assert active.scheduler.empty_lcm_blocks() > 0
@@ -380,8 +398,11 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
                 for row in rows
                 for block in row
             )
+            # The unaligned prompt holds one full-history copy-in block
+            # outside these tables until its first decode publishes the tail.
+            prompt_tail_copy_in = 1
             assert active.scheduler.empty_lcm_blocks() == (
-                _USABLE_BLOCKS - materialized
+                _USABLE_BLOCKS - materialized - prompt_tail_copy_in
             )
             assert all(len(active.released[group]) == 2 for group in KIMI_STATE_GROUPS)
 
@@ -396,7 +417,9 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
     prompt_end_tables = actual.tables
     prompt_end = active.snapshot(prompt_end_tables, STATE_LIVE_SLOT)
     for index in range(4):
-        actual = active.step("source", source_streams)
+        # The fourth decode ends the request: its records fold into its live
+        # block, which the finish publishes.
+        actual = active.step("source", source_streams, ends=index == 3)
         for group in KIMI_STATE_GROUPS:
             row = actual.tables[group][0]
             if index == 0:
@@ -432,7 +455,7 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
     reference = _NumericalReference(active.kernel, resume_streams)
     reference.step(0, _PROMPT_TOKENS)
     active.submit("resume", resume_tokens, shared_tokens + 7)
-    actual = active.step("resume", resume_streams)
+    actual = active.step("resume", resume_streams, ends=False)
     assert actual.begin == _PROMPT_TOKENS
     for group in KIMI_STATE_GROUPS:
         assert (
@@ -441,9 +464,9 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
         )
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     while active.computed["resume"] < shared_tokens + 7:
-        actual = active.step("resume", resume_streams)
+        actual = active.step("resume", resume_streams, ends=False)
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
-    actual = active.step("resume", resume_streams)
+    actual = active.step("resume", resume_streams, ends=False)
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     for key, state in active.snapshot(prompt_end_tables, STATE_LIVE_SLOT).items():
         assert torch.equal(

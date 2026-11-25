@@ -63,6 +63,7 @@ def metadata(device, page):
 
 
 def configure_prefill(backend):
+    backend._retained_records = None
     backend._prefill_graph_enabled = True
     backend.kda_backend = "cutedsl_kda"
     backend._prefill_metadata = {}
@@ -85,6 +86,7 @@ def _live_metadata(lengths, device):
     bounds = host.to(device=device, dtype=torch.int32)
     return MambaForwardMetadata(
         query_start_loc=bounds,
+        req_pool_indices=torch.arange(len(lengths), 0, -1, device=device),
         scan_query_start_loc=bounds.long(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,
@@ -124,6 +126,9 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     assert retained.extend_seq_lens_cpu.tolist() == lengths + [1] * padding
     assert retained.state_out_blocks_by_group["state"].tolist() == (
         list(range(1, live + 1)) + [-1] * padding
+    )
+    assert (
+        retained.req_pool_indices.tolist() == list(range(live, 0, -1)) + [0] * padding
     )
     assert retained.prefill_token_extent == 512
     with pytest.raises(ValueError, match="exceed the captured capacity"):
@@ -398,8 +403,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     torch.manual_seed(42)
     bucket, dim = 2048, 128
     channels = heads * dim
-    conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
-    states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
+    conv = torch.randn(13, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
+    states = torch.randn(13, heads, dim, dim, device="cuda", dtype=torch.float32)
     initial_conv, initial_states = conv.clone(), states.clone()
     # The live input of the captured projection: merged rows [q|k|v|g|f_a|b],
     # padded to the 128-row grid.
@@ -408,6 +413,14 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
+    backend._descriptor_row_by_layer = {0: 0}
+    backend._retained_records = torch.empty(10, 1, 3, heads, 16, dim, device="cuda")
+    correction, key, decay = backend._retained_records[:, 0].unbind(1)
+    correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
+    key.fill_(0.02)
+    decay.fill_(0.9)
+    length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
+    backend._retained_lengths = {0: length}
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -468,13 +481,18 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         )
         return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
-    def reset():
+    def reset(metadata):
         conv.copy_(initial_conv)
         states.copy_(initial_states)
+        length.fill_(3)
+        shared = metadata.state_in_blocks_by_group["state"] == 8
+        length[metadata.req_pool_indices[shared].long()] = 0
 
     def assert_scan_close(actual, expected):
         if backend_name == "cutedsl_kda":
-            assert torch.equal(actual, expected)
+            # The independent history reconstruction can differ by FP32 FMA rounding.
+            atol, rtol = (2e-6, 2e-5) if actual.dtype == torch.float32 else (2e-3, 2e-3)
+            torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         else:
             # The cuDNN plan can change with token capacity or padded request count.
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-4)
@@ -491,13 +509,21 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         )
         return MambaForwardMetadata(
             query_start_loc=bounds,
+            req_pool_indices=(
+                2 * torch.arange(len(prefixes), device="cuda") + page_shift
+            )
+            % 8
+            + 1,
             scan_query_start_loc=bounds.long(),
             query_start_loc_int64=bounds.long(),
             extend_seq_lens_cpu=lengths,
             cu_extend_seq_lens_cpu=host,
             state_in_blocks_by_group={
                 "state": torch.tensor(
-                    [1 if prefix else 0 for prefix in prefixes],
+                    [
+                        (8 if page_shift == 2 else page_shift + row) if prefix else 0
+                        for row, prefix in enumerate(prefixes)
+                    ],
                     device="cuda",
                     dtype=torch.int32,
                 )
@@ -582,6 +608,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         "query_start_loc": fixed.query_start_loc,
         "scan_query_start_loc": fixed.scan_query_start_loc,
         "query_start_loc_int64": fixed.query_start_loc_int64,
+        "request_slots": fixed.req_pool_indices,
         "state_in": fixed.state_in_blocks_by_group["state"],
         "state_out": fixed.state_out_blocks_by_group["state"],
     }
@@ -594,16 +621,66 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
-        reset()
-        expected = forward(compact=True)[: sum(lengths)].clone()
+        reset(source)
+        expected_lengths = length.clone()
+        expected_lengths[source.req_pool_indices.long()] = 0
+        from test.runtime.kda_torch_reference import kda_prefill_reference
+
+        expected_conv, expected_states = initial_conv.clone(), initial_states.clone()
+        expected_rows = []
+        offset = 0
+        for row, (count, prefix) in enumerate(zip(lengths, prefixes, strict=True)):
+            source_page = int(source.state_in_blocks_by_group["state"][row])
+            destination = int(source.state_out_blocks_by_group["state"][row])
+            initial = (
+                initial_states[source_page].clone()
+                if prefix
+                else torch.zeros_like(initial_states[0])
+            )
+            window = (
+                initial_conv[source_page].clone()
+                if prefix
+                else torch.zeros_like(initial_conv[0])
+            )
+            if prefix:
+                slot = int(source.req_pool_indices[row])
+                for step in range(int(length[slot, 0])):
+                    initial = (
+                        initial * decay[slot, :, step, None, :]
+                        + correction[slot, :, step, :, None]
+                        * key[slot, :, step, None, :]
+                    )
+            rows = projection[offset : offset + count]
+            gate = torch.nn.functional.linear(
+                rows[:, 4 * channels : 4 * channels + dim], kwargs["f_b_weight"]
+            )
+            result, final_state, final_conv = kda_prefill_reference(
+                rows[:, : 3 * channels].unsqueeze(0),
+                window.unsqueeze(0),
+                initial.unsqueeze(0),
+                rows[:, 4 * channels + dim : 4 * channels + dim + heads],
+                conv_weights=kwargs["conv_weights"],
+                bias=None,
+                gate=gate,
+                A_log=kwargs["A_log"],
+                dt_bias=kwargs["dt_bias"],
+                lower_bound=-5.0,
+                solution=backend_name,
+            )
+            expected_rows.append(
+                result.flatten(0, 1).flatten(1) * rows[:, 3 * channels : 4 * channels]
+            )
+            expected_conv[destination].copy_(final_conv[0])
+            expected_states[destination].copy_(final_state[0])
+            offset += count
+        expected = torch.cat(expected_rows)
         assert expected.dtype == torch.bfloat16
-        expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
         backend.forward_metadata = prepare_capacity_prefill_metadata(
             source, bucket, None, checkpoints=None
         )
-        reset()
+        reset(source)
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(fresh_eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -614,7 +691,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         # does not admit, such as MIXED batches).
         for metadata in (backend.forward_metadata, source):
             backend.forward_metadata = metadata
-            reset()
+            reset(source)
             ordinary.replay(valid_rows=sum(lengths))
             assert_scan_close(ordinary_output[: sum(lengths)], expected)
             assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -624,7 +701,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
-        reset()
+        reset(source)
         eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -633,7 +710,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
-        reset()
+        reset(source)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()
@@ -644,6 +721,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
         assert torch.equal(states.view(torch.uint8), eager_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
+        assert torch.equal(length, expected_lengths)
+        torch.testing.assert_close(states[8:], initial_states[8:], atol=0, rtol=0)
+        torch.testing.assert_close(conv[8:], initial_conv[8:], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -677,6 +757,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
+    backend._retained_lengths = {0: torch.zeros(4, 1, device="cuda", dtype=torch.int32)}
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -688,6 +769,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     pages = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     backend.forward_metadata = MambaForwardMetadata(
         query_start_loc=bounds,
+        req_pool_indices=torch.tensor([2, 1], device="cuda", dtype=torch.int64),
         scan_query_start_loc=bounds.long(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,
@@ -1512,19 +1594,10 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
 
 
 @pytest.mark.parametrize("released_by", ["flags", "events"])
-def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
-    kimi_host_cache, released_by
-):
-    """A replay waits before each captured segment for the highest layer whose
-    cache that segment touches, not for the whole Host load. The first segment
-    reads a KDA layer's state; the second writes rows of a later MLA layer's
-    page, then reads the KDA state again. The owner captures them with the
-    executor's tracker. In the load, only the MLA layer's page copy is held
-    back, and the layers are released in order, by flag as the Triton copy
-    kernel does or by event as the DMA path does. The first segment and the
-    break after it run before that copy lands, and the second segment's rows
-    land after it and survive. A replay that waited for the whole load, or for
-    a lower layer before the second segment, fails here.
+def test_segmented_replay_orders_layer_loads(kimi_host_cache, released_by):
+    """Flags and events order delayed loads before captured page accesses.
+
+    Stream concurrency is not guaranteed, so only the final data is checked.
     """
     from test.runtime.conftest import MLA_LATENT_DIM, kda_layer_id, mla_layer_id
 
@@ -1554,10 +1627,8 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
     )
     value = torch.ones(_BUCKET, 4, device="cuda")
     handoff = torch.empty_like(value)
-    first_segment_done = torch.cuda.Event()
 
     def mark(hidden):
-        first_segment_done.record()
         return hidden
 
     pool.get_component(kda, "recurrent_state")[page].normal_()
@@ -1585,10 +1656,12 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
         flags = torch.zeros(pool.layer_num, dtype=torch.int32, device="cuda")
         events.layer_ready_flags, events.wait_layer_ready = flags, wait_layer_ready
     load_stream = cache.executor.load_stream
+    input_ids = torch.ones(_BUCKET, dtype=torch.int64)
     load_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(load_stream):
         for layer in range(pool.layer_num):
             if layer == mla:
+                # A finite delay also works when streams share one connection.
                 torch.cuda._sleep(200_000_000)
                 latent[page].copy_(host_rows)
             if flags is not None:
@@ -1596,13 +1669,7 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
             events.layer_done_events[layer].record()
     tracker.set_consumers(load)
     with maybe_inference_mode():
-        result = owner.replay(
-            cache.ctx,
-            torch.ones(_BUCKET, dtype=torch.int64),
-            request_token_history=None,
-        )
-    first_segment_done.synchronize()
-    assert not load_stream.query()
+        result = owner.replay(cache.ctx, input_ids, request_token_history=None)
     torch.cuda.synchronize()
     assert torch.equal(latent[page], rows)
     assert torch.equal(result, value + state_rows() + state_rows())

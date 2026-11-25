@@ -904,8 +904,15 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane = PythonDataPlane::start(data_plane, peers.streams, cache_events)
-        .map_err(HostError::DataPlane)?;
+    let replay_retirement = Python::attach(|py| {
+        data_plane
+            .call_method0(py, "replay_retirement_enabled")?
+            .extract::<bool>(py)
+    })
+    .map_err(|error| Python::attach(|py| python_error(py, error)))?;
+    let data_plane =
+        PythonDataPlane::start(data_plane, peers.streams, cache_events, replay_retirement)
+            .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -939,10 +946,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         config.stream_interval,
         Some(config.physical_context_len),
         role,
+        scheduler.defers_decode_state(),
         config.finish_log,
         metrics.is_some(),
         trace,
-    );
+    )
+    .with_timing_ranks(config.metrics.labels.dp_rank, config.metrics.tp_rank);
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,

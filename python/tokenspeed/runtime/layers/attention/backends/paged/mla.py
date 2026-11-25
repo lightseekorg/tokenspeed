@@ -212,6 +212,16 @@ class MLAMetadataBackend(PagedMLABackend):
         **kwargs,
     ) -> None:
         super().configure_runtime(**kwargs)
+        self._configure_cache_geometry(
+            block_granularity=block_granularity,
+            virtual_block_count=virtual_block_count,
+            shard_count=shard_count,
+        )
+
+    def _configure_cache_geometry(
+        self, *, block_granularity: int, virtual_block_count: int, shard_count: int
+    ) -> None:
+        """Bind the arena geometry for this backend's decode implementation."""
         if shard_count == 1:
             return
         if shard_count != len(self.kvp_group):

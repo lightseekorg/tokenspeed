@@ -86,7 +86,9 @@ logger = get_colorful_logger(__name__)
 # either.
 SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
-# draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
+# draft q (RuntimeStates.future_draft_q): a DFlash2 draft needs it. A base DFLASH
+# draft records the dense q and takes SPECULATIVE_SAMPLING_BACKENDS; DFlash.
+# bind_sampling_backend checks the pairing once the draft is loaded.
 DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
 
 # Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
@@ -499,6 +501,10 @@ class ServerArgs:
     # The most back-to-back prefill rounds an overdue prompt may suspend the
     # interval for; 0 keeps the unbounded suspension.
     max_consecutive_prefill_rounds: int = 0
+    # The interval is owed only while at least this many requests are ready
+    # to decode; below it --max-consecutive-prefill-rounds still ends a run of
+    # prefill rounds that hold a decode back. 0 always owes the interval.
+    prefill_interval_min_decoding: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -709,6 +715,9 @@ class ServerArgs:
     attention_backend: str | None = None
     min_kv_split: int | None = None
     kda_backend: str = "auto"
+    # Records a request keeps per KDA layer between dense-state folds,
+    # including the verify window; None keeps max(16, draft tokens).
+    kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
@@ -818,6 +827,7 @@ class ServerArgs:
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
+    enable_deferred_gdn_state: bool = False
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
     speculative_exec_mode: int = -1
@@ -2293,12 +2303,10 @@ class ServerArgs:
         the draft-prob chain kernel:
         ``greedy`` verifies by exact match, so a dense q never enters it, and
         ``triton`` by a target-sampled exact match unless it runs block
-        verification, which reads the dense q. The one block drafter
-        served is DFLASH with the DFlash2 candidate selector: its walk samples
-        each step from the selector's q over its top-K candidates, which only
-        the ``triton`` backend verifies (sparse q); base DFLASH without the
-        selector is refused when the drafter binds the verifier, since only
-        the loaded checkpoint tells the two apart. The prefill role of a
+        verification, which reads the dense q. DFLASH is admitted with either
+        ``triton`` (a DFlash2 draft's sparse q) or a draft-prob backend (a base
+        draft's dense q); only the loaded checkpoint says which, so the drafter
+        refuses the wrong pairing when it binds the verifier. The prefill role of a
         disaggregated deployment never verifies a chain of its own and its
         drafted candidates ship to the decode node without q, so there the
         flag would only allocate the per-slot distribution buffer; it is
@@ -2318,8 +2326,7 @@ class ServerArgs:
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
-                "--speculative-algorithm EAGLE3, MTP, or DSPARK (or DFLASH with a "
-                "DFlash2 draft and --sampling-backend triton)"
+                "--speculative-algorithm EAGLE3, MTP, DSPARK, or DFLASH"
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
@@ -2328,12 +2335,15 @@ class ServerArgs:
                 f"{self.speculative_eagle_topk=}"
             )
         if self.speculative_algorithm == "DFLASH":
-            if self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND:
+            if (
+                self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND
+                and self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
+            ):
                 raise ValueError(
-                    "--enable-speculative-sampling with DFLASH needs --sampling-backend "
-                    f"{DFLASH_SPECULATIVE_SAMPLING_BACKEND}, the one verifier that reads "
-                    "the DFlash2 selector's sparse draft distribution; got "
-                    f"--sampling-backend {self.sampling_backend}"
+                    "--enable-speculative-sampling with DFLASH needs "
+                    f"--sampling-backend {DFLASH_SPECULATIVE_SAMPLING_BACKEND} "
+                    f"(DFlash2) or one of {sorted(SPECULATIVE_SAMPLING_BACKENDS)} "
+                    f"(base draft); got --sampling-backend {self.sampling_backend}"
                 )
         elif (
             self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
@@ -3276,6 +3286,17 @@ class ServerArgs:
                 "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
                 "it bounds how long an overdue prompt suspends the interval"
             )
+        if self.prefill_interval_min_decoding < 0:
+            raise ValueError("--prefill-interval-min-decoding must be non-negative")
+        if (
+            self.prefill_interval_min_decoding
+            and not self.max_consecutive_prefill_rounds
+        ):
+            raise ValueError(
+                "--prefill-interval-min-decoding needs "
+                "--max-consecutive-prefill-rounds: below the threshold the round "
+                "cap is what still bounds how long running decodes stall"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3579,6 +3600,7 @@ class ServerArgs:
                 "mxfp4",
                 "nvfp4",
                 "w8a8_fp8",
+                "w8a16_fp8_block",
                 "compressed-tensors",
             ],
             help="The quantization method.",
@@ -3728,6 +3750,19 @@ class ServerArgs:
             "interval again, and a prompt's held-back count restarts whenever "
             "one of its chunks runs. 0 (the default) keeps the unbounded "
             "suspension.",
+        )
+        parser.add_argument(
+            "--prefill-interval-min-decoding",
+            type=int,
+            default=ServerArgs.prefill_interval_min_decoding,
+            help="With --max-consecutive-prefill-rounds (which needs "
+            "--prefill-decode-interval): owe the "
+            "--prefill-decode-interval and --prefill-decode-min-interval decode "
+            "rounds only while at least this many requests are ready to decode. "
+            "With fewer, waiting prompts are prefilled at once, but once "
+            "--max-consecutive-prefill-rounds prefill rounds in a row have held "
+            "a decode back, the next round decodes. Aggregated serving only. "
+            "0 (the default) always owes them.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
@@ -4529,6 +4564,17 @@ class ServerArgs:
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
+            "--kda-history-capacity",
+            type=int,
+            default=ServerArgs.kda_history_capacity,
+            help="Accepted KDA records each request keeps per layer between "
+            "dense-state folds, counting the verify window (the speculative draft "
+            "tokens). Default: max(16, draft tokens); it must be at least the "
+            "draft tokens. A smaller capacity shrinks the per-request verify "
+            "workspace but folds the records into the dense state more often: at "
+            "the draft tokens themselves, every round that accepts any.",
+        )
+        parser.add_argument(
             "--drafter-attention-backend",
             type=str,
             help="Attention backend for drafter model in speculative decoding "
@@ -5029,15 +5075,14 @@ class ServerArgs:
             "drafter samples each step from its own distribution q (per-request "
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule (vLLM's "
-            "draft_sample_method=probabilistic). Needs EAGLE3 or MTP, or DSPARK "
-            "with the block or synthetic rejection method, with "
-            "--speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend, EAGLE4 on EAGLE-Harness "
-            "(--speculative-exec-mode 0 or 1, trees or chains) and the "
-            "flashinfer backend, or DFLASH with a DFlash2 (candidate selector) "
-            "draft and the triton backend; refused on the prefill role of "
-            "a disaggregated deployment. Every drafter but DFLASH costs a "
-            "per-request fp32 draft distribution buffer; see "
+            "draft_sample_method=probabilistic). Needs EAGLE3, MTP, DSPARK or "
+            "DFLASH with a base draft, with --speculative-eagle-topk 1 and the "
+            "flashinfer or flashinfer_full sampling backend, EAGLE4 on "
+            "EAGLE-Harness (--speculative-exec-mode 0 or 1, trees or chains) "
+            "and the flashinfer backend, or DFLASH with a DFlash2 (candidate "
+            "selector) draft and the triton backend; refused on the prefill "
+            "role of a disaggregated deployment. Every drafter but a DFlash2 "
+            "draft costs a per-request fp32 draft distribution buffer; see "
             "docs/configuration/server.md.",
         )
         parser.add_argument(
@@ -5061,6 +5106,12 @@ class ServerArgs:
             "above this value mark a request with no proposal yet (fresh "
             "admission, PD landing) and always reject. Must lie within "
             "[1.0, 2**20].",
+        )
+        parser.add_argument(
+            "--enable-deferred-gdn-state",
+            action="store_true",
+            default=ServerArgs.enable_deferred_gdn_state,
+            help="Defer accepted GDN recurrent replay to the next layer's WY (BF16 T4 chains).",
         )
         parser.add_argument(
             "--disable-replay-ssm",

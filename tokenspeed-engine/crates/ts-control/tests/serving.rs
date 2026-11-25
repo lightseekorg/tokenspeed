@@ -327,6 +327,10 @@ struct FakeDevice {
     /// The polls a cache op waits after the first one before it is
     /// acknowledged.
     ack_polls: usize,
+    /// The replay polls a retirement waits after the first, or disabled.
+    replay_ack_polls: Option<usize>,
+    replay_pending: VecDeque<(u64, usize)>,
+    replay_completed: u64,
     /// Cache-event polls so far.
     polls: usize,
     /// While closed, a poll acknowledges nothing.
@@ -599,6 +603,10 @@ impl TransferPeer for FakePeer {
                             _ => PdEvent::RemotePrefillDone(RemotePrefill {
                                 rid: rid.clone(),
                                 bootstrap_token: room.sent.expect("sent with the KV"),
+                                kv_ready_at: (
+                                    std::time::SystemTime::now(),
+                                    std::time::Instant::now(),
+                                ),
                                 cached_tokens: 0,
                                 bootstrap_logprob: None,
                                 spec_candidate_ids: None,
@@ -741,6 +749,10 @@ impl DataPlane for FakeDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if let Some(id) = dispatch.retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let forward = dispatch.forward;
         if let Some(directory) = &self.metrics_dir {
             let gauges = exported_gauges(directory);
@@ -875,6 +887,7 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                CacheOpKind::StateCommit => CacheEventKind::StateCommitDone,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged
@@ -889,7 +902,33 @@ impl DataPlane for FakeDevice {
         Ok(events)
     }
 
-    fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        self.replay_ack_polls.is_some()
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        for (_, polls_left) in &mut self.replay_pending {
+            *polls_left = polls_left.saturating_sub(1);
+        }
+        while self
+            .replay_pending
+            .front()
+            .is_some_and(|(_, polls)| *polls == 0)
+        {
+            self.replay_completed = self.replay_pending.pop_front().unwrap().0;
+        }
+        Ok(self.replay_completed)
+    }
+
+    fn release(
+        &mut self,
+        rids: &[String],
+        retirement_id: Option<u64>,
+    ) -> Result<(), DataPlaneError> {
+        if let Some(id) = retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let mut released = self.released.lock().unwrap();
         for rid in rids {
             let generated = self
@@ -1658,6 +1697,8 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// Polls each rank waits to complete recurrent State retirement.
+    replay_ack_polls: Option<fn(usize) -> usize>,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
     /// A test-only callback for real host failures after the device load.
@@ -1819,6 +1860,7 @@ fn run_rank<F: Frontend>(
         1,
         None,
         role,
+        false,
         FinishLog {
             enabled: true,
             request_stats: true,
@@ -1941,6 +1983,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
+        replay_ack_polls: setup.replay_ack_polls.map(|polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
             Gate::closed()
         } else {
@@ -8230,6 +8273,57 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     );
     let chunks = run(&engine.client, request("r2", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[test]
+fn memory_release_waits_for_the_retirement_batch_queued_by_the_last_forward() {
+    let sleeping = || {
+        EngineRequest::Control(Box::new(ControlRequest::IsSleeping(IsSleepingReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })))
+    };
+    let mut script = vec![Vec::new(); 8];
+    script[0].push(EngineRequest::Add(Box::new(request("r", 3, budget(2)))));
+    script[0].push(EngineRequest::Add(Box::new(request("s", 3, budget(2)))));
+    // A weights-only release exercises drain itself without a cache clear.
+    script[0].push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: Some(vec!["weights".to_owned()]),
+        }),
+    )));
+    // The last forward queues both exits at the tail of round 1. The
+    // slower rank completes retirement in round 5.
+    script[2].push(sleeping());
+    script[4].push(sleeping());
+    script[6].push(sleeping());
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            replay_ack_polls: Some(|rank| 1 + 3 * rank),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    let rank = &ranks[0];
+    assert_scripted_tokens(rank, "r", 2);
+    assert_scripted_tokens(rank, "s", 2);
+    assert!(rank.cache_ops.is_empty());
+    assert_eq!(rank.device_ops, ["release weights"]);
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("IsSleepingReqOutput", false),
+            ("IsSleepingReqOutput", false),
+            ("ReleaseMemoryOccupationReqOutput", true),
+            ("IsSleepingReqOutput", true),
+        ]
+    );
 }
 
 #[test]

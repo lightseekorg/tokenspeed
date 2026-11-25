@@ -81,6 +81,7 @@ its request partition is invalidated before another PD owner uses it.
 | `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory. |
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
+| `--enable-deferred-gdn-state` | Defer accepted recurrent replay to the next GDN layer's WY state read. Off by default. NVIDIA BF16 state, K128/V128 chain MTP3/T4 with value-head counts divisible by four and one pipeline stage; convolution commits immediately. Stopped rows and distinct source/destination state blocks commit immediately; unsupported forwards first materialize pending rows. Reserves a second batch payload bank (about 291 MiB at batch 128 and 36 GDN layers) plus small slot metadata. See [the execution contract](../design/unified_path.md#deferred-gdn-accepted-state). |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 | `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
@@ -539,9 +540,10 @@ LCM blocks when possible. Other policies keep their original allocation sizes.
 | `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off: no chunk gives way; at most half of `--chunked-prefill-size`; a decode server ignores it. Whatever N, a prefill server fills the budget a chunk leaves on its own with bootstrapped prompts that fit whole in it; [scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue) describes both. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--enable-short-prefill-first` | Prefill and aggregated servers: rank new local prefills by remaining work after Device/Host prefix reuse, including replay work, with stable ties and oldest-request protection after eight successful bypasses. Resident chunks keep priority. Off by default, preserving submission order ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
-| `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total (per chunk under `--max-consecutive-prefill-rounds`), so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md) ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
-| `--prefill-decode-min-interval` | After every round that runs a prefill chunk, run at least this many decode rounds before the next prefill round, unless no decode can run. Unlike `--prefill-decode-interval`, this floor still applies once a prompt has been held back for its full interval, so a long prompt's chunks alternate with decode rounds instead of stalling running decodes back to back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md). |
+| `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run or `--prefill-interval-min-decoding` waives it. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total (per chunk under `--max-consecutive-prefill-rounds`; below `--prefill-interval-min-decoding` the count may pass it), so running decodes stall less often and, while that threshold is met or unset, TTFT grows by at most this many decode steps; below it, one decode round follows each run of at most `--max-consecutive-prefill-rounds` prefill rounds that held decodes back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md) ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
+| `--prefill-decode-min-interval` | After every round that runs a prefill chunk, run at least this many decode rounds before the next prefill round, unless no decode can run or `--prefill-interval-min-decoding` waives it. Unlike `--prefill-decode-interval`, this floor still applies once a prompt has been held back for its full interval, so a long prompt's chunks alternate with decode rounds instead of stalling running decodes back to back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md). |
 | `--max-consecutive-prefill-rounds` | With `--prefill-decode-interval`: the most back-to-back prefill rounds that hold a decode back while an overdue prompt suspends the interval. The round that reaches it owes the decodes the whole interval again, and a prompt's held-back count restarts whenever one of its chunks runs, so the interval's bound applies to each chunk. Rounds with nothing to decode, and in mixed mode rounds that decode beside their prefill, end the run. Aggregated serving only. `0` (default) keeps the unbounded suspension ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
+| `--prefill-interval-min-decoding` | With `--max-consecutive-prefill-rounds` (which needs `--prefill-decode-interval`): the decode rounds of `--prefill-decode-interval` and `--prefill-decode-min-interval` are owed only while at least this many requests are ready to decode. With fewer, waiting prompts are prefilled at once instead of waiting out the interval, but once `--max-consecutive-prefill-rounds` prefill rounds in a row have held a decode back, the next round decodes, so the few running decodes stall at most that many prefill rounds at a time. This trades the running decodes' token latency for first-token latency while few requests decode; at or above the threshold nothing changes. Request slots (`--max-num-seqs`) still count prefilling and decoding requests alike. Aggregated serving only. `0` (default) always owes them ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
 | `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
 | `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
 | `--prefill-single-round` | One prefill round per window for the [DP prefill gate](../design/prefill-delay.md#1-the-two-attempt-points): the round after a prefill round is not an ALL point while any rank has decode work, so a backlog does not drain in consecutive prefill rounds; the next ALL point is `--prefill-attempt-interval` rounds later. An idle engine still admits at once, and ANY points are unchanged. Off by default; requires `--prefill-attempt-interval` and `--prefill-any-attempt-interval`. |
@@ -556,6 +558,7 @@ LCM blocks when possible. Other policies keep their original allocation sizes.
 | `--inkling2-loop-num-passes` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: run the looped core this many times (at least 1) instead of the checkpoint's `num_passes`. Each pass is 12 more layer visits, each with its own KV cache and convolution state unless `--inkling2-loop-share-cache` is set. DSpark drafts read hidden states at fixed visits, so with a draft model only the checkpoint's count is accepted; model-free `DUMMY` drafting serves any count. With `--decode-monokernel` each visit takes one of a step's 64 launch tags, so the 24-layer checkpoint serves at most 4 passes there. Unset by default; other checkpoints refuse it. |
 | `--inkling2-loop-share-cache` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: every pass of a core layer reads and writes that layer's one KV cache, so the KV pool holds one cache layer per decoder layer regardless of the pass count; each visit keeps its own convolution state. Off by default; other checkpoints refuse it. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
+| `--kda-history-capacity` | KDA models: how many accepted decode records each request keeps per KDA layer, counting the verify window, before they are folded into the dense recurrent state. Defaults to 16, or the verify width (`--speculative-num-draft-tokens`) when larger; it must be at least the verify width. A smaller capacity shrinks the per-request workspace taken from the KV cache budget but folds more often (at the verify width, every round that accepts a token). Cache checkpoints are the same either way. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
@@ -714,9 +717,9 @@ parser option keeps its existing behavior.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` with a DFlash2 draft (see below). Off by default. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` (base or DFlash2 draft, see below). Off by default. |
 | `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
-| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH`. |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH` with a DFlash2 draft, which records a sparse `q`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
@@ -880,8 +883,8 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3`, `MTP`, or `DSPARK` (each
-DSpark Markov step samples its token; `DFLASH` is covered below),
+Requirements: `--speculative-algorithm EAGLE3`, `MTP`, `DSPARK` (each
+DSpark Markov step samples its token) or `DFLASH` (covered below),
 `--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
 reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
@@ -923,13 +926,50 @@ residue, out of the
 KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
 headroom.
 
+#### DFLASH with a base draft
+
+A base `DFLASH` draft (no candidate selector) proposes a whole block from one
+forward. Under the flag it samples every block row from the target head's
+distribution `q = softmax(logits / T)` at the request's temperature and records
+that dense `q`, as the step drafters do; verify then runs the same draft-prob
+rule (`coin * q(x) < p(x)`, residual `norm(relu(p - q))`), so the served
+distribution is the target's `p`. The rows share no token dependency, so one
+GEMM projects all `num_draft_tokens - 1` of them through the head, and each
+row draws with its own noise offset. Greedy requests keep the argmax and a
+one-hot `q`. The verifier is one of `flashinfer`, `flashinfer_full` or `sonic`;
+`triton` reads only the DFlash2 `q` below, so the pairing is refused when the
+server loads the draft.
+
+Both rules serve `p`, so the flag changes the acceptance rate and not the
+distribution. The draft-prob rule accepts `1 - TV(p, q)` of the drafts and the
+target-only rule `p(argmax q)`; which is higher for a draft trained to be read
+greedily is a measurement, not a given.
+
+- Memory: the same dense rows as the step drafters above,
+  `(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes, plus the
+  verifier's gather buffer. Those rows are persistent; the block's own peak is
+  transient and sits in the drafting round: the one GEMM's whole-vocabulary
+  logits over every block row,
+  `(num_draft_tokens - 1) x batch x vocab_size x 2` bytes, which under tensor
+  parallelism is the gathered vocabulary rather than this rank's shard, plus
+  one `batch x vocab_size` fp32 `q` per row. A greedy block keeps only the
+  shard, so expect the drafting round's logits to grow by the head's TP size
+  when the flag goes on.
+- No proposal: a fresh admission and a PD landing hold the sentinel, so their
+  first verify rejects every draft and samples from the full target, as for the
+  step drafters. `--spec-reject-draft-prob-threshold` applies. Pass the flag to
+  the decode role only.
+- The draft head: sampling needs the whole row, so the head's logits are
+  gathered to full vocabulary rather than reduced to an argmax. Under
+  `--lm-head-tp-size` with attention DP the draft already holds a rank-local
+  copy of the head, so this adds no collective.
+
 #### DFLASH with a DFlash2 draft
 
 `DFLASH` takes the flag with a DFlash2 draft (a checkpoint with candidate
-selector weights) and `--sampling-backend triton` only; `DFLASH` with any other
-backend is refused at startup, and a base DFlash draft (no selector) is refused
-when the server loads it. The DFlash2 walk picks one of the selector's `K`
-candidates per draft step. Under the flag a sampling request draws that
+selector weights) and `--sampling-backend triton` only; a DFlash2 draft with
+any other backend is refused when the server loads it. The DFlash2 walk picks
+one of the selector's `K` candidates per draft step. Under the flag a sampling request draws that
 candidate from `q = softmax(scores / T)` over the `K` edges out of the
 previous pick, with noise keyed by the request's seed, the round and the drawn
 token id, so every TP rank draws the same token. Greedy requests keep the best

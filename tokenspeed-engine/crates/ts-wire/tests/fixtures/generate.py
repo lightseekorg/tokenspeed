@@ -56,6 +56,12 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
 )
+from tokenspeed.runtime.engine.request_timing import (
+    RequestClock,
+    RequestTimestamp,
+    RequestTiming,
+    RequestTimingEvents,
+)
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -441,6 +447,38 @@ def _output_slim_tail() -> list[bytes]:
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
 
+def _output_slim_timing() -> list[bytes]:
+    batch = msgspec.msgpack.decode(_output_slim_tail()[0], type=BatchTokenIDOutSlim)
+    batch.request_timing = [
+        RequestTiming(
+            role="decode",
+            dp_rank=2,
+            tp_rank=3,
+            clock=RequestClock(
+                host_id="worker-a",
+                process_instance_id="process-a",
+                clock_sync="unknown",
+                clock_uncertainty_ns="17",
+            ),
+            events=RequestTimingEvents(
+                accepted=RequestTimestamp(
+                    ts_unix_ns="1700000000000000001", ts_mono_ns="9007199254740993"
+                ),
+                kv_ready=RequestTimestamp(
+                    ts_unix_ns="1700000000200000002", ts_mono_ns="9007199454740994"
+                ),
+                finished=RequestTimestamp(
+                    ts_unix_ns="1700000000500000003", ts_mono_ns="9007199754740995"
+                ),
+            ),
+            kv_output_tokens=1,
+            e2e_latency_s=0.75,
+        ),
+        None,
+    ]
+    return [bytes(f) for f in _ENCODER.encode(batch)]
+
+
 def _output_slim_prefix9() -> list[bytes]:
     # An older producer: the tag plus the eight required fields, without the
     # engine index and load tail. Decoders fill the tail with zeros.
@@ -548,6 +586,7 @@ FIXTURES = {
     "control_output_internal_state": _control_output_internal_state,
     "output_slim": _output_slim,
     "output_slim_tail": _output_slim_tail,
+    "output_slim_timing": _output_slim_timing,
     "output_slim_prefix9": _output_slim_prefix9,
     "handshake_hello": _handshake_hello,
     "handshake_init": _handshake_init,

@@ -96,7 +96,9 @@ def test_verify_reads_committed_pool_and_stages_scratch():
         initial_state=pool, initial_state_indices=reads,
         disable_state_update=False, output_state_indices=rows,
         output_state=scratch, tree_ancestors=None,
-    )  # fmt: skip
+
+              pending_replay=None,
+          )  # fmt: skip
     expected, states = _reference(q, k, v, a, b, A_log, dt_bias, pool[reads.long()])
     torch.testing.assert_close(out.double(), expected, rtol=2e-2, atol=1e-2)
     for t in range(tokens):
@@ -126,11 +128,15 @@ def test_decode_and_verify_compile_once_across_batch_sizes():
             initial_state=pool, initial_state_indices=reads,
             disable_state_update=False, output_state_indices=rows,
             output_state=scratch, tree_ancestors=None,
+
+            pending_replay=None,
         )  # fmt: skip
         gdn_decode_mtp(
             q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
             initial_state=pool, initial_state_indices=reads,
             disable_state_update=True, tree_ancestors=None,
+
+            pending_replay=None,
         )  # fmt: skip
 
     run(1)

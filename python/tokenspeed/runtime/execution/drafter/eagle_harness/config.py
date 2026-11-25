@@ -279,6 +279,19 @@ def load_run_config(path: str) -> dict:
     return data[0] if isinstance(data, list) else data
 
 
+def check_chain_measure_shape(num_steps: int, num_draft_tokens: int) -> None:
+    """Refuse a chain cost measurement narrower than 15 steps / 16 tokens: a
+    chain's stop test reads the verify cost at widths 1, 2, 4, ..., 16 whatever
+    the serving chain's own budget, and a measurement only sweeps the widths
+    its draft verifies, so narrower data is refused by every server."""
+    if (num_steps, num_draft_tokens) != (15, 16):
+        raise ValueError(
+            "EAGLE-Harness chain cost data needs verify widths 1, 2, 4, ..., 16 "
+            "(a chain of any budget up to 16 serves from it): measure chains with "
+            f"15 steps and 16 draft tokens, got {num_steps=}, {num_draft_tokens=}"
+        )
+
+
 def validate_server_args(server_args: ServerArgs) -> None:
     """Refuse EAGLE-4 settings it cannot serve. Exec mode -1 (static chains
     and trees) only checks speculative sampling; exec modes 0 to 2
@@ -352,6 +365,11 @@ def validate_server_args(server_args: ServerArgs) -> None:
                 "EAGLE-Harness chains draft at most 15 steps and verify at most "
                 f"16 tokens: {server_args.speculative_num_steps=}, "
                 f"{server_args.speculative_num_draft_tokens=}"
+            )
+        if mode == 2:
+            check_chain_measure_shape(
+                server_args.speculative_num_steps,
+                server_args.speculative_num_draft_tokens,
             )
     cap = max_batch_size(server_args.speculative_compute_intensity)
     if mode == 2:

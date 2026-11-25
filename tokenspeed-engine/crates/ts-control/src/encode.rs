@@ -237,13 +237,13 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         }
     }
 
-    /// Serve until `stop` is set on the group's first rank.
     /// Enable logical metrics on the first attention-TP rank.
     pub fn with_metrics(mut self, metrics: Option<Arc<ts_metrics::EncoderMetrics>>) -> Self {
         self.metrics = metrics;
         self
     }
 
+    /// Serve until `stop` is set on the group's first rank.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), EncodeError> {
         loop {
             let received = match self.intake.as_mut() {
@@ -270,7 +270,6 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         }
     }
 
-    /// This rank has work in flight.
     fn record_snapshot(&mut self) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -297,6 +296,7 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         metrics.snapshot(state.0, state.1, state.2, oldest);
     }
 
+    /// This rank has work in flight.
     fn busy(&self) -> bool {
         !self.requests.is_empty() || self.encoding > 0 || !self.leased.is_empty()
     }
