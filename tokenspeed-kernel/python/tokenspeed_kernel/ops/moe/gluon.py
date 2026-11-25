@@ -3315,9 +3315,7 @@ def gluon_petit_max_tokens_per_rank(
                 " (a larger capacity would exceed the symmetric heap's "
                 "32-bit offsets)"
                 if raised
-                else f" (EP{world_size} keeps the default capacity"
-                + (f" for {profile.name}" if profile is not None else "")
-                + ")"
+                else f" (EP{world_size} keeps the default capacity{subject})"
             )
         )
     return capacity
