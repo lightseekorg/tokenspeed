@@ -1231,7 +1231,7 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
 // incomplete prefill has only the chunks it has been through; TokenSize()
 // would publish pages that were never computed). Device-only: the pages reach
 // Host through the image's L2 leg.
-void Scheduler::publishCompletedPrefix(Request& victim) {
+void Scheduler::publishCompletedPrefix(Request& victim, const StateCommitPages& live_state) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     // Even without SchedulerConfig::PublishesCompletedPages: with a Host cache
@@ -1251,12 +1251,63 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
         // exactly as publishCompletedPages registers before it caches.
         registerKvEventPublication(victim, cache_progress.prefix_hashes, *progress.completed_pages);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
+        if (peer_exports_) {
+            // The live blocks hold their state only once the runtime folds it
+            // at the start of this plan (ExecutionPlan::state_folds); a peer
+            // reads outside device order.
+            withholdUncommittedState(victim, progress.completed_pages->state_slot, live_state);
+        }
     }
     // A suspended request holds no Device block: the index keeps the
     // in-forward State checkpoint this publication may have just published.
     cache_progress.published_state_checkpoint_blocks.clear();
     cache_progress.retained_input_checkpoint.clear();
     victim.CacheProgressRef() = std::move(cache_progress);
+}
+
+namespace {
+
+// The State slot a decode step writes in place (GroupAllocator::AcquireStateLive).
+constexpr std::size_t kLiveStateSlot = 1;
+
+}  // namespace
+
+Scheduler::StateCommitPages Scheduler::liveDeferredStatePages(const Request& request) const {
+    StateCommitPages pages;
+    if (request.NumComputedTokens() <= request.PrefillSize()) {
+        return pages;  // no decode step has run, so no record has
+    }
+    const std::vector<BlockTable>& tables = request.BlockTablesRef();
+    for (std::uint32_t group = 0; group < tables.size(); ++group) {
+        const std::span<const std::int32_t> page_ids = tables[group].PageIds();
+        if (config_.cache_groups[group].deferred_decode_state && kLiveStateSlot < page_ids.size() &&
+            page_ids[kLiveStateSlot] != 0) {
+            pages.emplace(group, page_ids[kLiveStateSlot]);
+        }
+    }
+    return pages;
+}
+
+void Scheduler::planStateFolds(const Request& victim, const StateCommitPages& live_state, ExecutionPlan& plan) const {
+    const std::vector<BlockTable>& tables = victim.BlockTablesRef();
+    for (const auto& [group, page] : live_state) {
+        if (tables[group].PageIds()[kLiveStateSlot] == page) {
+            plan.state_folds[cache_group_ids_[group]].emplace_back(victim.RequestPoolIndex(), page);
+        }
+    }
+}
+
+void Scheduler::withholdUncommittedState(const Request& request, std::int32_t state_slot,
+                                         const StateCommitPages& candidates) {
+    const std::vector<BlockTable>& tables = request.BlockTablesRef();
+    for (const auto& [group, page] : candidates) {
+        const BlockTable& table = tables[group];
+        const auto slot = static_cast<std::size_t>(state_slot);
+        if (table.PageIds()[slot] == page &&
+            coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(group)).Contains(table.Blocks()[slot])) {
+            uncommitted_state_pages_.emplace(group, page);
+        }
+    }
 }
 
 std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) const {
@@ -1312,14 +1363,22 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
 // it did stands as its progress. Both callers then abort it rather than let
 // it run on: the publication registered blocks the victim would write again (a
 // partial page as a tail, and a State group's end state, which a decode step
-// writes in place).
+// writes in place). Either way the plan lists the victim's live blocks of
+// deferred-decode-state groups for the runtime to fold its decode records
+// into (ExecutionPlan::state_folds) before the image or any reader of the
+// publication reads them.
 std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
                                                        std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::retractVictim"};
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
-    publishCompletedPrefix(victim);
+    // Taken before the publication, which may swap a block for another
+    // request's equal entry.
+    const StateCommitPages live_state = liveDeferredStatePages(victim);
+    publishCompletedPrefix(victim, live_state);
+    // Also when the split below refuses the image: the publication stands.
+    planStateFolds(victim, live_state, build.plan);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     TierTransferManager::RetractionImageSplit split = tier_transfers_.SplitRetractionImage(
         victim.BlockTablesRef(), num_computed_tokens,

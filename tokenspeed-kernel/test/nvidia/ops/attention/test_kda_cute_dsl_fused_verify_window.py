@@ -47,20 +47,22 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)
+from kda_retained_reference import prepare_history  # noqa: E402
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     rmsnorm_gated_sigmoid,
 )
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     KdaOutputNorm,
-    KdaReplayRecords,
+    KdaRetainedHistory,
+    KdaRetainedRecords,
+    kda_fused_paged_verify,
     kda_fused_paged_verify_fuses_producers,
-    try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda._cute_dsl import (  # noqa: E402
     fused_verify_window as window_kernel,
 )
-from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_window import (  # noqa: E402
-    fused_verify_window_supported,
+from tokenspeed_kernel.ops.attention.kda._cute_dsl import (  # noqa: E402
+    recoverssm_verify as recoverssm_kernel,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     fused_kda_verify_conv_update,
@@ -122,66 +124,107 @@ def _inputs(batch, window, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0
     )
 
 
-def _records(x, *, original, capacity):
-    """Sentinel destinations; records view padded payload rows as serving does."""
+def _records(x, *, original, capacity, correction_stride=1, history_length=0):
+    """Sentinel-filled request records, with padding around each slot.
+
+    With ``history_length``, every slot first holds that many accepted records.
+    """
     slots, rows = x["slots"], x["mixed_qkv"].shape[0]
     correction_rows = torch.full(
-        (slots, capacity * WIDTH + CORRECTION_ROW_PAD), CORRECTION_FILL, device="cuda"
+        (slots, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
+        CORRECTION_FILL,
+        device="cuda",
     )
     key_gate_rows = torch.full(
         (slots, capacity * 2 * WIDTH + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
-    ).bfloat16()
+    )
+    packed = (
+        key_gate_rows[:, : capacity * 2 * WIDTH]
+        .view(slots, capacity, HEADS, 2 * DIM)
+        .transpose(1, 2)
+    )
+    history = KdaRetainedHistory(
+        correction_rows[:, : capacity * WIDTH * correction_stride]
+        .view(slots, capacity, HEADS, DIM * correction_stride)
+        .transpose(1, 2)[..., ::correction_stride],
+        packed[..., :DIM],
+        packed[..., DIM:],
+        torch.zeros(slots, 1, dtype=torch.int32, device="cuda"),
+        x["state_indices"],
+        torch.arange(x["state_indices"].numel(), device="cuda", dtype=torch.int32),
+    )
+    if history_length:
+        gen = torch.Generator(device="cuda").manual_seed(history_length)
+        shape = (slots, HEADS, history_length, DIM)
+        accepted = slice(0, history_length)
+        history.correction[:, :, accepted] = 0.02 * torch.randn(
+            shape, device="cuda", generator=gen
+        )
+        history.key[:, :, accepted] = F.normalize(
+            torch.randn(shape, device="cuda", generator=gen), dim=-1
+        )
+        history.decay[:, :, accepted] = 0.7 + 0.25 * torch.rand(
+            shape, device="cuda", generator=gen
+        )
+        history.length.fill_(history_length)
     stamps = torch.full(
-        (slots, capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
+        (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
     )
     retained = torch.full(
         (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
     ).bfloat16()
-    records = KdaReplayRecords(
+    records = KdaRetainedRecords(
         original_qkv=retained[:, : 3 * WIDTH] if original else None,
+        history=history,
         metadata=x["record_metadata"],
         stamps=stamps if x["record_metadata"] is not None else None,
-        correction=correction_rows[:, : capacity * WIDTH]
-        .view(slots, capacity, HEADS, DIM)
-        .transpose(1, 2),
-        key_gate=key_gate_rows[:, : capacity * 2 * WIDTH]
-        .view(slots, capacity, HEADS, 2 * DIM)
-        .transpose(1, 2),
         query_start_loc=x["query_start_loc"],
     )
     return records, (correction_rows, key_gate_rows, stamps, retained)
 
 
-def _verify(x, records, output_norm, **producers):
-    return try_kda_fused_paged_verify(
+def _verify(x, records, output_norm, *, override=None, **producers):
+    # Serving readies the history before every verify round.
+    prepare_history(
+        x["state_pool"],
+        records.history,
+        x["state_indices"],
+        x["query_start_loc"],
+        draft_token_num=x["window"],
+    )
+    return kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],
         x["conv_states"],
-        None,
         x["f_a_out"],
         x["f_b_weight"],
         x["beta_logits"],
         x["A_log"],
         x["dt_bias"],
         state_pool=x["state_pool"],
-        state_scratch=None,
         read_indices=x["state_indices"],
-        write_indices=x["state_indices"],
         num_heads=HEADS,
         head_dim=DIM,
         draft_token_num=x["window"],
         lower_bound=x["lower_bound"],
-        store_states=False,
         recurrent_layout="v_major",
-        replay_records=records,
+        retained_records=records,
         output_norm=output_norm,
+        override=override,
+        solution=None,
         **producers,
     )
 
 
-def _split(x, capacity):
+def _split(x, capacity, *, correction_stride=1, history_length=0):
     """The serving split producers, then the registered record verify."""
-    records, buffers = _records(x, original=False, capacity=capacity)
+    records, buffers = _records(
+        x,
+        original=False,
+        capacity=capacity,
+        correction_stride=correction_stride,
+        history_length=history_length,
+    )
     conv_qkv = fused_kda_verify_conv_update(
         x["mixed_qkv"],
         x["conv_weights"],
@@ -191,17 +234,49 @@ def _split(x, capacity):
         head_dim=DIM,
         draft_token_num=x["window"],
         original_qkv=buffers[3][:, : 3 * WIDTH],
+        query_start_loc=x["query_start_loc"],
     )
     g_raw = F.linear(x["f_a_out"], x["f_b_weight"])
     return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
 
 
-def _fused(x, capacity, output_norm=None):
-    records, buffers = _records(x, original=True, capacity=capacity)
+def _fused(x, capacity, output_norm=None, *, history_length=0):
+    records, buffers = _records(
+        x, original=True, capacity=capacity, history_length=history_length
+    )
     return _verify(x, records, output_norm), buffers
 
 
-def _assert_matches(expected, actual, capacity):
+def _gate_input_step(x, decays_ref):
+    """The decay change one BF16 step of each gate projection can make.
+
+    The split producers round the gate projection to BF16 in a GEMM whose
+    accumulation order varies across GPUs, where the fused kernel keeps it in
+    FP32. The input z = projection + dt_bias of each written decay follows
+    from the reference decay, and the decay moves by about decay times the
+    log-decay slope times one BF16 step of the projection.
+    """
+    column = torch.arange(decays_ref.shape[1], device="cuda")
+    head = column // DIM % HEADS
+    a = x["A_log"].float().exp()[head]
+    bias = x["dt_bias"].float()[head * DIM + column % DIM]
+    decay = decays_ref.clamp(min=2.0**-126, max=1.0)
+    if x["lower_bound"] is None:
+        # log decay = -a softplus(z); softplus(z) is its negation over a.
+        softplus = -torch.log(decay) / a
+        z = torch.log(torch.expm1(softplus))
+        slope = a * -torch.expm1(-softplus)
+    else:
+        # log decay = lower_bound sigmoid(a z).
+        gate = (torch.log(decay) / x["lower_bound"]).clamp(2.0**-24, 1 - 2.0**-24)
+        z = torch.logit(gate) / a
+        slope = -x["lower_bound"] * a * gate * (1 - gate)
+    step = decay * slope * (z - bias).abs() * 2.0**-7
+    written = decays_ref != KEY_GATE_FILL
+    return torch.where(written, torch.nan_to_num(step, nan=0.0, posinf=0.0), 0.0)
+
+
+def _assert_matches(x, expected, actual, capacity):
     out_ref, (corr_ref, kg_ref, stamps_ref, kept_ref) = expected
     out, (corr, kg, stamps, kept) = actual
     assert torch.equal(kept, kept_ref)
@@ -212,14 +287,17 @@ def _assert_matches(expected, actual, capacity):
             for base in range(0, capacity * 2 * WIDTH, 2 * DIM)
         ]
     ).cuda()
-    assert torch.equal(kg[:, key_cols], kg_ref[:, key_cols])
+    torch.testing.assert_close(
+        kg[:, key_cols], kg_ref[:, key_cols], atol=1e-7, rtol=2e-6
+    )
     tail = capacity * 2 * WIDTH
     assert torch.equal(kg[:, tail:], kg_ref[:, tail:])
     gate_cols = key_cols + DIM
     gates, gates_ref = kg[:, gate_cols].float(), kg_ref[:, gate_cols].float()
-    # One BF16 step of the larger gate, plus a floor for sums that cancel to near zero.
+    # One BF16 step of the larger gate, a floor for sums that cancel to near
+    # zero, and what one BF16 step of the gate projection moves it by.
     step = torch.maximum(gates.abs(), gates_ref.abs()) * 2.0**-7
-    step = step + gates_ref.abs().max() * 2.0**-16
+    step = step + gates_ref.abs().max() * 2.0**-16 + _gate_input_step(x, gates_ref)
     assert ((gates - gates_ref).abs() <= step).all()
     tail = capacity * WIDTH
     assert torch.equal(corr[:, tail:], corr_ref[:, tail:])
@@ -238,7 +316,7 @@ def _assert_matches(expected, actual, capacity):
 def test_fused_window_matches_split_producers(batch, window, lower_bound):
     x = _inputs(batch, window, seed=batch * 31 + window, lower_bound=lower_bound)
     state, history = x["state_pool"].clone(), x["conv_states"].clone()
-    _assert_matches(_split(x, window), _fused(x, window), window)
+    _assert_matches(x, _split(x, window), _fused(x, window), window)
     assert torch.equal(x["state_pool"], state)
     assert torch.equal(x["conv_states"], history)
 
@@ -246,7 +324,7 @@ def test_fused_window_matches_split_producers(batch, window, lower_bound):
 @pytest.mark.parametrize("capacity", [9, 13])
 def test_record_positions_wrap_the_ring(capacity):
     x = _inputs(4, 8, seed=capacity)
-    _assert_matches(_split(x, capacity), _fused(x, capacity), capacity)
+    _assert_matches(x, _split(x, capacity), _fused(x, capacity), capacity)
 
 
 def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
@@ -283,34 +361,22 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
 
 def test_fused_window_without_metadata_records_by_request():
     x = _inputs(4, 8, seed=40, metadata=False)
-    _assert_matches(_split(x, 8), _fused(x, 8), 8)
+    _assert_matches(x, _split(x, 8), _fused(x, 8), 8)
 
 
-@pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])
-def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
-    x = _inputs(3, 8, seed=41, f_a_pitch=int(unaligned == "f_a rows"))
-    if unaligned == "conv weights":
+@pytest.mark.parametrize("layout", ["f_a rows", "conv weights", "correction channels"])
+def test_strided_or_unaligned_inputs_match_split_producers(layout):
+    x = _inputs(3, 8, seed=41, f_a_pitch=int(layout == "f_a rows"))
+    if layout == "conv weights":
         weights = x["conv_weights"]
         shifted = torch.empty(weights.numel() + 1, device="cuda", dtype=weights.dtype)
         x["conv_weights"] = shifted[1:].view_as(weights).copy_(weights)
-    assert not fused_verify_window_supported(
-        x["mixed_qkv"],
-        x["conv_weights"],
-        x["conv_states"],
-        x["f_a_out"],
-        x["f_b_weight"],
-        x["beta_logits"],
-        x["A_log"],
-        x["dt_bias"],
-        x["state_pool"],
-        x["query_start_loc"],
-        x["state_indices"],
-        HEADS,
-        DIM,
-        8,
-        x["lower_bound"],
+    correction_stride = 2 if layout == "correction channels" else 1
+    expected = _split(x, 8, correction_stride=correction_stride)
+    records, buffers = _records(
+        x, original=True, capacity=8, correction_stride=correction_stride
     )
-    expected, actual = _split(x, 8), _fused(x, 8)
+    actual = _verify(x, records, None), buffers
     # The fallback runs the reference producers, so every result is exact.
     assert torch.equal(expected[0], actual[0])
     for ref, got in zip(expected[1], actual[1]):
@@ -418,6 +484,33 @@ def test_every_value_tile_gives_the_same_bits(batch, window, monkeypatch):
             assert torch.equal(got, want)
 
 
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("history_length", [5, 12])
+def test_accepted_history_gives_the_same_bits_in_every_value_tile(
+    batch, history_length, monkeypatch
+):
+    """Accepted records reach the outputs alike however the values split.
+
+    The fused window and the split verify share the history projection. Each
+    must store the same outputs and records for every value tile, up to one
+    unclustered CTA per head.
+    """
+    x = _inputs(batch, 4, seed=90 + batch + history_length)
+    fused, split = [], []
+    for rows in (32, 64, 128):
+        monkeypatch.setattr(window_kernel, "_value_tile_rows", lambda *_, n=rows: n)
+        monkeypatch.setattr(recoverssm_kernel, "_value_tile_rows", lambda *_, n=rows: n)
+        fused.append(_fused(x, 16, history_length=history_length))
+        split.append(_split(x, 16, history_length=history_length))
+    for results in (fused, split):
+        out, records = results[0]
+        for other_out, other_records in results[1:]:
+            assert torch.equal(other_out, out)
+            for got, want in zip(other_records, records):
+                assert torch.equal(got, want)
+    _assert_matches(x, split[0], fused[0], 16)
+
+
 def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():
     x = _inputs(3, 8, seed=43, f_a_pitch=1)
     norm = _output_norm(x, torch.bfloat16)
@@ -433,3 +526,40 @@ def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():
         enable_pdl=False,
     )
     assert torch.equal(normed, expected)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("raw_gate_only", [False, True])
+def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
+    state_dtype, raw_gate_only
+):
+    from kda_retained_reference import check_fused_retained_append
+
+    x = _inputs(2, 3, seed=143)
+    x["state_pool"] = x["state_pool"].to(state_dtype)
+    records = _records(x, original=True, capacity=8)[0]
+    expected = _records(x, original=True, capacity=8)[0]
+    check_fused_retained_append(
+        x, records, expected, _verify, width=3, raw_gate_only=raw_gate_only
+    )
+
+
+def test_a_page_past_the_pool_verifies_as_padding():
+    """A page past the checkpoint pool is padding, exactly like page -1: its
+    checkpoint and convolution history are not read, it records nothing, and
+    every result matches the page -1 run bit for bit."""
+    runs = []
+    for past_pool in (False, True):
+        # _inputs draws its pages from the global generator.
+        torch.manual_seed(223)
+        x = _inputs(5, 4, seed=223)
+        if past_pool:
+            x["state_indices"][2] = x["state_pool"].shape[0]
+        state, history = x["state_pool"].clone(), x["conv_states"].clone()
+        runs.append(_fused(x, 4))
+        assert torch.equal(x["state_pool"], state)
+        assert torch.equal(x["conv_states"], history)
+    (out, buffers), (past_out, past_buffers) = runs
+    assert torch.equal(past_out, out)
+    for past, padded in zip(past_buffers, buffers, strict=True):
+        assert torch.equal(past, padded)

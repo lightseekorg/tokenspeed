@@ -49,7 +49,7 @@ Writable types:
 2. RequestSpec
 3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
-5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone)
+5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone, StateCommitDone)
 
 All other types are produced by the scheduler and consumed by Python, so they do
 not need writable properties.
@@ -183,6 +183,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("sink_tokens", &tokenspeed::CacheGroupConfig::sink_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
+        .def_rw("deferred_decode_state", &tokenspeed::CacheGroupConfig::deferred_decode_state)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
@@ -543,6 +544,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::RestoreDone::op_id);
 
+    // The runtime committed the deferred decode state a plan's retractions
+    // published (ExecutionPlan.state_commit_fence).
+    nb::class_<tokenspeed::cache::StateCommitDone>(cache, "StateCommitDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::StateCommitDone::op_id);
+
     // RestoreOp.source_tiers carries these as plain integers per row.
     nb::enum_<tokenspeed::HostTier>(cache, "HostTier", nb::is_arithmetic())
         .value("L2", tokenspeed::HostTier::kL2)
@@ -798,6 +805,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("has_peer_fetches",
                      [](const tokenspeed::ExecutionPlan& plan) { return !plan.peer_fetches.empty(); })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
+        .def_ro("state_commit_fence", &tokenspeed::ExecutionPlan::state_commit_fence)
         .def("pages_to_zero_arrays",
              [](nb::handle self) {
                  // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
@@ -819,16 +827,35 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         // forwards and before this plan's zeroing; destinations are never in
         // pages_to_zero. No ACK.
         .def_ro("pages_to_copy", &tokenspeed::ExecutionPlan::pages_to_copy)
-        .def("pages_to_copy_arrays", [](nb::handle self) {
-            // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
-            // group (empty groups included): column 0 the source, column 1
-            // the destination. std::pair<int32, int32> is two contiguous
-            // int32s, which the static_assert below holds the layout to.
-            static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
-                          "a copy pair must be two contiguous int32 values");
+        .def("pages_to_copy_arrays",
+             [](nb::handle self) {
+                 // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
+                 // group (empty groups included): column 0 the source, column 1
+                 // the destination. std::pair<int32, int32> is two contiguous
+                 // int32s, which the static_assert below holds the layout to.
+                 static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
+                               "a copy pair must be two contiguous int32 values");
+                 auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+                 nb::dict out;
+                 for (auto& [gid, pairs] : plan.pages_to_copy) {
+                     const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
+                 }
+                 return out;
+             })
+        // The live State blocks of this plan's retraction victims, per
+        // deferred-decode-state group, as (request pool index, page id): the
+        // runtime folds each slot's accepted decode records into its block on
+        // the execution stream before the plan's stores, copies, zeroing and
+        // forward. No ACK.
+        .def_ro("state_folds", &tokenspeed::ExecutionPlan::state_folds)
+        .def("state_folds_arrays", [](nb::handle self) {
+            // Zero-copy (n, 2) int32 views of state_folds, one per listed
+            // group: column 0 the request pool index, column 1 the page id.
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pairs] : plan.pages_to_copy) {
+            for (auto& [gid, pairs] : plan.state_folds) {
                 const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
                 out[nb::str(gid.c_str())] =
                     nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);

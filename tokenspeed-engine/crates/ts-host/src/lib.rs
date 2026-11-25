@@ -939,6 +939,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         config.stream_interval,
         Some(config.physical_context_len),
         role,
+        scheduler.defers_decode_state(),
         config.finish_log,
         metrics.is_some(),
         trace,

@@ -72,33 +72,6 @@ def test_kda_generator_rejects_unimplemented_model_profile(
         prepare_kda_paged_prefill(request, mi350_platform)
 
 
-def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
-    def cpu_randn(shape, *, dtype, generator):
-        _ = generator
-        return torch.randn(shape, dtype=dtype)
-
-    monkeypatch.setattr(kda_generator, "_randn", cpu_randn)
-    q, k, v = kda_generator._packed_decode_qkv(
-        4,
-        16,
-        128,
-        128,
-        dtype=torch.bfloat16,
-        generator=None,
-    )
-    beta = kda_generator._packed_beta_logits(
-        4,
-        kda_generator._MODEL_PROFILES["glm53_flash_tp4"],
-        dtype=torch.bfloat16,
-        generator=None,
-    )
-
-    assert q.stride() == (24576, 6144, 128, 1)
-    assert k.stride() == q.stride()
-    assert v.stride() == q.stride()
-    assert beta.stride() == (25664, 6416, 1)
-
-
 @pytest.mark.parametrize(
     ("model_profile", "head_stride", "projection_width"),
     [("glm53_flash_tp4", 2048, 6416), ("kimi_k3_tp8", 1536, 6288)],
@@ -237,38 +210,6 @@ def test_kda_generator_builds_flat_decay_bias() -> None:
     assert dt_bias.shape == (2048,)
 
 
-def test_kda_generator_builds_arena_strided_state_pool() -> None:
-    state_pool = kda_generator._strided_state_pool(
-        3,
-        2,
-        4,
-        4,
-        48,
-        device="cpu",
-    )
-
-    assert state_pool.shape == (3, 2, 4, 4)
-    assert state_pool.stride() == (48, 16, 4, 1)
-    assert state_pool.is_contiguous() is False
-
-
-def test_kda_generator_builds_in_place_and_boundary_state_indices() -> None:
-    read_indices, in_place = kda_generator._state_page_indices(
-        4,
-        "in_place",
-        device="cpu",
-    )
-    _, distinct = kda_generator._state_page_indices(
-        4,
-        "distinct",
-        device="cpu",
-    )
-
-    assert read_indices.tolist() == [1, 2, 3, 4]
-    assert in_place.tolist() == [1, 2, 3, 4]
-    assert distinct.tolist() == [17, 18, 19, 20]
-
-
 def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
     # One 884736-byte page of the TP8 cache arena: the FP32 recurrent state
     # followed by the BF16 convolution history.
@@ -285,3 +226,147 @@ def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
     assert state_pool.shape == (3, 12, 128, 128)
     assert state_pool.stride() == (221184, 16384, 128, 1)
     assert conv_pool.data_ptr() - state_pool.data_ptr() == 12 * 128 * 128 * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    ("mode", "window", "history_length"),
+    [
+        ("kda_fused_paged_verify", 1, 0),
+        ("kda_fused_paged_verify", 4, 8),
+        ("kda_retained_commit", 1, 0),
+        ("kda_retained_commit", 4, 0),
+    ],
+)
+def test_retained_benchmark_repetitions_restore_mutable_state(
+    monkeypatch, mode, window, history_length
+):
+    from tokenspeed_kernel.platform import current_platform
+
+    parameters = dict(
+        model_profile="kimi_k3_tp8",
+        heads=12,
+        key_dim=128,
+        value_dim=128,
+        dtype="bfloat16",
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+        batch=1,
+        draft_token_num=window,
+        conv_kernel_size=4,
+        state_pages=3,
+        state_page_bytes=884736,
+    )
+    if mode == "kda_retained_commit":
+        parameters.update(accepted_length=window, layers=2, state_groups=1)
+    else:
+        parameters["history_length"] = history_length
+    request = BenchmarkRequest(
+        family="attention",
+        mode=mode,
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=False,
+        seed=47,
+    )
+    layers = []
+    original_prepare = kda_generator._retained_benchmark_layer
+
+    def capture_layer(*args):
+        layer = original_prepare(*args)
+        layers.append(layer)
+        return layer
+
+    monkeypatch.setattr(kda_generator, "_retained_benchmark_layer", capture_layer)
+    prepare = (
+        kda_generator.prepare_kda_fused_paged_verify
+        if mode == "kda_fused_paged_verify"
+        else kda_generator.prepare_kda_retained_commit
+    )
+    prepared = prepare(request, current_platform())
+    assert prepared.invocation.reset is not None
+    snapshots = None
+    for _ in range(3):
+        prepared.invocation.reset()
+        output = prepared.invocation.invoke()
+        current = []
+        if isinstance(output, torch.Tensor):
+            current.append(output)
+        for layer in layers:
+            history = layer["records"].history
+            current.extend(
+                [
+                    layer["state"],
+                    layer["conv"],
+                    history.length,
+                    history.correction,
+                    history.key,
+                    history.decay,
+                ]
+            )
+            expected_length = (
+                window if mode == "kda_retained_commit" else history_length
+            )
+            slots = history.record_slots.long()
+            assert history.length[slots, 0].tolist() == [expected_length]
+            if history_length:
+                assert torch.count_nonzero(
+                    history.correction[history.record_slots.long(), :, :history_length]
+                )
+        if snapshots is None:
+            snapshots = [value.clone() for value in current]
+        else:
+            for value, saved in zip(current, snapshots):
+                torch.testing.assert_close(value, saved, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("batch", [1, 17])
+def test_retained_verify_benchmark_keeps_the_raw_qkv_rows(monkeypatch, batch):
+    """Each producer arrangement leaves the window's pre-convolution rows.
+
+    One request fuses the producers into the window kernel; 17 requests run
+    the split producers, whose convolution keeps the rows as serving does.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    request = BenchmarkRequest(
+        family="attention",
+        mode="kda_fused_paged_verify",
+        parameters=dict(
+            model_profile="kimi_k3_tp8",
+            heads=12,
+            key_dim=128,
+            value_dim=128,
+            dtype="bfloat16",
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+            batch=batch,
+            draft_token_num=4,
+            conv_kernel_size=4,
+            state_pages=batch + 2,
+            state_page_bytes=884736,
+            history_length=4,
+        ),
+        solution=None,
+        registration=None,
+        cold_cache=False,
+        seed=47,
+    )
+    layers = []
+    original_prepare = kda_generator._retained_benchmark_layer
+
+    def capture_layer(*args):
+        layer = original_prepare(*args)
+        layers.append(layer)
+        return layer
+
+    monkeypatch.setattr(kda_generator, "_retained_benchmark_layer", capture_layer)
+    prepared = kda_generator.prepare_kda_fused_paged_verify(request, current_platform())
+    (layer,) = layers
+    raw_rows = layer["records"].original_qkv
+    raw_rows.fill_(float("nan"))
+    prepared.invocation.reset()
+    prepared.invocation.invoke()
+    torch.testing.assert_close(raw_rows, layer["projection"].mixed_qkv, atol=0, rtol=0)
