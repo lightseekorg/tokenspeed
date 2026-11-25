@@ -345,8 +345,8 @@ _ROUTE_TILE_CONFIGS = {
     # top-k IDs beats the direct decode on recorded verify and plain decode
     # routing, except a few plain decode samples with many distinct experts.
     # At 6-8 rows plain decode routing loses, so the direct decode keeps
-    # them. 17-128 rows: faster than the staged package; with uniform and
-    # Zipf routing it breaks even at 160 rows.
+    # them. 17-128 rows: faster than the staged package. Past 128 rows the
+    # 128-row tiles only break even with it, at 160 rows.
     (4096, 512, 256, 256, 8): (
         (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2, block_m=16)),
         # Stage 1's grouping cost grows with the route capacity, so 17-32
@@ -354,6 +354,18 @@ _ROUTE_TILE_CONFIGS = {
         (17, 32, _RouteTileConfig(32, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
         (33, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
         (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2, block_m=16)),
+        # 129-256 rows: 256-wide tiles in both stages stream each expert's
+        # weights in fewer, larger loads; 1.08-1.20x the staged package.
+        (
+            129,
+            256,
+            _RouteTileConfig(
+                256,
+                _RouteTileStage(256, 256, 1, 4),
+                _RouteTileStage(256, 256, 1, 4),
+                block_m=16,
+            ),
+        ),
     ),
 }
 assert all(
