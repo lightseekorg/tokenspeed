@@ -1037,6 +1037,8 @@ static PeerFetchView FetchView(const tokenspeed::PeerFetchOperation& fetch) {
                                     .tokens = ToRustVec(fetch.tokens)};
 }
 
+bool release_peer_pin(const std::shared_ptr<tokenspeed::PeerPinRelease>& handle) { return handle && handle->Release(); }
+
 std::shared_ptr<tokenspeed::PeerPinRelease> peer_release_handle(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
     return scheduler.PeerReleaseHandle(FromView(lease));
 }

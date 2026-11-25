@@ -40,14 +40,14 @@ namespace tokenspeed {
 class PeerPinRelease {
 public:
     explicit PeerPinRelease(std::span<CacheBlockRef> pins) : pins_(pins) {}
-    bool Release() const noexcept;
+    bool Release() noexcept;
     void Close() noexcept;
     bool Released() const noexcept { return released_.load(); }
 
 private:
-    mutable std::mutex mutex_;
+    std::mutex mutex_;
     std::span<CacheBlockRef> pins_;
-    mutable std::atomic<bool> released_{false};
+    std::atomic<bool> released_{false};
 };
 
 // The holder's half of peer prefix sharing. Answers are reads: the
@@ -82,7 +82,7 @@ public:
     // The changes, applied at the head.
     void Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us);
     void Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us,
-             const cache::PeerLookup* checkpoint = nullptr);
+             const cache::PeerLookup* checkpoint);
     // A release that asks for it, after a pin that held, demotes the pinned
     // prefix's leaf chain (CacheCoordinator::DemoteExportedChain): the
     // reader has its own copy now.
@@ -90,7 +90,7 @@ public:
     // Lets every lease past its deadline go: a soft pin is forgotten, a hard
     // pin's blocks go back and its tombstone stays for one more hard-pin
     // lifetime.
-    void Expire(std::int64_t now_us, bool retain_hard = false);
+    void Expire(std::int64_t now_us, bool retain_hard);
 
     std::size_t NumLeases() const;
     std::size_t NumPinnedBlocks() const;

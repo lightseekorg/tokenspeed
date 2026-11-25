@@ -76,6 +76,7 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                   rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
                   rust::Slice<const CacheEvent> cache_events);
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
+bool release_peer_pin(const std::shared_ptr<tokenspeed::PeerPinRelease>& handle);
 std::shared_ptr<tokenspeed::PeerPinRelease> peer_release_handle(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 bool enable_async_host_peer(tokenspeed::Scheduler& scheduler);
 bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive);

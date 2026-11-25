@@ -179,8 +179,8 @@ unrelated Device pages and published Host pages remain available. An accepted
 answer queues the hard pin of exactly those pages; a pin that finds them
 changed at the head holds nothing. The hard pin takes block references
 (`CacheBlockRef`), so the pages can neither be evicted, relocated by
-compaction nor moved by write-back. It has its own deadline, after which the holder's scheduler
-releases it and leaves a tombstone.
+compaction nor moved by write-back. Coordinated holders release expired pins
+and leave a tombstone. Independent holders use the liveness policy below.
 
 **Read.** Readers pull: one-sided reads from the holder's registered Device
 cache or Host pool into the reader's Device pages. The holder's data plane
@@ -225,8 +225,10 @@ a send failure clears the query immediately. Later landings can ask again
 after a lost request or reply, and a weight update clears outstanding queries
 along with the cached layouts.
 
-**A reader goes down:** the holder's soft and hard pins expire by their
-deadlines; nothing leaks.
+**A reader goes down.** Soft leases expire on both drivers. Coordinated
+holders expire hard pins under their existing timing contract. Independent
+holders keep hard references until RELEASE or transport teardown. The
+autonomous liveness policy below reports abandoned pins to the launcher.
 
 **A holder restarts** under the same name: its answers and layout carry its
 incarnation, and a reader drops a layout, and any answer, of another
@@ -252,8 +254,7 @@ landing given up, so no late write lands in a page another request was given.
 A read that succeeded retired every write before it returned.
 
 **A flush on the holder** (a weight update) is refused while a hard pin holds
-pages, as while a PD transfer is in flight, and proceeds once the pins end,
-within one hard-pin lifetime. A soft pin holds nothing; a pin after the flush
+pages, as while a PD transfer is in flight, and proceeds once the pins end. A soft pin holds nothing; a pin after the flush
 finds the pages changed.
 
 ### Overlap
@@ -489,9 +490,9 @@ while DP is waiting in a forward. Only the cache owner runs uniqueness observers
 demotes cache entries and returns unused storage to its pool. Duplicate releases
 receive the same answer during the record lifetime. No extra thread is needed.
 
-Hard-pinned source pages remain held until an explicit release. If the remote
-peer dies or a release is permanently lost, that lease can remain charged
-against the configured lease limit until teardown. Reclaiming abandoned hard pins requires proof that the transport has retired.
+During shutdown the independent worker drops queued reservations and grants,
+cancels landings still waiting to start a read, and drains submitted reads
+and active holder pins. It continues serving RELEASE while draining.
 
 ### Single-member Device landings
 
@@ -528,11 +529,22 @@ namespace, prefix length and full source-page mapping against the lookup
 and its writable grant before issuing DMA. Eviction or a changed mapping
 falls back to local prefill without a second lookup.
 
-Coordinated replicas keep their existing namespace. Single-member Host
-replicas use the existing Host namespace. Single-member Device replicas use
-a new protocol namespace so an older endpoint cannot satisfy a validated
-checkpoint PIN. An incompatible lookup is treated as a miss during rollout.
+Coordinated replicas keep their existing namespace. Independent Host and Device
+replicas use `async-host-v2:` and `async-device-v3:` respectively. During a
+rolling upgrade, endpoints with different protocol versions fall back to local
+prefill. A matching version is required on both sides for hard-pin liveness.
 
+An autonomous reader retries a missing RELEASE acknowledgement once. A READ
+still running after one third of the record lifetime renews its existing hard
+pin and repeats at that interval until retirement. Short reads send no renewal.
+A holder that receives neither renewal nor RELEASE for a full record lifetime
+(60 seconds by default) reports an engine error identifying the lease. Recovery
+requires replacing the holder process and its registered transport session.
+The error leaves the native pin in place so a timer cannot recycle live DMA pages.
+
+After 30 seconds without an admitted attempt on a degraded Device path, an
+idle reader may probe a prefix that met the original cold-start gain threshold.
+Per-request cost and feedback details are logged at debug level.
 
 Reader decision details are available in `tokenspeed:peer_decisions_total`.
 Local admission and no-attempt reasons count once at request termination and

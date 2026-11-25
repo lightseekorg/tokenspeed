@@ -105,6 +105,8 @@ pub struct Landing {
     phase_us: i64,
     phase: Phase,
     deadline_us: i64,
+    last_renewal_us: i64,
+    retried_release: bool,
     timeouts: Timeouts,
     /// Each member's read outcome, once reported.
     outcomes: Vec<Option<bool>>,
@@ -144,6 +146,8 @@ impl Landing {
                 failure: None,
                 phase_us: now_us,
                 phase,
+                last_renewal_us: now_us,
+                retried_release: false,
                 deadline_us: deadline(now_us, timeouts.answer_us),
                 timeouts,
                 outcomes: vec![None; members],
@@ -251,11 +255,49 @@ impl Landing {
         });
         if trusted && answer.held && answer.num_tokens == self.fetch.end_tokens && covers {
             self.transition(Phase::Read, "ok", now_us);
+            self.last_renewal_us = now_us;
             self.pinned = Some(answer);
             None
         } else {
             // A pin that holds anything must go; nothing was read.
             self.release(false, now_us)
+        }
+    }
+
+    pub(super) fn renew_read(&mut self, now_us: i64, lifetime_us: i64) -> bool {
+        if self.phase == Phase::Read
+            && now_us.saturating_sub(self.last_renewal_us) >= (lifetime_us / 3).max(1)
+        {
+            self.last_renewal_us = now_us;
+            return true;
+        }
+        false
+    }
+
+    // A lost request or acknowledgement is safe to replay on autonomous holders.
+    pub(super) fn retry_release(&mut self, now_us: i64) -> Option<Action> {
+        if let Phase::Release { read } = self.phase {
+            if now_us >= self.deadline_us && !self.retried_release {
+                self.retried_release = true;
+                self.deadline_us = deadline(now_us, self.timeouts.answer_us);
+                return Some(Action::SendRelease { demote: read });
+            }
+        }
+        None
+    }
+
+    // The caller has checked that this worker never submitted the read.
+    pub(super) fn cancel_before_read(&mut self, now_us: i64) -> Option<Action> {
+        match self.phase {
+            Phase::Layout => {
+                self.transition(Phase::Done(self.fetch.begin_tokens), "cancelled", now_us);
+                None
+            }
+            Phase::Pin | Phase::Read => {
+                self.pinned = None;
+                self.release(false, now_us)
+            }
+            _ => None,
         }
     }
 
@@ -446,6 +488,52 @@ mod tests {
         assert_eq!(landing.done(), Some(8));
         landing.transition(super::Phase::Layout, "ok", 8);
         assert_eq!(landing.done(), Some(8), "a finished landing is terminal");
+    }
+
+    #[test]
+    fn renew_only_an_active_read_and_replay_release_once() {
+        let mut landing = pinned_landing();
+        assert!(!landing.renew_read(19, 60));
+        assert!(landing.renew_read(20, 60));
+        assert!(!landing.renew_read(39, 60));
+        assert!(landing.renew_read(40, 60));
+        assert_eq!(landing.read(0, true, 41), None);
+        let release = Some(Action::SendRelease { demote: true });
+        assert_eq!(landing.read(1, true, 42), release);
+        assert!(!landing.renew_read(142, 60));
+        assert_eq!(landing.retry_release(141), None);
+        assert_eq!(landing.retry_release(142), release);
+        assert_eq!(landing.retry_release(242), None);
+        landing.tick(242);
+        assert_eq!(landing.done(), Some(0));
+    }
+
+    #[test]
+    fn draining_before_submission_cannot_authorize_a_late_read() {
+        for known in [false, true] {
+            let (mut landing, _) = Landing::new(fetch(), 1, known, 0, TIMEOUTS);
+            let action = landing.cancel_before_read(1);
+            assert_eq!(
+                action,
+                known.then_some(Action::SendRelease { demote: false })
+            );
+            assert_eq!(landing.layout_known(2), None);
+            assert_eq!(
+                landing.pinned(
+                    answer(PeerAnswerKind::Pin, true, 8, vec![page(0), page(1)]),
+                    true,
+                    3
+                ),
+                None
+            );
+            assert!(landing.pages_to_read().is_none());
+        }
+        let mut pinned = pinned_landing();
+        assert_eq!(
+            pinned.cancel_before_read(5),
+            Some(Action::SendRelease { demote: false })
+        );
+        assert!(pinned.pages_to_read().is_none());
     }
 
     #[test]

@@ -35,15 +35,18 @@ enum Command {
 
 struct Worker {
     commands: mpsc::Sender<Command>,
-    rounds: mpsc::Receiver<PeerRound>,
+    rounds: mpsc::Receiver<Result<PeerRound, PeerError>>,
     thread: thread::JoinHandle<()>,
     pending: usize,
+    failed: bool,
     device: bool,
 }
 impl Worker {
     fn send(&self, command: Command) {
-        self.commands.send(command).expect("peer worker exited");
-        self.thread.thread().unpark();
+        // agree() reports worker errors and channel disconnection to the control loop.
+        if self.commands.send(command).is_ok() {
+            self.thread.thread().unpark();
+        }
     }
 }
 impl Drop for Worker {
@@ -88,7 +91,7 @@ impl Peer {
         if background && replica.len() != 1 {
             return Err(PeerError::Topology);
         }
-        let protocol = Protocol::start(
+        let mut protocol = Protocol::start(
             settings,
             progress,
             member,
@@ -104,7 +107,12 @@ impl Peer {
             let (tx, rounds) = mpsc::channel();
             let thread = thread::Builder::new()
                 .name("ts-peer-host".into())
-                .spawn(move || drive(protocol, scheduler, rx, tx))?;
+                .spawn(move || {
+                    if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
+                        tracing::error!(%error, "peer worker stopped");
+                        let _ = tx.send(Err(error));
+                    }
+                })?;
             wake.set(thread.thread().clone())
                 .expect("one protocol worker");
             Driver::Background(Worker {
@@ -112,6 +120,7 @@ impl Peer {
                 rounds,
                 thread,
                 pending: 0,
+                failed: false,
                 device,
             })
         } else {
@@ -145,8 +154,22 @@ impl Peer {
         match &mut self.driver {
             Driver::Rounds(p) => p.agree(reports),
             Driver::Background(w) => {
+                if w.failed {
+                    return Err(PeerError::WorkerExited);
+                }
                 let mut out = PeerRound::default();
-                for round in w.rounds.try_iter() {
+                loop {
+                    let round = match w.rounds.try_recv() {
+                        Ok(Ok(round)) => round,
+                        Ok(Err(error)) => {
+                            w.failed = true;
+                            return Err(error);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            return Err(PeerError::WorkerExited)
+                        }
+                    };
                     // A positive lookup offers local admission while reservation is pending.
                     // Only a miss/revocation or a retired transfer finishes the attempt.
                     w.pending -= round
@@ -303,12 +326,17 @@ fn fallback(lease: ts_scheduler::PeerLeaseView) -> PeerEventView {
 // Control messages and hard-pin tickets belong to the same protocol worker.
 #[derive(Default)]
 struct Exports {
-    pins: HashMap<ts_scheduler::PeerLeaseView, ts_scheduler::PeerReleaseHandle>,
+    pins: HashMap<ts_scheduler::PeerLeaseView, (ts_scheduler::PeerReleaseHandle, Instant)>,
     finished: HashMap<ts_scheduler::PeerLeaseView, (Instant, bool)>,
     cleanup: VecDeque<(PeerEventView, i64)>,
 }
 impl Exports {
-    fn advance(&mut self, p: &Protocol, scheduler: &Mutex<Scheduler>) -> bool {
+    fn advance(
+        &mut self,
+        p: &Protocol,
+        scheduler: &Mutex<Scheduler>,
+        draining: bool,
+    ) -> Result<bool, PeerError> {
         let endpoint = p.endpoint.as_ref().unwrap();
         let now = Instant::now();
         let micros = now.duration_since(p.origin).as_micros() as i64;
@@ -319,12 +347,18 @@ impl Exports {
             }
         };
         for _ in 0..32 {
-            let Some(request) = endpoint.control.lock().pop_front() else {
+            let Some((arrival, request)) = endpoint.control.lock().pop_front() else {
                 break;
             };
             let (lease, demote) = match request {
                 Request::Layout { reply_to } => {
                     send((reply_to, endpoint.holder.lock().layout()));
+                    continue;
+                }
+                Request::Reading { lease } => {
+                    if let Some((_, deadline)) = self.pins.get_mut(&lease) {
+                        *deadline = arrival + p.settings.record_lifetime;
+                    }
                     continue;
                 }
                 Request::Release { lease, demote } => (lease, demote),
@@ -335,7 +369,10 @@ impl Exports {
             let held = if let Some((_, held)) = self.finished.get(&lease) {
                 *held
             } else {
-                let held = self.pins.remove(&lease).is_some_and(|pin| pin.release());
+                let held = self
+                    .pins
+                    .remove(&lease)
+                    .is_some_and(|(pin, _)| pin.release());
                 holder.finish_record(&lease);
                 self.finished
                     .insert(lease.clone(), (now + p.settings.record_lifetime, held));
@@ -362,23 +399,42 @@ impl Exports {
             send(reply);
         }
 
+        // Expiration cannot establish that remote DMA has retired. Keep the native
+        // strong refs and fail the engine explicitly so its supervisor can replace it.
+        // Consume timely renewals/releases already in ingress before declaring a loss.
+        let processed_until = endpoint
+            .control
+            .lock()
+            .front()
+            .map_or(now, |(at, _)| (*at).min(now));
+        if let Some((lease, _)) = self
+            .pins
+            .iter()
+            .find(|(_, (_, until))| *until < processed_until)
+        {
+            return Err(PeerError::UnreleasedPin(lease.clone()));
+        }
+        if draining {
+            endpoint.requests.lock().clear();
+        }
+
         // Register a waiter for the scheduler's round-boundary handoff on
         // contention. Bound the wait once per pass so RELEASE can progress.
         let mut handoff_wait = Some(Duration::from_micros(100));
         for _ in 0..16 {
-            if self.cleanup.is_empty() && endpoint.requests.lock().is_empty() {
+            if self.cleanup.is_empty() && (draining || endpoint.requests.lock().is_empty()) {
                 break;
             }
             let Some(mut cache) = scheduler
                 .try_lock()
                 .or_else(|| scheduler.try_lock_for(handoff_wait.take()?))
             else {
-                return true;
+                return Ok(true);
             };
             if let Some((event, at)) = self.cleanup.pop_front() {
                 cache
                     .apply_peer_export(&event, at)
-                    .expect("retire holder export");
+                    .map_err(|e| PeerError::Worker(e.to_string()))?;
                 continue;
             }
             let Some((at, request)) = endpoint.requests.lock().pop_front() else {
@@ -398,13 +454,18 @@ impl Exports {
                     && holder.matches_stamp(&stamp)
                     && cache
                         .apply_peer_export(&checkpoint, micros)
-                        .expect("validate and pin checkpoint")
+                        .map_err(|e| PeerError::Worker(e.to_string()))?
                 {
                     answer.held = true;
                     answer.num_tokens = checkpoint.num_tokens;
                     answer.pages = checkpoint.pages;
-                    self.pins
-                        .insert(lease.clone(), cache.peer_release_handle(lease));
+                    self.pins.insert(
+                        lease.clone(),
+                        (
+                            cache.peer_release_handle(lease),
+                            now + p.settings.record_lifetime,
+                        ),
+                    );
                 }
                 let reply = holder.reply(lease.clone(), answer);
                 drop(holder);
@@ -426,7 +487,7 @@ impl Exports {
             for change in holder.take_changes() {
                 let applied = cache
                     .apply_peer_export(&change, micros)
-                    .expect("valid holder export");
+                    .map_err(|e| PeerError::Worker(e.to_string()))?;
                 if let Reply::Answer { answer, .. } = &mut reply {
                     match answer.kind {
                         PeerAnswerKind::Lookup if !applied => {
@@ -436,9 +497,12 @@ impl Exports {
                         PeerAnswerKind::Pin => {
                             answer.held &= applied;
                             if answer.held {
-                                self.pins
-                                    .entry(answer.lease.clone())
-                                    .or_insert_with(|| cache.peer_release_handle(&answer.lease));
+                                self.pins.entry(answer.lease.clone()).or_insert_with(|| {
+                                    (
+                                        cache.peer_release_handle(&answer.lease),
+                                        now + p.settings.record_lifetime,
+                                    )
+                                });
                             }
                         }
                         _ => {}
@@ -452,18 +516,18 @@ impl Exports {
             }
             send((to, reply));
         }
-        !self.cleanup.is_empty()
+        Ok(!self.cleanup.is_empty()
             || !endpoint.requests.lock().is_empty()
-            || !endpoint.control.lock().is_empty()
+            || !endpoint.control.lock().is_empty())
     }
 }
 
 fn drive(
-    mut p: Protocol,
+    p: &mut Protocol,
     scheduler: Arc<Mutex<Scheduler>>,
     commands: mpsc::Receiver<Command>,
-    results: mpsc::Sender<PeerRound>,
-) {
+    results: &mpsc::Sender<Result<PeerRound, PeerError>>,
+) -> Result<(), PeerError> {
     let mut pending = HashMap::new();
     let mut exports = Exports::default();
     let mut reservations = VecDeque::new();
@@ -504,9 +568,18 @@ fn drive(
         }
         if stopping {
             pending.clear();
-            if p.landings.is_empty() {
-                return;
+            reservations.clear();
+            device_plans.clear();
+            let now = p.origin.elapsed().as_micros() as i64;
+            let mut releases = Vec::new();
+            for (rid, landing) in &mut p.landings {
+                if !p.reading.contains(rid) {
+                    if let Some(action) = landing.cancel_before_read(now) {
+                        releases.push((rid.clone(), action));
+                    }
+                }
             }
+            p.send(releases, now);
         }
         // Fence notifications can arrive before the plan command. Consume one
         // per plan, in FIFO order. Local device waits have no protocol deadline.
@@ -525,7 +598,7 @@ fn drive(
             });
             p.start_landings(fetches, p.origin.elapsed().as_micros() as i64, false, times);
         }
-        let holder_work = exports.advance(&p, &scheduler);
+        let holder_work = exports.advance(p, &scheduler, stopping)?;
         // Take the clock and queue under the same lock used to stamp arrivals.
         let (now, inbox) = {
             let mut queue = p.endpoint.as_ref().unwrap().replies.lock();
@@ -605,15 +678,21 @@ fn drive(
         }
         // Retry each queued lease at most once per turn. The request's grant
         // dies on local admission/abort; a stale holder lease must still pass PIN.
+        // Give each queue one bounded handoff so a busy holder queue cannot
+        // consume the reader's only opportunity to register a scheduler waiter.
+        let mut handoff_wait = Some(Duration::from_micros(100));
         for _ in 0..reservations.len().min(16) {
-            let Some(mut cache) = scheduler.try_lock() else {
+            let Some(mut cache) = scheduler
+                .try_lock()
+                .or_else(|| scheduler.try_lock_for(handoff_wait.take()?))
+            else {
                 break;
             };
             let (attempt, tokens, at) = reservations.pop_front().unwrap();
             let mut retry = false;
             let fetches = cache
                 .reserve_peer_host(&attempt.lease, tokens, &mut retry)
-                .expect("reserve Host prefix");
+                .map_err(|e| PeerError::Worker(e.to_string()))?;
             drop(cache);
             if retry {
                 reservations.push_back((attempt, tokens, at));
@@ -635,14 +714,33 @@ fn drive(
                 false
             }
         });
-        let round = p
-            .advance_reports(std::slice::from_ref(&report))
-            .expect("local peer report");
+        let lifetime_us = p.settings.record_lifetime.as_micros().min(i64::MAX as u128) as i64;
+        for (rid, landing) in &mut p.landings {
+            if p.reading.contains(rid) && landing.renew_read(now, lifetime_us) {
+                let holder = &landing.fetch().holder;
+                let message = Request::Reading {
+                    lease: landing.lease().clone(),
+                };
+                if let Err(error) = p.endpoint.as_ref().unwrap().net.request(holder, &message) {
+                    tracing::warn!(holder, %error, "could not renew active peer read");
+                }
+            }
+        }
+        let round = p.advance_reports(std::slice::from_ref(&report))?;
         out.events.extend(round.events);
         out.decisions.extend(round.decisions);
         out.landed.extend(round.landed);
         if !(out.events.is_empty() && out.decisions.is_empty() && out.landed.is_empty()) {
-            let _ = results.send(out);
+            let _ = results.send(Ok(out));
+        }
+        // The final RELEASE can finish the last landing during this pass.
+        // Exit before parking: a disconnected controller will never wake us.
+        if stopping
+            && p.landings.is_empty()
+            && exports.pins.is_empty()
+            && exports.cleanup.is_empty()
+        {
+            return Ok(());
         }
         // Socket replies and new attempts wake us immediately. The read pool
         // returns through a channel; poll only while work or a timeout exists.
@@ -652,7 +750,11 @@ fn drive(
             && pending.is_empty()
             && p.landings.is_empty()
         {
-            thread::park();
+            if let Some(deadline) = exports.pins.values().map(|(_, deadline)| *deadline).min() {
+                thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+            } else {
+                thread::park();
+            }
         } else {
             thread::park_timeout(Duration::from_millis(1));
         }

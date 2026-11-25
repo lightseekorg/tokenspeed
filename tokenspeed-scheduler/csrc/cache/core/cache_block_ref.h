@@ -88,7 +88,7 @@ private:
     void release() noexcept;
     // A pending owner callback keeps the control alive without pinning the page.
     static constexpr std::uint32_t kPending = 1u << 31;
-    std::uint32_t useCount() const noexcept { return strong_count_.load() & ~kPending; }
+    std::uint32_t useCount() const noexcept { return strong_count_.load(std::memory_order_acquire) & ~kPending; }
     void finishRelease(std::uint32_t state) noexcept;
 
     CacheBlock& object() noexcept { return object_; }

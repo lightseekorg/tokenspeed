@@ -142,10 +142,10 @@ struct AdmissionResources {
     // what the holder answered.
     bool peer_prepared{false};
     std::optional<PeerHit> peer_hit;
-    // Fixed prompt identities for admission retries, never residency. Leaving
-    // the pre-admission states releases them together with the storage hold.
     // Successful later first admissions while this is the oldest waiting prompt.
     std::int32_t prefill_bypasses{0};
+    // Fixed prompt identities for admission retries, never residency. Leaving
+    // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
 };
 

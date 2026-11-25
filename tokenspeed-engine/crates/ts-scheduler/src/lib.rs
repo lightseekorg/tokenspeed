@@ -822,8 +822,7 @@ mod ffi {
             scheduler: Pin<&mut Scheduler>,
             lease: &PeerLeaseView,
         ) -> SharedPtr<PeerPinRelease>;
-        #[rust_name = "release"]
-        fn Release(self: &PeerPinRelease) -> bool;
+        fn release_peer_pin(handle: &SharedPtr<PeerPinRelease>) -> bool;
         fn enable_async_host_peer(scheduler: Pin<&mut Scheduler>) -> bool;
         fn enable_async_device_peer(scheduler: Pin<&mut Scheduler>, adaptive: bool) -> bool;
         fn reserve_peer_host(
@@ -1064,7 +1063,7 @@ pub struct PeerReleaseHandle(cxx::SharedPtr<ffi::PeerPinRelease>);
 impl PeerReleaseHandle {
     /// Returns after all of this lease's strong references were dropped.
     pub fn release(&self) -> bool {
-        self.0.as_ref().is_some_and(|ticket| ticket.release())
+        ffi::release_peer_pin(&self.0)
     }
 }
 use ffi::PeerPinRelease;

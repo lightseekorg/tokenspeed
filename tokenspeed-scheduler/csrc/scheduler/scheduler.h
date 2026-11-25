@@ -261,8 +261,7 @@ public:
     bool EnableAsyncDevicePeer(bool adaptive);
     std::optional<PeerFetchOperation> ReservePeerHost(const PeerLeaseId& lease, std::int32_t num_tokens, bool& retry);
     bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
-    void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us,
-                         const cache::PeerLookup* checkpoint = nullptr);
+    void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint);
     void ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us);
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
@@ -558,6 +557,7 @@ private:
     void withholdUncommittedState(const Request& request, std::int32_t state_slot, const StateCommitPages& candidates);
     // Whether `page` of `group` is a published endpoint whose deferred decode
     // state the runtime has not acknowledged committing yet.
+    bool peerPagesReady(std::span<const PeerPage> pages) const;
     bool awaitsStateCommit(std::uint32_t group, std::int32_t page) const;
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
     // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
@@ -632,6 +632,7 @@ private:
         int samples{0};
         double scale{1.0};
         double success_rate{1.0};
+        std::int64_t last_attempt_us{0};
         double failure_us{0.0};  // unconditional expected wasted wait per attempt
     };
     std::array<LandingCost, 8> device_landing_cost_{};
@@ -961,6 +962,8 @@ private:
     // admission takes it this round.
     void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                               bool new_prompts_sealed);
+    void schedulePrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                             bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);

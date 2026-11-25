@@ -1154,8 +1154,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
             local_over_peer ? request->GetIf<fsm::Submitted>()->admission.peer_hit->num_tokens : 0;
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         if (local_over_peer) {
-            spdlog::info("[PeerChoice] rid={} local reason={} local_tokens={} holder_tokens={}", request->Id(), reason,
-                         operation.extend_prefix_len, holder_tokens);
+            spdlog::debug("[PeerChoice] rid={} local reason={} local_tokens={} holder_tokens={}", request->Id(), reason,
+                          operation.extend_prefix_len, holder_tokens);
         }
         operation.state_prefix_cached = outcome.state_prefix_cached;
         return operation;
@@ -2358,6 +2358,14 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
     }
 }
 
+void Scheduler::schedulePrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                    bool new_prompts_sealed) {
+    if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
+        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+}
+
 // P role: prefill worker. Completed prompts leave on plan.remote_decode
 // first -- their KV pages stay pinned until the transfer finishes
 // (pdTransferInFlight: on this role every page-holding state is pinned, from
@@ -2388,10 +2396,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
-    if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
-        schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
+    schedulePrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2534,10 +2539,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
-        if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
-        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
-        if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
-            schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+        schedulePrefillWork(feedback, build, candidates, new_prompts_sealed);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

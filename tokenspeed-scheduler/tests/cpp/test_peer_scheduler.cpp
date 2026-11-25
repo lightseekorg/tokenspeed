@@ -302,8 +302,6 @@ TEST_P(PeerSchedulerTest, LookupBoundCanExcludeAPublishedTailCheckpoint) {
     query.tokens.resize(query.max_tokens);
     query.prefix_hashes.resize(query.max_tokens / kP);
     const auto bounded = servicer_.Lookup(query).num_tokens;
-    std::cout << "lookup bound comparison: hybrid=" << GetParam() << " cap=" << query.max_tokens
-              << " short_answer=" << bounded << " wide_answer=" << wide << std::endl;
     EXPECT_EQ(wide, static_cast<int>(published.size()));
     EXPECT_LT(bounded, wide);
 }
@@ -386,6 +384,37 @@ TEST(DevicePeerChoice, ProtocolAndRecurringLocalWaitAffectChoicesIndependently) 
         const auto plan = offer(id, 672, 50000);
         EXPECT_EQ(plan.peer_fetches.size(), scenario.expect_read ? 1u : 0u);
         EXPECT_EQ(PrefillRows(plan).size(), scenario.expect_read ? 0u : 1u);
+    }
+}
+
+TEST(DevicePeerChoice, FailedPathCanProbeAgainOnlyAfterCooldown) {
+    auto cfg = PeerConfigFor("127.0.0.1:1000");
+    cfg.device_allocator.total_pages = cfg.cache_groups.front().total_pages = 4096;
+    cfg.max_scheduled_tokens = 512;
+    Scheduler reader{cfg};
+    ASSERT_TRUE(reader.EnableAsyncDevicePeer(true));
+    for (int i = 0; i < 4; ++i) {
+        const std::string id = "recovery-" + std::to_string(i);
+        const auto now = i < 2 ? 1LL + i * 5'000'000 : 31'000'001LL + (i - 2) * 5'000'000;
+        Send(reader, cache::PeerTick{.now_us = now});
+        reader.SubmitRequests({RequestSpec{
+            .request_id = id, .peer_holder = "127.0.0.1:1001", .tokens = MakeAlignedTokens(2049, kP, 10000 * i + 1)}});
+        Plan(reader);
+        const auto lookup = reader.TakePeerLookups().at(0);
+        Send(reader, cache::PeerLookupAnswered{.lease = lookup.lease, .num_tokens = 4096, .source_mask = 1});
+        const auto plan = Plan(reader);
+        const bool read = i == 0 || i == 2;
+        ASSERT_EQ(plan.peer_fetches.size(), read ? 1u : 0u);
+        if (read) {
+            Send(reader, cache::PeerTick{.now_us = now + 4'000'000});
+            Send(reader, cache::PeerFetchDone{.request_id = id,
+                                              .num_tokens = 0,
+                                              .dispatch_us = now,
+                                              .writable_us = now,
+                                              .terminal_us = now + 4'000'000});
+        }
+        Send(reader, forward::Abort{.request_id = id});
+        Plan(reader);
     }
 }
 
@@ -672,6 +701,18 @@ TEST_P(PeerSchedulerTest, AHolderPinsLoadedDevicePagesOnlyAfterTheirLoadAcknowle
         ASSERT_TRUE(
             std::ranges::any_of(answer.pages, [](const PeerPage& page) { return page.tier == CacheTier::kDevice; }));
         const bool ready = lookup.tokens.front() == ready_tokens.front();
+        auto lease = lookup.lease;
+        lease.reader += "-repin";
+        cache::PeerLookup checkpoint{.lease = lease,
+                                     .prefix_hashes = lookup.prefix_hashes,
+                                     .tokens = lookup.tokens,
+                                     .max_tokens = answer.num_tokens};
+        checkpoint.prefix_hashes.resize(answer.num_tokens / kP);
+        checkpoint.tokens.resize(answer.num_tokens);
+        cache::PeerPin repin{.lease = lease, .num_tokens = answer.num_tokens, .pages = answer.pages};
+        holder_.ApplyPeerExport(repin, 4'000'000, &checkpoint);
+        EXPECT_EQ(holder_.PeerLeaseHeld(lease), ready);
+        holder_.ApplyPeerExport(cache::PeerRelease{.lease = lease}, 4'000'001);
         EXPECT_EQ(servicer_.Pin(lookup.lease).held, ready)
             << "the Device index alone does not establish that H2D has completed";
     }
@@ -717,10 +758,25 @@ TEST(PeerStateCommitTest, ARetractedDecodeEndpointIsPinnedOnlyAfterItsCommit) {
         Plan(reader);
         const auto lookups = reader.TakePeerLookups();
         ASSERT_EQ(lookups.size(), 1u);
-        ASSERT_EQ(servicer.Lookup(lookups.front()).num_tokens, 4);
+        const auto answer = servicer.Lookup(lookups.front());
+        ASSERT_EQ(answer.num_tokens, 4);
+        const auto& lookup = lookups.front();
+        auto lease = lookup.lease;
+        lease.reader += "-repin";
+        cache::PeerLookup checkpoint{.lease = lease,
+                                     .prefix_hashes = lookup.prefix_hashes,
+                                     .tokens = lookup.tokens,
+                                     .max_tokens = answer.num_tokens};
+        checkpoint.tokens.resize(answer.num_tokens);
+        checkpoint.prefix_hashes.resize(answer.num_tokens / kP);
+        cache::PeerPin repin{.lease = lease, .num_tokens = answer.num_tokens, .pages = answer.pages};
+        holder.ApplyPeerExport(repin, 4'000'000, &checkpoint);
+        EXPECT_EQ(holder.PeerLeaseHeld(lease), !deferred);
         EXPECT_EQ(servicer.Pin(lookups.front().lease).held, !deferred);
         if (deferred) {
             Send(holder, cache::StateCommitDone{.op_id = *retraction->state_commit_fence});
+            holder.ApplyPeerExport(repin, 4'000'001, &checkpoint);
+            EXPECT_TRUE(holder.PeerLeaseHeld(lease));
             EXPECT_TRUE(servicer.Pin(lookups.front().lease).held);
         }
     }
@@ -1063,6 +1119,18 @@ TEST_F(AsyncHostReservationTest, SameKeyStorePublishesFirst) {
 }
 TEST_F(AsyncHostReservationTest, SameKeyPeerPublishesFirst) {
     SameKey(true);
+}
+
+TEST_F(AsyncHostReservationTest, OversizedExactBoundaryDoesNotConsumeOrEvictPages) {
+    const auto large = MakeAlignedTokens(27, kP);
+    reader.SubmitRequests({RequestSpec{.request_id = "large", .peer_holder = "holder", .tokens = large}});
+    Plan(reader);
+    const auto lookup = reader.TakePeerLookups().at(0);
+    const auto free_before = reader.HostPoolFreeBlocks();
+    bool retry = true;
+    EXPECT_FALSE(reader.ReservePeerHost(lookup.lease, 26 * kP, retry));
+    EXPECT_FALSE(retry);
+    EXPECT_EQ(reader.HostPoolFreeBlocks(), free_before);
 }
 
 TEST_F(AsyncHostReservationTest, HostCreditRetriesPastLookupTimeoutUntilDmaRetires) {

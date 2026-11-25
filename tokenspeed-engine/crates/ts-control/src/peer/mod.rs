@@ -113,8 +113,8 @@ pub enum PeerProgress {
 impl PeerProgress {
     fn identity_prefix(self) -> &'static str {
         match self {
-            Self::Host => "async-host-v1:",
-            Self::Device => "async-device-v2:",
+            Self::Host => "async-host-v2:",
+            Self::Device => "async-device-v3:",
             Self::Coordinated => "",
         }
     }
@@ -167,6 +167,17 @@ fn namespace(deployment_id: &str, weight_version: &str) -> String {
 /// A round's agreement could not be reached.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
+    /// An autonomous worker exited without reporting a result.
+    #[error("peer worker disconnected")]
+    WorkerExited,
+    /// The native scheduler rejected an operation on the worker.
+    #[error("peer worker: {0}")]
+    Worker(String),
+    /// Remote DMA retirement could not be established. Do not recycle these pages.
+    #[error(
+        "peer hard pin {0:?} was not released; replace the holder engine before reusing its cache"
+    )]
+    UnreleasedPin(ts_scheduler::PeerLeaseView),
     /// A member's report did not decode.
     #[error("a malformed peer report")]
     Report,
@@ -406,7 +417,7 @@ struct Endpoint {
     replies: Arc<Mutex<VecDeque<(Instant, Reply)>>>,
     driver: Arc<std::sync::OnceLock<thread::Thread>>,
     requests: Arc<Mutex<VecDeque<(Instant, Request)>>>,
-    control: Arc<Mutex<VecDeque<Request>>>,
+    control: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     _servicer: thread::JoinHandle<()>,
 }
 
@@ -482,9 +493,7 @@ impl Protocol {
         let (fence, fenced_plans) = mpsc::channel();
         let origin = Instant::now();
         let endpoint = listener
-            .map(|listener| {
-                start_endpoint(&settings, progress, replica, listener, scheduler, origin)
-            })
+            .map(|listener| start_endpoint(&settings, progress, replica, listener, scheduler))
             .transpose()?;
         Ok(Self {
             identity: settings.identity(progress),
@@ -601,6 +610,11 @@ impl Protocol {
         for (request, landing) in &mut self.landings {
             if self.progress != PeerProgress::Coordinated && landing.unanswered_pin(now_us) {
                 actions.push((request.clone(), Action::SendRelease { demote: false }));
+            }
+            if self.progress != PeerProgress::Coordinated {
+                if let Some(retry) = landing.retry_release(now_us) {
+                    actions.push((request.clone(), retry));
+                }
             }
             landing.tick(now_us);
             if self.layouts.contains_key(&landing.fetch().holder) {
@@ -1062,7 +1076,6 @@ fn start_endpoint(
     replica: Vec<RankGeometry>,
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
-    _origin: Instant,
 ) -> Result<Endpoint, PeerError> {
     let PeerListener { net, received } = listener;
     let holder = Arc::new(Mutex::new(Holder::new(
@@ -1089,8 +1102,13 @@ fn start_endpoint(
                 for frames in received {
                     match Inbound::decode(&frames) {
                         Ok(Inbound::Request(request)) if autonomous => {
-                            if matches!(request, Request::Release { .. } | Request::Layout { .. }) {
-                                control.lock().push_back(request);
+                            if matches!(
+                                request,
+                                Request::Reading { .. }
+                                    | Request::Release { .. }
+                                    | Request::Layout { .. }
+                            ) {
+                                control.lock().push_back((Instant::now(), request));
                             } else {
                                 requests.lock().push_back((Instant::now(), request));
                             }
@@ -1098,6 +1116,7 @@ fn start_endpoint(
                                 worker.unpark();
                             }
                         }
+                        Ok(Inbound::Request(Request::Reading { .. })) => continue,
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's
                             // scheduler work; answers between rounds.
@@ -1161,10 +1180,10 @@ mod identity_metrics_tests {
         };
         for (other, reason) in [
             ("model/one", "protocol_mismatch"),
-            ("async-host-v1:model/one", "protocol_mismatch"),
-            ("async-device-v2:model/two", "weight_mismatch"),
-            ("async-device-v2:other/one", "deployment_mismatch"),
-            ("async-device-v2:other/two", "namespace_mismatch"),
+            ("async-host-v2:model/one", "protocol_mismatch"),
+            ("async-device-v3:model/two", "weight_mismatch"),
+            ("async-device-v3:other/one", "deployment_mismatch"),
+            ("async-device-v3:other/two", "namespace_mismatch"),
         ] {
             assert_eq!(
                 settings.mismatch_reason(PeerProgress::Device, other),

@@ -141,7 +141,7 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 
-bool PeerPinRelease::Release() const noexcept {
+bool PeerPinRelease::Release() noexcept {
     std::lock_guard lock(mutex_);
     if (released_) return true;
     if (pins_.empty()) return false;

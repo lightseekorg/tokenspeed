@@ -610,6 +610,19 @@ pub struct Subsystems {
     pub peer: Option<Peer>,
 }
 
+// Only independent peers can use the scheduler during a device or collective wait.
+fn during_peer_wait<T>(
+    peer: Option<&Peer>,
+    scheduler: &mut ArcMutexGuard<RawMutex, Scheduler>,
+    wait: impl FnOnce() -> T,
+) -> T {
+    if peer.is_some_and(Peer::autonomous) {
+        ArcMutexGuard::unlocked(scheduler, wait)
+    } else {
+        wait()
+    }
+}
+
 /// One rank's scheduling loop.
 pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Held for the whole round. A peer holder's endpoint answers from the
@@ -990,13 +1003,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && memory_resident {
-                    if self.peer.as_ref().is_some_and(Peer::autonomous) {
-                        ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                            self.data_plane.idle_forward(&dp)
-                        })?;
-                    } else {
-                        self.data_plane.idle_forward(&dp)?;
-                    }
+                    during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+                        self.data_plane.idle_forward(&dp)
+                    })?;
                     forwarded = true;
                 }
             }
@@ -1214,13 +1223,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut forwarded = idle_forward;
         let device_work = plan.needs_device() || idle_forward;
         if device_work {
-            let pending = if self.peer.as_ref().is_some_and(Peer::autonomous) {
-                ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                    self.data_plane.execute(plan, &dispatch)
-                })?
-            } else {
-                self.data_plane.execute(plan, &dispatch)?
-            };
+            let pending = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+                self.data_plane.execute(plan, &dispatch)
+            })?;
             if let Some(pending) = pending {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
@@ -2985,13 +2990,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = if self.peer.as_ref().is_some_and(Peer::autonomous) {
-            ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                self.ranks.mesh.all_gather_i64(world, &row)
-            })?
-        } else {
-            self.ranks.mesh.all_gather_i64(world, &row)?
-        };
+        let rows = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+            self.ranks.mesh.all_gather_i64(world, &row)
+        })?;
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;

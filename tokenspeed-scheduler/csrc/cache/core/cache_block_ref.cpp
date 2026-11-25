@@ -36,12 +36,14 @@ CacheBlock::~CacheBlock() noexcept {
 namespace internal_cache_block_ref {
 
 void CacheBlockControl::retain() noexcept {
-    const auto count = strong_count_.fetch_add(1) & ~kPending;
+    // The caller already owns a live reference. Publication and final retirement
+    // synchronize separately, so incrementing requires only atomicity.
+    const auto count = strong_count_.fetch_add(1, std::memory_order_relaxed) & ~kPending;
     FatalCheck(count != 0 && count < kPending - 1, "cannot retain a destroyed or saturated CacheBlockControl");
 }
 
 void CacheBlockControl::release() noexcept {
-    const auto prior = strong_count_.fetch_sub(1);
+    const auto prior = strong_count_.fetch_sub(1, std::memory_order_acq_rel);
     FatalCheck((prior & ~kPending) != 0, "CacheBlockControl release requires a live reference");
     finishRelease(prior - 1);
 }
@@ -121,17 +123,18 @@ void CacheBlockRef::releaseFromPeer() noexcept {
     if (!control_) return;
     auto& count = control_->strong_count_;
     const auto pending = control_->kPending;
-    auto prior = count.load();
+    auto prior = count.load(std::memory_order_relaxed);
     do {
         FatalCheck((prior & ~pending) != 0, "cannot unpin a released block");
-    } while (!count.compare_exchange_weak(prior, (prior - 1) | pending));
+    } while (!count.compare_exchange_weak(prior, (prior - 1) | pending, std::memory_order_acq_rel,
+                                          std::memory_order_relaxed));
     if (prior & pending) control_ = nullptr;
 }
 
 void CacheBlockRef::finishPeerRelease() noexcept {
     if (auto* control = std::exchange(control_, nullptr)) {
         const auto pending = control->kPending;
-        const auto prior = control->strong_count_.fetch_and(~pending);
+        const auto prior = control->strong_count_.fetch_and(~pending, std::memory_order_acq_rel);
         FatalCheck((prior & pending) != 0, "peer release needs a pending callback");
         control->finishRelease(prior & ~pending);
     }

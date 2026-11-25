@@ -72,6 +72,11 @@ pub enum Request {
         /// Exact prefix and complete original source mapping.
         checkpoint: PeerEventView,
     },
+    /// An autonomous reader is still retiring a submitted read on this lease.
+    Reading {
+        /// The original lease including the reader incarnation.
+        lease: PeerLeaseView,
+    },
     /// The release of a lease, asking to demote after a complete read.
     Release {
         /// The lease.
@@ -122,6 +127,7 @@ const PIN: u8 = 2;
 const RELEASE: u8 = 3;
 const ANSWER: u8 = 4;
 const CHECKPOINT_PIN: u8 = 5;
+const READING: u8 = 6;
 
 fn write_str(out: &mut Writer, value: &str) {
     out.bytes(value.as_bytes());
@@ -320,6 +326,10 @@ impl Request {
                 out.u8(PIN);
                 write_lease(&mut out, lease);
             }
+            Request::Reading { lease } => {
+                out.u8(READING);
+                write_lease(&mut out, lease);
+            }
             Request::Release { lease, demote } => {
                 out.u8(RELEASE);
                 write_lease(&mut out, lease);
@@ -365,6 +375,9 @@ impl Request {
                 Request::CheckpointPin { stamp, checkpoint }
             }
             PIN => Request::Pin {
+                lease: read_lease(&mut reader).ok_or(Malformed)?,
+            },
+            READING => Request::Reading {
                 lease: read_lease(&mut reader).ok_or(Malformed)?,
             },
             RELEASE => Request::Release {
@@ -555,6 +568,7 @@ mod tests {
                 },
             },
             Request::Pin { lease: lease() },
+            Request::Reading { lease: lease() },
             Request::Release {
                 lease: lease(),
                 demote: true,

@@ -45,6 +45,10 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
     if (!PeerExports::Matches(coordinator_, lookup, num_tokens, pages)) {
         return false;
     }
+    return peerPagesReady(pages);
+}
+
+bool Scheduler::peerPagesReady(std::span<const PeerPage> pages) const {
     // A decoded endpoint a retraction published holds its deferred state only
     // after the runtime acknowledged the commit (ExecutionPlan::
     // state_commit_fence); local forwards order behind it, a remote read
@@ -62,7 +66,8 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
     // acknowledged it. Other Device pages and Host sources remain readable.
     const auto loading = tier_transfers_.LoadBackDestinations();
     return std::ranges::none_of(pages, [&](const PeerPage& page) {
-        return page.tier == CacheTier::kDevice && loading[page.group_id].contains(page.block_id);
+        return page.tier == CacheTier::kDevice &&
+               (page.group_id >= loading.size() || loading[page.group_id].contains(page.block_id));
     });
 }
 bool Scheduler::awaitsStateCommit(std::uint32_t group, std::int32_t page) const {
@@ -125,7 +130,7 @@ void Scheduler::handleEvent(const cache::PeerLookup& event) {
 
 void Scheduler::handleEvent(const cache::PeerPin& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer pin without configured peer sharing");
-    peer_exports_->Pin(coordinator_, event, peer_now_us_);
+    peer_exports_->Pin(coordinator_, event, peer_now_us_, nullptr);
 }
 
 void Scheduler::handleEvent(const cache::PeerRelease& event) {
@@ -171,7 +176,7 @@ void Scheduler::recordPeerDispatch(Request& request) {
     const auto& sample = *request.peer_dispatch_sample;
     const auto after_release = peer_now_us_ - sample.release_us;
     device_dispatch_wait_[sample.batch_class].Observe(sample.fence_wait_us + after_release);
-    spdlog::info("[PeerFeedback] rid={} release_to_prefill_round_us={}", request.Id(), after_release);
+    spdlog::debug("[PeerFeedback] rid={} release_to_prefill_round_us={}", request.Id(), after_release);
     request.peer_dispatch_sample.reset();
 }
 
@@ -194,9 +199,9 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
                 }
             }
             cost.failure_us += 0.125 * ((ok ? 0.0 : protocol_us) - cost.failure_us);
-            spdlog::info("[PeerFeedback] rid={} path={} ok={} fence_us={} protocol_us={} consume_us={} scale={:.4f}",
-                         event.request_id, a.path, ok, event.writable_us - event.dispatch_us, protocol_us,
-                         peer_now_us_ - event.terminal_us, cost.scale);
+            spdlog::debug("[PeerFeedback] rid={} path={} ok={} fence_us={} protocol_us={} consume_us={} scale={:.4f}",
+                          event.request_id, a.path, ok, event.writable_us - event.dispatch_us, protocol_us,
+                          peer_now_us_ - event.terminal_us, cost.scale);
         }
         cost.success_rate += 0.125 * ((ok ? 1.0 : 0.0) - cost.success_rate);
     }
@@ -329,6 +334,7 @@ bool Scheduler::ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now
 }
 void Scheduler::ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint) {
     peer_exports_->Expire(now_us, /*retain_hard=*/true);
+    if (!peerPagesReady(event.pages)) return;
     peer_exports_->Pin(coordinator_, event, now_us, checkpoint);
 }
 void Scheduler::ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us) {
@@ -550,6 +556,12 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
                 cost.failure_us;
             probe = saved_us <= peer_us + margin_us && saved_us > optimistic_us + margin_us &&
                     device_attempts_.empty() && std::hash<std::string>{}(request->Id()) % 16 == 0;
+            // A failed path gets a bounded chance to recover even when its
+            // success estimate would reject every near-boundary probe.
+            constexpr std::int64_t recovery_interval_us = 30'000'000;
+            probe |= cost.success_rate < 1.0 && device_attempts_.empty() &&
+                     peer_now_us_ - cost.last_attempt_us >= recovery_interval_us &&
+                     extra * compute_us_per_token > nominal_us + margin_us;
             if (saved_us <= peer_us + margin_us && !probe) {
                 request->peer_local_reason = "adaptive_recompute";
                 // Let regular admission try. If it cannot commit, keep the
@@ -590,9 +602,10 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         spdlog::debug("[Peer] rid={} lands [{}, {}) from {} ({} blocks)", request->Id(), fetch.begin_tokens,
                       fetch.end_tokens, fetch.holder, fetch.destinations.size());
         if (adaptive_device_peer_) {
-            spdlog::info("[PeerChoice] rid={} read extra={} path={} nominal_us={:.0f} local_wait_us={:.0f} reason={}",
-                         request->Id(), hit.num_tokens - fetch.begin_tokens, path, nominal_us, local_wait_us,
-                         probe ? "probe" : "score");
+            spdlog::debug("[PeerChoice] rid={} read extra={} path={} nominal_us={:.0f} local_wait_us={:.0f} reason={}",
+                          request->Id(), hit.num_tokens - fetch.begin_tokens, path, nominal_us, local_wait_us,
+                          probe ? "probe" : "score");
+            device_landing_cost_[path].last_attempt_us = peer_now_us_;
             device_attempts_.emplace(request->Id(), DeviceAttempt{path, nominal_us, batch_class, hit.num_tokens});
         }
         if (!hit.checkpoint.empty()) {

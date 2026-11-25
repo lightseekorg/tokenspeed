@@ -151,6 +151,9 @@ impl Holder {
     ) -> (String, Reply) {
         self.records.retain(|_, record| now < record.expires);
         match request {
+            Request::Reading { .. } => {
+                unreachable!("read liveness belongs to the autonomous driver")
+            }
             Request::Layout { reply_to } => (reply_to, self.layout()),
             Request::Lookup { lease, prompt } => {
                 let lookup = prompt.lookup_event(&lease);

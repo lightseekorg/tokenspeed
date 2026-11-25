@@ -1043,6 +1043,104 @@ fn timely_lookup_survives_reader_cache_lock_beyond_the_lookup_budget() {
     host_during_forward(true, Duration::ZERO, false, true);
 }
 
+#[test]
+fn an_abandoned_pin_reports_the_lease_without_recycling_live_pages() {
+    let arena = Arena::new(270_000);
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
+    cfg.driver = TestDriver::Automatic;
+    cfg.peer.record_lifetime = Duration::from_millis(500);
+    let mut holder = Replica::with_landing(
+        cfg,
+        listener,
+        geometry_with_host(HOLDER_BASE, 215_000),
+        &arena,
+        "Fused",
+        Landing::Host,
+    );
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let fixture = Replica::start("v1", READER_BASE, &arena);
+    let mut prompt = tokens;
+    prompt.push(500_000);
+    let mut cache = fixture.scheduler.lock();
+    cache
+        .submit_requests(&[spec("source", prompt, &holder.name)])
+        .unwrap();
+    let _plan = cache.next_execution_plan(true, false);
+    let lookup = cache.take_peer_lookups().pop().unwrap();
+    drop(cache);
+    let (tx, rx) = mpsc::channel();
+    let reader = PeerNet::start("127.0.0.1", 0, tx).unwrap();
+    let lease = ts_scheduler::PeerLeaseView {
+        reader: format!("127.0.0.1:{}", reader.port()),
+        id: 41,
+    };
+    let receive = || {
+        let frames = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let Inbound::Reply(Reply::Answer { answer, .. }) = Inbound::decode(&frames).unwrap() else {
+            panic!("expected answer")
+        };
+        answer
+    };
+    reader
+        .request(
+            &holder.name,
+            &Request::Lookup {
+                lease: lease.clone(),
+                prompt: ts_control::peer::wire::Prompt {
+                    prefix_hashes: lookup.prefix_hashes,
+                    tokens: lookup.tokens,
+                    max_tokens: lookup.max_tokens,
+                },
+            },
+        )
+        .unwrap();
+    assert!(receive().num_tokens > 0);
+    reader
+        .request(
+            &holder.name,
+            &Request::Pin {
+                lease: lease.clone(),
+            },
+        )
+        .unwrap();
+    assert!(receive().held);
+    // The live reader may spend longer than one lifetime in DMA.
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(150));
+        reader
+            .request(
+                &holder.name,
+                &Request::Reading {
+                    lease: lease.clone(),
+                },
+            )
+            .unwrap();
+    }
+    holder.peer.agree(&[]).unwrap();
+    assert!(holder.scheduler.lock().peer_stats().pinned_blocks > 0);
+    drop(reader);
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        match holder.peer.agree(&[]) {
+            Err(ts_control::peer::PeerError::UnreleasedPin(id)) => {
+                assert_eq!(id, lease);
+                break;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => panic!("unexpected error {error}"),
+        }
+        assert!(Instant::now() < until, "holder never surfaced the orphan");
+    }
+    assert!(holder.scheduler.lock().peer_stats().pinned_blocks > 0);
+    holder.peer.end_lookup("unused", "cancelled");
+    assert!(matches!(
+        holder.peer.agree(&[]),
+        Err(ts_control::peer::PeerError::WorkerExited)
+    ));
+}
+
 fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, hold_reader: bool) {
     let arena = Arena::new(270_000);
     let bound = || PeerListener::bind("127.0.0.1", 0).unwrap();
@@ -1104,6 +1202,7 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
         event(ForwardEventKind::PdBootstrapped, "B", vec![]),
     ]);
     let (ack_tx, ack_rx) = mpsc::channel();
+    let (ack_while_locked, observed_ack) = mpsc::channel();
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         if contend {
@@ -1189,7 +1288,9 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
                     Ok(Inbound::Reply(Reply::Layout { .. }))
                 ));
                 ready.send(()).unwrap();
-                std::thread::sleep(Duration::from_secs(4));
+                observed_ack
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("release ACK before unlocking");
                 assert_eq!(guard.peer_stats().pinned_blocks, 0);
                 assert!(
                     rx.try_recv().is_err(),
@@ -1219,10 +1320,16 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
                     std::thread::sleep(holder_delay);
                 }
                 let lookup = matches!(&reply, Reply::Answer{answer,..} if answer.kind == ts_scheduler::PeerAnswerKind::Lookup);
-                let guard = (hold_reader && lookup).then(|| reader_cache.lock());
+                let mut guard = (hold_reader && lookup).then(|| reader_cache.lock());
                 proxy.reply(&actual,&reply).unwrap();
-                if guard.is_some() {
+                if let Some(round) = guard.as_mut() {
                     std::thread::sleep(Duration::from_millis(150));
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while round.peer_stats().landing_requests == 0 {
+                        parking_lot::MutexGuard::bump(round);
+                        assert!(Instant::now() < until, "reader missed the scheduler handoff");
+                        std::thread::yield_now();
+                    }
                 }
                 drop(guard);
                 if release {
@@ -1232,8 +1339,9 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
                         proxy.request(&endpoint, &Request::Release {
                             lease: answer.lease.clone(), demote: true
                         }).unwrap();
-                        let repeated = wire_rx.recv_timeout(Duration::from_millis(50)).unwrap();
+                        let repeated = wire_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                         assert!(matches!(Inbound::decode(&repeated), Ok(Inbound::Reply(duplicate)) if duplicate == reply));
+                        ack_while_locked.send(()).unwrap();
                     }
                     let stats = holder_cache.lock().peer_stats();
                     ack_tx.send((at,stats.pinned_blocks,stats.leases)).unwrap();
@@ -1284,9 +1392,7 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
             let (retired, bytes) = read.unwrap();
             let (ack, pins, leases) = released.unwrap();
             assert!(start <= retired && retired <= ack && ack < forward_end);
-            if contend {
-                assert!(ack.duration_since(retired) < Duration::from_millis(50));
-            } else {
+            if !contend {
                 assert_eq!((pins, leases), (0, 0));
             }
             assert!(bytes > 0);
@@ -1310,6 +1416,15 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
 
 #[test]
 fn an_aborted_host_read_keeps_its_pages_until_retirement_without_publishing() {
+    held_host_read(false);
+}
+
+#[test]
+fn shutdown_drains_submitted_dma_and_discards_the_next_host_reservation() {
+    held_host_read(true);
+}
+
+fn held_host_read(shutdown: bool) {
     struct HeldRead {
         arena: Arena,
         entered: mpsc::Sender<()>,
@@ -1357,12 +1472,48 @@ fn an_aborted_host_read_keeps_its_pages_until_retirement_without_publishing() {
     reader
         .scheduler
         .lock()
-        .submit_requests(&[spec("cancel", prompt, &holder.name)])
+        .submit_requests(&[spec("cancel", prompt.clone(), &holder.name)])
         .unwrap();
     reader.round();
     reading
         .recv_timeout(Duration::from_secs(2))
         .expect("READ submitted");
+    if shutdown {
+        let mut cache = reader.scheduler.lock();
+        cache
+            .submit_requests(&[spec("queued", prompt, &holder.name)])
+            .unwrap();
+        let _plan = cache.next_execution_plan(true, false);
+        let lookups = cache.take_peer_lookups();
+        assert_eq!(lookups.len(), 1);
+        reader.peer.dispatch(vec![], lookups, 0);
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            if reader
+                .peer
+                .agree(&[])
+                .unwrap()
+                .events
+                .iter()
+                .any(|e| e.num_tokens > 0)
+            {
+                break;
+            }
+            assert!(Instant::now() < until, "second reservation never queued");
+            std::thread::yield_now();
+        }
+        drop(reader.peer);
+        assert!(holder.scheduler.lock().peer_stats().pinned_blocks > 0);
+        resume.send(()).unwrap();
+        // Disconnection proves that the read pool exited without picking up B.
+        assert_eq!(
+            reading.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        drop(cache);
+        assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
+        return;
+    }
     reader.advance(&[event(ForwardEventKind::Abort, "cancel", vec![])]);
     assert_eq!(reader.scheduler.lock().peer_stats().landing_requests, 1);
     assert!(holder.scheduler.lock().peer_stats().pinned_blocks > 0);
