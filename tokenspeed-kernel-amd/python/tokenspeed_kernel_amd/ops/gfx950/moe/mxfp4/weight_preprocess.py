@@ -391,6 +391,8 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         w._gluon_w2_bias_is_zero = not bool(torch.count_nonzero(w2_weight_bias).item())
         w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
 
+    # The W13 dispatch GEMM uses the same 128-wide N tile as the combine.
+    w13_rows = int(w13_weight.shape[-2])
     (
         w13_weight_data,
         w13_weight_scale_data,
@@ -405,8 +407,7 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         w.w2_weight_scale.data,
         _GLUON_COMBINE_BLOCK_N,
     )
-    if w13_weight_data is not w13_weight.data:
-        w._gluon_logical_intermediate_size = int(w13_weight.shape[-2]) // 2
+    if int(w13_weight_data.shape[-2]) != w13_rows:
         w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         w13_weight_scale = torch.nn.Parameter(
             w13_weight_scale_data, requires_grad=False

@@ -370,7 +370,6 @@ def test_dynamic_mxfp4_precomputed_moe_unaligned_intermediate(num_tokens: int) -
         generator=generator,
     )
     module = _make_dynamic_mxfp4_moe_module(raw)
-    assert module._gluon_logical_intermediate_size == intermediate_size
     hidden_states = torch.randn(
         (num_tokens, hidden_size),
         dtype=torch.bfloat16,
