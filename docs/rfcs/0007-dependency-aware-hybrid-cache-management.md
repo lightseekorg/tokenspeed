@@ -762,7 +762,7 @@ lease deadlines.
 --prefix-cache-gds-disk-read-cost A B    # required for GDS with Disk
 ```
 
-Use the [GDS calibration tools](../../test/cache_gds_calibration/README.md) to fit
+Use the [GDS calibration tools](https://github.com/lightseekorg/tokenspeed/blob/main/test/cache_gds_calibration/README.md) to fit
 `D/E` from isolated prefill timings and `A/B` from native Disk reads; native
 collection defaults to `cases_quick.json`, and configuration is exported only
 after held-out validation passes.
