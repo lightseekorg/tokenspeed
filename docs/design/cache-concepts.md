@@ -602,6 +602,12 @@ its KV tail are evicted together, so a stale state is never matched). Resuming a
 of its kernel chunk regroups a floating-point reduction; `numerics.md`
 ("Prefix hits resume at any token") states the tolerance and the oracle.
 
+`ServerArgs.checkpoint_config` derives production, publication and retention
+rules from the explicit checkpoint flag, engine role and eviction policy.
+Cache validation and staged argument resolution use the same rules without
+requiring full server initialization. Decode treats in-forward production as
+a no-op; GDS retains the publication filters but does not use LRU demotion hints.
+
 Capacity prefill graphs (`backends/state/prefill_capacity.py`) keep this
 contract at a captured request count: an unused request slot scans one
 padding row past the live tokens, its state-block index is negative so the
@@ -3621,6 +3627,8 @@ allocate none. Moving or abandoning a selection has no cache side effects.
 Commit prepares required Host reservations and records fresh rejection before
 Device removal, then applies the plan's watermarks, statistics and trace once.
 Host-only plans still commit even when they remove no Device blocks.
+Admission skips the eviction call only when both physical victims and GDS
+commit metadata are absent; publication and allocation still run normally.
 The member arena outlives the selected sets, and each compaction retains its
 own plan through placement. Selection order, cascades and write-back segment
 boundaries remain the planners' decisions.

@@ -261,6 +261,10 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
     const std::vector<CacheEvictor::UnevictedVictim> prospective_victims = [&] {
+        // GDS can commit logical decisions without removing Device blocks.
+        if (plan.eviction.victims.empty() && !plan.eviction.gds) {
+            return std::vector<CacheEvictor::UnevictedVictim>{};
+        }
         ProfileSpan evicting{"CacheCoordinator::commitAdmission (evict)"};
         return evictor_.EvictPlanned(
             plan.eviction, write_back_evictions_,

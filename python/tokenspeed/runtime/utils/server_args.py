@@ -533,7 +533,6 @@ class ServerArgs:
     # checkpoint whose end lies inside a page publishes no state and no KV tail
     # there either (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
-    checkpoint_config: CheckpointConfig = dataclasses.field(init=False)
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
@@ -1066,11 +1065,6 @@ class ServerArgs:
 
     def __post_init__(self):
         self.validate_prefix_cache_eviction()
-        self.checkpoint_config = CheckpointConfig.resolve(
-            in_forward=self.enable_state_checkpoint_in_forward,
-            role=self.disaggregation_mode,
-            eviction_policy=self.prefix_cache_evict_policy,
-        )
         self.validate_decode_extra_slots()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
@@ -1891,6 +1885,15 @@ class ServerArgs:
         """Whether this engine's scheduler has a Host tier: the local Host L2,
         or a shared L2 pool in its place."""
         return self.enable_kvstore or self.shared_l2_config is not None
+
+    @property
+    def checkpoint_config(self) -> CheckpointConfig:
+        """Derive checkpoint rules without depending on startup phase ordering."""
+        return CheckpointConfig.resolve(
+            in_forward=self.enable_state_checkpoint_in_forward,
+            role=self.disaggregation_mode,
+            eviction_policy=self.prefix_cache_evict_policy,
+        )
 
     @property
     def writes_state_checkpoints_in_forward(self) -> bool:

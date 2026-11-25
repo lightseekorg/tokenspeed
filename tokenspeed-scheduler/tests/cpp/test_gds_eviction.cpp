@@ -26,6 +26,7 @@
 #include <random>
 #include <unordered_set>
 
+#include "cache/coordinator/admission_planner.h"
 #include "cache/coordinator/gds_coverage.h"
 
 #include "cache/coordinator/gds_planner.h"
@@ -227,6 +228,60 @@ protected:
         return count;
     }
 };
+
+TEST(GdsAdmission, NoEvictionStillPublishesAndAllocates) {
+    for (const auto config : {PrefixCacheEvictionConfig::Lru(), PrefixCacheEvictionConfig::Gds({0.25, 0})}) {
+        SCOPED_TRACE(config.policy == PrefixCacheEvictionConfig::Policy::kGds ? "gds" : "lru");
+        BlockPool device{16, {1, 1}};
+        auto cache = MakeCoordinator(Specs(), kPage, device, false, nullptr, nullptr, nullptr, false, false, 0);
+        cache.ConfigureEviction(config);
+        std::vector<BlockTable> tables(2);
+        const Point point{4};
+        auto first = AdmitForTest(cache, tables, 4);
+        ASSERT_TRUE(first);
+        const CacheBlockLocation published = tables[0].Blocks().front()->Location();
+        const RequestProgress progress{.completed_pages = CompletedPages{.tokens = point.tokens,
+                                                                         .prefix_hashes = point.hashes,
+                                                                         .publish_state = true,
+                                                                         .boundary_kind = CacheBoundaryKind::kEndpoint},
+                                       .num_computed_tokens = 4};
+        auto next = AdmitForTest(cache, tables, GroupDemand{.extent = DenseGrowth{4}}, progress);
+        ASSERT_TRUE(next);
+        EXPECT_EQ(tables[0].NumBlocks(), 2);
+        EXPECT_EQ(tables[0].Blocks().front()->Location(), published);
+        ASSERT_EQ(next->new_page_ids.size(), 2u);
+        EXPECT_EQ(next->new_page_ids[0].size(), 1u);
+        EXPECT_EQ(cache.Prober().ProbePrefix(point.hashes).device.num_common_tokens, 4);
+        EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0);
+        EXPECT_EQ(cache.GdsStats().committed_plans, 0u);
+        cache.Free(tables);
+        EXPECT_EQ(cache.Prober().ProbePrefix(point.hashes).device.num_common_tokens, 4);
+    }
+}
+
+TEST_F(GdsEviction, AdmissionCommitsGdsMetadataWithoutPhysicalVictims) {
+    std::vector<BlockTable> tables(2);
+    auto first = AdmitForTest(cache, tables, 4);
+    ASSERT_TRUE(first);
+    const std::array demands{
+        GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}},
+        GroupDemand{.table = &tables[1], .extent = StateStep{StateStep::Kind::kKeep}},
+    };
+    // Exercise commit independently of selection: logical metadata remains
+    // work even when the plan removes no physical Device blocks.
+    AdmissionPlan plan{.prefix = cache.Prober().ProbePrefix({})};
+    plan.eviction.gds = std::make_unique<GdsEvictionCommit>();
+    plan.eviction.gds->stats.watermark = 0.8;
+    plan.eviction.gds->stats.committed_plans = 1;
+    auto result = CacheCoordinatorTestAccess::CommitAdmission(
+        cache, std::move(plan), demands, RequestProgress{.num_computed_tokens = 4}, first->access_epoch);
+    EXPECT_EQ(tables[0].NumBlocks(), 2);
+    ASSERT_EQ(result.new_page_ids.size(), 2u);
+    EXPECT_EQ(result.new_page_ids[0].size(), 1u);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0.8);
+    EXPECT_EQ(cache.GdsStats().committed_plans, 1u);
+    cache.Free(tables);
+}
 
 TEST_F(GdsEviction, SharedPrefixChangesTheSizeWithoutRefreshingTheStamp) {
     Point r4{16}, r8{32};
