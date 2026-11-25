@@ -1581,3 +1581,18 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+## Process replacement boundary
+
+A headless launcher owns every rank it starts, including node zero. A rank
+must not outlive a hard launcher failure. If starting a later rank or sending
+its bootstrap arguments fails, startup releases previously acquired processes,
+pipes and sentinel descriptors before propagating the failure. This includes
+encode ranks and does not terminate another independently launched engine.
+
+A replacement must recreate the complete communication world with fresh
+frontend connections. Attention-DP ranks share per-round collectives and cannot
+be replaced individually while other members of that world continue. Independent
+engine instances use independent launchers, GPU assignments and rendezvous
+ports; restarting one must not require resources assigned to another instance.
+Allocation and multi-node restart coordination remain the caller's responsibility.

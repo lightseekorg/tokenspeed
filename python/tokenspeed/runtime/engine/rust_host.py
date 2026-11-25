@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -259,6 +260,7 @@ class HostProcess:
         #: ``multiprocessing.connection.wait`` needs of a sentinel: the read
         #: end of a pipe whose only write end the process holds.
         self.sentinel = sentinel
+        self._close_sentinel = weakref.finalize(self, os.close, sentinel)
 
     @property
     def pid(self) -> int:
@@ -326,57 +328,67 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    with start_context:
-        # Capture launch-context environment changes (notably allocator LD_PRELOAD).
-        # Set each native writer's fallback before the host initializes logging.
-        level = server_args.log_level.lower()
-        host_env = os.environ.copy()
-        if host_env.get("LD_PRELOAD"):
-            # Nested allocator contexts can repeat an inherited hook. Preserve
-            # library order without changing the parent's environment.
-            host_env["LD_PRELOAD"] = ":".join(
-                dict.fromkeys(filter(None, host_env["LD_PRELOAD"].split(":")))
+    popen = None
+    try:
+        with start_context:
+            # Capture launch-context environment changes (notably allocator LD_PRELOAD).
+            # Set each native writer's fallback before the host initializes logging.
+            level = server_args.log_level.lower()
+            host_env = os.environ.copy()
+            if host_env.get("LD_PRELOAD"):
+                # Nested allocator contexts can repeat an inherited hook. Preserve
+                # library order without changing the parent's environment.
+                host_env["LD_PRELOAD"] = ":".join(
+                    dict.fromkeys(filter(None, host_env["LD_PRELOAD"].split(":")))
+                )
+            host_env.setdefault(
+                "TS_HOST_LOG",
+                {
+                    "warning": "warn",
+                    "critical": "error",
+                    "fatal": "error",
+                    "notset": "trace",
+                }.get(level, level),
             )
-        host_env.setdefault(
-            "TS_HOST_LOG",
-            {
-                "warning": "warn",
-                "critical": "error",
-                "fatal": "error",
-                "notset": "trace",
-            }.get(level, level),
-        )
-        host_env.setdefault(
-            "SPDLOG_LEVEL",
-            {
-                "warn": "warning",
-                "fatal": "critical",
-                "notset": "trace",
-            }.get(level, level),
-        )
-        popen = subprocess.Popen(
-            [
-                (
-                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                    if server_args.disaggregation_mode == "encode"
-                    else rank_process_title(server_args.mapping)
-                ),
-                "--python",
-                sys.executable,
-                "--control-fd",
-                str(child.fileno()),
-                "--enable-async-logging",
-                str(server_args.enable_async_logging).lower(),
-            ],
-            executable=binary,
-            env=host_env,
-            pass_fds=[child.fileno(), held_until_exit],
-            preexec_fn=preexec_fn,
-        )
-    child.close()
-    os.close(held_until_exit)
-    parent.send((server_args, port_args, metrics_relay_endpoint))
-    return HostProcess(popen, sentinel), parent
+            host_env.setdefault(
+                "SPDLOG_LEVEL",
+                {
+                    "warn": "warning",
+                    "fatal": "critical",
+                    "notset": "trace",
+                }.get(level, level),
+            )
+            popen = subprocess.Popen(
+                [
+                    (
+                        f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+                        if server_args.disaggregation_mode == "encode"
+                        else rank_process_title(server_args.mapping)
+                    ),
+                    "--python",
+                    sys.executable,
+                    "--control-fd",
+                    str(child.fileno()),
+                    "--enable-async-logging",
+                    str(server_args.enable_async_logging).lower(),
+                ],
+                executable=binary,
+                env=host_env,
+                pass_fds=[child.fileno(), held_until_exit],
+                preexec_fn=preexec_fn,
+            )
+        parent.send((server_args, port_args, metrics_relay_endpoint))
+        return HostProcess(popen, sentinel), parent
+    except BaseException:
+        if popen is not None:
+            popen.kill()
+            popen.wait()
+        parent.close()
+        os.close(sentinel)
+        raise
+    finally:
+        child.close()
+        os.close(held_until_exit)
 
 
 # ----------------------------------------------------------------------
