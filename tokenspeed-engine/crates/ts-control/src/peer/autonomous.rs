@@ -81,8 +81,7 @@ impl Peer {
         replica: Vec<RankGeometry>,
         listener: Option<PeerListener>,
         scheduler: Arc<Mutex<Scheduler>>,
-        reader: Arc<dyn PageReader>,
-        pusher: Arc<dyn PagePusher>,
+        transfers: PeerTransfers,
     ) -> Result<Self, PeerError> {
         let device = progress == PeerProgress::Device;
         let background = progress != PeerProgress::Coordinated;
@@ -96,8 +95,7 @@ impl Peer {
             replica,
             listener,
             scheduler.clone(),
-            reader,
-            pusher,
+            transfers,
         )?;
         let (port, fence, origin) = (protocol.port(), protocol.fence(), protocol.origin);
         let driver = if background {

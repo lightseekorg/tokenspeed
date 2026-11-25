@@ -38,7 +38,7 @@ use ts_control::peer::{
     push::{PagePusher, PushItem},
     read::Arena,
     wire::{Reply, Request},
-    Peer, PeerListener, PeerProgress, PeerSettings,
+    Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
 };
 use ts_scheduler::{
     ForwardEvent, ForwardEventKind, PeerFetchView, PeerTier, RequestSpec, Scheduler,
@@ -197,12 +197,16 @@ enum TestDriver {
 }
 
 struct FixtureSettings {
+    pages: u64,
+    soft_pin_us: i64,
     driver: TestDriver,
     peer: PeerSettings,
 }
 
 fn settings(name: &str, weight_version: &str) -> FixtureSettings {
     FixtureSettings {
+        pages: PAGES,
+        soft_pin_us: 1_000_000,
         driver: TestDriver::Coordinated,
         peer: PeerSettings {
             name: name.to_owned(),
@@ -296,30 +300,14 @@ impl Replica {
         role: &str,
         landing: Landing,
     ) -> Self {
-        let pages = PAGES;
-        Self::with_reader_pages(
-            settings, listener, geometry, reader, role, landing, pages, 1_000_000,
-        )
-    }
-
-    fn with_reader_pages(
-        settings: FixtureSettings,
-        listener: PeerListener,
-        geometry: RankGeometry,
-        reader: Arc<dyn PageReader>,
-        role: &str,
-        landing: Landing,
-        pages: u64,
-        soft_pin_us: i64,
-    ) -> Self {
         let scheduler = Arc::new(Mutex::new(scheduler(
             &settings.peer.name,
             1,
             role,
             landing,
             settings.peer.timeouts.answer_us,
-            pages,
-            soft_pin_us,
+            settings.pages,
+            settings.soft_pin_us,
         )));
         let name = settings.peer.name.clone();
         let progress = match settings.driver {
@@ -341,8 +329,10 @@ impl Replica {
             vec![geometry],
             Some(listener),
             scheduler.clone(),
-            reader,
-            Arc::new(NoPushes),
+            PeerTransfers {
+                reader,
+                pusher: Arc::new(NoPushes),
+            },
         )
         .unwrap();
         Self {
@@ -1390,15 +1380,15 @@ fn delayed_checkpoint_pin(evict: bool) {
         cfg.peer.timeouts.answer_us = 50_000;
         // Also expire the Rust holder's lookup metadata before the PIN.
         cfg.peer.record_lifetime = Duration::from_secs(2);
-        Replica::with_reader_pages(
+        cfg.pages = 512;
+        cfg.soft_pin_us = 2_000_000;
+        Replica::with_landing(
             cfg,
             listener,
             geometry(base),
-            Arc::new(arena.clone()),
+            &arena,
             "Fused",
             Landing::Device,
-            512,
-            2_000_000,
         )
     };
     let mut holder = replica(HOLDER_BASE);

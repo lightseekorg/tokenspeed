@@ -39,7 +39,7 @@ use ts_control::{
         landing::Timeouts,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        Peer, PeerFence, PeerListener, PeerProgress, PeerSettings,
+        Peer, PeerFence, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_scheduler::Scheduler;
@@ -289,8 +289,10 @@ pub fn start(
         geometries,
         listener,
         scheduler,
-        Arc::new(EngineReader(engine)),
-        Arc::new(push),
+        PeerTransfers {
+            reader: Arc::new(EngineReader(engine)),
+            pusher: Arc::new(push),
+        },
     )
     .map_err(|error| error.to_string())?;
     // A second start would be a second peer; there is one per process.

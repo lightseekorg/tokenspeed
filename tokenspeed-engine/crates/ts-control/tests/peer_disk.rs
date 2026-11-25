@@ -42,7 +42,7 @@ use ts_control::{
         landing::Timeouts,
         push::{PageWriter, PushEndpoint, PushSource},
         read::Arena,
-        Peer, PeerListener, PeerProgress, PeerSettings,
+        Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_disk::{Backend, ExecutorConfig, Memory};
@@ -306,8 +306,10 @@ impl Replica {
             vec![geometry(base, push.name())],
             Some(listener),
             scheduler.clone(),
-            Arc::new(arena.clone()),
-            Arc::new(push),
+            PeerTransfers {
+                reader: Arc::new(arena.clone()),
+                pusher: Arc::new(push),
+            },
         )
         .unwrap();
         Self {

@@ -73,6 +73,14 @@ use crate::{
 
 const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
+/// Data-transfer endpoints owned by this member's peer read workers.
+pub struct PeerTransfers {
+    /// Read remote Device and Host pages into local destinations.
+    pub reader: Arc<dyn PageReader>,
+    /// Request a holder-side push for Disk pages.
+    pub pusher: Arc<dyn PagePusher>,
+}
+
 /// What a replica's peer sharing runs with.
 #[derive(Debug, Clone)]
 pub struct PeerSettings {
@@ -456,8 +464,7 @@ impl Protocol {
     /// Start one member with every member's geometry in `replica`.
     /// The first (`member` 0) must supply the bound `listener` and serves
     /// `scheduler` as a holder; other members must supply `None`. The
-    /// member reads through `reader` and has holders' Disk pages pushed
-    /// through `pusher` (its rank's push endpoint).
+    /// member uses its own transfer endpoints for direct reads and Disk pushes.
     pub fn start(
         settings: PeerSettings,
         progress: PeerProgress,
@@ -465,8 +472,7 @@ impl Protocol {
         replica: Vec<RankGeometry>,
         listener: Option<PeerListener>,
         scheduler: Arc<Mutex<Scheduler>>,
-        reader: Arc<dyn PageReader>,
-        pusher: Arc<dyn PagePusher>,
+        transfers: PeerTransfers,
     ) -> Result<Self, PeerError> {
         let members = replica.len();
         let geometry = replica.get(member).cloned().ok_or(PeerError::Report)?;
@@ -501,7 +507,7 @@ impl Protocol {
             read_metrics: None,
             lookup_times: HashMap::new(),
             decisions: Vec::new(),
-            reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
+            reads: Reads::start(transfers.reader, transfers.pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
     }
