@@ -4393,7 +4393,15 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                         p_handle.release()
                                         o_handle.commit()
                                         o_token = o_producer.try_acquire()
-                                    o_producer.tail()
+                                    # Wait for the release of the last O stage on
+                                    # every cluster rank. Each CTA of the KV-split
+                                    # cluster issues its own MMAs (CtaGroup.ONE),
+                                    # while o_producer.tail() waits only on even
+                                    # ranks: it serves the two-CTA MMA pair, whose
+                                    # leader is the only producer.
+                                    for _ in cutlass.range_constexpr(self.o_stages - 1):
+                                        o_producer.advance()
+                                    o_producer.acquire()
                                     if cutlass.const_expr(
                                         self.query_rows_per_cta == 1
                                         and not self.caller_allocates_scratch
