@@ -5,6 +5,10 @@ E4M3 checkpoint with FP32 128 × 128 block scales. Checkpoint metadata can use
 `quant_method: fp8` or `quant_method: w8a16_fp8_block`; ordinary `fp8` execution
 continues to use its existing activation policy.
 
+Absent or null checkpoint quantization metadata leaves the model unquantized.
+Configuration normalization and wrapped text-config extraction preserve that
+meaning; a model provider may explicitly declare the optional field as `None`.
+
 Each quantized matrix has a `.weight` tensor in `float8_e4m3fn` and a
 `.weight_scale_inv` tensor in `float32`. For `[N, K]` weights, scales have shape
 `[ceil(N / 128), ceil(K / 128)]`. Expert storage adds the expert dimension.
