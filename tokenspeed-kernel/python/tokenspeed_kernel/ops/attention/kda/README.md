@@ -57,9 +57,12 @@ request's. The convolution launch stores each layer's verdict on each row
 `[rows, layers]` scratch, and the count launch reduces a row's verdicts and
 writes its count once: the start count plus the acceptance, when every layer
 accepted. A request still decoding that some layers accept and others reject,
-or whose slot holds a fault (below), keeps its count, and its `request_ends`
-entry rises to `REQUEST_DECODE_STATE_INCONSISTENT` instead of letting its
-layers drift; the control plane stops and names the request. A request whose
+or that any layer it carries rejects, or that some layer leaves idle (its
+group's pages invalid), or whose slot holds a fault (below), keeps its count,
+and its `request_ends` entry rises to `REQUEST_DECODE_STATE_INCONSISTENT`
+instead of losing tokens or letting its layers drift; the control plane stops
+and names the request. A row no layer carries (graph padding, a masked overlap
+row) reports nothing. A request whose
 slot is set in `request_stopped` ended in this forward: the convolution launch
 also folds its records, through this round's acceptance, into its live page
 (each program of a row takes some heads), and the count launch clears its
@@ -103,10 +106,13 @@ the checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
 Convolution and count publication use the common retained commit ABI. A
 request that ended in the forward has its records folded into its live page by
-the commit; if a layer that carries it rejects its commit (stale stamps, an
-interval past the capacity), the commit raises the row's `request_ends` entry
-to `REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
-page that lacks accepted tokens.
+the commit; if a layer rejects its commit (stale stamps, an interval past the
+capacity) or never carries it (its group's pages invalid) while another layer
+does, the commit raises the row's `request_ends` entry to
+`REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
+page that lacks accepted tokens. A request ending in a forward that gives it
+no valid page in any group carries no layer, so its records never fold and it
+reports nothing: the one case these reports leave open.
 
 ## Retained preparation
 

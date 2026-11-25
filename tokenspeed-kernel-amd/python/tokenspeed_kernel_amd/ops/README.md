@@ -2092,9 +2092,11 @@ Retained commit clamps the accepted count to the actual window and configured
 bound, updates convolution from the caller's original QKV and stores each
 layer's verdict on each row; a second launch reduces a row's verdicts and
 writes its count once, the start count plus the acceptance, when every layer
-accepted and its slot holds no fault. A still-decoding row that some layers
-reject, or a faulted slot, raises the row's `request_ends` entry to
-`REQUEST_DECODE_STATE_INCONSISTENT` instead. It does not replay dense state or
+accepted and its slot holds no fault. A still-decoding row that a layer
+rejects or leaves idle, or a faulted slot, raises the row's `request_ends`
+entry to `REQUEST_DECODE_STATE_INCONSISTENT` instead; an ended row that some
+layer does not accept raises it to `REQUEST_ENDED_INCOMPLETE`. Rows no layer
+carries report nothing. It does not replay dense state or
 copy retained records, except to fold a request that ended. Zero acceptance
 still copies source convolution history to a distinct live page. Invalid
 accepted stamps prevent that layer's convolution writes.

@@ -645,13 +645,13 @@ def retained_batched_publish_kernel(
 
     Every layer's records follow the one count the request's slot keeps, so
     it advances only when every layer accepted the round and the round's
-    prepare found the slot sound. A request still decoding whose commit some
-    layers accepted and others did not, or whose slot holds a fault, reports
-    ``INCONSISTENT`` instead of replaying records some layers never wrote. A
-    request that ended in this forward keeps the ``request_ends`` contract: a
-    layer that carried it but rejected its commit left its records outside
-    the live page, so the row reports ``INCOMPLETE``. A row's entry is only
-    raised, never lowered.
+    prepare found the slot sound. A request still decoding that some layer
+    did not accept -- one rejected it, or its group's pages left it idle --
+    or whose slot holds a fault, reports ``INCONSISTENT`` and keeps its
+    count instead of losing or replaying accepted tokens. A request that
+    ended in this forward and that some layer did not accept left records
+    outside a live page, so the row reports ``INCOMPLETE``. A row no layer
+    carries reports nothing. A row's entry is only raised, never lowered.
     """
     row = tl.program_id(0).to(tl.int64)
     lanes = tl.arange(0, LAYERS)
@@ -678,7 +678,10 @@ def retained_batched_publish_kernel(
         other=0,
     )
     fault = tl.load(faults + record_slot * fault_stride, mask=carried, other=0)
-    split = (stopped == 0) & (accepting > 0) & (accepting < layers)
+    # A carried row some layer did not accept: rejected outright, or never
+    # reached because its group's pages were invalid. A row no layer carries
+    # (graph padding, a masked overlap row, a slot not resident) says nothing.
+    unaccepted = carried & (accepting < layers)
     if (accepting == layers) & (fault == 0):
         # An ended request's records are folded into its live page.
         tl.store(
@@ -686,9 +689,9 @@ def retained_batched_publish_kernel(
             tl.where(stopped != 0, 0, old + take).to(tl.int32),
         )
     code = tl.where(
-        split | (fault != 0),
+        ((stopped == 0) & unaccepted) | (fault != 0),
         INCONSISTENT,
-        tl.where((stopped != 0) & (rejecting > 0), INCOMPLETE, 0),
+        tl.where((stopped != 0) & unaccepted, INCOMPLETE, 0),
     )
     if code > 0:
         tl.store(request_ends + row, tl.maximum(tl.load(request_ends + row), code))

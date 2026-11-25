@@ -491,9 +491,14 @@ is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
 rather than publish an incomplete state. So is a request, ended or not, whose
 deferred state the device found inconsistent
 (`REQUEST_DECODE_STATE_INCONSISTENT`, `CommitError::InconsistentDecodeState`,
-which names the request): a retained-history interval out of range, the KDA
-layers of a decode round disagreeing on its commit, or an extend storing into
-some State groups' live blocks only. A per-slot fault carries what the prepare
+which names the request): a retained-history interval out of range, a KDA
+layer of a decode round not accepting its commit -- one rejected it or, its
+group's pages invalid, never carried it -- or an extend storing into some
+State groups' live blocks only. An ending request some KDA layer did not
+accept reports `REQUEST_ENDED_INCOMPLETE`. A row no KDA layer carries (graph
+padding, a masked overlap row) reports nothing; so does the one remaining
+gap, a request ending in a forward that gave it no valid page in any group,
+whose records then never fold. A per-slot fault carries what the prepare
 or the extend's metadata finds past the stop conditions, which rewrite each
 row's entry; the decode commit, and for extend rows a report right after the
 stop conditions, raise the entry to it.

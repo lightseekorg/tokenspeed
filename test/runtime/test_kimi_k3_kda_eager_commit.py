@@ -944,8 +944,10 @@ def test_padded_graph_verify_keeps_live_rows_and_commits_isolated():
                     atol=1e-5 if component == "recurrent_state" else 0,
                     rtol=1e-3 if component == "recurrent_state" else 0,
                 )
-        # Padding rows leave every count alone; the live rows' counts follow
-        # the eager forward's: one accepted token at least, every round.
+        # Padding rows report nothing and leave every count alone; the live
+        # rows' counts follow the eager forward's: one accepted token at
+        # least, every round.
+        assert not captured.request_ends.any()
         assert torch.equal(
             captured.backend._replay_length, eager.backend._replay_length
         )
@@ -2377,3 +2379,79 @@ def test_an_extend_row_with_live_pages_in_some_groups_reports_inconsistent():
         REQUEST_ENDED,
         REQUEST_DECODE_STATE_INCONSISTENT,
     ]
+
+
+def _round_with_invalid_pages(harness, pages, seq_len, seed, invalid_groups):
+    """One verify round of slot 1 whose live page reads -1 in ``invalid_groups``."""
+    tables = {
+        group: np.asarray([[0, page] for page in pages[group]], dtype=np.int32)
+        for group in _STATE_GROUPS
+    }
+    delivered = _tables_for(harness.contract, tables, DEV)
+    for group in invalid_groups:
+        delivered[group][0, 1] = -1
+    harness.backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([1], dtype=torch.int32, device=DEV),
+        torch.tensor([seq_len], dtype=torch.int32, device=DEV),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=delivered,
+    )
+    harness.forward(harness.inputs(1, seed), 1)
+    harness.backend.commit_verified_state(
+        torch.tensor([T], dtype=torch.int32, device=DEV), accepted_path=None
+    )
+
+
+def test_a_decoding_request_every_layer_rejects_reports_an_inconsistent_state():
+    """A commit no layer of a running request accepts -- here no layer
+    verified the round, so every stamp is stale -- would drop the tokens the
+    request accepted: its row reports the state inconsistent and its count
+    and convolution windows stay."""
+    from tokenspeed_kernel.ops.metadata import REQUEST_DECODE_STATE_INCONSISTENT
+
+    harness = _Harness(draft_tokens=T, seed=1705)
+    pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
+    harness.round([1], pages, [8 + T], 1705, [T])
+    conv_before = {
+        layer: harness.pool.get_component(layer, "conv_state").clone()
+        for layer in harness.layer_ids
+    }
+    harness.prepare_metadata([1], pages, [8 + 2 * T])
+    harness.backend.commit_verified_state(
+        torch.tensor([T], dtype=torch.int32, device=DEV), accepted_path=None
+    )
+    assert harness.request_ends[0].item() == REQUEST_DECODE_STATE_INCONSISTENT
+    assert harness.backend._replay_length[1].item() == T
+    for layer, before in conv_before.items():
+        torch.testing.assert_close(
+            harness.pool.get_component(layer, "conv_state"), before, atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid,end",
+    [("one group", "incomplete"), ("every group", "ended")],
+    ids=["one_group_invalid", "masked_overlap_row"],
+)
+def test_an_ending_request_with_invalid_pages(invalid, end):
+    """An ending request whose live page is invalid in one State group never
+    folds those layers, so its live blocks lack accepted tokens: INCOMPLETE.
+    A masked overlap row -- every group's pages invalid, its request ended
+    by an earlier forward -- carries no layer and reports nothing."""
+    from tokenspeed_kernel.ops.metadata import (
+        REQUEST_ENDED,
+        REQUEST_ENDED_INCOMPLETE,
+    )
+
+    harness = _Harness(draft_tokens=T, seed=1706)
+    pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
+    harness.round([1], pages, [8 + T], 1706, [T])
+    harness.stopped[1] = True
+    harness.request_ends[0] = REQUEST_ENDED
+    groups = _STATE_GROUPS[:1] if invalid == "one group" else _STATE_GROUPS
+    _round_with_invalid_pages(harness, pages, 8 + 2 * T, 1707, groups)
+    expected = REQUEST_ENDED_INCOMPLETE if end == "incomplete" else REQUEST_ENDED
+    assert harness.request_ends[0].item() == expected
+    assert harness.backend._replay_length[1].item() == T

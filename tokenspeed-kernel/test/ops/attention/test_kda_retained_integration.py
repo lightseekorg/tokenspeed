@@ -418,6 +418,51 @@ def test_a_commit_some_layers_reject_reports_an_inconsistent_state(window):
     assert int(actual[1][3]) == 7
 
 
+@pytest.mark.parametrize("cause", ["stale", "capacity"])
+def test_a_decoding_row_every_layer_rejects_reports_an_inconsistent_state(cause):
+    """Row 1 (slot 3) is live and every layer that carries it rejects its
+    commit -- stale stamps everywhere, or a start count with no room for the
+    acceptance: it reports the state inconsistent, keeps its count and
+    shifts no convolution window; the other rows commit."""
+    # actual keeps every layer's tensors the descriptors point at alive.
+    args, keepalive, actual, expected = _commit_case(4)
+    convs, length, _ = actual
+    if cause == "stale":
+        args["record_stamps"][:, 0, ..., 1] = -1
+    else:
+        args["replay_start"][3] = 8
+    before = [conv[4].clone() for conv in convs]
+    _resolve_commit()(**args)
+    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
+    assert length[:, 0].tolist() == [2 + 4, 2, 7, 7]
+    for conv, conv_before in zip(convs, before):
+        torch.testing.assert_close(conv[4], conv_before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "pages,stopped,end",
+    [
+        ("one group", True, REQUEST_ENDED_INCOMPLETE),
+        ("every group", True, REQUEST_ENDED),
+        ("every group", False, 0),
+    ],
+    ids=["stopped_partial", "masked_stopped", "padding"],
+)
+def test_rows_some_layers_never_carry(pages, stopped, end):
+    """Row 1 (slot 3) has invalid pages in group 0 only, or in both groups.
+    An ended row whose group-0 layer never folded reports INCOMPLETE; a row
+    no layer carries -- a masked overlap row that ended earlier, or graph
+    padding -- reports nothing and keeps its count."""
+    args, keepalive, actual, _ = _commit_case(4, stopped_slots=(3,) if stopped else ())
+    length = actual[1]
+    groups = [0] if pages == "one group" else [0, 1]
+    args["read_indices"][groups, 1] = -1
+    args["write_indices"][groups, 1] = -1
+    _resolve_commit()(**args)
+    assert args["request_ends"].tolist()[1] == end
+    assert int(length[3]) == 7
+
+
 def test_a_slot_the_prepare_flagged_reports_an_inconsistent_state():
     """A fault the prepare left in a slot reaches the row's report at the
     commit, and its count stays; a higher code than a row's end report wins."""
