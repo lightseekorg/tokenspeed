@@ -1385,9 +1385,12 @@ def get_rope(
                 cache_position_limit,
             ),
             scaling,
-            # NPU torch is built without CUDA and the trainer builds the
-            # deepseek_yarn inv_freq table on the host: force CPU ramp and
-            # frequency tables, then the cache moves to the NPU device.
+            # NPU torch has no CUDA device constructor, so the YaRN
+            # ramp/frequency tensors cannot be built on "cuda" and are both
+            # forced to CPU; the GPU branch keeps the server-arg values via
+            # the ternary (trainer alignment uses ramp=cpu, frequency=cuda).
+            # Note: this silently overrides an explicit --yarn-frequency-device
+            # (and --yarn-ramp-mask-device) on NPU.
             _YarnDevices(
                 "cpu" if current_platform().is_npu else yarn_ramp_mask_device,
                 "cpu" if current_platform().is_npu else yarn_frequency_device,

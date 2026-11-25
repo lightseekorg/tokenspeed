@@ -439,61 +439,6 @@ def bind_grammar_mask_buf(
     info.apply_vocab_mask = get_apply_vocab_mask_func(grammar_backend)
 
 
-def _fill_eager_bitmask(
-    grammars: list,
-    bs: int,
-    eager_buffers: EagerGrammarBuffers,
-    spec_num_tokens: int,
-    is_spec_decode: bool,
-    input_ids_buf,
-    output_layout: ForwardOutputLayout,
-) -> None:
-    """Sync, walk grammars on host, H2D the bitmask. Non-CUDA path only."""
-    if is_spec_decode:
-        first = output_layout.num_extends
-        count = bs - first
-        candidates = input_ids_buf[-count * spec_num_tokens :]
-        eager_buffers.candidates_cpu_buf[first:bs].copy_(
-            candidates.view(count, spec_num_tokens), non_blocking=True
-        )
-        device_module = torch.get_device_module()
-        sync_ev = device_module.Event()
-        sync_ev.record()
-        sync_ev.synchronize()
-        cand_cpu = eager_buffers.candidates_cpu_buf
-        active = bs * spec_num_tokens
-        cpu_buf = eager_buffers.vocab_mask_spec_cpu_buf
-        gpu_buf = eager_buffers.vocab_mask_spec_buf
-        cpu_buf[:active].fill_(-1)
-        for i, grammar in enumerate(grammars):
-            if grammar is None or grammar.finished or grammar.is_terminated():
-                continue
-            row_base = i * spec_num_tokens
-            advanced = 0
-            positions = output_layout.output_width(i)
-            for pos in range(positions):
-                if grammar.is_terminated():
-                    break
-                grammar.fill_vocab_mask(cpu_buf, row_base + pos)
-                if pos + 1 == positions:
-                    break
-                next_tok = int(cand_cpu[i, pos + 1].item())
-                if not grammar.try_accept_token(next_tok):
-                    break
-                advanced += 1
-            if advanced:
-                grammar.rollback(advanced)
-        gpu_buf[:active].copy_(cpu_buf[:active], non_blocking=True)
-    else:
-        cpu_buf = eager_buffers.vocab_mask_cpu_buf
-        gpu_buf = eager_buffers.vocab_mask_buf
-        cpu_buf[:bs].fill_(-1)
-        for i, grammar in enumerate(grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(cpu_buf, i)
-        gpu_buf[:bs].copy_(cpu_buf[:bs], non_blocking=True)
-
-
 GrammarRuntime = CapturableGrammarExecutor | EagerGrammarBuffers
 
 

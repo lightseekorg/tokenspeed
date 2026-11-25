@@ -1939,7 +1939,6 @@ class DeepseekV3Model(nn.Module):
             if device_module.is_available() and not _platform.is_npu
             else None
         )
-        # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
                 DeepseekV3DecoderLayer(
