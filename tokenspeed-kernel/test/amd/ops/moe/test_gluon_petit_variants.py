@@ -121,8 +121,8 @@ def test_ep8_prefill_tail_variant_is_compiled(experts, top_k) -> None:
 
 def test_prefill_tail_variant_is_compiled() -> None:
     # A 50,000-token prompt leaves an 848-row prefill tail at 1,024, 2,048 and
-    # 4,096-token chunks; its m64/w4 stage-1 variant compiled for 27-28 s
-    # inside a serving step before startup compiled every variant.
+    # 4,096-token chunks; its m64/w4 stage-1 variant must be among those the
+    # startup compile builds, or it compiles inside a serving step.
     config = _config(4, 384, 6, 4096)
     assert config.variant_key(848) == ("cta56", "m64_w4", "div16")
     assert config.variant_key(848) in {

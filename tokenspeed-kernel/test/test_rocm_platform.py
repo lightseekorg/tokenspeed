@@ -130,11 +130,7 @@ def test_loaded_hip_runtime_path_without_hip_mapping(tmp_path):
     assert platform_module._loaded_hip_runtime_path(str(tmp_path / "missing")) is None
 
 
-def test_hip_runtime_prefers_the_mapped_library(tmp_path):
-    maps = tmp_path / "maps"
-    maps.write_text(
-        "7f0000004000-7f0000005000 r--p 00000000 00:2a 12 /rocm/lib/libamdhip64.so.7\n"
-    )
+def test_hip_runtime_prefers_the_mapped_library():
     opened = []
 
     def cdll(name):

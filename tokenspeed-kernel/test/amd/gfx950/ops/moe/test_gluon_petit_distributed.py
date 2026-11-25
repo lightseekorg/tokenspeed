@@ -556,8 +556,7 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
     The warmup call compiles (without launching) every kernel variant a rank
     can launch at this capacity; afterwards Triton's in-process cache must
     hit for every count, including the last chunk of a 50,000-token prompt
-    (848 rows at EP4, 1360 at EP8's 2560-row chunks; the 848-row tail once
-    compiled for 27-28 s inside a serving step).
+    (848 rows at EP4, 1360 at EP8's 2560-row chunks).
     """
     import triton
     from tokenspeed_kernel.ops.moe import gluon as petit

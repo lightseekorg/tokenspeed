@@ -505,6 +505,8 @@ def test_dynamic_mxfp4_dsv41_tp8_decode_takes_slot_parallel(
     )
     expected = run()
     torch.cuda.synchronize()
+    # Without the TP8 entry the shape takes the ragged path, which does not
+    # call the decode stage 2: the record still holds only the first run.
     assert slot_parallel == [True]
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 

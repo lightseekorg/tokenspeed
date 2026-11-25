@@ -84,10 +84,15 @@ def test_shared_expert_stream_label(
 
 
 @pytest.mark.parametrize(
-    "value,stream", [("1", "aux"), ("0", "main")], ids=["aux", "main"]
+    "value,label",
+    [
+        ("1", "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"),
+        ("0", "main (Gluon Petit default)"),
+    ],
+    ids=["aux", "main"],
 )
 def test_layer_zero_logs_the_shared_expert_stream(
-    monkeypatch, caplog, value, stream
+    monkeypatch, caplog, value, label
 ) -> None:
     monkeypatch.setenv(_SWITCH, value)
     caplog.set_level(logging.INFO, logger="tokenspeed.runtime.models.deepseek_v41_moe")
@@ -111,11 +116,6 @@ def test_layer_zero_logs_the_shared_expert_stream(
     )
     messages = [r.getMessage() for r in caplog.records]
     assert messages == [
-        f"DeepSeek V4 MoE shared expert stream: {stream} ("
-        + (
-            "TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM"
-            if stream == "aux"
-            else "Gluon Petit default"
-        )
-        + ") prefix=model.layers.0.mlp moe_backend=gluon_petit"
+        f"DeepSeek V4 MoE shared expert stream: {label} "
+        "prefix=model.layers.0.mlp moe_backend=gluon_petit"
     ]

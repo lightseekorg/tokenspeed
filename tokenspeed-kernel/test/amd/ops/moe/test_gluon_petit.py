@@ -607,20 +607,8 @@ def test_largest_capacity_per_world_size() -> None:
     # the draft above 5280; the server's limit is the smaller.
     assert gluon_petit_largest_max_tokens_per_rank(4) == 7808
     assert gluon_petit_largest_max_tokens_per_rank(8) == 2624
-    petit_kernel = _import_petit_kernel()
-    for profile, world_size, largest in (
-        (_DSV41_FLASH_PROFILE, 4, 7808),
-        (_DSV41_FLASH_PROFILE, 8, 2624),
-        (_DSV41_FLASH_DSPARK_PROFILE, 8, 5280),
-    ):
-        reserved, _ = _megamoe_config(
-            petit_kernel, profile, world_size, largest
-        ).heap_bytes()
-        assert reserved < 1 << 32
-        with pytest.raises(ValueError, match="32-bit offsets"):
-            _megamoe_config(petit_kernel, profile, world_size, largest + 32)
     assert (
-        petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK == 9184
+        _import_petit_kernel().MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK == 9184
     ), "the EP4 draft's largest is Petit's largest encodable capacity"
 
 
@@ -647,6 +635,15 @@ def test_largest_capacity_per_profile(profile, world_size, largest) -> None:
         f"for {profile.name}",
     ):
         gluon_petit_max_tokens_per_rank(world_size, largest + 1, profile)
+    petit_kernel = _import_petit_kernel()
+    if 1024 < largest < petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK:
+        # The limit is where the heap reaches 32-bit offsets.
+        reserved, _ = _megamoe_config(
+            petit_kernel, profile, world_size, largest
+        ).heap_bytes()
+        assert reserved < 1 << 32
+        with pytest.raises(ValueError, match="32-bit offsets"):
+            _megamoe_config(petit_kernel, profile, world_size, largest + 32)
 
 
 @pytest.mark.parametrize("profile", [_KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE])
