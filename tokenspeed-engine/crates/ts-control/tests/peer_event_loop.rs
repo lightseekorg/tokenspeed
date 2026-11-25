@@ -25,7 +25,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex as StdMutex, Once,
     },
     thread,
@@ -314,6 +314,8 @@ struct DeviceHooks {
     complete: PauseHook,
     execute: PauseHook,
     ops: StdMutex<Vec<String>>,
+    copy_only_plans: AtomicUsize,
+    idle_execute_calls: AtomicUsize,
 }
 struct HookedDevice {
     gen: HashMap<String, i32>,
@@ -329,9 +331,15 @@ impl DataPlane for HookedDevice {
     }
     fn execute(
         &mut self,
-        _: ExecutionPlan,
+        plan: ExecutionPlan,
         d: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if plan.has_pages_to_copy() && d.forward.is_none() {
+            self.hooks.copy_only_plans.fetch_add(1, Ordering::SeqCst);
+        }
+        if d.dp.is_some_and(|dp| dp.idle_forward) {
+            self.hooks.idle_execute_calls.fetch_add(1, Ordering::SeqCst);
+        }
         self.hooks.execute.pause_if_armed();
         let Some(b) = d.forward else {
             return Ok(None);
@@ -943,4 +951,349 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
     };
     sched.advance_peer(t0 + 150_000, &[rev]).unwrap();
     assert!(!sched.peer_lease_held(&lease) && sched.clear_cache());
+}
+
+fn compaction_peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
+    interpreter();
+    Python::attach(|py| {
+        let code = format!(
+            "import tokenspeed_scheduler as ts\n\
+             cfg = ts.SchedulerConfig()\n\
+             cfg.role = ts.SchedulerConfig.Role.Fused\n\
+             cfg.prefix_granularity = 8; cfg.max_scheduled_tokens = 64\n\
+             cfg.max_batch_size = 64; cfg.max_resident_requests = 64\n\
+             cfg.max_retracted_requests = 0; cfg.decode_input_tokens = 1\n\
+             cfg.num_device_pages = 29; cfg.num_snapshot_pages = 1; cfg.disable_l2_cache = True\n\
+             cfg.cache_groups = [\n\
+               ts.CacheGroupConfig(group_id='full_attention', block_granularity=8,\n\
+                 total_pages=58, attn_kind=ts.AttnKind.Full,\n\
+                 cache_blocks_per_lcm_block=2, transfer_policy=ts.CacheTransferPolicy.FullSuffix),\n\
+               ts.CacheGroupConfig(group_id='sliding', block_granularity=8,\n\
+                 total_pages=29, attn_kind=ts.AttnKind.SlidingWindow,\n\
+                 sliding_window_tokens=64, cache_blocks_per_lcm_block=1,\n\
+                 transfer_policy=ts.CacheTransferPolicy.FullSuffix),\n\
+             ]\n\
+             cfg.peer_config = ts.PeerConfig(name='{name}', incarnation=1, max_leases=32,\n\
+               soft_pin_us={soft_pin_us}, hard_pin_us=30_000_000, lookup_timeout_us=2_000_000,\n\
+               min_fetch_tokens=8, landing_tier=ts.PeerLandingTier.Device,\n\
+               max_host_landing_blocks=0, host_ready_timeout_us=0)\n\
+             result = ts.Scheduler(cfg)\n"
+        );
+        let g = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&g), None)
+            .unwrap();
+        Scheduler::from_python(&g.get_item("result").unwrap().unwrap()).unwrap()
+    })
+}
+
+fn make_compaction_lookup_prompt(prefix: &[i32]) -> Prompt {
+    let mut h = compaction_peer_scheduler("prompt-builder-compact", 30_000_000);
+    let mut full = prefix.to_vec();
+    full.extend(99_000..99_008);
+    h.submit_requests(&[RequestSpec {
+        admission_id: 0,
+        request_id: "p".into(),
+        session_id: String::new(),
+        cache_group_id: String::new(),
+        shared_prefix_tokens: Vec::new(),
+        peer_holder: "holder".into(),
+        tokens: full,
+        max_new_tokens: 1,
+        max_cached_prefix_tokens: i32::MAX,
+    }])
+    .unwrap();
+    let _ = h.next_execution_plan(true, false);
+    let l = h.take_peer_lookups().pop().unwrap();
+    Prompt {
+        prefix_hashes: l.prefix_hashes,
+        tokens: l.tokens,
+        max_tokens: l.max_tokens,
+    }
+}
+
+fn compaction_rank_geometry(base: u64) -> RankGeometry {
+    RankGeometry {
+        session: "local".into(),
+        device: vec![
+            DeviceField {
+                group_id: 0,
+                field_id: "layer.0.full".into(),
+                address: base,
+                page_stride: PAGE_BYTES,
+                bytes: PAGE_BYTES,
+            },
+            DeviceField {
+                group_id: 1,
+                field_id: "layer.0.sliding".into(),
+                address: base + 10_000,
+                page_stride: PAGE_BYTES,
+                bytes: PAGE_BYTES,
+            },
+        ],
+        host: None,
+        push: None,
+    }
+}
+
+#[test]
+fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forward_completes() {
+    interpreter();
+    let ls = [(); 2].map(|_| Listener::bind("127.0.0.1").unwrap());
+    let addrs: Vec<_> = ls
+        .iter()
+        .map(|l| format!("127.0.0.1:{}", l.port().unwrap()))
+        .collect();
+    let pl = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_name = format!("127.0.0.1:{}", pl.port());
+    let (s0, s1) = (
+        Arc::new(Mutex::new(compaction_peer_scheduler(
+            &holder_name,
+            30_000_000,
+        ))),
+        Arc::new(Mutex::new(peer_scheduler("dp1-compact", 30_000_000))),
+    );
+    let p0 = Peer::start(
+        peer_settings(&holder_name),
+        0,
+        vec![compaction_rank_geometry(0)],
+        Some(pl),
+        s0.clone(),
+        Arc::new(Arena::new(200_000)),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let (fe0, fe1, h0, h1, stop) = (
+        Arc::new(FrontendState::default()),
+        Arc::new(FrontendState::default()),
+        Arc::new(DeviceHooks::default()),
+        Arc::new(DeviceHooks::default()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let [l0, l1] = ls;
+    let t0 = spawn_rank(
+        0,
+        l0,
+        addrs.clone(),
+        vec![0],
+        Some(vec![0, 1]),
+        s0.clone(),
+        Some(fe0.clone()),
+        h0.clone(),
+        Some(p0),
+        1,
+        stop.clone(),
+    );
+    let t1 = spawn_rank(
+        1,
+        l1,
+        addrs,
+        vec![1],
+        Some(vec![0, 1]),
+        s1,
+        Some(fe1.clone()),
+        h1.clone(),
+        None,
+        1,
+        stop.clone(),
+    );
+
+    // 1. Fragment the pool with eight 1-page prompts submitted in one round so
+    //    each full_attention parent holds [cached page | hole] alongside eight
+    //    cached sliding parents.
+    let a_tokens: Vec<Vec<i32>> = (0..8)
+        .map(|k| (100 + 50 * k..100 + 50 * k + 8).collect())
+        .collect();
+    fe0.receive_hook.arm();
+    fe0.receive_hook.wait_entered();
+    for (k, toks) in a_tokens.iter().enumerate() {
+        fe0.push(add_req(&format!("a{k}"), toks.clone(), 1));
+    }
+    fe0.receive_hook.release();
+    for k in 0..8 {
+        fe0.wait_finished(&format!("a{k}"));
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let client = PeerNet::start("127.0.0.1", 0, tx).unwrap();
+    let caddr = format!("127.0.0.1:{}", client.port());
+    let send_lookup = |id: u64, prompt: &Prompt| {
+        client
+            .request(
+                &holder_name,
+                &Request::Lookup {
+                    lease: PeerLeaseView {
+                        reader: caddr.clone(),
+                        id,
+                    },
+                    prompt: prompt.clone(),
+                },
+            )
+            .unwrap();
+    };
+    let recv_answer = || -> (i32, bool) {
+        let Inbound::Reply(Reply::Answer { answer, .. }) =
+            Inbound::decode(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap()
+        else {
+            panic!("expected peer Answer reply")
+        };
+        (answer.num_tokens, answer.held)
+    };
+    let pin_prompt = |id: u64, prompt: &Prompt| -> PeerLeaseView {
+        let lease = PeerLeaseView {
+            reader: caddr.clone(),
+            id,
+        };
+        send_lookup(id, prompt);
+        let (tokens, _) = recv_answer();
+        assert_eq!(tokens, 8);
+        client
+            .request(
+                &holder_name,
+                &Request::Pin {
+                    lease: lease.clone(),
+                },
+            )
+            .unwrap();
+        let (_, held) = recv_answer();
+        assert!(held);
+        lease
+    };
+    let release_lease = |lease: PeerLeaseView| {
+        client
+            .request(
+                &holder_name,
+                &Request::Release {
+                    lease,
+                    demote: false,
+                },
+            )
+            .unwrap();
+        let _ = recv_answer();
+    };
+
+    // 2. Hard-pin a1..a7 (leaving a0 unpinned so chunk 1 of R can take a0's
+    //    sliding parent and fill the eight full_attention holes).
+    let a_prompts: Vec<Prompt> = a_tokens
+        .iter()
+        .map(|toks| make_compaction_lookup_prompt(toks))
+        .collect();
+    let mut leases: Vec<Option<PeerLeaseView>> = (0..8)
+        .map(|k| (k >= 1).then(|| pin_prompt(10 + k as u64, &a_prompts[k])))
+        .collect();
+
+    // 3. Submit the 126-token lone request R. Chunk 1 (64 tokens) runs and
+    //    completes; chunk 2 blocks on a1..a7, so lone-request recovery
+    //    publishes chunk 1's eight full pages first without forwarding.
+    let r_tokens: Vec<i32> = (3000..3126).collect();
+    let r_page0_prompt = make_compaction_lookup_prompt(&r_tokens[..8]);
+    fe0.push(add_req("R", r_tokens.clone(), 1));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut probe_id = 100u64;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for R chunk 1 pages to publish"
+        );
+        probe_id += 1;
+        send_lookup(probe_id, &r_page0_prompt);
+        let (tokens, _) = recv_answer();
+        if tokens >= 8 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // 4. Arm h0.execute and release one kept parent (a1) plus one vacatable
+    //    parent (a7), keeping a2..a6 pinned. Lone-request compaction copies
+    //    R's published full_attention block out of a7's parent into a1's
+    //    cleared slot (emitting pages_to_copy), while the chunk-2 retry still
+    //    fails for lack of sliding parents (forward == None, so in_flight
+    //    stays empty while copies_confirmed_at is set).
+    assert_eq!(h0.copy_only_plans.load(Ordering::SeqCst), 0);
+    h0.execute.arm();
+    for k in [1usize, 7] {
+        release_lease(leases[k].take().unwrap());
+    }
+    h0.execute.wait_entered();
+    assert_eq!(
+        h0.copy_only_plans.load(Ordering::SeqCst),
+        1,
+        "compaction must emit a plan with pages_to_copy and no forward"
+    );
+
+    // 5. While rank 0 is paused inside the copy-only execute, arm dp1's
+    //    receive_hook so rank 0 enters gate() on the next round with
+    //    in_flight.is_empty() == true and copies_confirmed_at == Some(...).
+    //    gate() must keep self.scheduler locked.
+    fe1.receive_hook.arm();
+    h0.execute.release();
+    fe1.receive_hook.wait_entered();
+    thread::sleep(Duration::from_millis(15));
+    send_lookup(201, &a_prompts[4]);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(80)).is_err(),
+        "gate() must keep scheduler locked while copies_confirmed_at is pending"
+    );
+
+    // 6. Trigger an idle_forward on rank 0 while copies_confirmed_at is still
+    //    set (dp1 runs a local request). plan_and_dispatch must keep
+    //    self.scheduler locked during idle_forward, and idle_forward must not
+    //    clear copies_confirmed_at.
+    let idle_before = h0.idle_execute_calls.load(Ordering::SeqCst);
+    h0.execute.arm();
+    fe1.push(add_req(
+        "r1-while-copies",
+        (600..600 + 2 * PAGE).collect(),
+        1,
+    ));
+    fe1.receive_hook.release();
+    h0.execute.wait_entered();
+    assert!(
+        h0.idle_execute_calls.load(Ordering::SeqCst) > idle_before,
+        "rank 0 should be executing an idle_forward"
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(80)).is_err(),
+        "idle_forward must keep scheduler locked while copies_confirmed_at is pending"
+    );
+    fe1.receive_hook.arm();
+    h0.execute.release();
+    assert_eq!(recv_answer().0, 8);
+    fe1.receive_hook.wait_entered();
+    thread::sleep(Duration::from_millis(15));
+    send_lookup(202, &a_prompts[4]);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(80)).is_err(),
+        "idle_forward must not clear copies_confirmed_at before a real forward completes"
+    );
+    fe1.receive_hook.release();
+    assert_eq!(recv_answer().0, 8);
+    fe1.wait_finished("r1-while-copies");
+
+    // 7. Release a2..a6 so R dispatches and completes chunk 2's forward,
+    //    clearing copies_confirmed_at. Afterwards gate() unlocks again.
+    for lease in leases[2..=6].iter_mut() {
+        release_lease(lease.take().unwrap());
+    }
+    fe0.wait_finished("R");
+
+    h1.execute.arm();
+    fe1.push(add_req(
+        "r1-after-copies",
+        (700..700 + 2 * PAGE).collect(),
+        2,
+    ));
+    h1.execute.wait_entered();
+    fe1.receive_hook.arm();
+    h1.execute.release();
+    fe1.receive_hook.wait_entered();
+    thread::sleep(Duration::from_millis(15));
+    let post_lease = pin_prompt(204, &r_page0_prompt);
+    release_lease(post_lease);
+    fe1.receive_hook.release();
+    fe1.wait_finished("r1-after-copies");
+
+    stop.store(true, Ordering::Relaxed);
+    t0.join().unwrap();
+    t1.join().unwrap();
 }

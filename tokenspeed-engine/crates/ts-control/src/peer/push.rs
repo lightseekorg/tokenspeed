@@ -324,7 +324,8 @@ impl Slots {
     }
 }
 
-/// RAII guard returning a staging slot on scope exit or panic.
+/// RAII guard returning a staging slot on normal scope exit; leaks on panic
+/// so an in-flight NVMe DMA read cannot write into a reused slot.
 struct SlotGuard<'a> {
     slots: &'a Slots,
     slot: usize,
@@ -338,7 +339,9 @@ impl SlotGuard<'_> {
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
-        self.slots.give_back(self.slot);
+        if !std::thread::panicking() {
+            self.slots.give_back(self.slot);
+        }
     }
 }
 
@@ -1510,5 +1513,29 @@ mod tests {
         cancelled.store(true, Ordering::Release);
         slots.wake_all();
         assert!(w.join().unwrap());
+    }
+
+    #[test]
+    fn slot_guard_leaks_on_panic_and_returns_normally() {
+        let slots = Slots {
+            total: 2,
+            max_per_job: 1,
+            free: Mutex::new(vec![0, 1]),
+            returned: Condvar::new(),
+        };
+        {
+            let guard = slots.try_take().unwrap();
+            assert_eq!(slots.free_count(), 1);
+            let _ = guard.index();
+        }
+        assert_eq!(slots.free_count(), 2);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slots.try_take().unwrap();
+            assert_eq!(slots.free_count(), 1);
+            panic!("simulated panic with in-flight DMA");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(slots.free_count(), 1);
     }
 }
