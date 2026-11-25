@@ -85,12 +85,13 @@ def fused_topk_topp_renorm(probs, top_ks, top_ps, *, out=None):
 
 
 def sample_from_probs(probs, coins, workspace, *, out=None):
-    """Sample using caller-provided coins, outputs and retained scratch."""
+    """Sample with one coin per probability row, including strided coin views."""
     if out is None:
         out = torch.empty((probs.shape[0],), dtype=torch.int32, device=probs.device)
+    # The native categorical sampler reads coins with unit stride.
     return torch.ops.custom.npu_sample_from_probs(
         probs,
-        coins,
+        coins.contiguous(),
         workspace.partial_sums,
         workspace.selected_blocks,
         workspace.residuals,

@@ -90,3 +90,32 @@ def test_sampling_workspace_rejects_invalid_geometry():
     for rows, vocab in ((0, 4), (1, 0)):
         with pytest.raises(ValueError, match="must be positive"):
             SamplingWorkspace.create(rows, vocab, "meta")
+
+
+def test_sample_from_probs_uses_each_request_coin_on_graph_replay():
+    from tokenspeed_kernel_npu.ops.sampling import SamplingWorkspace, sample_from_probs
+
+    # Prefill takes column zero of the per-request speculative coin buffer.
+    rows = 4
+    probs = torch.full((rows, 4), 0.25, dtype=torch.float32, device="npu")
+    coin_buffer = torch.zeros((rows + 1, 8), dtype=torch.float32, device="npu")
+    coins = coin_buffer[1:, 0]
+    workspace = SamplingWorkspace.create(rows, probs.shape[1], "npu")
+    out = torch.empty(rows, dtype=torch.int32, device="npu")
+
+    coins.copy_(torch.tensor([0.125, 0.375, 0.625, 0.875]))
+    assert sample_from_probs(probs, coins, workspace, out=out).cpu().tolist() == [
+        0,
+        1,
+        2,
+        3,
+    ]
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        sample_from_probs(probs, coins, workspace, out=out)
+
+    for expected in ([3, 2, 1, 0], [1, 3, 0, 2]):
+        coins.copy_((torch.tensor(expected, dtype=torch.float32) + 0.5) / 4)
+        graph.replay()
+        assert out.cpu().tolist() == expected
