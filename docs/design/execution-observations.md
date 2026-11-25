@@ -163,6 +163,8 @@ native Python conversion and cumulative Completion validation. The frozen full
 `output_pre_execution.hex` frame remains alongside the new execution fixture;
 its absent observation is unavailable, not zero. A frozen old Python decoder
 also reads the new frame's old columns while ignoring the added tail.
+Engram input-capacity and model-input regressions use the real executor
+configuration to check that disabled observations preserve those contracts.
 
 Real GPU tests live in `test/runtime/execution/test_execution_observations_cuda.py`
 and `test/test_execution_observations.py`. They use normal CUDA availability

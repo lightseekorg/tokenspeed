@@ -43,7 +43,10 @@ from tokenspeed.runtime.execution import input_buffer, model_executor, weight_lo
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
-from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.model_executor import (
+    ModelExecutor,
+    ModelExecutorConfig,
+)
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
@@ -70,6 +73,47 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 VOCAB_SIZE = 128
+
+
+def _executor_config(*, device, chunk_size, width, pp_size, depth):
+    return ModelExecutorConfig(
+        device=device,
+        max_num_seqs=4,
+        data_parallel_size=1,
+        enable_memory_saver=False,
+        spec_algo="DSPARK" if width > 1 else None,
+        spec_num_tokens=width,
+        chunked_prefill_size=chunk_size,
+        max_req_pool_size=5,
+        pp_size=pp_size,
+        overlap_schedule_depth=depth,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=width,
+        enable_nan_detection=False,
+        enable_speculative_sampling=False,
+        state_checkpoint_in_forward=False,
+        execution_observations=False,
+        enforce_eager=False,
+        enable_dp_local_cuda_graph=False,
+        prefix_granularity=1,
+        context_len=64,
+        physical_context_len=64 + width,
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2, 4],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        input_logprob_chunk_tokens=64,
+        query_shard_size=1,
+        query_shard_rank=0,
+    )
 
 
 def _state(prompt, output):
@@ -809,23 +853,12 @@ def test_executor_input_capacity_covers_decode_capture(
     )
     monkeypatch.setattr(model_executor.NanGuard, "create", stop_before_model_setup)
     executor = ModelExecutor.__new__(ModelExecutor)
-    config = SimpleNamespace(
+    config = _executor_config(
         device="cpu",
-        max_num_seqs=4,
-        data_parallel_size=1,
-        enable_memory_saver=False,
-        spec_algo="DSPARK" if width > 1 else None,
-        spec_num_tokens=width,
-        chunked_prefill_size=chunk_size,
-        max_req_pool_size=5,
+        chunk_size=chunk_size,
+        width=width,
         pp_size=pp_size,
-        overlap_schedule_depth=depth,
-        input_vocab_size=VOCAB_SIZE,
-        vocab_size=VOCAB_SIZE,
-        output_length=width,
-        enable_nan_detection=False,
-        enable_speculative_sampling=False,
-        state_checkpoint_in_forward=False,
+        depth=depth,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
@@ -877,8 +910,8 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor.model_runner = runner
     executor.input_buffers = ib
     executor.runtime_states = runtime
-    executor.config = SimpleNamespace(
-        model_is_mrope=False, pp_size=1, data_parallel_size=1
+    executor.config = _executor_config(
+        device=ib.device, chunk_size=16, width=1, pp_size=1, depth=0
     )
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=Mock())
     executor._active_positions_override = None
