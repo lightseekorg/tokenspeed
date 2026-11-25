@@ -1546,3 +1546,31 @@ def test_fuse_post_combine_variant_and_apply_plumbing() -> None:
         assert kwargs["residual"] is residual and kwargs["residual_ready"] is ready
         assert got is target and kwargs["out"] is target
         assert not petit._PETIT_COMBINE_POST  # the scope is popped
+
+
+def test_stage1_n128_received_experts_rule_ep8() -> None:
+    """C5 selector at EP8 (48 local target experts, 16 draft): DP8 decode
+    with 1 + 5 draft rows per request routes R = 6 x concurrency rows."""
+    import lib.moe.rocm.mega_moe as forwarding
+
+    _import_petit_kernel()
+    pays = forwarding.Stage1N128PaysForExperts
+    assert [e for e in range(0, 49) if pays(e, 10, 256)] == [
+        *range(1, 13),
+        *range(26, 39),
+    ]
+    bounds = forwarding.ReceivedExpertsBounds
+    assert {r: bounds(r, 6, 384, 8) for r in (6, 12, 24, 48, 96)} == {
+        6: (4, 5),
+        12: (8, 9),
+        24: (15, 18),
+        48: (25, 36),
+        96: (37, 48),
+    }
+    assert {r: bounds(r, 3, 128, 8) for r in (1, 2, 4, 8, 16)} == {
+        1: (1, 1),
+        2: (1, 1),
+        4: (1, 2),
+        8: (3, 3),
+        16: (5, 6),
+    }

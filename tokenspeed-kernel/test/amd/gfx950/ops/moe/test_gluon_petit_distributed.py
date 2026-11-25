@@ -609,8 +609,8 @@ def _graph_kernel_nodes(capture) -> int:
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_fuse_prep_bit_exact(profile_name):
@@ -659,7 +659,13 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
         )
 
     try:
-        for counts in ([0] * ws, [2, 2, 2, 0], [6, 0, 0, 0], [3, 3, 3, 3], [24] * ws):
+        for counts in (
+            [0] * ws,
+            [2] * (ws - 1) + [0],
+            [6] + [0] * (ws - 1),
+            [3] * ws,
+            [24] * ws,
+        ):
             count = counts[rank]
             values = torch.arange(count * profile.hidden, device=device)
             x = (
@@ -760,8 +766,8 @@ def _petit_launch_module():
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_stage1_n128_bit_exact(profile_name):
@@ -810,10 +816,10 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
     try:
         for counts, threshold in (
             ([0] * ws, 8),
-            ([2, 2, 2, 0], 8),
-            ([6, 0, 0, 0], 8),
-            ([1, 8, 9, 40], 8),
-            ([24, 3, 0, 64], 64),
+            ([2] * (ws - 1) + [0], 8),
+            ([6] + [0] * (ws - 1), 8),
+            (([1, 8, 9, 40] * 2)[:ws], 8),
+            (([24, 3, 0, 64] * 2)[:ws], 64),
         ):
             count = counts[rank]
             values = torch.arange(count * profile.hidden, device=device)
@@ -867,8 +873,8 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_fuse_post_combine(profile_name):
@@ -915,7 +921,13 @@ def test_distributed_petit_fuse_post_combine(profile_name):
             shared_out=None,
         )
 
-    for counts in ([0] * ws, [2, 2, 2, 0], [6, 0, 0, 0], [24, 0, 0, 0], [6] * ws):
+    for counts in (
+        [0] * ws,
+        [2] * (ws - 1) + [0],
+        [6] + [0] * (ws - 1),
+        [24] + [0] * (ws - 1),
+        [6] * ws,
+    ):
         count = counts[rank]
         values = torch.arange(count * profile.hidden, device=device)
         x = (
@@ -978,8 +990,8 @@ def test_distributed_petit_fuse_post_combine(profile_name):
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_stage2_n128_bit_exact(profile_name):
@@ -1031,11 +1043,11 @@ def test_distributed_petit_stage2_n128_bit_exact(profile_name):
     try:
         for counts in (
             [0] * ws,
-            [2, 2, 2, 0],
-            [6, 0, 0, 0],
-            [24, 0, 0, 0],
-            [1, 8, 9, 40],
-            [600, 0, 3, 0],
+            [2] * (ws - 1) + [0],
+            [6] + [0] * (ws - 1),
+            [24] + [0] * (ws - 1),
+            ([1, 8, 9, 40] * 2)[:ws],
+            ([600, 0, 3, 0] * 2)[:ws],
         ):
             count = counts[rank]
             values = torch.arange(count * profile.hidden, device=device)
@@ -1093,8 +1105,8 @@ def test_distributed_petit_stage2_n128_bit_exact(profile_name):
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
@@ -1149,12 +1161,12 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
     try:
         module.kStage1N128MaxTokens = -1
         for counts in (
-            [6, 0, 0, 0],
-            [12, 0, 0, 0],
-            [24, 0, 0, 0],
-            [2, 2, 2, 0],
-            [3, 3, 3, 3],
-            [6, 6, 6, 6],
+            [6] + [0] * (ws - 1),
+            [12] + [0] * (ws - 1),
+            [24] + [0] * (ws - 1),
+            [2] * (ws - 1) + [0],
+            [3] * ws,
+            [6] * ws,
         ):
             count = counts[rank]
             values = torch.arange(count * profile.hidden, device=device)

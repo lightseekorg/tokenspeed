@@ -76,6 +76,22 @@ def test_variant_counts_cover_every_launchable_key(
     assert counts == tuple(sorted(counts))
 
 
+def _with_stage1_n128(expected: tuple[int, ...]) -> tuple[int, ...]:
+    """Expected variant counts with C5's row rule (TOKENSPEED_PETIT_STAGE1_N128).
+
+    With the switch on, the first count above its threshold in each Triton
+    integer class (plain and multiple of 16) leaves the N=128 stage-1 tile:
+    one more variant each. Off (the default) keeps ``expected``.
+    """
+    import lib.moe.rocm.mega_moe as forwarding
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    if module.kStage1N128MaxTokens < 0:
+        return expected
+    first_div16 = (module.kStage1N128MaxTokens // 16 + 1) * 16
+    return tuple(sorted({*expected, module.kStage1N128MaxTokens + 1, first_div16}))
+
+
 @pytest.mark.parametrize(
     "experts,top_k,expected",
     [
@@ -89,18 +105,9 @@ def test_variant_counts_cover_every_launchable_key(
 )
 @pytest.mark.parametrize("capacity", [1024, 4096])
 def test_ep4_dsv41_variant_counts(experts, top_k, expected, capacity) -> None:
-    import lib.moe.rocm.mega_moe as forwarding
-
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
-    if module.kStage1N128MaxTokens >= 0:
-        # C5 (TOKENSPEED_PETIT_STAGE1_N128) on: the first count above its
-        # threshold, in each Triton integer class (plain and multiple of 16),
-        # leaves the N=128 stage-1 tile: one more variant each.
-        first_div16 = (module.kStage1N128MaxTokens // 16 + 1) * 16
-        expected = tuple(
-            sorted({*expected, module.kStage1N128MaxTokens + 1, first_div16})
-        )
-    assert _config(4, experts, top_k, capacity).variant_token_counts() == expected
+    assert _config(4, experts, top_k, capacity).variant_token_counts() == (
+        _with_stage1_n128(expected)
+    )
 
 
 @pytest.mark.parametrize(
@@ -116,7 +123,9 @@ def test_ep4_dsv41_variant_counts(experts, top_k, expected, capacity) -> None:
     ],
 )
 def test_ep8_dsv41_variant_counts(experts, top_k, capacity, expected) -> None:
-    assert _config(8, experts, top_k, capacity).variant_token_counts() == expected
+    assert _config(8, experts, top_k, capacity).variant_token_counts() == (
+        _with_stage1_n128(expected)
+    )
 
 
 @pytest.mark.parametrize("experts,top_k", [(384, 6), (128, 3)])
