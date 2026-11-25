@@ -109,6 +109,8 @@ class AscendMLABackend(AscendQCPPrefillBackend, MLAAttnBackend):
         super().__init__(
             config, replace(spec, backend_name=None), kernel_page_size=kernel_page_size
         )
+        # Native decode returns latent rows; the caller applies the value projection.
+        self.supports_mla_projected_value_decode = False
         if config.kvp_size not in (1, 8):
             raise ValueError("Ascend MLA native merge supports DCP1/8")
         self._dcp = AscendDCPContext(
@@ -229,6 +231,10 @@ class AscendMLABackend(AscendQCPPrefillBackend, MLAAttnBackend):
     ) -> None:
         if shard_count != self._dcp.degree:
             raise ValueError("MLA cache sharding and DCP group disagree")
+        if block_granularity < self.kernel_page_size or (
+            block_granularity % self.kernel_page_size
+        ):
+            raise ValueError("MLA ownership blocks must contain whole kernel pages")
         self._placement = CachePlacement(
             block_granularity, virtual_block_count, self._dcp.ranks, self._dcp.rank
         )

@@ -108,8 +108,10 @@ arriving: it would be unbound at once.
 
 The paged attention router supplies each MLA backend with its group's block
 granularity, virtual block count and shard count at runtime configuration.
-Ascend binds these to its native decode metadata and cache placement. The
-generic MLA backend uses the same geometry for its partial-result merge.
+Ascend requires each ownership block to contain whole kernel pages. Its native
+decode returns latent rows so the caller can apply the value projection after
+any cross-rank merge. The generic MLA backend uses the same geometry for its
+partial-result merge.
 
 Packing is a property of each pool. Device packing satisfies attention-kernel
 strides; compact Host storage uses a parent large enough for the largest single

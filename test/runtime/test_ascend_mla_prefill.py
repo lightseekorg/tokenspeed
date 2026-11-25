@@ -609,9 +609,23 @@ def test_ascend_mla_binds_arena_geometry(monkeypatch, degree):
         backend.configure_runtime(
             block_granularity=256, virtual_block_count=count, shard_count=degree
         )
+        assert not backend.supports_mla_projected_value_decode
         assert backend._decode_metadata.virtual_block_count == count
         expected = CachePlacement(256, count, tuple(range(degree)), 0)
         assert backend.cache_placement(None) == (expected if degree > 1 else None)
+
+
+@pytest.mark.parametrize("granularity", [0, 64, 192])
+def test_ascend_mla_rejects_incomplete_ownership_pages(monkeypatch, granularity):
+    pytest.importorskip("torch_npu")
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "numerics", "fast")
+    backend = _mla_backend(degree=8)
+    with pytest.raises(ValueError, match="whole kernel pages"):
+        backend.configure_runtime(
+            block_granularity=granularity, virtual_block_count=65, shard_count=8
+        )
 
 
 @pytest.mark.parametrize("engine", ["null", "prefill", "decode"])
