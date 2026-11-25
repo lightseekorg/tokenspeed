@@ -41,6 +41,7 @@ pub mod msgpack;
 pub mod multimodal;
 pub mod output;
 pub mod request;
+pub mod request_timing;
 pub mod sampling;
 pub mod tensor;
 pub mod value;
@@ -57,6 +58,7 @@ pub use multimodal::{
 };
 pub use output::{BatchTokenIDOutSlim, RequestOutput};
 pub use request::{SessionParams, TokenizedGenerateReqInput};
+pub use request_timing::{RequestClock, RequestTimestamp, RequestTiming, RequestTimingEvents};
 pub use sampling::SamplingParams;
 pub use tensor::Tensor;
 pub use value::Value;

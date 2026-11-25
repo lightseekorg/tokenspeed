@@ -37,7 +37,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ts_collective::{Group, Mesh, Reduce};
@@ -1659,9 +1659,11 @@ impl TransferPeer for DecodePeer {
                 })?;
                 let wait_started = state.waiting_since.get(&receiver.room).copied();
                 drop(state);
+                let kv_ready_at = (SystemTime::now(), Instant::now());
                 if replica.index() == 0 {
                     if let (Some(metrics), Some(started)) = (&self.shared.metrics, wait_started) {
-                        metrics.observe_decode_kv_wait(started.elapsed().as_secs_f64());
+                        let waited = kv_ready_at.1.duration_since(started);
+                        metrics.observe_decode_kv_wait(waited.as_secs_f64());
                     }
                 }
                 tracing::info!(
@@ -1679,6 +1681,7 @@ impl TransferPeer for DecodePeer {
                     bootstrap_logprob: landed.bootstrap_logprob,
                     spec_candidate_ids: landed.spec_candidate_ids,
                     request_pool_index,
+                    kv_ready_at,
                 }));
                 ended.push(rid.clone());
             }

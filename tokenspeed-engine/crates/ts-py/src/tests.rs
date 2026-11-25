@@ -141,3 +141,50 @@ asyncio.run(asyncio.wait_for(exercise(), 5))
         let _engine = py.detach(|| runtime().block_on(peer)).unwrap();
     });
 }
+
+#[test]
+fn terminal_request_timing_preserves_typed_fields_in_python() {
+    let frames = include_str!("../../ts-wire/tests/fixtures/output_slim_timing.hex")
+        .lines()
+        .map(|line| {
+            bytes::Bytes::from(
+                (0..line.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let batch: ts_wire::BatchTokenIDOutSlim = ts_wire::decode_frames(&frames).unwrap();
+    Python::initialize();
+    Python::attach(|py| {
+        let chunks = ts_client::OutputChunk::from_batch(batch)
+            .unwrap()
+            .map(|(_, chunk)| super::chunk_dict(py, chunk).unwrap())
+            .collect::<Vec<_>>();
+        let locals = PyDict::new(py);
+        locals.set_item("chunks", chunks).unwrap();
+        let code = CString::new(
+            r#"
+assert chunks[0]["completion_tokens"] == 1
+assert chunks[0]["finish_reason"] == "stop"
+assert chunks[0]["request_timing"] == {
+    "role": "decode", "dp_rank": 2, "tp_rank": 3,
+    "clock": {
+        "host_id": "worker-a", "process_instance_id": "process-a",
+        "clock_sync": "unknown", "clock_uncertainty_ns": "17",
+    },
+    "events": {
+        "accepted": {"ts_unix_ns": "1700000000000000001", "ts_mono_ns": "9007199254740993"},
+        "kv_ready": {"ts_unix_ns": "1700000000200000002", "ts_mono_ns": "9007199454740994"},
+        "finished": {"ts_unix_ns": "1700000000500000003", "ts_mono_ns": "9007199754740995"},
+    },
+    "kv_output_tokens": 1, "e2e_latency_s": 0.75,
+}
+assert chunks[1]["request_timing"] is None
+"#,
+        )
+        .unwrap();
+        py.run(&code, Some(&locals), None).unwrap();
+    });
+}
