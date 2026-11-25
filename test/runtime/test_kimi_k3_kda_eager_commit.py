@@ -2332,16 +2332,11 @@ def test_a_decoding_request_some_layers_reject_reports_an_inconsistent_state():
     assert harness.backend._replay_length[1].item() == T
 
 
-def test_an_extend_row_with_live_pages_in_some_groups_reports_inconsistent():
-    """An extend's metadata cannot clear one count for a row whose scan
-    stores into some groups' live pages only: the row keeps its count, and
-    the report after the stop conditions raises its request end."""
-    from tokenspeed_kernel.ops.metadata import (
-        REQUEST_DECODE_STATE_INCONSISTENT,
-        REQUEST_ENDED,
-    )
-
-    harness = _Harness(draft_tokens=4)
+def _extend_with_live_pages_in_some_groups(harness):
+    """Prepare an extend of two rows, slots 1 and 2, each holding three
+    retained records and completing a prompt of 9 tokens. Row 0 has live
+    pages in every State group and its count clears; row 1 has one in the
+    first group only, so it keeps its count and its slot faults."""
     _seed_retained_history(harness, slot=1, length=3)
     _seed_retained_history(harness, slot=2, length=3)
     prefix = torch.tensor([8, 8], dtype=torch.int32)
@@ -2372,10 +2367,171 @@ def test_an_extend_row_with_live_pages_in_some_groups_reports_inconsistent():
         query_shard=None,
     )
     assert harness.backend._replay_length[[1, 2]].flatten().tolist() == [0, 3]
+
+
+def test_an_extend_row_with_live_pages_in_some_groups_reports_inconsistent():
+    """An extend's metadata cannot clear one count for a row whose scan
+    stores into some groups' live pages only: the row keeps its count, and
+    the report after the stop conditions raises its request end."""
+    from tokenspeed_kernel.ops.metadata import (
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        REQUEST_ENDED,
+    )
+
+    harness = _Harness(draft_tokens=4)
+    _extend_with_live_pages_in_some_groups(harness)
     # The stop conditions overwrite every row; the report runs after them.
     harness.request_ends[:2] = torch.tensor([REQUEST_ENDED, 0], dtype=torch.int32)
     harness.backend.report_request_faults(harness.request_ends[:2], num_extends=2)
     assert harness.request_ends[:2].tolist() == [
+        REQUEST_ENDED,
+        REQUEST_DECODE_STATE_INCONSISTENT,
+    ]
+
+
+def test_the_forward_step_reports_an_extend_fault_after_the_stop_conditions():
+    """The forward step's stop conditions write every row's request end, so
+    it reports the extend rows' faults after them: a request whose state is
+    inconsistent and that ends in the same forward still reports the fault,
+    and a request without one keeps its end."""
+    from tokenspeed_kernel.ops.metadata import (
+        REQUEST_DECODE_STATE_INCONSISTENT,
+        REQUEST_ENDED,
+    )
+
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_executor import (
+        ModelExecutor,
+        ModelExecutorConfig,
+    )
+    from tokenspeed.runtime.execution.nan_guard import NanGuard
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.execution.types import StopCriteria
+    from tokenspeed.runtime.layers.logits_processor_output import (
+        LogitsProcessorOutput,
+    )
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
+    vocab, stop_token, slots = 32, 7, [1, 2]
+    harness = _Harness(draft_tokens=4)
+    max_bs = harness.config.max_bs
+    config = ModelExecutorConfig(
+        # The graph-padding slot sits after the scheduler's resident slots.
+        max_req_pool_size=harness.config.max_resident_requests + 1,
+        output_length=1,
+        enforce_eager=True,
+        prefix_granularity=128,
+        max_num_seqs=max_bs,
+        chunked_prefill_size=4096,
+        input_vocab_size=vocab,
+        vocab_size=vocab,
+        context_len=4096,
+        physical_context_len=4096,
+        device=DEV,
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=None,
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=max_bs,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        input_logprob_chunk_tokens=1024,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        enable_speculative_sampling=False,
+        enable_dp_local_cuda_graph=False,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+    )
+    # The executor's collaborators, as ModelExecutor.__init__ builds and binds
+    # them; the forward step runs on the harness's backend and pool.
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = config
+    executor.device = DEV
+    executor.device_module = torch.get_device_module(DEV)
+    executor.attn_backend = harness.backend
+    executor.sampling_backend = GreedySamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=False,
+            sampling_stream="per-request",
+            logprob_order="torch",
+            enable_output_logprobs=False,
+            enable_output_cumulative_probs=False,
+            max_bs=max_bs,
+            max_draft_tokens_per_req=1,
+            max_req_pool_size=config.max_req_pool_size,
+            vocab_size=vocab,
+            device=DEV,
+        )
+    )
+    executor.runtime_states = RuntimeStates(
+        config.max_req_pool_size, vocab, vocab, config.output_length, device=DEV
+    )
+    executor.input_buffers = InputBuffers(
+        max_bs=max_bs,
+        max_num_tokens=config.chunked_prefill_size,
+        state_write_padding_pool_index=config.max_req_pool_size,
+        device=DEV,
+    )
+    executor.request_ends = harness.request_ends
+    executor.nan_guard = NanGuard.create(config.enable_nan_detection, max_bs, DEV)
+    # No grammar backend: the step takes the eager path, no captured grammar.
+    executor.grammar_runtime = None
+    executor.dspark_context_producer = None
+    executor.drafter = None
+    executor.tree_spec = None
+    harness.backend.bind_request_stop_flags(
+        executor.runtime_states.stopped, executor.request_ends
+    )
+
+    # Both requests complete their 9-token prompts (8 cached, 1 new) and stop
+    # on the token they sample.
+    states = executor.runtime_states
+    states.bind_stop_criteria(
+        [11, 12],
+        slots,
+        [StopCriteria(stop_token_ids=(stop_token,), token_limit=64)] * 2,
+    )
+    states.valid_cache_lengths[slots] = 8
+    buffers = executor.input_buffers
+    buffers.req_pool_indices_buf[:2].copy_(torch.tensor(slots))
+    buffers.state_write_req_pool_indices_buf[:2].copy_(torch.tensor(slots))
+    buffers.input_lengths_buf[:2].fill_(1)
+    buffers.extend_prompt_lens_buf[:2].fill_(9)
+    _extend_with_live_pages_in_some_groups(harness)
+
+    # The model's logits: every row samples the stop token.
+    logits = torch.zeros(2, vocab, device=DEV)
+    logits[:, stop_token] = 1.0
+    executor._run_target_forward = lambda ctx: LogitsProcessorOutput(
+        next_token_logits=logits
+    )
+    ctx = ForwardContext(
+        attn_backend=harness.backend,
+        token_to_kv_pool=harness.pool,
+        bs=2,
+        num_extends=2,
+        input_num_tokens=2,
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=ForwardOutputLayout(2, 2, 0, 1),
+    )
+    tokens, *_ = executor._forward_step(
+        2,
+        ctx,
+        SamplingBatchInfo(device=DEV, req_pool_indices=torch.tensor(slots, device=DEV)),
+    )
+    torch.cuda.synchronize()
+    assert tokens.tolist() == [stop_token, stop_token]
+    assert states.stopped[slots].tolist() == [True, True]
+    assert executor.request_ends[:2].tolist() == [
         REQUEST_ENDED,
         REQUEST_DECODE_STATE_INCONSISTENT,
     ]
