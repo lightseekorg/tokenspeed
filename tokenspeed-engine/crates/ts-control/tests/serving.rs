@@ -878,6 +878,7 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                CacheOpKind::StateCommit => CacheEventKind::StateCommitDone,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged
@@ -1848,6 +1849,7 @@ fn run_rank<F: Frontend>(
         1,
         None,
         role,
+        false,
         FinishLog {
             enabled: true,
             request_stats: true,

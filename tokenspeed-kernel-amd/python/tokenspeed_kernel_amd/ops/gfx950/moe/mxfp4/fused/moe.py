@@ -1196,7 +1196,7 @@ def _launch_mxfp4_route_tiles(
         )
     expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
     num_local_experts = int(w13_runtime.shape[0])
-    block_m = 16
+    block_m = config.block_m
     max_rows = config.route_capacity
     if n_tokens > max_rows:
         raise ValueError(

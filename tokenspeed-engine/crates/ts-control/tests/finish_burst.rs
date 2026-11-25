@@ -151,6 +151,7 @@ fn processor(specs: &[RequestSpec]) -> OutputProcessor {
         1,
         None,
         Role::Plain,
+        false,
         FinishLog {
             enabled: false,
             request_stats: false,

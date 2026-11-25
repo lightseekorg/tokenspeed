@@ -426,6 +426,9 @@ def _refresh_capacity_metadata(target, source):
             device=old.device,
             out=old[actual_bs + 1 :],
         )
+    if target.req_pool_indices is not None:
+        target.req_pool_indices[:actual_bs].copy_(source.req_pool_indices)
+        target.req_pool_indices[actual_bs:].zero_()
     target.extend_seq_lens_cpu[:actual_bs].copy_(source.extend_seq_lens_cpu)
     target.extend_seq_lens_cpu[actual_bs:].fill_(1)
     refresh_causal_conv1d_capacity_metadata(
