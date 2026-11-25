@@ -106,13 +106,6 @@ names its slot), so that the parents they leave empty return to the FIFO.
 A parent it keeps never empties between one block leaving it and another
 arriving: it would be unbound at once.
 
-The paged attention router supplies each MLA backend with its group's block
-granularity, virtual block count and shard count at runtime configuration.
-Ascend requires each ownership block to contain whole kernel pages. Its native
-decode returns latent rows so the caller can apply the value projection after
-any cross-rank merge. The generic MLA backend uses the same geometry for its
-partial-result merge.
-
 Packing is a property of each pool. Device packing satisfies attention-kernel
 strides; compact Host storage uses a parent large enough for the largest single
 group payload, then fits as many complete children of each group as that parent
