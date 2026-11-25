@@ -296,6 +296,7 @@ class KimiK3Recipe(CacheRecipe):
     @property
     def draft_sliding_page_size(self) -> int:
         """Padded draft pages cannot be subdivided by a contiguous view."""
+        from tokenspeed.runtime.layers.attention import backends  # noqa: F401
         from tokenspeed.runtime.layers.attention.registry import (
             AttentionArch,
             _get_backend_cls,
