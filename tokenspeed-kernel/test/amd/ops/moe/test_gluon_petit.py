@@ -53,6 +53,55 @@ from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 
+def _test_profile(*, num_experts: int, top_k: int) -> _Profile:
+    """A small bias-free SiLU profile for the tests that mock Petit's launch."""
+    return _Profile(
+        name="test",
+        num_experts=num_experts,
+        top_k=top_k,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+
+
+def _test_state(profile: _Profile, **kwargs) -> _GluonPetitState:
+    """A layer state with empty weights and no biases for ``profile``."""
+    return _GluonPetitState(
+        profile=profile,
+        w13_weight=torch.empty(0),
+        w2_weight=torch.empty(0),
+        w13_scale=torch.empty(0),
+        w2_scale=torch.empty(0),
+        w13_bias=None,
+        w2_bias=None,
+        **kwargs,
+    )
+
+
+def _test_inputs(*, top_k: int) -> SimpleNamespace:
+    """Four-row heap input views of a ``_test_profile`` (64-wide MXFP4 rows)."""
+    return SimpleNamespace(
+        tokens=torch.empty((4, 32), dtype=torch.uint8),
+        scales=torch.empty((4, 2), dtype=torch.uint8),
+        expert_ids=torch.empty((4, top_k), dtype=torch.int32),
+        expert_weights=torch.empty((4, top_k), dtype=torch.float32),
+    )
+
+
+def _megamoe_module():
+    """Petit's launch module, whose globals hold the launch switches
+    (``kStage1N128MaxTokens``, ``kStage1N128ByExperts``, ``kStage2N128``)."""
+    import sys
+
+    _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    return sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+
+
 @pytest.mark.parametrize(
     "profile",
     [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE],
@@ -366,16 +415,7 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
     module.w13_weight_bias = None
     module.w2_weight_bias = None
     module._moe_backend_state = None
-    profile = _Profile(
-        name="test",
-        num_experts=2,
-        top_k=1,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
+    profile = _test_profile(num_experts=2, top_k=1)
     layouts = []
 
     def repack(
@@ -429,36 +469,12 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
 
 
 def test_apply_keeps_zero_token_rank_in_collective() -> None:
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=1,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
-    inputs = SimpleNamespace(
-        tokens=torch.empty((4, 32), dtype=torch.uint8),
-        scales=torch.empty((4, 2), dtype=torch.uint8),
-        expert_ids=torch.empty((4, 1), dtype=torch.int32),
-        expert_weights=torch.empty((4, 1), dtype=torch.float32),
-    )
+    profile = _test_profile(num_experts=8, top_k=1)
+    inputs = _test_inputs(top_k=1)
     config = mock.Mock()
     config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
     workspace = SimpleNamespace(config=config, heap=object(), inputs=inputs)
-    layer = SimpleNamespace(
-        _moe_backend_state=_GluonPetitState(
-            profile=profile,
-            w13_weight=torch.empty(0),
-            w2_weight=torch.empty(0),
-            w13_scale=torch.empty(0),
-            w2_scale=torch.empty(0),
-            w13_bias=None,
-            w2_bias=None,
-        )
-    )
+    layer = SimpleNamespace(_moe_backend_state=_test_state(profile))
     overlap = mock.Mock()
     x = torch.empty((0, profile.model_dim), dtype=torch.bfloat16)
 
@@ -505,37 +521,15 @@ def test_apply_fuse_prep_reads_router_buffers_in_place(
     """
     from tokenspeed_kernel.ops.moe import gluon as petit
 
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=2,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
-    heap = SimpleNamespace(
-        tokens=torch.empty((4, 32), dtype=torch.uint8),
-        scales=torch.empty((4, 2), dtype=torch.uint8),
-        expert_ids=torch.full((4, 2), -1, dtype=torch.int32),
-        expert_weights=torch.full((4, 2), -1.0, dtype=torch.float32),
-    )
+    profile = _test_profile(num_experts=8, top_k=2)
+    heap = _test_inputs(top_k=2)
+    heap.expert_ids.fill_(-1)
+    heap.expert_weights.fill_(-1.0)
     config = mock.Mock()
     config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
     config.run_routes.side_effect = lambda *args, **kwargs: torch.empty(0)
     workspace = SimpleNamespace(config=config, heap=object(), inputs=heap)
-    layer = SimpleNamespace(
-        _moe_backend_state=_GluonPetitState(
-            profile=profile,
-            w13_weight=torch.empty(0),
-            w2_weight=torch.empty(0),
-            w13_scale=torch.empty(0),
-            w2_scale=torch.empty(0),
-            w13_bias=None,
-            w2_bias=None,
-        )
-    )
+    layer = SimpleNamespace(_moe_backend_state=_test_state(profile))
     x = torch.zeros((3, profile.model_dim), dtype=torch.bfloat16)
     topk_ids = torch.tensor([[0, 5], [7, 2], [3, 4]], dtype=id_dtype)
     topk_weights = torch.tensor(
@@ -597,36 +591,14 @@ def test_apply_fuse_prep_reads_router_buffers_in_place(
 def test_apply_compiles_every_variant_once_under_startup_warmup(
     warming, capturing, compiles
 ) -> None:
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=1,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
-    inputs = SimpleNamespace(
-        tokens=torch.empty((4, 32), dtype=torch.uint8),
-        scales=torch.empty((4, 2), dtype=torch.uint8),
-        expert_ids=torch.empty((4, 1), dtype=torch.int32),
-        expert_weights=torch.empty((4, 1), dtype=torch.float32),
-    )
+    profile = _test_profile(num_experts=8, top_k=1)
+    inputs = _test_inputs(top_k=1)
     config = mock.Mock(world_size=8)
     config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
     config.compile_variants.return_value = (0, 1)
     heap = object()
     workspace = SimpleNamespace(config=config, heap=heap, inputs=inputs)
-    state = _GluonPetitState(
-        profile=profile,
-        w13_weight=torch.empty(0),
-        w2_weight=torch.empty(0),
-        w13_scale=torch.empty(0),
-        w2_scale=torch.empty(0),
-        w13_bias=None,
-        w2_bias=None,
-    )
+    state = _test_state(profile)
     layer = SimpleNamespace(_moe_backend_state=state)
     x = torch.empty((0, profile.model_dim), dtype=torch.bfloat16)
 
@@ -889,27 +861,9 @@ def test_ep8_launch_choice_above_1024_rows(profile, rows) -> None:
 
 
 def test_raised_capacity_is_carried_into_state_and_apply() -> None:
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=1,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
+    profile = _test_profile(num_experts=8, top_k=1)
     layer = SimpleNamespace(
-        _moe_backend_state=_GluonPetitState(
-            profile=profile,
-            w13_weight=torch.empty(0),
-            w2_weight=torch.empty(0),
-            w13_scale=torch.empty(0),
-            w2_scale=torch.empty(0),
-            w13_bias=None,
-            w2_bias=None,
-            max_tokens_per_rank=2048,
-        )
+        _moe_backend_state=_test_state(profile, max_tokens_per_rank=2048)
     )
     x = torch.empty((2049, profile.model_dim), dtype=torch.bfloat16)
     for kwargs, error in (
@@ -975,16 +929,7 @@ def test_startup_compile_logs_profile_capacity_and_counts(caplog) -> None:
     config = mock.Mock(world_size=8)
     config.compile_variants.return_value = (0, 1, 2, 256, 257, 512, 513)
     workspace = SimpleNamespace(config=config, heap=object(), inputs=object())
-    state = _GluonPetitState(
-        profile=_DSV41_FLASH_PROFILE,
-        w13_weight=torch.empty(0),
-        w2_weight=torch.empty(0),
-        w13_scale=torch.empty(0),
-        w2_scale=torch.empty(0),
-        w13_bias=None,
-        w2_bias=None,
-        max_tokens_per_rank=2560,
-    )
+    state = _test_state(_DSV41_FLASH_PROFILE, max_tokens_per_rank=2560)
     caplog.set_level(logging.INFO, logger="tokenspeed_kernel.ops.moe.gluon")
     _compiled_variant_keys.clear()
     try:
@@ -1007,12 +952,8 @@ def test_stage1_n128_switch_selects_tile_and_variants(profile) -> None:
     """C5 (TOKENSPEED_PETIT_STAGE1_N128): counts up to the threshold take the
     32x128 stage-1 tile, a separate compile variant; stage 2 keeps its tile.
     Off (-1, the default) every count keeps the old launch choice."""
-    import sys
-
     petit_kernel = _import_petit_kernel()
-    import lib.moe.rocm.mega_moe as forwarding
-
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    module = _megamoe_module()
     config = _megamoe_config(petit_kernel, profile, 4, 1024)
     with mock.patch.object(module, "kStage1N128MaxTokens", -1):
         off_counts = config.variant_token_counts()
@@ -1049,12 +990,8 @@ def test_stage2_n128_config_replaces_stage2_only(profile) -> None:
     fragments, W2 tile), the stage-1 arrival mask and the stage-1 and
     combine kernels stay the base's, and the epilogue's LDS column map and
     write-back cover every tile element exactly once (both widths)."""
-    import sys
-
     petit_kernel = _import_petit_kernel()
-    import lib.moe.rocm.mega_moe as forwarding
-
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    module = _megamoe_module()
     config = _megamoe_config(petit_kernel, profile, 4, 1024)
     adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
     b1, b2, b_combine = adapter.Kernels(True, False, False, True)
@@ -1176,12 +1113,8 @@ def test_stage1_n128_selector_by_received_experts(profile, expected) -> None:
     from the collective's row count; the row rule is off, a rank still takes
     N=128 only where its own count admits the 32-row tile; the warmup compiles
     the N=128 tile for every 32-row-tile count."""
-    import sys
-
     petit_kernel = _import_petit_kernel()
-    import lib.moe.rocm.mega_moe as forwarding
-
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    module = _megamoe_module()
     config = _megamoe_config(petit_kernel, profile, 4, 1024)
     with mock.patch.object(module, "kStage1N128ByExperts", False):
         assert config.stage1_n128_for_global_rows(6) is None
@@ -1303,12 +1236,7 @@ def selector_table():
     """Rows of (profile, layout, counts, estimate, collision-free, delivered
     per rank, old decision, new decision, right decision at the delivered
     counts). Print with ``python3 -c`` from the test directory."""
-    import sys
-
-    _import_petit_kernel()
-    import lib.moe.rocm.mega_moe as forwarding
-
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    module = _megamoe_module()
     shapes = {"dsv41_flash": (384, 6), "dsv41_flash_dspark": (128, 3)}
     tiles, ctas = 2560 // 256, 256
     rows = []
@@ -1362,38 +1290,14 @@ def test_apply_passes_call_wide_stage1_tile(selected, do_finalize) -> None:
     answer to the launch unchanged (None: selector off, row rule)."""
     from tokenspeed_kernel.ops.moe import gluon as petit
 
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=2,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
-    heap = SimpleNamespace(
-        tokens=torch.empty((4, 32), dtype=torch.uint8),
-        scales=torch.empty((4, 2), dtype=torch.uint8),
-        expert_ids=torch.empty((4, 2), dtype=torch.int32),
-        expert_weights=torch.empty((4, 2), dtype=torch.float32),
-    )
+    profile = _test_profile(num_experts=8, top_k=2)
+    heap = _test_inputs(top_k=2)
     config = mock.Mock()
     config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
     config.run_routes.side_effect = lambda *args, **kwargs: torch.empty(0)
     config.stage1_n128_for_global_rows.return_value = selected
     workspace = SimpleNamespace(config=config, heap=object(), inputs=heap)
-    layer = SimpleNamespace(
-        _moe_backend_state=_GluonPetitState(
-            profile=profile,
-            w13_weight=torch.empty(0),
-            w2_weight=torch.empty(0),
-            w13_scale=torch.empty(0),
-            w2_scale=torch.empty(0),
-            w13_bias=None,
-            w2_bias=None,
-        )
-    )
+    layer = SimpleNamespace(_moe_backend_state=_test_state(profile))
     x = torch.zeros((1, profile.model_dim), dtype=torch.bfloat16)
     with mock.patch(
         "tokenspeed_kernel.ops.moe.gluon._get_workspace", return_value=workspace
@@ -1462,13 +1366,10 @@ def test_fuse_post_combine_variant_and_apply_plumbing() -> None:
     """C3: the residual combine is its own kernel (the off path keeps the old
     cache keys); inside petit_combine_post the apply passes residual, ready
     and out to run(); outside it passes neither."""
-    import sys
-
-    petit_kernel = _import_petit_kernel()
-    import lib.moe.rocm.mega_moe as forwarding
     from tokenspeed_kernel.ops.moe import gluon as petit
 
-    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    petit_kernel = _import_petit_kernel()
+    module = _megamoe_module()
     config = _megamoe_config(petit_kernel, _DSV41_FLASH_PROFILE, 4, 1024)
     adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
     b1, b2, b_combine = adapter.Kernels(True, False, False, True)
@@ -1482,37 +1383,13 @@ def test_fuse_post_combine_variant_and_apply_plumbing() -> None:
     with pytest.raises(AssertionError):  # a residual needs reduced routes
         SourceRouteReducer(adapter.Config, 128, 512, False, True)
 
-    profile = _Profile(
-        name="test",
-        num_experts=8,
-        top_k=2,
-        model_dim=64,
-        logical_intermediate=32,
-        inter_dim=32,
-        has_bias=False,
-        activation="silu",
-    )
-    heap = SimpleNamespace(
-        tokens=torch.empty((4, 32), dtype=torch.uint8),
-        scales=torch.empty((4, 2), dtype=torch.uint8),
-        expert_ids=torch.empty((4, 2), dtype=torch.int32),
-        expert_weights=torch.empty((4, 2), dtype=torch.float32),
-    )
+    profile = _test_profile(num_experts=8, top_k=2)
+    heap = _test_inputs(top_k=2)
     run_config = mock.Mock()
     run_config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
     run_config.stage1_n128_for_global_rows.return_value = None
     workspace = SimpleNamespace(config=run_config, heap=object(), inputs=heap)
-    layer = SimpleNamespace(
-        _moe_backend_state=_GluonPetitState(
-            profile=profile,
-            w13_weight=torch.empty(0),
-            w2_weight=torch.empty(0),
-            w13_scale=torch.empty(0),
-            w2_scale=torch.empty(0),
-            w13_bias=None,
-            w2_bias=None,
-        )
-    )
+    layer = SimpleNamespace(_moe_backend_state=_test_state(profile))
     x = torch.zeros((1, profile.model_dim), dtype=torch.bfloat16)
 
     def apply():
