@@ -626,6 +626,8 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes(monkeypatch) ->
     )
     probe_pool = make_mha_pool_for_groups((group,), device="cpu")
     retained_view = probe_pool.get_key_buffer(0)
+    retained_shape = retained_view.shape
+    assert retained_view[0, 0, 0].item() == 0
     assert retained_view.untyped_storage().nbytes() > 0
 
     order = []
@@ -645,6 +647,10 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes(monkeypatch) ->
     def build_components(**kwargs):
         order.append(("build", kwargs))
         assert retained_view.untyped_storage().nbytes() == 0
+        assert retained_view.shape == retained_shape
+        # Scalar indexing checks the storage bounds before touching the data.
+        with pytest.raises(RuntimeError, match="out of bounds for storage of size 0"):
+            retained_view[0, 0, 0].item()
         return SimpleNamespace(
             token_to_kv_pool=make_mha_pool_for_groups((group,), device="cpu"),
             draft_token_to_kv_pool="draft",
