@@ -24,7 +24,7 @@
 //! * a request with `max_new_tokens = n` gets `n` one-token outputs, the
 //!   last finished with `"length"`;
 //! * a request without `max_new_tokens` gets one token and then runs until
-//!   it is aborted, which finishes it with `"abort"`.
+//!   it is aborted; `SilentScheduler` retires it without a terminal output.
 //!
 //! Generated token `k` of a request is `1000 * engine_index + k`, so tests
 //! can tell which engine served a request.
@@ -37,7 +37,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use ts_wire::{
     control::{FlushCacheReqOutput, IsSchedulerPausedReqOutput},
     decode_frames, encode_frames,
@@ -67,14 +70,56 @@ pub fn ipc_address(name: &str) -> String {
 pub struct FakeEngine {
     /// Every message the engine received on its input socket, in order.
     pub received: mpsc::UnboundedReceiver<EngineRequest>,
-    kill: mpsc::UnboundedSender<()>,
+    commands: mpsc::UnboundedSender<Command>,
     task: JoinHandle<()>,
 }
 
+enum Command {
+    Shutdown,
+    Output {
+        rid: String,
+        k: i64,
+        finish: Option<String>,
+        sent: oneshot::Sender<()>,
+    },
+    DisconnectInput(oneshot::Sender<()>),
+    PauseInput(bool, oneshot::Sender<()>),
+}
+
 impl FakeEngine {
+    /// Send another step, including a delayed output for an aborted request.
+    pub async fn output(&self, rid: &str, k: i64, finish: Option<&str>) {
+        let (sent, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Output {
+                rid: rid.to_owned(),
+                k,
+                finish: finish.map(str::to_owned),
+                sent,
+            })
+            .unwrap();
+        wait.await.unwrap();
+    }
+
+    /// Break only ingress, retaining the output connection for failure tests.
+    pub async fn disconnect_input(&self) {
+        let (done, wait) = oneshot::channel();
+        self.commands.send(Command::DisconnectInput(done)).unwrap();
+        wait.await.unwrap();
+    }
+
+    /// Stop reading input so a large real ZMQ send waits on backpressure.
+    pub async fn pause_input(&self, paused: bool) {
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::PauseInput(paused, done))
+            .unwrap();
+        wait.await.unwrap();
+    }
+
     /// Announce shutdown with the sentinel and stop serving.
     pub fn shut_down(&self) {
-        let _ = self.kill.send(());
+        let _ = self.commands.send(Command::Shutdown);
     }
 
     /// The next message the engine received.
@@ -113,6 +158,8 @@ pub fn start(handshake_address: &str, index: u16, dp_rank: i64, dp_size: i64) ->
 pub enum Role {
     /// A scheduler, which takes add, abort and control requests.
     Scheduler,
+    /// A scheduler that sends no terminal output for a client abort.
+    SilentScheduler,
     /// An EPD encode server, which takes encode requests only.
     Encoder,
 }
@@ -126,7 +173,7 @@ pub fn start_as(
     role: Role,
 ) -> FakeEngine {
     let (received_tx, received) = mpsc::unbounded_channel();
-    let (kill, kill_rx) = mpsc::unbounded_channel();
+    let (commands, commands_rx) = mpsc::unbounded_channel();
     let handshake_address = handshake_address.to_owned();
     let task = tokio::spawn(async move {
         run(
@@ -136,13 +183,13 @@ pub fn start_as(
             dp_size,
             role,
             received_tx,
-            kill_rx,
+            commands_rx,
         )
         .await;
     });
     FakeEngine {
         received,
-        kill,
+        commands,
         task,
     }
 }
@@ -154,7 +201,7 @@ async fn run(
     dp_size: i64,
     role: Role,
     received: mpsc::UnboundedSender<EngineRequest>,
-    mut kill: mpsc::UnboundedReceiver<()>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let mut handshake = DealerSocket::with_options(options(index));
     handshake.connect(&handshake_address).await.unwrap();
@@ -183,7 +230,7 @@ async fn run(
         ..Default::default()
     };
     match role {
-        Role::Scheduler => registration.declare_scheduler(),
+        Role::Scheduler | Role::SilentScheduler => registration.declare_scheduler(),
         Role::Encoder => registration.declare_encoder(),
     }
     input
@@ -194,12 +241,39 @@ async fn run(
     output.connect(&init.addresses.outputs[0]).await.unwrap();
 
     let mut running: HashSet<String> = HashSet::new();
+    let mut input = Some(input);
+    let mut input_paused = false;
     loop {
         let frames = tokio::select! {
-            message = input.recv() => message.unwrap().into_vec(),
-            _ = kill.recv() => {
-                output.send(single(EngineOutput::Dead.to_frames())).await.unwrap();
-                return;
+            message = async {
+                match &mut input {
+                    Some(input) if !input_paused => input.recv().await,
+                    _ => std::future::pending().await,
+                }
+            } => message.unwrap().into_vec(),
+            Some(command) = commands.recv() => {
+                match command {
+                    Command::Shutdown => {
+                        output.send(single(EngineOutput::Dead.to_frames())).await.unwrap();
+                        return;
+                    }
+                    Command::Output { rid, k, finish, sent } => {
+                        if finish.is_some() {
+                            running.remove(&rid);
+                        }
+                        output.send(single(step(index, &rid, k, finish.as_deref(), 3, &running, false))).await.unwrap();
+                        let _ = sent.send(());
+                    }
+                    Command::DisconnectInput(done) => {
+                        input.take();
+                        let _ = done.send(());
+                    }
+                    Command::PauseInput(paused, done) => {
+                        input_paused = paused;
+                        let _ = done.send(());
+                    }
+                }
+                continue;
             }
         };
         let request = EngineRequest::from_frames(&frames).unwrap();
@@ -231,7 +305,7 @@ async fn run(
             }
             EngineRequest::Abort(rids) => {
                 for rid in rids {
-                    if running.remove(&rid) {
+                    if running.remove(&rid) && role != Role::SilentScheduler {
                         let batch = step(index, &rid, 2, Some("abort"), 0, &running, false);
                         output.send(single(batch)).await.unwrap();
                     }

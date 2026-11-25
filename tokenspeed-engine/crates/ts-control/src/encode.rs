@@ -270,7 +270,6 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         }
     }
 
-    /// This rank has work in flight.
     fn record_snapshot(&mut self) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -297,6 +296,7 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         metrics.snapshot(state.0, state.1, state.2, oldest);
     }
 
+    /// This rank has work in flight.
     fn busy(&self) -> bool {
         !self.requests.is_empty() || self.encoding > 0 || !self.leased.is_empty()
     }
