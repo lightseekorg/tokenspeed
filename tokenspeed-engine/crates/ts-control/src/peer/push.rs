@@ -313,7 +313,6 @@ impl Slots {
         self.returned.notify_one();
     }
 
-    #[cfg(test)]
     fn free_count(&self) -> usize {
         self.free.lock().len()
     }
@@ -545,6 +544,12 @@ impl Holder {
                     };
                     let started = Instant::now();
                     let deadline = queued.arrived + queued.budget;
+                    // Isolate a per-job panic so a fixed-size worker pool is never
+                    // permanently drained by an unexpected fault in a single push
+                    // (e.g. an external writer/FFI panic). During unwind, `SlotGuard`
+                    // intentionally leaks any staging slot with in-flight NVMe DMA
+                    // rather than reusing it, while `JobGuard` still fails the job
+                    // back to the reader.
                     let ok = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         state.run(
                             &queued.session,
@@ -558,6 +563,7 @@ impl Holder {
                             tracing::error!(
                                 job = queued.guard.key.job,
                                 worker = index,
+                                free_slots = state.slots.free_count(),
                                 "peer push worker caught panic; failing job without retiring worker"
                             );
                             false
@@ -1619,16 +1625,13 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
 
         struct PanicNWriter {
-            remaining_panics: AtomicUsize,
+            remaining_panics: std::sync::atomic::AtomicIsize,
             ok_writes: AtomicUsize,
         }
         impl PageWriter for PanicNWriter {
             fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
-                if self
-                    .remaining_panics
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+                // Signed, so the countdown may run past zero without wrapping.
+                if self.remaining_panics.fetch_sub(1, Ordering::SeqCst) > 0 {
                     panic!("simulated writer panic");
                 }
                 self.ok_writes.fetch_add(1, Ordering::SeqCst);
@@ -1637,7 +1640,7 @@ mod tests {
         }
 
         let writer = Arc::new(PanicNWriter {
-            remaining_panics: AtomicUsize::new(MAX_PUSH_WORKERS),
+            remaining_panics: std::sync::atomic::AtomicIsize::new(MAX_PUSH_WORKERS as isize),
             ok_writes: AtomicUsize::new(0),
         });
         let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 11).unwrap();
