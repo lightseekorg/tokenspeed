@@ -571,6 +571,16 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
+Checkpoint positions and scan indices are planned on the host. Each metadata
+preparation packs its related tensors into one pinned upload without
+synchronizing the model stream. Checkpoint writers reuse the uploaded row
+and offset views. These mirrors stay live-sized; only the token and block
+slots consumed by captured
+state writers keep the fixed capacity shape. Retained device views belong to
+the existing `attention_state` region and follow its `weights` release/resume
+lifecycle. Each upload has fresh host staging storage so overlapping forwards
+cannot overwrite metadata whose transfer is still in flight.
+
 For PD landing into a partial history block, follow the
 [block-table export contract](#block-tables-and-exported-page-ids) above.
 
