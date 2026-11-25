@@ -38,6 +38,10 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+def is_npu_build() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 # List of packages to check versions
 PACKAGE_LIST = [
     "tokenspeed",
@@ -140,6 +144,10 @@ def get_cuda_info() -> dict[str, object]:
             cuda_info.update(_get_cuda_version_info())
 
         return cuda_info
+    elif is_npu_build():
+        npu_info = {"NPU available": True}
+        npu_info.update(_get_npu_info())
+        return npu_info
     return {}
 
 
@@ -166,6 +174,17 @@ def _get_gpu_info() -> dict[str, str]:
             gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
 
     return gpu_info
+
+
+def _get_npu_info() -> dict[str, str]:
+    """Get information about available NPUs."""
+    devices = defaultdict(list)
+    for device_index in range(torch.npu.device_count()):
+        devices[torch.npu.get_device_name(device_index)].append(str(device_index))
+    npu_info = {}
+    for name, device_ids in devices.items():
+        npu_info[f"NPU {','.join(device_ids)}"] = name
+    return npu_info
 
 
 def _get_cuda_version_info() -> dict[str, str | None]:
@@ -341,6 +360,9 @@ def main() -> None:
 
     ulimit_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     env_info["ulimit soft"] = ulimit_soft
+
+    memlock_soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    env_info["ulimit -l (soft)"] = memlock_soft
 
     for k, v in env_info.items():
         print(f"{k}: {v}")
