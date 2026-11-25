@@ -265,7 +265,7 @@ class MoELayer(torch.nn.Module):
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
-        if self._quant_kind == "fp8":
+        if self._quant_kind in ("fp8", "w8a16_fp8_block"):
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
             # The loader slices each rank's block scales at ceil(ispp / block)
             # rows, which follow its weight rows only for a block-aligned
@@ -709,6 +709,13 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
+        if self._quant_kind == "w8a16_fp8_block":
+            from tokenspeed.runtime.layers.quantization.w8a16_fp8_block import (
+                validate_w8a16_weights,
+            )
+
+            validate_w8a16_weights(module.w13_weight, module.w13_weight_scale_inv)
+            validate_w8a16_weights(module.w2_weight, module.w2_weight_scale_inv)
         prepared = kernel_moe_process_weights(
             self.plan, module, communication_initializer=initialize_communication
         )

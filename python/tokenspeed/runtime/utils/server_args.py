@@ -3600,6 +3600,7 @@ class ServerArgs:
                 "mxfp4",
                 "nvfp4",
                 "w8a8_fp8",
+                "w8a16_fp8_block",
                 "compressed-tensors",
             ],
             help="The quantization method.",
