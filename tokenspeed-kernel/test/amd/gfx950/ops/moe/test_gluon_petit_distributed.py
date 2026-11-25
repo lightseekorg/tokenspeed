@@ -381,21 +381,38 @@ def _reference(x, ids, weights, profile):
 
 
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+# The raised capacity each world size serves DSv4.1 Flash with: EP4's
+# 4096-token chunks, and EP8's 2560 (a 512-multiple below its 2624-row limit).
+_RAISED_CAPACITY = {4: 4096, 8: 2560}.get(_WORLD_SIZE, 4096)
+# Rows of a 50,000-token prompt's last prefill chunk at each capacity
+# (848 at 1024 and 4096 rows, 1360 at 2560).
+_PROMPT_TOKENS = 50_000
+
+
+def _skip_above_profile_capacity(profile_name: str, capacity: int) -> None:
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    profile = next(p for p in petit._PROFILES if p.name == profile_name)
+    largest = petit._profile_largest_max_tokens_per_rank(profile, _WORLD_SIZE)
+    if capacity > largest:
+        pytest.skip(
+            f"{profile_name} admits at most {largest} rows per rank at "
+            f"EP{_WORLD_SIZE}"
+        )
 
 
 @pytest.mark.skipif(
     _WORLD_SIZE not in (4, 8) or not is_cdna4(),
     reason="requires torchrun with four or eight gfx950 GPUs",
 )
-@pytest.mark.parametrize("capacity", (1024, 4096))
+@pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize("profile_name", tuple(_PROFILES))
 def test_distributed_petit_reference(profile_name, capacity):
     profile = _PROFILES[profile_name]
     if _WORLD_SIZE not in profile.world_sizes:
         sizes = "/".join(map(str, profile.world_sizes))
         pytest.skip(f"{profile_name} is registered for EP{sizes} only")
-    if capacity != 1024 and _WORLD_SIZE != 4:
-        pytest.skip("Petit admits a per-rank capacity above 1024 rows at EP4 only")
+    _skip_above_profile_capacity(profile_name, capacity)
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
         assert (
@@ -437,8 +454,8 @@ def test_distributed_petit_reference(profile_name, capacity):
         if capacity == 1024
         else (
             # A raised capacity still serves small and uneven calls.
-            ("uneven", [0, 1, 12, 24]),
-            # Every rank above the old 1024-row cap at once (EP4 2048-row chunks).
+            ("uneven", ([0, 1, 12, 24] * 2)[:ws]),
+            # Every rank above the old 1024-row cap at once (2048-row chunks).
             ("above_1024", [2048] * ws),
             # Every rank at the raised capacity fills each destination's pool.
             ("full", [capacity] * ws),
@@ -526,10 +543,10 @@ _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
 
 
 @pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
-@pytest.mark.parametrize("capacity", (1024, 4096))
+@pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_startup_warmup_compiles_every_variant(
     profile_name, capacity
@@ -538,8 +555,9 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
 
     The warmup call compiles (without launching) every kernel variant a rank
     can launch at this capacity; afterwards Triton's in-process cache must
-    hit for every count, including the 848-row tail of a 50,000-token prompt
-    that once compiled for 27-28 s inside a serving step.
+    hit for every count, including the last chunk of a 50,000-token prompt
+    (848 rows at EP4, 1360 at EP8's 2560-row chunks; the 848-row tail once
+    compiled for 27-28 s inside a serving step).
     """
     import triton
     from tokenspeed_kernel.ops.moe import gluon as petit
@@ -593,10 +611,19 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
         run([16] * ws)
     counts = workspace.config.variant_token_counts()
     expected = {
-        "dsv41_flash": (0, 1, 2, 480, 481, 512, 513, 1008, 1009),
-        "dsv41_flash_dspark": (0, 1, 2, 12, 16, 24, 32, 352, 353, 704, 705),
+        4: {
+            "dsv41_flash": (0, 1, 2, 480, 481, 512, 513, 1008, 1009),
+            "dsv41_flash_dspark": (0, 1, 2, 12, 16, 24, 32, 352, 353, 704, 705),
+        },
+        # EP8: the target takes the 8-warp 64-row tile from 256 rows, the
+        # draft from 1024 (whose plain class 1025 only a raised capacity has).
+        8: {
+            "dsv41_flash": (0, 1, 2, 256, 257, 512, 513),
+            "dsv41_flash_dspark": (0, 1, 2, 12, 16, 24, 32, 256, 257, 1024)
+            + ((1025,) if capacity > 1024 else ()),
+        },
     }
-    assert counts == expected[profile_name]
+    assert counts == expected[ws][profile_name]
 
     compiled = []
     previous = triton.knobs.runtime.jit_cache_hook
@@ -610,12 +637,15 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
 
     triton.knobs.runtime.jit_cache_hook = cache_hook
     try:
-        for count in sorted({*counts, 848, 849, 1023, 1024, capacity - 1, capacity}):
+        tail = _PROMPT_TOKENS % capacity
+        for count in sorted(
+            {*counts, 848, 849, 1023, 1024, tail, capacity - 1, capacity}
+        ):
             for do_finalize in (True, False):
                 run([count] * ws, do_finalize)
         # Uneven ranks, as data-parallel attention produces them.
-        run([848, 0, 1, capacity])
-        run([3, 848, 1009, 0], do_finalize=False)
+        run(([848, 0, 1, capacity] + [tail, 16, 0, 1])[:ws])
+        run(([3, 848, 1009, 0] + [257, 0, 24, 2])[:ws], do_finalize=False)
     finally:
         triton.knobs.runtime.jit_cache_hook = previous
     assert not compiled, f"rank {rank} compiled Petit kernels in serving: {compiled}"

@@ -92,6 +92,33 @@ def test_ep4_dsv41_variant_counts(experts, top_k, expected, capacity) -> None:
     assert _config(4, experts, top_k, capacity).variant_token_counts() == expected
 
 
+@pytest.mark.parametrize(
+    "experts,top_k,capacity,expected",
+    [
+        # Target: m64/w8 from 256 rows at EP8 (cta192 below 512).
+        (384, 6, 1024, (0, 1, 2, 256, 257, 512, 513)),
+        (384, 6, 2560, (0, 1, 2, 256, 257, 512, 513)),
+        # Draft: m64/w4 at 256-1023, m64/w8 from 1024; its plain class 1025
+        # needs a capacity above 1024.
+        (128, 3, 1024, (0, 1, 2, 12, 16, 24, 32, 256, 257, 1024)),
+        (128, 3, 2560, (0, 1, 2, 12, 16, 24, 32, 256, 257, 1024, 1025)),
+    ],
+)
+def test_ep8_dsv41_variant_counts(experts, top_k, capacity, expected) -> None:
+    assert _config(8, experts, top_k, capacity).variant_token_counts() == expected
+
+
+@pytest.mark.parametrize("experts,top_k", [(384, 6), (128, 3)])
+def test_ep8_prefill_tail_variant_is_compiled(experts, top_k) -> None:
+    # A 50,000-token prompt in 2,560-token chunks leaves a 1,360-row tail.
+    config = _config(8, experts, top_k, 2560)
+    assert 50_000 % 2560 == 1360
+    assert config.variant_key(1360) == ("cta56", "m64_w8", "div16")
+    assert config.variant_key(1360) in {
+        config.variant_key(n) for n in config.variant_token_counts()
+    }
+
+
 def test_prefill_tail_variant_is_compiled() -> None:
     # A 50,000-token prompt leaves an 848-row prefill tail at 1,024, 2,048 and
     # 4,096-token chunks; its m64/w4 stage-1 variant compiled for 27-28 s
