@@ -708,8 +708,8 @@ def test_startup_refuses_a_state_consumer_that_cannot_store_the_checkpoint(
         )
 
 
-def _checkpointing_state_backend(spec_tokens):
-    """The shared recurrent-state backend on CPU slabs, planning checkpoints.
+def _checkpointing_state_backend(spec_tokens, *, device):
+    """The shared recurrent-state backend planning checkpoints on small slabs.
 
     Building metadata launches no kernel, so the backend only declares the
     checkpointing scan (GDN's FlashInfer prefill) this host may lack.
@@ -723,12 +723,18 @@ def _checkpointing_state_backend(spec_tokens):
 
     backend = CheckpointingStateBackend(
         *_mamba_config_pair(
-            torch, heads=2, head_dim=2, spec_tokens=spec_tokens, max_bs=4
+            torch, heads=2, head_dim=2, spec_tokens=spec_tokens, max_bs=4, device=device
         )
     )
     backend.set_kv_pool(
         _ContractPool(
-            {0: ("linear_attention", torch.zeros(10, 12, 3), torch.zeros(10, 2, 2, 2))}
+            {
+                0: (
+                    "linear_attention",
+                    torch.zeros(10, 12, 3, device=device),
+                    torch.zeros(10, 2, 2, 2, device=device),
+                )
+            }
         )
     )
     backend.init_cuda_graph_state(max_bs=4)
@@ -743,7 +749,7 @@ def test_a_mixed_forward_with_verify_rows_gives_its_extend_rows_their_checkpoint
     # prompt -- the checkpoints being the second and the third.
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    backend = _checkpointing_state_backend(spec_tokens=3)
+    backend = _checkpointing_state_backend(spec_tokens=3, device="cpu")
     _init_mixed_round(backend, ForwardMode.EXTEND, 2, checkpoints=True, device="cpu")
     extend = backend.forward_metadata
     _init_mixed_round(backend, ForwardMode.MIXED, 4, checkpoints=True, device="cpu")
@@ -782,9 +788,38 @@ def test_a_mixed_forward_without_drafts_plans_its_checkpoints_over_every_row():
     # extend rows, so the plan counts every row; the decode rows store none.
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    backend = _checkpointing_state_backend(spec_tokens=1)
+    backend = _checkpointing_state_backend(spec_tokens=1, device="cpu")
     _init_mixed_round(backend, ForwardMode.MIXED, 4, checkpoints=True, device="cpu")
     assert backend._mixed_forward_metadata is None
     metadata = backend.forward_metadata
     assert metadata.scan_state_checkpoints.cu_starts.tolist() == [0, 2, 3, 3, 3]
     assert metadata.scan_checkpoint_rows.tolist() == [1, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_scan_checkpoint_metadata_upload_does_not_synchronize():
+    from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+        in_forward_state_checkpoints,
+    )
+
+    backend = _checkpointing_state_backend(spec_tokens=1, device="cuda")
+    lengths = torch.tensor([144, 100], dtype=torch.int32)
+    checkpoints = in_forward_state_checkpoints(
+        torch.tensor([128, 64], dtype=torch.int32),
+        lengths,
+        2,
+        {
+            "linear_attention": torch.tensor(
+                [[0, 1, 2]] * 2, dtype=torch.int32, device="cuda"
+            )
+        },
+        ("linear_attention",),
+    )
+    backend._scan_state_checkpoints(checkpoints, lengths)
+    torch.cuda.synchronize()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        backend._scan_state_checkpoints(checkpoints, lengths)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
