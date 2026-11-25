@@ -788,6 +788,8 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
         # The pool is one fresh allocation, and its row stride is a multiple of
         # 16 bytes.
         rows_aligned=True,
+        request_mask=None,
+        selected_requests=None,
     )
     final = (base + chain).long()
     torch.testing.assert_close(replayed[final], ssm[final], rtol=1e-4, atol=1e-5)

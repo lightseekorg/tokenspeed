@@ -2042,6 +2042,16 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        self.attn_backend.prepare_pending_recurrent_state(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            self.runtime_states.valid_cache_lengths,
+            allow_defer=(
+                ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+                and ctx.output_layout.decode_width == 4
+            ),
+        )
+
         # KV offloading uses scheduler request slots to bind hot partitions;
         # ordinary backends keep their existing path through a no-op hook.
         self.attn_backend.prepare_cache_batch(

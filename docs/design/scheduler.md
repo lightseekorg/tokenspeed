@@ -2398,3 +2398,25 @@ retirement, then for any outstanding local forward. Repeated cancellation
 cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.
+
+## Deferred recurrent state
+
+With deferred recurrent replay enabled, ordinary decode completion advances
+the token frontier as usual. The GPU owns the replay record. The runtime
+uses the request slots already carried by snapshot operations and tracks the
+last decode slot for request releases and scheduler aborts. It materializes
+replay for an ending request because its State may already be in the prefix
+index, including when retraction published a checkpoint before finding that
+its image could not fit.
+
+The scheduler releases slots and blocks by the ordinary request state
+transitions. The runtime orders replay writeback before the plan's snapshot,
+store, copy, zero, load and forward operations consume or reuse them. Host
+retirement fences also cover releases queued by the preceding round's
+results, even when no subsequent forward runs.
+
+The peer holder declines new Device page PINs until retirement fences have
+completed on the replica, since the source execution stream cannot order an
+incoming RDMA read. The reader can use local compute. PINs for prefixes held
+entirely in Host or Disk and existing leases continue independently. The same
+completion tracking protects cache clear and drain.

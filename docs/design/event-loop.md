@@ -1572,3 +1572,12 @@ disabled metrics and prefill output do not create an observation.
 Admission failures prepare their final output before logging completion, as the
 other terminal paths do. Preparing that output consumes a sampled TTFT trace;
 completion logging therefore emits no second breakdown for the same request.
+
+## Recurrent-state materialization feedback
+
+The data plane retires replay for snapshot and abort slots before running
+the corresponding plan. Releases use the same forward queue and retire any
+remaining replay ahead of later plans. The control plane tracks retirement
+fences separately from scheduler cache operations. Peer export, cache clear
+and drain wait for replica completion, including releases queued after the
+last forward's results.

@@ -24,22 +24,31 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from tokenspeed_kernel.ops.attention.gdn import (
+    GdnPendingReplay,
     gdn_chunk_prefill_capturable,
     gdn_chunk_prefill_stores_state_checkpoints,
     gdn_decode_supports,
+    gdn_pending_replay_supported,
     gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
+from tokenspeed_kernel.ops.conv.replay import BankedConvReplayPayload
 
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
     CapacityPrefillBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 
 if TYPE_CHECKING:
-    import torch
-
+    from tokenspeed.runtime.layers.attention.backends.state.gdn_pending import (
+        GdnPendingState,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        MambaForwardMetadata,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -75,6 +84,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         spec: SoftmaxAttnConfig,
         *,
         writes_state_checkpoints_in_forward: bool,
+        defer_recurrent_state: bool,
     ) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
@@ -94,6 +104,11 @@ class GdnAttnBackend(CapacityPrefillBackend):
         )
         self._writes_state_checkpoints_in_forward = writes_state_checkpoints_in_forward
 
+        self._defer_recurrent_state = defer_recurrent_state
+        self._pending_state: GdnPendingState | None = None
+        self._pending_slot_count = RequestSlotLayout(
+            config.max_resident_requests
+        ).capacity
         self._head_k_dim = linear_attn.head_k_dim
         self._head_v_dim = linear_attn.head_v_dim
         # Resolved when a pool binds: the pool's prefix granularity spaces the
@@ -106,6 +121,9 @@ class GdnAttnBackend(CapacityPrefillBackend):
         self._decode_packed_qkv_views = False
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        if self._pending_state is not None:
+            self._pending_state.materialize(None)
+            self._pending_state = None
         super()._publish_cache_pool(cache_pool)
         # In-forward checkpoints sit at prefix-page multiples of a chunk start,
         # so the scan must store at that granularity.
@@ -193,3 +211,132 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # FlashInfer's kernel needs; skipped where the selected kernel reads the
         # views by stride. A chain verify's conv update writes dense rows instead.
         return pack_gdn_projection(mixed_qkv, a, b)
+
+    def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
+        super()._ensure_verify_scratch(bs, draft_token_num)
+        replay = self._gdn_replay
+        if (
+            not self._defer_recurrent_state
+            or replay is None
+            or self.draft_tree
+            or self.is_draft
+            or draft_token_num != 4
+            or not gdn_pending_replay_supported(
+                self.dtype, geometry=replay.geometry, state_dtype=replay.state_dtype
+            )
+        ):
+            return
+        if self._pending_state is not None:
+            if self._pending_state.capacity < bs:
+                raise RuntimeError(
+                    "deferred GDN workspace must be sized before capture"
+                )
+            return
+        from tokenspeed.runtime.layers.attention.backends.state.gdn_pending import (
+            GdnPendingState,
+        )
+
+        tables = self._verify_copy_tables_get()
+        self._pending_state = GdnPendingState(
+            replay.payload,
+            replay.parameters,
+            slot_count=self._pending_slot_count,
+            geometry=replay.geometry,
+            state_addresses=tables["ssm_comp"],
+            state_row_strides=tables["ssm_element_stride"],
+            rows_aligned=tables["ssm_rows_aligned"],
+            group_indices=tables["group_sel"],
+        )
+        replay.payload = self._pending_state.payload[0]
+        self._pending_state.warmup()
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        size = super().preallocate_verify_workspace(max_bs, draft_token_num)
+        if self._pending_state is not None:
+            size += self._pending_state.nbytes - self._gdn_replay.payload.nbytes
+        return size
+
+    def _deferred_verify_metadata(
+        self, *, allow_defer: bool
+    ) -> MambaForwardMetadata | None:
+        metadata = self.forward_metadata
+        if (
+            allow_defer
+            and metadata is not None
+            and metadata.mamba_output_indices is not None
+        ):
+            return metadata
+        return None
+
+    def prepare_pending_recurrent_state(
+        self, slots: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        pending = self._pending_state
+        if pending is None:
+            return
+        metadata = self._deferred_verify_metadata(allow_defer=allow_defer)
+        reads = None
+        if metadata is not None:
+            reads = torch.stack(
+                [
+                    metadata.state_in_blocks_by_group[group][: slots.numel()]
+                    for group in self._state_groups()
+                ]
+            )
+        pending.prepare(slots, frontier, enabled=metadata is not None, reads=reads)
+
+    def prepare_recurrent_state_acceptance(
+        self, stopped: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        pending = self._pending_state
+        if pending is not None:
+            # Target preparation is captured, while acceptance can run outside
+            # the graph. Refresh its host choice after an eager prefill/mixed
+            # forward, which may have disabled deferral since capture.
+            pending.enabled = (
+                self._deferred_verify_metadata(allow_defer=allow_defer) is not None
+            )
+            if pending.enabled:
+                pending.prepare_acceptance(stopped, frontier)
+
+    def materialize_recurrent_state(self, slots: torch.Tensor | None) -> None:
+        if self._pending_state is not None:
+            self._pending_state.materialize(slots)
+
+    def discard_recurrent_state(self, slots: torch.Tensor) -> None:
+        if self._pending_state is not None:
+            self._pending_state.discard(slots)
+
+    def _replay_inputs(self, layer_id, seq_len, a, b, *, A_log, dt_bias):
+        payload, av, bv = super()._replay_inputs(
+            layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
+        )
+        pending = self._pending_state
+        if pending is not None and pending.enabled:
+            return BankedConvReplayPayload(
+                payload, av, bv, pending.bank, pending.payload.stride(0)
+            )
+        return payload, av, bv
+
+    def _pending_replay_descriptor(
+        self, layer_id: int, batch: int
+    ) -> GdnPendingReplay | None:
+        pending = self._pending_state
+        if pending is not None and pending.enabled:
+            return pending.descriptor(self._gdn_replay.layer_ids.index(layer_id), batch)
+        return None
+
+    def _replay_commit(self, payload, parameters, **tables) -> None:
+        pending = self._pending_state
+        if pending is not None and pending.enabled:
+            pending.accept(
+                tables["accepted_length"],
+                read_indices=tables["read_indices"],
+                write_indices=tables["write_indices"],
+            )
+        else:
+            super()._replay_commit(payload, parameters, **tables)
+
+    def slot_state_exporters(self):
+        owners = super().slot_state_exporters()
+        return owners if self._pending_state is None else (*owners, self._pending_state)
