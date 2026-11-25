@@ -82,7 +82,8 @@ class TokenSpeedA2ALamportState:
             raise ValueError(
                 "Requires TP2/4/8, positive capacity, and two-BF16-aligned shards"
             )
-        if 3 * max_rows * channels // 2 > 2**31 - 1:
+        self.words = max_rows * channels // 2
+        if 3 * self.words + 2 * self.tp_size > 2**31 - 1:
             raise ValueError("A2A workspace exceeds 32-bit indexing")
         if (
             not 1
@@ -95,7 +96,6 @@ class TokenSpeedA2ALamportState:
         self.max_rows = max_rows
         self.channels = channels
         self.blocks = blocks
-        self.words = max_rows * channels // 2
         self.chunk_threshold_bytes = None
         self.chunk_scratch = self.chunk_peers = None
         self.chunk_flags = self.chunk_flag_peers = None
@@ -104,7 +104,7 @@ class TokenSpeedA2ALamportState:
         self.chunk_capacity = self.words // 2
         with torch.inference_mode(False):
             self.scratch = empty_owned_symmetric(
-                (3 * self.words,), dtype=torch.int64, device=device
+                (3 * self.words + 2 * self.tp_size,), dtype=torch.int64, device=device
             )
         self.scratch.zero_()
         self.handle = symm.rendezvous(self.scratch, group=group)
@@ -118,12 +118,12 @@ class TokenSpeedA2ALamportState:
             dtype=torch.int64,
             device=device,
         )
-        self.control = torch.tensor([1, 0], dtype=torch.int32, device=device)
+        self.control = torch.tensor([1, 0, 0, 0], dtype=torch.int32, device=device)
         self.output = torch.empty(
             max_rows * channels, dtype=torch.bfloat16, device=device
         )
         self.module = build_cuda_module(
-            "tokenspeed_lamport_a2a_v2",
+            "tokenspeed_lamport_a2a_v3",
             [Path(__file__).with_name("lamport_a2a.cu")],
         )
         torch.cuda.synchronize(device)
@@ -213,14 +213,51 @@ class TokenSpeedA2ALamportState:
             dtype=torch.int64,
             device=device,
         )
-        self.chunk_control = torch.tensor([1, 0], dtype=torch.int32, device=device)
+        self.chunk_control = torch.tensor([1, 0], dtype=torch.int64, device=device)
         self.chunk_module = build_cuda_module(
-            "tokenspeed_chunk_a2a_v2",
+            "tokenspeed_chunk_a2a_v3",
             [Path(__file__).with_name("chunk_a2a.cu")],
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=self.group)
         self.chunk_threshold_bytes = threshold_bytes
+
+
+def _state_buffers(state):
+    return (
+        state.output,
+        state.scratch,
+        state.control,
+        state.peers,
+        state.chunk_scratch,
+        state.chunk_flags,
+        state.chunk_control,
+        state.chunk_peers,
+        state.chunk_flag_peers,
+        state.fp8_output,
+        state.fp8_scales,
+    )
+
+
+def _tensor_range(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr()
+    return tensor.device, start, start + storage.nbytes()
+
+
+def _ranges_overlap(
+    tensor: torch.Tensor, buffers: tuple[torch.Tensor | None, ...]
+) -> bool:
+    device, start, end = _tensor_range(tensor)
+    if start == end:
+        return False
+    for buf in buffers:
+        if buf is None:
+            continue
+        bdev, bstart, bend = _tensor_range(buf)
+        if bdev == device and bstart < bend and start < bend and bstart < end:
+            return True
+    return False
 
 
 @register_kernel(
@@ -245,17 +282,9 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
     """
     if inputs.ndim != 2:
         raise ValueError("A2A input must be a matrix")
-    if inputs.untyped_storage().data_ptr() in (
-        state.output.untyped_storage().data_ptr(),
-        state.scratch.untyped_storage().data_ptr(),
-    ):
-        raise ValueError("Input must not alias A2A output or communication scratch")
-    if (
-        state.chunk_scratch is not None
-        and inputs.untyped_storage().data_ptr()
-        == state.chunk_scratch.untyped_storage().data_ptr()
-    ):
-        raise ValueError("Input must not alias chunk communication scratch")
+    buffers = _state_buffers(state)
+    if _ranges_overlap(inputs, buffers):
+        raise ValueError("Input must not alias A2A state storage")
     size = state.tp_size
     rows = inputs.shape[0] // size if inverse else inputs.shape[0]
     shape = (size * rows, state.channels // size) if inverse else (rows, state.channels)
@@ -290,22 +319,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
             )
         # A separate destination preserves ownership across subsequent calls.
         # Reject shared storage conservatively, including protocol metadata.
-        output_storage = out.untyped_storage().data_ptr()
-        if any(
-            buffer is not None and output_storage == buffer.untyped_storage().data_ptr()
-            for buffer in (
-                inputs,
-                state.output,
-                state.scratch,
-                state.control,
-                state.peers,
-                state.chunk_scratch,
-                state.chunk_flags,
-                state.chunk_control,
-                state.chunk_peers,
-                state.chunk_flag_peers,
-            )
-        ):
+        if _ranges_overlap(out, (inputs, *buffers)):
             raise ValueError("Output must not alias A2A inputs or state storage")
         output = out
     if (
@@ -318,6 +332,8 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
             output,
             state.chunk_peers,
             state.chunk_control,
+            state.chunk_scratch,
+            state.chunk_flags,
             state.chunk_capacity,
             rows,
             state.channels,
@@ -331,6 +347,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
         output,
         state.peers,
         state.control,
+        state.scratch,
         state.words,
         rows,
         state.channels,
@@ -372,23 +389,7 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
         or inputs.data_ptr() % 16
     ):
         raise ValueError("Invalid fused A2A quantization input or unprepared state")
-    storage = inputs.untyped_storage().data_ptr()
-    if any(
-        buffer is not None and storage == buffer.untyped_storage().data_ptr()
-        for buffer in (
-            state.output,
-            state.scratch,
-            state.control,
-            state.peers,
-            state.chunk_scratch,
-            state.chunk_flags,
-            state.chunk_control,
-            state.chunk_peers,
-            state.chunk_flag_peers,
-            state.fp8_output,
-            state.fp8_scales,
-        )
-    ):
+    if _ranges_overlap(inputs, _state_buffers(state)):
         raise ValueError("Fused A2A input must not alias state storage")
     rows = inputs.shape[0]
     padded_rows = (state.tp_size * rows + 3) // 4 * 4
@@ -406,6 +407,8 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
             scales,
             state.chunk_peers,
             state.chunk_control,
+            state.chunk_scratch,
+            state.chunk_flags,
             state.chunk_capacity,
             rows,
             state.channels,
@@ -419,6 +422,7 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
             scales,
             state.peers,
             state.control,
+            state.scratch,
             state.words,
             rows,
             state.channels,
@@ -467,25 +471,9 @@ def tokenspeed_a2a_lamport_fp8(state, inputs, input_scales, rows):
         or not input_scales.is_contiguous()
     ):
         raise ValueError("Prequantized A2A requires FP8 row inputs and per-128 scales")
-    for tensor in (inputs, input_scales):
-        storage = tensor.untyped_storage().data_ptr()
-        if any(
-            buffer is not None and storage == buffer.untyped_storage().data_ptr()
-            for buffer in (
-                state.output,
-                state.scratch,
-                state.control,
-                state.peers,
-                state.chunk_scratch,
-                state.chunk_flags,
-                state.chunk_control,
-                state.chunk_peers,
-                state.chunk_flag_peers,
-                state.fp8_output,
-                state.fp8_scales,
-            )
-        ):
-            raise ValueError("Prequantized A2A inputs must not alias state storage")
+    buffers = _state_buffers(state)
+    if any(_ranges_overlap(t, buffers) for t in (inputs, input_scales)):
+        raise ValueError("Prequantized A2A inputs must not alias state storage")
     # Values and scales together need less space than the BF16 output. Views
     # share the existing lifetime without adding another persistent allocation.
     count = rows * state.channels
@@ -507,6 +495,7 @@ def tokenspeed_a2a_lamport_fp8(state, inputs, input_scales, rows):
         scales,
         state.peers,
         state.control,
+        state.scratch,
         state.words,
         rows,
         state.channels,
