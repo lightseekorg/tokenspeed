@@ -484,6 +484,7 @@ def _super_cache_recipe(
             speculative_eagle_topk=topk,
             speculative_draft_tree=with_draft and topk > 1,
             enable_replay_ssm=with_draft,
+            enable_deferred_gdn_state=False,
             kv_offload_config=None,
             mamba_ssm_dtype="float32",
         ),

@@ -1589,6 +1589,7 @@ def test_flashinfer_mtp_reads_conv_rows_and_projection_gates(
             output_state_indices=write_rows if scatter else None,
             tree_ancestors=None,
             solution="flashinfer",
+            pending_replay=None,
         )
         return out, state
 
@@ -2619,6 +2620,7 @@ def test_gdn_decode_page_strided_state(device: str, state_dtype, mode, require):
             ),
             disable_state_update=mode == "readonly_tree",
             tree_ancestors=ancestors,
+            pending_replay=None,
             **common,
         )
 
@@ -2800,6 +2802,7 @@ def test_gdn_mtp_state_offsets_beyond_int32(
                 if mode in ("tree", "readonly_tree")
                 else None
             ),
+            pending_replay=None,
             **common,
         )
 
@@ -2843,7 +2846,11 @@ def test_gdn_default_selection_updates_page_strided_state(
         initial_state_indices=torch.tensor([1, 3], device=device, dtype=torch.int32),
     )
     function = gdn_decode_step if steps == 1 else gdn_decode_mtp
-    kwargs = {} if steps == 1 else dict(disable_state_update=False, tree_ancestors=None)
+    kwargs = (
+        {}
+        if steps == 1
+        else dict(disable_state_update=False, tree_ancestors=None, pending_replay=None)
+    )
     expected_state = pool.clone()
     expected = function(
         q, k, v, initial_state=expected_state, solution="triton", **common, **kwargs
@@ -2904,7 +2911,11 @@ def test_gdn_registered_kernels_preserve_page_strided_state(
     )
     kwargs = {}
     if mode != "step":
-        kwargs = dict(disable_state_update=mode == "readonly", tree_ancestors=None)
+        kwargs = dict(
+            disable_state_update=mode == "readonly",
+            tree_ancestors=None,
+            pending_replay=None,
+        )
         if mode == "scatter":
             kwargs["output_state_indices"] = torch.arange(
                 5, 5 + 2 * steps, device=device, dtype=torch.int32
