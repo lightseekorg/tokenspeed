@@ -24,9 +24,15 @@ Import-level checks (no kernel runs): the switch defaults off, and only with
 it on does a Petit layer fork its shared expert onto the auxiliary stream.
 """
 
+import logging
+
 import pytest
 
-from tokenspeed.runtime.models.deepseek_v41_moe import shared_expert_stream
+from tokenspeed.runtime.models.deepseek_v41_moe import (
+    log_shared_expert_stream,
+    shared_expert_stream,
+    shared_expert_stream_label,
+)
 from tokenspeed.runtime.utils.env import envs
 
 _SWITCH = "TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM"
@@ -58,3 +64,58 @@ def test_switch_on_forks_petit_shared_expert(monkeypatch, value) -> None:
     # Other backends are unaffected by the switch.
     assert shared_expert_stream(aux, use_gluon_petit=False) is aux
     assert shared_expert_stream(None, use_gluon_petit=True) is None
+
+
+@pytest.mark.parametrize(
+    "value,use_gluon_petit,has_aux,label",
+    [
+        ("1", True, True, "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"),
+        ("0", True, True, "main (Gluon Petit default)"),
+        ("0", False, True, "aux (backend default)"),
+        ("1", True, False, "main (no aux stream)"),
+    ],
+)
+def test_shared_expert_stream_label(
+    monkeypatch, value, use_gluon_petit, has_aux, label
+) -> None:
+    monkeypatch.setenv(_SWITCH, value)
+    aux = object() if has_aux else None
+    assert shared_expert_stream_label(aux, use_gluon_petit=use_gluon_petit) == label
+
+
+@pytest.mark.parametrize(
+    "value,stream", [("1", "aux"), ("0", "main")], ids=["aux", "main"]
+)
+def test_layer_zero_logs_the_shared_expert_stream(
+    monkeypatch, caplog, value, stream
+) -> None:
+    monkeypatch.setenv(_SWITCH, value)
+    caplog.set_level(logging.INFO, logger="tokenspeed.runtime.models.deepseek_v41_moe")
+    for layer_index in range(3):
+        log_shared_expert_stream(
+            layer_index,
+            1,
+            object(),
+            use_gluon_petit=True,
+            prefix=f"model.layers.{layer_index}.mlp",
+            moe_backend="gluon_petit",
+        )
+    # No shared expert, nothing to log.
+    log_shared_expert_stream(
+        0,
+        0,
+        object(),
+        use_gluon_petit=True,
+        prefix="model.layers.0.mlp",
+        moe_backend="gluon_petit",
+    )
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        f"DeepSeek V4 MoE shared expert stream: {stream} ("
+        + (
+            "TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM"
+            if stream == "aux"
+            else "Gluon Petit default"
+        )
+        + ") prefix=model.layers.0.mlp moe_backend=gluon_petit"
+    ]

@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import functools
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -47,6 +49,8 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+
+logger = logging.getLogger(__name__)
 
 platform = current_platform()
 
@@ -3523,6 +3527,16 @@ def _get_workspace(
     inputs = config.input_views(heap, max_tokens_per_rank)
     workspace = _Workspace(config=config, heap=heap, inputs=inputs)
     _workspace_cache[key] = workspace
+    reserved, physical = config.heap_bytes()
+    logger.info(
+        "Gluon Petit workspace: profile=%s world_size=%d max_tokens_per_rank=%d "
+        "heap_reserved_bytes=%d heap_physical_bytes=%d",
+        profile.name,
+        world_size,
+        max_tokens_per_rank,
+        reserved,
+        physical,
+    )
     return workspace
 
 
@@ -3545,7 +3559,8 @@ def _compile_variants(
     key = _workspace_key(device, state.profile, state.max_tokens_per_rank)
     if key in _compiled_variant_keys:
         return
-    workspace.config.compile_variants(
+    start = time.perf_counter()
+    counts = workspace.config.compile_variants(
         workspace.heap,
         state.w13_weight,
         state.w2_weight,
@@ -3556,6 +3571,17 @@ def _compile_variants(
         inputs=workspace.inputs,
     )
     _compiled_variant_keys.add(key)
+    counts = tuple(counts)
+    logger.info(
+        "Gluon Petit startup compile: profile=%s world_size=%d "
+        "max_tokens_per_rank=%d variants=%d counts=%s seconds=%.1f",
+        state.profile.name,
+        workspace.config.world_size,
+        state.max_tokens_per_rank,
+        len(counts),
+        "[" + ",".join(map(str, counts)) + "]",
+        time.perf_counter() - start,
+    )
 
 
 def _slice_inputs(inputs: Any, num_tokens: int) -> Any:

@@ -208,6 +208,39 @@ def shared_expert_stream(
     return aux_stream
 
 
+def shared_expert_stream_label(
+    aux_stream: object | None, *, use_gluon_petit: bool
+) -> str:
+    """Name the stream ``shared_expert_stream`` picks, and why, for the log."""
+    if shared_expert_stream(aux_stream, use_gluon_petit=use_gluon_petit) is None:
+        if aux_stream is None:
+            return "main (no aux stream)"
+        return "main (Gluon Petit default)"
+    if use_gluon_petit:
+        return "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"
+    return "aux (backend default)"
+
+
+def log_shared_expert_stream(
+    layer_index: int,
+    n_shared_experts: int,
+    aux_stream: object | None,
+    *,
+    use_gluon_petit: bool,
+    prefix: str,
+    moe_backend: str,
+) -> None:
+    """Log, once per model (layer 0), which stream the shared expert runs on."""
+    if layer_index != 0 or not n_shared_experts:
+        return
+    logger.info(
+        "DeepSeek V4 MoE shared expert stream: %s prefix=%s moe_backend=%s",
+        shared_expert_stream_label(aux_stream, use_gluon_petit=use_gluon_petit),
+        prefix,
+        moe_backend,
+    )
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -235,6 +268,14 @@ class DeepseekV4MoE(nn.Module):
         self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
         self.stream_fork = StreamFork(
             shared_expert_stream(aux_stream, use_gluon_petit=self.use_gluon_petit)
+        )
+        log_shared_expert_stream(
+            layer_index,
+            self.n_shared_experts,
+            aux_stream,
+            use_gluon_petit=self.use_gluon_petit,
+            prefix=prefix,
+            moe_backend=getattr(moe_backend, "value", moe_backend),
         )
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):

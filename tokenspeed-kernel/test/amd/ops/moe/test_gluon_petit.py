@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging
+import re
 from functools import partial
 from types import SimpleNamespace
 from unittest import mock
@@ -32,6 +34,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
     _MUSE_SPARK_PROFILE,
+    _compile_variants,
     _compiled_variant_keys,
     _get_workspace,
     _GluonPetitState,
@@ -40,6 +43,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _Profile,
     _profile_largest_max_tokens_per_rank,
     _validate_layer,
+    _workspace_cache,
     gluon_petit_largest_max_tokens_per_rank,
     gluon_petit_max_tokens_per_rank,
     gluon_petit_mxfp4_megamoe_apply,
@@ -87,9 +91,12 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
-    with mock.patch(
-        "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
-    ), pytest.raises(NoKernelFoundError):
+    with (
+        mock.patch(
+            "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
+        ),
+        pytest.raises(NoKernelFoundError),
+    ):
         moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
@@ -500,8 +507,9 @@ def test_apply_compiles_every_variant_once_under_startup_warmup(
         expert_ids=torch.empty((4, 1), dtype=torch.int32),
         expert_weights=torch.empty((4, 1), dtype=torch.float32),
     )
-    config = mock.Mock()
+    config = mock.Mock(world_size=8)
     config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
+    config.compile_variants.return_value = (0, 1)
     heap = object()
     workspace = SimpleNamespace(config=config, heap=heap, inputs=inputs)
     state = _GluonPetitState(
@@ -769,3 +777,72 @@ def test_raised_capacity_is_carried_into_state_and_apply() -> None:
                 overlap_fn=None,
                 **kwargs,
             )
+
+
+def test_workspace_logs_profile_capacity_and_heap(caplog) -> None:
+    petit_kernel = _import_petit_kernel()
+    heap = object()
+    inputs = object()
+    caplog.set_level(logging.INFO, logger="tokenspeed_kernel.ops.moe.gluon")
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size", return_value=8
+        ),
+        mock.patch.object(
+            petit_kernel, "create_vmm_symmetric_heap", return_value=heap
+        ) as create_heap,
+        mock.patch.object(
+            petit_kernel.MegaMoeConfig, "input_views", return_value=inputs
+        ),
+    ):
+        try:
+            for _ in range(2):
+                workspace = _get_workspace(
+                    torch.device("cuda", 0), _DSV41_FLASH_PROFILE, 2560
+                )
+        finally:
+            _workspace_cache.clear()
+    create_heap.assert_called_once_with(8)
+    assert workspace.heap is heap and workspace.inputs is inputs
+    reserved, physical = workspace.config.heap_bytes()
+    assert reserved < 1 << 32
+    # One line per workspace, not per layer.
+    assert [r.getMessage() for r in caplog.records] == [
+        "Gluon Petit workspace: profile=dsv41_flash world_size=8 "
+        f"max_tokens_per_rank=2560 heap_reserved_bytes={reserved} "
+        f"heap_physical_bytes={physical}"
+    ]
+
+
+def test_startup_compile_logs_profile_capacity_and_counts(caplog) -> None:
+    config = mock.Mock(world_size=8)
+    config.compile_variants.return_value = (0, 1, 2, 256, 257, 512, 513)
+    workspace = SimpleNamespace(config=config, heap=object(), inputs=object())
+    state = _GluonPetitState(
+        profile=_DSV41_FLASH_PROFILE,
+        w13_weight=torch.empty(0),
+        w2_weight=torch.empty(0),
+        w13_scale=torch.empty(0),
+        w2_scale=torch.empty(0),
+        w13_bias=None,
+        w2_bias=None,
+        max_tokens_per_rank=2560,
+    )
+    caplog.set_level(logging.INFO, logger="tokenspeed_kernel.ops.moe.gluon")
+    _compiled_variant_keys.clear()
+    try:
+        for _ in range(2):
+            _compile_variants(torch.device("cuda", 0), state, workspace)
+    finally:
+        _compiled_variant_keys.clear()
+    config.compile_variants.assert_called_once()
+    (message,) = [r.getMessage() for r in caplog.records]
+    assert re.fullmatch(
+        r"Gluon Petit startup compile: profile=dsv41_flash world_size=8 "
+        r"max_tokens_per_rank=2560 variants=7 counts=\[0,1,2,256,257,512,513\] "
+        r"seconds=\d+\.\d",
+        message,
+    ), message
