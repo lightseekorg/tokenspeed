@@ -758,7 +758,7 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
         cuda_lamport_a2a,
     )
 
-    assert world_size == 4
+    assert world_size in (2, 4, 8)
     torch.manual_seed(1103 + rank)
     blocks = min(128, torch.cuda.get_device_properties(device).multi_processor_count)
 
@@ -787,10 +787,11 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
     # Zero threshold disables chunk exchange. Reuse one state while crossing
     # packet/paired-packet/chunk boundaries, including exactly 4 and 8 MiB.
     cases = [
-        (channels, [1, 3, 32, 64, 128], 0) for channels in (8, 40, 12288, 16384)
+        (channels, [1, 3, 32, 64, 128], 0)
+        for channels in (2 * world_size, 10 * world_size, 12288, 16384)
     ] + [
         (2048, [1, 1023, 1024, 2048, 2049, 1], 0),
-        (32, [1, 3, 128, 512, 1, 512, 3], 4096),
+        (8 * world_size, [1, 3, 128, 512, 1, 512, 3], 4096),
         (12288, [1, 3, 128, 512, 1, 512, 3], 8 * 2**20),
         (2048, [1, 1023, 1024, 2048, 2049, 2048, 1], 8 * 2**20 + 1),
     ]
@@ -841,20 +842,78 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
                     check_bits(snapshot, expected)
                 del graph, snapshots, sources, references
 
-        # Exercise unsigned generation IDs across the signed-int32 boundary.
-        torch.cuda.synchronize(device)
-        dist.barrier(group=ref_group)
-        state.control[0] = 2**31 - 2
-        if state.chunk_control is not None:
-            state.chunk_control[0] = 2**31 - 2
-        for rows in (row_counts[0], max(row_counts)):
-            x = torch.randn((rows, channels), dtype=torch.bfloat16, device=device)
-            expected = reference(x, False)
-            for _ in range(5):
-                check_bits(cuda_lamport_a2a(state, x, False), expected)
         torch.cuda.synchronize(device)
         dist.barrier(group=ref_group)
         del call, state
+
+    # The first three large calls populate each ring, including the tails
+    # that a single-row exchange never touches. Reuse the state for two resets.
+    for grid in (1, torch.cuda.get_device_properties(device).multi_processor_count):
+        state = CudaLamportA2AState(ref_group, 32, 128, device, grid)
+        x = torch.empty((32, 128), dtype=torch.bfloat16, device=device)
+        for generation in (1, 2):
+            for _ in range(3):
+                x.view(torch.int16).random_(-32768, 32768)
+                x.view(torch.int16)[:, :2] = torch.tensor(
+                    [-32768, 32705], device=device
+                )
+                check_bits(cuda_lamport_a2a(state, x, False), reference(x, False))
+            state.control[0] = -2
+            for _ in range(2):
+                check_bits(
+                    cuda_lamport_a2a(state, x[:1], False), reference(x[:1], False)
+                )
+            assert state.control.tolist() == [1, 0, 0, generation]
+            assert state.scratch[: 3 * state.words].count_nonzero().item() == 0
+            x.view(torch.int16).random_(-32768, 32768)
+            expected = reference(x, False)
+            if rank == 1:
+                torch.cuda._sleep(50000)
+            check_bits(cuda_lamport_a2a(state, x, False), expected)
+        torch.cuda.synchronize()
+        dist.barrier(group=ref_group)
+        del state
+
+    # Capture a single call so each replay checks one side of the boundary.
+    for rows, chunk in ((1, False), (1024, False), (1024, True)):
+        state = CudaLamportA2AState(ref_group, rows, 2048, device, blocks)
+        if chunk:
+            state.prepare_chunk_exchange(1)
+        x = torch.zeros(rows, 2048, dtype=torch.bfloat16, device=device)
+        cuda_lamport_a2a(state, x, False)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = cuda_lamport_a2a(state, x, False)
+        state.control[0] = -2
+        if chunk:
+            state.chunk_control[0] = 2**32 - 2
+        for _ in range(5):
+            x.view(torch.int16).random_(-32768, 32768)
+            expected = reference(x, False)
+            graph.replay()
+            check_bits(actual, expected)
+        if chunk:
+            assert state.chunk_control.tolist() == [2**32 + 3, 0]
+            flags = state.chunk_flags.view(3, world_size, blocks)
+            assert (flags[(2**32 + 2) % 3] == 2**32 + 2).all().item()
+        else:
+            assert state.control.tolist() == [4, 0, 0, 1]
+        bits = 64 if chunk else 32
+        control = state.chunk_control if chunk else state.control
+        sign_bit = 1 << (bits - 1)
+        control[0] = sign_bit - 2
+        for _ in range(4):
+            x.view(torch.int16).random_(-32768, 32768)
+            expected = reference(x, False)
+            graph.replay()
+            check_bits(actual, expected)
+        assert control[0].item() & ((1 << bits) - 1) == sign_bit + 2
+        if chunk:
+            assert (flags[(sign_bit + 1) % 3] == 1 - sign_bit).all().item()
+        graph.reset()
+        torch.cuda.synchronize()
+        dist.barrier(group=ref_group)
+        del state
 
 
 def _test_reduce_scatter(rank, world_size, device, group, ref_group):
@@ -1121,13 +1180,15 @@ class TestCommOps:
         [
             pytest.param(2, "runtime", id="ws2-runtime"),
             pytest.param(4, "runtime", id="ws4-runtime"),
+            pytest.param(2, "cuda_lamport", id="ws2-cuda-lamport"),
+            pytest.param(8, "cuda_lamport", id="ws8-cuda-lamport"),
             pytest.param(4, "cuda_lamport", id="ws4-cuda-lamport"),
         ],
     )
     def test_all_to_all_single(self, world_size, backend):
         if backend == "cuda_lamport":
             if torch.version.hip is not None or torch.cuda.device_count() < world_size:
-                pytest.skip("Custom A2A requires four NVIDIA GPUs")
+                pytest.skip("Custom A2A requires enough NVIDIA GPUs")
             if importlib.util.find_spec("flashinfer") is None:
                 pytest.skip(
                     "Custom A2A requires the optional FlashInfer JIT dependency"

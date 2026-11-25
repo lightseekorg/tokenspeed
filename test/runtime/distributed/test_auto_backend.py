@@ -34,6 +34,20 @@ needs_iris = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(("channels", "rows"), [(0, 1), (-8, 1), (8, 178956970)])
+def test_lamport_preparation_bounds(monkeypatch, channels, rows):
+    from tokenspeed.runtime.distributed.comm_backend import auto
+
+    monkeypatch.setattr(
+        auto, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
+    )
+    backend = AutoBackend()
+    assert (
+        backend.prepare_shard_exchange((0, 1, 2, 3), channels, rows, torch.bfloat16)
+        is False
+    )
+
+
 def test_runtime_import_without_iris():
     result = subprocess.run(
         [

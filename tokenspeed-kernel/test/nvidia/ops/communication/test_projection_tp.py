@@ -20,6 +20,7 @@
 
 """Projection exchange correctness for TP2/4/8 at KDA channel widths."""
 
+import ctypes
 from datetime import timedelta
 
 import pytest
@@ -82,7 +83,7 @@ def _check_a2a(rank, device, size):
     state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
     # Small packets, the paired-packet launch, chunk exchange, then back to
     # packets. Odd M also exercises TP2's prepared-FP8 row padding.
-    for rows in (1, 128, 257, 1):
+    for step, rows in enumerate((1, 128, 257, 1)):
         inputs = torch.empty(rows, KDA_WIDTH, dtype=torch.bfloat16, device=device)
         gathered = torch.empty(
             size * rows, KDA_WIDTH, dtype=inputs.dtype, device=device
@@ -124,7 +125,13 @@ def _check_a2a(rank, device, size):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = tokenspeed_a2a_lamport_fp8_quantize(state, inputs)
-        for capture in (False, True):
+        # Advance only the active counter and only once. Rewinding a chunk
+        # counter onto flags already published by earlier calls creates ABA.
+        if step == 0:
+            state.control[0] = -2
+        elif rows == 257:
+            state.chunk_control[0] = 2**32 - 2
+        for capture in (False, True, True, True):
             inputs.mul_(0.75).add_((rank + 1) * 0.03125)
             inputs[:, :128] = 0
             dist.all_gather_into_tensor(gathered, inputs)
@@ -149,6 +156,199 @@ def _check_a2a(rank, device, size):
     torch.cuda.synchronize(device)
     dist.barrier()
     del state
+    _check_epoch_boundaries(rank, device, size)
+
+
+def _check_epoch_boundaries(rank, device, size):
+    rows = 128  # At KDA width the full input exercises the 4 MiB paired launch.
+    state = TokenSpeedA2ALamportState(dist.group.WORLD, rows, KDA_WIDTH, device, 8)
+    full = torch.empty(rows, KDA_WIDTH, dtype=torch.bfloat16, device=device)
+    output = torch.empty_like(full).view(size * rows, -1)
+
+    def verify(x, call, skew=False):
+        x.view(torch.int16).random_(-32768, 32768)
+        gathered = x.new_empty((size * len(x), KDA_WIDTH))
+        dist.all_gather_into_tensor(gathered, x)
+        if skew and rank == 1:
+            torch.cuda._sleep(50000)
+        result = call()
+        expected = gathered.chunk(size, dim=1)[rank]
+        assert torch.equal(result.view(torch.int16), expected.view(torch.int16))
+
+    def exchange():
+        return tokenspeed_a2a_lamport(state, full, False, out=output)
+
+    for _ in range(3):
+        verify(full, exchange)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        small = tokenspeed_a2a_lamport(state, full[:1], False, out=None)
+
+    def replay():
+        graph.replay()
+        return small
+
+    state.control[0] = -1
+    verify(full[:1], replay)
+    assert state.control.tolist() == [1, 0, 0, 1]
+    assert state.scratch[: 3 * state.words].count_nonzero().item() == 0
+    verify(full, exchange, skew=True)
+    state.control[0] = -1
+    verify(full, exchange)
+    assert state.control.tolist() == [1, 0, 0, 2]
+    state.control[0] = 2**31 - 2
+    for _ in range(4):
+        verify(full[:1], replay)
+    assert state.control[0].item() == 2 - 2**31
+    graph.reset()
+
+    state.prepare_chunk_exchange(1)
+    flags = state.chunk_flags.view(3, size, state.blocks)
+    for seed, count in ((2**32 - 2, 5), (2**63 - 2, 4)):
+        state.chunk_control[0] = seed
+        for _ in range(count):
+            verify(full, exchange)
+        last = seed + count - 1
+        signed = last if last < 2**63 else last - 2**64
+        assert state.chunk_control.tolist() == [signed + 1, 0]
+        assert (flags[last % 3] == signed).all().item()
+
+    if rank == 0:
+        packet = (output, state.peers, state.control, state.scratch)
+        args = (rows, KDA_WIDTH, rank, state.blocks, False)
+        with pytest.raises(RuntimeError, match="numel"):
+            state.module.exchange(full, *packet, state.words + 1, *args)
+        misaligned = full.new_empty(full.numel() + 1)[1:].view_as(full)
+        with pytest.raises(RuntimeError, match="alignment"):
+            state.module.exchange(misaligned, *packet, state.words, *args)
+        chunk = (
+            output,
+            state.chunk_peers,
+            state.chunk_control,
+            state.chunk_scratch,
+            state.chunk_flags,
+            state.chunk_capacity,
+            rows,
+            KDA_WIDTH,
+            rank,
+        )
+        with pytest.raises(RuntimeError, match="numel"):
+            state.chunk_module.exchange_chunk(
+                state.chunk_flag_peers, full, *chunk, state.blocks + 1, False
+            )
+        with pytest.raises(RuntimeError, match="alignment"):
+            state.chunk_module.exchange_chunk(
+                state.chunk_flag_peers, misaligned, *chunk, state.blocks, False
+            )
+        with pytest.raises(RuntimeError, match="numel"):
+            state.module.exchange(
+                full[:1],
+                output[:size],
+                *packet[1:],
+                state.words - 1,
+                1,
+                KDA_WIDTH,
+                rank,
+                state.blocks,
+                False,
+            )
+        with pytest.raises(RuntimeError, match="numel"):
+            state.chunk_module.exchange_chunk(
+                state.chunk_flag_peers,
+                full[:1],
+                output[:size],
+                *chunk[1:5],
+                state.chunk_capacity - 2,
+                1,
+                KDA_WIDTH,
+                rank,
+                state.blocks,
+                False,
+            )
+        with pytest.raises(RuntimeError, match="numel"):
+            state.chunk_module.exchange_chunk(
+                state.chunk_flag_peers, full, *chunk, state.blocks - 1, False
+            )
+
+    _check_dlpack_offset(state, full[:1], rank, size)
+    if size in (2, 4):
+        narrow = TokenSpeedA2ALamportState(dist.group.WORLD, 1, 8, device, 1)
+        with pytest.raises(ValueError, match="alias"):
+            tokenspeed_a2a_lamport(
+                narrow, narrow.control.view(torch.bfloat16).view(1, 8), False, out=None
+            )
+        view = narrow.scratch[narrow.words : narrow.words + 2]
+        alias = torch.from_dlpack(torch.utils.dlpack.to_dlpack(view))
+        assert (
+            alias.untyped_storage().data_ptr()
+            != narrow.scratch.untyped_storage().data_ptr()
+        )
+        alias = alias.view(torch.bfloat16).view(1, 8)
+        with pytest.raises(ValueError, match="alias"):
+            tokenspeed_a2a_lamport(narrow, alias, False, out=None)
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+
+def _check_dlpack_offset(state, inputs, rank, size):
+    from flashinfer.comm.dlpack_utils import DLTensor
+    from tvm_ffi import from_dlpack
+
+    # Torch normally folds a slice's offset into data. Export the same view
+    # with a separate DLPack byte_offset to exercise native address arithmetic.
+    def output_view(storage, offset):
+        view = storage[offset : offset + inputs.numel()].view(size, -1)
+        capsule = torch.utils.dlpack.to_dlpack(view)
+        get_pointer = ctypes.PYFUNCTYPE(
+            ctypes.POINTER(DLTensor), ctypes.py_object, ctypes.c_char_p
+        )(("PyCapsule_GetPointer", ctypes.pythonapi))
+        tensor = get_pointer(capsule, b"dltensor").contents
+        tensor.data = storage.data_ptr()
+        tensor.byte_offset = offset * storage.element_size()
+        return from_dlpack(capsule)
+
+    inputs.fill_(rank + 1)
+    for chunk in (False, True):
+        storage = inputs.new_full((8 + inputs.numel(),), -1)
+
+        def exchange(out):
+            if chunk:
+                state.chunk_module.exchange_chunk(
+                    state.chunk_flag_peers,
+                    inputs,
+                    out,
+                    state.chunk_peers,
+                    state.chunk_control,
+                    state.chunk_scratch,
+                    state.chunk_flags,
+                    state.chunk_capacity,
+                    1,
+                    state.channels,
+                    rank,
+                    state.blocks,
+                    False,
+                )
+            else:
+                state.module.exchange(
+                    inputs,
+                    out,
+                    state.peers,
+                    state.control,
+                    state.scratch,
+                    state.words,
+                    1,
+                    state.channels,
+                    rank,
+                    state.blocks,
+                    False,
+                )
+
+        with pytest.raises(RuntimeError, match="alignment"):
+            exchange(output_view(storage, 1))
+        exchange(output_view(storage, 8))
+        assert (storage[:8] == -1).all().item()
+        for peer, row in enumerate(storage[8:].view(size, -1)):
+            assert (row == peer + 1).all().item()
 
 
 def _check_prequantized_a2a(state, rank, device, size):
@@ -174,7 +374,8 @@ def _check_prequantized_a2a(state, rank, device, size):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = exchange()
-        for capture in (False, True, True):
+        state.control[0] = -2
+        for capture in (True, True, False):
             # Preserve arbitrary payloads, including signed zero and NaNs in
             # either format; compare integer views instead of float values.
             values.view(torch.uint8).random_(0, 256)

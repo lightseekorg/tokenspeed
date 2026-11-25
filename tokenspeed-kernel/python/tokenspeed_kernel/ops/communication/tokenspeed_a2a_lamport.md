@@ -18,8 +18,11 @@ cross-GPU barrier kernel; waiting still happens inside the packet-polling loop.
 
 Three scratch generations prevent a fast sender from overwriting a slow
 receiver. Finishing an exchange requires data from every peer, so a sender
-cannot advance three exchanges ahead of a reader. A local CTA-entry counter
-ensures every CTA reads the current generation before it advances. The grid
+cannot advance three exchanges ahead of a reader. After each CTA broadcasts the current
+generation, its last thread increments the entry counter. On the normal path,
+thread `blockDim.x - 1` of CTA `gridDim.x - 1` waits for all entry arrivals and
+advances the epoch. At epoch `0xFFFFFFFF`, CTA 0 drains all CTAs, runs the
+two-phase peer barrier around a full-ring clear, and resets the epoch to 1. The grid
 must not exceed the SM count. The kernel pipelines multiple independent
 packet reads for larger messages; one read per thread avoids that overhead
 for small ones.
@@ -52,9 +55,12 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   while queued work or graphs reference them; synchronize every rank before
   releasing the state.
 - Eager and CUDA Graph execution use the same kernel and GPU-owned generation.
-  Recreate the communicator before `2^32` calls: generation overflow traps
-  rather than risking acceptance of stale packets. There is no recovery from
-  a missing peer; collective participation is mandatory.
+  After epoch `0xFFFFFFFF`, every CTA reports completion of its payload reads.
+  Block zero waits for the local CTAs, synchronizes with its peers, clears all
+  three local rings across the prepared capacity, and synchronizes with its
+  peers again before publishing epoch one. Two flags per peer distinguish
+  successive resets. Chunk exchange uses a separate 64-bit epoch. Every rank
+  must participate in each call.
 - Packet storage is twice the payload size; three generations cost `6*S`
   scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
   also increases link traffic. This is a **low-latency**, not a large-message
@@ -190,3 +196,6 @@ maximum rank time, and reports the median of five samples. The timing includes
 output restoration. The benchmark is communication-only: it does not establish a
 projection or model speedup. AG/RS are latency references, not interchangeable
 A2A algorithms; compare their message-size definitions explicitly.
+
+Lamport collective launches require full-grid co-residency (`blocks <= sm_count`).
+Concurrent blocking kernels must not pin SMs on the same device during the exchange.
