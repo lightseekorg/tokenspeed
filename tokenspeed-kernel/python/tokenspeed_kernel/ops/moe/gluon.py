@@ -3058,9 +3058,6 @@ if platform.is_amd:
 # this capacity is the one Petit has always built.
 _MAX_TOKENS_PER_RANK = 1024
 _SORTED_TOKEN_BLOCK = 32
-# World sizes whose capacity may rise above the default, up to what keeps the
-# symmetric heap below 32-bit offsets. EP8 stays at the default.
-_RAISED_CAPACITY_WORLD_SIZES = frozenset({4})
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
 _GPT_OSS_SWIGLU_BETA = 1.0
@@ -3084,6 +3081,10 @@ class _Profile:
     has_bias: bool
     activation: str
     world_sizes: frozenset[int] = frozenset({8})
+    # World sizes at which this profile's capacity may rise above the default
+    # 1024 rows, up to what keeps its symmetric heap below 32-bit offsets.
+    # Every other world size keeps the default.
+    raised_capacity_world_sizes: frozenset[int] = frozenset()
 
 
 _GPT_OSS_120B_PROFILE = _Profile(
@@ -3126,6 +3127,7 @@ _DSV41_FLASH_PROFILE = _Profile(
     has_bias=False,
     activation="silu_clamped",
     world_sizes=frozenset({4, 8}),
+    raised_capacity_world_sizes=frozenset({4, 8}),
 )
 _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     name="dsv41_flash_dspark",
@@ -3137,6 +3139,7 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     has_bias=False,
     activation="silu_clamped",
     world_sizes=frozenset({4, 8}),
+    raised_capacity_world_sizes=frozenset({4, 8}),
 )
 _MUSE_SPARK_PROFILE = _Profile(
     name="muse_spark",
@@ -3201,48 +3204,79 @@ def _megamoe_config(
     )
 
 
+def _raises_capacity(profile: _Profile, world_size: int) -> bool:
+    return world_size in profile.world_sizes and (
+        world_size in profile.raised_capacity_world_sizes
+    )
+
+
+@functools.cache
+def _profile_largest_max_tokens_per_rank(profile: _Profile, world_size: int) -> int:
+    """Return the largest capacity ``profile``'s heap admits at ``world_size``.
+
+    The largest 32-row multiple, at most Petit's largest encodable capacity,
+    whose symmetric heap stays below 32-bit offsets; 1024 rows when the
+    profile does not raise its capacity at ``world_size``.
+    """
+    world_size = int(world_size)
+    if not _raises_capacity(profile, world_size):
+        return _MAX_TOKENS_PER_RANK
+    petit_kernel = _import_petit_kernel()
+
+    def fits(rows: int) -> bool:
+        try:
+            _megamoe_config(petit_kernel, profile, world_size, rows)
+        except ValueError:
+            return False
+        return True
+
+    low, high = (
+        _MAX_TOKENS_PER_RANK,
+        petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK,
+    )
+    if fits(high):
+        return high
+    # Invariant: low fits, high does not; both are 32-row multiples.
+    while high - low > _SORTED_TOKEN_BLOCK:
+        middle = (low + high) // 2 // _SORTED_TOKEN_BLOCK * _SORTED_TOKEN_BLOCK
+        low, high = (middle, high) if fits(middle) else (low, middle)
+    return low
+
+
 @functools.cache
 def gluon_petit_largest_max_tokens_per_rank(world_size: int) -> int:
     """Return the largest per-rank token capacity Petit admits at ``world_size``.
 
-    EP8 (and any world size Petit does not serve, which MoELayer refuses)
-    keeps the default 1024 rows. A world size in
-    ``_RAISED_CAPACITY_WORLD_SIZES`` admits the largest 32-row multiple whose
-    symmetric heap stays below 32-bit offsets for every profile registered at
-    that world size (the DSv4.1 Flash target and DSpark draft at EP4).
+    The minimum, over the profiles whose capacity rises at ``world_size``
+    (``_Profile.raised_capacity_world_sizes``: the DSv4.1 Flash target and
+    DSpark draft at EP4 and EP8), of the largest 32-row multiple whose
+    symmetric heap stays below 32-bit offsets: 7808 rows at EP4 and 2624 at
+    EP8, both set by the DSv4.1 Flash target. A world size at which no profile
+    raises (and any world size Petit does not serve, which MoELayer refuses)
+    keeps the default 1024 rows; so do the other profiles at EP8, which
+    ``gluon_petit_max_tokens_per_rank`` enforces when given the profile.
     """
     world_size = int(world_size)
-    if world_size not in _RAISED_CAPACITY_WORLD_SIZES:
-        return _MAX_TOKENS_PER_RANK
-    petit_kernel = _import_petit_kernel()
-    largest = petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK
-    for profile in _PROFILES:
-        if world_size not in profile.world_sizes:
-            continue
-
-        def fits(rows: int) -> bool:
-            try:
-                _megamoe_config(petit_kernel, profile, world_size, rows)
-            except ValueError:
-                return False
-            return True
-
-        low, high = _MAX_TOKENS_PER_RANK, largest
-        if not fits(high):
-            # Invariant: low fits, high does not; both are 32-row multiples.
-            while high - low > _SORTED_TOKEN_BLOCK:
-                middle = (low + high) // 2 // _SORTED_TOKEN_BLOCK * _SORTED_TOKEN_BLOCK
-                low, high = (middle, high) if fits(middle) else (low, middle)
-            largest = low
-    return largest
+    largest = [
+        _profile_largest_max_tokens_per_rank(profile, world_size)
+        for profile in _PROFILES
+        if _raises_capacity(profile, world_size)
+    ]
+    return min(largest) if largest else _MAX_TOKENS_PER_RANK
 
 
-def gluon_petit_max_tokens_per_rank(world_size: int, rows_per_rank: int) -> int:
+def gluon_petit_max_tokens_per_rank(
+    world_size: int, rows_per_rank: int, profile: _Profile | None = None
+) -> int:
     """Size Petit's per-rank capacity for a server's largest per-rank batch.
 
     Args:
         world_size: Petit (MoE EP) world size.
         rows_per_rank: Largest number of tokens one rank sends in one call.
+        profile: The model profile the capacity is for, when known (the
+            workspace passes it). A profile that does not raise its capacity
+            at ``world_size`` admits only the default 1024 rows; without a
+            profile the limit is ``gluon_petit_largest_max_tokens_per_rank``.
 
     Returns:
         ``rows_per_rank`` rounded up to the 32-row sorted-token block, at least
@@ -3250,23 +3284,34 @@ def gluon_petit_max_tokens_per_rank(world_size: int, rows_per_rank: int) -> int:
 
     Raises:
         ValueError: if the capacity exceeds the largest one admitted at
-            ``world_size`` (its heap would exceed 32-bit offsets, or EP8).
+            ``world_size`` (its heap would exceed 32-bit offsets, or the
+            profile keeps the default capacity there).
     """
+    world_size = int(world_size)
     rows_per_rank = int(rows_per_rank)
     capacity = max(
         _MAX_TOKENS_PER_RANK,
         -(-rows_per_rank // _SORTED_TOKEN_BLOCK) * _SORTED_TOKEN_BLOCK,
     )
-    largest = gluon_petit_largest_max_tokens_per_rank(world_size)
+    if profile is None:
+        largest = gluon_petit_largest_max_tokens_per_rank(world_size)
+        raised = largest > _MAX_TOKENS_PER_RANK
+        subject = ""
+    else:
+        largest = _profile_largest_max_tokens_per_rank(profile, world_size)
+        raised = _raises_capacity(profile, world_size)
+        subject = f" for {profile.name}"
     if capacity > largest:
         raise ValueError(
             f"Gluon Petit MegaMoE supports at most {largest} tokens per rank at "
-            f"world size {world_size}; got {rows_per_rank}"
+            f"world size {world_size}{subject}; got {rows_per_rank}"
             + (
                 " (a larger capacity would exceed the symmetric heap's "
                 "32-bit offsets)"
-                if world_size in _RAISED_CAPACITY_WORLD_SIZES
-                else f" (EP{world_size} keeps the default capacity)"
+                if raised
+                else f" (EP{world_size} keeps the default capacity"
+                + (f" for {profile.name}" if profile is not None else "")
+                + ")"
             )
         )
     return capacity
@@ -3465,7 +3510,7 @@ def _get_workspace(
         )
 
     if max_tokens_per_rank != gluon_petit_max_tokens_per_rank(
-        world_size, max_tokens_per_rank
+        world_size, max_tokens_per_rank, profile
     ):
         raise ValueError(
             "Gluon Petit MegaMoE capacity must be a multiple of "

@@ -59,7 +59,8 @@ def _config(world_size: int, num_experts: int, top_k: int, capacity: int):
 
 @pytest.mark.parametrize("experts,top_k", [(384, 6), (128, 3)])
 @pytest.mark.parametrize(
-    "world_size,capacity", [(4, 1024), (4, 2048), (4, 4096), (4, 7808), (8, 1024)]
+    "world_size,capacity",
+    [(4, 1024), (4, 2048), (4, 4096), (4, 7808), (8, 1024), (8, 2560), (8, 2624)],
 )
 def test_variant_counts_cover_every_launchable_key(
     experts, top_k, world_size, capacity

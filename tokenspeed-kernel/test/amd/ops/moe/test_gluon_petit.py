@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _import_petit_kernel,
     _megamoe_config,
     _Profile,
+    _profile_largest_max_tokens_per_rank,
     _validate_layer,
     gluon_petit_largest_max_tokens_per_rank,
     gluon_petit_max_tokens_per_rank,
@@ -593,16 +594,74 @@ def test_default_capacity_keeps_solution_and_heap(profile, world_size) -> None:
 
 def test_largest_capacity_per_world_size() -> None:
     # EP4: the DSv4.1 Flash target's heap reaches 2**32 above 7808 rows; the
-    # DSpark draft fits every encodable capacity. EP8 keeps 1024 rows.
+    # DSpark draft fits every encodable capacity. EP8: the rank-slot region
+    # grows with ranks squared, so the target reaches 2**32 above 2624 rows and
+    # the draft above 5280; the server's limit is the smaller.
     assert gluon_petit_largest_max_tokens_per_rank(4) == 7808
-    assert gluon_petit_largest_max_tokens_per_rank(8) == 1024
+    assert gluon_petit_largest_max_tokens_per_rank(8) == 2624
     petit_kernel = _import_petit_kernel()
-    reserved, _ = _megamoe_config(
-        petit_kernel, _DSV41_FLASH_PROFILE, 4, 7808
-    ).heap_bytes()
-    assert reserved < 1 << 32
-    with pytest.raises(ValueError, match="32-bit offsets"):
-        _megamoe_config(petit_kernel, _DSV41_FLASH_PROFILE, 4, 7840)
+    for profile, world_size, largest in (
+        (_DSV41_FLASH_PROFILE, 4, 7808),
+        (_DSV41_FLASH_PROFILE, 8, 2624),
+        (_DSV41_FLASH_DSPARK_PROFILE, 8, 5280),
+    ):
+        reserved, _ = _megamoe_config(
+            petit_kernel, profile, world_size, largest
+        ).heap_bytes()
+        assert reserved < 1 << 32
+        with pytest.raises(ValueError, match="32-bit offsets"):
+            _megamoe_config(petit_kernel, profile, world_size, largest + 32)
+    assert (
+        petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK == 9184
+    ), "the EP4 draft's largest is Petit's largest encodable capacity"
+
+
+@pytest.mark.parametrize(
+    "profile,world_size,largest",
+    [
+        (_DSV41_FLASH_PROFILE, 4, 7808),
+        (_DSV41_FLASH_DSPARK_PROFILE, 4, 9184),
+        (_DSV41_FLASH_PROFILE, 8, 2624),
+        (_DSV41_FLASH_DSPARK_PROFILE, 8, 5280),
+        # Profiles that do not raise their capacity at EP8 keep 1024 rows.
+        (_GPT_OSS_120B_PROFILE, 8, 1024),
+        (_DSV4_PROFILE, 8, 1024),
+        (_KIMI_K3_PROFILE, 8, 1024),
+        (_MUSE_SPARK_PROFILE, 8, 1024),
+    ],
+)
+def test_largest_capacity_per_profile(profile, world_size, largest) -> None:
+    assert _profile_largest_max_tokens_per_rank(profile, world_size) == largest
+    assert gluon_petit_max_tokens_per_rank(world_size, largest, profile) == largest
+    with pytest.raises(
+        ValueError,
+        match=f"at most {largest} tokens per rank at world size {world_size} "
+        f"for {profile.name}",
+    ):
+        gluon_petit_max_tokens_per_rank(world_size, largest + 1, profile)
+
+
+@pytest.mark.parametrize("profile", [_KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE])
+def test_profile_without_raised_capacity_refuses_above_1024_at_ep8(profile) -> None:
+    # The server admits EP8 chunks up to 2624 rows for DSv4.1 Flash; a model
+    # whose profile keeps the default refuses them when its workspace is built.
+    assert gluon_petit_max_tokens_per_rank(8, 2048) == 2048
+    with pytest.raises(
+        ValueError, match=f"EP8 keeps the default capacity for {profile.name}"
+    ):
+        gluon_petit_max_tokens_per_rank(8, 1025, profile)
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size", return_value=8
+        ),
+        pytest.raises(
+            ValueError, match=f"keeps the default capacity for {profile.name}"
+        ),
+    ):
+        _get_workspace(torch.device("cuda", 0), profile, 2048)
 
 
 @pytest.mark.parametrize(
@@ -614,15 +673,19 @@ def test_largest_capacity_per_world_size() -> None:
         (4, 4096, 4096),
         (4, 7808, 7808),
         (4, 7809, None),
-        (8, 1025, None),
-        (8, 2048, None),
+        (8, 1025, 1056),
+        (8, 2048, 2048),
+        (8, 2560, 2560),
+        (8, 2624, 2624),
+        (8, 2625, None),
+        (8, 4096, None),
     ],
 )
 def test_capacity_rounds_to_sorted_blocks_and_refuses_above_heap_limit(
     world_size, rows, capacity
 ) -> None:
     if capacity is None:
-        largest = 7808 if world_size == 4 else 1024
+        largest = 7808 if world_size == 4 else 2624
         with pytest.raises(ValueError, match=f"at most {largest} tokens per rank"):
             gluon_petit_max_tokens_per_rank(world_size, rows)
     else:
@@ -651,6 +714,16 @@ def test_ep4_launch_choice_above_1024_rows(profile, rows, expected) -> None:
         assert _megamoe_config(petit_kernel, profile, 4, 1024).launch_choice(
             rows
         ) == config.launch_choice(rows)
+
+
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+@pytest.mark.parametrize("rows", [1024, 1360, 2048, 2560])
+def test_ep8_launch_choice_above_1024_rows(profile, rows) -> None:
+    # At EP8 both profiles launch the 8-warp 64-row tile and the 56-CTA
+    # producer from 1024 rows up to the raised 2560-row capacity.
+    petit_kernel = _import_petit_kernel()
+    config = _megamoe_config(petit_kernel, profile, 8, 2560)
+    assert config.launch_choice(rows) == ("cta56", "m64_w8")
 
 
 def test_raised_capacity_is_carried_into_state_and_apply() -> None:

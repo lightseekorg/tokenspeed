@@ -3072,7 +3072,9 @@ class ServerArgs:
                     "per rank)"
                 )
             # Petit's buffers are sized for the largest per-rank batch; above
-            # 1024 rows its heap grows up to the 32-bit offset limit (EP4).
+            # 1024 rows its heap grows up to the 32-bit offset limit (the
+            # DSv4.1 Flash target and draft at EP4 and EP8; other profiles
+            # keep 1024 rows, which Petit's workspace enforces per model).
             from tokenspeed_kernel.ops.moe.gluon import (
                 gluon_petit_largest_max_tokens_per_rank,
             )
