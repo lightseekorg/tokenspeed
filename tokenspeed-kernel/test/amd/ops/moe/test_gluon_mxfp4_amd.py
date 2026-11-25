@@ -431,6 +431,85 @@ def test_dynamic_mxfp4_precomputed_moe_unaligned_intermediate(num_tokens: int) -
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("num_tokens", [6, 32])
+def test_dynamic_mxfp4_dsv41_tp8_decode_takes_slot_parallel(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    """DeepSeek V4.1 Flash MoE at TP8 (I = 288, padded to 320): DSpark decode
+    rows (6 per request, up to 32) take the slot-parallel direct decode and
+    match the ragged path the shape took without the table entry."""
+    if not is_cdna4():
+        pytest.skip("Dynamic MXFP4 activation is unavailable on this GPU")
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import decode_stage2
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+    generator = torch.Generator(device="cuda").manual_seed(20261125 + num_tokens)
+    num_experts, hidden_size, intermediate_size, top_k = 384, 5120, 288, 6
+    raw = make_mxfp4_moe_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        generator=generator,
+    )
+    module = _make_dynamic_mxfp4_moe_module(raw)
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda", generator=generator)[:top_k]
+            for _ in range(num_tokens)
+        ]
+    ).to(torch.int32)
+    topk_weights = torch.softmax(
+        torch.randn((num_tokens, top_k), device="cuda", generator=generator), dim=-1
+    )
+
+    def run() -> torch.Tensor:
+        return gluon_mxfp_precomputed_mxfp4_fused_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            expert_start=0,
+            global_num_experts=num_experts,
+            do_finalize=True,
+            x_quantized=None,
+            out_dtype=torch.bfloat16,
+            swiglu_alpha=1.0,
+            swiglu_limit=10.0,
+            swiglu_beta=0.0,
+            out=None,
+        )
+
+    slot_parallel = []
+    stage2 = decode_stage2.invoke_stage2_mxfp4_mfma_decode_gluon
+
+    def record_stage2(*args, **kwargs):
+        slot_parallel.append(kwargs.get("SLOT_PARALLEL"))
+        return stage2(*args, **kwargs)
+
+    monkeypatch.setattr(
+        decode_stage2, "invoke_stage2_mxfp4_mfma_decode_gluon", record_stage2
+    )
+    actual = run()
+    torch.cuda.synchronize()
+    assert slot_parallel == [True]
+    monkeypatch.setattr(
+        moe, "_SLOT_PARALLEL_DIRECT_DECODE_MAX_M", {(5120, 576, 384, 6): 32}
+    )
+    expected = run()
+    torch.cuda.synchronize()
+    assert slot_parallel == [True]
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "global_num_experts", "input_kind"),
     (

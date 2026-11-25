@@ -278,7 +278,9 @@ _DIRECT_STAGE2_BLOCK_K = 128
 # Key: hidden width, intermediate width, global experts, top-k. Finalized
 # decode up to this many rows takes the direct path with the slot-parallel
 # stage 2, whose short K keeps the per-token top-k chain latency bound.
-_SLOT_PARALLEL_DIRECT_DECODE_MAX_M = {(5120, 576, 384, 6): 32}
+# DeepSeek V4.1 Flash: MoE TP4 (I = 576) and MoE TP8 (I = 288, padded to 320
+# by the weight preprocess so W13's N is a multiple of 128).
+_SLOT_PARALLEL_DIRECT_DECODE_MAX_M = {(5120, 576, 384, 6): 32, (5120, 320, 384, 6): 32}
 
 
 def _select_direct_stage2_tiles(
