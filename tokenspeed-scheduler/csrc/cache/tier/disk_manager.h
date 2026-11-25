@@ -100,6 +100,7 @@ public:
     // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
     std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
     std::size_t NumQueuedCleanings() const { return cleaning_.size(); }
+    std::size_t NumAwaitingReuse() const { return awaiting_reuse_.size(); }
     std::uint64_t WrittenBlocks() const { return written_blocks_; }
     std::uint64_t ReadBlocks() const { return read_blocks_; }
     std::uint64_t FailedReads() const { return failed_reads_; }
@@ -127,11 +128,17 @@ private:
     std::size_t numOperations(DiskOpKind kind) const;
     std::size_t heldHostBlocks(DiskOpKind kind) const;
     DiskOperation command(std::uint64_t id, const Ticket& ticket) const;
+    // Moves the entries acquired since the reuse gate turned them away back
+    // into the cleaning queue, a bounded number per call.
+    void requeueReused();
 
     CacheCoordinator& coordinator_;
     const DiskConfig config_;
     std::map<std::uint64_t, Ticket> operations_;
     std::deque<CacheKey> cleaning_;
+    // Dirty Host entries the reuse gate turned away: cleaned once a later
+    // admission acquires them, forgotten when the Host drops them.
+    std::deque<CacheKey> awaiting_reuse_;
     std::vector<DiskOperation> commands_;
     std::uint64_t next_id_{1};
     std::uint64_t written_blocks_{0};

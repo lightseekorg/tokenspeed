@@ -172,14 +172,40 @@ void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
 }
 
 void DiskTransferManager::DropCleaning() {
-    dropped_cleanings_ += cleaning_.size();
+    dropped_cleanings_ += cleaning_.size() + awaiting_reuse_.size();
     cleaning_.clear();
+    awaiting_reuse_.clear();
+}
+
+void DiskTransferManager::requeueReused() {
+    // Each plan looks at a bounded slice, oldest first, and rotates what still waits.
+    constexpr std::size_t kMaxChecked = 64;
+    CacheStore& store = coordinator_.Store();
+    const BlockPool& host_pool = *store.HostPool();
+    for (std::size_t checked = std::min(awaiting_reuse_.size(), kMaxChecked); checked > 0; --checked) {
+        CacheKey key = std::move(awaiting_reuse_.front());
+        awaiting_reuse_.pop_front();
+        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        std::optional<PrefixCacheIndex::CachedBlockMetadata> meta;
+        if (loc) meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        if (!meta) {
+            // The Host dropped it while it waited.
+            ++dropped_cleanings_;
+        } else if (coordinator_.Disk().ContainsDiskCachedBlock(key)) {
+            // A descendant's cleaning already wrote it to Disk.
+        } else if (meta->eviction.was_acquired) {
+            QueueCleaning(std::span{&key, 1});
+        } else {
+            awaiting_reuse_.push_back(std::move(key));
+        }
+    }
 }
 
 void DiskTransferManager::StartCleaning() {
     const auto max_ops = static_cast<std::size_t>(config_.max_operations);
     const std::size_t max_write_ops = std::max<std::size_t>(1, max_ops / 4);
     const std::size_t read_reserve = max_ops > 1 ? 1 : 0;
+    requeueReused();
     if (cleaning_.empty() || operations_.size() + read_reserve >= max_ops ||
         numOperations(DiskOpKind::kWrite) >= max_write_ops) {
         return;
@@ -226,13 +252,13 @@ void DiskTransferManager::StartCleaning() {
     // Admission filter applied to the branch tip (`cleaning_.front()`): skips
     // short branches and single-hit cold tails without breaking ancestor chains
     // of qualifying long/reused branches.
-    const auto rejected_by_admission = [&](const CacheKey& key, const BoundaryTree::Node& node) {
-        if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return false;
+    enum class Admission { kClean, kDrop, kAwaitReuse };
+    const auto admission_of = [&](const CacheKey& key, const BoundaryTree::Node& node) {
+        if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return Admission::kClean;
         const auto loc = store.LocationOf(host_pool, key.group_id, key);
-        if (!loc) return true;
+        if (!loc) return Admission::kDrop;
         const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
-        if (!meta) return true;
-        if (config_.require_reuse_for_cleaning && !meta->eviction.was_acquired) return true;
+        if (!meta) return Admission::kDrop;
         if (config_.min_clean_tokens > 0) {
             std::int64_t branch_tokens = node.boundary_tokens;
             if (branch_tokens <= 0 && meta->eviction.logical_block_index >= 0) {
@@ -240,9 +266,11 @@ void DiskTransferManager::StartCleaning() {
                 const std::int64_t span = group_granularity > 0 ? group_granularity : store.PrefixGranularity();
                 branch_tokens = (static_cast<std::int64_t>(meta->eviction.logical_block_index) + 1) * span;
             }
-            if (branch_tokens > 0 && branch_tokens < config_.min_clean_tokens) return true;
+            if (branch_tokens > 0 && branch_tokens < config_.min_clean_tokens) return Admission::kDrop;
         }
-        return false;
+        // A branch not reused yet may be reused later: it waits instead of being lost.
+        if (config_.require_reuse_for_cleaning && !meta->eviction.was_acquired) return Admission::kAwaitReuse;
+        return Admission::kClean;
     };
 
     Ticket ticket{.kind = DiskOpKind::kWrite};
@@ -255,9 +283,17 @@ void DiskTransferManager::StartCleaning() {
             cleaning_.pop_front();
             continue;
         }
-        if (rejected_by_admission(front, *node)) {
+        if (const Admission admission = admission_of(front, *node); admission != Admission::kClean) {
             cleaning_.pop_front();
-            ++dropped_cleanings_;
+            if (admission == Admission::kAwaitReuse) {
+                if (awaiting_reuse_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
+                    awaiting_reuse_.pop_front();
+                    ++dropped_cleanings_;
+                }
+                awaiting_reuse_.push_back(front);
+            } else {
+                ++dropped_cleanings_;
+            }
             continue;
         }
         // The pages above it first, nearest the root first, so a cleaned page

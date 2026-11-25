@@ -136,6 +136,9 @@ struct AdmissionResources {
     std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // The Ready hold a peer Host landing extended: the landing's hold took
+    // `storage_hold`, and the prefix below it stays held for as long.
+    std::optional<StorageReadyHold> storage_base_hold;
     // The request has asked its peer holder once (or has none to ask), and
     // what the holder answered.
     bool peer_prepared{false};

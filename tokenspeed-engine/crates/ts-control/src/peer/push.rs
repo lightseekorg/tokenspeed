@@ -704,7 +704,6 @@ impl HolderState {
         // Pre-validate every item before issuing any disk read or RDMA write,
         // and group PushItems by unique `(group, block)` so each Disk
         // block is read from NVMe once even if multiple items refer to it.
-        // its fields span on the reader.
         struct UniqueBlock<'a> {
             range: ts_l3::Range,
             batches: Vec<&'a [PushSpan]>,
@@ -1350,7 +1349,7 @@ mod tests {
             .unwrap();
         let reader = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 2).unwrap();
 
-        // 1. 3 MR-split PushItems for block 1 -> 1 deduplicated NVMe read + 3 MR write batches.
+        // 1. 3 PushItems naming block 1 -> 1 deduplicated NVMe read + 3 MR write batches.
         let split = vec![
             PushItem {
                 group: 0,

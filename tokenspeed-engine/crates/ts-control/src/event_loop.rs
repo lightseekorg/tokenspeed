@@ -668,9 +668,13 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     history: Option<HistoryRows>,
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
-    /// Whether the last dispatched plan carried `pages_to_copy` whose device
-    /// execution has not yet been confirmed by a subsequent commit.
-    last_plan_had_copies: bool,
+    /// Forwards queued on the device and forwards whose results came back.
+    forwards_dispatched: u64,
+    forwards_completed: u64,
+    /// Set while a dispatched plan's `pages_to_copy` may still be queued on the
+    /// device: the `forwards_dispatched` count whose completion proves, by
+    /// device order, that the copies ran. A later plan never clears it.
+    copies_confirmed_at: Option<u64>,
     cache_ops: CacheOps,
     replay_retirements: Option<ReplayRetirements>,
     controls: Controls,
@@ -779,7 +783,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             grammar_queue: Vec::new(),
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
-            last_plan_had_copies: false,
+            forwards_dispatched: 0,
+            forwards_completed: 0,
+            copies_confirmed_at: None,
             cache_ops: CacheOps::new(),
             cache_clear_started: None,
             startup_cache_clear: false,
@@ -1109,11 +1115,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     },
                 )?;
             }
-            self.last_plan_had_copies = device_work && frozen_has_copies;
+            if device_work && frozen_has_copies {
+                // No forward of its own: the next one dispatched is behind it.
+                self.copies_confirmed_at = Some(self.forwards_dispatched + 1);
+            }
+            let copies_clear = self.copies_confirmed_at.is_none();
             let mut forwarded = false;
-            if let Some(dp) = self.dp_round(None, &mut stop, !frozen_has_copies)? {
+            if let Some(dp) = self.dp_round(None, &mut stop, copies_clear)? {
                 if dp.idle_forward && memory_resident {
-                    if frozen_has_copies {
+                    if !copies_clear {
                         self.data_plane.idle_forward(&dp)?;
                     } else {
                         let data_plane = &mut self.data_plane;
@@ -1126,7 +1136,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             busy |= forwarded;
             self.note_forward(forwarded);
-            if frozen_has_copies {
+            if !copies_clear {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
             } else {
                 ArcMutexGuard::unlocked(&mut self.scheduler, || {
@@ -1358,25 +1368,33 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
+        let mut queued = false;
         let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
-            let executed = if idle_forward && !has_device_copies {
-                let data_plane = &mut self.data_plane;
-                ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                    data_plane.execute(plan, &dispatch)
-                })?
-            } else {
-                self.data_plane.execute(plan, &dispatch)?
-            };
+            let executed =
+                if idle_forward && !has_device_copies && self.copies_confirmed_at.is_none() {
+                    let data_plane = &mut self.data_plane;
+                    ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                        data_plane.execute(plan, &dispatch)
+                    })?
+                } else {
+                    self.data_plane.execute(plan, &dispatch)?
+                };
             if let Some(pending) = executed {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
                 self.in_flight.push_back((batch, input_logprobs, pending));
+                self.forwards_dispatched += 1;
                 forwarded = true;
+                queued = true;
             }
         }
-        self.last_plan_had_copies = device_work && has_device_copies;
+        if device_work && has_device_copies {
+            // Its own forward runs behind the copies; without one, the next
+            // forward dispatched does.
+            self.copies_confirmed_at = Some(self.forwards_dispatched + u64::from(!queued));
+        }
         self.note_forward(forwarded);
 
         // Commit from the head once the queue exceeds the depth; a round with
@@ -2125,7 +2143,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             ];
             let reduced = if self.ranks.replica.size() == 1
                 && self.in_flight.is_empty()
-                && !self.last_plan_had_copies
+                && self.copies_confirmed_at.is_none()
             {
                 let reduced = {
                     let mesh = &mut self.ranks.mesh;
@@ -2137,7 +2155,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 // ranks in `all_reduce` must be applied to `self.scheduler` before
                 // `clear_cache` or `next_execution_plan` runs in this round.
                 // Limited to single-member replicas so TP/PP adds no per-round broadcast,
-                // and only when no forward or copy batch is still queued on the device.
+                // and only when no forward is in flight and every dispatched copy batch
+                // is behind a forward that completed. The round-head `bump`, the idle
+                // receive and `complete()` hand the scheduler over regardless, as on main.
                 self.sync_peer_holder_changes()?;
                 reduced
             } else {
@@ -3419,8 +3439,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let data_plane = &mut self.data_plane;
             let result =
                 ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
-            if self.in_flight.is_empty() {
-                self.last_plan_had_copies = false;
+            self.forwards_completed += 1;
+            if self
+                .copies_confirmed_at
+                .is_some_and(|at| self.forwards_completed >= at)
+            {
+                self.copies_confirmed_at = None;
             }
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;

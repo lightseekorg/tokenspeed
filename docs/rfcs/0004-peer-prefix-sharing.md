@@ -163,7 +163,7 @@ boundary its SWA window and State checkpoints can resume from, and lists the
 pages a reader's table would hold at each slot. A soft pin holds no block
 reference: the lookup's change refreshes the entries, as a hit does, so they
 leave last, and keeps the prompt up to the answered boundary. A soft pin
-expires after a bounded deadline (2 s at the default 50 ms answer timeout,
+expires after a bounded deadline (about 2 s at the default 50 ms answer timeout,
 scaled with `--peer-prefix-answer-timeout-ms` and capped at the 30 s hard-pin
 lifetime so a hard pin never shortens it and the servicer's record lifetime
 always outlives it). Soft pins never cost the holder capacity it needs.

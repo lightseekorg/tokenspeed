@@ -896,9 +896,39 @@ TEST(DiskTierTest, CleaningAdmissionAndReadSlotReservation) {
     DiskConfig reuse = Limits();
     reuse.require_reuse_for_cleaning = true;
     DiskTierCache c3(FullOnly(), 16, reuse);
-    c3.disks.QueueCleaning(c3.OnHostOnly(Prompt(2, 1)));
+    const auto cold = c3.OnHostOnly(Prompt(2, 1));
+    c3.disks.QueueCleaning(cold);
     c3.disks.StartCleaning();
-    EXPECT_EQ(c3.disks.DroppedCleanings(), 2u);
+    // Not reused yet: nothing is written, and nothing is given up either.
+    EXPECT_TRUE(c3.disks.TakeCommands().empty());
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 2u);
+    // A later admission acquires the Host entries: the next plan cleans them.
+    {
+        auto& index = c3.coordinator.Store().Groups()[0].Index();
+        const auto probe = FullAttnMatcher{}.Probe(index, c3.host, cold, 0, 2, /*extra_hits=*/nullptr);
+        const PrefixMatch reused =
+            index.AcquireMatched(c3.host, cold, 0, probe, CacheCoordinatorTestAccess::NextAccessEpoch(c3.coordinator),
+                                 /*session=*/nullptr);
+        EXPECT_EQ(reused.blocks.size(), 2u);
+    }
+    c3.disks.StartCleaning();
+    const auto writes = c3.disks.TakeCommands();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].group_ids.size(), 2u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+
+    // An entry the Host drops while it waits is forgotten.
+    DiskTierCache c4(FullOnly(), 16, reuse);
+    const auto gone = c4.OnHostOnly(Prompt(2, 3));
+    c4.disks.QueueCleaning(gone);
+    c4.disks.StartCleaning();
+    c4.EvictFromHost(std::span{gone}.last(1));
+    c4.EvictFromHost(std::span{gone}.first(1));
+    c4.disks.StartCleaning();
+    EXPECT_EQ(c4.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c4.disks.DroppedCleanings(), 2u);
 }
 
 TEST(DiskTierTest, PartialHostCreditExhaustionRetryableAndInt32BlockBound) {

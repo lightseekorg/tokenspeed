@@ -1156,6 +1156,106 @@ TEST(PeerDiskInterleavingTest, DiskReadyHoldSurvivesFailedPeerHostLandingAsFallb
     EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
 }
 
+TEST(PeerDiskInterleavingTest, DiskReadyHoldSurvivesASuccessfulPeerHostLandingUntilAdmission) {
+    Scheduler holder{PeerConfigFor("holder")};
+    const std::vector<std::int32_t> full_prefix = MakeAlignedTokens(4, kP);
+    WarmOnHolder(holder, full_prefix);
+
+    SchedulerConfig cfg = HostLandingConfigFor("reader", /*hybrid=*/false);
+    cfg.device_allocator.total_pages = 17;
+    cfg.cache_groups.front().total_pages = 17;
+    cfg.host_allocator.total_pages = 33;
+    cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    cfg.disk_allocator.total_pages = 33;
+    cfg.disk_config = DiskConfig{.max_operations = 4,
+                                 .max_blocks_per_operation = 32,
+                                 .max_host_blocks = 8,
+                                 .max_write_host_blocks = 4,
+                                 .max_queued_cleanings = 32,
+                                 .min_prefetch_tokens = kP,
+                                 .wait_timeout_us = 10'000,
+                                 .ready_timeout_us = 10'000};
+    cfg.max_batch_size = 1;
+    cfg.max_resident_requests = 1;
+    SetTestSnapshotPool(cfg);
+    Scheduler reader{cfg};
+
+    Send(reader, cache::StorageTick{.now_us = 1, .allow_forward = true, .allow_storage = true});
+    const std::vector<std::int32_t> short_prefix(full_prefix.begin(), full_prefix.begin() + 2 * kP);
+    SeedAndCleanToDisk(reader, {{"s1", short_prefix}});
+    ASSERT_TRUE(SchedulerTestAccess::Coordinator(reader).ClearDeviceCache());
+    EvictHostTokens(reader, short_prefix);
+
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "blk", .tokens = MakeAlignedTokens(2, kP, 8000), .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(reader)).size(), 1u);
+
+    std::vector<std::int32_t> peer_toks = full_prefix;
+    peer_toks.insert(peer_toks.end(), {9001, 9002});
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "r-ok", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
+    const auto reads = ExtractDiskOps(Plan(reader));
+    ASSERT_EQ(reads.size(), 1u);
+    Send(reader, cache::DiskDone{.op_id = reads[0].op_id, .success = true});
+    Plan(reader);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+
+    HolderServicer servicer{holder};
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan p_land = Plan(reader);
+    ASSERT_EQ(p_land.peer_fetches.size(), 1u);
+    EXPECT_EQ(p_land.peer_fetches[0].begin_tokens, 4);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+
+    // Under Host eviction pressure while the peer Host landing is in flight,
+    // the Disk-prefetched [0, 4) Host blocks stay pinned and cannot be evicted.
+    {
+        CacheCoordinator& coord = SchedulerTestAccess::Coordinator(reader);
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t off = 0; off < short_prefix.size(); off += kP) {
+            pages.emplace_back(short_prefix.data() + off, kP);
+        }
+        for (const CacheKey& key : coord.Store().KeysForGroup(ComputePrefixHashes(pages, ""), 0)) {
+            const auto loc = coord.Store().LocationOf(*coord.Store().HostPool(), 0, key);
+            ASSERT_TRUE(loc.has_value());
+            EXPECT_FALSE(coord.Evictor().EvictHostCachedBlock(0, *loc, &CacheEvictor::HostEvictionStats::lru));
+        }
+    }
+
+    // The landing succeeds: its hold takes the request's hold slot, and the Disk
+    // hold under the prefix it extends stays until admission.
+    Send(reader, cache::PeerFetchDone{.request_id = "r-ok", .num_tokens = p_land.peer_fetches[0].end_tokens});
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 1u);
+    {
+        CacheCoordinator& coord = SchedulerTestAccess::Coordinator(reader);
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t off = 0; off < short_prefix.size(); off += kP) {
+            pages.emplace_back(short_prefix.data() + off, kP);
+        }
+        for (const CacheKey& key : coord.Store().KeysForGroup(ComputePrefixHashes(pages, ""), 0)) {
+            const auto loc = coord.Store().LocationOf(*coord.Store().HostPool(), 0, key);
+            ASSERT_TRUE(loc.has_value());
+            EXPECT_FALSE(coord.Evictor().EvictHostCachedBlock(0, *loc, &CacheEvictor::HostEvictionStats::lru));
+        }
+    }
+
+    // Admission resumes from the whole landed prefix and gives both holds up.
+    while (SchedulerTestAccess::ResultsInFlight(reader, "blk") > 0) {
+        Send(reader, forward::ExtendResult{.request_id = "blk", .tokens = {7}});
+    }
+    Send(reader, forward::Finish{.request_id = "blk"});
+    const auto rows = PrefillRows(Plan(reader));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].first, "r-ok");
+    EXPECT_EQ(rows[0].second, p_land.peer_fetches[0].end_tokens);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 0u);
+}
+
 TEST(PeerSchedulerRound7Test, ExpiredSoftPinMaxLeasesOverflowAndFusedAbortSafety) {
     // 1. max_leases overflow & expired soft pin never phantom-pin or vouch across ClearCache.
     SchedulerConfig cfg = PeerConfigFor("holder");

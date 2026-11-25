@@ -55,7 +55,8 @@ StorageStats Scheduler::GetStorageStats() const {
     for (const auto& request : requests_) {
         stats.waiting_requests += request->Is<fsm::Prefetching>();
         const auto* admission = request->AdmissionResourcesPtr();
-        stats.ready_requests += admission != nullptr && admission->storage_hold.has_value();
+        stats.ready_requests +=
+            admission != nullptr && (admission->storage_hold.has_value() || admission->storage_base_hold.has_value());
     }
     return stats;
 }
@@ -165,13 +166,15 @@ void Scheduler::releaseStorage(Request& request) {
     // Host landing (`peer_host_landings_`) owns its own lifecycle and peer
     // clock, so leave it untouched here.
     if (const auto* prefetch = request.GetIf<fsm::Prefetching>();
-        prefetch != nullptr && ownsStorageLease(prefetch->lease)) {
+        prefetch != nullptr && (!prefetch->lease || ownsStorageLease(prefetch->lease))) {
         request.Apply(fsm::FinishPrefetchEvent{std::nullopt});
     }
     if (auto* admission = request.AdmissionResourcesPtr()) {
         if (admission->storage_hold && ownsStorageLease(admission->storage_hold->lease)) {
             admission->storage_hold.reset();
         }
+        // The base of a landed peer prefix is an L3/Disk hold as well.
+        admission->storage_base_hold.reset();
         admission->storage_prepared = true;
     }
 }

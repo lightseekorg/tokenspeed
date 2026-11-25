@@ -58,7 +58,7 @@ public:
     static bool Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages);
     // Whether the lookup's lease can be recorded without overflowing max_leases_.
-    bool CanAcceptLookup(const PeerLeaseId& lease, std::size_t pending_new_leases = 0) const;
+    bool CanAcceptLookup(const PeerLeaseId& lease, std::size_t pending_new_leases) const;
     // Whether the lease still holds an active soft pin eligible to become hard.
     bool CanPin(const PeerLeaseId& lease) const;
     // Whether the lease's pin holds its pages now.

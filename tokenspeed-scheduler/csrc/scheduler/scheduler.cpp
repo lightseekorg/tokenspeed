@@ -285,6 +285,9 @@ bool Scheduler::CanClearCacheRetainingStorage() const {
             if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_hold) {
                 leases.push_back(admission->storage_hold->lease.OperationId());
             }
+            if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_base_hold) {
+                leases.push_back(admission->storage_base_hold->lease.OperationId());
+            }
         }
         if (!storage_transfers_->CanRetainForClear(leases)) return false;
         retained = storage_transfers_->HeldBlockRefs();

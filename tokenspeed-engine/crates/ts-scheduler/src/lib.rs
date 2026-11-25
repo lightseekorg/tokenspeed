@@ -1117,13 +1117,9 @@ impl Scheduler {
     }
 
     /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
-    /// read from the cache as it stands; it changes nothing.
-    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
-        ffi::answer_peer_lookup(self.get(), lookup, 0)
-    }
-
-    /// Like [`Self::answer_peer_lookup`], accounting for `pending_new_leases`
-    /// unsynced lookup hits already queued in the holder servicer.
+    /// read from the cache as it stands; it changes nothing. Bounded by the
+    /// `pending_new_leases` unsynced lookup hits already queued in the holder
+    /// servicer.
     pub fn answer_peer_lookup_bounded(
         &self,
         lookup: &PeerEventView,

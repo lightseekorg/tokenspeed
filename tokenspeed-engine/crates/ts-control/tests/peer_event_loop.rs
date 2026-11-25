@@ -913,7 +913,7 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
         demote: false,
         request_id: String::new(),
     };
-    let ans = sched.answer_peer_lookup(&lev);
+    let ans = sched.answer_peer_lookup_bounded(&lev, 0);
     assert_eq!(ans.num_tokens, 3 * PAGE);
     let t0 = 2_000_000_000_000_000_i64;
     sched.advance_peer(t0, &[lev]).unwrap();

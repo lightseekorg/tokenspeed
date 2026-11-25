@@ -111,7 +111,9 @@ file and registered memory. It has two backends, chosen explicitly:
   registered as fixed buffers, in pieces of at most 1 GiB; no request crosses
   a piece. When a platform disallows `O_DIRECT` DMA directly against device-pinned
   host memory (`EFAULT`), `ts-disk` falls back to registered bounce buffers for
-  those chunks. The file is not registered and SQPOLL is not used: the kernels and
+  those chunks. If the bounce pool itself cannot be registered (for example a
+  low `RLIMIT_MEMLOCK`), it is still used, with non-fixed reads and writes, and
+  a warning names the error. The file is not registered and SQPOLL is not used: the kernels and
   container policies in use refuse fixed files and unprivileged SQPOLL.
 - **psync**: a pool of threads calling `pread`/`pwrite`, for hosts whose
   policy refuses io_uring.

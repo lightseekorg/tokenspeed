@@ -117,6 +117,7 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
             peer_now_us_ >= admission->storage_hold->deadline_us) {
             spdlog::debug("[Peer] rid={} Host landing's ready hold expired before admission", request->Id());
             admission->storage_hold.reset();
+            admission->storage_base_hold.reset();
         }
     }
 }
@@ -164,9 +165,16 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
             }
             // A request that let go of the landing has nothing to step.
             if (waiting) {
+                // The landing's hold takes the request's one hold slot. A Ready
+                // hold already there covers the prefix the landing extends: it
+                // steps aside and lives as long as the landing's hold, or the
+                // landed suffix would lose its base to Host eviction.
+                std::optional<fsm::StorageReadyHold> base;
+                if (*landed > 0) base = std::exchange(request->AdmissionResourcesPtr()->storage_hold, std::nullopt);
                 request->Apply(fsm::FinishPrefetchEvent{
                     *landed > 0 ? std::optional{Deadline(peer_now_us_, config_.peer_config->host_ready_timeout_us)}
                                 : std::nullopt});
+                if (base) request->AdmissionResourcesPtr()->storage_base_hold = std::move(base);
             }
             return;
         }

@@ -52,8 +52,10 @@ DiskStats Scheduler::GetDiskStats() const {
         const auto* prefetch = request->GetIf<fsm::Prefetching>();
         stats.waiting_requests += prefetch != nullptr && prefetch->lease.IssuedBy(*disk_transfers_);
         const auto* admission = request->AdmissionResourcesPtr();
-        stats.ready_requests += admission != nullptr && admission->storage_hold &&
-                                admission->storage_hold->lease.IssuedBy(*disk_transfers_);
+        stats.ready_requests +=
+            admission != nullptr &&
+            ((admission->storage_hold && admission->storage_hold->lease.IssuedBy(*disk_transfers_)) ||
+             (admission->storage_base_hold && admission->storage_base_hold->lease.IssuedBy(*disk_transfers_)));
     }
     return stats;
 }
