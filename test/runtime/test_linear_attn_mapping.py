@@ -103,8 +103,11 @@ class TestLinearAttnConfig:
     def _server_args(tp_size=1):
         from types import SimpleNamespace
 
+        # The ServerArgs fields generate reads: the linear-attention mapping
+        # and, for KDA checkpoints, the retained history capacity.
         return SimpleNamespace(
-            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
+            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size)),
+            kda_history_capacity=None,
         )
 
     @staticmethod
@@ -130,6 +133,19 @@ class TestLinearAttnConfig:
         assert (spec.layer_ids) == (tuple(text_config.linear_layer_ids))
         assert (len(spec.layer_ids)) == (69)
         assert (spec.tp_size) == (8)
+
+    def test_kda_history_capacity_comes_from_the_launch_option(self):
+        from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        model = self._model(KimiLinearConfig())
+        default = prepare_server_args(["test-model"])
+        assert LinearAttnConfig.generate(default, model).kda_history_capacity is None
+        launched = prepare_server_args(["test-model", "--kda-history-capacity", "8"])
+        assert LinearAttnConfig.generate(launched, model).kda_history_capacity == 8
 
     def test_qwen35_gdn_geometry(self):
         from tokenspeed.runtime.configs.qwen3_5_text_base_config import (

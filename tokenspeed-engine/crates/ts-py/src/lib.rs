@@ -40,6 +40,9 @@
 mod bootstrap;
 mod l3;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,6 +65,13 @@ create_exception!(
     EngineError,
     PyException,
     "The engines are unreachable or refused a submission."
+);
+
+create_exception!(
+    tokenspeed_engine._native,
+    RequestCancelled,
+    EngineError,
+    "The client cancelled this stream; engine resource retirement may still be in progress."
 );
 
 fn engine_error(error: impl std::fmt::Display) -> PyErr {
@@ -291,7 +301,9 @@ impl Frontend {
             .collect()
     }
 
-    /// This frontend's unfinished requests per engine, in index order.
+    /// This frontend's attached request streams per engine, in index order.
+    /// Local cancellation decreases this count without proving retirement
+    /// of engine resources.
     fn in_flight(&self) -> Vec<usize> {
         self.client.in_flight()
     }
@@ -329,8 +341,8 @@ impl Frontend {
 
     /// Wait for outputs and return every one that arrived, oldest first: a
     /// `(rid, chunk)` per output, where the chunk is a dict, or an
-    /// `EngineError` for a stream the engines ended without a finished
-    /// output.
+    /// `EngineError` for a stream ended without a finished output.
+    /// Explicit local cancellation yields its subclass `RequestCancelled`.
     fn next_outputs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -346,12 +358,28 @@ impl Frontend {
         })
     }
 
-    /// Ask the engine to abort a request; its outputs then end with an
-    /// abort. Resolves to False if the request is not in flight.
+    /// Ask the engine to abort a request, leaving its local stream attached.
+    /// A terminal output is not guaranteed. Resolves to False if the request
+    /// is not in flight; True means only that the abort was sent.
     fn abort<'py>(&self, py: Python<'py>, rid: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client.abort(&rid).await.map_err(engine_error)
+        })
+    }
+
+    /// Send an abort and close this client's stream. `next_outputs` yields
+    /// `(rid, RequestCancelled)` after any already queued outputs.
+    /// Resolves to True only if this call closed the stream; False if it
+    /// was absent or finished/closed concurrently. A failed or interrupted
+    /// send leaves the stream attached for retry unless it ended independently.
+    /// If cancellation completed before the awaitable was interrupted, its
+    /// result remains queued. This is not an engine/cache/transfer retirement fence.
+    /// Use a fresh request id for a subsequent submission.
+    fn cancel<'py>(&self, py: Python<'py>, rid: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.cancel(&rid).await.map_err(engine_error)
         })
     }
 
@@ -404,9 +432,12 @@ impl<'py> IntoPyObject<'py> for Deliveries {
         for (rid, item) in self.0 {
             let output = match item {
                 Ok(chunk) => chunk_dict(py, chunk)?.into_any(),
-                Err(error) => EngineError::new_err(error.to_string())
-                    .into_value(py)
-                    .into_bound_py_any(py)?,
+                Err(error) => match error {
+                    StreamError::Cancelled => RequestCancelled::new_err(error.to_string()),
+                    _ => EngineError::new_err(error.to_string()),
+                }
+                .into_value(py)
+                .into_bound_py_any(py)?,
             };
             list.append((rid, output))?;
         }
@@ -485,5 +516,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PendingFrontend>()?;
     module.add_class::<Frontend>()?;
     module.add("EngineError", module.py().get_type::<EngineError>())?;
+    module.add(
+        "RequestCancelled",
+        module.py().get_type::<RequestCancelled>(),
+    )?;
     Ok(())
 }

@@ -134,6 +134,11 @@ def test_extra_slots_reject_invalid_capacity(extra):
 
 
 def test_recipe_prices_residents_without_growing_execution_workspace():
+    from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_request_slot_bytes,
+    )
+
     small = kimi_recipe(max_bs=2)
     expanded = kimi_recipe(max_bs=2)
     expanded.server_args.disaggregation_mode = "decode"
@@ -142,7 +147,16 @@ def test_recipe_prices_residents_without_growing_execution_workspace():
         max_resident_requests=5,
         pd_disaggregation_enabled=True,
     )
-    assert expanded.workspace_bytes() == small.workspace_bytes()
+    # Batch-indexed scratch stays sized by max_bs. KDA keeps its retained
+    # records in request slots across rounds, so each extra resident adds its
+    # slot's records and nothing else.
+    extra_slots = RequestSlotLayout(5).capacity - RequestSlotLayout(2).capacity
+    slot_bytes = kda_request_slot_bytes(
+        expanded.attn_config, expanded.groups(), draft_token_num=1
+    )
+    assert expanded.workspace_bytes() - small.workspace_bytes() == (
+        extra_slots * slot_bytes
+    )
     groups = expanded.groups()
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         capacity_model,

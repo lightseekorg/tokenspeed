@@ -466,12 +466,10 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Prefill: decode allocation is deferred, so a request is admitted
-    /// at once and its destination's allocation has its own event.
+    /// Deferred prefill waits only for its destination, not for bootstrap.
     deferred: bool,
-    /// Tracked requests: rid, room, bootstrapped, failure reported, and
-    /// (deferred) admitted.
-    tracked: Vec<(String, u64, bool, bool, bool)>,
+    /// Tracked requests: rid, room, bootstrapped, failure reported.
+    tracked: Vec<(String, u64, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -501,7 +499,7 @@ impl TransferPeer for FakePeer {
                 .decode_registered = true;
         }
         self.tracked
-            .push((rid.to_owned(), bootstrap.room, false, false, false));
+            .push((rid.to_owned(), bootstrap.room, false, false));
         Ok(())
     }
 
@@ -519,7 +517,7 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .flat_map(|(_, room, bootstrapped, _, _)| {
+                .flat_map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
                         || room.cancel_pending
@@ -567,14 +565,10 @@ impl TransferPeer for FakePeer {
         let mut agreed = agreed.chunks_exact(2);
         let deferred = self.deferred && role == Role::Prefill;
         self.tracked
-            .retain_mut(|(rid, room, bootstrapped, failed, admitted)| {
+            .retain_mut(|(rid, room, bootstrapped, failed)| {
                 let state = agreed.next().expect("one state per tracked request");
                 let (poll, retired) = (state[0], state[1]);
                 let room = wire.rooms.entry(*room).or_default();
-                if deferred && !*admitted {
-                    *admitted = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
-                }
                 match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                     TransferPoll::Failed => {
                         // Failure ends the output before held writes retire.
@@ -881,6 +875,7 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                CacheOpKind::StateCommit => CacheEventKind::StateCommitDone,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged
@@ -1825,6 +1820,7 @@ fn run_rank<F: Frontend>(
         1,
         None,
         role,
+        false,
         FinishLog {
             enabled: true,
             request_stats: true,
@@ -4344,6 +4340,23 @@ fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
         );
         assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
         assert_eq!(rank.released.len(), 1, "depth {depth}");
+    }
+}
+
+#[test]
+fn a_deferred_prefill_computes_in_its_submission_round_without_a_decode_peer() {
+    for depth in [0, 1] {
+        let script = vec![vec![EngineRequest::Add(Box::new(disaggregated(
+            "r", 9, 40, 4,
+        )))]];
+        let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert!(rank.released.is_empty());
+        let wire = wire.lock().unwrap();
+        assert!(!wire.rooms[&9].decode_registered);
+        assert!(wire.rooms[&9].preallocated.is_none());
+        assert!(wire.rooms[&9].sent.is_none());
     }
 }
 

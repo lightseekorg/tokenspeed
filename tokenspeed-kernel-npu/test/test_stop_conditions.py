@@ -81,6 +81,8 @@ def test_stop_conditions_match_cpu(
         stop_ids,
         limits,
         stopped,
+        # Every row's request end is written; start from a value never reported.
+        torch.full((batch,), -1, dtype=torch.int32),
     ]
     device = [tensor.to("npu") for tensor in initial]
     kwargs = dict(
@@ -121,3 +123,4 @@ def test_stop_conditions_match_cpu(
     torch.npu.synchronize()
     torch.testing.assert_close(device[2].cpu(), expected[2], rtol=0, atol=0)
     torch.testing.assert_close(device[8].cpu(), expected[8], rtol=0, atol=0)
+    torch.testing.assert_close(device[9].cpu(), expected[9], rtol=0, atol=0)

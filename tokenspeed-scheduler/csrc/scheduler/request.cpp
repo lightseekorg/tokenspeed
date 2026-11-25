@@ -30,7 +30,7 @@
 
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
+Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap)
     : id_{spec.request_id},
       admission_id_{spec.admission_id},
       session_id_{spec.session_id},
@@ -42,8 +42,8 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       max_new_tokens_{spec.max_new_tokens},
       max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
       prefix_granularity_{prefix_granularity},
-      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
+      state_{awaits_bootstrap ? fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}
+                              : fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}} {}
 
 std::span<const std::string> Request::PromptPrefixHashes() {
     return PromptPrefixHashes(submitted_prompt_size_ / prefix_granularity_);

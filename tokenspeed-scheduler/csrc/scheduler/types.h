@@ -153,6 +153,14 @@ struct SchedulerConfig {
     // chunks runs (docs/design/scheduler.md §3.3). 0 keeps the unbounded
     // suspension.
     std::int32_t max_consecutive_prefill_rounds{0};
+    // With max_consecutive_prefill_rounds: a round owes the decode rounds of
+    // prefill_decode_interval and prefill_decode_min_interval only while at
+    // least this many requests are ready to decode (PrefillDone or Decoding)
+    // before it. With fewer, the intervals are waived, but a run of
+    // back-to-back prefill rounds that hold a decode back still ends at the
+    // cap and the next round decodes (docs/design/scheduler.md §3.3). 0
+    // always owes them.
+    std::int32_t prefill_interval_min_decoding{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after
@@ -166,12 +174,12 @@ struct SchedulerConfig {
     // on the role directly.
     Role role{Role::kFused};
     // What the Decode destination gates on the P role; refused elsewhere
-    // (Validate), and absent there it is kEarly. Under either policy a prompt
-    // is admitted once pd::BootstrappedEvent arrived.
-    //   kEarly     that event also says every Decode rank allocated the
+    // (Validate), and absent there it is kEarly.
+    //   kEarly     pd::BootstrappedEvent says every Decode rank allocated the
     //              destination, so a prompt computes with its destination
     //              allocated.
-    //   kDeferred  the destination has its own event,
+    //   kDeferred  a prompt is submitted without waiting for Decode. The
+    //              destination has its own event,
     //              pd::DestinationReadyEvent. A prompt computed before it
     //              waits in PrefillAwaitingDestination, and its KV is sent
     //              once it arrived.

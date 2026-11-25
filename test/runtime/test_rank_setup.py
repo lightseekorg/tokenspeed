@@ -186,6 +186,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -248,6 +249,38 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
     assert cfg.max_consecutive_prefill_rounds == 2
 
 
+def test_the_prefill_interval_min_decoding_defaults_to_always_owed():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "4"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 0
+
+
+def test_the_prefill_interval_min_decoding_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "128",
+            "--max-consecutive-prefill-rounds",
+            "1",
+            "--prefill-interval-min-decoding",
+            "6",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 6
+    assert cfg.max_consecutive_prefill_rounds == 1
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -285,6 +318,30 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
                 "64",
             ],
             "--prefill-decode-min-interval cannot be combined",
+        ),
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--max-consecutive-prefill-rounds",
+                "1",
+                "--prefill-interval-min-decoding",
+                "-1",
+            ],
+            "--prefill-interval-min-decoding must be non-negative",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--prefill-interval-min-decoding", "8"],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-interval-min-decoding",
+                "8",
+            ],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
         ),
     ],
 )
@@ -1118,6 +1175,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
