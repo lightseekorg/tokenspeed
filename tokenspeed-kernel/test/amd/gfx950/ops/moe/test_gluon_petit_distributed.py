@@ -33,6 +33,7 @@ import os
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel
@@ -381,6 +382,14 @@ def _reference(x, ids, weights, profile):
 
 
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+_REQUIRES_EP4_OR_EP8 = pytest.mark.skipif(
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
+)
+_REQUIRES_EP8 = pytest.mark.skipif(
+    _WORLD_SIZE != 8 or not is_cdna4(),
+    reason="requires torchrun with eight gfx950 GPUs",
+)
 # The raised capacity each world size serves DSv4.1 Flash with: EP4's
 # 4096-token chunks, and EP8's 2560 (a 512-multiple below its 2624-row limit).
 _RAISED_CAPACITY = {4: 4096, 8: 2560}.get(_WORLD_SIZE, 4096)
@@ -413,10 +422,7 @@ def _skip_above_profile_capacity(profile_name: str, capacity: int) -> None:
         )
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
+@_REQUIRES_EP4_OR_EP8
 @pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize("profile_name", tuple(_PROFILES))
 def test_distributed_petit_reference(profile_name, capacity):
@@ -608,23 +614,18 @@ def _graph_kernel_nodes(capture) -> int:
     return int(count.value)
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
+_FUSION_PROFILES = pytest.mark.parametrize(
+    "profile_name", ("dsv41_flash", "dsv41_flash_dspark")
 )
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
-def test_distributed_petit_fuse_prep_bit_exact(profile_name):
-    """C1 (TOKENSPEED_PETIT_FUSE_PREP): Petit reads the router's top-k buffers.
 
-    With the switch on, Petit must give bit-for-bit the copying path's output
-    for zero-row ranks, the tp4ep4 2/2/2/0 split, DP4 single-busy-rank calls,
-    int64 ids and BF16 weights (one cast each), the deferred-routes mode and
-    CUDA graph replay with refreshed router buffers; and its captured graph
-    has two fewer nodes per call than the copying path's for int32 ids and
-    FP32 weights.
+
+def _fusion_case(profile_name: str) -> SimpleNamespace:
+    """One rank's Petit layer for the fusion tests (C1, C5, C5b, C3).
+
+    Joins the process group, builds ``profile_name``'s layer with this rank's
+    weights and returns it with ``call(x, ids, weights, counts,
+    do_finalize=True)``, the Petit apply at the per-rank row ``counts``.
     """
-    from tokenspeed_kernel.ops.moe import gluon as petit
-
     profile = _PROFILES[profile_name]
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -637,8 +638,6 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
     _weights(layer, profile, rank, ws)
     plan = _make_plan(profile, ws)
     kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
-    initial = petit._PETIT_FUSE_PREP
 
     def call(x, ids, weights, counts, do_finalize=True):
         return kernel_moe_apply(
@@ -658,6 +657,89 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
             shared_out=None,
         )
 
+    return SimpleNamespace(
+        profile=profile, rank=rank, device=device, ws=ws, layer=layer, call=call
+    )
+
+
+def _fusion_inputs(case, count: int):
+    """This rank's ``count`` input rows and their synthetic top-k routes."""
+    profile = case.profile
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    values = torch.arange(count * profile.hidden, device=case.device)
+    x = (
+        ((((values * 13 + case.rank * 7) % 127) - 63).float() * input_scale)
+        .reshape(count, profile.hidden)
+        .to(torch.bfloat16)
+    )
+    ids, weights = _routing(count, case.rank, profile, case.ws, case.device)
+    return x, ids, weights
+
+
+def _eager_routes_replays(case, x, ids, weights, counts):
+    """Petit's outputs under the current switch setting, on every rank.
+
+    The eager output, the deferred routes (``do_finalize=False``) and two
+    replays of a captured CUDA graph whose router buffers are refreshed with
+    new routes before each replay (a replay must read their current values).
+    """
+    count = counts[case.rank]
+    eager = case.call(x, ids, weights, counts).clone()
+    routes = case.call(x, ids, weights, counts, do_finalize=False)[0].clone()
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    graph_ids, graph_weights = ids.clone(), weights.clone()
+    with torch.cuda.graph(graph):
+        captured = case.call(x, graph_ids, graph_weights, counts)
+    replays = []
+    for step in (0, 1):
+        new_ids, new_weights = _routing(
+            count, case.rank + step, case.profile, case.ws, case.device
+        )
+        graph_ids.copy_(new_ids)
+        graph_weights.copy_(new_weights)
+        graph.replay()
+        replays.append(captured.clone())
+    torch.cuda.synchronize()
+    dist.barrier()
+    del graph
+    dist.barrier()
+    return eager, routes, replays
+
+
+def _assert_bit_exact(on, off) -> None:
+    """Eager output, deferred routes and both graph replays agree bit for bit."""
+    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+    for a, b in zip(on[2], off[2]):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+def _assert_reference(out, x, ids, weights, profile) -> None:
+    """``out`` passes the FP32 reference (ranks with rows only)."""
+    if x.shape[0]:
+        expected = _reference(x, ids, weights, profile)
+        torch.testing.assert_close(out, expected, atol=2e-6, rtol=8e-3)
+
+
+@_REQUIRES_EP4_OR_EP8
+@_FUSION_PROFILES
+def test_distributed_petit_fuse_prep_bit_exact(profile_name):
+    """C1 (TOKENSPEED_PETIT_FUSE_PREP): Petit reads the router's top-k buffers.
+
+    With the switch on, Petit must give bit-for-bit the copying path's output
+    for zero-row ranks, the tp4ep4 2/2/2/0 split, DP4 single-busy-rank calls,
+    int64 ids and BF16 weights (one cast each), the deferred-routes mode and
+    CUDA graph replay with refreshed router buffers; and its captured graph
+    has two fewer nodes per call than the copying path's for int32 ids and
+    FP32 weights.
+    """
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    case = _fusion_case(profile_name)
+    profile, rank, device, ws = case.profile, case.rank, case.device, case.ws
+    initial = petit._PETIT_FUSE_PREP
     try:
         for counts in (
             [0] * ws,
@@ -666,14 +748,7 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
             [3] * ws,
             [24] * ws,
         ):
-            count = counts[rank]
-            values = torch.arange(count * profile.hidden, device=device)
-            x = (
-                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
-                .reshape(count, profile.hidden)
-                .to(torch.bfloat16)
-            )
-            ids, weights = _routing(count, rank, profile, ws, device)
+            x, ids, weights = _fusion_inputs(case, counts[rank])
             for id_dtype, weight_dtype in (
                 (torch.int32, torch.float32),
                 (torch.int64, torch.bfloat16),
@@ -683,47 +758,18 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
                 outputs = {}
                 for fused in (False, True):
                     petit._PETIT_FUSE_PREP = fused
-                    eager = call(x, caller_ids, caller_weights, counts).clone()
-                    routes = call(
-                        x, caller_ids, caller_weights, counts, do_finalize=False
-                    )[0].clone()
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    graph = torch.cuda.CUDAGraph()
-                    graph_ids = caller_ids.clone()
-                    graph_weights = caller_weights.clone()
-                    with torch.cuda.graph(graph):
-                        captured = call(x, graph_ids, graph_weights, counts)
-                    replays = []
-                    for step in (0, 1):
-                        # Replays must read the router buffers' current values.
-                        new_ids, new_weights = _routing(
-                            count, rank + step, profile, ws, device
-                        )
-                        graph_ids.copy_(new_ids)
-                        graph_weights.copy_(new_weights)
-                        graph.replay()
-                        replays.append(captured.clone())
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    outputs[fused] = (eager, routes, replays)
-                    del graph
-                    dist.barrier()
+                    outputs[fused] = _eager_routes_replays(
+                        case, x, caller_ids, caller_weights, counts
+                    )
                 off, on = outputs[False], outputs[True]
 
                 def check():
-                    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
-                    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
-                    for a, b in zip(on[2], off[2]):
-                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                    _assert_bit_exact(on, off)
                     torch.testing.assert_close(on[2][0], off[0], atol=0, rtol=0)
-                    if count and weight_dtype == torch.float32:
+                    if weight_dtype == torch.float32:
                         # The reference takes FP32 weights; BF16-rounded
                         # weights are checked bit for bit against the copies.
-                        expected = _reference(x, ids, weights, profile)
-                        torch.testing.assert_close(
-                            on[0], expected, atol=2e-6, rtol=8e-3
-                        )
+                        _assert_reference(on[0], x, ids, weights, profile)
 
                 _collective_check(device, check)
                 dist.barrier()
@@ -736,7 +782,9 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
             petit._PETIT_FUSE_PREP = fused
             torch.cuda.synchronize()
             dist.barrier()
-            nodes[fused] = _graph_kernel_nodes(lambda: call(x, ids, weights, counts))
+            nodes[fused] = _graph_kernel_nodes(
+                lambda: case.call(x, ids, weights, counts)
+            )
             torch.cuda.synchronize()
             dist.barrier()
         print(
@@ -765,11 +813,8 @@ def _petit_launch_module():
     return sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+@_REQUIRES_EP4_OR_EP8
+@_FUSION_PROFILES
 def test_distributed_petit_stage1_n128_bit_exact(profile_name):
     """C5 (TOKENSPEED_PETIT_STAGE1_N128): the 32x128 stage-1 tile.
 
@@ -780,39 +825,9 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
     CUDA graph replay.
     """
     module = _petit_launch_module()
-    profile = _PROFILES[profile_name]
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    rank = dist.get_rank()
-    device = torch.device("cuda", local_rank)
-    ws = _WORLD_SIZE
-    layer = _TestMoeLayer(profile, ws, device)
-    _weights(layer, profile, rank, ws)
-    plan = _make_plan(profile, ws)
-    kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    case = _fusion_case(profile_name)
+    rank, ws = case.rank, case.ws
     initial = module.kStage1N128MaxTokens
-
-    def call(x, ids, weights, counts, do_finalize=True):
-        return kernel_moe_apply(
-            plan,
-            x,
-            layer,
-            x.new_empty((x.shape[0], 0)),
-            topk_weights=weights,
-            topk_ids=ids,
-            num_tokens_global=sum(counts),
-            max_num_tokens_per_gpu=max(counts),
-            do_finalize=do_finalize,
-            low_latency=None,
-            overlap_fn=None,
-            shared_input=None,
-            shared_weight=None,
-            shared_out=None,
-        )
-
     try:
         for counts, threshold in (
             ([0] * ws, 8),
@@ -821,62 +836,26 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
             (([1, 8, 9, 40] * 2)[:ws], 8),
             (([24, 3, 0, 64] * 2)[:ws], 64),
         ):
-            count = counts[rank]
-            values = torch.arange(count * profile.hidden, device=device)
-            x = (
-                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
-                .reshape(count, profile.hidden)
-                .to(torch.bfloat16)
-            )
-            ids, weights = _routing(count, rank, profile, ws, device)
+            x, ids, weights = _fusion_inputs(case, counts[rank])
             outputs = {}
             for max_rows in (-1, threshold):
                 module.kStage1N128MaxTokens = max_rows
-                eager = call(x, ids, weights, counts).clone()
-                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
-                torch.cuda.synchronize()
-                dist.barrier()
-                graph = torch.cuda.CUDAGraph()
-                graph_ids, graph_weights = ids.clone(), weights.clone()
-                with torch.cuda.graph(graph):
-                    captured = call(x, graph_ids, graph_weights, counts)
-                replays = []
-                for step in (0, 1):
-                    new_ids, new_weights = _routing(
-                        count, rank + step, profile, ws, device
-                    )
-                    graph_ids.copy_(new_ids)
-                    graph_weights.copy_(new_weights)
-                    graph.replay()
-                    replays.append(captured.clone())
-                torch.cuda.synchronize()
-                dist.barrier()
-                outputs[max_rows] = (eager, routes, replays)
-                del graph
-                dist.barrier()
+                outputs[max_rows] = _eager_routes_replays(case, x, ids, weights, counts)
             off, on = outputs[-1], outputs[threshold]
 
             def check():
-                torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
-                torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
-                for a, b in zip(on[2], off[2]):
-                    torch.testing.assert_close(a, b, atol=0, rtol=0)
+                _assert_bit_exact(on, off)
                 torch.testing.assert_close(on[2][0], on[0], atol=0, rtol=0)
-                if count:
-                    expected = _reference(x, ids, weights, profile)
-                    torch.testing.assert_close(on[0], expected, atol=2e-6, rtol=8e-3)
+                _assert_reference(on[0], x, ids, weights, case.profile)
 
-            _collective_check(device, check)
+            _collective_check(case.device, check)
             dist.barrier()
     finally:
         module.kStage1N128MaxTokens = initial
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+@_REQUIRES_EP4_OR_EP8
+@_FUSION_PROFILES
 def test_distributed_petit_fuse_post_combine(profile_name):
     """C3 (TOKENSPEED_PETIT_FUSE_POST): the combine adds a residual row.
 
@@ -889,38 +868,9 @@ def test_distributed_petit_fuse_post_combine(profile_name):
     """
     from tokenspeed_kernel.ops.moe import gluon as petit
 
-    profile = _PROFILES[profile_name]
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    rank = dist.get_rank()
-    device = torch.device("cuda", local_rank)
-    ws = _WORLD_SIZE
-    layer = _TestMoeLayer(profile, ws, device)
-    _weights(layer, profile, rank, ws)
-    plan = _make_plan(profile, ws)
-    kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
-
-    def call(x, ids, weights, counts):
-        return kernel_moe_apply(
-            plan,
-            x,
-            layer,
-            x.new_empty((x.shape[0], 0)),
-            topk_weights=weights,
-            topk_ids=ids,
-            num_tokens_global=sum(counts),
-            max_num_tokens_per_gpu=max(counts),
-            do_finalize=True,
-            low_latency=None,
-            overlap_fn=None,
-            shared_input=None,
-            shared_weight=None,
-            shared_out=None,
-        )
-
+    case = _fusion_case(profile_name)
+    profile, rank, device, ws = case.profile, case.rank, case.device, case.ws
+    call = case.call
     for counts in (
         [0] * ws,
         [2] * (ws - 1) + [0],
@@ -929,13 +879,7 @@ def test_distributed_petit_fuse_post_combine(profile_name):
         [6] * ws,
     ):
         count = counts[rank]
-        values = torch.arange(count * profile.hidden, device=device)
-        x = (
-            ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
-            .reshape(count, profile.hidden)
-            .to(torch.bfloat16)
-        )
-        ids, weights = _routing(count, rank, profile, ws, device)
+        x, ids, weights = _fusion_inputs(case, count)
         gen = torch.Generator(device=device).manual_seed(1234 + rank)
         shared = (
             torch.randn((count, profile.hidden), generator=gen, device=device) * 0.5
@@ -989,11 +933,8 @@ def test_distributed_petit_fuse_post_combine(profile_name):
         dist.barrier()
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+@_REQUIRES_EP4_OR_EP8
+@_FUSION_PROFILES
 def test_distributed_petit_stage2_n128_bit_exact(profile_name):
     """C5b (TOKENSPEED_PETIT_STAGE2_N128): the 32x128 stage-2 tile.
 
@@ -1005,39 +946,9 @@ def test_distributed_petit_stage2_n128_bit_exact(profile_name):
     mixed counts and a 64-row stage-1 tile (600 rows).
     """
     module = _petit_launch_module()
-    profile = _PROFILES[profile_name]
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    rank = dist.get_rank()
-    device = torch.device("cuda", local_rank)
-    ws = _WORLD_SIZE
-    layer = _TestMoeLayer(profile, ws, device)
-    _weights(layer, profile, rank, ws)
-    plan = _make_plan(profile, ws)
-    kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    case = _fusion_case(profile_name)
+    rank, ws = case.rank, case.ws
     initial = (module.kStage1N128MaxTokens, module.kStage2N128)
-
-    def call(x, ids, weights, counts, do_finalize=True):
-        return kernel_moe_apply(
-            plan,
-            x,
-            layer,
-            x.new_empty((x.shape[0], 0)),
-            topk_weights=weights,
-            topk_ids=ids,
-            num_tokens_global=sum(counts),
-            max_num_tokens_per_gpu=max(counts),
-            do_finalize=do_finalize,
-            low_latency=None,
-            overlap_fn=None,
-            shared_input=None,
-            shared_weight=None,
-            shared_out=None,
-        )
-
     # (stage-1 N=128 row threshold, stage-2 N=128); the first is the old path.
     variants = ((-1, False), (-1, True), (8, True))
     try:
@@ -1049,66 +960,30 @@ def test_distributed_petit_stage2_n128_bit_exact(profile_name):
             ([1, 8, 9, 40] * 2)[:ws],
             ([600, 0, 3, 0] * 2)[:ws],
         ):
-            count = counts[rank]
-            values = torch.arange(count * profile.hidden, device=device)
-            x = (
-                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
-                .reshape(count, profile.hidden)
-                .to(torch.bfloat16)
-            )
-            ids, weights = _routing(count, rank, profile, ws, device)
+            x, ids, weights = _fusion_inputs(case, counts[rank])
             outputs = {}
             for variant in variants:
                 module.kStage1N128MaxTokens, module.kStage2N128 = variant
-                eager = call(x, ids, weights, counts).clone()
-                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
-                torch.cuda.synchronize()
-                dist.barrier()
-                graph = torch.cuda.CUDAGraph()
-                graph_ids, graph_weights = ids.clone(), weights.clone()
-                with torch.cuda.graph(graph):
-                    captured = call(x, graph_ids, graph_weights, counts)
-                replays = []
-                for step in (0, 1):
-                    new_ids, new_weights = _routing(
-                        count, rank + step, profile, ws, device
-                    )
-                    graph_ids.copy_(new_ids)
-                    graph_weights.copy_(new_weights)
-                    graph.replay()
-                    replays.append(captured.clone())
-                torch.cuda.synchronize()
-                dist.barrier()
-                outputs[variant] = (eager, routes, replays)
-                del graph
-                dist.barrier()
+                outputs[variant] = _eager_routes_replays(case, x, ids, weights, counts)
             off = outputs[variants[0]]
 
             def check():
                 for variant in variants[1:]:
                     on = outputs[variant]
-                    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
-                    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
-                    for a, b in zip(on[2], off[2]):
-                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                    _assert_bit_exact(on, off)
                     torch.testing.assert_close(on[2][0], on[0], atol=0, rtol=0)
-                if count:
-                    expected = _reference(x, ids, weights, profile)
-                    torch.testing.assert_close(
-                        outputs[variants[1]][0], expected, atol=2e-6, rtol=8e-3
-                    )
+                _assert_reference(
+                    outputs[variants[1]][0], x, ids, weights, case.profile
+                )
 
-            _collective_check(device, check)
+            _collective_check(case.device, check)
             dist.barrier()
     finally:
         module.kStage1N128MaxTokens, module.kStage2N128 = initial
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+@_REQUIRES_EP4_OR_EP8
+@_FUSION_PROFILES
 def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
     """C5's received-experts selector (TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts).
 
@@ -1118,46 +993,16 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
     busy rank, the tp4ep4 2/2/2/0 and 3/3/3/3 splits and 6 rows on every rank.
     """
     module = _petit_launch_module()
-    profile = _PROFILES[profile_name]
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    rank = dist.get_rank()
-    device = torch.device("cuda", local_rank)
-    ws = _WORLD_SIZE
-    layer = _TestMoeLayer(profile, ws, device)
-    _weights(layer, profile, rank, ws)
-    plan = _make_plan(profile, ws)
-    kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    case = _fusion_case(profile_name)
+    rank, ws = case.rank, case.ws
     initial = (module.kStage1N128MaxTokens, module.kStage1N128ByExperts)
     from tokenspeed_kernel.ops.moe import gluon as petit
 
     config = petit._get_workspace(
-        device,
-        layer._moe_backend_state.profile,
-        layer._moe_backend_state.max_tokens_per_rank,
+        case.device,
+        case.layer._moe_backend_state.profile,
+        case.layer._moe_backend_state.max_tokens_per_rank,
     ).config
-
-    def call(x, ids, weights, counts, do_finalize=True):
-        return kernel_moe_apply(
-            plan,
-            x,
-            layer,
-            x.new_empty((x.shape[0], 0)),
-            topk_weights=weights,
-            topk_ids=ids,
-            num_tokens_global=sum(counts),
-            max_num_tokens_per_gpu=max(counts),
-            do_finalize=do_finalize,
-            low_latency=None,
-            overlap_fn=None,
-            shared_input=None,
-            shared_weight=None,
-            shared_out=None,
-        )
-
     try:
         module.kStage1N128MaxTokens = -1
         for counts in (
@@ -1168,39 +1013,13 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
             [3] * ws,
             [6] * ws,
         ):
-            count = counts[rank]
-            values = torch.arange(count * profile.hidden, device=device)
-            x = (
-                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
-                .reshape(count, profile.hidden)
-                .to(torch.bfloat16)
-            )
-            ids, weights = _routing(count, rank, profile, ws, device)
+            x, ids, weights = _fusion_inputs(case, counts[rank])
             outputs = {}
             for by_experts in (False, True):
                 module.kStage1N128ByExperts = by_experts
-                eager = call(x, ids, weights, counts).clone()
-                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
-                torch.cuda.synchronize()
-                dist.barrier()
-                graph = torch.cuda.CUDAGraph()
-                graph_ids, graph_weights = ids.clone(), weights.clone()
-                with torch.cuda.graph(graph):
-                    captured = call(x, graph_ids, graph_weights, counts)
-                replays = []
-                for step in (0, 1):
-                    new_ids, new_weights = _routing(
-                        count, rank + step, profile, ws, device
-                    )
-                    graph_ids.copy_(new_ids)
-                    graph_weights.copy_(new_weights)
-                    graph.replay()
-                    replays.append(captured.clone())
-                torch.cuda.synchronize()
-                dist.barrier()
-                outputs[by_experts] = (eager, routes, replays)
-                del graph
-                dist.barrier()
+                outputs[by_experts] = _eager_routes_replays(
+                    case, x, ids, weights, counts
+                )
             decisions = [None] * ws
             module.kStage1N128ByExperts = True
             dist.all_gather_object(
@@ -1210,15 +1029,10 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
 
             def check():
                 assert len(set(decisions)) == 1 and decisions[0] is not None
-                torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
-                torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
-                for a, b in zip(on[2], off[2]):
-                    torch.testing.assert_close(a, b, atol=0, rtol=0)
-                if count:
-                    expected = _reference(x, ids, weights, profile)
-                    torch.testing.assert_close(on[0], expected, atol=2e-6, rtol=8e-3)
+                _assert_bit_exact(on, off)
+                _assert_reference(on[0], x, ids, weights, case.profile)
 
-            _collective_check(device, check)
+            _collective_check(case.device, check)
             dist.barrier()
     finally:
         module.kStage1N128MaxTokens, module.kStage1N128ByExperts = initial
@@ -1227,10 +1041,7 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
 _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
-    reason="requires torchrun with four or eight gfx950 GPUs",
-)
+@_REQUIRES_EP4_OR_EP8
 @pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize(
     "profile_name", ("dsv41_flash", "dsv41_flash_dspark", "muse_spark")
@@ -1355,10 +1166,7 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
     assert not compiled, f"rank {rank} compiled Petit kernels in serving: {compiled}"
 
 
-@pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
-    reason="requires torchrun with eight gfx950 GPUs",
-)
+@_REQUIRES_EP8
 @pytest.mark.parametrize("profile_name", sorted(_PROFILES))
 def test_distributed_petit_deferred_routes(profile_name):
     """Deferred finalize returns every unweighted route to its source rank.
@@ -1456,10 +1264,7 @@ def test_distributed_petit_deferred_routes(profile_name):
             dist.barrier()
 
 
-@pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
-    reason="requires torchrun with eight gfx950 GPUs",
-)
+@_REQUIRES_EP8
 def test_distributed_petit_routes_follow_back_to_back_launches():
     """Back-to-back small launches never return an earlier launch's routes.
 
