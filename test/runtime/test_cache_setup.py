@@ -579,6 +579,76 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     assert linear_attn.draft_tree is (topk > 1)
 
 
+@pytest.mark.parametrize(
+    ("replay_enabled", "replay_supported", "draft_tokens", "expected_workspace_bytes"),
+    # A model-free draft (DUMMY) verifies the same window as one with draft
+    # layers, so it sizes the same workspace (see the test above); a width of
+    # one runs no verify window.
+    (
+        (True, True, 3, 164),
+        (False, True, 3, 128),
+        (True, False, 3, 128),
+        (True, True, 1, 0),
+    ),
+)
+def test_qwen_recipe_sizes_verify_workspace_without_draft_layers(
+    monkeypatch,
+    replay_enabled: bool,
+    replay_supported: bool,
+    draft_tokens: int,
+    expected_workspace_bytes: int,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.gdn.gdn_replay_commit_supported",
+        lambda dtype: replay_supported,
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=SimpleNamespace()),
+    )
+    target_spec = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        attn_tp_size=1,
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+    )
+    attn_config = AttnConfig(
+        components=(target_spec, _tiny_linear_attn()),
+        **_model_wide_kwargs(device="cuda"),
+    )
+    server_args = SimpleNamespace(
+        kv_offload_config=None,
+        block_size=64,
+        max_total_tokens=None,
+        speculative_num_draft_tokens=draft_tokens,
+        speculative_eagle_topk=1,
+        speculative_draft_tree=False,
+        enable_replay_ssm=replay_enabled,
+        mamba_ssm_dtype="float32",
+    )
+
+    setup = prepare_cache_setup(
+        family="qwen_gdn",
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=16_384,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    linear_attn = attn_config.component(LinearAttnConfig)
+    assert linear_attn is not None
+    assert linear_attn.replay_ssm is (
+        replay_enabled and replay_supported and draft_tokens > 1
+    )
+
+
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
 @pytest.mark.parametrize("ple_enabled", (False, True))
 @pytest.mark.parametrize("role", ("null", "prefill", "decode"))

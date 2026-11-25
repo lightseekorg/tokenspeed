@@ -294,16 +294,24 @@ class QwenGDNRecipe(CacheRecipe):
         return bool(self.num_draft_layers) and self.server_args.speculative_draft_tree
 
     @cached_property
+    def verifies_draft_window(self) -> bool:
+        """Whether target verification runs a multi-token window.
+
+        This is the window the GDN backend stages, with or without draft
+        layers: a model-free DUMMY draft has none.
+        """
+        return int(self.server_args.speculative_num_draft_tokens or 1) > 1
+
+    @cached_property
     def replay_ssm(self) -> bool:
         """Whether the GDN backend replays the SSM state instead of staging it."""
         if (
             self.attn_config.component(LinearAttnConfig) is None
-            or not self.num_draft_layers
+            or not self.verifies_draft_window
         ):
             return False
         if not (
             self.server_args.enable_replay_ssm
-            and int(self.server_args.speculative_num_draft_tokens) > 1
             and torch.device(self.attn_config.device).type == "cuda"
         ):
             return False
@@ -318,7 +326,7 @@ class QwenGDNRecipe(CacheRecipe):
     @override
     def workspace_bytes(self) -> int:
         """Return bytes needed to stage the GDN verify window."""
-        if not self.num_draft_layers:
+        if not self.verifies_draft_window:
             return 0
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
