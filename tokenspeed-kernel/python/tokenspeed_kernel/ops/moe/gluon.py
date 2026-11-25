@@ -1048,7 +1048,9 @@ if platform.is_amd:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False, True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ep_size": frozenset({1, 4}),
+            # EP-size agnostic: each rank's expert_start = ep_rank * local experts,
+            # and every path skips routes outside its slice (all-reduce sums).
+            "ep_size": frozenset({1, 4, 8}),
             "ispp_alignment": frozenset({512}),
             "internal_activation_dtype": frozenset({"input"}),
             "fp8_scale_block_shape": frozenset({(_FP8_BLOCK, _FP8_BLOCK)}),

@@ -4042,6 +4042,29 @@ def test_legacy_gluon_plans_keep_existing_implementation(
     assert plan["apply_kernel_name"] == expected
 
 
+@pytest.mark.parametrize("ep_size", [1, 8])
+def test_glm53_flash_block_fp8_plan_selects_gluon_at_ep1_and_ep8(
+    mi350_platform: PlatformInfo, ep_size: int
+) -> None:
+    """GLM-5.3 Flash's block-FP8 experts at MoE TP1 (ispp 2048), backend auto."""
+    expected = "gluon_fp8_block_precomputed_moe_apply"
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip("Gluon block-FP8 MoE is only registered on AMD")
+    plan = _moe_fp8_channel_plan(
+        mi350_platform,
+        weight_dtype="fp8",
+        activation="swiglu",
+        activation_clamped=True,
+        ep_size=ep_size,
+        ispp=2048,
+        hidden=4096,
+        num_experts=288,
+        top_k=8,
+        fp8_scale_block_shape=(128, 128),
+    )
+    assert plan["apply_kernel_name"] == expected
+
+
 def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
     """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
     return _moe_fp8_channel_plan(

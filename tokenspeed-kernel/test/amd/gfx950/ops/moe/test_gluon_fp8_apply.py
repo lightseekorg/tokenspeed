@@ -569,6 +569,102 @@ def test_gluon_block_fp8_warp_routed_reference(
         assert not empty.any()
 
 
+def _block_fp8_module(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    s13: torch.Tensor,
+    s2: torch.Tensor,
+    ep_size: int,
+    ep_rank: int,
+) -> torch.nn.Module:
+    from tokenspeed_kernel.ops.moe.gluon import gluon_fp8_moe_weights
+
+    module = torch.nn.Module()
+    module.w13_weight = w13.contiguous()
+    module.w2_weight = w2.contiguous()
+    module.w13_weight_scale_inv = s13.contiguous()
+    module.w2_weight_scale_inv = s2.contiguous()
+    module.ep_size = ep_size
+    module.ep_rank = ep_rank
+    module.num_local_experts = w13.shape[0]
+    module.activation = "swiglu"
+    module.swiglu_arg = SimpleNamespace(alpha=1.0, limit=7.0)
+    module.swiglu_beta = 0.0
+    module.w13_input_layout = "concatenated"
+    gluon_fp8_moe_weights({"activation": "swiglu"}, module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [8, 64, 4097], ids=["warp-decode", "exact-mfma", "bf16-prefill"]
+)
+@pytest.mark.parametrize(
+    ("num_experts", "hidden", "intermediate"),
+    [(16, 512, 512), (288, 4096, 2048)],
+    ids=["small", "glm53-flash"],
+)
+def test_gluon_block_fp8_apply_ep8_ranks_match_reference(
+    num_tokens: int,
+    num_experts: int,
+    hidden: int,
+    intermediate: int,
+    record_property,
+) -> None:
+    """EP8 on one GPU: each of eight ranks holds its slice of the expert bank.
+
+    Each rank's output matches the reference over its local experts, and the
+    eight partial outputs (what the EP all-reduce sums) match the reference
+    over the whole bank, on all three paths of the block-FP8 apply: warp decode
+    (<= 32 tokens), exact MFMA (<= 4096) and the BF16 prefill copies (> 4096).
+    The second shape is GLM-5.3 Flash at MoE TP1 (288 experts, 36 per rank,
+    hidden 4096, intermediate 2048, top-8).
+    """
+    from test_gluon_fp8_packed_small import _assert_numerics, _fixture, _reference
+    from tokenspeed_kernel.ops.moe.gluon import gluon_fp8_block_precomputed_moe_apply
+
+    ep_size = 8
+    x, w13, w2, s13, s2, ids, weights = _fixture(
+        num_tokens, 1, 0, False, hidden, intermediate, local_experts=num_experts
+    )
+    local = num_experts // ep_size
+    total = torch.zeros(num_tokens, hidden, device="cuda", dtype=torch.float32)
+    for rank in range(ep_size):
+        experts = slice(rank * local, (rank + 1) * local)
+        module = _block_fp8_module(
+            w13[experts], w2[experts], s13[experts], s2[experts], ep_size, rank
+        )
+        actual = gluon_fp8_block_precomputed_moe_apply(
+            {"activation": "swiglu"},
+            x,
+            module,
+            torch.empty(num_tokens, num_experts, device="cuda"),
+            topk_weights=weights,
+            topk_ids=ids,
+        )
+        expected = _reference(
+            x,
+            w13[experts],
+            w2[experts],
+            s13[experts],
+            s2[experts],
+            ids,
+            weights,
+            rank * local,
+            7.0,
+            quantized_activations=False,
+        )[0]
+        if expected.float().norm() > 0:
+            _assert_numerics(actual, expected, record_property)
+        else:
+            assert not actual.any()
+        total += actual.float()
+        del module
+    full = _reference(
+        x, w13, w2, s13, s2, ids, weights, 0, 7.0, quantized_activations=False
+    )[0]
+    _assert_numerics(total.to(torch.bfloat16), full, record_property)
+
+
 @pytest.mark.parametrize("rows", [1, 2, 3, 4])
 @pytest.mark.parametrize("stress", ["normal", "outlier", "cancellation"])
 def test_gluon_block_fp8_packed_warp_stress(
