@@ -605,6 +605,7 @@ def test_ascend_mla_binds_arena_geometry(monkeypatch, degree):
 
     monkeypatch.setitem(global_server_args_dict, "numerics", "fast")
     backend = _mla_backend(degree=degree)
+    assert not backend.supports_layer_sliding_window
     for count in (65, 129):
         backend.configure_runtime(
             block_granularity=256, virtual_block_count=count, shard_count=degree

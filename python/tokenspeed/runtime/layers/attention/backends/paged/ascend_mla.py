@@ -111,6 +111,8 @@ class AscendMLABackend(AscendQCPPrefillBackend, MLAAttnBackend):
         )
         # Native decode returns latent rows; the caller applies the value projection.
         self.supports_mla_projected_value_decode = False
+        # Native decode attends to the full history of each sequence.
+        self.supports_layer_sliding_window = False
         if config.kvp_size not in (1, 8):
             raise ValueError("Ascend MLA native merge supports DCP1/8")
         self._dcp = AscendDCPContext(
