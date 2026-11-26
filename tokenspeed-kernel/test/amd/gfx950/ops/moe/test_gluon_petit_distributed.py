@@ -1056,7 +1056,7 @@ _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
 @_REQUIRES_EP4_OR_EP8
 @pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize(
-    "profile_name", ("dsv41_flash", "dsv41_flash_dspark", "muse_spark")
+    "profile_name", ("dsv41_flash", "dsv41_flash_dspark", "muse_spark", "glm53_flash")
 )
 def test_distributed_petit_startup_warmup_compiles_every_variant(
     profile_name, capacity
@@ -1137,6 +1137,10 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
             # Muse Spark's raised 2304 rows add the plain class above 1024.
             "muse_spark": (0, 1, 2, 12, 16, 128, 129, 1024)
             + ((1025,) if capacity > 1024 else ()),
+            # GLM-5.3 Flash (288 experts): the default producer rule (cta128
+            # below 12 rows, cta64 below 24, then cta56) and the 8-warp 64-row
+            # tile from 256 rows; nothing changes above 1024.
+            "glm53_flash": (0, 1, 2, 12, 16, 24, 32, 256, 257),
         },
     }
     expected = expected[ws][profile_name]
