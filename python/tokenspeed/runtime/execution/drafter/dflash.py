@@ -81,6 +81,9 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.drafter.speculative_sampling import (
+        DraftProposalSampler,
+    )
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
     from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -169,6 +172,7 @@ class DFlash(BaseDrafter):
     uses_shared_context_projection = True
     sample_from_anchor = False
     spec_algorithm = "DFLASH"
+    supports_speculative_sampling = True
 
     def __init__(
         self,
@@ -248,32 +252,53 @@ class DFlash(BaseDrafter):
 
     @override
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
-        """Refuse --enable-speculative-sampling for greedy DFLASH, else bind.
+        """Arm sampled block drafting under --enable-speculative-sampling.
 
-        Base DFLASH proposes the argmax of every block row and records no
-        draft distribution, so the base ``draft_probs`` gate never fires for
-        it; the verifier's config says whether the flag is on. DFlash2 samples
-        its walk (sparse q, see its override) and DSpark its Markov steps
-        (dense q through the base sampler).
+        Base DFLASH then samples each block row from ``softmax(logits / T)``
+        and records the dense q, as the step drafters do; DFlash2 samples its
+        walk (sparse q, see its override) and DSpark its Markov steps.
 
         Args:
             sampling_backend: The executor's verifier.
 
         Raises:
-            ValueError: The flag is on and this drafter proposes greedily.
+            ValueError: The flag is on and this drafter proposes greedily, or
+                a DFLASH drafter's verifier does not read the q it records.
         """
-        if (
-            sampling_backend.config.enable_speculative_sampling
-            and not self.supports_speculative_sampling
-        ):
-            raise ValueError(
-                "--enable-speculative-sampling with DFLASH needs a DFlash2 draft "
-                "(candidate selector weights) whose walk samples each step from "
-                f"its own distribution; {type(self).__name__} proposes a whole "
-                "block greedily"
-            )
-        # A no-op unless the executor allocated draft_probs (DSpark).
+        if sampling_backend.config.enable_speculative_sampling:
+            if not self.supports_speculative_sampling:
+                raise ValueError(
+                    "--enable-speculative-sampling is not supported by "
+                    f"{type(self).__name__}: it proposes a whole block greedily"
+                )
+            # ServerArgs admits both DFLASH pairings: it validates flags, and
+            # which draft this is follows from the loaded checkpoint. The
+            # pairing is therefore checked here, against the drafter built for
+            # it, rather than guessed from the draft's config.
+            if (
+                self.spec_algorithm == "DFLASH"
+                and sampling_backend.reads_sparse_draft_q()
+                != self.records_sparse_draft_q
+            ):
+                kind = "sparse" if self.records_sparse_draft_q else "dense"
+                raise ValueError(
+                    f"{type(self).__name__} records a {kind} draft q that "
+                    f"{type(sampling_backend).__name__} does not read: use "
+                    "--sampling-backend triton for DFlash2, and flashinfer, "
+                    "flashinfer_full or sonic for a base DFLASH draft"
+                )
+        # A no-op unless the executor allocated draft_probs (base DFLASH, DSpark).
         super().bind_sampling_backend(sampling_backend)
+
+    @override
+    def require_full_draft_logits(self) -> None:
+        """DFLASH samples the target's shared head, not a draft-owned processor.
+
+        The base method reads ``draft_model_runner.model.logits_processor``,
+        which a DFLASH draft model does not have: ``wire_target`` binds the
+        target's head and processor here instead.
+        """
+        self.logits_processor.require_full_vocab_logits()
 
     @override
     def idle_forward_global_num_tokens(
@@ -1596,12 +1621,54 @@ class DFlash(BaseDrafter):
     ) -> torch.Tensor:
         """Sample the block draft tokens from the draft hidden states."""
         next_tokens[:, 0] = block_ids[:, 0]
-        self._greedy_sample_from_vocab_parallel_head(
-            draft_hidden[:, 1:, :].reshape(-1, self.hidden_size),
-            out=next_tokens[:, 1:],
-        )
+        if self.draft_sampler is None:
+            self._greedy_sample_from_vocab_parallel_head(
+                draft_hidden[:, 1:, :].reshape(-1, self.hidden_size),
+                out=next_tokens[:, 1:],
+            )
+        else:
+            self._sample_block_from_q(draft_hidden, self.draft_sampler, next_tokens)
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    def _sample_block_from_q(
+        self,
+        draft_hidden: torch.Tensor,
+        sampler: DraftProposalSampler,
+        next_tokens: torch.Tensor,
+    ) -> None:
+        """Sample each block row from ``softmax(logits / T)`` and record its q.
+
+        Rows do not depend on each other's tokens, so one GEMM projects them
+        all. Row ``k`` is verify column ``k``, which ``propose`` calls step
+        ``k - 1`` (each step draws its own noise).
+
+        The rows go through the processor rather than a bare matmul, unlike the
+        greedy block: these logits ARE the target head's (``wire_target`` binds
+        the target's head and processor; a DFLASH draft has neither of its
+        own), so the scale and the softcap that standardize them are the
+        target's. The greedy block can skip both because a positive scale and
+        the monotone softcap leave the argmax where it is, but they move a
+        softmax, and a Muse Spark target's scale is 0.18. (DFlash2 instead
+        takes the scale and softcap of its candidate selector's own
+        projection, which the head monokernel bakes in.)
+        """
+        bs = draft_hidden.shape[0]
+        num_steps = self.spec_num_tokens - 1
+        # Step-major, so each step's logits are one contiguous [bs, V] block.
+        rows = draft_hidden[:, 1:, :].transpose(0, 1).reshape(-1, self.hidden_size)
+        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+        logits = self.logits_processor._get_logits(
+            rows,
+            self.lm_head,
+            metadata,
+            embedding_bias=None,
+            plan=None,
+            require_full_vocab=True,
+        )
+        logits = logits.view(num_steps, bs, logits.shape[-1])
+        for step in range(num_steps):
+            next_tokens[:, step + 1].copy_(sampler.propose(logits[step], step=step))
 
     # ------------------------------------------------------------------
     # Prefill-round block graphs
@@ -1757,6 +1824,10 @@ class DFlash(BaseDrafter):
         if self.target_model is None:
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
+        if self.draft_sampler is not None:
+            self.draft_sampler.prepare_round(
+                accept_lengths, num_extends=base_ctx.num_extends
+            )
         if base_ctx.target_capture_sink is self and not self._context_written:
             raise RuntimeError(
                 "DFLASH armed the capture sink, but the target never handed "

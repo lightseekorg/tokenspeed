@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache
 
 import torch
@@ -51,6 +53,7 @@ except (ImportError, NotImplementedError):
 _CACHE_LOCK = threading.Lock()
 _WORKSPACES = {}
 _WORKSPACE_LOCK = threading.Lock()
+_WORKSPACE_REGION: Callable[[], AbstractContextManager[object]] = nullcontext
 _PROBE_SPLIT_K = 16
 _MAX_OVERRIDE_TOKENS = 1024
 _PLANS = {}
@@ -116,6 +119,25 @@ def supports_fused_hc(device: torch.device) -> bool:
     return _resident_clusters(index, stream) >= 6
 
 
+def set_gated_residual_workspace_region(
+    region: Callable[[], AbstractContextManager[object]],
+) -> None:
+    """Allocate later persistent fused mix workspaces inside ``region()``.
+
+    The workspaces are process-wide and keep their contents across calls, so a
+    runtime that releases memory passes a scope that preserves their storage.
+    A process has one such region: the runtime registers it once, before kernel
+    warmup, and a later call replaces it for workspaces allocated afterwards.
+
+    Args:
+        region: Factory of the allocation scope entered around each new
+            workspace, including layouts first reached after warmup. CUDA
+            graph capture never allocates one.
+    """
+    global _WORKSPACE_REGION
+    _WORKSPACE_REGION = region
+
+
 def _workspace_for_plan(
     device: torch.device,
     projection_rows: int,
@@ -162,7 +184,7 @@ def _workspace_for_plan(
                 # post-SiLU activation.
                 # Persistent scratch can be reused by calls made outside the
                 # inference-mode context that first warmed this layout.
-                with torch.inference_mode(False):
+                with torch.inference_mode(False), _WORKSPACE_REGION():
                     activation_storage = torch.empty(
                         (workers * slot_rows, lowrank), device=device, dtype=torch.int16
                     )
@@ -238,6 +260,8 @@ _SM107_HC_ROW_TILES = (
 )
 # (split_k, M_proj, B_mma, stages) of the one-round SM107 tiles.
 _SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
+# Generic tactic that SM107 runs as split-K 16 at 17-64 rows.
+_SM107_S16_GENERIC = (8, 64, 32, 1, 1, 5, 32)
 
 
 def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
@@ -730,6 +754,9 @@ def _model_tactic(
     measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
     if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
         # Only the generic tactic of a range is replaced, not a forced one.
+        if 16 < rows <= 64 and (split_k, m, n, lp, lb, stages, f) == _SM107_S16_GENERIC:
+            # Fused HC needs six resident 16-CTA clusters: one S16 round holds 64 rows.
+            split_k, n = 16, 32 if rows <= 32 else 64
         for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
             if (
                 first <= rows

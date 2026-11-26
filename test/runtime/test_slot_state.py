@@ -20,7 +20,7 @@
 
 """The slot-state image: every per-slot owner exports what it must, exactly.
 
-CPU-only. Two guards per owner (``RuntimeStates``, the drafters with
+The tests use CPU tensors. Two guards per owner (``RuntimeStates``, the drafters with
 cross-round state, the Inkling ring, the DSA KPool tail, the executor's
 aggregate):
 
@@ -33,6 +33,9 @@ aggregate):
   per-slot buffer added to a constructed owner without an exporter fails
   here instead of silently breaking a restored request; an owner class this
   file does not construct is not guarded.
+
+KDA folds its request workspace into the dense checkpoint before retraction.
+``test_retraction_image_executor.py`` restores that checkpoint after slot reuse.
 """
 
 from __future__ import annotations
@@ -653,17 +656,28 @@ def _storage_ids(rows) -> set[int]:
     return {row.untyped_storage().data_ptr() for row in rows}
 
 
-def _assert_slot_state_complete(owner, *, exporter, slot_domains: set[int]) -> None:
-    """Every slot-sized tensor of ``owner`` (and its components) is exported by
-    ``exporter`` or declared by the exporter's class; the declarations are
-    required attributes, empty or not."""
+def _assert_slot_state_complete(
+    owner,
+    *,
+    exporter,
+    slot_domains: set[int],
+    workspace_slot_state: tuple[str, ...] = (),
+) -> None:
+    """Account for each slot-sized tensor on the owner and its components.
+
+    Workspace fields hold updates that have been folded into checkpoint pages
+    before a snapshot. Each such field must be allocated with a slot dimension.
+    """
     exported = _storage_ids(exporter.slot_state_rows(0))
     declared = set(type(exporter).token_derived_slot_state) | set(
         type(exporter).constant_slot_state
     )
+    per_slot = _per_slot_tensors(owner, slot_domains)
+    assert set(workspace_slot_state) <= per_slot.keys()
+    declared.update(workspace_slot_state)
     uncovered = sorted(
         name
-        for name, tensor in _per_slot_tensors(owner, slot_domains).items()
+        for name, tensor in per_slot.items()
         if tensor.untyped_storage().data_ptr() not in exported and name not in declared
     )
     assert not uncovered, (
@@ -722,6 +736,60 @@ def test_backend_slot_state_is_complete():
     pool = _kpool_pool()
     target = _dsa(pool, is_draft=False)
     _assert_slot_state_complete(pool, exporter=target, slot_domains={POOL_ROWS})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs KDA GPU registration")
+def test_kda_backend_slot_state_is_complete():
+    from dataclasses import replace
+    from test.runtime.conftest import make_kimi_pool
+    from test.runtime.test_kimi_k3_kda import _backend_config
+
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+
+    config, spec = _backend_config("cpu")
+    config = replace(config, max_bs=MAX_BS, max_resident_requests=MAX_RESIDENT_REQUESTS)
+    backend = KdaAttnBackend(
+        config, spec, enable_prefill_graph=False, kda_backend="auto"
+    )
+    backend.set_kv_pool(make_kimi_pool("cpu", usable_pages=24))
+    backend.preallocate_verify_workspace(MAX_BS, config.speculative_num_draft_tokens)
+    assert backend.slot_state_rows(MAX_RESIDENT_REQUESTS) == []
+    assert backend.slot_state_bytes() == 0
+    _assert_slot_state_complete(
+        backend,
+        exporter=backend,
+        slot_domains={POOL_ROWS},
+        workspace_slot_state=backend.workspace_slot_state,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs KDA GPU registration")
+def test_kda_recycled_and_restored_slots_start_without_accepted_records():
+    """A slot that starts a new admission never replays a previous owner's records."""
+    from dataclasses import replace
+    from test.runtime.conftest import make_kimi_pool
+    from test.runtime.test_kimi_k3_kda import _backend_config
+
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+
+    config, spec = _backend_config("cpu")
+    config = replace(config, max_bs=MAX_BS, max_resident_requests=MAX_RESIDENT_REQUESTS)
+    backend = KdaAttnBackend(
+        config, spec, enable_prefill_graph=False, kda_backend="auto"
+    )
+    backend.set_kv_pool(make_kimi_pool("cpu", usable_pages=24))
+    backend.preallocate_verify_workspace(MAX_BS, config.speculative_num_draft_tokens)
+    counts = backend._retained_length_storage
+    counts.fill_(5)
+    # Slots 2 and 4 start serving new admissions (RuntimeStates.bind_stop_criteria).
+    backend.reset_request_workspace(torch.tensor([2, 4]), stream=None)
+    # A restore imports no KDA rows; the restored slot starts empty too.
+    backend.import_slot_state(
+        6, torch.empty(0, dtype=torch.uint8), None, admission_id=9
+    )
+    for slot in range(counts.shape[1]):
+        expected = 0 if slot in (2, 4, 6) else 5
+        assert bool(counts[:, slot].eq(expected).all()), slot
 
 
 @pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)
@@ -898,3 +966,34 @@ def _v41_confidence_drafter(monkeypatch):
 def test_v41_confidence_slot_state_is_complete(monkeypatch):
     drafter = _v41_confidence_drafter(monkeypatch)
     _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})
+
+
+def _gdn_pending():
+    from tokenspeed.runtime.layers.attention.backends.state.gdn_pending import (
+        GdnPendingState,
+    )
+
+    return GdnPendingState(
+        torch.empty(2, MAX_BS * 4, 128 + 2 * 128 + 4, dtype=torch.bfloat16),
+        torch.zeros(2, 2, 2),
+        slot_count=POOL_ROWS,
+        geometry=(1, 2, 128, 128),
+        state_addresses=torch.zeros(2, dtype=torch.uint64),
+        state_row_strides=torch.full((2,), 2 * 128 * 128, dtype=torch.int64),
+        rows_aligned=True,
+        group_indices=torch.zeros(2, dtype=torch.int64),
+    )
+
+
+def test_gdn_pending_metadata_is_complete_and_snapshots_require_materialization():
+    owner = _gdn_pending()
+    _assert_slot_state_complete(owner, exporter=owner, slot_domains={POOL_ROWS})
+    owner.records[3] = torch.tensor([7, -1, 100, -1])
+    layout = SlotStateLayout([owner])
+    image = torch.empty(layout.nbytes, dtype=torch.uint8)
+    layout.export(3, image, None, admission_id=1)
+    layout.import_(6, image, None, admission_id=1)
+    assert torch.equal(owner.records[3], owner.records[6])
+    owner.records[3, 1] = 0
+    with pytest.raises(RuntimeError, match="must be materialized"):
+        layout.export(3, image, None, admission_id=1)

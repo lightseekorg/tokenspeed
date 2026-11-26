@@ -2,24 +2,29 @@
 
 The engine's control plane, in Rust, as
 [RFC 0002](../docs/rfcs/0002-rust-control-plane.md) describes it: every
-engine rank is a Python process that enters the native host extension,
-runs the scheduling loop in Rust and uses Python for the data plane. The design rules of the loop are in
+engine rank is a CPython process. The launcher starts `ts-host`, which execs
+`python -m tokenspeed_engine.host`; its main thread enters the native host
+extension and runs the scheduling loop in Rust, and its forward thread runs
+the Python data plane. Frontends such as SMG and Dynamo are separate
+processes that reach the ranks over the msgpack ZMQ wire, so no Python sits
+on the request path. The design rules of the loop are in
 [`docs/design/event-loop.md`](../docs/design/event-loop.md).
 
 | Source crate | Published package | Role |
 | --- | --- | --- |
 | `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
 | `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts, control operations and an EPD encode server's encode requests. |
-| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `ts-l3`'s executor for Python tests over a data plane's Host pool. |
+| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), `ts-l3`'s executor for Python tests over a data plane's Host pool, and `ts-pd`'s bootstrap server, which the launcher hosts. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
 | `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into `_host`, with a `cxx` facade for the control thread. The module is imported from the host extension, so the plans Python reads are the same C++ objects the control thread produced. The crate also holds the host's profile span recorder, which the C++ scheduler's spans reach through the facade. |
-| `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
+| `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, OTLP trace export, the engine side of the msgpack wire, and the per-round agreements among ranks, including those on the L3 and Disk tiers' and peer prefix sharing's results. An EPD encode rank runs its encode loop instead of the scheduling loop. |
 | `ts-grammar` | `tokenspeed-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
 | `ts-metrics` | `tokenspeed-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
 | `ts-mooncake` | `tokenspeed-mooncake` | The Mooncake transfer engine and store client through their C APIs, loaded at runtime from the `tokenspeed-mooncake` wheel. |
+| `ts-disk` | `tokenspeed-disk` | Block I/O between registered memory (the Host pool and a peer push ring) and a local file for the Disk tier ([RFC 0006](../docs/rfcs/0006-disk-tier.md)): `O_DIRECT` reads and writes on io_uring or a `pread`/`pwrite` thread pool, chosen explicitly, with reads ahead of background writes paced to a byte budget. |
 | `ts-l3` | `tokenspeed-l3` | The L3 storage tier's Host-only executor ([asynchronous L3](../docs/design/async-l3-cache.md)): object naming, the Host pool's layout and ownership, bounded queues and workers, backend health, and the stores (the Mooncake store client, and an in-memory one for tests). |
-| `ts-pd` | `tokenspeed-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
-| `ts-host` | `tokenspeed-host` | The rank extension: the launching interpreter imports it, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
+| `ts-pd` | `tokenspeed-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress; the routes, block manifests and copies between unequal Prefill and Decode rank sets; the bootstrap server the nodes rendezvous through; and EPD's embedding transfers from an encode node to the prefill ranks. |
+| `ts-host` | `tokenspeed-host` | The rank extension: the launching interpreter imports it, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. An EPD encode rank runs the host's encode mode (`epd/encode_host.py`). |
 
 The crates.io packages use the `tokenspeed-` prefix. Their Rust library names
 remain `ts_wire`, `ts_client`, and so on; the Python module remains `_native`,
@@ -27,14 +32,29 @@ and the host launcher remains `ts-host`, backed by the `_host` extension. For ex
 
 ```toml
 [dependencies]
-ts-client = { package = "tokenspeed-client", version = "0.1.0" }
+ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 ```
 
 ## Wire conformance
 
-The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
-long-request ingress, prompt logprobs and high-frequency output streaming with
-the real wire, control and client classes, without a GPU or model weights.
+The native frontend offers two distinct request operations. `abort(rid)`
+only sends the engine's abort and does not guarantee a terminal output.
+`cancel(rid)` also closes that client's output stream after a successful send:
+Rust receives `StreamError::Cancelled`; Python's `next_outputs()` receives
+`(rid, RequestCancelled)`, an `EngineError` subclass, after already queued
+chunks.
+
+A finish is preserved when it wins the race. A failed or interrupted cancel
+send leaves ownership attached for retry unless the stream ended independently.
+
+Cancellation changes no engine retirement fence or engine-reported load; use
+fresh request ids for subsequent submissions. See the
+[request lifecycle contract](../docs/design/event-loop.md#request-identity-and-submission-failures).
+
+`tokenspeed-client` 0.2 makes `StreamError` non-exhaustive and adds `Cancelled`.
+Rust callers updating from 0.1 must include a fallback match arm. The minor
+version change keeps this source incompatibility out of ordinary 0.1 updates;
+the engine wire schema and Python wheel versioning are unchanged.
 
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
@@ -74,27 +94,38 @@ The frontend likewise consumes a decoded batch into independently owned
 per-request chunks. A queued chunk owns its arrays until consumption or
 cancellation; one slow request need not retain another request's payload.
 
-## Building
-
 Snapshot SDK updates carry a complete publication directory in the optional
 `UpdateWeightsFromMooncakeReqInput.snapshot` map. The native host and Python
-runtime must be built together to transport this field. The existing global
-commit and memory-saver rules still apply. The configured SDK updater receives
-`update_weights(models, version=..., snapshot=...)`. Tensor data remains in the
-SDK's store. Requests without a snapshot retain the existing SDK protocol.
+runtime must be built together to transport this field. The global commit and
+memory-saver rules apply as they do to any weight update. The configured SDK
+updater receives `update_weights(models, version=..., snapshot=...)`. Tensor
+data remains in the SDK's store. Requests without a snapshot use the SDK
+protocol without one.
+
+## Building
 
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
 an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
 installed. The scheduler source is bundled in its crate; the grammar build
-downloads the pinned, SHA256-checked xgrammar source release and therefore
-needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+downloads the pinned, SHA256-checked tokenspeed-xgrammar source release and needs
+network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+Keep that source pin aligned with the Python dependency, which still imports as
+`xgrammar`, and regenerate the tokenizer fixtures with
+`python tokenspeed-engine/crates/ts-grammar/tests/fixtures/generate.py` when upgrading.
+Rebuild the engine alongside the Python dependency so their tokenizer serialization
+formats agree.
+In an existing environment, uninstall the upstream `xgrammar` distribution before
+installing `tokenspeed-xgrammar`; both own the `xgrammar` module.
+
+For `cargo test --locked`, install `numpy` and `prometheus-client` in that
+interpreter too. The metrics tests read the real Prometheus multiprocess files.
 
 Install a development build with `pip install -e tokenspeed-engine` from the
 repository root. It builds both native extensions and the scheduler together.
-`tokenspeed_engine.host_binary()` still names the `ts-host` launcher. It keeps
-the existing arguments and execs the selected `--python` interpreter to enter
-`tokenspeed_engine.host`, preserving the PID and inherited descriptors.
+`tokenspeed_engine.host_binary()` names the `ts-host` launcher, which execs the
+`--python` interpreter it is given to enter `tokenspeed_engine.host`,
+preserving the PID and inherited descriptors.
 `tokenspeed_engine.scheduler` is the scheduler's Python API, the same names
 `tokenspeed_scheduler` exports, served by the scheduler linked into `_host`.
 TokenSpeed imports it, so it needs no separate `tokenspeed-scheduler` install,
@@ -107,16 +138,34 @@ timestamps from the default UTC (`...Z`) to the machine's local time with
 an explicit UTC offset (`...+08:00`); truthy values are `1`, `true`, `on`
 and `yes`, case-insensitive, matching dynamo's `DYN_LOG_USE_LOCAL_TZ`.
 
+## CPU benchmark
+
+The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
+long-request ingress, prompt logprobs and high-frequency output streaming with
+the real wire, control and client classes, without a GPU or model weights.
+
 ## Releasing Python wheels
 
-**Build and Release TokenSpeed** first builds, tests and publishes an engine
-post release to the wheel repository, then builds and publishes TokenSpeed.
-Both use the same source commit; for a nightly this is the kernel nightly's
-commit. TokenSpeed nightlies pin the actual engine version returned by the
-release workflow, including any post-date advancement. Stable TokenSpeed
-releases retain their existing engine dependency range. These automatic
-engine releases do not upload to PyPI. A TokenSpeed nightly dry run also
-builds and tests the engine without publishing either package.
+Engine wheels are released in three ways:
+
+* With a TokenSpeed nightly. **Publish nightly**
+  ([nightly wheels](../docs/guides/getting-started.md#nightly-wheels)) runs
+  **Build and Release TokenSpeed**, which first calls
+  **Release TokenSpeed Engine** with the `nightly` release type on the run's
+  source commit and date, then pins TokenSpeed to the exact engine version it
+  returns. A nightly is `<base>.postYYYYMMDD`, or `<base>rcN.postYYYYMMDD`
+  for release candidate `N`; its date never advances. It goes to
+  `lightseekorg/whl` only. A version already published from another commit
+  fails the run unless `replace_nightly` replaces its wheels and refreshes
+  their index hashes.
+* With a stable release. The **Biweekly release**
+  ([biweekly releases](../docs/guides/weekly-release.md)) bumps the engine's
+  base version through a version PR and publishes the engine wheels from
+  `release/engine-<version>` to `lightseekorg/whl` and PyPI. TokenSpeed then
+  pins `tokenspeed-engine==<version>`. A stable TokenSpeed release builds no
+  engine: it requires that pin and a `tokenspeed-engine/` tree unchanged
+  since the commit that engine was published from.
+* With a manual run of **Release TokenSpeed Engine**, described below.
 
 Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
 build and test wheels, or `publish` on `main` to upload them. Choose a
@@ -144,34 +193,35 @@ the requested date without automatic advancement.
 Leave `version_date` empty for a stable `release`. The workflow resolves the
 version once and changes the Python package version only in the build
 checkout. The committed base version and Rust crate versions stay unchanged.
+A manual stable release publishes the committed base version, so merge its
+bump first.
 
 Wheels are attached to
 [`lightseekorg/whl` releases](https://github.com/lightseekorg/whl/releases)
-under `tokenspeed-engine-v<VERSION>`. Only `rc` is marked as a GitHub
-prerelease; `post` uses a normal GitHub release. The workflow also creates or
-updates the pip indexes
-in the wheel repository's `gh-pages` branch, retaining historical links and
-adding SHA256 hashes. No manual directory preparation is needed. GitHub
+under `tokenspeed-engine-v<VERSION>`. `rc` and nightly releases are marked as
+GitHub prereleases; `post` and `release` use normal GitHub releases. The
+workflow also creates or updates the pip indexes in the wheel repository's
+`gh-pages` branch, retaining historical links and adding SHA256 hashes. No manual directory preparation is needed. GitHub
 Pages serves an index update after its deployment finishes.
 
 ```bash
 # Stable wheels mirrored from a release.
 pip install --index-url https://lightseek.org/whl/ tokenspeed-engine
-# Post releases and explicitly selected release candidates.
+# Nightlies, post releases and explicitly selected release candidates.
 pip install --index-url https://lightseek.org/whl/nightly/ tokenspeed-engine
 pip install --pre --index-url https://lightseek.org/whl/nightly/ 'tokenspeed-engine==0.1.0rc20261112'
 ```
 
-The existing `https://lightseek.org/whl/nightly/rocm7.2/` index receives the
-same engine post/rc wheels. An rc sorts below the same base version's final
-and post releases, so pin the exact version when testing it. Merge a base
-version bump before the next stable release.
+The `https://lightseek.org/whl/nightly/rocm7.2/` index receives the same
+engine nightly, post and rc wheels. An rc sorts below the same base version's
+final and post releases, so pin the exact version when testing it.
 
 Use **Re-run failed jobs** to upload missing files from the same source
-commit. **Re-run all jobs** resolves the version again and may allocate a
-new post date; use **Re-run failed jobs** to retain the original version.
-Existing assets are never overwritten. A different commit requires
-a new post run, an unused rc date, or a new base version for a stable release.
+commit. In a manual run, **Re-run all jobs** resolves the version again and
+may allocate a new post date; use **Re-run failed jobs** to retain the
+original version. Only a nightly with `replace_nightly` overwrites existing
+assets. A different commit requires a new post run, an unused rc date, or a
+new base version for a stable release.
 
 Wheels support Linux with glibc 2.28 or newer on x86_64 and aarch64.
 Each architecture has two wheels: `cp311-cp311` for CPython 3.11 and

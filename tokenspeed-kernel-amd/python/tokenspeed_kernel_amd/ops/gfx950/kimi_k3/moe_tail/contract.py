@@ -88,6 +88,11 @@ class KimiK3MoeTailBuild:
     its output folded into the next layer's FP32 attention-residual block
     partial, then RMS-normalized (as ``attnres_combine`` does). ``mix_eps`` is
     that mix's epsilon, None without it.
+
+    With ``gated_norm`` the attention output is the raw KDA recurrence output,
+    and the tail applies the layer's gated output norm as it stages it: the
+    gate logits rows are ``gate_stride`` elements apart, ``norm_eps`` is the
+    norm's epsilon.
     """
 
     tokens: int
@@ -98,12 +103,26 @@ class KimiK3MoeTailBuild:
     ln_eps: float
     next_mix: bool
     mix_eps: float | None
+    gated_norm: bool = False
+    gate_stride: int = 0
+    norm_eps: float = 0.0
 
     def __post_init__(self):
         if not 1 <= self.tokens <= MAX_ROWS or not 1 <= self.nblocks <= 8:
             raise ValueError("The MoE tail takes 1-8 rows and 1-8 residual blocks")
         if (self.mix_eps is not None) != self.next_mix:
             raise ValueError("mix_eps is the next layer's mix's, given exactly with it")
+        if self.gated_norm and not gated_norm_rows(self.tokens):
+            raise ValueError(
+                f"The MoE tail stages the gated norm of 32-head-row chunks, not "
+                f"{self.tokens} rows"
+            )
+
+
+def gated_norm_rows(tokens: int) -> bool:
+    """Whether the tail can apply the KDA gated output norm at ``tokens`` rows:
+    their 128-element head rows fill whole 32-row staging chunks."""
+    return tokens * (ATTENTION // 128) % 32 == 0
 
 
 def _align(value: int, alignment: int) -> int:

@@ -20,9 +20,11 @@
 
 """The Python half of the Rust engine host (RFC 0002).
 
-``ts-host`` (``tokenspeed-engine/crates/ts-host``) runs one rank: its control
-thread schedules, admits requests and emits outputs in Rust, and the
-interpreter it embeds runs the data plane. This module is everything that
+``ts-host`` (``tokenspeed-engine/crates/ts-host``) starts one rank by
+exec'ing the launcher's interpreter into ``tokenspeed_engine.host``. That
+process's main thread enters the host extension and becomes the control
+thread, which schedules, admits requests and emits outputs in Rust; its
+forward thread runs the data plane. This module is everything that
 interpreter runs, plus the launcher's side:
 
 * ``start_rust_host`` starts the binary for one rank; every launch path
@@ -66,9 +68,17 @@ from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
+from tokenspeed.runtime.cache.disk import (
+    DiskSettings,
+    DiskTierTuning,
+    disk_scheduler_config,
+    disk_settings,
+)
+from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
+    PUSH_TIMEOUT_S,
     QUARANTINE_S,
     RECORD_LIFETIME_S,
     PeerSharingSettings,
@@ -76,6 +86,7 @@ from tokenspeed.runtime.cache.peer import (
     peer_incarnation,
     peer_scheduler_config,
 )
+from tokenspeed.runtime.cache.transfer.ops import SnapshotOp
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -297,7 +308,8 @@ def start_rust_host(
         binary: The ``ts-host`` executable.
         server_args: The rank's server arguments.
         port_args: The engine's ports.
-        start_context: Entered around starting the process.
+        start_context: Entered before capturing the child environment and
+            starting the process, including allocator preload configuration.
         metrics_relay_endpoint: The node's metrics relay
             (``metrics/relay.py``), which runs the output plugins; None
             when no plugin is selected.
@@ -319,6 +331,12 @@ def start_rust_host(
         # Set each native writer's fallback before the host initializes logging.
         level = server_args.log_level.lower()
         host_env = os.environ.copy()
+        if host_env.get("LD_PRELOAD"):
+            # Nested allocator contexts can repeat an inherited hook. Preserve
+            # library order without changing the parent's environment.
+            host_env["LD_PRELOAD"] = ":".join(
+                dict.fromkeys(filter(None, host_env["LD_PRELOAD"].split(":")))
+            )
         host_env.setdefault(
             "TS_HOST_LOG",
             {
@@ -543,6 +561,10 @@ class HostConfig:
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
             and ``--enable-metrics``.
+        disk: With the local Disk tier, what the host starts its executor
+            from; else None.
+        disk_metrics: This rank reports the Disk tier's metrics: with the
+            tier and ``--enable-metrics``.
         attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
@@ -616,6 +638,8 @@ class HostConfig:
     trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
+    disk: DiskSettings | None
+    disk_metrics: bool
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
@@ -641,8 +665,8 @@ def host_in_flight_depth(server_args: ServerArgs) -> int:
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
 
-# The Host pools an L3 executor addresses, kept for the process.
-_L3_HOST_POOLS: list = []
+# The Host pools a native executor (L3, Disk) addresses, kept for the process.
+_ADDRESSED_HOST_POOLS: list = []
 
 
 @dataclass
@@ -656,6 +680,9 @@ class _AdmittedRequest:
     multimodal_inputs: MultimodalInputs | None
     # Its grammar's matcher in the host, once compiled; None without one.
     grammar: HostGrammar | None = None
+    # The slot whose last decode could have left replay. Retraction ends
+    # that ownership even though the request's admission stays alive.
+    replay_slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -688,8 +715,13 @@ class HostDataPlane:
         attn_tp_cpu_group,
         epd_publisher,
         starting: bool,
+        record_cache_observations: bool = False,
+        *,
+        defer_recurrent_state: bool,
     ) -> None:
         self._device = handle
+        self._defer_recurrent_state = defer_recurrent_state
+        self._record_cache_observations = record_cache_observations
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
         self._starting = starting
@@ -785,6 +817,22 @@ class HostDataPlane:
     def _admission_id(self, rid: str) -> int:
         return self._requests[rid].admission_id
 
+    def _retiring_replay_slots(self, plan, cache_ops) -> list[int]:
+        slots = []
+        for operation in cache_ops:
+            if isinstance(operation, SnapshotOp):
+                request = self._requests[operation.request_id]
+                if request.replay_slot is not None:
+                    slots.append(operation.request_pool_index)
+                    request.replay_slot = None
+        for abort in plan.aborts:
+            request = self._requests.get(abort.request_id)
+            if request is not None and request.replay_slot is not None:
+                # A retraction can publish a checkpoint before it fails.
+                slots.append(request.replay_slot)
+                request.replay_slot = None
+        return slots
+
     def execute(
         self,
         plan,
@@ -793,6 +841,7 @@ class HostDataPlane:
         grammar_advance: list[bool] | None,
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
         history: tuple[list[int], list[int], list[list[int]]] | None,
+        retirement_id: int | None = None,
     ) -> _Dispatched | None:
         """Run one round's plan; the forward to complete later, if one ran.
 
@@ -813,6 +862,7 @@ class HostDataPlane:
                 committed prefixes the batch seeds (``RequestHistorySeeds``'
                 slots, prefix lengths and tokens); None when no row needs
                 one.
+            retirement_id: The host's fence for snapshots and scheduler aborts.
         """
         dp_metadata = None
         idle_forward = False
@@ -891,11 +941,36 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
+        cache_ops = cache_ops_from_plan(
+            plan,
+            request_admission=self._admission_id,
+            record_observations=self._record_cache_observations,
+        )
+        retirement_slots = (
+            self._retiring_replay_slots(plan, cache_ops.device)
+            if retirement_id is not None
+            else ()
+        )
+        if (
+            self._defer_recurrent_state
+            and planned is not None
+            and planned.forward_op.num_extends() == 0
+            and any(request.replay_slot is None for request in requests)
+        ):
+            for request, slot in zip(
+                requests, planned.forward_op.request_pool_indices, strict=True
+            ):
+                request.replay_slot = slot
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
         with kernel_warmup(enabled=self._starting):
-            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            results = self._device.execute(
+                plan,
+                planned,
+                cache_ops=cache_ops.device,
+                retirement_slots=retirement_slots,
+                retirement_id=retirement_id,
+            )
             if idle_forward:
                 self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
@@ -951,12 +1026,36 @@ class HostDataPlane:
             )
         ]
 
-    def release(self, rids: list[str]) -> None:
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """CPU observations completed by the preceding cache ACK poll.
+
+        The Rust host adds trusted engine/rank/instance context and performs
+        bounded nonblocking export. This method performs no device queries,
+        serialization, I/O, or request-ID lookup.
+        """
+        return self._device.poll_cache_observations()
+
+    def poll_replay_retirement(self) -> int:
+        """Report the last completed replay fence to the host."""
+        return self._device.poll_replay_retirement()
+
+    def replay_retirement_enabled(self) -> bool:
+        """Whether the host needs to order replay retirement work."""
+        return self._defer_recurrent_state
+
+    def release(self, rids: list[str], retirement_id: int | None = None) -> None:
         """Forget requests that ended. Their grammar matchers and
         shared-memory features go behind every forward launched before this,
         the ones that may read them."""
         requests = [(rid, self._requests.pop(rid)) for rid in rids]
-        if any(
+        retirement_slots = []
+        if retirement_id is not None:
+            retirement_slots = [
+                request.replay_slot
+                for _, request in requests
+                if request.replay_slot is not None
+            ]
+        if retirement_slots or any(
             request.grammar is not None
             or (
                 request.multimodal_inputs is not None
@@ -967,6 +1066,8 @@ class HostDataPlane:
             # A release is a data-plane task: it runs behind a drafter's
             # pending round.
             self._device.settle()
+        if retirement_id is not None:
+            self._device.retire_replay(retirement_id, retirement_slots)
         for rid, request in requests:
             if request.grammar is not None:
                 request.grammar.release()
@@ -1048,6 +1149,10 @@ class HostDataPlane:
         """Restore memory regions, in order."""
         for tag in tags:
             self._regions[tag].resume()
+
+    def finish_memory_resume(self) -> None:
+        """Rebuild resources after the scheduler's all-rank wake gate."""
+        self._device.finish_memory_resume()
 
     def set_grammar_entries(self, entries: list[tuple[str, int]]) -> None:
         """The host's matcher entries, before serving starts."""
@@ -1200,22 +1305,15 @@ def _peer_sharing_settings(
     host_cache,
     geometry,
 ) -> PeerSharingSettings:
-    """What the host starts this rank's peer sharing from. A collective of
-    the world (the namespace's checkpoint agreement) and of the attention-TP
-    group (one incarnation for the replica, whose members' schedulers must
-    agree on their lease ids)."""
+    """Build the live cache namespace and agree on the TP replica's incarnation."""
     mapping = server_args.mapping
-    world_group = (
-        pg_manager.get_process_group("gloo", mapping.world_group)
-        if mapping.world_size > 1
-        else None
-    )
     deployment_id = cache_deployment_id(
         server_args,
         model_config,
         draft_model_config,
         host_cache=host_cache,
-        world_cpu_group=world_group,
+        world_cpu_group=None,
+        for_peer=True,
     )
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
@@ -1226,11 +1324,21 @@ def _peer_sharing_settings(
         )
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)
-    port = server_args.peer_prefix_port + mapping.attn.dp_rank
+    port = server_args.peer_prefix_port
     # The name a router's hint carries: the advertised host when given.
     host = server_args.peer_prefix_host or local_ip
     return PeerSharingSettings(
-        name=peer_endpoint_name(host, port),
+        name=peer_endpoint_name(host, port, mapping.attn.dp_rank),
+        node_leaders=(
+            ((mapping.rank, mapping.attn.dp_rank),)
+            if server_args.emulate_rank_zero
+            else tuple(
+                (rank, dp_rank)
+                for dp_rank, rank in enumerate(mapping.attn.dp_group)
+                if rank // mapping.nprocs_per_node
+                == mapping.rank // mapping.nprocs_per_node
+            )
+        ),
         bind_host="::" if ":" in local_ip else "0.0.0.0",
         port=port,
         incarnation=incarnation[0],
@@ -1238,9 +1346,11 @@ def _peer_sharing_settings(
         weight_version=str(server_args.weight_version),
         answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
         quarantine_s=QUARANTINE_S,
+        push_timeout_s=PUSH_TIMEOUT_S,
         record_lifetime_s=RECORD_LIFETIME_S,
         library=mooncake_library(),
         local_ip=local_ip,
+        push_host=host,
         protocol=mooncake_protocol(),
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
@@ -1294,6 +1404,18 @@ class HostBootstrap:
             model_config = load_model_config(
                 server_args, server_args.model, draft_of=None
             )
+            # Refused here, where the model is known, like the layouts
+            # ServerArgs refuses: deferred allocation is not validated
+            # with multimodal inputs.
+            if (
+                model_config.is_multimodal_active
+                and server_args.disaggregation_decode_allocation_policy == "deferred"
+            ):
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy deferred does "
+                    "not support a multimodal model; serve it with "
+                    "--language-model-only"
+                )
             if server_args.speculative_draft_model_path is not None:
                 draft_model_config = load_model_config(
                     server_args,
@@ -1375,8 +1497,30 @@ class HostBootstrap:
             if l3 is not None:
                 # The executor addresses the Host pool by pointer, and native
                 # I/O that cannot prove its retirement keeps it past close.
-                _L3_HOST_POOLS.append(device.host_cache.storage)
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             storage_config = l3.runtime.scheduler if l3 is not None else None
+            # The local Disk tier under the Host pool; None without
+            # --disk-tier-paths (docs/rfcs/0006-disk-tier.md).
+            disk = None
+            disk_config = None
+            if server_args.disk_tier_paths is not None:
+                disk_tuning = DiskTierTuning.from_json(server_args.disk_tier_config)
+                disk = disk_settings(
+                    server_args,
+                    tuning=disk_tuning,
+                    host_storage=device.host_cache.storage,
+                    ownership=device.host_cache.ownership,
+                    global_rank=global_rank,
+                )
+                disk_config = disk_scheduler_config(
+                    disk_tuning,
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
+                )
+                # The executor addresses the Host pool by pointer as well.
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             #: With peer prefix sharing, what the host starts this rank's peer
             #: endpoint and reads from (``cache/peer.py``); else None.
             self.peer_sharing = None
@@ -1394,6 +1538,11 @@ class HostBootstrap:
                     incarnation=self.peer_sharing.incarnation,
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
+                    landing_tier=server_args.peer_prefix_landing_tier,
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
                 )
             specs = device.specs
             geometry = specs.cache_geometry
@@ -1401,6 +1550,8 @@ class HostBootstrap:
                 server_args,
                 specs,
                 storage_config=storage_config,
+                num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
+                disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
                 max_resident_requests=max_resident_requests,
@@ -1425,11 +1576,7 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
-                max_kv_page_num=(
-                    0
-                    if server_args.chunk_prefill_kv_size is None
-                    else scheduler_config.max_kv_page_num
-                ),
+                max_kv_page_num=scheduler_config.max_kv_page_num,
                 prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity
@@ -1649,6 +1796,8 @@ class HostBootstrap:
                 ),
                 l3=l3,
                 l3_metrics=l3 is not None and server_args.enable_metrics,
+                disk=disk,
+                disk_metrics=disk is not None and server_args.enable_metrics,
                 attn_tp_rank=attn_tp_rank,
                 engine_role=server_args.disaggregation_mode,
             )
@@ -1696,6 +1845,8 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 starting=server_args.enable_startup_requests,
+                record_cache_observations=device.specs.cache_observation_capacity > 0,
+                defer_recurrent_state=server_args.enable_deferred_gdn_state,
             )
             self._device = device.handle
 
@@ -1815,7 +1966,9 @@ def bootstrap(
             "sharing; rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.disaggregation_mode == "encode":
-        return EncodeBootstrap(server_args, port_args, connection)
+        return EncodeBootstrap(
+            server_args, port_args, connection, metrics_relay_endpoint
+        )
     return HostBootstrap(
         server_args,
         port_args,

@@ -177,7 +177,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.4 and compile isolated modules, operators, and tuning caches. They require
+0.7.5 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -252,7 +252,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.4) initializes unused rows inside active
+The pinned FlashInfer version (0.7.5) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -325,13 +325,13 @@ whose routing already has both edits is used as is, so this module is no
 longer built once the minimum supported FlashInfer includes #5557; remove the
 adapter then.
 
-### Qwen3.8 low-batch tactic
+### Qwen3.8 decode tactic
 
 For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with
 TP4/EP4 and top-k 10, the private runner restricts inputs of at most 32 tokens
 to FlashInfer's valid tile-32 tactics. If the native launcher does not offer
 tile 32 for a profile, all native tactics remain available. Other models and
-larger token counts use the full tuner. Only the matching shape gets a separate
+larger TP4 token counts use the full tuner. Only the matching shape gets a separate
 tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
@@ -357,6 +357,30 @@ GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
+
+With TP1 (all 512 experts local), the policy covers the 128- to 512-token
+buckets instead (65 to 512 rows: 17 to 128 requests with four MTP rows each).
+It keys on the token bucket, so TP1 prefill and extend batches of 65 to 512
+tokens get tile 32 as well. FlashInfer tunes on balanced routes, about 2.5 to
+10 tokens per expert there, and usually picks tiles of 8 or 16 tokens. Decode
+routes are skewed: on routes captured from a real-text prefill, a batch of 32
+requests x 4 rows reaches only about 161 of the 512 experts per layer, and a
+few experts take most of the rows. On SM107 with FlashInfer 0.7.5 and those
+routes (routing, FC1 and FC2 in a CUDA graph with PDL), the tuner's pick vs
+the tile-32 pick it makes under this policy, us per MoE call:
+
+| rows | tuner today | tile 32 |
+|---|---|---|
+| 128 | 60.16 | 54.26 |
+| 256 | 67.55 | 63.68 |
+| 512 | 84.80 | 75.71 |
+
+On balanced routes tile 32 costs 1.3 to 2.5% per MoE call at 33 to 256 rows.
+The 64-token bucket (33 to 64 rows) keeps the full tuner: tile 32 saved 3% per
+call on the captured routes but nothing in serving at 9 to 16 requests, and
+tile 8 wins at 33 rows. At 8 to 32 rows the tuner's tile-8 and tile-16 picks are
+as fast or faster, and from the next bucket (768) the tuner already picks tile
+32, so other buckets keep the full tuner.
 
 ### Kimi-K3 decode tactic
 
@@ -452,6 +476,29 @@ The kernel takes precomputed routes only as BF16 weights packed with the
 expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
+
+## FlashInfer CuTe DSL NVFP4 SiTU (`flashinfer_cutedsl.py`)
+
+`flashinfer_cutedsl_nvfp4_situ_routed_moe_apply` runs Kimi-K3 NVFP4 SiTU
+experts on FlashInfer's CuTe DSL fused MoE (`--moe-backend
+flashinfer_cutedsl`); `auto` keeps the TRT-LLM-Gen kernel. The preprocessor
+converts the checkpoint layout: W13 rows `[gate | up]` become `[up | gate]`
+interleaved in 64-row groups, and the linear E4M3 block scales are swizzled
+per expert. The scale storage stays expert-major and the kernels read it
+through an MMA-layout view, so DWDP streams these experts like the TRT-LLM
+layout. FC1 alpha is `a13 * w13_scale_2` and FC2 alpha `a2 * w2_scale_2`. The
+kernel quantizes the GEMM2 input with one global scale (`1 / a2`), so the
+preprocessor rejects checkpoints whose per-expert `a2` differ (Kimi-K3-NVFP4
+ships 1.0 everywhere).
+
+Expert parallelism uses global routing IDs and computes only the local
+expert shard; the caller owns dispatch and combines the ranks' partial outputs.
+EP1 execution also supports DWDP's full-expert views over sharded weight storage.
+
+The apply uses one fixed tactic (256-row routing tiles, 2-CTA clusters) and
+the fused, atomic finalize; it always finalizes. On GB300 at K3 prefill shapes
+(896 experts, top-16, uniform routing) the routed MoE layer is 5-6% faster than
+TRT-LLM-Gen at 16K rows and 11% faster at 24K rows beside a peer weight copy.
 
 ## FP8 per-channel experts
 
@@ -570,8 +617,9 @@ byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 ## Routing weight storage and deferred finalize
 
 `moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
-routing stores its weights in that dtype after FP32 scoring, normalization, and
-scaling.
+and Kimi K3 routing store their weights in that dtype after FP32 scoring,
+normalization, and scaling. Kimi K3 uses BF16 for TRT-LLM SiTU and FP32 for
+MegaMoE and Gluon Petit.
 
 On NVIDIA, the DeepSeek V4 MoE defers finalization for BF16 activations
 whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
@@ -638,6 +686,40 @@ The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
 router and do not depend on the FlashInfer package shipping its experimental
 kernel sources (release wheels omit them). Prepare/warm up before graph capture;
 no persistent activation tensors are cached per layer by this adapter.
+
+## Kimi-K3 MXFP4 MegaMoE (`flashinfer_cutedsl.py`)
+
+`flashinfer_mxfp4_situ_mega_moe_apply` (`solution="mega_moe"`) runs FlashInfer's
+Kimi K3 MegaMoE: the expert kernel dispatches routed rows to their owners and
+runs both MXFP4 expert GEMMs with SiTU on MXFP8 activations. A final top-k
+reduction combines the returned expert outputs.
+
+The preprocessor rewrites the checkpoint's packed experts in place into the
+kernel's layout (gate/up rows interleaved in 16-row groups, block scales
+swizzled), so the layer keeps one copy of its weights. Weights are launch
+arguments: MoE layers with matching dimensions and activation in an EP group
+share one set of workspaces (`thirdparty/flashinfer/kimi_mega_moe.py`).
+
+A workspace's token capacity is a compile-time parameter; the live row count
+is not. Both MegaMoE runners use the runtime's startup tuning capacity.
+`MoELayer.input_buffers` prepares shared storage in the CPU-backed workspace
+region during warmup. MXFP4 compiles power-of-two capacities from 128 to that
+bound over shared storage, with fixed region and counter offsets across variants.
+Each variant is warmed before capture. The router writes IDs and scores directly
+into the selected capacity's buffers, and the quantizer writes MXFP8 values
+and scales there. Only unused route rows need masking; there is no routing-copy
+kernel on this path. All EP ranks use the same per-step capacity.
+
+The kernel is sized for every SM of the device. Above 128 rows per rank its
+router spans several CTAs and deadlocks across ranks when another kernel holds
+SMs during the launch, so the caller must not overlap it with work on another
+stream. Both MXFP4 and NVFP4 MegaMoE join shared-expert work immediately before
+launch. Routing and latent projection may overlap shared computation beforehand;
+shared-expert TP reduction may overlap routed normalization and projection
+afterward.
+
+The kernel takes BF16 rows, int32 expert ids and FP32 route weights, and
+returns a view of the workspace that is valid until its next launch.
 
 ## NVFP4 MegaMoE for Qwen3.5
 

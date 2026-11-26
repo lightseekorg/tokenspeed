@@ -59,6 +59,10 @@ std::int32_t snapshotPoolBlocks(const SchedulerConfig& config) {
     return config.HasSnapshotPool() ? config.snapshot_allocator.NumUsableBlocks() : 0;
 }
 
+std::int32_t diskPoolBlocks(const SchedulerConfig& config) {
+    return config.HasDiskCache() ? config.disk_allocator.NumUsableBlocks() : 0;
+}
+
 std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
     std::vector<std::int32_t> slots_per_group;
     slots_per_group.reserve(config.cache_groups.size());
@@ -95,17 +99,24 @@ Scheduler::Scheduler(SchedulerConfig config)
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), config_.host_group_packing},
       snapshot_pool_{snapshotPoolBlocks(config_), config_.host_group_packing},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
-                                   config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
-                                   snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
-                                   config_.StreamsDeviceCacheToHost(),
-                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack,
-                                   config_.CheckpointRetentionRequests(), config_.checkpoint_retention_leaf_distance)},
+      disk_pool_{diskPoolBlocks(config_), config_.host_group_packing},
+      coordinator_{MakeCoordinator(
+          MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_, config_.enable_l3_storage,
+          hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr, diskPoolBlocks(config_) > 0 ? &disk_pool_ : nullptr,
+          snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr, config_.StreamsDeviceCacheToHost(),
+          config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack,
+          config_.CheckpointRetentionRequests(), config_.checkpoint_retention_leaf_distance)},
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
                              : nullptr},
-      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr} {
+      disk_transfers_{config_.HasDiskCache() ? std::make_unique<DiskTransferManager>(coordinator_, *config_.disk_config)
+                                             : nullptr},
+      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr},
+      peer_host_landings_{
+          config_.peer_config && config_.peer_config->landing_tier == PeerLandingTier::kHost
+              ? std::make_unique<PeerHostLandings>(coordinator_, config_.peer_config->max_host_landing_blocks)
+              : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -118,7 +129,7 @@ Scheduler::Scheduler(SchedulerConfig config)
             const CacheKey boundary = eventKey(key);
             // A Host block can arrive for a boundary no publication here ever
             // described (an L3 read): without its tokens there is no event.
-            if (mutation == CacheMutation::kHostResidency && !kv_event_boundaries_.contains(boundary)) {
+            if (mutation == CacheMutation::kLowerTierResidency && !kv_event_boundaries_.contains(boundary)) {
                 return;
             }
             markKvEventBoundaryForReconcile(boundary);
@@ -189,9 +200,10 @@ KvEventBatch Scheduler::DrainKvEventBatch() {
                                      ? static_cast<std::int32_t>(descriptor_tokens)
                                      : 0;
         const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
-        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable};
+        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable,
+                                                             status.disk_publishable};
         if (publishable != event_boundary.published) {
-            const bool anywhere = status.device_publishable || status.host_publishable;
+            const bool anywhere = status.device_publishable || status.host_publishable || status.disk_publishable;
             mutations.push_back({.block_hash = event_boundary.stored->block_hash,
                                  .stored = anywhere ? event_boundary.stored : KvEventDescriptorRef{},
                                  .resident = publishable});
@@ -212,8 +224,63 @@ bool Scheduler::ClearCache() {
     return clearCache(true);
 }
 
+void Scheduler::CancelStorageBackups() {
+    if (storage_transfers_) storage_transfers_->CancelBackups();
+    if (disk_transfers_) disk_transfers_->DropCleaning();
+}
+
+void Scheduler::CancelStorageForClear() {
+    for (auto& request : requests_) releaseStorage(*request);
+    CancelStorageBackups();
+}
+
 bool Scheduler::CanClearCache() const {
     return cacheIsClearable(true);
+}
+
+bool Scheduler::CanPrepareStorageClear() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    auto storage_refs = storage_transfers_ ? storage_transfers_->HeldBlockRefs() : std::vector<const CacheBlockRef*>{};
+    if (disk_transfers_) {
+        const std::vector<const CacheBlockRef*> disk_refs = disk_transfers_->HeldHostBlockRefs();
+        storage_refs.insert(storage_refs.end(), disk_refs.begin(), disk_refs.end());
+    }
+    return coordinator_.CacheIsClearableAfterStorageDrain(storage_refs);
+}
+
+bool Scheduler::CanClearCacheRetainingStorage() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    // A Disk operation or a peer landing into Host is never retained across a
+    // clear: one finishing after it would publish the old contents.
+    if ((disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending()) return false;
+    std::vector<const CacheBlockRef*> retained;
+    if (storage_transfers_) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& request : requests_) {
+            if (const auto* prefetch = request->GetIf<fsm::Prefetching>(); prefetch && prefetch->lease) {
+                leases.push_back(prefetch->lease.OperationId());
+            }
+            if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_hold) {
+                leases.push_back(admission->storage_hold->lease.OperationId());
+            }
+        }
+        if (!storage_transfers_->CanRetainForClear(leases)) return false;
+        retained = storage_transfers_->HeldBlockRefs();
+    }
+    return coordinator_.CacheIsClearableRetainingStorage(retained);
+}
+
+bool Scheduler::ClearCacheRetainingStorage() {
+    if (!CanClearCacheRetainingStorage()) return false;
+    CancelStorageForClear();
+    if (storage_transfers_) storage_transfers_->RetainForClear();
+    coordinator_.ClearCacheRetainingStorage();
+    spdlog::info("[Scheduler] flush completed with old storage references retained; remaining L3 capacity available");
+    return true;
 }
 
 bool Scheduler::cacheIsClearable(bool include_host) const {
@@ -389,6 +456,14 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     }
 }
 
+void Scheduler::SetCacheEventSink(std::shared_ptr<CacheEventSink> sink) {
+    if (submitted_requests_) {
+        throw std::logic_error("install the cache event sink before submitting requests");
+    }
+    req_pool_allocator_.SetEventSink(sink.get());
+    cache_event_sink_ = std::move(sink);
+}
+
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     ProfileSpan profile_span{"Scheduler::SubmitRequests"};
     std::unordered_set<std::string> request_ids;
@@ -396,7 +471,13 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
     const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
+    const bool awaits_bootstrap = config_.role == Role::kD ||
+                                  (config_.role == Role::kP && config_.decode_allocation_policy !=
+                                                                   SchedulerConfig::DecodeAllocationPolicy::kDeferred);
     for (const RequestSpec& spec : request_specs) {
+        if (cache_event_sink_ && spec.admission_id == 0) {
+            throw std::invalid_argument("cache events require the control plane admission identity");
+        }
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
         }
@@ -431,7 +512,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, awaits_bootstrap));
     }
 
     // With prefix caching, every first admission reads the prompt's page
@@ -445,6 +526,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         }
     }
 
+    submitted_requests_ = submitted_requests_ || !pending_requests.empty();
     requests_.reserve(requests_.size() + pending_requests.size());
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
         const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
@@ -499,14 +581,33 @@ std::size_t Scheduler::ReadyWaitingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+                                fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
 }
 
 std::size_t Scheduler::RunningSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillAwaitingDestination,
+                                fsm::PrefillDone, fsm::Decoding>();
     }));
+}
+
+std::size_t Scheduler::AwaitingDestinationSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillAwaitingDestination>();
+    }));
+}
+
+std::int32_t Scheduler::AwaitingDestinationLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> request_tables;
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::PrefillAwaitingDestination>()) {
+            continue;
+        }
+        request_tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.CountActiveLcmBlocks(request_tables);
 }
 
 std::size_t Scheduler::RemotePrefillSize() const {
@@ -517,6 +618,15 @@ std::size_t Scheduler::RemotePrefillSize() const {
 std::size_t Scheduler::PdTransferSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
+}
+
+std::size_t Scheduler::PrefillInflightSize() const {
+    if (config_.role != Role::kP) {
+        return 0;
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
+    }));
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {
@@ -652,6 +762,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
+    if (disk_transfers_) {
+        ProfileSpan profile_span{"Scheduler::prepareDisk"};
+        for (const auto& request : requests_) prepareDisk(*request);
+    }
     if (peer_exports_) {
         ProfileSpan profile_span{"Scheduler::preparePeer"};
         for (const auto& request : requests_) preparePeer(*request);
@@ -697,7 +811,18 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
             storage_transfers_->StartBackups();
         else
             storage_transfers_->DropBackups();
+        storage_transfers_->UpdateRetainedCapacityWarning();
         storage_operations = storage_transfers_->TakeCommands();
+    }
+    // Cleaning copies dirty Host entries to Disk ahead of need; it runs after
+    // the build, whose write-backs and evictions it then sees.
+    std::vector<DiskOperation> disk_operations;
+    if (disk_transfers_) {
+        if (storage_allowed_)
+            disk_transfers_->StartCleaning();
+        else
+            disk_transfers_->DropCleaning();
+        disk_operations = disk_transfers_->TakeCommands();
     }
 
     if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
@@ -719,14 +844,28 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     if (!built.snapshot_stores.empty()) {
         plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
     }
+    // The endpoints this plan's retractions published wait for the runtime's
+    // commit, which it acknowledges under one fence for the whole plan.
+    if (!uncommitted_state_pages_.empty()) {
+        plan.state_commit_fence = next_state_commit_fence_++;
+        state_commit_fences_.emplace(*plan.state_commit_fence, std::exchange(uncommitted_state_pages_, {}));
+    }
     if (!built.load_backs.empty()) {
         plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
     }
     if (!built.snapshot_restores.empty()) {
         plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
-    const bool has_storage_work = !storage_operations.empty();
+    // Landings into Host start before admission (preparePeer), in this plan
+    // whether or not it forwards.
+    for (PeerFetchOperation& fetch : std::exchange(peer_host_fetches_, {})) {
+        plan.peer_fetches.push_back(std::move(fetch));
+    }
+    const bool has_storage_work = !storage_operations.empty() || !disk_operations.empty();
     for (auto& operation : storage_operations) {
+        plan.With(CacheOperation{std::move(operation)});
+    }
+    for (auto& operation : disk_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
     trackStalledRounds(num_live_requests,
@@ -771,10 +910,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
 }
 
 void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
-    // With nothing out, only a new submission or an abort can change the next
-    // plan.
-    const bool stalled = forward_allowed_ && (!storage_transfers_ || !storage_transfers_->HasPending()) &&
-                         num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+    // Retained and terminal-unknown storage only protect their own addresses;
+    // waiting for them cannot make a blocked request progress.
+    const bool stalled = forward_allowed_ && !StorageProgressPending() && num_live_requests > 0 && plan_is_empty &&
+                         !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                          });

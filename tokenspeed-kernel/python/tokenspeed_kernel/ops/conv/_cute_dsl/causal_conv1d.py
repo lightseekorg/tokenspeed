@@ -161,6 +161,7 @@ class CausalConv1dPrefill:
         has_bias: bool,
         silu: bool,
         use_pdl: bool,
+        key_dim: int | None,
     ):
         if threads <= 0 or threads > 1024 or block_m <= 0 or block_n <= 0:
             raise ValueError("convolution tiles and thread count must be positive")
@@ -189,7 +190,13 @@ class CausalConv1dPrefill:
         self.input_align = math.gcd(
             pointer_alignment, 2 * self.vector, 2 * input_stride
         )
-        self.output_align = math.gcd(pointer_alignment, 2 * self.vector, 2 * channels)
+        # None: packed rows; else q, k and v rows of key_dim, key_dim and value_dim.
+        self.key_dim = key_dim
+        self.value_dim = channels - 2 * key_dim if key_dim is not None else None
+        row_widths = (channels,) if key_dim is None else (key_dim, self.value_dim)
+        self.output_align = math.gcd(
+            pointer_alignment, 2 * self.vector, *(2 * width for width in row_widths)
+        )
         self.weight_align = math.gcd(weight_alignment, 8 * self.vector)
 
     @cute.jit
@@ -205,6 +212,8 @@ class CausalConv1dPrefill:
         batches: cute.Pointer,
         offsets: cute.Pointer,
         out: cute.Pointer,
+        out_k: cute.Pointer,
+        out_v: cute.Pointer,
         programs: Int32,
         stream: cuda.CUstream,
     ):
@@ -223,6 +232,8 @@ class CausalConv1dPrefill:
             cute.make_tensor(batches, flat),
             cute.make_tensor(offsets, flat),
             cute.make_tensor(out, flat),
+            cute.make_tensor(out_k, flat),
+            cute.make_tensor(out_v, flat),
         ).launch(
             grid=grid,
             block=(self.threads, 1, 1),
@@ -288,14 +299,37 @@ class CausalConv1dPrefill:
         return values.load()
 
     @cute.jit
-    def _store_row(self, out, row, channel, acc):
+    def _store_vector(self, out, offset, result):
+        address = out.iterator + cute.assume(offset, divby=self.output_align // 2)
+        dest = cute.make_tensor(address, cute.make_layout(self.vector))
+        cute.autovec_copy(result, dest)
+
+    @cute.jit
+    def _store_row(self, out, out_k, out_v, row, channel, acc):
         result = cute.make_rmem_tensor((self.vector,), BFloat16)
         for v in cutlass.range_constexpr(self.vector):
             value = acc[v]
             if cutlass.const_expr(self.silu):
                 value = _silu(value)
             result[v] = value.to(BFloat16)
-        if cutlass.const_expr(self.channels % self.block_n == 0):
+        if cutlass.const_expr(self.key_dim is not None):
+            if (
+                cutlass.const_expr(self.channels % self.block_n == 0)
+                or channel < self.channels
+            ):
+                if channel < self.key_dim:
+                    self._store_vector(out, row * self.key_dim + channel, result)
+                elif channel < 2 * self.key_dim:
+                    self._store_vector(
+                        out_k, row * self.key_dim + channel - self.key_dim, result
+                    )
+                else:
+                    self._store_vector(
+                        out_v,
+                        row * self.value_dim + channel - 2 * self.key_dim,
+                        result,
+                    )
+        elif cutlass.const_expr(self.channels % self.block_n == 0):
             offset = cute.assume(
                 row * self.channels + channel, divby=self.output_align // 2
             )
@@ -323,6 +357,8 @@ class CausalConv1dPrefill:
         bias,
         state,
         out,
+        out_k,
+        out_v,
         start,
         token,
         length,
@@ -389,7 +425,7 @@ class CausalConv1dPrefill:
                     w = weights[tap, None].load()
                     product = _multiply_bf16(value, w)
                     acc = self._add(acc, product)
-                self._store_row(out, start + token + row, channel, acc)
+                self._store_row(out, out_k, out_v, start + token + row, channel, acc)
 
         if cutlass.const_expr(first):
             # The request's last three inputs (or old history when it is
@@ -423,7 +459,19 @@ class CausalConv1dPrefill:
 
     @cute.kernel
     def causal_conv1d_prefill(
-        self, x, weight, bias, state, slots, history, boundaries, batches, offsets, out
+        self,
+        x,
+        weight,
+        bias,
+        state,
+        slots,
+        history,
+        boundaries,
+        batches,
+        offsets,
+        out,
+        out_k,
+        out_v,
     ):
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
@@ -446,6 +494,8 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_k,
+                        out_v,
                         start,
                         token,
                         length,
@@ -462,6 +512,8 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_k,
+                        out_v,
                         start,
                         token,
                         length,
@@ -478,6 +530,8 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_k,
+                        out_v,
                         start,
                         token,
                         length,

@@ -378,7 +378,7 @@ private:
         if (enable_events_) {
             const auto history = static_cast<std::int32_t>(&hashes - histories_.data());
             Request request(RequestSpec{.request_id = "fill", .tokens = HistoryTokens(history, total)},
-                            config_.page_size, Role::kFused);
+                            config_.page_size, /*awaits_bootstrap=*/false);
             SchedulerTestAccess::RegisterKvEventPages(scheduler_, request, hashes, hit / config_.page_size);
         }
         CacheCompletedBlocksForTest(Coordinator(), tables, hashes, result->access_epoch, hit / config_.page_size, total,

@@ -23,6 +23,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <memory>
 #include <optional>
 #include <span>
@@ -56,6 +58,8 @@ enum class ImageShortfall : std::uint8_t { kNoPool, kBlobSlot, kSnapshotPool, kH
 // Host cache tiers. Scheduling policy and request state transitions stay in
 // Scheduler.
 class TierTransferManager {
+    friend struct TierTransferManagerTestAccess;
+
 public:
     explicit TierTransferManager(CacheCoordinator& coordinator);
 
@@ -308,7 +312,12 @@ private:
     };
     // Wraps by design: an id only tells in-flight ops apart, and none stays in
     // flight across 2^32 later ops. The width is the wire format's.
-    std::uint32_t nextOpId() { return next_op_id_++; }
+    std::uint32_t nextOpId() {
+        if (next_op_id_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("cache operation generation exhausted");
+        }
+        return static_cast<std::uint32_t>(next_op_id_++);
+    }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
     // The Host block an unacknowledged store already carries for each key, with
@@ -333,7 +342,7 @@ private:
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
-    std::uint32_t next_op_id_{0};
+    std::uint64_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
     std::array<WriteBackStats, 4> write_back_stats_;
     LoadBackStats prefix_load_stats_;

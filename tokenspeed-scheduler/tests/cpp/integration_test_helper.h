@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -46,6 +47,7 @@ namespace tokenspeed {
 // build does.
 struct SchedulerTestAccess {
     static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
+    static StorageTransferManager& Storage(Scheduler& scheduler) { return *scheduler.storage_transfers_; }
     static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
     static BlockPool& Pool(Scheduler& scheduler) { return scheduler.block_pool_; }
     // A metadata-only fill still needs the same token descriptors as a real
@@ -65,6 +67,21 @@ struct SchedulerTestAccess {
     // Whether the request's prompt prefix hashes have been computed.
     static bool PromptHashed(Scheduler& scheduler, const std::string& request_id) {
         return scheduler.findRequest(request_id)->prompt_prefix_hashes_.has_value();
+    }
+    // A capacity retraction of a quiescent resident past its victim probe
+    // (Scheduler::retractVictim), aborting it as its callers do when the image
+    // is refused, built into `plan`. Returns the refusal, if any.
+    static std::optional<ImageShortfall> RetractVictim(Scheduler& scheduler, const std::string& request_id,
+                                                       ExecutionPlan& plan) {
+        Request* victim = scheduler.findRequest(request_id);
+        Scheduler::PlanBuild build{plan,
+                                   Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false}};
+        std::vector<WriteBackOperation> write_back_operations;
+        const std::optional<ImageShortfall> shortfall = scheduler.retractVictim(*victim, build, write_back_operations);
+        if (shortfall) {
+            scheduler.onImageDoesNotFit(*victim, *shortfall, build);
+        }
+        return shortfall;
     }
 };
 

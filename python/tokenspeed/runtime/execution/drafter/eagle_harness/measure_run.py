@@ -54,6 +54,9 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
 )
 from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 
+from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
+    check_chain_measure_shape,
+)
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import (
     CHAIN_RULE_MAX_BATCH_SIZE,
     COST_BATCH_SIZES,
@@ -421,6 +424,11 @@ def main(argv: list[str] | None = None) -> None:
         max_batch_size(args.compute_intensity), CHAIN_RULE_MAX_BATCH_SIZE
     ):
         raise SystemExit(f"--max-bs above the {args.compute_intensity} batch cap")
+    if args.compute_intensity == "chain_intensity":
+        try:
+            check_chain_measure_shape(args.num_steps, args.num_draft_tokens)
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
 
     from transformers import AutoConfig, AutoTokenizer
 

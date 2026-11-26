@@ -37,6 +37,7 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_warmup  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (  # noqa: E402
     _stage1_mxfp4_direct_mfma_gluon,
+    gluon_mxfp4_moe_route_groups_gfx950,
     gluon_mxfp4_moe_stage1_route_tiles_gfx950,
     invoke_stage1_mxfp4_mfma_decode_gluon,
 )
@@ -56,6 +57,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (  # noqa: E402
     _ROUTE_TILE_CONFIGS,
     _RouteTileConfig,
+    _select_route_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (  # noqa: E402
     _max_padded_route_capacity,
@@ -64,8 +66,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (  # noqa: E4
     _moe_sorting_stage3_kernel,
     _moe_sorting_stage4_kernel,
     gluon_moe_sorting,
-    gluon_mxfp4_moe_route_pack_gfx950,
-    gluon_mxfp4_moe_route_tiles_gfx950,
     gluon_mxfp4_moe_sort_histogram_prefix_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (  # noqa: E402
@@ -528,8 +528,9 @@ def test_direct_mfma_decode_deferred_ep_routes(
 
 
 def test_route_tiled_gemms_preserve_route_slots() -> None:
-    # Past 16 rows the GEMMs read the routes and tiles that the pack and tile
-    # kernels write; the ID-grouped tests cover 16 rows and fewer.
+    # Past 16 rows an expert's routes span several 16-route groups: 19 rows
+    # route every token to the same local experts, so each expert's routes
+    # split into a full group and a short one.
     rows = 19
     generator = torch.Generator(device="cuda").manual_seed(41)
     _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
@@ -559,13 +560,12 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
     mapping = torch.empty(rows * TOPK, dtype=torch.int32, device="cuda")
     reference_mapping = torch.empty_like(mapping)
     max_rows = 32
-    sorted_routes = torch.empty(
-        NUM_EXPERTS * max_rows, dtype=torch.int32, device="cuda"
-    )
     descriptors = torch.empty(
         (NUM_EXPERTS * (max_rows // 16), 3), dtype=torch.int32, device="cuda"
     )
-    counts = torch.empty(NUM_EXPERTS, dtype=torch.int32, device="cuda")
+    sorted_routes = torch.empty(
+        descriptors.shape[0] * 16, dtype=torch.int32, device="cuda"
+    )
     group_count = torch.empty(1, dtype=torch.int32, device="cuda")
 
     invoke_stage1_mxfp4_mfma_decode_gluon(
@@ -600,34 +600,13 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         PIPELINE_K=False,
     )
-    gluon_mxfp4_moe_route_pack_gfx950[(NUM_EXPERTS,)](
-        ids,
-        sorted_routes,
-        counts,
-        mapping,
-        rows,
-        EXPERT_START=expert_start,
-        NUM_EXPERTS=NUM_EXPERTS,
-        TOPK=TOPK,
-        MAX_ROWS=max_rows,
-        num_warps=4,
-    )
-    gluon_mxfp4_moe_route_tiles_gfx950[(1,)](
-        counts,
-        descriptors,
-        group_count,
-        NUM_EXPERTS=NUM_EXPERTS,
-        BLOCK_M=16,
-        MAX_ROWS=max_rows,
-        num_warps=4,
-    )
     gluon_mxfp4_moe_stage1_route_tiles_gfx950[(64,)](
         packed,
         scales,
         w13,
         s13,
-        sorted_routes,
-        descriptors,
+        ids,
+        mapping,
         group_count,
         sorted_routes,
         descriptors,
@@ -650,9 +629,10 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         BLOCK_M=16,
         PREFETCH_TILES=0,
-        ROUTES_FROM_IDS=False,
         EXPERT_START=expert_start,
         NUM_EXPERTS=NUM_EXPERTS,
+        MAX_ROWS=max_rows,
+        PREGROUPED=False,
         num_warps=4,
     )
     gluon_mxfp4_moe_stage2_route_tiles_gfx950[(64,)](
@@ -677,6 +657,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         BLOCK_M=16,
         PREFETCH_TILES=1,
+        PERSISTENT_PROGRAMS=64,
+        SINGLE_ROUND_JOBS=0,
         num_warps=1,
     )
     owned = (ids.flatten() >= expert_start) & (
@@ -686,6 +668,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         owned, torch.arange(rows * TOPK, device="cuda", dtype=torch.int32), -1
     )
     torch.testing.assert_close(mapping, expected_mapping, atol=0, rtol=0)
+    # TOPK - 1 experts hold 19 routes and one holds 18: two groups each.
+    assert group_count.item() == 2 * TOPK
     torch.testing.assert_close(
         intermediate[owned], reference_intermediate[owned], atol=0, rtol=0
     )
@@ -722,6 +706,182 @@ def test_route_tile_schedules_match_direct_reference(
     rows: int, config: _RouteTileConfig
 ) -> None:
     """Every route-tile schedule keeps every route, up to a full expert list."""
+    _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
+
+
+def _ep4_wide_cases() -> list[tuple[int, _RouteTileConfig]]:
+    """The EP4 entries whose tiles hold 32 routes, at sampled row counts.
+
+    The samples are every eighth row count of each entry plus its upper end.
+    """
+    cases = []
+    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS[(4096, 4096, 64, 256, 8)]:
+        if config.block_m != 32:
+            continue
+        for rows in [*range(min_rows, max_rows, 8), max_rows]:
+            cases.append((rows, config))
+    return cases
+
+
+_EP4_WIDE_CASES = _ep4_wide_cases()
+
+
+@pytest.mark.parametrize(("rows", "config"), _EP4_WIDE_CASES)
+def test_wide_route_tiles_match_direct_reference_at_sampled_row_counts(
+    rows: int, config: _RouteTileConfig
+) -> None:
+    """32-route tiles keep every route's bits at sampled row counts.
+
+    The samples are every eighth row count of each entry plus its upper end.
+    Every local expert holds all rows' routes, so each spans several tiles.
+    """
+    _check_route_tiles_match_direct_reference(rows, config, 2048, 0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "config"),
+    [case for case in _EP4_WIDE_CASES if case[0] in (96, 128, 137, 193, 256)],
+)
+def test_route_tile_size_does_not_change_bits(
+    rows: int, config: _RouteTileConfig
+) -> None:
+    """32-route and 16-route tiles of one schedule give the same bits.
+
+    Under random routing, the route map and every route this rank owns match.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(rows + 1)
+    _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
+    packed, scales = _quantize_mxfp4_activation(
+        _exact_mxfp4_activation(rows, HIDDEN, generator)
+    )
+    ids = _random_route_ids(rows, generator)
+
+    def launch(config: _RouteTileConfig) -> tuple[torch.Tensor, torch.Tensor]:
+        output = torch.full(
+            (rows * TOPK, HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        actual, _, mapping = _launch_mxfp4_route_tiles(
+            packed,
+            scales,
+            w13,
+            s13,
+            w2,
+            s2,
+            ids,
+            torch.empty(
+                (rows * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+            ),
+            empty_swizzled_cdna4_mxfp4_scale(
+                rows * TOPK, INTERMEDIATE // 32, device="cuda"
+            ),
+            output,
+            expert_start=NUM_EXPERTS,
+            top_k=TOPK,
+            config=config,
+            stage2_programs=2048,
+            stage2_single_round_jobs=0,
+        )
+        return actual, mapping
+
+    wide, wide_mapping = launch(config)
+    narrow, narrow_mapping = launch(config._replace(block_m=16))
+    torch.testing.assert_close(wide_mapping, narrow_mapping, atol=0, rtol=0)
+    owned = wide_mapping >= 0
+    assert owned.any()
+    torch.testing.assert_close(
+        wide[owned].view(torch.int16), narrow[owned].view(torch.int16), atol=0, rtol=0
+    )
+
+
+def test_route_tile_row_counts_share_their_entry_compile() -> None:
+    """Every EP4 route-tile row count compiles nothing beyond its entry's.
+
+    The row count is a runtime argument; only the entry's schedule (tile
+    widths, prefetch depth, waves, route capacity) is compile-time. Each
+    entry's first row count warms its kernels, then every row count served by
+    the 17-256 row entries launches without a new specialization.
+    """
+    entries = [
+        (min_rows, max_rows, config)
+        for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS[(4096, 4096, 64, 256, 8)]
+        if min_rows >= 17
+    ]
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
+
+    def launch(rows: int, config: _RouteTileConfig) -> None:
+        # Buffers sized per call, as the serving path allocates them.
+        packed, scales = _quantize_mxfp4_activation(
+            _exact_mxfp4_activation(rows, HIDDEN, generator)
+        )
+        _launch_mxfp4_route_tiles(
+            packed,
+            scales,
+            w13,
+            s13,
+            w2,
+            s2,
+            _random_route_ids(rows, generator),
+            torch.empty(
+                (rows * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+            ),
+            empty_swizzled_cdna4_mxfp4_scale(
+                rows * TOPK, INTERMEDIATE // 32, device="cuda"
+            ),
+            None,
+            expert_start=NUM_EXPERTS,
+            top_k=TOPK,
+            config=config,
+            stage2_programs=2048,
+            stage2_single_round_jobs=0,
+        )
+
+    for min_rows, _, config in entries:
+        launch(min_rows, config)
+    torch.cuda.synchronize()
+    with assert_no_triton_compile(
+        gluon_mxfp4_moe_route_groups_gfx950,
+        gluon_mxfp4_moe_stage1_route_tiles_gfx950,
+        gluon_mxfp4_moe_stage2_route_tiles_gfx950,
+    ):
+        for min_rows, entry_max_rows, config in entries:
+            for rows in range(min_rows + 1, entry_max_rows + 1, 7):
+                launch(rows, config)
+            launch(entry_max_rows, config)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("bound_offset", [-1, 0])
+def test_route_tile_stage2_programs_cover_every_job(bound_offset: int) -> None:
+    """Stage 2 on 4 persistent programs covers every job: with its
+    one-program-a-job bound one below the job count the 4 programs loop over
+    all jobs; at the job count every job gets its own program."""
+    rows = 65
+    # The EP4 schedule that has a one-program-a-job bound at 65-128 rows.
+    config = _select_route_tile_config(
+        rows,
+        hidden_dim=4096,
+        inter_dim=4096,
+        num_local_experts=64,
+        num_experts=256,
+        top_k=8,
+    )
+    # The test routes every token to TOPK experts; the last token's last route
+    # belongs to another rank.
+    groups = sum(
+        (count + config.block_m - 1) // config.block_m
+        for count in [rows] * (TOPK - 1) + [rows - 1]
+    )
+    jobs = groups * (HIDDEN // config.stage2.block_n)
+    _check_route_tiles_match_direct_reference(rows, config, 4, jobs + bound_offset)
+
+
+def _check_route_tiles_match_direct_reference(
+    rows: int,
+    config: _RouteTileConfig,
+    stage2_programs: int,
+    stage2_single_round_jobs: int,
+) -> None:
     generator = torch.Generator(device="cuda").manual_seed(rows)
     _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
     packed, scales = _quantize_mxfp4_activation(
@@ -799,6 +959,8 @@ def test_route_tile_schedules_match_direct_reference(
         expert_start=expert_start,
         top_k=TOPK,
         config=config,
+        stage2_programs=stage2_programs,
+        stage2_single_round_jobs=stage2_single_round_jobs,
     )
     assert bias is None
     assert actual.data_ptr() == output.data_ptr()
@@ -924,6 +1086,8 @@ def test_id_grouped_route_tiles_match_direct_under_replay(rows: int) -> None:
             expert_start=expert_start,
             top_k=TOPK,
             config=config,
+            stage2_programs=2048,
+            stage2_single_round_jobs=0,
         )
 
     def check(mapping):
@@ -1025,8 +1189,6 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
 
     warmup(48)
     kernels = (
-        gluon_mxfp4_moe_route_pack_gfx950,
-        gluon_mxfp4_moe_route_tiles_gfx950,
         gluon_mxfp4_moe_stage1_route_tiles_gfx950,
         gluon_mxfp4_moe_stage2_route_tiles_gfx950,
         _stage1_mxfp4_direct_mfma_gluon,

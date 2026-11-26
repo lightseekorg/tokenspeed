@@ -89,6 +89,7 @@ def _drafter(
 ) -> DSpark:
     """A DSpark carrying only the state the block graphs read."""
     drafter = object.__new__(DSpark)
+    drafter.draft_sampler = None
     drafter.attention_kind = attention_kind
     drafter.draft_model_runner = SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size), pp_size=pp_size)

@@ -21,8 +21,9 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import tokenspeed_kernel.ops.ple as ple
+import pytest
 import torch
+from tokenspeed_kernel.ops import ple
 
 
 def test_ple_host_gather_uses_device_visible_table_pointer(monkeypatch) -> None:
@@ -38,7 +39,7 @@ def test_ple_host_gather_uses_device_visible_table_pointer(monkeypatch) -> None:
     )
     monkeypatch.setattr(ple, "_ple_host_gather_kernel", kernel)
 
-    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None) is out
+    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None, table_shards=4) is out
     pointer.assert_called_once_with(table)
     args, kwargs = kernel.__getitem__.return_value.call_args
     assert args[0] == 12345
@@ -60,6 +61,122 @@ def test_ple_host_gather_empty_ids_skip_pointer_mapping(monkeypatch) -> None:
     )
     monkeypatch.setattr(ple, "_ple_host_gather_kernel", kernel)
 
-    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None) is out
+    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None, table_shards=4) is out
     pointer.assert_not_called()
     kernel.__getitem__.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize(
+    "head_dim, table_shards, scale_mode",
+    [
+        (160, 4, "scalar"),
+        (512, 4, "row"),
+        (512, 4, "none"),
+        (160, 1, "scalar"),
+        (512, 1, "row"),
+    ],
+    ids=["flash-tp4", "max-online-fp8", "max-bf16", "flash-tp1", "max-tp1-online-fp8"],
+)
+def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
+    from tokenspeed_kernel.ops.ple.triton import (
+        _ple_host_gather_kernel,
+        _ple_host_gather_persistent_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    vocab_start = (1 << 33) + 113 if table_shards > 1 else 0
+    dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
+    table = torch.randn(128, head_dim).to(dtype).pin_memory()
+    scalar = 0.00019931793212890625 if scale_mode == "scalar" else None
+    scales = torch.linspace(0.5, 1.5, 128)
+    row_scale = scales.cuda() if scale_mode == "row" else None
+
+    def check(tokens):
+        local_ids = torch.arange(tokens * 16) % 144 - 8
+        ids = (vocab_start + local_ids).reshape(tokens, 16).cuda()
+        out = torch.empty((ids.numel(), head_dim), device="cuda", dtype=torch.bfloat16)
+        ple.ple_host_gather(
+            table,
+            ids,
+            out,
+            vocab_start,
+            vocab_start + 128,
+            scalar,
+            row_scale,
+            table_shards=table_shards,
+        )
+        rows = local_ids.clamp(0, 127)
+        expected = table.float()[rows]
+        if scalar is not None:
+            expected *= scalar
+        if row_scale is not None:
+            expected *= scales[rows, None]
+        expected[(local_ids < 0) | (local_ids >= 128)] = 0
+        torch.testing.assert_close(out.cpu(), expected.bfloat16(), atol=0, rtol=0)
+
+    for tokens in (1, 16, 8192):
+        check(tokens)
+    with assert_no_triton_compile(
+        _ple_host_gather_kernel, _ple_host_gather_persistent_kernel
+    ):
+        for tokens in (4, 32, 16384):
+            check(tokens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("table_shards, tokens", [(4, 4), (1, 8192)])
+def test_host_gather_large_table_offset(table_shards, tokens):
+    dim = 160
+    table_rows = 2**31 // dim + 2
+    table = torch.empty((table_rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
+    last_rows = torch.arange(2 * dim).reshape(2, dim).float() % 31 - 15
+    table[-2:].copy_(last_rows.to(table.dtype))
+    ids = torch.tensor(
+        [table_rows - 1, -1, table_rows - 2, table_rows],
+        device="cuda",
+        dtype=torch.int64,
+    ).repeat(tokens, 4)
+    out = torch.empty((ids.numel(), dim), device="cuda", dtype=torch.bfloat16)
+    scale = 0.00019931793212890625
+    ple.ple_host_gather(
+        table, ids, out, 0, table_rows, scale, None, table_shards=table_shards
+    )
+    zero = torch.zeros(dim)
+    expected = (
+        (torch.stack((last_rows[-1], zero, last_rows[0], zero)) * scale)
+        .bfloat16()
+        .repeat(tokens * 4, 1)
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_peer_gather_shard_boundary_and_large_offset():
+    dim = 160
+    rows = 2**31 // dim + 2
+    shards = [
+        torch.empty((rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
+        for _ in range(2)
+    ]
+    for i, shard in enumerate(shards):
+        shard[0].fill_(2 * i + 1)
+        shard[-1].fill_(2 * i + 2)
+    ptrs = torch.tensor(
+        [ple.current_platform().device_visible_data_ptr(s) for s in shards],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    ids = torch.tensor([-1, 0, rows - 1, rows, 2 * rows - 1, 2 * rows], device="cuda")
+    out = torch.empty((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
+    ple.ple_host_gather(
+        shards[0], ids, out, 0, 2 * rows, 0.5, None, table_shards=2, shard_ptrs=ptrs
+    )
+    expected = torch.tensor([0, 0.5, 1, 1.5, 2, 0], dtype=out.dtype)
+    torch.testing.assert_close(
+        out.cpu(), expected[:, None].expand_as(out), atol=0, rtol=0
+    )
+    with pytest.raises(ValueError, match="row_scale is unsupported with shard_ptrs"):
+        ple.ple_host_gather(
+            shards[0], ids, out, 0, 2 * rows, None, out, table_shards=2, shard_ptrs=ptrs
+        )

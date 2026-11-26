@@ -54,6 +54,12 @@ void PeerConfig::Validate() const {
         min_fetch_tokens <= 0) {
         throw std::invalid_argument("peer sharing needs a name, and positive lease limits, lifetimes and minimum");
     }
+    const bool host = landing_tier == PeerLandingTier::kHost;
+    if (host != (max_host_landing_blocks > 0) || host != (host_ready_timeout_us > 0) || max_host_landing_blocks < 0 ||
+        host_ready_timeout_us < 0) {
+        throw std::invalid_argument(
+            "peer Host landings need positive Host block credits and a ready timeout, and Device landings neither");
+    }
     // Lease ids count up from incarnation << 32: a wider incarnation would lose
     // the bits that tell two runs of the reader apart.
     if (incarnation == 0 || incarnation > std::numeric_limits<std::uint32_t>::max()) {
@@ -71,6 +77,32 @@ PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens
     const auto pages = static_cast<std::size_t>(num_tokens / prefix_granularity);
     return Prompt(std::span{lookup.prefix_hashes}.first(pages),
                   std::span{lookup.tokens}.first(static_cast<std::size_t>(num_tokens)), num_tokens);
+}
+
+// What a holder lists for `prompt`: its Device and Host hit, or, when its
+// Disk tier extends that, the Disk-extended listing, whose Disk pages the
+// holder pushes (docs/rfcs/0006-disk-tier.md).
+PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+    PrefixProber::PrefixListing listing =
+        coordinator.Prober().ListPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
+    if (coordinator.Disk().HasPool()) {
+        PrefixProber::PrefixListing with_disk =
+            coordinator.Storage().ListWithDisk(prompt, coordinator.Disk().PrefixHits(prompt));
+        if (with_disk.num_tokens > listing.num_tokens) return with_disk;
+    }
+    return listing;
+}
+
+// The listing's blocks, held and refreshed (CacheCoordinator::ExportPrefix).
+CacheCoordinator::PrefixExport ExportPeerPrefix(CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+    if (coordinator.Disk().HasPool()) {
+        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt);
+        if (std::ranges::any_of(listing.pages,
+                                [](const PrefixProber::ListedPage& page) { return page.tier == CacheTier::kDisk; })) {
+            return coordinator.ExportListing(listing);
+        }
+    }
+    return coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
 }
 
 std::vector<PeerPage> Pages(const PrefixProber::PrefixListing& listing) {
@@ -92,8 +124,8 @@ PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const 
                      lookup.lease.id);
         return answer;
     }
-    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
-        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
+    const PrefixProber::PrefixListing listing =
+        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
     answer.num_tokens = listing.num_tokens;
     answer.pages = Pages(listing);
     return answer;
@@ -104,8 +136,8 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
         return false;
     }
-    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
-        coordinator.Prober().ProbePromptPrefix(PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity())));
+    const PrefixProber::PrefixListing listing =
+        ListPeerPrefix(coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()));
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 
@@ -121,8 +153,8 @@ void PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup&
         static_cast<std::int64_t>(leases_.size()) >= max_leases_) {
         return;
     }
-    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(
-        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
+    CacheCoordinator::PrefixExport exported =
+        ExportPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
     if (exported.num_tokens == 0) {
         return;
     }
@@ -149,9 +181,9 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
         return;
     }
     const auto pages = static_cast<std::size_t>(pin.num_tokens / coordinator.PrefixGranularity());
-    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(
-        Prompt(std::span{lease.prefix_hashes}.first(pages),
-               std::span{lease.tokens}.first(static_cast<std::size_t>(pin.num_tokens)), pin.num_tokens)));
+    CacheCoordinator::PrefixExport exported = ExportPeerPrefix(
+        coordinator, Prompt(std::span{lease.prefix_hashes}.first(pages),
+                            std::span{lease.tokens}.first(static_cast<std::size_t>(pin.num_tokens)), pin.num_tokens));
     // The pin holds what its answer named, or nothing: the blocks it just
     // acquired go back with the lease.
     std::vector<PeerPage> acquired;
@@ -170,6 +202,7 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
         return;
     }
     lease.phase = Phase::kHard;
+    lease.pinned_us = now_us;
     lease.deadline_us = Deadline(now_us, hard_pin_us_);
     lease.access_epoch = exported.access_epoch;
     for (CacheCoordinator::ExportedBlock& block : exported.blocks) {
@@ -178,7 +211,7 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
     }
 }
 
-void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release) {
+void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release, std::int64_t now_us) {
     const auto it = leases_.find(release.lease);
     if (it == leases_.end()) {
         return;
@@ -187,6 +220,9 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
     // The pins go first: a demotion skips an entry anything holds.
     Lease lease = std::move(it->second);
     leases_.erase(it);
+    if (held && observe_pins_) {
+        pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, false});
+    }
     lease.pins.clear();
     if (held && release.demote) {
         coordinator.DemoteExportedChain(lease.keys, lease.access_epoch);
@@ -194,19 +230,26 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
 }
 
 void PeerExports::Expire(std::int64_t now_us) {
-    std::erase_if(leases_, [&](auto& entry) {
-        Lease& lease = entry.second;
+    // Older libstdc++ versions pass const entries to erase_if predicates.
+    // Expiration also updates hard pins, so walk the mutable entries directly.
+    for (auto it = leases_.begin(); it != leases_.end();) {
+        Lease& lease = it->second;
         if (now_us < lease.deadline_us) {
-            return false;
+            ++it;
+            continue;
         }
         if (lease.phase != Phase::kHard) {
-            return true;
+            it = leases_.erase(it);
+            continue;
+        }
+        if (observe_pins_) {
+            pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, true});
         }
         lease.phase = Phase::kExpired;
         lease.pins.clear();
         lease.deadline_us = Deadline(now_us, hard_pin_us_);
-        return false;
-    });
+        ++it;
+    }
 }
 
 std::size_t PeerExports::NumPinnedBlocks() const {

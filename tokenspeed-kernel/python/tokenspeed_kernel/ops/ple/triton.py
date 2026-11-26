@@ -29,8 +29,8 @@ virtual sequence ``[carried state | tokens]`` and picks the source per tap:
 
 - ``_ngram_ids_kernel``: per-token n-gram hash ids, optionally emitting the
   raw trailing window from the same loads.
-- ``_ple_page_gather_kernel`` / ``_ple_page_scatter_kernel``: one cache row per
-  page id, treating page id 0 as the null page.
+- ``_ple_page_gather_pair_kernel`` / ``_ple_page_scatter_kernel``: read the context
+  and conv state together, or write a cache row per page ID. Page ID 0 is null.
 - ``_ple_dilated_conv_kernel``: dilated depthwise conv + SiLU with an epilogue
   that folds up to two full-width addends and the verify-scratch windows.
 - ``_ple_conv_state_kernel``: one launch combining convolution and request
@@ -178,43 +178,6 @@ def _exact_remainder(value, divisor, reciprocal):
 
 
 @triton.jit
-def _ple_page_gather_kernel(
-    field_ptr,
-    page_ptr,
-    out_ptr,
-    default,
-    field_row_stride,
-    N,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Read one cache row per page id, substituting ``default`` for null pages.
-
-    Page id 0 is the null page, so its row is replaced rather than read. The
-    masked load supplies the fill, which keeps the replacement inside the one
-    pass instead of allocating a full-size ``default`` block and selecting
-    against it. ``field_row_stride`` carries the plan's page stride, which the
-    arena is free to pad past the row's own extent.
-    """
-
-    row = tl.program_id(0)
-    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = off < N
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    page = tl.load(page_ptr + row).to(tl.int64)
-    field_dtype = field_ptr.dtype.element_ty
-    value = tl.load(
-        field_ptr + tl.maximum(page, 0) * field_row_stride + off,
-        mask=mask & (page > 0),
-        other=default.to(field_dtype),
-    )
-    tl.store(out_ptr + row * N + off, value, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
 def _ple_page_gather_pair_kernel(
     context_ptr,
     conv_ptr,
@@ -295,7 +258,7 @@ def _ple_page_scatter_kernel(
 
 
 @triton.jit
-def _ple_host_gather_kernel(
+def _ple_host_gather_rows(
     table_address,
     ids_ptr,
     scale_value,
@@ -304,12 +267,17 @@ def _ple_host_gather_kernel(
     head_dim,
     vocab_start,
     vocab_end,
+    row,
+    rows,
+    destination_ptr,
     IS_FP8: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SORTED: tl.constexpr,
+    SHARD_ROWS: tl.constexpr = 0,
 ):
-    """Gather one n-gram row per program straight out of pinned host memory.
+    """Gather a tile of n-gram rows straight out of pinned host memory.
 
     ``table_address`` is the host allocation's base address, not a device
     tensor: under unified addressing a page-locked host pointer is a valid
@@ -327,10 +295,13 @@ def _ple_host_gather_kernel(
     it here -- before the reduce -- stays correct under tensor parallelism.
     """
 
-    row = tl.program_id(0)
-    global_id = tl.load(ids_ptr + row)
-    in_range = (global_id >= vocab_start) & (global_id < vocab_end)
+    global_id = tl.load(ids_ptr + row, mask=row < rows, other=0).to(tl.int64)
+    in_range = (row < rows) & (global_id >= vocab_start) & (global_id < vocab_end)
     local_id = tl.where(in_range, global_id - vocab_start, 0)
+    if SHARD_ROWS:
+        owner = local_id // SHARD_ROWS
+        local_id = local_id % SHARD_ROWS
+        table_address = tl.load(table_address + owner)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < head_dim
     out_dtype = out_ptr.dtype.element_ty
@@ -339,18 +310,129 @@ def _ple_host_gather_kernel(
     else:
         table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
     values = tl.load(
-        table + local_id * head_dim + offsets, mask=mask & in_range, other=0.0
+        (table[:, None] if SHARD_ROWS else table)
+        + local_id[:, None] * head_dim
+        + offsets[None, :],
+        mask=mask[None, :] & in_range[:, None],
+        other=0.0,
     ).to(tl.float32)
     if HAS_SCALE:
         if ROW_SCALE:
-            values = values * tl.load(scale_ptr + local_id, mask=in_range, other=0.0)
+            values = (
+                values
+                * tl.load(scale_ptr + local_id, mask=in_range, other=0.0)[:, None]
+            )
         else:
             values = values * scale_value
-    tl.store(
-        out_ptr + row * head_dim + offsets,
-        tl.where(in_range, values, 0.0).to(out_dtype),
-        mask=mask,
+    destination = (
+        tl.load(destination_ptr + row, row < rows, other=0).to(tl.int64)
+        if SORTED
+        else row
     )
+    tl.store(
+        out_ptr + destination[:, None] * head_dim + offsets[None, :],
+        tl.where(in_range[:, None], values, 0.0).to(out_dtype),
+        mask=(row[:, None] < rows) & mask[None, :],
+    )
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _ple_host_gather_kernel(
+    table_address,
+    ids_ptr,
+    scale_value,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    rows,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    SHARD_ROWS: tl.constexpr = 0,
+):
+    """Gather ``rows`` n-gram ids straight out of pinned host memory.
+
+    Each program gathers one ``BLOCK_R``-row tile into ``out_ptr`` through
+    :func:`_ple_host_gather_rows`, whose docstring covers the unified
+    addressing, shard masking and dequant contract.
+    """
+
+    row = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+    _ple_host_gather_rows(
+        table_address,
+        ids_ptr,
+        scale_value,
+        scale_ptr,
+        out_ptr,
+        head_dim,
+        vocab_start,
+        vocab_end,
+        row,
+        rows,
+        ids_ptr,
+        IS_FP8,
+        HAS_SCALE,
+        ROW_SCALE,
+        BLOCK_D,
+        False,
+        SHARD_ROWS,
+    )
+
+
+@triton.jit(do_not_specialize=["rows", "grid"])
+def _ple_host_gather_persistent_kernel(
+    table_address,
+    ids_ptr,
+    scale_value,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    rows,
+    grid,
+    destination_ptr,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """Persistent variant for large gathers over a complete table.
+
+    The launcher sorts the ids first; programs walk the sorted ids in
+    grid-stride steps of ``grid * BLOCK_R`` rows and scatter each gathered
+    row to its original position through the ``destination_ptr``
+    indirection. Used instead of :func:`_ple_host_gather_kernel` when a
+    complete table serves at least 131,072 ids, where sorted host reads
+    stream better than direct gathers. The shared row helper's docstring
+    covers the unified addressing, shard masking and dequant contract.
+    """
+
+    for base in tl.range(tl.program_id(0).to(tl.int64) * BLOCK_R, rows, grid * BLOCK_R):
+        row = base + tl.arange(0, BLOCK_R)
+        _ple_host_gather_rows(
+            table_address,
+            ids_ptr,
+            scale_value,
+            scale_ptr,
+            out_ptr,
+            head_dim,
+            vocab_start,
+            vocab_end,
+            row,
+            rows,
+            destination_ptr,
+            IS_FP8,
+            HAS_SCALE,
+            ROW_SCALE,
+            BLOCK_D,
+            True,
+        )
 
 
 @triton.jit
@@ -377,6 +459,7 @@ def _ple_dilated_conv_kernel(
     ADD_GATED: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    COMPACT: tl.constexpr,
 ):
     """Fused dilated depthwise conv + SiLU over the packed-free layout.
 
@@ -445,34 +528,34 @@ def _ple_dilated_conv_kernel(
         result = (result.to(tl.float32) + residual.to(tl.float32)).to(out_dtype)
     tl.store(out_ptr + token * C + ch, result, mask=cmask)
 
-    if WRITE_WINDOWS:
-        # The verify scratch holds one ``windows_block_rows`` row block per
-        # request whose first row is the carried state, so token ``col`` of
-        # request ``req`` owns row ``req * windows_block_rows + 1 + col``. The
-        # packed layout is one row per token instead.
+    if COMPACT:
+        wrow = req * windows_block_rows + 1 + col
+        tl.store(windows_ptr + wrow * C * STATE + ch, x, mask=cmask)
+    elif WRITE_WINDOWS:
         wrow = token.to(tl.int64)
         if SCATTER_WINDOWS:
             wrow = req * windows_block_rows + 1 + col
         win_dtype = windows_ptr.dtype.element_ty
-        for s in tl.static_range(STATE):
-            v = col + 1 + s
-            from_state = v < STATE
-            tok_idx = tl.maximum(start + (v - STATE), 0)
-            w_state = tl.load(
-                initial_ptr + (req * C + ch) * STATE + v,
-                mask=cmask & from_state,
-                other=0.0,
-            ).to(win_dtype)
-            w_tok = tl.load(
-                values_ptr + tok_idx * C + ch,
-                mask=cmask & (~from_state),
-                other=0.0,
-            ).to(win_dtype)
-            tl.store(
-                windows_ptr + (wrow * C + ch) * STATE + s,
-                tl.where(from_state, w_state, w_tok),
-                mask=cmask,
-            )
+        state_col = tl.arange(0, triton.next_power_of_2(STATE))
+        v = col + 1 + state_col
+        from_state = v < STATE
+        valid = cmask[:, None] & (state_col[None, :] < STATE)
+        tok_idx = tl.maximum(start + v - STATE, 0)
+        w_state = tl.load(
+            initial_ptr + (req * C + ch[:, None]) * STATE + v[None, :],
+            mask=valid & from_state[None, :],
+            other=0.0,
+        )
+        w_tok = tl.load(
+            values_ptr + tok_idx[None, :] * C + ch[:, None],
+            mask=valid & ~from_state[None, :],
+            other=0.0,
+        )
+        tl.store(
+            windows_ptr + (wrow * C + ch[:, None]) * STATE + state_col[None, :],
+            tl.where(from_state[None, :], w_state, w_tok).to(win_dtype),
+            mask=valid,
+        )
 
 
 @triton.jit
@@ -540,6 +623,88 @@ def _ple_conv_final_kernel(
 
 
 @triton.jit
+def _ple_conv_token_tile(
+    values_ptr,
+    initial_ptr,
+    weights,
+    req_ptr,
+    col_ptr,
+    starts_ptr,
+    out_ptr,
+    gated_ptr,
+    residual_ptr,
+    gated_row_stride,
+    residual_row_stride,
+    C,
+    TOTAL,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    STATE: tl.constexpr,
+    ADD_GATED: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """A ``BLOCK_T`` by ``BLOCK_C`` tile of the dilated depthwise conv + SiLU.
+
+    Mirrors :func:`_ple_dilated_conv_kernel` with the same virtual
+    per-request sequence ``[carried state (STATE cols) | tokens]`` and fused
+    epilogue addends, but covers ``BLOCK_T`` tokens per program so the
+    channel weights are fetched once per tile. Each token resolves its own
+    request and position, so a tile may cross a request boundary; tap ``k``
+    of output column ``c`` reads virtual position ``c + k*D`` from the
+    carried state or the flat token tensor. ``ADD_GATED`` / ``ADD_RESIDUAL``
+    fold the gated value stream and the incoming hidden states into the
+    epilogue with the same per-addend rounding as the per-token kernel.
+    """
+
+    token = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    live = token < TOTAL
+    valid = live[:, None] & (ch[None, :] < C)
+    req = tl.load(req_ptr + token, live, other=0).to(tl.int64)
+    col = tl.load(col_ptr + token, live, other=0).to(tl.int64)
+    start = tl.load(starts_ptr + req, live, other=0).to(tl.int64)
+    initial_base = (req[:, None] * C + ch[None, :]) * STATE
+    out_dtype = out_ptr.dtype.element_ty
+
+    acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
+    for k in tl.static_range(K):
+        v = col + k * D
+        from_state = v < STATE
+        tok_idx = tl.maximum(start + v - STATE, 0)
+        x_state = tl.load(
+            initial_ptr + initial_base + v[:, None],
+            mask=valid & from_state[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        x_tok = tl.load(
+            values_ptr + tok_idx[:, None] * C + ch[None, :],
+            mask=valid & ~from_state[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        x = tl.where(from_state[:, None], x_state, x_tok)
+        acc += weights[k][None, :] * x
+    silu = acc * (1.0 / (1.0 + tl.exp(-acc)))
+    result = silu.to(out_dtype)
+    if ADD_GATED:
+        gated = tl.load(
+            gated_ptr + token[:, None] * gated_row_stride + ch[None, :],
+            mask=valid,
+            other=0.0,
+        )
+        result = (result.to(tl.float32) + gated.to(tl.float32)).to(out_dtype)
+    if ADD_RESIDUAL:
+        residual = tl.load(
+            residual_ptr + token[:, None] * residual_row_stride + ch[None, :],
+            mask=valid,
+            other=0.0,
+        )
+        result = (result.to(tl.float32) + residual.to(tl.float32)).to(out_dtype)
+    tl.store(out_ptr + token[:, None] * C + ch[None, :], result, mask=valid)
+
+
+@triton.jit
 def _ple_conv_state_kernel(
     values_ptr,
     initial_ptr,
@@ -570,11 +735,13 @@ def _ple_conv_state_kernel(
     WEIGHTS_INDEPENDENT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    COMPACT_WINDOWS: tl.constexpr,
 ):
     """One launch for token outputs and request states, including empty requests.
 
-    Program i owns token i and request i independently. Neither state writer
-    consumes conv outputs: both read the same immutable normalized input.
+    Program i owns a tile of tokens and request i independently. State writes
+    read the same immutable normalized input as convolution.
     """
     ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     if ENABLE_PDL and not WEIGHTS_INDEPENDENT:
@@ -587,31 +754,59 @@ def _ple_conv_state_kernel(
             tl.extra.cuda.gdc_wait()
         # Successors may set up, but must wait before reading any output.
         tl.extra.cuda.gdc_launch_dependents()
-    if tl.program_id(0) < TOTAL:
-        _ple_dilated_conv_kernel(
-            values_ptr,
-            initial_ptr,
-            weights,
-            req_ptr,
-            col_ptr,
-            starts_ptr,
-            out_ptr,
-            windows_ptr,
-            gated_ptr,
-            residual_ptr,
-            windows_block_rows,
-            gated_row_stride,
-            residual_row_stride,
-            C,
-            D,
-            K,
-            STATE,
-            WRITE_WINDOWS,
-            SCATTER_WINDOWS,
-            ADD_GATED,
-            ADD_RESIDUAL,
-            BLOCK_C,
-        )
+    token_base = tl.program_id(0)
+    if BLOCK_T > 1:
+        token_base = token_base.to(tl.int64) * BLOCK_T
+    if token_base < TOTAL:
+        if BLOCK_T > 1:
+            _ple_conv_token_tile(
+                values_ptr,
+                initial_ptr,
+                weights,
+                req_ptr,
+                col_ptr,
+                starts_ptr,
+                out_ptr,
+                gated_ptr,
+                residual_ptr,
+                gated_row_stride,
+                residual_row_stride,
+                C,
+                TOTAL,
+                D,
+                K,
+                STATE,
+                ADD_GATED,
+                ADD_RESIDUAL,
+                BLOCK_C,
+                BLOCK_T,
+            )
+        else:
+            _ple_dilated_conv_kernel(
+                values_ptr,
+                initial_ptr,
+                weights,
+                req_ptr,
+                col_ptr,
+                starts_ptr,
+                out_ptr,
+                windows_ptr,
+                gated_ptr,
+                residual_ptr,
+                windows_block_rows,
+                gated_row_stride,
+                residual_row_stride,
+                C,
+                D,
+                K,
+                STATE,
+                WRITE_WINDOWS,
+                SCATTER_WINDOWS,
+                ADD_GATED,
+                ADD_RESIDUAL,
+                BLOCK_C,
+                COMPACT_WINDOWS,
+            )
     if WRITE_FINAL or SCATTER_WINDOWS:
         if tl.program_id(0) < BATCH:
             _ple_conv_final_kernel(
@@ -724,7 +919,17 @@ register_triton_warmup(
         for block in (32, 64, 128, 256)
     ),
 )
+
+
+def _conv_state_warmup_variants(bound):
+    bounds = {"TOTAL": (1, 16, 17), "BATCH": (1, 16, 17)}
+    if bound["BLOCK_T"] > 1:
+        # Long-prefill warmup also covers the same call with a short tail.
+        return (bounds, bounds | {"BLOCK_T": (1,), "BLOCK_C": (256,)})
+    return (bounds,)
+
+
 register_triton_warmup(
     _ple_conv_state_kernel,
-    variants=({"TOTAL": (1, 16, 17), "BATCH": (1, 16, 17)},),
+    variants=_conv_state_warmup_variants,
 )

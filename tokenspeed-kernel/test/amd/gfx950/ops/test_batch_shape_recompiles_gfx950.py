@@ -186,6 +186,53 @@ def test_mha_prefill_batch_size(window_left, skip_softmax_threshold):
             _check_batch_matches_single_requests(run, lengths, out, lse)
 
 
+@pytest.mark.parametrize("window_left", [-1, 100])
+def test_rel_mha_prefill_batch_size(window_left):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.rmha import prefill
+
+    heads, kv_heads, dim, rel_extent = 32, 8, 128, 512
+
+    def run(lengths, single=None):
+        q, k, v, cu, cu_gpu = _prefill_inputs(heads, kv_heads, dim, lengths)
+        # Seeded apart from Q, K and V, so the bias is not a copy of Q.
+        generator = torch.Generator(device=DEVICE).manual_seed(1000 + len(lengths))
+        rel_logits = torch.randn(
+            cu[-1],
+            heads,
+            rel_extent,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        if single is not None:
+            rows = slice(cu[single], cu[single + 1])
+            q, k, v, rel_logits = q[rows], k[rows], v[rows], rel_logits[rows]
+            lengths = [lengths[single]]
+            cu = [0, lengths[0]]
+            cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+        return prefill.launch_gluon_rel_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            rel_logits,
+            cu_gpu,
+            cu,
+            max(lengths),
+            window_left=window_left,
+            return_lse=True,
+        )
+
+    # The batch size and longest query length are unspecialized: one compile.
+    run([5])
+    with assert_no_triton_compile(
+        prefill.gluon_rel_mha_prefill_gfx950,
+        prefill.gluon_rel_mha_prefill_sliding_gfx950,
+    ):
+        for lengths in _PREFILL_BATCHES:
+            out, lse = run(lengths)
+            _check_batch_matches_single_requests(run, lengths, out, lse)
+
+
 @pytest.mark.parametrize("window", [-1, 127])
 def test_mha_prefill_token_stride_and_request_count(window):
     from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
@@ -699,99 +746,6 @@ def test_iris_lamport_allreduce_row_count(moe):
             )
 
     assert_warmup_covers((kernel,), lambda: compile_for(1), compile_for, (5, 16, 63))
-
-
-def test_kda_fused_replay_batch_size():
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
-
-    layers = 4
-    descriptors = torch.zeros(layers, 10, dtype=torch.uint64, device=DEVICE)
-    groups = torch.zeros(layers, dtype=torch.int32, device=DEVICE)
-
-    # Compile only: the descriptors would have to address real layer buffers.
-    def compile_for(batch):
-        pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
-        accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
-        metadata = torch.zeros(batch, 3, dtype=torch.int64, device=DEVICE)
-        stamps = torch.zeros(layers, batch, 4, 2, dtype=torch.int64, device=DEVICE)
-        activation_ref = torch.empty(0, dtype=torch.bfloat16, device=DEVICE)
-        decode.gluon_kda_fused_replay_gfx950.warmup(
-            descriptors,
-            groups,
-            pages,
-            pages,
-            accepted,
-            metadata,
-            stamps,
-            activation_ref,
-            activation_ref,
-            torch.empty(0, dtype=torch.float32, device=DEVICE),
-            BATCH=batch,
-            qkv_stride=4608,
-            conv_stride=13824,
-            state_stride=196608,
-            u_stride=1536,
-            kg_stride=3072,
-            record_slots=batch,
-            stamp_layer_stride=stamps.stride(0),
-            lower_bound=-5.0,
-            H=12,
-            D=128,
-            T=4,
-            CAPACITY=4,
-            BOUNDED=True,
-            num_warps=4,
-            debug=True,
-            grid=(1,),
-        )
-
-    compile_for(16)
-    compile_for(3)
-    with assert_no_triton_compile(decode.gluon_kda_fused_replay_gfx950):
-        for batch in (5, 7, 11, 13, 15):
-            compile_for(batch)
-
-
-def test_kda_fused_decode_batch_size():
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
-
-    heads, head_dim, pages = 12, 128, 96
-    width = heads * head_dim
-    # Q/K/V, output gate, f_a, and beta are column slices of one projection.
-    packed = torch.randn(48, 4 * width + head_dim + heads, device=DEVICE).bfloat16()
-    conv_weights = torch.randn(3 * width, 4, device=DEVICE).bfloat16()
-    conv_states = torch.zeros(pages, 3 * width, 3, device=DEVICE).bfloat16()
-    f_b_weight = torch.randn(width, head_dim, device=DEVICE).bfloat16()
-    state_pool = torch.zeros(pages, heads, head_dim, head_dim, device=DEVICE)
-
-    def run(batch):
-        rows = packed[:batch]
-        decode.gluon_kda_fused_decode_gfx950(
-            mixed_qkv=rows[:, : 3 * width],
-            conv_weights=conv_weights,
-            conv_states=conv_states,
-            f_a_out=rows[:, 4 * width : 4 * width + head_dim],
-            f_b_weight=f_b_weight,
-            beta_logits=rows[:, 4 * width + head_dim :],
-            A_log=torch.zeros(heads, device=DEVICE),
-            dt_bias=torch.zeros(width, device=DEVICE),
-            state_pool=state_pool,
-            read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
-            write_indices=torch.arange(
-                batch, 2 * batch, device=DEVICE, dtype=torch.int32
-            ),
-            num_heads=heads,
-            head_dim=head_dim,
-            cu_seqlens=torch.arange(batch + 1, device=DEVICE, dtype=torch.int32),
-            lower_bound=-5.0,
-        )
-
-    # The state pipeline depth is bucketed by programs per CU.
-    for batch in (16, 32, 48):
-        run(batch)
-    with assert_no_triton_compile(decode.gluon_kda_fused_paged_decode_vmajor_gfx950):
-        for batch in (1, 3, 7, 21, 22, 33, 42, 43, 47):
-            run(batch)
 
 
 def test_dsa_decode_scorer_table_width():

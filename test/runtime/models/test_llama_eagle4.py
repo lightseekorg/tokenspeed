@@ -341,6 +341,13 @@ def test_eagle4_accepts_the_released_draft_configs() -> None:
     validate_draft_config(_nemotron_draft_config())
 
 
+def test_eagle4_accepts_the_decode_monokernel_key_startup_sets_on_drafts() -> None:
+    # Startup declares decode_monokernel on every draft config; EAGLE-4 takes it only off.
+    validate_draft_config(_qwen38_draft_config(decode_monokernel=False))
+    with pytest.raises(ValueError, match="decode_monokernel"):
+        validate_draft_config(_qwen38_draft_config(decode_monokernel=True))
+
+
 @pytest.mark.parametrize(
     "overrides,match",
     [

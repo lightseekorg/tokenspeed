@@ -146,3 +146,20 @@ def test_admission_group_capability_is_explicit_and_legacy_defaults_to_zero() ->
     assert legacy.shared_prefix_publication_contract == 0
     assert legacy.shared_prefix_storage_enabled is False
     assert legacy.capacity_blocks == output.capacity_blocks
+
+
+def test_request_timing_decodes_typed_boundaries_and_legacy_missing_column():
+    batch = MsgpackDecoder(BatchTokenIDOutSlim).decode(_frames("output_slim_timing"))
+    timing = batch.request_timing[0]
+    assert timing.role == "decode"
+    assert (timing.dp_rank, timing.tp_rank) == (2, 3)
+    assert timing.clock.host_id == "worker-a"
+    assert timing.clock.process_instance_id == "process-a"
+    assert timing.events.accepted.ts_mono_ns == "9007199254740993"
+    assert timing.events.kv_ready.ts_unix_ns == "1700000000200000002"
+    assert timing.events.finished.ts_unix_ns == "1700000000500000003"
+    assert timing.kv_output_tokens == 1
+    assert timing.e2e_latency_s == 0.75
+    assert batch.request_timing[1] is None
+    legacy = MsgpackDecoder(BatchTokenIDOutSlim).decode(_frames("output_slim_prefix9"))
+    assert legacy.request_timing == []

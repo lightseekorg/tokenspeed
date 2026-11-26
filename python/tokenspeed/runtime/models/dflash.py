@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import (
@@ -54,7 +55,12 @@ from tokenspeed.runtime.layers.paged_attention import (
     hf_sliding_window_to_window_left,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import (
+    Phi3LongRoPEScaledRotaryEmbedding,
+    RopeScaling,
+    RotaryEmbedding,
+    get_rope,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.kimi_k3_comm import draft_all_reduce
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
@@ -62,6 +68,7 @@ from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.server_args import spec_rope_positions
 from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
 if TYPE_CHECKING:
@@ -73,6 +80,20 @@ if TYPE_CHECKING:
 # most the row-owned kernel keeps resident; larger draft forwards keep the
 # unfused reduction.
 _FUSED_REDUCE_NORM_MAX_ROWS = 128
+
+
+def _draft_rope_cache_limit(rope_scaling: dict[str, Any] | None) -> int | None:
+    if (
+        rope_scaling is None
+        or RopeScaling.type_from_dict(rope_scaling) != "deepseek_yarn"
+    ):
+        return None
+    context = global_server_args_dict.get("max_model_len")
+    verify_width = global_server_args_dict.get("speculative_num_draft_tokens")
+    if context is None or context <= 0 or verify_width is None or verify_width <= 0:
+        return None
+    # Raw draft positions can extend past the last admitted token.
+    return spec_rope_positions(context, verify_width)
 
 
 class DFlashAttention(nn.Module):
@@ -146,6 +167,7 @@ class DFlashAttention(nn.Module):
             max_position=int(getattr(config, "max_position_embeddings", 32768)),
             base=rope_theta,
             rope_scaling=rope_scaling,
+            cache_position_limit=_draft_rope_cache_limit(rope_scaling),
         )
 
         sliding_window_size = _get_dflash_layer_sliding_window(config, layer_id)
@@ -205,6 +227,28 @@ class DFlashAttention(nn.Module):
             self.rotary_emb.cos_sin_cache,
             is_neox=self.rotary_emb.is_neox_style,
         )
+
+
+def prepare_reduce_norm_fusion(mapping: Mapping, hidden_size: int) -> bool:
+    """Arm the fused all-reduce + norm of a draft's layer boundaries.
+
+    Collective: every rank arms the same groups in order, or declines alike,
+    before cache sizing and graph capture.
+
+    Args:
+        mapping: The draft's parallel layout.
+        hidden_size: Width of the rows the boundaries reduce.
+
+    Returns:
+        Whether both groups span several ranks and armed a workspace for
+        ``comm_fusion_max_num_tokens`` rows.
+    """
+    cap = int(global_server_args_dict["comm_fusion_max_num_tokens"])
+    groups = dict.fromkeys((mapping.dense.tp_group, mapping.attn.tp_group))
+    return cap > 0 and all(
+        len(group) > 1 and prepare_all_reduce_fusion(group, hidden_size, cap)
+        for group in groups
+    )
 
 
 def reduce_norm(
@@ -489,6 +533,17 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
                 for i in range(int(config.num_hidden_layers))
             ]
         )
+        # The executor checks the physical context against the table the layers built.
+        self.rope_positions: int | None = min(
+            (
+                module.position_capacity
+                for module in self.layers.modules()
+                if isinstance(
+                    module, (RotaryEmbedding, Phi3LongRoPEScaledRotaryEmbedding)
+                )
+            ),
+            default=None,
+        )
         self.norm = RMSNorm(int(config.hidden_size), eps=eps)
         # The draft's prepared fusions (prepare_communication_runtime).
         self.fused_reduce_norm: LamportResidualRMSNorm | None = None
@@ -695,15 +750,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             Whether the draft prepared anything.
         """
         prepared = self._prepare_fused_reduce_norm(max_num_tokens)
-        cap = int(global_server_args_dict["comm_fusion_max_num_tokens"])
-        groups = dict.fromkeys(
-            (self.mapping.dense.tp_group, self.mapping.attn.tp_group)
-        )
-        # Collective: every rank arms the same groups in order, or declines alike.
-        self.allreduce_fusion = cap > 0 and all(
-            len(group) > 1
-            and prepare_all_reduce_fusion(group, int(self.config.hidden_size), cap)
-            for group in groups
+        self.allreduce_fusion = prepare_reduce_norm_fusion(
+            self.mapping, int(self.config.hidden_size)
         )
         for layer in self.layers:
             layer.allreduce_fusion = self.allreduce_fusion
@@ -730,6 +778,10 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         del max_num_tokens
         if self.fused_reduce_norm is not None:
             return True
+        # Iris needs Gluon at import time, before its support check can run.
+        if not current_platform().is_cdna4:
+            return False
+
         from tokenspeed_kernel.ops.communication.iris import (
             iris_lamport_residual_rmsnorm_supported,
             prepare_iris_lamport_residual_rmsnorm,

@@ -474,6 +474,8 @@ def _decode_batch(bs: int, width: int):
             host_write_policy="write_through",
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
+            max_consecutive_prefill_rounds=0,
+            prefill_interval_min_decoding=0,
             storage_config=None,
             decode_input_tokens=width,
             cache_groups=[
@@ -484,6 +486,8 @@ def _decode_batch(bs: int, width: int):
                     attn_kind=ts.AttnKind.Full,
                 )
             ],
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
     for i in range(bs):

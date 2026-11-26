@@ -110,6 +110,9 @@ class BlockwiseGemmRunner(TunableRunner):
         return id(self)
 
     def _prepare_profile_inputs(self, inputs):
+        # The tuner builds token-major activation scales; launches read MN-major.
+        inputs = list(inputs)
+        inputs[2] = inputs[2].t().contiguous().t()
         # Each profile bucket owns its temporary buffers only while tuning.
         self._profile_inputs = []
         self._profile_step = 0

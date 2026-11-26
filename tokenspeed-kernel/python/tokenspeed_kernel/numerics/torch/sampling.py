@@ -498,7 +498,9 @@ def torch_top_k_top_p_support(
     "vocab_shard_topk",
     name="torch_vocab_shard_topk",
     solution="torch",
-    signatures=format_signatures("logits", "dense", {torch.bfloat16, torch.float16}),
+    signatures=format_signatures(
+        "logits", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
     priority=Priority.REFERENCE,
 )
 def torch_vocab_shard_topk(
@@ -509,10 +511,16 @@ def torch_vocab_shard_topk(
     out: torch.Tensor,
     *,
     softcap: float | None,
+    softcap_form: str | None,
     vocab_mask: torch.Tensor | None,
+    values_out: torch.Tensor | None,
+    halo_out: torch.Tensor | None,
 ) -> None:
     """Reference ``vocab_shard_topk``: a stable descending sort, so equal
-    values keep the lowest column first."""
+    values keep the lowest column first. Both softcap forms compute
+    ``c * tanh(x / c)``."""
+    if (softcap is None) != (softcap_form is None):
+        raise ValueError(f"softcap {softcap} has no form {softcap_form!r}")
     scaled = logits if logit_scale is None else logits * logit_scale
     if softcap is not None:
         # Rounded to the logits' dtype, as the logits processor writes it.
@@ -523,6 +531,9 @@ def torch_vocab_shard_topk(
         words = vocab_mask[:, tokens // 32]
         allowed = (words >> (tokens % 32).to(words.dtype)) & 1
         scaled = scaled.masked_fill(allowed == 0, float("-inf"))
+    if values_out is not None:
+        values_out[:, vocab_start : vocab_start + scaled.shape[1]] = scaled
+        halo_out.copy_(scaled[:, : halo_out.shape[1]])
     order = torch.sort(scaled, dim=-1, descending=True, stable=True).indices[:, :k]
     out[:, :k] = torch.gather(scaled, 1, order)
     out[:, k:] = (order + vocab_start).float()

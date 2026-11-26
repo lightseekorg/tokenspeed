@@ -38,21 +38,14 @@ __all__ = []
 
 
 def _per_token_group_quant_8bit(
-    x: torch.Tensor, group_size: int, use_ue8m0: bool
+    x: torch.Tensor, group_size: int, use_ue8m0: bool, *, mn_major: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if group_size != 128:
         raise ValueError(
             "trtllm fp8_quantize_1x128 only supports group_size=128, "
             f"got {group_size}"
         )
-    q, scale = fp8_quantize_1x128(x, use_ue8m0)
-    if scale.ndim == 1:
-        # The flat-buffer ABI uses 4-row alignment and trailing padding.
-        rows, columns = x.shape
-        padded_rows = (rows + 3) // 4 * 4
-        groups = columns // group_size
-        scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
-    return q, scale
+    return fp8_quantize_1x128(x, use_ue8m0, mn_major=mn_major)
 
 
 if _IS_NVIDIA:
@@ -68,7 +61,7 @@ if _IS_NVIDIA:
 
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
         qweight, _scale = _per_token_group_quant_8bit(
-            x, group_size=128, use_ue8m0=False
+            x, group_size=128, use_ue8m0=False, mn_major=False
         )
         return qweight.float()
 
@@ -115,12 +108,12 @@ if _IS_NVIDIA:
             return q.reshape(x.shape), scale.float().reshape(*x.shape[:-1], 1)
 
         if granularity == "token_group":
-            q, scale = _per_token_group_quant_8bit(
+            return _per_token_group_quant_8bit(
                 x,
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
+                mn_major=False,
             )
-            return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 
@@ -153,17 +146,16 @@ if _IS_NVIDIA:
         scale_encoding: str,
         enable_pdl: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return FP8 values and a logical [M,K/128] view of native scales."""
+        """Return FP8 values and [M, K/128] scales stored MN-major."""
         if granularity != "token_group" or scale_encoding != "float32":
             raise ValueError(
                 "MN-major FP8 quantization requires FP32 token-group scales"
             )
         if enable_pdl:
             raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
-        q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
-        # Preserve the native M stride; padding depends on the TRT-LLM ABI.
-        # Consumers may still need to align or repack these scales.
-        return q, scale.t()
+        return _per_token_group_quant_8bit(
+            x, group_size, use_ue8m0=False, mn_major=True
+        )
 
     __all__ = [
         "trtllm_fp8_token_group_128",

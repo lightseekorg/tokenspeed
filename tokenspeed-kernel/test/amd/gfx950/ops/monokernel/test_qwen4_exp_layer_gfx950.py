@@ -624,7 +624,8 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
     one-token decode steps do. It gives:
 
     * the same output streams,
-    * each token's conv windows (and PLE context) in its scratch rows,
+    * GDN conv windows and PLE context in scratch, plus compact PLE conv inputs
+      that commit the same state for every accepted prefix,
     * a replay payload from which TokenSpeed's replay commit rebuilds the
       state after the last token.
 
@@ -740,7 +741,33 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
             assert torch.equal(windows[row], conv[first + 1 + step])
             if with_ple:
                 assert torch.equal(context_windows[row], context[first + 1 + step])
-                assert torch.equal(ple_windows[row], ple_state[first + 1 + step])
+
+    if with_ple:
+        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows_compact
+
+        restored = torch.empty(requests, WIDTH, 9, dtype=torch.bfloat16, device=dev)
+        request_ids = torch.arange(requests, device=dev, dtype=torch.int64)
+        source_base = request_ids * (chain + 1)
+        source_addresses = torch.tensor(
+            [ple_windows.data_ptr()], device=dev, dtype=torch.uint64
+        )
+        destination_addresses = torch.tensor(
+            [restored.data_ptr()], device=dev, dtype=torch.uint64
+        )
+        strides = torch.tensor([restored.stride(0)], device=dev, dtype=torch.int64)
+        for accepted in range(chain + 1):
+            accepted_counts = (request_ids + accepted) % (chain + 1)
+            copy_state_rows_compact(
+                source_addresses,
+                destination_addresses,
+                source_base + accepted_counts,
+                request_ids,
+                row_bytes=restored[0].numel() * restored.element_size(),
+                dst_row_strides=strides,
+                scratch=ple_windows,
+                verify_width=chain,
+            )
+            assert torch.equal(restored, ple_state[base + accepted_counts])
 
     replayed = ssm0.clone()
     gdn_replay_commit(
@@ -761,6 +788,8 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
         # The pool is one fresh allocation, and its row stride is a multiple of
         # 16 bytes.
         rows_aligned=True,
+        request_mask=None,
+        selected_requests=None,
     )
     final = (base + chain).long()
     torch.testing.assert_close(replayed[final], ssm[final], rtol=1e-4, atol=1e-5)

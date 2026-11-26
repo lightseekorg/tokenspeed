@@ -26,7 +26,11 @@ commit, the accepted frontier, the drafter and the tokens reported to the
 scheduler -- must see the request end exactly where the control plane ends
 it, so the accepted width is cut on the device, in place, before any of them
 reads it. A request that ends this round is marked stopped; the forward the
-overlap schedule already dispatched behind it then keeps nothing.
+overlap schedule already dispatched behind it then keeps nothing. Each row
+also reports to the control plane whether the device ended its request, so
+the control plane publishes a deferred decode state only on the device's
+word: ``REQUEST_ENDED``, which a deferred-state commit that could not
+complete the row's state raises to ``REQUEST_ENDED_INCOMPLETE``.
 """
 
 from __future__ import annotations
@@ -42,7 +46,11 @@ from tokenspeed_kernel.signature import (
     format_signatures,
 )
 
-__all__ = ["apply_stop_conditions"]
+__all__ = ["REQUEST_ENDED", "REQUEST_ENDED_INCOMPLETE", "apply_stop_conditions"]
+
+# A row's ``request_ends`` entry: 0 while its request runs on the device.
+REQUEST_ENDED = 1
+REQUEST_ENDED_INCOMPLETE = 2
 
 _BLOCK = 64
 
@@ -58,6 +66,7 @@ def _apply_stop_conditions_kernel(
     stop_token_ids_ptr,
     token_limits_ptr,
     stopped_ptr,
+    request_ends_ptr,
     batch_size,
     num_extends,
     num_prefill_outputs,
@@ -66,6 +75,7 @@ def _apply_stop_conditions_kernel(
     DECODE_WIDTH: tl.constexpr,
     WIDTH_PAD: tl.constexpr,
     NUM_STOP_IDS: tl.constexpr,
+    ENDED: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row_mask = rows < batch_size
@@ -133,6 +143,7 @@ def _apply_stop_conditions_kernel(
     tl.store(accept_lengths_ptr + rows, kept, mask=decode)
     stops = tl.where(is_extend, extend_stops, decode_stops)
     tl.store(stopped_ptr + slots, stops.to(tl.int1), mask=live)
+    tl.store(request_ends_ptr + rows, tl.where(live & stops, ENDED, 0), mask=row_mask)
 
 
 def _apply_stop_conditions_torch(
@@ -145,6 +156,7 @@ def _apply_stop_conditions_torch(
     stop_token_ids: torch.Tensor,
     token_limits: torch.Tensor,
     stopped: torch.Tensor,
+    request_ends: torch.Tensor,
     num_extends: int,
     num_prefill_outputs: int,
     decode_width: int,
@@ -152,10 +164,11 @@ def _apply_stop_conditions_torch(
 ) -> None:
     """Scalar reference of the kernel, for devices without it (and the
     kernel's parity tests): cut each decode row's accepted width at its stop
-    conditions and record ``stopped``, in place, as ``apply_stop_conditions``
-    documents."""
+    conditions and record ``stopped`` and ``request_ends``, in place, as
+    ``apply_stop_conditions`` documents."""
     for row in range(req_pool_indices.shape[0]):
         slot = int(req_pool_indices[row])
+        request_ends[row] = 0
         if slot == padding_index:
             continue
         stop_ids = {int(x) for x in stop_token_ids[slot].tolist() if x >= 0}
@@ -171,6 +184,7 @@ def _apply_stop_conditions_torch(
                 )
             )
             stopped[slot] = stops
+            request_ends[row] = REQUEST_ENDED if stops else 0
             continue
         start = num_prefill_outputs + (row - num_extends) * decode_width
         accepted = int(accept_lengths[row])
@@ -184,9 +198,11 @@ def _apply_stop_conditions_torch(
         kept = min(accepted, first_stop + 1, budget)
         if bool(stopped[slot]):
             accept_lengths[row] = 0
+            request_ends[row] = REQUEST_ENDED
             continue
         accept_lengths[row] = kept
         stopped[slot] = first_stop < kept or kept >= budget
+        request_ends[row] = REQUEST_ENDED if bool(stopped[slot]) else 0
 
 
 def apply_stop_conditions(
@@ -199,6 +215,7 @@ def apply_stop_conditions(
     stop_token_ids: torch.Tensor,
     token_limits: torch.Tensor,
     stopped: torch.Tensor,
+    request_ends: torch.Tensor,
     *,
     num_extends: int,
     num_prefill_outputs: int,
@@ -232,13 +249,18 @@ def apply_stop_conditions(
             ends.
         stopped: ``[pool]`` bool; read for decode requests, written for every
             live request.
+        request_ends: ``[batch]`` int32, written for every row:
+            ``REQUEST_ENDED`` when the device ended the row's request, in
+            this forward or an earlier one, else 0. A later commit that
+            defers decode state may raise it to ``REQUEST_ENDED_INCOMPLETE``.
         num_extends: Leading requests that are extends.
         num_prefill_outputs: Leading extend requests that sampled a token.
         decode_width: Output tokens per decode request.
         padding_index: Slot value of a padding row.
 
     Returns:
-        None. ``accept_lengths`` and ``stopped`` are updated in place.
+        None. ``accept_lengths``, ``stopped`` and ``request_ends`` are updated
+        in place.
 
     Raises:
         ValueError: A tensor is not the shape, dtype or layout the update
@@ -274,6 +296,8 @@ def apply_stop_conditions(
         raise ValueError(f"token_limits and stopped must be [{pool}]")
     if stopped.dtype != torch.bool:
         raise ValueError("stopped must be a bool tensor")
+    if request_ends.shape != (batch_size,) or request_ends.dtype != torch.int32:
+        raise ValueError(f"request_ends must be [{batch_size}] int32")
     tensors = (
         req_pool_indices,
         output_tokens,
@@ -284,6 +308,7 @@ def apply_stop_conditions(
         stop_token_ids,
         token_limits,
         stopped,
+        request_ends,
     )
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("apply_stop_conditions needs contiguous tensors")
@@ -302,6 +327,7 @@ def apply_stop_conditions(
             stop_token_ids,
             token_limits,
             stopped,
+            request_ends,
             num_extends,
             num_prefill_outputs,
             decode_width,
@@ -324,6 +350,7 @@ def apply_stop_conditions(
         stop_token_ids,
         token_limits,
         stopped,
+        request_ends,
         num_extends,
         num_prefill_outputs,
         decode_width,
@@ -350,6 +377,7 @@ def triton_apply_stop_conditions(
     stop_token_ids,
     token_limits,
     stopped,
+    request_ends,
     num_extends,
     num_prefill_outputs,
     decode_width,
@@ -357,11 +385,12 @@ def triton_apply_stop_conditions(
 ) -> None:
     """Apply the portable device update after public input validation.
 
-    Registry leaves accept all 13 arguments positionally in this order:
+    Registry leaves accept all 14 arguments positionally in this order:
     ``req_pool_indices``, ``output_tokens``, ``accept_lengths``,
     ``input_lengths``, ``prompt_lengths``, ``valid_cache_lengths``,
-    ``stop_token_ids``, ``token_limits``, ``stopped``, ``num_extends``,
-    ``num_prefill_outputs``, ``decode_width``, ``padding_index``.
+    ``stop_token_ids``, ``token_limits``, ``stopped``, ``request_ends``,
+    ``num_extends``, ``num_prefill_outputs``, ``decode_width``,
+    ``padding_index``.
     Shapes, dtypes and in-place semantics follow :func:`apply_stop_conditions`.
     """
     batch_size = req_pool_indices.shape[0]
@@ -378,6 +407,7 @@ def triton_apply_stop_conditions(
         stop_token_ids,
         token_limits,
         stopped,
+        request_ends,
         batch_size,
         num_extends,
         num_prefill_outputs,
@@ -386,5 +416,6 @@ def triton_apply_stop_conditions(
         DECODE_WIDTH=decode_width,
         WIDTH_PAD=max(2, triton.next_power_of_2(decode_width)),
         NUM_STOP_IDS=stop_token_ids.shape[1],
+        ENDED=REQUEST_ENDED,
         num_warps=4,
     )

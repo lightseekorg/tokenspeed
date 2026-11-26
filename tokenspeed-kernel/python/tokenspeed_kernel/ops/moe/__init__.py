@@ -57,6 +57,7 @@ __all__ = [
     "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
+    "moe_prepare_input_buffers",
     "moe_process_weights",
     "moe_warmup",
     "moe_topk",
@@ -238,7 +239,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.5, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -2265,6 +2266,10 @@ def moe_plan(
     supports_fp8_per_tensor_input = True in apply_spec.traits.get(
         "supports_fp8_per_tensor_input", frozenset({False})
     )
+    # The weight preprocessor returns PreparedExpertWeights for DWDP storage.
+    supports_peer_weights = True in apply_spec.traits.get(
+        "supports_peer_weights", frozenset({False})
+    )
     sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
     sorted_route_block_sizes = apply_spec.traits.get(
         "sorted_route_block_size", frozenset()
@@ -2283,6 +2288,9 @@ def moe_plan(
         "features": features,
         "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
+        "prepare_input_buffers": getattr(
+            kernel.impl, "_tokenspeed_prepare_input_buffers", None
+        ),
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "fuse_shared_expert": getattr(
             kernel.impl, "_tokenspeed_fuse_shared_expert", None
@@ -2305,6 +2313,7 @@ def moe_plan(
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         "supports_fp8_per_tensor_input": supports_fp8_per_tensor_input,
+        "supports_peer_weights": supports_peer_weights,
         "sorted_route_rows": sorted_route_rows,
         "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
@@ -2366,6 +2375,25 @@ def moe_process_weights(
         else:
             communication_initializer(initialize)
     return result
+
+
+def moe_prepare_input_buffers(
+    plan: dict, w: torch.nn.Module
+) -> Callable[
+    [int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+]:
+    """Prepare the selected kernel's input storage and return its view factory.
+
+    Args:
+        plan: The selected MoE plan, including its EP process group.
+        w: Processed expert weights used to prepare the runner.
+
+    Returns:
+        A callable taking live rows and the maximum rows over EP ranks. It
+        returns activation, scale, expert-ID and route-weight buffer views.
+        Call collectively before capture, in the runtime's workspace region.
+    """
+    return plan["prepare_input_buffers"](plan, w)
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
@@ -2525,6 +2553,7 @@ import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.flashinfer_cutedsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401

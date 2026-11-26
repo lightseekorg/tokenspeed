@@ -878,8 +878,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
     backend.is_draft = False
     backend.spec_num_tokens = query_width
-    # configure_runtime's probe verdict: the records core needs an FP8 cache.
+    # configure_runtime's probe verdicts: both need an FP8 cache.
     backend._dcp_decode_records_core = False
+    backend._kvp_decode_solution = None
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0,

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for Hugging Face Hub 429 rate-limit retry behavior."""
+"""Tests for Hugging Face Hub rate-limit and transient server-error retries."""
 
 import os
 import sys
@@ -75,7 +75,14 @@ def test_rate_limit_waits_for_retry_after_then_succeeds(recorded_sleeps) -> None
         assert 30 <= slept <= 30 * 1.25
 
 
-def test_non_rate_limit_error_propagates_immediately(recorded_sleeps) -> None:
+def test_transient_server_errors_are_retried(recorded_sleeps) -> None:
+    errors = [_hf_error(status) for status in (500, 502, 503, 504)]
+
+    assert call_with_hf_rate_limit_retry("testing", _flaky(errors)) == "ok"
+    assert len(recorded_sleeps) == 4
+
+
+def test_non_retryable_error_propagates_immediately(recorded_sleeps) -> None:
     with pytest.raises(HfHubHTTPError):
         call_with_hf_rate_limit_retry("testing", _flaky([_hf_error(404)]))
     assert recorded_sleeps == []
@@ -98,12 +105,18 @@ def test_unparseable_retry_after_uses_exponential_backoff(recorded_sleeps) -> No
     assert 5.0 <= recorded_sleeps[0] <= 5.0 * 1.25
 
 
-def test_gives_up_once_retry_budget_is_exhausted(recorded_sleeps, monkeypatch) -> None:
+@pytest.mark.parametrize("status", [429, 504])
+def test_gives_up_once_retry_budget_is_exhausted(
+    recorded_sleeps, monkeypatch, status
+) -> None:
     monkeypatch.setattr(hf_hub_retry, "HF_RATE_LIMIT_RETRY_BUDGET_S", 40.0)
 
-    def always_rate_limited() -> str:
-        raise _hf_error(429, "30")
+    error = _hf_error(status, "30")
 
-    with pytest.raises(HfHubHTTPError):
-        call_with_hf_rate_limit_retry("testing", always_rate_limited)
+    def always_fails() -> str:
+        raise error
+
+    with pytest.raises(HfHubHTTPError) as caught:
+        call_with_hf_rate_limit_retry("testing", always_fails)
+    assert caught.value is error
     assert len(recorded_sleeps) == 1

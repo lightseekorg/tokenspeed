@@ -55,6 +55,7 @@ from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    PrefillRequestLayout,
     reject_bounded_replay,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
@@ -65,6 +66,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry imp
     learn_cache_group_geometry,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    GROUP_WRITE_SLOT_DTYPE,
     GroupTableSpec,
     GroupTableStacks,
 )
@@ -382,7 +384,9 @@ class CacheGroupRouter(AttentionBackend):
                 kernel_page_size=leaf.kernel_page_size,
                 max_num_pages=leaf.max_num_pages,
                 atom_pages_per_block=self.cache_pool.atom_pages_per_block(
-                    gid, leaf.kernel_page_size
+                    gid,
+                    leaf.kernel_page_size,
+                    write_slot_dtype=GROUP_WRITE_SLOT_DTYPE,
                 ),
             )
             for gid, leaf in self.leaves.items()
@@ -732,6 +736,13 @@ class CacheGroupRouter(AttentionBackend):
                 "decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend/mixed/idle ({forward_mode})"
             )
+        self._prefill_request_layout = (
+            PrefillRequestLayout.from_cpu_lengths(
+                num_extends, extend_seq_lens_cpu, extend_prefix_lens_cpu
+            )
+            if num_extends and not forward_mode.is_idle()
+            else None
+        )
         live_bs = 0 if forward_mode.is_idle() else bs
         self._check_live_delivery(live_bs, block_tables)
         self.stacks.fill(bs, live_bs, block_tables)
@@ -790,6 +801,8 @@ class CacheGroupRouter(AttentionBackend):
     ) -> None:
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
+        if num_extends == 0:
+            self._prefill_request_layout = None
         del kwargs
         self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
@@ -797,21 +810,7 @@ class CacheGroupRouter(AttentionBackend):
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
             )
         self._check_live_delivery(actual_bs, block_tables)
-        targets = {
-            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
-        }
-        self.stacks.fill_decode(
-            bs,
-            actual_bs,
-            block_tables,
-            seq_lens,
-            self._decode_tokens_per_req,
-            targets={
-                gid: (*pair, self.leaves[gid].decode_seq_lens_floor)
-                for gid, pair in targets.items()
-                if pair is not None
-            },
-        )
+        targets = self._fill_decode_stacks(bs, actual_bs, block_tables, seq_lens)
         # Draft refreshes after mixed rounds still publish only their decode tail.
         self._decode_request_offset = num_extends
         self._publish_decode_locations(bs, self._decode_tokens_per_req)
@@ -830,6 +829,34 @@ class CacheGroupRouter(AttentionBackend):
             else:
                 leaf.publish_decode_metadata(bs, seq_lens, num_extends=num_extends)
             leaf.set_request_slots(req_pool_indices[:bs])
+
+    def _fill_decode_stacks(
+        self,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+        seq_lens: torch.Tensor,
+    ) -> dict:
+        """Fill the stacks, the decode write window and the leaves' copy-only
+        buffers for a decode step of ``actual_bs`` live requests (0: idle);
+        returns each leaf's buffer targets (None for a leaf that refreshes
+        itself)."""
+        targets = {
+            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
+        }
+        self.stacks.fill_decode(
+            bs,
+            actual_bs,
+            block_tables,
+            seq_lens,
+            self._decode_tokens_per_req,
+            targets={
+                gid: (*pair, self.leaves[gid].decode_seq_lens_floor)
+                for gid, pair in targets.items()
+                if pair is not None
+            },
+        )
+        return targets
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -850,7 +877,10 @@ class CacheGroupRouter(AttentionBackend):
             raise NotImplementedError(
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
             )
-        self.stacks.fill(bs, 0, block_tables)
+        self._prefill_request_layout = None
+        # The idle arm of the refresh replay runs, so capture compiles the
+        # kernel replay launches.
+        self._fill_decode_stacks(bs, 0, block_tables, seq_lens)
         self._decode_request_offset = 0
         self._refresh_decode_locations(bs, seq_lens)
         for gid, leaf in self.leaves.items():
@@ -1010,6 +1040,13 @@ class CacheGroupRouter(AttentionBackend):
             return False
         return self._leaf_for(layer).takes_owned_decode_topk(layer)
 
+    def projects_decode_values(self, layer, **sizes):
+        if self._offload_adapter is not None and self._offload_adapter.offloads_layer(
+            layer.layer_id
+        ):
+            return False
+        return self._leaf_for(layer).projects_decode_values(layer, **sizes)
+
     def dcp_decode_query_rider(self, layer, q):
         if not self.takes_owned_decode_topk(layer):
             return None
@@ -1017,6 +1054,9 @@ class CacheGroupRouter(AttentionBackend):
 
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
+
+    def gates_decode_output(self, layer):
+        return self._leaf_for(layer).gates_decode_output(layer)
 
     def decode_kv_view(self, layer, token_to_kv_pool):
         return self._leaf_for(layer).decode_kv_view(layer, token_to_kv_pool)
