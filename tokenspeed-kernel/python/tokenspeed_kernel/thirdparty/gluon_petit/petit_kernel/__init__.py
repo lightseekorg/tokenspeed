@@ -742,3 +742,37 @@ class MegaMoeConfig:
             stage1_n128=stage1_n128,
             **residual_kw,
         )
+
+
+def mega_moe_largest_max_tokens_per_rank(**config) -> int:
+    """Return the largest per-rank capacity ``MegaMoeConfig(**config)`` admits.
+
+    ``config`` holds every ``MegaMoeConfig`` field but ``max_tokens_per_rank``.
+    The result is the largest 32-row multiple, at most
+    ``MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK``, whose symmetric heap stays
+    below 32-bit offsets (binary search from the default 1024 rows, which
+    always fit). The heap is sized in pure Python (``MegaMoEHeapBytes`` over
+    the solution registry), so this neither builds or loads the compiled
+    extension nor initializes the GPU runtime: a host without a GPU can size
+    capacities.
+    """
+
+    def fits(rows: int) -> bool:
+        try:
+            MegaMoeConfig(**config, max_tokens_per_rank=rows)
+        except ValueError:
+            return False
+        return True
+
+    low, high = (
+        MEGA_MOE_DEFAULT_MAX_TOKENS_PER_RANK,
+        MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK,
+    )
+    if fits(high):
+        return high
+    # Invariant: low fits, high does not; both are 32-row multiples.
+    block = MEGA_MOE_SORTED_TOKEN_BLOCK
+    while high - low > block:
+        middle = (low + high) // 2 // block * block
+        low, high = (middle, high) if fits(middle) else (low, middle)
+    return low

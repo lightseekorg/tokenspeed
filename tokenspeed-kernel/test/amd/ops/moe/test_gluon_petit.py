@@ -794,6 +794,72 @@ def test_profile_without_raised_capacity_refuses_above_1024_at_ep8(profile) -> N
         _get_workspace(torch.device("cuda", 0), profile, 2048)
 
 
+# Run in a fresh interpreter that imports only Petit's pure-Python package
+# (never tokenspeed_kernel.ops, whose platform probe opens the GPU): prints the
+# EP8 capacities, then every file descriptor that names a GPU device node.
+_CAPACITY_WITHOUT_GPU = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import petit_kernel as p
+F = p.MegaMoeActivationFunction
+def largest(experts, top_k, hidden, inter, function):
+    return p.mega_moe_largest_max_tokens_per_rank(
+        world_size=8, num_experts=experts, topk=top_k, model_dim=hidden,
+        activation=p.MegaMoeActivation.mxfp4, activation_function=function,
+        stages=p.MegaMoeStages.two_stage, inter_dim=inter, has_bias=False)
+print(largest(256, 8, 4096, 4096, F.silu), largest(384, 6, 5120, 2560,
+      F.silu_clamped), largest(288, 8, 4096, 2048, F.silu_clamped))
+fds = []
+for fd in os.listdir("/proc/self/fd"):
+    try:
+        fds.append(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        pass
+print([f for f in fds if f.startswith(("/dev/kfd", "/dev/dri"))])
+"""
+
+
+def test_largest_capacity_needs_no_extension_or_gpu() -> None:
+    """Petit's capacity search sizes the heap in pure Python: Muse Spark 2368,
+    DSv4.1 Flash 2624 and GLM-5.3 Flash 2464 rows at EP8 (the values the
+    profiles above serve), without loading the compiled extension or opening
+    a GPU device."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import tokenspeed_kernel
+    from tokenspeed_kernel.thirdparty import gluon_petit
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(tokenspeed_kernel.__file__).parents[1])]
+        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CAPACITY_WITHOUT_GPU,
+            str(Path(gluon_petit.__file__).parent),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+    )
+    capacities, gpu_files = result.stdout.splitlines()[-2:]
+    assert capacities == "2368 2624 2464"
+    assert gpu_files == "[]"
+    # The same search through the profiles.
+    assert [
+        _profile_largest_max_tokens_per_rank(profile, 8)
+        for profile in (_MUSE_SPARK_PROFILE, _DSV41_FLASH_PROFILE, _GLM53_FLASH_PROFILE)
+    ] == [2368, 2624, 2464]
+
+
 def test_muse_spark_capacity_at_ep8() -> None:
     # The server admits EP8 chunks up to DSv4.1 Flash's 2624 rows; Muse Spark's
     # workspace admits its 2304-row chunk and its 2368-row limit and refuses

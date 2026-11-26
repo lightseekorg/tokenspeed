@@ -3210,10 +3210,11 @@ class _GluonPetitState:
     max_tokens_per_rank: int = _MAX_TOKENS_PER_RANK
 
 
-def _megamoe_config(
-    petit_kernel: Any, profile: _Profile, world_size: int, max_tokens_per_rank: int
-) -> Any:
-    return petit_kernel.MegaMoeConfig(
+def _megamoe_config_fields(
+    petit_kernel: Any, profile: _Profile, world_size: int
+) -> dict[str, Any]:
+    """``profile``'s ``MegaMoeConfig`` fields, all but ``max_tokens_per_rank``."""
+    return dict(
         world_size=world_size,
         num_experts=profile.num_experts,
         topk=profile.top_k,
@@ -3228,6 +3229,14 @@ def _megamoe_config(
         stages=petit_kernel.MegaMoeStages.two_stage,
         inter_dim=profile.inter_dim,
         has_bias=profile.has_bias,
+    )
+
+
+def _megamoe_config(
+    petit_kernel: Any, profile: _Profile, world_size: int, max_tokens_per_rank: int
+) -> Any:
+    return petit_kernel.MegaMoeConfig(
+        **_megamoe_config_fields(petit_kernel, profile, world_size),
         max_tokens_per_rank=max_tokens_per_rank,
     )
 
@@ -3244,31 +3253,17 @@ def _profile_largest_max_tokens_per_rank(profile: _Profile, world_size: int) -> 
 
     The largest 32-row multiple, at most Petit's largest encodable capacity,
     whose symmetric heap stays below 32-bit offsets; 1024 rows when the
-    profile does not raise its capacity at ``world_size``.
+    profile does not raise its capacity at ``world_size``. The search is
+    Petit's ``mega_moe_largest_max_tokens_per_rank``, which needs neither the
+    compiled extension nor a GPU.
     """
     world_size = int(world_size)
     if not _raises_capacity(profile, world_size):
         return _MAX_TOKENS_PER_RANK
     petit_kernel = _import_petit_kernel()
-
-    def fits(rows: int) -> bool:
-        try:
-            _megamoe_config(petit_kernel, profile, world_size, rows)
-        except ValueError:
-            return False
-        return True
-
-    low, high = (
-        _MAX_TOKENS_PER_RANK,
-        petit_kernel.MEGA_MOE_LARGEST_ENCODED_MAX_TOKENS_PER_RANK,
+    return petit_kernel.mega_moe_largest_max_tokens_per_rank(
+        **_megamoe_config_fields(petit_kernel, profile, world_size)
     )
-    if fits(high):
-        return high
-    # Invariant: low fits, high does not; both are 32-row multiples.
-    while high - low > _SORTED_TOKEN_BLOCK:
-        middle = (low + high) // 2 // _SORTED_TOKEN_BLOCK * _SORTED_TOKEN_BLOCK
-        low, high = (middle, high) if fits(middle) else (low, middle)
-    return low
 
 
 @functools.cache
