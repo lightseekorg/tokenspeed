@@ -141,7 +141,9 @@ def gluon_bf16_moe(
         decode = num_tokens <= DECODE_MAX_M
     if warp_decode is None:
         warp_decode = decode and num_tokens <= WARP_DECODE_MAX_M and I_r % 256 == 0
-    if expert_start:
+    if expert_parallel or expert_start:
+        # Warp decode reads experts straight from topk_ids and cannot skip
+        # routes owned by other EP ranks, including on rank 0.
         warp_decode = False
     if decode:
         block_m = DECODE_BLOCK_M

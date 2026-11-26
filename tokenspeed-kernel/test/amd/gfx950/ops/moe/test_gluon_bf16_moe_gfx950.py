@@ -576,12 +576,22 @@ def test_prefill_slices_are_bit_identical(
 
 
 @requires_cdna4
-def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
-    """The prefill aligner maps global EP routes to contiguous local weights."""
+@pytest.mark.parametrize(
+    ("num_tokens", "decode", "expert_start"),
+    [(64, False, 4), (64, False, 0), (4, True, 4), (4, True, 0)],
+    ids=["prefill-rank2", "prefill-rank0", "decode-rank2", "decode-rank0"],
+)
+def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes(
+    num_tokens: int, decode: bool, expert_start: int
+) -> None:
+    """The aligner maps global EP routes to contiguous local weights.
+
+    Decode covers the first EP rank too: its expert_start is 0, and the warp
+    decode path (which reads experts straight from topk_ids) must not take
+    routes that belong to other ranks.
+    """
     generator = torch.Generator(device="cuda").manual_seed(29)
-    num_tokens = 64
     num_local_experts = 2
-    expert_start = 4
     top_k = 2
     hidden = torch.randn(
         num_tokens, D, dtype=torch.bfloat16, device="cuda", generator=generator
@@ -626,7 +636,7 @@ def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
         w2,
         topk_ids,
         topk_weights,
-        decode=False,
+        decode=decode,
         expert_start=expert_start,
         expert_parallel=True,
     )
