@@ -160,8 +160,6 @@ def _generate_text() -> list[bytes]:
     sampling_params.normalize(tokenizer=None)
     return _add(
         TokenizedGenerateReqInput(
-            cache_group_id=None,
-            shared_prefix_tokens=[],
             return_full_vocab_topk=False,
             rid="r-text",
             http_worker_ipc="ipc:///tmp/worker",

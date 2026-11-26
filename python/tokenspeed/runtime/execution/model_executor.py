@@ -456,9 +456,10 @@ class ModelExecutorConfig:
     # once (``--input-logprob-chunk-tokens``). Bounds the transient
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
     # changes a result.
+    input_logprob_chunk_tokens: int
+    # --full-vocab-top-k width and the explicitly selected normalizer solution.
     full_vocab_top_k: int
     full_vocab_top_k_solution: str | None
-    input_logprob_chunk_tokens: int
     # Draft-prob rejection sampling: the drafter records its per-step
     # proposal distributions in RuntimeStates.draft_probs and verify accepts
     # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects

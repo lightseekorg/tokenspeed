@@ -54,6 +54,7 @@ def _executor(*, enabled, drafter):
     from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor.full_vocab_topk = None
     executor.sampling_backend = GreedySamplingBackend(
         SamplingBackendConfig(
             synthetic_acceptance_length=None,

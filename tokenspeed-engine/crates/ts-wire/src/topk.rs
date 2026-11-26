@@ -53,13 +53,13 @@ pub fn validate_row(
         return Err(invalid("invalid tail log mass"));
     }
     let mut head_ids = [0i32; 128];
-    for j in 0..k {
+    for (j, head_id) in head_ids[..k].iter_mut().enumerate() {
         let id = int(2 + j);
         let value = float(2 + k + j);
         if id < 0 || i64::from(id) >= vocab_size {
             return Err(invalid("head IDs must be distinct vocabulary IDs"));
         }
-        head_ids[j] = id;
+        *head_id = id;
         if !value.is_finite() || value > 0.0 {
             return Err(invalid("head logprobs must be finite and nonpositive"));
         }
