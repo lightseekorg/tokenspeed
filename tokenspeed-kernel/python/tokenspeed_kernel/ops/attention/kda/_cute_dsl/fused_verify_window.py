@@ -760,8 +760,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
 
         The last warp issues them, lane l for records l, l + 32, ..., after
         lane 0 posts their bytes on the records' mbarrier, which phase 1 waits
-        on. The prepare leaves at most ``capacity - window`` records, so they
-        fit the region's ``history_rows`` rows.
+        on. ``count`` is the applied length, at most ``capacity - window``
+        (0 when the prepare folded the records), so they fit the region's
+        ``history_rows`` rows.
         """
         K = self.key_dim
         VT = self.value_tile_rows
