@@ -2788,7 +2788,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         match self.controls.handle(request, refusal) {
             Effect::DemoteSessions(ids, ended) => {
                 let changed = self.scheduler.demote_sessions(&ids, ended);
-                self.controls.reply(ControlOutput::DemoteSessions(
+                // All mirrored schedulers must apply the metadata mutation before
+                // its owner replies; device retirement remains a separate fence.
+                self.replica_min(vec![1])?;
+                self.frontend.reply(ControlOutput::DemoteSessions(
                     ts_wire::control::DemoteSessionsReqOutput {
                         rid: None,
                         http_worker_ipc: None,
@@ -2799,7 +2802,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             Effect::DemoteCacheGroups(ids, ended) => {
                 let changed = self.scheduler.demote_cache_groups(&ids, ended);
-                self.controls.reply(ControlOutput::DemoteCacheGroups(
+                self.replica_min(vec![1])?;
+                self.frontend.reply(ControlOutput::DemoteCacheGroups(
                     ts_wire::control::DemoteCacheGroupsReqOutput {
                         rid: None,
                         http_worker_ipc: None,

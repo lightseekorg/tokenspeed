@@ -79,6 +79,13 @@ calls every scheduler it drives); the transport turns it into the engine's
 own operation and answers it under its call id once the operation's reply
 comes back, so the loop sees only its own operations.
 
+Session and cache-group demotion acknowledge immediately after the scheduler
+metadata mutation and replica agreement, before planning or waiting for another
+forward. The acknowledgment confirms all mirrored schedulers applied the mutation;
+attention-DP engines acknowledge independently. These replies confirm metadata
+changes, not device work retirement. Pause, flush, memory release and transfer
+retirement retain their existing drain fences.
+
 Scheduler load travels on the same output wire, including an empty batch at
 startup and at most once per second without token outputs. Reports carry
 running and waiting counts and resident, active, and total LCM blocks; the
