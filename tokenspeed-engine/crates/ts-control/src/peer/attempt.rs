@@ -59,6 +59,7 @@ enum Phase {
     Planning,
     Pin,
     Reading,
+    Quarantine,
     Closing(Disposition),
     Finished,
 }
@@ -356,6 +357,7 @@ impl Attempt {
         &mut self,
         member: usize,
         v: &Vote,
+        quarantine_us: i64,
         now: i64,
         round: &mut PeerRound,
     ) -> Option<Message> {
@@ -400,17 +402,23 @@ impl Attempt {
         }
         if self.votes.contains(&Some(2)) {
             // All members reported retirement and at least one is Unknown.
-            // The scheduler already retains the permanently frozen target pages
-            // via FetchFrozen; mark this Rust Attempt finished so prompt/hash
-            // memory and the 4096-attempt table slot are reclaimed without
-            // emitting TargetRetired or Release.
-            tracing::error!(
+            // Keep target pages frozen (FetchFrozen) through the agreed
+            // quarantine interval before emitting TargetRetired and
+            // RELEASE(Abort), so write faults or vanished holders cannot
+            // permanently leak device KV blocks or holder pins.
+            let wait_us = quarantine_us.max(0);
+            tracing::warn!(
                 holder = %v.key.holder.name,
                 lease = v.key.lease,
                 offer = v.offer,
-                "peer transfer retired with unknown write state; leaving reader targets frozen and omitting holder Release"
+                quarantine_us = wait_us,
+                "peer transfer retired with unknown write state; quarantining targets before TargetRetired and Release(Abort)"
             );
-            self.phase = Phase::Finished;
+            self.pages.clear();
+            self.source = None;
+            self.plan = None;
+            self.phase = Phase::Quarantine;
+            self.deadline = now.saturating_add(wait_us);
             return None;
         }
         if self.frozen {
@@ -538,6 +546,18 @@ impl Attempt {
             }
             return (vote, None);
         }
+        if self.phase == Phase::Quarantine {
+            if now >= self.deadline {
+                if self.frozen {
+                    if let Some(f) = &self.fetch {
+                        round.events.push(event(PeerEventKind::TargetRetired, f, 0));
+                    }
+                    self.frozen = false;
+                }
+                return (None, Some(self.close(Disposition::Abort, now)));
+            }
+            return (None, None);
+        }
         if let Phase::Closing(d) = self.phase {
             if now >= self.deadline {
                 self.finish(false, round);
@@ -636,6 +656,7 @@ mod verification {
                 let (mut a, key, offer) = granted_candidate();
                 let mut round = PeerRound::default();
                 let mut release = None;
+                let quarantine_us = 500_000;
                 for i in 0..8 {
                     let rank = if reverse { 7 - i } else { i };
                     let vote = Vote {
@@ -644,24 +665,64 @@ mod verification {
                         stage: DONE,
                         value: values[rank],
                     };
-                    let action = a.vote(rank, &vote, 2, &mut round);
+                    let action = a.vote(rank, &vote, quarantine_us, 2, &mut round);
                     if i < 7 {
                         assert!(action.is_none());
                     }
                     if action.is_some() {
                         release = action;
                     }
-                    assert!(a.vote(rank, &vote, 3, &mut round).is_none());
+                    assert!(a.vote(rank, &vote, quarantine_us, 3, &mut round).is_none());
                 }
                 assert!(round.landed.is_empty());
                 if values.contains(&2) {
                     assert!(release.is_none());
-                    assert!(a.finished());
+                    assert!(!a.finished());
+                    assert!(a.frozen);
                     assert!(a.take_pending_release(i64::MAX).is_none());
                     assert!(round
                         .events
                         .iter()
                         .any(|e| e.kind == PeerEventKind::FetchFrozen));
+                    // Before quarantine deadline, stay frozen and emit nothing.
+                    round.events.clear();
+                    let (v_before, m_before) = a.tick(
+                        None,
+                        None,
+                        Duration::from_secs(1),
+                        2 + quarantine_us - 1,
+                        &mut round,
+                    );
+                    assert!(v_before.is_none() && m_before.is_none());
+                    assert!(round.events.is_empty());
+                    assert!(a.frozen && !a.finished());
+                    // Once quarantine elapses, emit TargetRetired and Release(Abort).
+                    let (v_after, m_after) = a.tick(
+                        None,
+                        None,
+                        Duration::from_secs(1),
+                        2 + quarantine_us,
+                        &mut round,
+                    );
+                    assert!(v_after.is_none());
+                    assert!(!a.frozen);
+                    assert_eq!(round.events.len(), 1);
+                    assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+                    assert_eq!(
+                        m_after,
+                        Some(Message::Release(key.clone(), offer.id, Disposition::Abort))
+                    );
+                    // Ack closes cleanly without emitting a duplicate FetchDone.
+                    round.events.clear();
+                    a.ack(
+                        &key,
+                        offer.id,
+                        Disposition::Abort,
+                        Closure::Closed,
+                        &mut round,
+                    );
+                    assert!(a.finished());
+                    assert!(round.events.is_empty());
                     continue;
                 }
                 let disposition = if values.contains(&0) {
@@ -749,7 +810,7 @@ mod verification {
             stage: FREEZE,
             value: 1,
         };
-        assert!(a.vote(0, &freeze_vote, 2, &mut round).is_none());
+        assert!(a.vote(0, &freeze_vote, 500_000, 2, &mut round).is_none());
         assert_eq!(round.events.len(), 1);
         assert_eq!(round.events[0].kind, PeerEventKind::FetchFrozen);
         assert!(a.frozen);
@@ -763,7 +824,7 @@ mod verification {
                 stage: DONE,
                 value: 0,
             };
-            if let Some(m) = a.vote(rank, &done_vote, 3, &mut round) {
+            if let Some(m) = a.vote(rank, &done_vote, 500_000, 3, &mut round) {
                 release = Some(m);
             }
         }
@@ -774,6 +835,47 @@ mod verification {
             release,
             Some(Message::Release(key, offer.id, Disposition::Abort))
         );
+    }
+
+    #[test]
+    fn quarantine_survives_invalidate_and_detaches_release_if_holder_is_dead() {
+        let (mut a, key, offer) = granted_candidate();
+        let mut round = PeerRound::default();
+        let quarantine_us = 5_000_000;
+        for rank in 0..8 {
+            let vote = Vote {
+                key: key.clone(),
+                offer: offer.id,
+                stage: DONE,
+                value: if rank == 0 { 2 } else { 0 },
+            };
+            assert!(a
+                .vote(rank, &vote, quarantine_us, 100, &mut round)
+                .is_none());
+        }
+        assert!(a.frozen && !a.finished());
+        // Weight invalidation must never shorten destination quarantine.
+        a.invalidate();
+        round.events.clear();
+        let (_, m) = a.tick(None, None, Duration::from_secs(1), 4_999_999, &mut round);
+        assert!(m.is_none() && round.events.is_empty() && a.frozen);
+        assert!(a.take_pending_release(i64::MAX).is_none());
+
+        // At quarantine expiry, emit TargetRetired and enter Closing(Abort).
+        let (_, release) = a.tick(None, None, Duration::from_secs(1), 5_000_100, &mut round);
+        assert!(!a.frozen);
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+        let expected = Message::Release(key, offer.id, Disposition::Abort);
+        assert_eq!(release, Some(expected.clone()));
+
+        // If holder is dead and never ACKs, Closing detaches Release after 2s without
+        // emitting a duplicate FetchDone, reclaiming the Attempt slot cleanly.
+        round.events.clear();
+        a.tick(None, None, Duration::from_secs(1), 7_000_100, &mut round);
+        assert!(round.events.is_empty());
+        assert_eq!(a.take_pending_release(7_000_100), Some(expected));
+        assert!(a.finished());
     }
 
     #[test]

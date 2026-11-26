@@ -394,7 +394,7 @@ pub fn start(
         if replica.index() == 0 && retirement_bound_ms == 0 {
             tracing::warn!(
                 disk_push = layout.can_push_disk(),
-                "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS is unset (0); orphaned grants and Unknown Disk push retirements retain holder pins until restart"
+                "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS is unset (0); orphaned grants from crashed readers retain holder pins until restart"
             );
         }
         peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);

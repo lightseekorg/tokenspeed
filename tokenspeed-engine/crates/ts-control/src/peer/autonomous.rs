@@ -73,6 +73,7 @@ pub struct Peer {
     fence: PeerFence,
     origin: Instant,
     member: usize,
+    quarantine_us: i64,
     push_timeout: Duration,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     next_sample_us: i64,
@@ -95,6 +96,7 @@ impl Peer {
         if background && replica.len() != 1 {
             return Err(PeerError::Topology);
         }
+        let quarantine_us = settings.timeouts.quarantine_us.max(0);
         let push_timeout = Duration::from_micros(settings.timeouts.push_us.max(0) as u64);
         let pusher = transfers.pusher.clone();
         let mut protocol = Protocol::start(
@@ -146,6 +148,7 @@ impl Peer {
             fence,
             origin,
             member,
+            quarantine_us,
             push_timeout,
             metrics: None,
             next_sample_us: 0,
@@ -206,6 +209,7 @@ impl Peer {
             self.device_pin_gate.clone(),
             self.pusher.clone(),
             retirement_bound_ms,
+            self.quarantine_us,
             self.push_timeout,
         );
         if control.reader() {

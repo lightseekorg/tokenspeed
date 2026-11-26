@@ -37,13 +37,17 @@ an offer's id on its push endpoint once pinned and rejects pushes for inactive
 or mismatched-incarnation offers before touching NVMe. When a Disk push is
 cancelled and the holder does not confirm within a short grace window, the
 reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
-the background on its push dispatcher for a bounded retry budget; a late
-`Cancelled`/`Done` reply cleanly unfreezes the landing via `TargetRetired` and
-sends `RELEASE(Abort)`, whereas retry-budget expiry, an RDMA write error, or a
-push worker panic reports `Unknown` retirement and leaves both endpoints frozen
-(`frozen_targets`, `frozen_blocks`, and `frozen_landings` metrics expose frozen
-landings). Closing or expiring an offer on the holder revokes its push
-authorization, cancels in-flight pushes, and waits for them to drain before
+the background on its push dispatcher for a bounded retry budget (60 seconds);
+a late `Cancelled`/`Done` reply cleanly unfreezes the landing via
+`TargetRetired` and sends `RELEASE(Abort)`, whereas retry-budget expiry, an
+RDMA write error, or a push worker panic reports `Unknown` retirement. On
+`Unknown` retirement, all reader members hold the landing frozen for the agreed
+quarantine interval (`quarantine_us`, shared with legacy peer landings;
+`frozen_targets`, `frozen_blocks`, and `frozen_landings` metrics expose active
+frozen landings) and then emit `TargetRetired` and `RELEASE(Abort)` in lockstep
+so neither a write fault nor a dead/restarted holder permanently leaks device KV
+memory or holder pins. Closing or expiring an offer on the holder revokes its
+push authorization, cancels in-flight pushes, and waits for them to drain before
 releasing Disk block pins. Every reader's local 30-second monotonic submission
 window starts before it votes
 READY; workers check the same deadline at each READ batch and clamp Disk push
@@ -60,8 +64,9 @@ scheduling pauses after the check, native queues, reconnects, retries, DMA
 drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
 are enabled—push message delivery latency, holder push queue wait, and NVMe/RDMA
 execution time (because a holder anchors each push's deadline at message
-arrival). Deployments enabling Disk-tier v1 peer sharing must configure this
-bound so source pins are reclaimed if a reader disappears or freezes. All ranks
+arrival). Deployments enabling Disk-tier v1 peer sharing should configure this
+bound so orphaned source pins are reclaimed if a reader disappears before
+sending `RELEASE`. All ranks
 follow their holder leader's configured value. After the submission interval plus
 this bound, the holder initiates an ABORT, cancels any pushes tagged with the
 offer, and releases its own source references even if the reader disappeared.
@@ -70,13 +75,15 @@ bound, leave the setting unset: a granted source remains pinned pending explicit
 closure. A timeout for polling one Mooncake batch alone does not establish the
 bound. No heartbeats extend it.
 
-After all reader members have retired their reads, a missing RELEASE reply
+After all reader members have retired their reads (or finished quarantining an
+unknown retirement), a missing RELEASE reply
 can still force the request to recompute. Once its closing deadline passes,
 the reader drops the finished request and keeps the exact release message.
 New lookups to that holder pause until its pending closes receive terminal
 replies. Cleanup retries rotate among those leases and do not occupy active
 attempt slots. Healthy holders can continue serving requests. An unknown DMA
-retirement keeps the original landing frozen and cannot enter this retry path.
+retirement stays frozen through its quarantine interval and cannot enter this
+retry path until `TargetRetired` and `RELEASE(Abort)` are emitted.
 
 ## Two worlds: logical tokens vs. physical storage
 

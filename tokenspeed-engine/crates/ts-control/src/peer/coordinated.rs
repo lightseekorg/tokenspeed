@@ -40,6 +40,7 @@ use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, 
 pub(super) struct Report {
     legacy: Vec<u8>,
     retirement_bound_ms: u32,
+    quarantine_us: i64,
     proposals: Vec<(i64, Message, Message)>,
     messages: Vec<Message>,
     votes: Vec<Vote>,
@@ -57,6 +58,7 @@ impl Report {
         let mut w = Writer::new();
         w.bytes(&self.legacy);
         w.u32(self.retirement_bound_ms);
+        w.i64(self.quarantine_us);
         w.count(self.proposals.len());
         for (issued_at, q, a) in self.proposals {
             w.i64(issued_at);
@@ -80,6 +82,7 @@ impl Report {
         let mut r = Reader::new(b);
         let legacy = r.bytes()?.to_vec();
         let retirement_bound_ms = r.u32()?;
+        let quarantine_us = r.i64()?;
         let proposals = (0..r.count()?)
             .map(|_| Some((r.i64()?, msg(&mut r)?, msg(&mut r)?)))
             .collect::<Option<Vec<_>>>()?;
@@ -99,6 +102,7 @@ impl Report {
         r.finish(Self {
             legacy,
             retirement_bound_ms,
+            quarantine_us,
             proposals,
             messages,
             votes,
@@ -187,6 +191,7 @@ pub(super) struct Control {
     missing: Vec<PeerEventView>,
     admission: bool,
     retirement_bound_ms: u32,
+    quarantine_us: i64,
     push_timeout: Duration,
     pub meter: Option<Arc<ts_metrics::PeerMetrics>>,
 }
@@ -201,6 +206,7 @@ impl Control {
         device_pin_gate: Arc<super::servicer::DevicePinGate>,
         pusher: Arc<dyn PagePusher>,
         retirement_bound_ms: u32,
+        quarantine_us: i64,
         push_timeout: Duration,
     ) -> (Self, PeerFence) {
         let (tx, signaled) = mpsc::channel();
@@ -227,6 +233,7 @@ impl Control {
                 missing: Vec::new(),
                 admission: true,
                 retirement_bound_ms,
+                quarantine_us: quarantine_us.max(0),
                 push_timeout,
                 meter: None,
             },
@@ -328,6 +335,7 @@ impl Control {
         Report {
             legacy,
             retirement_bound_ms: self.retirement_bound_ms,
+            quarantine_us: self.quarantine_us,
             messages,
             votes: std::mem::take(&mut self.votes),
             proposals: std::mem::take(&mut self.proposals),
@@ -469,6 +477,7 @@ impl Control {
         }
         let first = &mut reports[0];
         let retirement_bound_ms = first.retirement_bound_ms;
+        let quarantine_us = first.quarantine_us.max(0);
         // Coordinated rounds share rank zero's reported clock. Use it for both
         // proposal timestamps and expiry, even if member process origins differ.
         let now = round.now_us;
@@ -494,7 +503,7 @@ impl Control {
                     READY | DONE | FREEZE => self
                         .attempts
                         .get_mut(&v.key.lease)
-                        .and_then(|a| a.vote(i, v, now, round)),
+                        .and_then(|a| a.vote(i, v, quarantine_us, now, round)),
                     _ => return Err(PeerError::Report),
                 };
                 if let Some(m) = reply {

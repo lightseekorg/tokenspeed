@@ -42,7 +42,9 @@ use ts_control::{
     peer::{
         geometry::{DeviceField, HostGroup, HostPool, RankGeometry, Spans},
         landing::Timeouts,
-        push::{PageWriter, PushEndpoint, PushSource},
+        push::{
+            PagePusher, PageWriter, PushEndpoint, PushItem, PushOutcome, PushSource, PushTarget,
+        },
         read::Arena,
         registered::{Member, Replica as RegisteredReplica},
         Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
@@ -327,7 +329,7 @@ impl PageWriter for FaultableArenaWriter {
     }
 }
 
-fn peer_settings(name: &str, incarnation: u64, push_us: i64) -> PeerSettings {
+fn peer_settings(name: &str, incarnation: u64, push_us: i64, quarantine_us: i64) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
         incarnation,
@@ -335,7 +337,7 @@ fn peer_settings(name: &str, incarnation: u64, push_us: i64) -> PeerSettings {
         weight_version: "v1".into(),
         timeouts: Timeouts {
             answer_us: 2_000_000,
-            quarantine_us: 10_000,
+            quarantine_us,
             push_us,
         },
         record_lifetime: Duration::from_secs(10),
@@ -416,6 +418,8 @@ impl MultiRankReplica {
             arena,
             semantic,
             5_000_000,
+            10_000,
+            None,
         )
     }
 
@@ -442,6 +446,8 @@ impl MultiRankReplica {
             arena,
             semantic,
             push_us,
+            10_000,
+            None,
         )
     }
 
@@ -457,6 +463,8 @@ impl MultiRankReplica {
         arena: &Arena,
         semantic: [u8; 32],
         push_us: i64,
+        quarantine_us: i64,
+        custom_pusher: Option<Arc<dyn PagePusher>>,
     ) -> Self {
         let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let name = format!("127.0.0.1:{}", listener.port());
@@ -622,8 +630,9 @@ impl MultiRankReplica {
                 with_disk,
                 versioned_shards,
             )));
+            let pusher: Arc<dyn PagePusher> = custom_pusher.clone().unwrap_or(push);
             let mut peer = Peer::start(
-                peer_settings(&name, incarnation, push_us),
+                peer_settings(&name, incarnation, push_us, quarantine_us),
                 PeerProgress::Coordinated,
                 rank,
                 geometries.clone(),
@@ -631,7 +640,7 @@ impl MultiRankReplica {
                 sched.clone(),
                 PeerTransfers {
                     reader: Arc::new(arena.clone()),
-                    pusher: push,
+                    pusher,
                 },
             )
             .unwrap();
@@ -1122,20 +1131,25 @@ fn tp1_kvp1_holder_disk_to_tp8_kvp8_reader_hybrid_cross_layout() {
 }
 
 #[test]
-fn v1_disk_push_write_fault_freezes_landing_and_keeps_holder_pinned() {
+fn v1_disk_push_write_fault_quarantines_then_unfreezes_and_releases_holder() {
     let semantic = [0x3C; 32];
     let arena = Arena::new(ARENA_BASE_OFFSET as usize + 10 * 0x80_000);
     let mut holder =
         MultiRankReplica::start(1, 20, 11, true, false, ARENA_BASE_OFFSET, &arena, semantic);
-    let mut reader = MultiRankReplica::start(
+    let quarantine_us = 250_000;
+    let mut reader = MultiRankReplica::start_with_options(
         8,
         21,
         READER_DEVICE_LCM,
+        false,
         false,
         true,
         ARENA_BASE_OFFSET + 0x80_000,
         &arena,
         semantic,
+        10_000_000,
+        quarantine_us,
+        None,
     );
 
     let prefix: Vec<i32> = (1..=4 * PAGE).collect();
@@ -1143,7 +1157,9 @@ fn v1_disk_push_write_fault_freezes_landing_and_keeps_holder_pinned() {
     holder.evict_all_device_and_host(30_000, 4, 6);
 
     // Inject RDMA write fault on the holder's push writer -> Message::Unknown ->
-    // ReadRetirement::Unknown -> reader emits FetchFrozen and NEVER sends Release!
+    // ReadRetirement::Unknown -> reader emits FetchFrozen and holds both reader
+    // targets and holder pins through `quarantine_us`, then emits TargetRetired
+    // + Release(Abort) so neither side leaks KV blocks.
     holder.fail_writes.store(true, Ordering::Release);
     let mut prompt = prefix.clone();
     prompt.extend(70_000..70_000 + PAGE);
@@ -1168,15 +1184,11 @@ fn v1_disk_push_write_fault_freezes_landing_and_keeps_holder_pinned() {
         );
         std::thread::sleep(Duration::from_millis(2));
     }
-    // Pump several more rounds and prove holder Disk blocks stay pinned (no premature Release).
-    for _ in 0..10 {
-        holder.round();
-        reader.round();
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    // Immediately after fallback (still inside the 250ms quarantine window),
+    // reader targets stay frozen and holder Disk blocks remain pinned.
     assert!(
         holder.ranks[0].scheduler.lock().peer_stats().pinned_blocks > 0,
-        "unknown write retirement must keep holder Disk blocks pinned"
+        "unknown write retirement must keep holder Disk blocks pinned during quarantine"
     );
     for r in &reader.ranks {
         let stats = r.scheduler.lock().peer_stats();
@@ -1184,6 +1196,152 @@ fn v1_disk_push_write_fault_freezes_landing_and_keeps_holder_pinned() {
         assert!(stats.frozen_blocks > 0, "rank {} frozen_blocks", r.rank);
         assert_eq!(stats.frozen_landings, 1, "rank {} frozen_landings", r.rank);
     }
+
+    // Pump rounds past `quarantine_us`: reader must emit TargetRetired and
+    // Release(Abort), unfreezing all 8 reader ranks and releasing holder pins.
+    let unfreeze_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        holder.round();
+        reader.round();
+        let all_unfrozen = reader.ranks.iter().all(|r| {
+            let st = r.scheduler.lock().peer_stats();
+            st.frozen_targets == 0 && st.frozen_blocks == 0
+        });
+        let holder_clear = holder.ranks[0].scheduler.lock().peer_stats().pinned_blocks == 0;
+        if all_unfrozen && holder_clear {
+            break;
+        }
+        assert!(
+            Instant::now() < unfreeze_deadline,
+            "expected quarantine expiry to unfreeze reader targets and release holder pins"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reader.finish_request("fault-req");
+    holder.assert_no_leaked_pins();
+    reader.assert_no_leaked_pins();
+}
+
+#[test]
+fn dead_holder_unanswered_cancel_unfreezes_reader_after_budget_and_quarantine() {
+    /// Emulates a holder whose push endpoint goes completely silent (crashed /
+    /// partitioned / restarted on a new port): never answers Push or Cancel,
+    /// triggers early `cancelling` freeze after `freeze_wait`, then expires the
+    /// retry budget with `PushOutcome::Unknown`.
+    struct SilentHolderPusher {
+        freeze_wait: Duration,
+        retry_budget: Duration,
+    }
+    impl PagePusher for SilentHolderPusher {
+        fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+            Err("unused in v1".into())
+        }
+        fn start_push_many(
+            &self,
+            _targets: Vec<PushTarget>,
+            budget: Duration,
+            _submit_until: Instant,
+            sealed: Arc<AtomicBool>,
+            cancelling: Arc<AtomicBool>,
+            finish: Box<dyn FnOnce(PushOutcome) + Send>,
+        ) {
+            let freeze_wait = self.freeze_wait;
+            let retry_budget = self.retry_budget;
+            std::thread::spawn(move || {
+                let wait_until = Instant::now() + budget;
+                while !sealed.load(Ordering::Acquire) && Instant::now() < wait_until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(freeze_wait);
+                cancelling.store(true, Ordering::Release);
+                std::thread::sleep(retry_budget);
+                finish(PushOutcome::Unknown(
+                    "holder cancel retries exhausted".into(),
+                ));
+            });
+        }
+    }
+
+    let semantic = [0x4D; 32];
+    let arena = Arena::new(ARENA_BASE_OFFSET as usize + 10 * 0x80_000);
+    let mut holder =
+        MultiRankReplica::start(1, 50, 11, true, false, ARENA_BASE_OFFSET, &arena, semantic);
+    let silent_pusher = Arc::new(SilentHolderPusher {
+        freeze_wait: Duration::from_millis(30),
+        retry_budget: Duration::from_millis(120),
+    });
+    let mut reader = MultiRankReplica::start_with_options(
+        8,
+        51,
+        READER_DEVICE_LCM,
+        false,
+        false,
+        true,
+        ARENA_BASE_OFFSET + 0x80_000,
+        &arena,
+        semantic,
+        40_000,  // 40ms push timeout before entering cancel phase
+        150_000, // 150ms quarantine after Unknown retirement
+        Some(silent_pusher),
+    );
+
+    let prefix: Vec<i32> = (1..=4 * PAGE).collect();
+    holder.run_to_finish("silent-seed", prefix.clone());
+    holder.evict_all_device_and_host(55_000, 4, 6);
+
+    let mut prompt = prefix.clone();
+    prompt.extend(75_000..75_000 + PAGE);
+    reader.submit_requests(&[req_spec("silent-req", prompt, &holder.name)]);
+
+    // Drive until early FetchFrozen fallback completes locally.
+    let freeze_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        holder.round();
+        let (rows, _) = reader.round();
+        if reader.saw_frozen {
+            if let Some((_, landed)) = rows.into_iter().find(|(r, _)| r == "silent-req") {
+                assert_eq!(landed, 0, "early-frozen fallback must reuse 0 tokens");
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < freeze_deadline,
+            "expected early FetchFrozen fallback while holder is silent"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for r in &reader.ranks {
+        let stats = r.scheduler.lock().peer_stats();
+        assert_eq!(
+            stats.frozen_targets, 1,
+            "rank {} frozen during retry",
+            r.rank
+        );
+        assert!(stats.frozen_blocks > 0, "rank {} frozen_blocks", r.rank);
+    }
+
+    // Stop pumping `holder` completely to simulate a dead/unreachable holder
+    // node: even with ZERO responses to Cancel or Release, the reader must
+    // unfreeze all 8 ranks once retry_budget + quarantine_us elapses (in
+    // production: 60s cancel retry + 5s quarantine ~= 65s < 70s).
+    reader.finish_request("silent-req");
+    let unfreeze_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        reader.round();
+        let all_unfrozen = reader.ranks.iter().all(|r| {
+            let st = r.scheduler.lock().peer_stats();
+            st.frozen_targets == 0 && st.frozen_blocks == 0
+        });
+        if all_unfrozen {
+            break;
+        }
+        assert!(
+            Instant::now() < unfreeze_deadline,
+            "dead-holder landing must unfreeze after retry budget + quarantine"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reader.assert_no_leaked_pins();
 }
 
 #[test]
@@ -1202,6 +1360,8 @@ fn holder_without_disk_push_truncates_to_device_host_instead_of_missing() {
         &arena,
         semantic,
         10_000_000,
+        10_000,
+        None,
     );
     let mut reader = MultiRankReplica::start(
         8,

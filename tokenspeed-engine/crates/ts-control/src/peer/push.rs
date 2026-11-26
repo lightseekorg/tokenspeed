@@ -761,12 +761,16 @@ struct JobGuard {
     sockets: Weak<Sockets>,
     key: JobKey,
     running: Arc<Running>,
+    /// True for v2 `PUSH_V2` (`P`) callers that understand `UNKNOWN` (`u`)
+    /// replies; false for legacy `PUSH` (`p`) callers that only speak `d`/`x`.
+    supports_unknown: bool,
     outcome: RunOutcome,
 }
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        let unknown = matches!(self.outcome, RunOutcome::UnknownRetirement);
+        let unknown =
+            self.supports_unknown && matches!(self.outcome, RunOutcome::UnknownRetirement);
         {
             let mut running_map = self.state.running.lock();
             running_map.remove(&self.key);
@@ -783,7 +787,13 @@ impl Drop for JobGuard {
                     job: self.key.job,
                     ok: false,
                 },
-                RunOutcome::UnknownRetirement => Message::Unknown { job: self.key.job },
+                RunOutcome::UnknownRetirement if self.supports_unknown => {
+                    Message::Unknown { job: self.key.job }
+                }
+                RunOutcome::UnknownRetirement => Message::Done {
+                    job: self.key.job,
+                    ok: false,
+                },
             };
             send(&sockets, &self.key.reply_to, &reply);
             if let Some(acknowledge) = ack {
@@ -1003,7 +1013,9 @@ impl Holder {
             }
             return;
         }
-        let running = Arc::new(Running::new(offer));
+        let supports_unknown = offer.is_some();
+        let active_offer = offer.filter(|&(_, id)| id != 0);
+        let running = Arc::new(Running::new(active_offer));
         enum Reject {
             InFlightDuplicate,
             FencedUnknown,
@@ -1017,7 +1029,11 @@ impl Holder {
             } else {
                 let mut fenced = self.state.fenced.lock();
                 if fenced.may_be_unknown(&key) {
-                    Some(Reject::FencedUnknown)
+                    if supports_unknown {
+                        Some(Reject::FencedUnknown)
+                    } else {
+                        Some(Reject::Clean)
+                    }
                 } else if fenced.is_unknown_overflowed() {
                     // Holder Disk serving is quarantined after unknown-fence
                     // overflow, but `key` is provably not an overflowed unknown
@@ -1026,7 +1042,7 @@ impl Holder {
                     fenced.insert(key.clone(), false);
                     Some(Reject::Quarantined)
                 } else {
-                    let offer_unauthorized = match offer {
+                    let offer_unauthorized = match active_offer {
                         Some(pair) => !self.state.active_offers.lock().contains(&pair),
                         None => false,
                     };
@@ -1107,6 +1123,7 @@ impl Holder {
             sockets,
             key,
             running,
+            supports_unknown,
             outcome: RunOutcome::RetiredFailed,
         };
         let queued = QueuedPush {
@@ -2175,8 +2192,10 @@ impl PagePusher for PushEndpoint {
                 port,
                 Message::Push {
                     job,
-                    offer: (target.offer_id != 0)
-                        .then_some((target.holder_incarnation, target.offer_id)),
+                    // Multi-holder callers always speak `PUSH_V2` (`P`), which
+                    // also signals support for `UNKNOWN` (`u`) replies; an
+                    // `offer_id == 0` simply omits offer-whitelist enforcement.
+                    offer: Some((target.holder_incarnation, target.offer_id)),
                     reply_to: self.name.clone(),
                     session: target.session,
                     budget_us,
@@ -3594,6 +3613,42 @@ mod tests {
         raw_reader.send(h_host, h_port, p1.frames()).unwrap();
         let replay = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
         assert_eq!(replay, Some(Message::Unknown { job: 1 }));
+
+        // Legacy frame `p` (`offer: None`) hitting an RDMA write fault must reply
+        // `Done { ok: false }` (and `Cancelled` on Cancel), NEVER unrecognized frame `u`.
+        let legacy_job = (77u64 << 32) | 5;
+        let legacy_push = Message::Push {
+            job: legacy_job,
+            offer: None,
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: items.clone(),
+        };
+        assert_eq!(legacy_push.frames()[0].as_ref(), PUSH);
+        raw_reader
+            .send(h_host, h_port, legacy_push.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(5)).unwrap()),
+            Some(Message::Done {
+                job: legacy_job,
+                ok: false,
+            })
+        );
+        let legacy_cancel = Message::Cancel {
+            job: legacy_job,
+            reply_to: reply_ep.clone(),
+        };
+        raw_reader
+            .send(h_host, h_port, legacy_cancel.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Cancelled { job: legacy_job })
+        );
+        // Verify production cancel retry budget bounds silent-holder recovery (~60s + 5s quarantine < 70s).
+        assert_eq!(CANCEL_RETRY_BUDGET, Duration::from_secs(60));
 
         // 3. Unknown-fence overflow quarantines Disk serving (`can_serve_disk() == false`),
         //    still answers `Unknown` for replays within the overflowed peer/incarnation HWM,
