@@ -283,6 +283,7 @@ result=ts.Scheduler(cfg)
             1,
             Some(1 << 24),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             false,
             None,

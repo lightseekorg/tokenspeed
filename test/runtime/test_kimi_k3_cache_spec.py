@@ -7,7 +7,7 @@ from test.ci_system.ci_register import register_cuda_ci
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
-from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
+from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_recipe, kimi_tp8_layout
 
 import pytest
 import torch
@@ -158,81 +158,49 @@ def test_bf16_mla_cache_reuses_the_same_packing_rule() -> None:
     assert latent.page_stride_bytes == latent_page_bytes
 
 
-@pytest.mark.parametrize("kvp_size", [1, 4])
+@pytest.mark.parametrize(
+    "device,backend_name,kvp_size",
+    [("cpu", "mla", 1), ("cuda", "tokenspeed_mla", 1), ("cuda", "tokenspeed_mla", 4)],
+)
 def test_speculative_verify_workspace_is_reserved_outside_the_arena(
-    monkeypatch,
+    device,
+    backend_name,
     kvp_size,
 ) -> None:
     from dataclasses import replace
 
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
-        lambda dtype, **kwargs: False,
-    )
     recipe, _, layout = kimi_tp8_layout(
         draft_layers=5,
         max_bs=4,
+        max_resident_requests=12,
+        pd_enabled=True,
         speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=8,
     )
+    recipe.server_args.disaggregation_mode = "decode"
 
     recipe.attn_config = replace(
         recipe.attn_config,
-        device="cuda",
+        device=device,
         kvp_size=kvp_size,
         kvp_group=tuple(range(kvp_size)),
         components=(
-            replace(recipe.attn_config.components[0], backend_name="tokenspeed_mla"),
+            replace(recipe.attn_config.components[0], backend_name=backend_name),
             *recipe.attn_config.components[1:],
         ),
     )
 
-    # Four requests, each with one committed seed row and eight candidate rows,
-    # across all 69 target KDA layers.
-    expected_workspace_bytes = 2_022_174_720
-    assert recipe.workspace_bytes() == expected_workspace_bytes
-
-    setup = recipe.setup()
-    assert setup.fixed_workspace_bytes == expected_workspace_bytes
-    expected_parents = (
-        recipe.cache_budget_bytes - expected_workspace_bytes
-    ) // layout.lcm_block_bytes - 1
-    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
-
-
-def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
-        lambda dtype, **kwargs: True,
-    )
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda.kda_fused_paged_verify_uses_split_producers",
-        lambda dtype, **kwargs: True,
-    )
-    recipe, groups, layout = kimi_tp8_layout(
-        draft_layers=5,
-        max_bs=4,
-        speculative_algorithm="DSPARK",
-        speculative_num_draft_tokens=8,
-    )
-    conv_row_bytes = 4 * sum(
-        field.payload_bytes
-        for spec, fields in groups
-        if spec.group_id != "full_attention"
-        for field in fields
-        if field.field_id.endswith(".conv_state")
-    )
-    # 69 layers x (4 requests x 8 positions): BF16 raw QKV and K/raw gate,
-    # FP32 correction, plus fixed descriptors and request/generation stamps.
-    expected_payload_bytes = 69 * 4 * 8 * (4608 * 2 + 1536 * 4 + 3072 * 2)
-    descriptor_bytes = 69 * (10 * 8 + 4) + 3 * 4 * 8
+    # Four batch rows stage QKV. Twelve resident requests and the two
+    # reserved request slots each hold sixteen FP32 U/K/decay records and
+    # one INT32 accepted count per layer.
+    qkv_bytes = 69 * 4 * 8 * 4608 * 2
+    retained_bytes = 69 * 14 * (12 * 16 * 128 * 3 * 4 + 4)
+    descriptor_bytes = 69 * (14 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
-    record_metadata_bytes = 4 * 3 * 8 + 69 * 4 * 8 * 2 * 8
+    record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
     expected_workspace_bytes = (
-        conv_row_bytes
-        + expected_payload_bytes
+        qkv_bytes
+        + retained_bytes
         + descriptor_bytes
         + page_and_step_bytes
         + record_metadata_bytes
@@ -262,10 +230,6 @@ def test_the_amd_kvp_prefill_reserves_its_gather_workspace(monkeypatch) -> None:
     )
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
-        lambda dtype, **kwargs: False,
-    )
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     recipe, _, _ = kimi_tp8_layout(
         draft_layers=5,
@@ -307,7 +271,7 @@ def test_the_amd_kvp_prefill_reserves_its_gather_workspace(monkeypatch) -> None:
     assert recipe.workspace_bytes() == history
 
 
-def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
+def test_prefill_only_kimi_reserves_no_decode_workspace() -> None:
     """A prefill-only engine has no decode records, with or without a drafter."""
     recipe, _, _ = kimi_tp8_layout(
         draft_layers=5,
@@ -423,3 +387,103 @@ def test_token_limit_retains_kda_working_set(limit, kvp_size):
     assert recipe.parents_needed(layout, limit) > (
         limit // (recipe._max_packing(layout) * layout.prefix_granularity)
     )
+
+
+@pytest.mark.parametrize("capacity", [4, 8, 24])
+def test_kda_history_capacity_sizes_each_request_slot(capacity):
+    """--kda-history-capacity sets the records a request slot keeps per layer."""
+    recipe = kimi_recipe(
+        speculative_num_draft_tokens=4,
+        max_resident_requests=7,
+        kda_history_capacity=capacity,
+    )
+    smaller = kimi_recipe(
+        speculative_num_draft_tokens=4,
+        max_resident_requests=6,
+        kda_history_capacity=capacity,
+    )
+    assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
+        69 * (3 * 12 * capacity * 128 * 4 + 4)
+    )
+
+
+def test_kda_history_capacity_below_the_verify_window_is_refused():
+    recipe = kimi_recipe(speculative_num_draft_tokens=8, kda_history_capacity=4)
+    with pytest.raises(ValueError, match="at least the verify window"):
+        recipe.workspace_bytes()
+
+
+@pytest.mark.parametrize("width", [1, 4, 20])
+def test_kimi_checkpoint_is_independent_of_request_history(width):
+    recipe = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=7)
+    schema = recipe.groups()
+    assert schema == kimi_recipe().groups()
+    fields = {
+        field.field_id: field
+        for spec, fields in schema
+        if spec.attn_kind == "state"
+        for field in fields
+    }
+    # Cache pages hold only dense checkpoints, as they do without retained history.
+    assert {name.rsplit(".", 1)[1] for name in fields} == {
+        "conv_state",
+        "recurrent_state",
+    }
+    # Increasing residency by one adds the FP32 records and the INT32 accepted
+    # count of that request's slot.
+    smaller = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=6)
+    assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
+        69 * (3 * 12 * max(16, width) * 128 * 4 + 4)
+    )
+    recipe.server_args.disaggregation_mode = "prefill"
+    assert recipe.groups() == schema
+    assert recipe.workspace_bytes() == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA portable retained kernels",
+)
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_retained_recipe_supports_portable_square_geometry(head_dim):
+    from dataclasses import replace
+
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_retained_supported,
+    )
+
+    recipe = kimi_recipe()
+    linear = recipe.attn_config.component(LinearAttnConfig)
+    config = replace(
+        recipe.attn_config,
+        components=tuple(
+            (
+                replace(component, head_k_dim=head_dim, head_v_dim=head_dim)
+                if component is linear
+                else component
+            )
+            for component in recipe.attn_config.components
+        ),
+    )
+    assert kda_retained_supported(config)
+
+
+def test_retained_recipe_rejects_nonsquare_recurrent_geometry():
+    from dataclasses import replace
+
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_retained_supported,
+    )
+
+    recipe = kimi_recipe()
+    linear = recipe.attn_config.component(LinearAttnConfig)
+    config = replace(
+        recipe.attn_config,
+        components=tuple(
+            replace(component, head_k_dim=64) if component is linear else component
+            for component in recipe.attn_config.components
+        ),
+    )
+    assert not kda_retained_supported(config)

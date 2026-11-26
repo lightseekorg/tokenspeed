@@ -44,6 +44,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 1,
                 None,
                 Role::Decode,
+                false,
                 FinishLog {
                     enabled: true,
                     request_stats,
@@ -56,7 +57,13 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
             state.created_time = wall_seconds() - 1.0;
             p.assign_admission(&mut state);
             p.register("ok".to_owned(), state);
-            p.remote_prefill_done("ok", 7, 1, None);
+            p.remote_prefill_done(
+                "ok",
+                7,
+                1,
+                None,
+                (std::time::SystemTime::now(), std::time::Instant::now()),
+            );
             p.finish_remote_prefill_only("ok");
             let mut failed = RequestState::new(vec![8, 9], 3, BTreeSet::new(), true, None, false);
             p.assign_admission(&mut failed);
@@ -74,7 +81,13 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 1
             );
             assert!(p.state("duplicate").unwrap().finished_reason.is_none());
-            p.remote_prefill_done("duplicate", 12, 0, None);
+            p.remote_prefill_done(
+                "duplicate",
+                12,
+                0,
+                None,
+                (std::time::SystemTime::now(), std::time::Instant::now()),
+            );
             assert_eq!(
                 p.finish_remote_prefill_only("duplicate").released,
                 ["duplicate"]

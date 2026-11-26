@@ -44,7 +44,7 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
+    Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap);
 
     const std::string& Id() const { return id_; }
     std::uint64_t AdmissionId() const { return admission_id_; }

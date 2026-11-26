@@ -91,6 +91,13 @@ class TestEagleHarnessConfig:
         # A sampled chain draws each node's one child, as a tree its children.
         sa = self._resolve_tree("EAGLE4", 1, 15, 16, **chain, **sampled)
         assert sa.eagle_harness and sa.enable_speculative_sampling
+        # A narrower chain serves from that data; its measurement is 15 steps / 16 tokens.
+        sa = self._resolve_tree("EAGLE4", 1, 7, 8, **chain)
+        assert sa.eagle_harness
+        sa = self._resolve_tree(
+            "EAGLE4", 1, 15, 16, **{**chain, "speculative_exec_mode": 2}
+        )
+        assert sa.eagle_harness
         tree = ("EAGLE4", 4, 12, 16)
         # Only exec mode 2 (up to 64 steps) meets the lane limit below the node limit.
         measure = {**harness, "speculative_exec_mode": 2}
@@ -102,6 +109,12 @@ class TestEagleHarnessConfig:
             (("EAGLE4", 3, 6, 16), harness, "1, 2, 4 or 8"),
             (tree, {**harness, "max_num_seqs": 80}, "serve at most 32"),
             (("EAGLE4", 1, 16, 16), chain, "at most 15 steps"),
+            # Chain cost data covers widths up to 16 whatever the chain serving it verifies.
+            (
+                ("EAGLE4", 1, 7, 8),
+                {**chain, "speculative_exec_mode": 2},
+                "15 steps and 16 draft tokens",
+            ),
             (
                 ("EAGLE4", 1, 15, 16),
                 {**chain, **sampled, "sampling_backend": "triton"},

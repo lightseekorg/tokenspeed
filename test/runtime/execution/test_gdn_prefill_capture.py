@@ -110,6 +110,7 @@ def _backend(*, writes_state_checkpoints_in_forward, layer_ids=(0,)):
     return GdnAttnBackend(
         *_config(layer_ids),
         writes_state_checkpoints_in_forward=writes_state_checkpoints_in_forward,
+        defer_recurrent_state=False,
     )
 
 
@@ -603,7 +604,12 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
             return q * 2 + 1
 
     config, spec = _config((0, 2))
-    gdn = GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=True)
+    gdn = GdnAttnBackend(
+        config,
+        spec,
+        writes_state_checkpoints_in_forward=True,
+        defer_recurrent_state=False,
+    )
     root = Qwen4ExpBackend(
         config,
         HybridLinearAttnBackend(FullAttention(config, spec), gdn, [1]),

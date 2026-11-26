@@ -123,6 +123,8 @@ def test_live_checkpoints_take_their_page_rows_and_unused_slots_write_nothing():
     ]
     assert target.state_checkpoints.rows.tolist() == [0, 1]
     assert target.state_checkpoints.offsets.tolist() == [256, 128]
+    assert target.state_checkpoints.device_rows.tolist() == [0, 1]
+    assert target.state_checkpoints.device_offsets.tolist() == [256, 128]
 
     # A later forward without checkpoints clears every slot in place.
     _refresh(target, [448], None)
@@ -131,6 +133,8 @@ def test_live_checkpoints_take_their_page_rows_and_unused_slots_write_nothing():
     assert target.state_checkpoints.token_index.tolist() == [512] * 4
     assert target.state_checkpoints.blocks_by_group["state"].tolist() == [-1] * 4
     assert target.state_checkpoints.rows.numel() == 0
+    assert target.state_checkpoints.device_rows.numel() == 0
+    assert target.state_checkpoints.device_offsets.numel() == 0
     slots = target.state_checkpoints
     assert addresses == [
         tensor.data_ptr()

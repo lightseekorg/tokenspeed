@@ -27,7 +27,7 @@ use std::{
     collections::HashSet,
     sync::atomic::{AtomicI64, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -239,8 +239,16 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Succeeded("original".to_owned())
     );
+    let before = (std::time::SystemTime::now(), Instant::now());
+    let event = next_event(&mut pair.decode, &mut mesh, &group);
+    let PdEvent::RemotePrefillDone(done) = &event else {
+        panic!("expected landed KV")
+    };
+    let kv_ready_at = done.kv_ready_at;
+    assert!(kv_ready_at.0 >= before.0 && kv_ready_at.0 <= std::time::SystemTime::now());
+    assert!(kv_ready_at.1 >= before.1 && kv_ready_at.1 <= Instant::now());
     assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
+        event,
         PdEvent::RemotePrefillDone(RemotePrefill {
             rid: "original".to_owned(),
             bootstrap_token: 777,
@@ -248,6 +256,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
             bootstrap_logprob: Some(-0.5),
             spec_candidate_ids: Some(vec![1, 2, 3]),
             request_pool_index: 3,
+            kv_ready_at,
         })
     );
     assert!(landed(&destination, &source));
@@ -294,8 +303,16 @@ fn abort_room_ignores_a_room_owned_by_an_active_prefill_request() {
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Succeeded("original".to_owned())
     );
+    let before = (std::time::SystemTime::now(), Instant::now());
+    let event = next_event(&mut pair.decode, &mut mesh, &group);
+    let PdEvent::RemotePrefillDone(done) = &event else {
+        panic!("expected landed KV")
+    };
+    let kv_ready_at = done.kv_ready_at;
+    assert!(kv_ready_at.0 >= before.0 && kv_ready_at.0 <= std::time::SystemTime::now());
+    assert!(kv_ready_at.1 >= before.1 && kv_ready_at.1 <= Instant::now());
     assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
+        event,
         PdEvent::RemotePrefillDone(RemotePrefill {
             rid: "original".to_owned(),
             bootstrap_token: 555,
@@ -303,6 +320,7 @@ fn abort_room_ignores_a_room_owned_by_an_active_prefill_request() {
             bootstrap_logprob: None,
             spec_candidate_ids: None,
             request_pool_index: 3,
+            kv_ready_at,
         })
     );
     assert!(landed(&destination, &source));

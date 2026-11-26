@@ -1738,3 +1738,23 @@ fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
     assert!(plan.aborts().is_empty());
     assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
 }
+
+#[test]
+fn a_scheduler_reports_whether_a_cache_group_defers_its_decode_state() {
+    interpreter();
+    for deferred in [false, true] {
+        let code = format!(
+            "{NEW_SCHEDULER}
+state = ts.CacheGroupConfig(
+    group_id='state', block_granularity=0, total_pages=64, attn_kind=ts.AttnKind.State
+)
+state.deferred_decode_state = {}
+cfg.cache_groups = [*cfg.cache_groups, state]
+result = ts.Scheduler(cfg)
+",
+            if deferred { "True" } else { "False" }
+        );
+        let scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+        assert_eq!(scheduler.defers_decode_state(), deferred);
+    }
+}

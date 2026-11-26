@@ -208,10 +208,6 @@ def test_prefill_under_deferred_allocation_counts_prompts_waiting_for_their_dest
     scheduler.submit_requests(
         [make_spec(rid, [10 * i + 1, 10 * i + 2]) for i, rid in enumerate(rids)]
     )
-    admitted = ExecutionEvent()
-    for rid in rids:
-        admitted.add_event(PD.BootstrappedEvent(rid))
-    scheduler.advance(admitted)
     assert scheduler.next_execution_plan().forward[0].request_ids == rids
     for rid in rids:
         result = ForwardEvent.ExtendResult()
@@ -364,9 +360,8 @@ def test_prefill_role_hands_off_without_the_draft_window():
 
 
 def test_prefill_under_deferred_allocation_holds_its_kv_until_the_destination_is_ready():
-    """Under deferred decode allocation ``PD.BootstrappedEvent`` only admits
-    a prompt; its KV is handed off once ``PD.DestinationReadyEvent`` reports
-    that the Decode destination is allocated."""
+    """Prefill computes without bootstrap and hands off KV only once the
+    decode destination is allocated."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
     cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Deferred
@@ -392,10 +387,7 @@ def test_prefill_under_deferred_allocation_holds_its_kv_until_the_destination_is
     spec = make_spec("p", [1, 2])
     spec.max_new_tokens = 8
     scheduler.submit_requests([spec])
-    assert not scheduler.next_execution_plan().forward[0].request_ids
-    assert scheduler.bootstrapping_size() == 1
-
-    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("p")))
+    assert scheduler.bootstrapping_size() == 0
     assert scheduler.next_execution_plan().forward[0].request_ids == ["p"]
     result = ForwardEvent.ExtendResult()
     result.request_id = "p"
