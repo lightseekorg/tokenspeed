@@ -603,6 +603,9 @@ class K3MoeTailComm:
 
     Both stage-2 patterns add the attention residual exactly once. Token count
     selects the pattern; the model controls stream scheduling independently.
+    When NVLS multicast is unavailable, Stage 1 falls back to ordinary
+    all-reduce plus RMSNorm and Stage 2 routes every token count through
+    ``up_proj_inject_ar`` with ordinary all-reduce.
     Workspaces are prepared once and reused by sequential layers, while each
     layer supplies its own normalization and projection weights.
     """
@@ -630,13 +633,17 @@ class K3MoeTailComm:
         self.top_k = top_k
         self.routed_norm = routed_norm
         self.up_proj = up_proj
-        self.use_allreduce_fusion = _unified_tail_applicable(
-            mapping=mapping,
-            hidden_size=hidden_size,
-            latent_size=routed_hidden,
-            top_k=top_k,
-            is_blackwell=current_platform().is_blackwell,
-            has_routed_norm=routed_norm is not None,
+        self.use_allreduce_fusion = (
+            _unified_tail_applicable(
+                mapping=mapping,
+                hidden_size=hidden_size,
+                latent_size=routed_hidden,
+                top_k=top_k,
+                is_blackwell=current_platform().is_blackwell,
+                has_routed_norm=routed_norm is not None,
+            )
+            and dist.is_initialized()
+            and multicast_backend_available(_get_process_group(mapping.moe.tp_ep_group))
         )
         self.defer_finalize = (
             self.use_allreduce_fusion and experts_supports_deferred_finalize
@@ -667,7 +674,12 @@ class K3MoeTailComm:
                 raise RuntimeError("Cannot grow a prepared K3 MoE workspace")
             return True
         group = _get_process_group(self.mapping.moe.tp_ep_group)
+        multicast_ok = multicast_backend_available(group)
         if self.use_allreduce_fusion:
+            if not multicast_ok:
+                raise RuntimeError(
+                    "K3 routed allreduce fusion requires NVLink multicast symmetric memory"
+                )
             K3MoeTailComm._routed_workspace = create_allreduce_fusion_workspace(
                 group=group,
                 hidden_size=self.routed_hidden,
@@ -675,17 +687,29 @@ class K3MoeTailComm:
                 max_num_tokens=max_num_tokens,
                 rms_eps=self.rms_eps,
             )
-        K3MoeTailComm._latent_tail = KimiK3LatentTailOp(
-            group=group, hidden_size=self.hidden_size, latent_size=self.routed_hidden
-        )
-        if max_num_tokens > _MULTIMEM_AR_MIN_TOKENS:
-            if not multimem_prealloc(
-                max_num_tokens, (self.hidden_size,), group.group_name
-            ):
-                raise RuntimeError("K3 MoE tail requires Multimem all-reduce")
-            K3MoeTailComm._multimem_group_name = group.group_name
+        if multicast_ok:
+            K3MoeTailComm._latent_tail = KimiK3LatentTailOp(
+                group=group,
+                hidden_size=self.hidden_size,
+                latent_size=self.routed_hidden,
+            )
+            if max_num_tokens > _MULTIMEM_AR_MIN_TOKENS:
+                if not multimem_prealloc(
+                    max_num_tokens, (self.hidden_size,), group.group_name
+                ):
+                    raise RuntimeError("K3 MoE tail requires Multimem all-reduce")
+                K3MoeTailComm._multimem_group_name = group.group_name
+        else:
+            K3MoeTailComm._latent_tail = None
+            K3MoeTailComm._multimem_group_name = None
         K3MoeTailComm._stage2_capacity = max_num_tokens
-        logger.info(f"K3 MoE tail workspaces prepared through M={max_num_tokens}")
+        if multicast_ok:
+            logger.info(f"K3 MoE tail workspaces prepared through M={max_num_tokens}")
+        else:
+            logger.info(
+                f"K3 MoE tail prepared through M={max_num_tokens} without NVLS "
+                "multicast; using ordinary all-reduce"
+            )
         return True
 
     def shared_rs(self, shared_partial: torch.Tensor) -> torch.Tensor:
@@ -695,13 +719,17 @@ class K3MoeTailComm:
             shared_partial: Rank-local BF16 [M,H], with M in [1,32].
 
         Returns:
-            Padded [64,H/TP] reduced shard, with the first M rows live.
+            Padded [64,H/TP] reduced shard with the first M rows live when
+            NVLS multicast is prepared, or ``shared_partial`` unchanged when
+            falling back to ordinary all-reduce.
         """
         if self.mapping.moe.tp_ep_size == 1:
             return shared_partial
+        if self._stage2_capacity is None:
+            raise RuntimeError("K3 shared RS must be prepared before forward")
         tail = self._latent_tail
         if tail is None:
-            raise RuntimeError("K3 shared RS must be prepared before forward")
+            return shared_partial
         return tail.reduce_scatter_shared(shared_partial)
 
     def routed_ar_fusion(
@@ -756,12 +784,15 @@ class K3MoeTailComm:
 
         Args:
             routed_latent: Replicated normalized BF16 [M,L], with M in [1,32].
-            shared_shard: Padded rank-local output returned by shared_rs.
+            shared_shard: Padded rank-local output returned by shared_rs (or
+                the unreduced [M,H] shared partial when NVLS multicast is
+                unavailable).
             prefix_sum: Replicated BF16 [M,H] attention residual.
 
         Returns:
             BF16 [M,H] combined output on every rank. Projection uses SIMT
-            for M1..5 and TensorCore for M6..32.
+            for M1..5 and TensorCore for M6..32 when NVLS multicast is
+            prepared, and delegates to ``up_proj_inject_ar`` otherwise.
         """
         if self.mapping.moe.tp_ep_size == 1:
             return self.up_proj_inject_ar(routed_latent, shared_shard, prefix_sum)
@@ -770,7 +801,10 @@ class K3MoeTailComm:
             raise RuntimeError("K3 MoE tail must be prepared before forward")
         if routed_latent.shape[0] > capacity:
             raise ValueError("K3 token count exceeds the prepared MoE workspace")
-        return self._latent_tail.project_and_gather(
+        tail = self._latent_tail
+        if tail is None:
+            return self.up_proj_inject_ar(routed_latent, shared_shard, prefix_sum)
+        return tail.project_and_gather(
             routed_latent, self.up_proj.weight, shared_shard, prefix_sum
         )
 
@@ -808,8 +842,8 @@ class K3MoeTailComm:
                 when inject_residual already added it to ``shared_partial``.
 
         Returns:
-            BF16 [M,H] combined output on every rank. M33..1024 uses ordinary
-            AR; M>1024 uses Multimem AR.
+            BF16 [M,H] combined output on every rank. Uses Multimem AR above
+            1024 tokens when prepared, and ordinary AR otherwise.
         """
         num_tokens = routed_latent.shape[0]
         if self.mapping.moe.tp_ep_size == 1:
@@ -822,7 +856,11 @@ class K3MoeTailComm:
         if num_tokens > capacity:
             raise ValueError("K3 token count exceeds the prepared MoE workspace")
         shared_partial = shared_partial.view(num_tokens, self.hidden_size)
-        if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
+        use_multimem = (
+            num_tokens > _MULTIMEM_AR_MIN_TOKENS
+            and self._multimem_group_name is not None
+        )
+        if use_multimem:
             shared_partial = multimem_stage(
                 shared_partial, self._multimem_group_name, capacity
             )
@@ -833,7 +871,7 @@ class K3MoeTailComm:
         start, width = self.up_proj.shard_slice
         target = shared_partial[:, start : start + width]
         target.addmm_(routed_latent, self.up_proj.weight.t())
-        if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
+        if use_multimem:
             # The next layer reuses the symmetric staging buffer.
             return multimem_all_reduce_staged(
                 shared_partial, self._multimem_group_name
