@@ -108,8 +108,15 @@ The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
 an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
 installed. The scheduler source is bundled in its crate; the grammar build
-downloads the pinned, SHA256-checked xgrammar source release and therefore
-needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+downloads the pinned, SHA256-checked tokenspeed-xgrammar source release and needs
+network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+Keep that source pin aligned with the Python dependency, which still imports as
+`xgrammar`, and regenerate the tokenizer fixtures with
+`python tokenspeed-engine/crates/ts-grammar/tests/fixtures/generate.py` when upgrading.
+Rebuild the engine alongside the Python dependency so their tokenizer serialization
+formats agree.
+In an existing environment, uninstall the upstream `xgrammar` distribution before
+installing `tokenspeed-xgrammar`; both own the `xgrammar` module.
 
 For `cargo test --locked`, install `numpy` and `prometheus-client` in that
 interpreter too. The metrics tests read the real Prometheus multiprocess files.
