@@ -63,6 +63,24 @@ DECODE_S1_BLOCK_N = 64  # stage-1 N tile
 DECODE_S1_BLOCK_K = 128  # stage-1 K tile
 DECODE_S1_NBUF = 1  # single LDS buffer
 
+# ---- Prefill row slicing ------------------------------------------------------
+# Stage 2 reads the intermediate [tokens * topk, I] through buffer loads, which
+# address at most 2**31 - 1 bytes from the tensor's base: at an intermediate
+# of 2 GiB or more (GLM-5.3 Flash, top-8, I=2048: 65,536 tokens) the last
+# vectors fall out of range and read as zeros. Under expert parallelism the
+# partials [tokens, topk, D] are also zero-filled per call (4 GiB per MoE layer
+# at 65,536 GLM tokens). Prefill is sliced by rows so every launch keeps the
+# intermediate under 2 GiB, and EP launches at most EP_PREFILL_MAX_TOKENS rows;
+# each row's result does not depend on the other rows, so slicing is exact.
+_BUFFER_MAX_BYTES = 2**31 - 1
+EP_PREFILL_MAX_TOKENS = 16384
+
+
+def _prefill_max_tokens(topk: int, i_r: int, expert_parallel: bool) -> int:
+    """Rows per prefill launch that keep the BF16 intermediate under 2 GiB."""
+    rows = _BUFFER_MAX_BYTES // (topk * i_r * 2)
+    return min(rows, EP_PREFILL_MAX_TOKENS) if expert_parallel else rows
+
 
 def _decode_split_k(num_tokens: int, num_k_tiles: int) -> int:
     """Decode split-K factor for the stage-1 tile (K=128 -> 56 K-tiles).
@@ -127,6 +145,31 @@ def gluon_bf16_moe(
         warp_decode = False
     if decode:
         block_m = DECODE_BLOCK_M
+    else:
+        max_tokens = _prefill_max_tokens(topk, I_r, expert_parallel)
+        if num_tokens > max_tokens:
+            # Balanced slices stay far above DECODE_MAX_M, on this path.
+            slices = -(-num_tokens // max_tokens)
+            step = -(-num_tokens // slices)
+            out = torch.empty(
+                (num_tokens, D), dtype=torch.bfloat16, device=hidden_states.device
+            )
+            for start in range(0, num_tokens, step):
+                rows = slice(start, start + step)
+                out[rows] = gluon_bf16_moe(
+                    hidden_states[rows],
+                    w1,
+                    w2,
+                    topk_ids[rows],
+                    topk_weights[rows],
+                    block_m=block_m,
+                    split_k=split_k,
+                    decode=False,
+                    warp_decode=False,
+                    expert_start=expert_start,
+                    expert_parallel=expert_parallel,
+                )
+            return out
 
     if decode and warp_decode:
         # Pure-Gluon warp-reduce GEMV decode: no sort, expert read directly from

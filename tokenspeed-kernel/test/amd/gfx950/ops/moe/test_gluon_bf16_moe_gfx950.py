@@ -534,6 +534,47 @@ def test_fp16_weight_moe_warp_decode_matches_default(num_tokens):
     assert max_abs <= 1e-2 * peak + 1e-2, f"max_abs={max_abs}"
 
 
+def test_prefill_slices_keep_intermediate_under_2gib() -> None:
+    """GLM-5.3 Flash (top-8, I=2048) slices at 65,535 rows (EP1) and 16,384
+    rows (EP); DeepSeek-V3 TP8 (I=256) never slices below 524,287 rows."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe as bf16_moe
+
+    assert bf16_moe._prefill_max_tokens(8, 2048, False) == 65535
+    assert bf16_moe._prefill_max_tokens(8, 2048, True) == 16384
+    assert bf16_moe._prefill_max_tokens(8, 256, False) == 524287
+    for topk, i_r in ((8, 2048), (8, 256), (16, 4096)):
+        rows = bf16_moe._prefill_max_tokens(topk, i_r, False)
+        assert rows * topk * i_r * 2 < 2**31 <= (rows + 1) * topk * i_r * 2
+
+
+@requires_cdna4
+@pytest.mark.parametrize("expert_parallel", [False, True], ids=["ep1", "ep"])
+def test_prefill_slices_are_bit_identical(
+    expert_parallel: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sliced prefill (here forced at 100 rows) equals one launch bit for bit,
+    with uneven slices and EP routes outside the local experts."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe as bf16_moe
+
+    hidden, w1, w2, topk_ids, topk_weights = _build(333, seed=5)
+    # EP holds 64 of the 256 routed experts; without EP every route is local.
+    expert_start = 64 if expert_parallel else 0
+    local = slice(expert_start, expert_start + 64) if expert_parallel else slice(E)
+    kwargs = dict(
+        decode=False, expert_start=expert_start, expert_parallel=expert_parallel
+    )
+    whole = gluon_bf16_moe(
+        hidden, w1[local], w2[local], topk_ids, topk_weights, **kwargs
+    )
+    monkeypatch.setattr(
+        bf16_moe, "_prefill_max_tokens", lambda topk, i_r, expert_parallel: 100
+    )
+    sliced = gluon_bf16_moe(
+        hidden, w1[local], w2[local], topk_ids, topk_weights, **kwargs
+    )
+    assert torch.equal(sliced, whole)
+
+
 @requires_cdna4
 def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
     """The prefill aligner maps global EP routes to contiguous local weights."""
