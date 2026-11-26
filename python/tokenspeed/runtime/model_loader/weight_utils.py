@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Iterable
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import filelock
@@ -113,9 +114,18 @@ def get_lock(
 
 def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
     """Return the checkpoint folder holding its JSON files, fetched if remote."""
+    from tokenspeed.runtime.model_loader.object_store import (
+        is_object_store_uri,
+        sync_object_store_metadata,
+    )
+
     model_name_or_path = model_config.model_path
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
+    if is_object_store_uri(model_name_or_path):
+        return sync_object_store_metadata(
+            model_name_or_path, cache_dir=load_config.download_dir
+        )
 
     def download_config_files() -> str:
         return snapshot_download(
@@ -407,15 +417,25 @@ def filter_safetensors_files_by_weight_names(
     with open(index_file_name) as f:
         weight_map = json.load(f)["weight_map"]
     needed_files = set()
+    needed_basenames = set()
     for weight_name, shard_name in weight_map.items():
         if weight_name_filter(weight_name):
             needed_files.add(os.path.join(hf_folder, shard_name))
+            needed_basenames.add(shard_name)
     indexed_files = {
         os.path.join(hf_folder, shard_name) for shard_name in weight_map.values()
     }
-    filtered = [
-        f for f in hf_weights_files if f in needed_files or f not in indexed_files
-    ]
+    indexed_basenames = set(weight_map.values())
+    from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+    filtered = []
+    for f in hf_weights_files:
+        if is_object_store_uri(f):
+            base = f.rsplit("/", 1)[-1]
+            if base in needed_basenames or base not in indexed_basenames:
+                filtered.append(f)
+        elif f in needed_files or f not in indexed_files:
+            filtered.append(f)
     if not filtered:
         logger.warning(
             f"Weight-name shard filter matched nothing in {index_file_name}; "
@@ -964,6 +984,142 @@ def _instanttensor_tensors(
             total=len(f.keys()),
             mininterval=1.0,
         )
+
+
+def runai_streamer_weights_iterator(
+    hf_weights_files: list[str],
+    *,
+    distributed: bool,
+    weight_name_filter: Callable[[str], bool] | None,
+    index_weight_map: dict[str, str] | None,
+    concurrency: int | None = None,
+    memory_limit: int | None = None,
+    remote_file_factory: Callable[[str], Any] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Stream safetensors weights via ``runai_model_streamer.SafetensorsStreamer``.
+
+    Supports local file paths as well as ``gs://`` and ``s3://`` object-store URIs.
+    When ``weight_name_filter`` rejects some tensors in a remote shard (for example,
+    a large host-resident embedding table sharing a shard with small projection
+    weights), accepted tensors from that mixed shard are fetched directly via
+    byte-range reads so rejected tables are never streamed into memory.
+    """
+    try:
+        from runai_model_streamer import SafetensorsStreamer
+    except ImportError as e:
+        raise ImportError(
+            "runai_streamer load format requires runai-model-streamer; "
+            "install runai-model-streamer (and runai-model-streamer-gcs or "
+            "runai-model-streamer-s3 for object-store URIs)."
+        ) from e
+
+    from tokenspeed.runtime.model_loader.object_store import (
+        RemoteSafetensorsFile,
+        is_object_store_uri,
+    )
+
+    stream_files: list[str] = []
+    range_read_shards: list[tuple[str, list[str]]] = []
+
+    if weight_name_filter is not None and index_weight_map is not None:
+        by_shard: dict[str, list[str]] = {}
+        for weight_name, shard_name in index_weight_map.items():
+            by_shard.setdefault(shard_name, []).append(weight_name)
+        for path in hf_weights_files:
+            if is_object_store_uri(path):
+                shard_name = path.rsplit("/", 1)[-1]
+                shard_weights = by_shard.get(shard_name)
+                if shard_weights:
+                    accepted = [w for w in shard_weights if weight_name_filter(w)]
+                    if len(accepted) < len(shard_weights):
+                        if accepted:
+                            range_read_shards.append((path, accepted))
+                        continue
+            stream_files.append(path)
+    else:
+        stream_files = list(hf_weights_files)
+
+    env_overrides: dict[str, str] = {}
+    if concurrency is not None:
+        env_overrides["RUNAI_STREAMER_CONCURRENCY"] = str(concurrency)
+    if memory_limit is not None:
+        env_overrides["RUNAI_STREAMER_MEMORY_LIMIT"] = str(memory_limit)
+
+    if stream_files:
+        with ExitStack() as stack:
+            # Run:ai reads these env vars when opening the streamer and
+            # scheduling files; restore process-wide os.environ before the
+            # first yield so concurrent threads do not observe mutations.
+            saved_env: dict[str, str | None] = {
+                k: os.environ.get(k) for k in env_overrides
+            }
+            try:
+                os.environ.update(env_overrides)
+                streamer = stack.enter_context(SafetensorsStreamer())
+                streamer.stream_files(stream_files, is_distributed=distributed)
+            finally:
+                for k, prev in saved_env.items():
+                    if prev is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = prev
+            for name, tensor in streamer.get_tensors():
+                if weight_name_filter is not None and not weight_name_filter(name):
+                    continue
+                yield name, tensor
+
+    open_remote_file = (
+        RemoteSafetensorsFile if remote_file_factory is None else remote_file_factory
+    )
+    for path, accepted_names in range_read_shards:
+        logger.info(
+            f"Reading {len(accepted_names)} filtered tensor(s) from {path} "
+            "via byte-range requests instead of full-shard streaming."
+        )
+        remote_file = open_remote_file(path)
+        for name in accepted_names:
+            yield name, remote_file.get_tensor(name)
+
+
+@contextmanager
+def open_safetensors_slice(
+    checkpoint_dir: str,
+    shard_name: str,
+    tensor_name: str,
+):
+    """Yield a lazy CPU slice handle for ``tensor_name`` in ``shard_name``.
+
+    Uses local ``safetensors.safe_open`` when the shard exists on disk; falls back
+    to byte-range object-store reads when ``checkpoint_dir`` is an object-store
+    URI or a synced metadata directory carrying its source URI.
+    """
+    from tokenspeed.runtime.model_loader.object_store import (
+        RemoteSafetensorsFile,
+        is_object_store_uri,
+        join_object_store_uri,
+        read_source_uri,
+    )
+
+    if is_object_store_uri(checkpoint_dir):
+        remote_uri = join_object_store_uri(checkpoint_dir, shard_name)
+        yield RemoteSafetensorsFile(remote_uri).get_slice(tensor_name)
+        return
+
+    local_shard = os.path.join(checkpoint_dir, shard_name)
+    if os.path.isfile(local_shard):
+        with safe_open(local_shard, framework="pt", device="cpu") as handle:
+            yield handle.get_slice(tensor_name)
+        return
+
+    source_uri = read_source_uri(checkpoint_dir)
+    if source_uri is not None:
+        remote_uri = join_object_store_uri(source_uri, shard_name)
+        yield RemoteSafetensorsFile(remote_uri).get_slice(tensor_name)
+        return
+
+    raise FileNotFoundError(
+        f"Safetensors shard {shard_name!r} not found under {checkpoint_dir!r}"
+    )
 
 
 def pt_weights_iterator(

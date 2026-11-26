@@ -15,7 +15,8 @@ For a compact compatibility table, see
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `runai_streamer`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. `runai_streamer` streams safetensors from local paths or object-store URIs (`gs://`, `s3://`). |
+| `--model-loader-extra-config` | Optional JSON object of loader-specific options (e.g., `concurrency`, `memory_limit`, `distributed` for `runai_streamer`). |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |

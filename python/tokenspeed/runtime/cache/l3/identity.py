@@ -64,6 +64,7 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "auto": (("*.safetensors",), ("*.bin",), ("*.pt",)),
     "safetensors": (("*.safetensors",),),
     "instanttensor": (("*.safetensors",),),
+    "runai_streamer": (("*.safetensors",),),
     "mistral": (("consolidated*.safetensors",),),
     "pt": (("*.pt",),),
     "npcache": (("*.bin",),),
@@ -71,6 +72,8 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "dummy": (),
     "extensible": (("*.safetensors",), ("*.bin",), ("*.pt",)),
 }
+# Run:ai streamer tuning knobs affect only I/O scheduling, never weight bytes.
+_RUNAI_STREAMER_TUNING_KEYS = frozenset({"concurrency", "memory_limit", "distributed"})
 # Keep in lockstep with ShardedStateLoader.DEFAULT_PATTERN.
 _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
@@ -214,10 +217,21 @@ def l3_checkpoint_id(
 
     if not isinstance(model_loader_extra_config, dict):
         raise TypeError("model_loader_extra_config must be a dict")
-    extra_json = json.dumps(
-        model_loader_extra_config, sort_keys=True, separators=(",", ":")
-    )
-    fmt = _normalize_load_format(load_format)
+    raw_fmt = _normalize_load_format(load_format)
+    if raw_fmt == "runai_streamer":
+        # Run:ai streams the exact same safetensors bytes; strip I/O tuning
+        # knobs and normalize to "safetensors" so P/D replicas with different
+        # concurrency/distributed settings share the same L3 namespace.
+        extra_for_id = {
+            k: v
+            for k, v in model_loader_extra_config.items()
+            if k not in _RUNAI_STREAMER_TUNING_KEYS
+        }
+        fmt = "safetensors"
+    else:
+        extra_for_id = model_loader_extra_config
+        fmt = raw_fmt
+    extra_json = json.dumps(extra_for_id, sort_keys=True, separators=(",", ":"))
     ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
@@ -225,13 +239,13 @@ def l3_checkpoint_id(
             return _checkpoint_id_with_load_format(
                 snapshot,
                 load_format=fmt,
-                extra_config=model_loader_extra_config,
+                extra_config=extra_for_id,
                 ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_path, fmt, extra_json),
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     commit = getattr(hf_config, "_commit_hash", None)
@@ -239,7 +253,7 @@ def l3_checkpoint_id(
         return _checkpoint_id_with_load_format(
             commit,
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     model_dir = _resolved_model_dir(model_path, revision=revision)
@@ -249,20 +263,20 @@ def l3_checkpoint_id(
             return _checkpoint_id_with_load_format(
                 snapshot,
                 load_format=fmt,
-                extra_config=model_loader_extra_config,
+                extra_config=extra_for_id,
                 ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_dir, fmt, extra_json),
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
         return _checkpoint_id_with_load_format(
             revision,
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     raise ValueError(

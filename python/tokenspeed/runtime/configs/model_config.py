@@ -788,6 +788,7 @@ class ModelConfig:
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
+        download_dir = server_args.download_dir if server_args is not None else None
         self.hf_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
@@ -799,6 +800,7 @@ class ModelConfig:
                 if is_draft_worker
                 else None
             ),
+            download_dir=download_dir,
             **kwargs,
         )
         _apply_constrained_decoding_policy(
@@ -810,6 +812,7 @@ class ModelConfig:
             self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
+            download_dir=download_dir,
             **kwargs,
         )
 

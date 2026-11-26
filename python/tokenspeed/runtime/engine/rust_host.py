@@ -1679,6 +1679,7 @@ class HostBootstrap:
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 architectures=model_config.hf_config.architectures,
+                download_dir=server_args.download_dir,
                 **model_config.tokenizer_kwargs,
             )
             eos_token_ids = resolve_stop_token_ids(

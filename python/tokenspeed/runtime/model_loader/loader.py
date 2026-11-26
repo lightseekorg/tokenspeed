@@ -27,6 +27,7 @@
 import collections
 import dataclasses
 import glob
+import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterable
@@ -65,6 +66,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    runai_streamer_weights_iterator,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
     split_kv_cache_scales,
@@ -314,6 +316,7 @@ class DefaultModelLoader(BaseModelLoader):
                 LoadFormat.AUTO,
                 LoadFormat.SAFETENSORS,
                 LoadFormat.INSTANTTENSOR,
+                LoadFormat.RUNAI_STREAMER,
             ):
                 raise ValueError(
                     "Explicit checkpoint files require safetensors loading"
@@ -343,7 +346,11 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format in (LoadFormat.SAFETENSORS, LoadFormat.INSTANTTENSOR):
+        elif load_format in (
+            LoadFormat.SAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
+            LoadFormat.RUNAI_STREAMER,
+        ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -928,6 +935,168 @@ class ShardedStateLoader(BaseModelLoader):
         return model.eval()
 
 
+class RunaiModelStreamerLoader(DefaultModelLoader):
+    """Model loader that streams safetensors weights with Run:ai Model Streamer.
+
+    Supports both local directories and cloud object-store URIs (``gs://``,
+    ``s3://``). Remote checkpoints sync only their non-weight metadata files to
+    a local cache directory and stream ``*.safetensors`` shards directly.
+    """
+
+    def __init__(self, load_config: LoadConfig) -> None:
+        BaseModelLoader.__init__(self, load_config)
+        extra_config = (
+            {}
+            if load_config.model_loader_extra_config is None
+            else dict(load_config.model_loader_extra_config)
+        )
+        concurrency = extra_config.pop("concurrency", None)
+        memory_limit = extra_config.pop("memory_limit", None)
+        distributed = extra_config.pop("distributed", False)
+        if extra_config:
+            raise ValueError(
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: {sorted(extra_config)}"
+            )
+        if concurrency is not None and (
+            isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)
+            or concurrency < 1
+        ):
+            raise ValueError(
+                f"runai_streamer concurrency must be a positive int, got {concurrency!r}"
+            )
+        if memory_limit is not None and (
+            isinstance(memory_limit, bool)
+            or not isinstance(memory_limit, int)
+            or memory_limit < 0
+        ):
+            raise ValueError(
+                f"runai_streamer memory_limit must be a non-negative int, got {memory_limit!r}"
+            )
+        if not isinstance(distributed, bool):
+            raise ValueError(
+                f"runai_streamer distributed must be a bool, got {distributed!r}"
+            )
+        self.concurrency: int | None = concurrency
+        self.memory_limit: int | None = memory_limit
+        self.distributed: bool = distributed
+
+    def _prepare_weights(
+        self,
+        model_name_or_path: str,
+        revision: str | None,
+        fall_back_to_pt: bool,
+        weight_files: tuple[str, ...] | None,
+    ) -> tuple[str, list[str], bool]:
+        from tokenspeed.runtime.model_loader.object_store import (
+            is_object_store_uri,
+            join_object_store_uri,
+            list_object_store_safetensors,
+            sync_object_store_metadata,
+        )
+
+        if not is_object_store_uri(model_name_or_path):
+            return super()._prepare_weights(
+                model_name_or_path, revision, fall_back_to_pt, weight_files
+            )
+
+        hf_folder = sync_object_store_metadata(
+            model_name_or_path, cache_dir=self.load_config.download_dir
+        )
+        if weight_files is not None:
+            uris = [
+                join_object_store_uri(model_name_or_path, name) for name in weight_files
+            ]
+            return hf_folder, uris, True
+
+        index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.isfile(index_path):
+            with open(index_path, encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            shard_names = sorted(set(weight_map.values()))
+            uris = [
+                join_object_store_uri(model_name_or_path, name) for name in shard_names
+            ]
+        else:
+            uris = list_object_store_safetensors(model_name_or_path)
+
+        if not uris:
+            raise RuntimeError(
+                f"Cannot find any safetensors weights under `{model_name_or_path}`"
+            )
+        return hf_folder, uris, True
+
+    def _get_weights_iterator(
+        self,
+        source: "DefaultModelLoader.Source",
+        weight_name_filter: Callable[[str], bool] | None,
+        checkpoint_load_group: tuple[int, ...] | None,
+        mapping: Mapping,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        del mapping
+        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+            source.model_or_path,
+            source.revision,
+            source.fall_back_to_pt,
+            source.weight_files,
+        )
+        if not use_safetensors:
+            raise ValueError("runai_streamer only supports safetensors checkpoints.")
+        hf_weights_files.sort()
+
+        index_weight_map: dict[str, str] | None = None
+        index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.isfile(index_path):
+            with open(index_path, encoding="utf-8") as f:
+                index_weight_map = json.load(f).get("weight_map")
+
+        prefixed_filter = (
+            (lambda name: weight_name_filter(source.prefix + name))
+            if weight_name_filter is not None
+            else None
+        )
+        if prefixed_filter is not None:
+            hf_weights_files = filter_safetensors_files_by_weight_names(
+                hf_weights_files,
+                hf_folder,
+                SAFE_WEIGHTS_INDEX_NAME,
+                prefixed_filter,
+            )
+
+        if self.distributed:
+            if checkpoint_load_group is not None:
+                raise ValueError(
+                    "runai_streamer distributed=True is incompatible with "
+                    f"checkpoint_load_group={checkpoint_load_group!r}: Run:ai "
+                    "distributed streaming broadcasts across the full default "
+                    "process group rather than a rank subset."
+                )
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_world_size() <= 1
+            ):
+                logger.warning(
+                    "runai_streamer distributed=True requested without a "
+                    "multi-rank torch.distributed process group; streaming "
+                    "locally without broadcast."
+                )
+                use_distributed = False
+            else:
+                use_distributed = True
+        else:
+            use_distributed = False
+        weights_iterator = runai_streamer_weights_iterator(
+            hf_weights_files,
+            distributed=use_distributed,
+            weight_name_filter=prefixed_filter,
+            index_weight_map=index_weight_map,
+            concurrency=self.concurrency,
+            memory_limit=self.memory_limit,
+        )
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
@@ -942,5 +1111,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.EXTENSIBLE:
         return ExtensibleModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+        return RunaiModelStreamerLoader(load_config)
 
     return DefaultModelLoader(load_config)

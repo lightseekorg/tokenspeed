@@ -449,6 +449,7 @@ class ServerArgs:
     tokenizer: str | None = None
     tokenizer_mode: str = "auto"
     load_format: str = "auto"
+    model_loader_extra_config: str | dict | None = None
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -3141,6 +3142,27 @@ class ServerArgs:
                 "after loading, and no weight update rebuilds them"
             )
 
+    def _parse_model_loader_extra_config(self) -> None:
+        raw = self.model_loader_extra_config
+        if raw is None or raw == "":
+            self.model_loader_extra_config = {}
+            return
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "--model-loader-extra-config must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("--model-loader-extra-config must be a JSON object")
+            self.model_loader_extra_config = parsed
+            return
+        if isinstance(raw, dict):
+            self.model_loader_extra_config = dict(raw)
+            return
+        raise ValueError("--model-loader-extra-config must be a JSON object or dict")
+
     def validate_petit_moe_options(self):
         """Validate shared backend, model, and scheduling options for Petit.
 
@@ -3458,6 +3480,7 @@ class ServerArgs:
             )
 
         self.validate_model_update_options()
+        self._parse_model_loader_extra_config()
 
         if (
             self.speculative_algorithm is not None
@@ -3653,6 +3676,7 @@ class ServerArgs:
                 "pt",
                 "safetensors",
                 "instanttensor",
+                "runai_streamer",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -3666,9 +3690,19 @@ class ServerArgs:
             '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
             "via distributed loading, pipelined prefetching, and direct I/O "
             "(with optional GPUDirect Storage support). "
+            '"runai_streamer" streams safetensors weights from local storage '
+            "or cloud object stores (gs://, s3://) via Run:ai Model Streamer. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            default=ServerArgs.model_loader_extra_config,
+            help="Optional JSON object of extra options for the selected "
+            "model loader (e.g., concurrency, memory_limit, distributed for "
+            "--load-format runai_streamer).",
         )
         parser.add_argument(
             "--trust-remote-code",
