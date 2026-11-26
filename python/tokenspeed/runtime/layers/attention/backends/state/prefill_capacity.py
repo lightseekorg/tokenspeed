@@ -198,7 +198,7 @@ def _capacity_metadata(source, bucket, checkpoints):
     if checkpoints is None and source.state_checkpoints is not None:
         raise ValueError("this capacity layout stores no in-forward State checkpoint")
     # The live checkpoint plan fits this forward only (its interval and scan
-    # buffer); fixed slots replace it. So does the scan plan, rebuilt over the
+    # buffer); fixed slots replace it. The backend plans the scan over the
     # snapshot's own boundaries (``prepare_prefill_metadata``).
     cloned = _clone_metadata(
         replace(

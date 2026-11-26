@@ -95,6 +95,7 @@ def _assert_matches_portable(
             else initial_state.transpose(-1, -2).contiguous()
         ),
         plan=None,
+        plan_layer=0,
         **kwargs,
     )
     actual_state = actual_state.transpose(-1, -2)

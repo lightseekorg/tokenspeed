@@ -14,9 +14,9 @@ The feature is on by default for supported prefill batches on the
 `cutedsl_kda` and `cudnn` backends when prefill graphs are on. It uses the existing
 prefill computation and the scheduler-owned two-slot state table.
 Both backends use FlashInfer and consume strided Q/K/V views from convolution
-output. The CuTe scan generates its plan from the live device boundaries,
-once per forward for the ordinary scan's metadata, which every layer reads;
-its scratch is owned by the invocation or captured graph pool.
+output. The CuTe scan plans once per forward from the live device boundaries, and
+every layer reads that plan; its scratch is owned by the forward's metadata,
+the invocation, or the captured graph pool.
 
 ## How it works
 
