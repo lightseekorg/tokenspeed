@@ -590,6 +590,10 @@ class LatentMoELayer(nn.Module):
         # ceil(T / EP) share of the replicated rows and leave the other rows'
         # routed latent zero, so the EP all-reduce assembles every row.
         split_replicated_rows: bool = False,
+        # Overlap the shared experts on ``shared_expert_stream`` in graph
+        # phases too (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM under Gluon
+        # Petit's attention-TP layout); by default captured graphs stay serial.
+        shared_expert_overlap_in_graphs: bool = False,
     ) -> None:
         super().__init__()
         if split_replicated_rows and input_projections is not None:
@@ -649,6 +653,7 @@ class LatentMoELayer(nn.Module):
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
         self.split_replicated_rows = split_replicated_rows
+        self.shared_expert_overlap_in_graphs = shared_expert_overlap_in_graphs
 
     def _route_row_share(
         self,
@@ -780,7 +785,7 @@ class LatentMoELayer(nn.Module):
             # HIP graph warmup can deadlock when an auxiliary GEMM competes
             # with Iris's spin-wait all-reduce kernels. Keep the captured path
             # serial; eager serving can safely use the compute-stream overlap.
-            and not get_is_cuda_graph_phase()
+            and (self.shared_expert_overlap_in_graphs or not get_is_cuda_graph_phase())
         )
         shared_reduction_applied = False
 

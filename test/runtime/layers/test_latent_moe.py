@@ -1335,3 +1335,47 @@ def test_latent_moe_split_replicated_rows_refuses_packed_projections() -> None:
             input_projections=lambda hidden_states, shared_out: None,
             split_replicated_rows=True,
         )
+
+
+class _RecordingFork:
+    """Stands in for StreamFork: records whether the shared branch overlapped."""
+
+    enabled: list[bool] = []
+
+    def __init__(self, aux_stream) -> None:
+        self.aux_stream = aux_stream
+
+    def scope(self, *, enable: bool):
+        _RecordingFork.enabled.append(enable)
+        fork = self
+
+        class _Scope:
+            def __enter__(self):
+                return fork
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Scope()
+
+    def branch(self):
+        return self.scope(enable=False)
+
+
+@pytest.mark.parametrize("in_graphs", [False, True])
+def test_latent_moe_shared_expert_overlap_in_graphs_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch, in_graphs: bool
+) -> None:
+    """Captured graphs keep the shared experts serial unless the layer opts in
+    (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM under the attention-TP Petit
+    layout); eager forwards overlap either way."""
+    monkeypatch.setattr(latent_module, "StreamFork", _RecordingFork)
+    monkeypatch.setattr(latent_module, "get_is_cuda_graph_phase", lambda: True)
+    _RecordingFork.enabled = []
+    layer = _layer(
+        shared_experts=_Shared(),
+        shared_expert_stream=object(),
+        shared_expert_overlap_in_graphs=in_graphs,
+    )
+    layer(torch.ones(2, 4))
+    assert _RecordingFork.enabled[0] is in_graphs

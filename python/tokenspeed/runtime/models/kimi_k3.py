@@ -2931,6 +2931,16 @@ class KimiLinearMoE(nn.Module):
                 logger.info("K3 MoE communication: all-gather/reduce-scatter")
             return
 
+        # Opt-in (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM, as DeepSeek V4's
+        # Petit MoE): under the attention-TP Petit layout the TP-sharded shared
+        # experts run on the aux stream, captured graphs included, beside the
+        # routed share; the branch is rank-local GEMMs and the joint all-reduce
+        # waits for the join.
+        petit_shared_expert_aux_stream = (
+            self.execution_plan.petit_tp_attention
+            and alt_stream is not None
+            and envs.TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM.get()
+        )
         # Native EP owns its collectives; native TP reduces before replicated up-projection.
         self.native_latent_moe = (
             LatentMoELayer(
@@ -2944,8 +2954,12 @@ class KimiLinearMoE(nn.Module):
                 shared_reduce=None,
                 joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
-                    alt_stream if self.execution_plan.overlap_shared_experts else None
+                    alt_stream
+                    if self.execution_plan.overlap_shared_experts
+                    or petit_shared_expert_aux_stream
+                    else None
                 ),
+                shared_expert_overlap_in_graphs=petit_shared_expert_aux_stream,
                 expert_parallel_group=mapping.moe.ep_group,
                 # The packed projection covers every row; a row share cannot
                 # take it.
