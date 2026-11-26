@@ -569,3 +569,182 @@ def test_save_keeps_rank_specific_tactics(monkeypatch, tmp_path):
     path = tmp_path / "configs.json"
     assert save_autotune_cache(str(path), object(), 0)
     assert json.loads(path.read_bytes()) == local | peer
+
+
+def test_autotune_cache_ignores_ephemeral_uv_and_pyc_record_entries(
+    monkeypatch, tmp_path
+) -> None:
+    import importlib.metadata
+    import json
+
+    class _FakeDist:
+        def __init__(self, version: str, record: str | None) -> None:
+            self.version = version
+            self._record = record
+
+        def read_text(self, filename: str) -> str | None:
+            return self._record if filename == "RECORD" else None
+
+    # Mirror real FlashInfer's two-module layout (flashinfer.autotuner
+    # re-exporting from flashinfer.autotuner.autotuner).
+    impl_mod = types.ModuleType("flashinfer.autotuner.autotuner")
+    pkg_mod = types.ModuleType("flashinfer.autotuner")
+    fi_root = types.ModuleType("flashinfer")
+    fi_root.__path__ = []
+    fi_root.autotuner = pkg_mod
+
+    state = {
+        "raw_dsl": "",
+        "dists": {},
+    }
+
+    def raw_collect_metadata() -> dict[str, object]:
+        return {
+            "gpu": "B300",
+            "flashinfer_version": "0.7.5",
+            "cutlass_dsl_version": state["raw_dsl"],
+        }
+
+    class _ValidatingTuner:
+        def __init__(self) -> None:
+            self.active = False
+            self.is_tuning_mode = False
+            self.saved_meta: dict[str, object] | None = None
+
+        def save_configs(self, path: str) -> None:
+            meta = impl_mod._collect_metadata()
+            self.saved_meta = meta
+            Path(path).write_text(
+                json.dumps({"_metadata": meta, "op": ["Runner", 7]}),
+                encoding="utf-8",
+            )
+
+        def load_configs(self, path: str) -> bool:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            if payload.get("_metadata") != impl_mod._collect_metadata():
+                return False
+            self.active = True
+            return True
+
+        def clear_cache(self) -> None:
+            self.active = False
+
+    _ValidatingTuner.__module__ = impl_mod.__name__
+    tuner = _ValidatingTuner()
+
+    class _AutoTuner:
+        @staticmethod
+        def get():
+            return tuner
+
+    impl_mod._collect_metadata = raw_collect_metadata
+    impl_mod.AutoTuner = _AutoTuner
+    pkg_mod._collect_metadata = raw_collect_metadata
+    pkg_mod.AutoTuner = _AutoTuner
+
+    monkeypatch.setitem(sys.modules, "flashinfer", fi_root)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", pkg_mod)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner.autotuner", impl_mod)
+    monkeypatch.setattr(tuning, "_autotuner", pkg_mod)
+    monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+
+    def fake_distribution(name: str):
+        if name not in state["dists"]:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return state["dists"][name]
+
+    monkeypatch.setattr(importlib.metadata, "distribution", fake_distribution)
+
+    host_a_cutlass_record = "\n".join(
+        [
+            "nvidia_cutlass_dsl/core.py,sha256=aaaa1111,1024",
+            "nvidia_cutlass_dsl/lib.so,sha256=bbbb2222,4096",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/METADATA,sha256=cccc3333,512",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/uv_cache.json,sha256=hostA_ts,96",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/INSTALLER,sha256=uv_hash,3",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/RECORD,,",
+        ]
+    )
+    host_a_torch_record = "\n".join(
+        [
+            "torch/__init__.py,sha256=tttt1111,2048",
+            "torch-2.14.0+cu130.dist-info/uv_cache.json,sha256=torchA_ts,96",
+            "torch-2.14.0+cu130.dist-info/RECORD,,",
+        ]
+    )
+    # Host B has identical package code/binaries (in different RECORD order),
+    # different uv_cache.json timestamps, different INSTALLER, and new .pyc files.
+    host_b_cutlass_record = "\n".join(
+        [
+            "nvidia_cutlass_dsl-4.8.0.dist-info/METADATA,sha256=cccc3333,512",
+            "nvidia_cutlass_dsl/lib.so,sha256=bbbb2222,4096",
+            "nvidia_cutlass_dsl/core.py,sha256=aaaa1111,1024",
+            "nvidia_cutlass_dsl/__pycache__/core.cpython-312.pyc,,",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/uv_cache.json,sha256=hostB_ts,96",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/INSTALLER,sha256=pip_hash,4",
+            "nvidia_cutlass_dsl-4.8.0.dist-info/RECORD,,",
+        ]
+    )
+    host_b_torch_record = "\n".join(
+        [
+            "torch/__init__.py,sha256=tttt1111,2048",
+            "torch/__pycache__/__init__.cpython-312.pyc,,",
+            "torch-2.14.0+cu130.dist-info/uv_cache.json,sha256=torchB_ts,96",
+            "torch-2.14.0+cu130.dist-info/RECORD,,",
+        ]
+    )
+
+    config = {"model": "kimi-k3", "dp": 16, "ep": 16}
+
+    # Host A computes cache path and saves configs.
+    tuning._stable_package_record_digest.cache_clear()
+    state["raw_dsl"] = "nvidia-cutlass-dsl==4.8.0:raw_a1;torch==2.14.0+cu130:raw_a2"
+    state["dists"] = {
+        "nvidia-cutlass-dsl": _FakeDist("4.8.0", host_a_cutlass_record),
+        "torch": _FakeDist("2.14.0+cu130", host_a_torch_record),
+    }
+    path_a = autotune_cache_path(config)
+    assert path_a is not None
+    assert save_autotune_cache(path_a, None, 0)
+    assert impl_mod._collect_metadata is raw_collect_metadata
+    assert pkg_mod._collect_metadata is raw_collect_metadata
+    assert tuner.saved_meta is not None
+    assert "raw_a1" not in str(tuner.saved_meta["cutlass_dsl_version"])
+
+    # Host B gets the exact same cache path and loads Host A's saved cache.
+    tuning._stable_package_record_digest.cache_clear()
+    state["raw_dsl"] = "nvidia-cutlass-dsl==4.8.0:raw_b1;torch==2.14.0+cu130:raw_b2"
+    state["dists"] = {
+        "nvidia-cutlass-dsl": _FakeDist("4.8.0", host_b_cutlass_record),
+        "torch": _FakeDist("2.14.0+cu130", host_b_torch_record),
+    }
+    path_b = autotune_cache_path(config)
+    assert path_b == path_a
+    assert load_autotune_cache(path_b, None, 0)
+    assert tuner.active
+    assert impl_mod._collect_metadata is raw_collect_metadata
+    assert pkg_mod._collect_metadata is raw_collect_metadata
+
+    # Host C changes an actual installed file hash (same package version):
+    # cache path must change and Host A's saved cache must be rejected.
+    tuning._stable_package_record_digest.cache_clear()
+    host_c_cutlass_record = host_a_cutlass_record.replace(
+        "sha256=aaaa1111", "sha256=modified9"
+    )
+    state["dists"]["nvidia-cutlass-dsl"] = _FakeDist("4.8.0", host_c_cutlass_record)
+    path_c = autotune_cache_path(config)
+    assert path_c != path_a
+    assert not load_autotune_cache(path_a, None, 0)
+    assert not tuner.active
+
+    # Editable / unhashed RECORD falls back to FlashInfer's original raw hash.
+    tuning._stable_package_record_digest.cache_clear()
+    state["dists"]["nvidia-cutlass-dsl"] = _FakeDist(
+        "4.8.0", "nvidia_cutlass_dsl/core.py,,\n"
+    )
+    state["raw_dsl"] = "nvidia-cutlass-dsl==4.8.0:editable_hash_1"
+    path_edit_1 = autotune_cache_path(config)
+    state["raw_dsl"] = "nvidia-cutlass-dsl==4.8.0:editable_hash_2"
+    path_edit_2 = autotune_cache_path(config)
+    assert path_edit_1 != path_edit_2
+    tuning._stable_package_record_digest.cache_clear()

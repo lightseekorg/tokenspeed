@@ -23,11 +23,14 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import functools
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
+import sys
 import tempfile
 from collections.abc import Generator
 from contextvars import ContextVar
@@ -59,6 +62,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+# Installer and bytecode files inside site-packages / *.dist-info that vary per
+# host or across restarts (e.g. uv_cache.json install timestamps, *.pyc) without
+# changing the installed package's code or binaries.
+_EPHEMERAL_RECORD_NAMES = frozenset(
+    {"RECORD", "INSTALLER", "REQUESTED", "uv_cache.json"}
+)
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 _autotune_process_group: dist.ProcessGroup | None = None
@@ -262,6 +271,127 @@ def _ep_moe_candidates():
         AutoTuner.choose_one = original_choose
 
 
+def _is_ephemeral_record_path(rel_path: str) -> bool:
+    normalized = rel_path.replace("\\", "/")
+    parts = normalized.split("/")
+    name = parts[-1]
+    if name in _EPHEMERAL_RECORD_NAMES:
+        return True
+    return name.endswith((".pyc", ".pyo")) or "__pycache__" in parts
+
+
+@functools.cache
+def _stable_package_record_digest(pkg_name: str, expected_version: str) -> str | None:
+    """Hash a distribution's ``RECORD`` entries excluding ephemeral files.
+
+    Tradeoff: this trusts the wheel installer's ``RECORD`` metadata rather than
+    re-hashing installed files on disk, so an in-place edit under
+    ``site-packages`` that leaves ``RECORD`` unchanged will not invalidate the
+    autotune cache. That is acceptable for a tactic cache keyed on wheel
+    installs; editable or unhashed installs have no content hashes in
+    ``RECORD`` and fall back to FlashInfer's original token.
+
+    Returns ``None`` when the distribution is missing, its version disagrees,
+    or its ``RECORD`` carries no content hashes, so callers keep FlashInfer's
+    original token unchanged.
+    """
+    try:
+        dist_info = importlib.metadata.distribution(pkg_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    if dist_info.version != expected_version:
+        return None
+    record_text = dist_info.read_text("RECORD")
+    if not record_text:
+        return None
+    kept_lines: list[str] = []
+    has_content_hash = False
+    for row in csv.reader(record_text.splitlines()):
+        if not row:
+            continue
+        rel_path = row[0].strip()
+        if not rel_path or _is_ephemeral_record_path(rel_path):
+            continue
+        digest = row[1].strip() if len(row) > 1 else ""
+        size = row[2].strip() if len(row) > 2 else ""
+        if digest:
+            has_content_hash = True
+        kept_lines.append(f"{rel_path},{digest},{size}")
+    if not kept_lines or not has_content_hash:
+        return None
+    kept_lines.sort()
+    return hashlib.sha256("\n".join(kept_lines).encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_cutlass_dsl_version(raw_value: str) -> str:
+    """Stabilize ``cutlass_dsl_version`` against ephemeral dist-info files.
+
+    FlashInfer hashes installed package files into semicolon-separated
+    ``<pkg>==<ver>:<hash>`` entries. Ephemeral files such as ``uv_cache.json``
+    (per-host ``uv`` install timestamps) or newly generated ``*.pyc`` bytecode
+    cause identical multi-node wheel installs or restarts to miss the cache.
+    Replace each package's hash with a deterministic digest over its non-ephemeral
+    ``RECORD`` entries so real package or file changes still invalidate caches.
+    """
+    parts: list[str] = []
+    for entry in raw_value.split(";"):
+        spec, sep, _raw_hash = entry.partition(":")
+        if not sep or "==" not in spec:
+            parts.append(entry)
+            continue
+        pkg_name, version = spec.split("==", 1)
+        stable_digest = _stable_package_record_digest(pkg_name.strip(), version.strip())
+        if stable_digest is None:
+            parts.append(entry)
+        else:
+            parts.append(f"{spec}:{stable_digest}")
+    return ";".join(parts)
+
+
+def _stable_autotune_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    if not isinstance(metadata, dict):
+        return metadata
+    raw_dsl = metadata.get("cutlass_dsl_version")
+    if not isinstance(raw_dsl, str) or not raw_dsl:
+        return metadata
+    stable_dsl = _stable_cutlass_dsl_version(raw_dsl)
+    if stable_dsl == raw_dsl:
+        return metadata
+    updated = dict(metadata)
+    updated["cutlass_dsl_version"] = stable_dsl
+    return updated
+
+
+@contextlib.contextmanager
+def _stable_flashinfer_metadata(tuner) -> Generator[None]:
+    """Stabilize FlashInfer's private ``_collect_metadata`` during cache save/load.
+
+    Temporary shim until upstream FlashInfer excludes ephemeral installer and
+    bytecode files (``uv_cache.json``, ``INSTALLER``, ``*.pyc``) from its
+    environment hash.
+    """
+    modules = []
+    seen_ids: set[int] = set()
+    for mod in (_autotuner, sys.modules.get(type(tuner).__module__)):
+        if mod is None or id(mod) in seen_ids:
+            continue
+        if callable(getattr(mod, "_collect_metadata", None)):
+            modules.append((mod, mod._collect_metadata))
+            seen_ids.add(id(mod))
+    if not modules:
+        yield
+        return
+    try:
+        for mod, original in modules:
+            mod._collect_metadata = lambda orig=original: _stable_autotune_metadata(
+                orig()
+            )
+        yield
+    finally:
+        for mod, original in modules:
+            mod._collect_metadata = original
+
+
 def autotune_cache_path(cache_key: dict[str, object]) -> str | None:
     """Build a cache path from model/layout facts and FlashInfer metadata.
 
@@ -276,7 +406,7 @@ def autotune_cache_path(cache_key: dict[str, object]) -> str | None:
 
     payload = {
         "config": cache_key,
-        "environment": _autotuner._collect_metadata(),
+        "environment": _stable_autotune_metadata(_autotuner._collect_metadata()),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -358,8 +488,13 @@ def autotune(
     candidates = _ep_moe_candidates() if tune_mode else contextlib.nullcontext()
     cache = _reuse_autotune_cache() if tune_mode else contextlib.nullcontext()
     gemms = _gemm_token_buckets() if tune_mode else contextlib.nullcontext()
-    with cache, candidates, gemms, _autotuner.autotune(
-        tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
+    with (
+        cache,
+        candidates,
+        gemms,
+        _autotuner.autotune(
+            tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
+        ),
     ):
         yield
 
@@ -485,7 +620,10 @@ def load_autotune_cache(
         if payload is not None:
             try:
                 # All ranks load the broadcast bytes; a rewrite cannot split them.
-                with tempfile.NamedTemporaryFile() as tmp:
+                with (
+                    _stable_flashinfer_metadata(tuner),
+                    tempfile.NamedTemporaryFile() as tmp,
+                ):
                     tmp.write(payload)
                     tmp.flush()
                     loaded = bool(tuner.load_configs(tmp.name))
@@ -524,8 +662,12 @@ def save_autotune_cache(
         return False
     payload = None
     try:
-        with tempfile.NamedTemporaryFile() as tmp:
-            _autotuner.AutoTuner.get().save_configs(tmp.name)
+        tuner = _autotuner.AutoTuner.get()
+        with (
+            _stable_flashinfer_metadata(tuner),
+            tempfile.NamedTemporaryFile() as tmp,
+        ):
+            tuner.save_configs(tmp.name)
             payload = Path(tmp.name).read_bytes()
     except Exception:
         logger.warning(f"Could not save FlashInfer cache {path}", exc_info=True)
