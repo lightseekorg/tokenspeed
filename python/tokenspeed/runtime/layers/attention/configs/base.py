@@ -315,7 +315,13 @@ class AttnConfig:
                     raise ValueError(
                         "MLA DCP decode does not support non-causal block drafts"
                     )
-            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
+            elif softmax.is_dsa and (
+                softmax.backend_name in (None, "dsa")
+                or (
+                    softmax.paged_backend_cls is not None
+                    and softmax.paged_backend_cls.supports_mla_dcp
+                )
+            ):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
                     raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")

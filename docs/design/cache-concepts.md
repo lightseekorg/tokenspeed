@@ -2626,6 +2626,9 @@ counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
 require the full-attention backend to declare `supports_mla_dcp`; FlashMLA,
 TokenSpeed MLA (CuTe MLA) and DSA declare this capability.
+When resolving a hybrid's registered DSA leaf, the runtime retains the
+validated backend class in the softmax config. KVP validation recognizes that
+class's capability as well as the built-in DSA name.
 Decode (DCP) gathers query heads, computes attention over owned history, and
 merges partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reads its bounded prefix chunks through the backend

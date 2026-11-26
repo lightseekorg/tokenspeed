@@ -23,6 +23,7 @@
 import logging
 import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -120,6 +121,46 @@ def test_dsa_storage_accepts_a_selected_numerical_backend(monkeypatch, device, n
 def test_dsa_storage_rejects_unregistered_backend_names(monkeypatch, device):
     with pytest.raises(ValueError, match="kv-parallel-size"):
         _config(monkeypatch, device, "plugin_dsa_numerics")
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_resolved_hybrid_dsa_keeps_registered_kvp_backend(monkeypatch, device):
+    from tokenspeed.runtime.layers.attention import registry
+
+    class ModelDSABackend(backends.dsa.DSABackend):
+        supports_mla_dcp = True
+
+    name = "plugin_dsa_numerics"
+    monkeypatch.setitem(
+        registry._BACKEND_REGISTRY, name, ({AttentionArch.DSA}, ModelDSABackend)
+    )
+    config, spec = _config(monkeypatch, device, "hybrid_linear_attn")
+    cls = registry._validate_mla_dcp_backend(name, AttentionArch.DSA, config)
+    resolved = replace(
+        config,
+        components=(replace(spec, backend_name=name, paged_backend_cls=cls),),
+    )
+    assert resolved.kvp_size == 8
+    assert (
+        registry._get_backend_cls(name, AttentionArch.DSA, resolved) is ModelDSABackend
+    )
+
+
+def test_registered_dsa_without_dcp_is_rejected(monkeypatch):
+    from tokenspeed.runtime.layers.attention import registry
+
+    class ModelDSABackend(backends.dsa.DSABackend):
+        supports_mla_dcp = False
+
+    name = "plugin_dsa_numerics"
+    monkeypatch.setitem(
+        registry._BACKEND_REGISTRY, name, ({AttentionArch.DSA}, ModelDSABackend)
+    )
+    config, _ = _config(monkeypatch, "npu", "hybrid_linear_attn")
+    with pytest.raises(ValueError, match="supports_mla_dcp=False"):
+        registry._validate_mla_dcp_backend(name, AttentionArch.DSA, config)
+    with pytest.raises(ValueError, match="kv-parallel-size"):
+        _config(monkeypatch, "npu", name, paged_backend_cls=ModelDSABackend)
 
 
 @pytest.mark.parametrize("name", [None, "dsa"])

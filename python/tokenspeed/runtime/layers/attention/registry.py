@@ -1294,7 +1294,7 @@ def _narrow_spec_for_pp(
 
 def _validate_mla_dcp_backend(
     name: str | None, arch: AttentionArch, config: AttnConfig | None = None
-) -> None:
+) -> type[AttentionBackend]:
     backend_cls = _get_backend_cls(name, arch, config)
     if not backend_cls.supports_mla_dcp:
         raise ValueError(
@@ -1302,6 +1302,7 @@ def _validate_mla_dcp_backend(
             "does not support MLA DCP "
             "(supports_mla_dcp=False)"
         )
+    return backend_cls
 
 
 def _draft_only_group_ids(
@@ -1419,6 +1420,7 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    kvp_backend_cls = None
     if (
         config.kvp_size > 1
         # V4.1 validates KVP in its config and specialized recipe.
@@ -1428,12 +1430,14 @@ def create_attn_components(
             or target.is_hybrid_linear
         )
     ):
-        _validate_mla_dcp_backend(
+        kvp_backend_cls = _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch, config
         )
     if config.kvp_size > 1 and target.is_hybrid_linear:
         resolved_softmax = dataclasses.replace(
-            softmax_attn, backend_name=target_full_attn_backend_name
+            softmax_attn,
+            backend_name=target_full_attn_backend_name,
+            paged_backend_cls=kvp_backend_cls,
         )
         config = dataclasses.replace(
             config,
