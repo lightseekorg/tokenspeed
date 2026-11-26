@@ -52,6 +52,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         select_paged_dsa_attention,
         select_paged_dsa_indexer,
     )
+    pytest.importorskip("flash_ops")
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     class CheckedKernels(AscendDSAKernels):
@@ -201,6 +202,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
 @pytest.mark.parametrize("rank", [0, 1, 7])
 @pytest.mark.parametrize("block_size", [128, 256])
 def test_dcp_local_storage_replay(rank, block_size):
+    pytest.importorskip("flash_ops")
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
@@ -315,6 +317,7 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
     production path uses fused distributed TopK/LSE; no legacy CP kernels are
     required by this metadata regression.
     """
+    pytest.importorskip("flash_ops")
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
