@@ -166,6 +166,75 @@ def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interva
     assert plan.forward[0].input_lengths == ([1, 63] if enabled else [64])
 
 
+@pytest.mark.parametrize("role", ["null", "prefill"])
+@pytest.mark.parametrize(
+    "policy,request_ids,input_lengths",
+    [
+        ("fifo", ["long"], [64]),
+        ("short-prefill-first", ["short"], [64]),
+    ],
+)
+def test_explicit_prefill_policy_controls_real_scheduler_plan(
+    role, policy, request_ids, input_lengths
+):
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--chunked-prefill-size",
+            "64",
+            "--disaggregation-mode",
+            role,
+            "--prefill-policy",
+            policy,
+        ]
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    requests = []
+    for request_id, tokens in [
+        ("long", list(range(128))),
+        ("short", list(range(200, 264))),
+    ]:
+        request = ts.RequestSpec()
+        request.request_id = request_id
+        request.tokens = tokens
+        request.max_new_tokens = 1
+        requests.append(request)
+    scheduler.submit_requests(requests)
+    if role == "prefill":
+        event = ts.ExecutionEvent()
+        for request in requests:
+            event.add_event(ts.PD.BootstrappedEvent(request.request_id))
+        scheduler.advance(event)
+    plan = scheduler.next_execution_plan()
+    forward = plan.forward[0]
+    assert forward.request_ids == request_ids
+    assert forward.input_lengths == input_lengths
+
+
+@pytest.mark.parametrize("policy", ["fifo", "short-prefill-first"])
+def test_config_builder_refuses_conflicting_prefill_selectors(policy):
+    args = ServerArgs(model="x", max_num_seqs=8, prefill_policy=policy)
+    # A caller can change resolved args before building the rank config.
+    args.enable_short_prefill_first = True
+    with pytest.raises(
+        ValueError, match="--prefill-policy.*--enable-short-prefill-first"
+    ):
+        _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+
+
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
         num_device_pages=32,

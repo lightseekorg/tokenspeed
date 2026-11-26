@@ -93,6 +93,8 @@ CacheKey eventKey(const CacheKey& key) {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
+      prefill_policy_{MakePrefillPolicy(config_.prefill_policy.value_or(
+          config_.enable_short_prefill_first ? PrefillPolicyKind::kShortPrefillFirst : PrefillPolicyKind::kFifo))},
       req_pool_allocator_{config_.max_resident_requests},
       decode_slots_{config_.role == Role::kD ? config_.max_batch_size : 0},
       snapshot_slots_{config_.max_retracted_requests},

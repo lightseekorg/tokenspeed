@@ -273,6 +273,13 @@ capacity model (§1.4) states the same split.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
+Local prefill ordering is selected once when Scheduler is constructed.
+The PrefillPolicy factory selects fifo or short-prefill-first through
+--prefill-policy. Omitting this selector preserves the existing default
+and the --enable-short-prefill-first opt-in; supplying both selectors is
+rejected. Both implementations share admission and execution, retaining
+the candidate ordering and starvation protection described below.
+
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
 prefill that is still incomplete. Nothing behind it is scheduled that round
 (on the P role, whole prompts complete beside it in the budget its chunk

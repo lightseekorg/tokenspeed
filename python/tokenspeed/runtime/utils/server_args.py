@@ -505,6 +505,8 @@ class ServerArgs:
     # to decode; below it --max-consecutive-prefill-rounds still ends a run of
     # prefill rounds that hold a decode back. 0 always owes the interval.
     prefill_interval_min_decoding: int = 0
+    # None preserves the legacy short-prefill flag and its default FIFO order.
+    prefill_policy: str | None = None
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -3263,6 +3265,17 @@ class ServerArgs:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
             raise ValueError("--chunk-prefill-kv-size must be positive")
+        if self.prefill_policy is not None:
+            _require_choice(
+                "--prefill-policy",
+                self.prefill_policy,
+                ("fifo", "short-prefill-first"),
+            )
+            if self.enable_short_prefill_first:
+                raise ValueError(
+                    "--prefill-policy cannot be combined with "
+                    "--enable-short-prefill-first; choose one prefill policy"
+                )
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative")
         if self.prefill_decode_interval and self.disaggregation_mode != "null":
@@ -3702,12 +3715,23 @@ class ServerArgs:
             "docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
+            "--prefill-policy",
+            choices=("fifo", "short-prefill-first"),
+            default=ServerArgs.prefill_policy,
+            help="Local prefill policy: fifo preserves submission order; "
+            "short-prefill-first prefers less uncached work with oldest-request "
+            "protection. Omitted by default to preserve the legacy selector. "
+            "Cannot be combined with --enable-short-prefill-first.",
+        )
+        parser.add_argument(
             "--enable-short-prefill-first",
             action="store_true",
             default=ServerArgs.enable_short_prefill_first,
-            help="Prefer new local prefill requests with less uncached work, with "
+            help="Compatibility selector for the short-prefill-first policy. "
+            "Prefer new local prefill requests with less uncached work, with "
             "oldest-request starvation protection. Off by default; resident "
-            "chunks retain priority. Applies to fused and prefill roles.",
+            "chunks retain priority. Applies to fused and prefill roles. "
+            "Cannot be combined with --prefill-policy.",
         )
         parser.add_argument(
             "--enable-mixed-batch",

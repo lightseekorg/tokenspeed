@@ -52,6 +52,7 @@
 #include "scheduler/kv_cache_events.h"
 #include "scheduler/lone_request_recovery.h"
 #include "scheduler/operations/cache.h"
+#include "scheduler/prefill_policy.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
 
@@ -913,6 +914,7 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    std::unique_ptr<PrefillPolicy> prefill_policy_;
     // Declared before the allocator, tickets and requests: they release their
     // slots before the sink's last reference can be destroyed.
     std::shared_ptr<CacheEventSink> cache_event_sink_;
