@@ -42,7 +42,7 @@ _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
 
 def test_npu_validates_required_options_without_rewriting_them():
-    with pytest.raises(ValueError, match="disable-prefill-graph"):
+    with pytest.raises(ValueError, match="disable-pdl"):
         ServerArgs(
             model="Qwen/Qwen3-0.6B",
             device="npu",
