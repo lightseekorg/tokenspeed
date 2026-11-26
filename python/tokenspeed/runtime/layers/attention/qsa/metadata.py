@@ -75,7 +75,10 @@ class QSASelection:
 
 @dataclass(frozen=True)
 class QSALayout:
-    """Layer-invariant cache geometry for one QSA model forward."""
+    """Layer-invariant cache geometry for one QSA model forward.
+
+    `request_indices` stores the int32 batch-local request ID of each query row.
+    """
 
     seq_lens: torch.Tensor
     logical_positions: torch.Tensor

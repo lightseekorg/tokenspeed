@@ -768,7 +768,7 @@ def test_prims_qsa_interleaves_workspace_geometries(capture, smaller_first, devi
     first, second = (small, large) if smaller_first else (large, small)
     q, k, v, slots, metadata = first
     expected = _reference(q, k, v, slots, 1 / 16)
-    runner = prims._PrimTSQSARunner(q.device)
+    runner = prims._get_runner(metadata.workspace, q.device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -812,7 +812,7 @@ def test_prims_qsa_keeps_warmed_layer_cache_bindings(device):
         device=device,
     )
     other_k, other_v = k * 0.5, -v
-    runner = prims._PrimTSQSARunner(q.device)
+    runner = prims._get_runner(metadata.workspace, q.device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):

@@ -105,7 +105,7 @@ class _PrimTSQSARunner:
     def __init__(self, device: torch.device) -> None:
         self._device = device
         self._sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        self._workspace = torch.empty(0, dtype=torch.uint8, device=device)
+        self._workspace: torch.Tensor | None = None
         self._plans: dict[tuple[int, int], OrderedDict[tuple, _PrimTSQSAPlan]] = {}
         self._captured_plans: WeakValueDictionary[tuple, _PrimTSQSAPlan] = (
             WeakValueDictionary()
@@ -168,8 +168,8 @@ class _PrimTSQSARunner:
         )
         seq_lens = torch.ones(rows, dtype=torch.int32, device=self._device)
         # Keep scratch plans and their workspace out of serving/graph state.
-        scratch_runner = _PrimTSQSARunner(self._device)
         scratch_workspace = QSAWorkspace()
+        scratch_runner = _get_runner(scratch_workspace, self._device)
         for group_size in _warmup_group_sizes(q_heads, kv_heads, max_rows):
             for routes in route_counts:
                 scratch_metadata = QSASparseMetadata(
@@ -278,9 +278,11 @@ class _PrimTSQSARunner:
             offsets = _group_offsets(metadata.query_start_loc, group_size)
             # New packed geometries also occur during serving, which forbids
             # synchronizing host-to-device copies.
-            qo_indptr = torch.tensor(
+            host_indptr = torch.tensor(
                 offsets, dtype=torch.int32, device="cpu", pin_memory=True
-            ).to(self._device, non_blocking=True)
+            )
+            with metadata.workspace.allocation_region():
+                qo_indptr = host_indptr.to(self._device, non_blocking=True)
             max_kv = metadata.block_table.shape[1] * page_size
             # Completed current blocks compete for top-k; only a partial tail is appended.
             size = get_q_token_kv_block_sparse_workspace_size(
@@ -297,17 +299,22 @@ class _PrimTSQSARunner:
                 share_pattern_across_kv_heads=True,
                 count_current_block_in_topk=True,
             )
-            if size > self._workspace.numel():
+            if self._workspace is None or size > self._workspace.numel():
                 # Older plans retain their allocation, including plans owned
                 # by graphs. Growing eager scratch never changes their addresses.
-                self._workspace = torch.zeros(
-                    1 << (size - 1).bit_length(), dtype=torch.uint8, device=self._device
-                )
+                with metadata.workspace.allocation_region():
+                    self._workspace = torch.zeros(
+                        1 << (size - 1).bit_length(),
+                        dtype=torch.uint8,
+                        device=self._device,
+                    )
             else:
                 # Initialize the new geometry's sections. Cached nonsplit
                 # plans remain safe: run rewrites every workspace value read
                 # by attention, including on replay after another geometry.
-                self._workspace.zero_()
+                # Reload warmup can reuse workspace allocated in inference mode.
+                with torch.inference_mode():
+                    self._workspace.zero_()
             wrapper = QTokenKvBlockSparsePagedTSWrapper()
             wrapper.plan(
                 len(offsets) - 1,

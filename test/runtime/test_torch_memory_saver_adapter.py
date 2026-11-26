@@ -343,6 +343,15 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
             torch.testing.assert_close(tensor, reference, rtol=0, atol=0)
 
 
+def _ordinary_cuda_bytes() -> int:
+    return sum(
+        segment["total_size"]
+        for segment in torch.cuda.memory_snapshot()
+        if segment["device"] == torch.cuda.current_device()
+        and tuple(segment["segment_pool_id"]) == (0, 0)
+    )
+
+
 def _check_managed_metadata_on_cuda():
     """Check managed allocations, retained views and zero ordinary bytes on CUDA."""
     from tokenspeed.runtime.execution.forward_step import prepare_capture_metadata
@@ -547,11 +556,7 @@ def _check_managed_metadata_on_cuda():
                 del result
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="requires native CUDA VMM memory-saver hooks",
-)
-def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+def _run_with_cuda_memory_saver(check, *, timeout=90):
     memory_saver = pytest.importorskip("torch_memory_saver")
     # Preload hooks must be installed before CUDA initializes in the child.
     with memory_saver.configure_subprocess():
@@ -559,13 +564,321 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
             [
                 sys.executable,
                 "-c",
-                "from test.runtime.test_torch_memory_saver_adapter import "
-                "_check_managed_metadata_on_cuda; _check_managed_metadata_on_cuda()",
+                f"from test.runtime.test_torch_memory_saver_adapter import "
+                f"{check.__name__}; {check.__name__}()",
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,
-            timeout=90,
+            timeout=timeout,
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+    _run_with_cuda_memory_saver(_check_managed_metadata_on_cuda)
+
+
+@torch.inference_mode()
+def _check_gated_residual_workspace_on_cuda():
+    from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
+    from tokenspeed_kernel.ops.residual import select_gated_residual_mix_kernel
+
+    from tokenspeed.runtime.layers.hyperconnection import (
+        GatedResidualSimple,
+        HyperConnectionConfig,
+        register_workspace_region,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    register_workspace_region(saver)
+    g, h, r = 4, 2048, 256
+    with saver.region(tag="weights", enable_cpu_backup=True), torch.device("cuda"):
+        mixer = GatedResidualSimple(
+            HyperConnectionConfig(hc_count=g, hidden_size=h, hc_lowrank=r)
+        ).to(dtype=torch.bfloat16)
+        mixer.process_weights_after_loading(mixer)
+    with saver.named_region("executor_inputs"):
+        normalized = torch.randn(33, g * h, device="cuda", dtype=torch.bfloat16)
+    down, up = mixer.mix_inject_proj.weight, mixer.input_mix_weight_up.weight
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = []
+
+    for rows in (1, 33):
+        inputs = normalized[:rows]
+        with torch.cuda.stream(stream):
+            selected, _ = select_gated_residual_mix_kernel(
+                inputs,
+                down,
+                up,
+                g,
+                h,
+                r,
+                weights_independent=True,
+                override=None,
+                solution=None,
+            )
+            assert selected.name == "cute_fused_hyperconnection_mix"
+            mixer.mix(inputs, normalized=inputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with saver.cuda_graph(graph, pool=None, stream=stream, tag="cuda_graph"):
+            mixed, (_, _, inject) = mixer.mix(inputs, normalized=inputs)
+        graphs.append(graph)
+        tensors = (inputs, down, up, mixed, inject)
+        addresses = tuple(tensor.data_ptr() for tensor in tensors)
+        for _ in range(2):
+            torch.cuda.synchronize()
+            saver.pause(tag="cuda_graph")
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            ordinary_bytes = _ordinary_cuda_bytes()
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            saver.resume(tag="cuda_graph")
+            assert tuple(tensor.data_ptr() for tensor in tensors) == addresses
+
+            inputs.mul_(-0.5)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = torch_hyperconnection_mix(
+                inputs.cpu(), down.cpu(), up.cpu(), g, h, r, r + g, 1.0, True
+            )
+            for actual, reference in zip((mixed, inject), expected, strict=True):
+                torch.testing.assert_close(
+                    actual.cpu().double(), reference, atol=0.004, rtol=0.01
+                )
+
+
+def test_gated_residual_workspace_survives_sleep_and_lazy_allocation():
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
+    if not torch.cuda.is_available() or not supports_fused_hc(torch.device("cuda")):
+        pytest.skip("requires supported Blackwell and CuTe DSL")
+    _run_with_cuda_memory_saver(_check_gated_residual_workspace_on_cuda)
+
+
+@torch.inference_mode()
+def _check_bf16_prims_qsa_workspace_on_cuda():
+    from test.runtime.cache_pool_test_utils import make_qsa_pool_for_layers
+
+    from tokenspeed_kernel.ops.attention.qsa import (
+        QSASparseMetadata,
+        qsa_sparse_attention,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.workspace import capture_session
+
+    from tokenspeed.runtime.configs.model_config import AttentionArch
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.drafter.eagle import AcceptedPrefixPublisher
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.qsa.metadata import QSALayout, QSASelection
+    from tokenspeed.runtime.layers.attention.registry import create_paged_router
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    page_size, head_dim, q_heads = 256, 256, 12
+    pool = make_qsa_pool_for_layers(
+        device="cuda",
+        layer_ids=(0,),
+        field_layer_offset=0,
+        num_layers=1,
+        num_lcm_blocks=3,
+        kv_head_dim=head_dim,
+        enable_memory_saver=True,
+    )
+    saver = pool.arena.memory_saver_adapter
+    component = MHAConfig(
+        backend_name="qsa",
+        num_attention_heads=q_heads,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        kernel_page_size=page_size,
+        context_len=page_size,
+        max_bs=257,
+        max_resident_requests=257,
+        is_draft=True,
+        components=(component,),
+    )
+    router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
+    router.set_cache_pool(pool)
+    backend = router.leaves["full_attention"]
+    layer = PagedAttention(
+        num_heads=q_heads,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        scaling=head_dim**-0.5,
+        layer_id=0,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    torch.manual_seed(42)
+    k, v = pool.get_kv_buffer(0)
+    k[page_size:].normal_()
+    v[page_size:].normal_()
+    graphs = []
+    retained = []
+    previous_capacity = 0
+    stream = torch.cuda.Stream()
+    for rows in (1, 257):
+        with saver.named_region("executor_inputs"):
+            q = torch.randn(rows, q_heads, head_dim, device="cuda", dtype=k.dtype)
+            requests = torch.arange(rows, device=q.device, dtype=torch.int32)
+            page_table = (1 + requests % 2).view(rows, 1)
+            verify_width, block_size, block_topk = 3, 4, 64
+            first = page_size - verify_width
+            positions = torch.arange(first, page_size, device=q.device).repeat(rows)
+            verify_requests = requests.repeat_interleave(verify_width)
+            complete = ((positions + 1) // block_size).to(torch.int32)
+            block_ids = torch.arange(block_topk, device=q.device, dtype=torch.int32)
+            blocks = torch.where(block_ids < complete[:, None], block_ids, -1)
+            verify_slots = qwen4_exp_qsa_selected_slots(
+                blocks,
+                complete,
+                positions,
+                verify_requests,
+                page_table,
+                page_size,
+                block_size,
+                block_topk * block_size,
+                enable_pdl=False,
+            )
+            accepted = (requests + 1) % verify_width
+            gather_ids = (requests * verify_width + accepted).long()
+            accepted_positions = (first + accepted).long()
+            seq_lens = (accepted_positions + 1).to(torch.int32)
+            slots = verify_slots.index_select(0, gather_ids)
+            write_slots = requests[:1]
+            router.sparse_topk.qsa_selection = QSASelection(
+                verify_slots, blocks, block_size
+            )
+            router.sparse_topk.qsa_metadata = QSALayout(
+                seq_lens=seq_lens,
+                logical_positions=positions,
+                request_indices=verify_requests,
+                qsa_locs=write_slots,
+                recent_locs=write_slots,
+                complete_blocks=complete,
+                queries_per_request=verify_width,
+                qsa_page_table=page_table,
+                full_page_table=page_table,
+                full_kernel_page_size=page_size,
+                reset_draft_tags=None,
+            )
+            ctx = ForwardContext(
+                attn_backend=router,
+                token_to_kv_pool=pool,
+                bs=rows,
+                num_extends=0,
+                input_num_tokens=rows * verify_width,
+                forward_mode=ForwardMode.DECODE,
+                output_layout=ForwardOutputLayout(0, 0, rows, 1),
+                gather_ids=gather_ids,
+                draft_narrowing=AcceptedPrefixPublisher(router, seq_lens),
+            )
+
+        def forward():
+            return backend.forward_decode(
+                q,
+                None,
+                None,
+                layer,
+                write_slots,
+                pool,
+                rows,
+                topk_indices=slots,
+                ctx=ctx,
+            ).view_as(q)
+
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            eager = forward().cpu()
+            # A real plan proves that draft step zero selected PrimTS.
+            runner = backend._qsa_workspace.runners[q.device]
+            expected_blocks = torch.where(
+                block_ids < (seq_lens[:, None] // block_size), block_ids, -1
+            )
+            expected = qsa_sparse_attention(
+                q,
+                k,
+                v,
+                slots,
+                scale=layer.scaling,
+                max_seqlen_q=1,
+                metadata_capacity_rows=None,
+                k_scale=None,
+                v_scale=None,
+                sparse_metadata=QSASparseMetadata(
+                    expected_blocks,
+                    page_table,
+                    requests,
+                    accepted_positions,
+                    tuple(range(rows + 1)),
+                    page_size,
+                    block_size,
+                    backend._qsa_workspace,
+                    seq_lens=seq_lens,
+                ),
+                override=None,
+                solution="flashinfer_prims",
+            ).cpu()
+            del expected_blocks
+        torch.testing.assert_close(eager, expected, atol=0, rtol=0)
+        assert runner._workspace.numel() > previous_capacity
+        previous_capacity = runner._workspace.numel()
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), saver.cuda_graph(
+            graph, pool=None, stream=stream, tag="cuda_graph"
+        ):
+            captured = forward()
+        graphs.append((graph, captured, expected))
+        plan = next(
+            plan
+            for plan in runner._captured_plans.values()
+            if plan.qo_indptr.numel() == rows + 1
+        )
+        retained.extend(
+            (q, slots, blocks, page_table, plan.qo_indptr, runner._workspace)
+        )
+        for _ in range(2):
+            torch.cuda.synchronize()
+            snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+            saver.pause(tag="cuda_graph")
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            assert _ordinary_cuda_bytes() == 0
+            saver.resume(tag="weights")
+            saver.resume(tag="cuda_graph")
+            for tensor, address, contents in snapshots:
+                assert tensor.data_ptr() == address
+                torch.testing.assert_close(tensor.cpu(), contents, atol=0, rtol=0)
+            for recorded, output, reference in graphs:
+                recorded.replay()
+                torch.testing.assert_close(output.cpu(), reference, atol=0, rtol=0)
+
+
+def test_bf16_prims_draft_workspace_survives_sleep_and_growth():
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    if not torch.cuda.is_available() or current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("requires SM100 or SM103 with CUDA VMM memory-saver hooks")
+    _run_with_cuda_memory_saver(_check_bf16_prims_qsa_workspace_on_cuda, timeout=300)
 
 
 def _check_megamoe_buffers_on_cuda():

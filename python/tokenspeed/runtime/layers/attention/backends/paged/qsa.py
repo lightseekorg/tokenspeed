@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import dataclasses
+from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -100,7 +102,11 @@ class QSAAttnBackend(MHAAttnBackend):
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
-        self._qsa_workspace.clear()
+        self._qsa_workspace = QSAWorkspace(
+            allocation_region=partial(
+                cache_pool.arena.memory_saver_adapter.named_region, "workspace"
+            )
+        )
         self._extend_lengths = None
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
@@ -231,53 +237,71 @@ class QSAAttnBackend(MHAAttnBackend):
             if not isinstance(selection, QSASelection):
                 raise RuntimeError("invalid QSA logical selection memo")
             rows = q.shape[0]
-            # Draft step zero may narrow target-aligned physical slots without
-            # carrying their logical rows. Direct-slot kernels handle that case.
-            if selection.selected_slots.shape[0] == rows:
-                layout = ctx.attn_backend.sparse_topk.qsa_metadata
-                if not isinstance(layout, QSALayout):
-                    raise RuntimeError("QSA selection requires the current row layout")
-                if (
-                    self._bf16_scratch is not None
-                    and max_seqlen_q is None
-                    and ctx.draft_narrowing is None
-                ):
-                    # A large target extend attends a BF16 copy of its pages;
-                    # None keeps the FP8 path below.
-                    output = self._bf16_scratch.attention(
-                        q,
-                        k_cache,
-                        v_cache,
-                        topk_indices,
-                        page_table=layout.full_page_table,
-                        seq_lens=layout.seq_lens,
-                        lengths=self._extend_lengths,
-                        scale=layer.scaling,
-                    )
-                    if output is not None:
-                        return output.reshape(rows, -1)
-                if max_seqlen_q is None:
-                    metadata = self.forward_extend_metadata
-                    if metadata is None:
-                        raise RuntimeError("QSA ragged queries require extend metadata")
-                    offsets = tuple(metadata.cu_extend_seq_lens_cpu)
-                else:
-                    offsets = tuple(range(0, rows + 1, max_seqlen_q))
-                # Graph breaks may copy physical slots into a stable buffer;
-                # logical candidates stay in the same per-forward memo.
-                sparse_metadata = QSASparseMetadata(
-                    selected_blocks=selection.selected_blocks[:rows],
-                    block_table=layout.full_page_table,
-                    token_to_request=layout.request_indices[:rows].to(torch.int32),
-                    query_positions=layout.logical_positions[:rows],
-                    query_start_loc=offsets,
-                    page_size=layout.full_kernel_page_size,
-                    block_size=selection.block_size,
-                    workspace=self._qsa_workspace,
-                    seq_lens=layout.seq_lens,
+            layout = ctx.attn_backend.sparse_topk.qsa_metadata
+            if not isinstance(layout, QSALayout):
+                raise RuntimeError("QSA selection requires the current row layout")
+            selected_blocks = selection.selected_blocks
+            request_indices = layout.request_indices
+            query_positions = layout.logical_positions
+            if ctx.draft_narrowing is not None:
+                # Step zero uses the accepted row of each request's verify
+                # window for Q and physical slots. Gather its logical metadata
+                # from the same row, while seq_lens reflects the accepted prefix.
+                gather_ids = ctx.gather_ids
+                if gather_ids is None or gather_ids.shape != (rows,):
+                    raise RuntimeError("QSA draft requires one gather index per query")
+                # PrimTS can retain the gathered views in its prepared plan.
+                # During capture the graph pool owns the replay's copies.
+                region = (
+                    nullcontext()
+                    if q.is_cuda and torch.cuda.is_current_stream_capturing()
+                    else self._qsa_workspace.allocation_region()
                 )
-            elif ctx.draft_narrowing is None:
+                with region:
+                    selected_blocks = selected_blocks.index_select(0, gather_ids)
+                    request_indices = request_indices.index_select(0, gather_ids)
+                    query_positions = query_positions.index_select(0, gather_ids)
+            elif selection.selected_slots.shape[0] != rows:
                 raise RuntimeError("QSA selection must have one row per query")
+            if (
+                self._bf16_scratch is not None
+                and max_seqlen_q is None
+                and ctx.draft_narrowing is None
+            ):
+                # A large target extend attends a BF16 copy of its pages;
+                # None keeps the FP8 path below.
+                output = self._bf16_scratch.attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    topk_indices,
+                    page_table=layout.full_page_table,
+                    seq_lens=layout.seq_lens,
+                    lengths=self._extend_lengths,
+                    scale=layer.scaling,
+                )
+                if output is not None:
+                    return output.reshape(rows, -1)
+            if max_seqlen_q is None:
+                metadata = self.forward_extend_metadata
+                if metadata is None:
+                    raise RuntimeError("QSA ragged queries require extend metadata")
+                offsets = tuple(metadata.cu_extend_seq_lens_cpu)
+            else:
+                offsets = tuple(range(0, rows + 1, max_seqlen_q))
+            # Graph breaks may copy physical slots into a stable buffer;
+            # logical candidates stay in the indexer's per-forward memo.
+            sparse_metadata = QSASparseMetadata(
+                selected_blocks=selected_blocks[:rows],
+                block_table=layout.full_page_table,
+                token_to_request=request_indices[:rows],
+                query_positions=query_positions[:rows],
+                query_start_loc=offsets,
+                page_size=layout.full_kernel_page_size,
+                block_size=selection.block_size,
+                workspace=self._qsa_workspace,
+                seq_lens=layout.seq_lens,
+            )
         output = qsa_sparse_attention(
             q,
             k_cache,

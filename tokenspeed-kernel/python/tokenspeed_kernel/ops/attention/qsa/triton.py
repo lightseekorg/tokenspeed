@@ -108,11 +108,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         safe_logical = tl.maximum(logical, 0)
 
         tl.store(positions + rows, logical, mask=mask)
-        tl.store(
-            requests + rows,
-            tl.full((BLOCK,), request, tl.int64),
-            mask=mask,
-        )
+        tl.store(requests + rows, request, mask=mask)
         tl.store(
             complete_blocks + rows,
             # Padded MTP rows can precede position zero and have no blocks.
@@ -186,7 +182,7 @@ def qwen4_exp_qsa_prepare_metadata(
         draft_logical_positions: Optional request-local draft tags to reset.
 
     Returns:
-        Logical positions, request ids, compressed-cache locations,
+        Logical positions, int32 request ids, compressed-cache locations,
         recent-cache locations and complete-block counts, all with one entry
         per flattened query row. Complete-block counts are nonnegative,
         including padded MTP rows whose logical positions precede zero.
@@ -196,7 +192,7 @@ def qwen4_exp_qsa_prepare_metadata(
     device = seq_lens.device
     outputs = (
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
-        torch.empty((total_tokens,), dtype=torch.int64, device=device),
+        torch.empty((total_tokens,), dtype=torch.int32, device=device),
         torch.empty(
             (total_tokens,),
             dtype=QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE,

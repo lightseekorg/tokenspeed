@@ -31,8 +31,10 @@ from tokenspeed_kernel.ops.residual import (
     cute_fused,
     gated_residual_mix,
     pad_gated_residual_projection_weight,
+    select_gated_residual_mix_kernel,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
+from utils import assert_no_cute_compile
 
 
 @pytest.fixture(autouse=True)
@@ -237,8 +239,71 @@ def test_interleaved_supported_model_dimensions():
 
 
 @pytest.mark.parametrize(
-    "g,h,r", [(3, 128, 9), (2, 96, 16), (9, 64, 64), (2, 64, 2056)]
+    "g,h,r,rows,capture_rows,inject,dtype",
+    [
+        (4, 2048, 256, 1, 3, True, torch.bfloat16),
+        (4, 768, 72, 9, 11, False, torch.float16),
+        (4, 1024, 512, 17, 19, True, torch.bfloat16),
+        (9, 64, 64, 1, 3, True, torch.bfloat16),
+        (2, 64, 2056, 1, 3, True, torch.bfloat16),
+    ],
 )
+@torch.inference_mode()
+def test_aligned_dimensions_dispatch_fused_and_reuse_tail_plan(
+    g, h, r, rows, capture_rows, inject, dtype
+):
+    pdl_enabled(True)
+    x, down, up = _inputs(g, h, r, capture_rows, dtype, inject)
+    projection_rows = r + (g if inject else 0)
+    selected, _ = select_gated_residual_mix_kernel(
+        x,
+        down,
+        up,
+        g,
+        h,
+        r,
+        weights_independent=True,
+        override=None,
+        solution=None,
+    )
+    assert selected.name == "cute_fused_hyperconnection_mix"
+
+    def mix(normalized):
+        return gated_residual_mix(
+            normalized,
+            down,
+            up,
+            g,
+            h,
+            r,
+            projection_rows=projection_rows,
+            projection_scale=1.0 / g,
+            weights_independent=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        actual = mix(x[:rows])
+    stream.synchronize()
+    _check(actual, (x[:rows], down, up), g, h, r, inject)
+
+    graph = torch.cuda.CUDAGraph()
+    with assert_no_cute_compile(), torch.cuda.graph(graph, stream=stream):
+        actual = mix(x)
+    x.mul_(-0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(actual, (x, down, up), g, h, r, inject)
+
+
+def test_fused_layout_byte_limit():
+    # Each BF16 projection row occupies 128 KiB at this width.
+    assert cute_fused.supports_fused_hc_shape(4, 16384, 16376)
+    assert not cute_fused.supports_fused_hc_shape(4, 16384, 16384)
+
+
+@pytest.mark.parametrize("g,h,r", [(3, 128, 9), (2, 96, 16)])
 @torch.inference_mode()
 def test_unsupported_dimensions_fall_back_and_preserve_exact_override(g, h, r):
     values = _inputs(g, h, r, 7, torch.bfloat16, True)
@@ -254,5 +319,5 @@ def test_unsupported_dimensions_fall_back_and_preserve_exact_override(g, h, r):
         solution=None,
     )
     _check(actual, values, g, h, r, True)
-    with pytest.raises(ValueError, match="validated model dimensions"):
+    with pytest.raises(ValueError, match="H divisible by 64 and R by 8"):
         _run(values, g, h, r, True)
