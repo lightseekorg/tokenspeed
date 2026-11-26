@@ -749,7 +749,8 @@ def iris_fused_lamport_twoshot_muse_attntail(
 ):
     """Reduce [ROWS, WIDTH] BF16 rows with the TP4 two-shot, then apply the boundary.
 
-    The boundary is Muse's attention boundary on every row. Bitwise to iris_lamport_twoshot_bf16_allreduce followed by
+    The boundary is Muse's attention boundary on every row. This is bitwise
+    equivalent to iris_lamport_twoshot_bf16_allreduce followed by
     _post_norm_residual_pre_norm_kernel without a post-norm weight. With
     ROWS % WORLD_SIZE == 0 each shard of the two-shot is whole rows.
 

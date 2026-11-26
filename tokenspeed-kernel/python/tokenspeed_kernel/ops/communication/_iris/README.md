@@ -65,9 +65,10 @@ Muse's TP4 attention boundary past the one-shot push's rows, up to the
 two-shot's last row (whole rows a rank), takes the same route without the
 attention part: one launch whose sender programs run the two-shot's tile steps
 unchanged and whose last programs, one per row, wait for their reduced row in
-the all-gather slots and apply the boundary. It is bitwise to the two-shot
-followed by the Triton boundary, and uses its own region and per-sender /
-per-row stage words, so the plain two-shot's counters stay untouched.
+the all-gather slots and apply the boundary. It is bitwise equivalent to the
+two-shot followed by the Triton boundary, and uses its own region and
+per-sender / per-row stage words, so the plain two-shot's counters stay
+untouched.
 
 `residual_rmsnorm.py` reduces BF16 rows fused with the residual add and
 RMSNorm, for callers that prepare it per group and width (draft layers). Each
