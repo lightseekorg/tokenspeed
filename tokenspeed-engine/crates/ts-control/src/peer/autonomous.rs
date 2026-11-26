@@ -200,7 +200,7 @@ impl Peer {
         channel: Option<super::VersionedChannel>,
         retirement_bound_ms: u32,
     ) {
-        let (control, fence) = super::coordinated::Control::new(
+        let (mut control, fence) = super::coordinated::Control::new(
             layout,
             self.member,
             name,
@@ -212,6 +212,7 @@ impl Peer {
             self.quarantine_us,
             self.push_timeout,
         );
+        control.logical_meter = self.metrics.clone();
         if control.reader() {
             self.fence = fence;
         }
@@ -361,6 +362,7 @@ impl Peer {
     ) {
         self.metrics = logical.clone();
         if let Some(v) = &mut self.versioned {
+            v.logical_meter = logical.clone();
             v.meter = physical.clone();
         }
         match &mut self.driver {

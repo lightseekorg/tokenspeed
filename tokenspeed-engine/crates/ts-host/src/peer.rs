@@ -383,19 +383,22 @@ pub fn start(
     )
     .map_err(|error| error.to_string())?;
     if let Some(layout) = registered {
-        let retirement_bound_ms = match std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS") {
-            Ok(s) => s
-                .parse::<std::num::NonZeroU32>()
-                .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
-                .get(),
-            Err(std::env::VarError::NotPresent) => 0,
-            Err(e) => return Err(e.to_string()),
-        };
-        if replica.index() == 0 && retirement_bound_ms == 0 {
-            tracing::warn!(
-                disk_push = layout.can_push_disk(),
-                "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS is unset (0); orphaned grants from crashed readers retain holder pins until restart"
-            );
+        let retirement_env = std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS");
+        let retirement_env_unset = matches!(retirement_env, Err(std::env::VarError::NotPresent));
+        let retirement_bound_ms =
+            resolve_retirement_bound_ms(retirement_env, layout.can_push_disk())?;
+        if replica.index() == 0 {
+            if retirement_bound_ms == 0 {
+                tracing::warn!(
+                    disk_push = layout.can_push_disk(),
+                    "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS is unset (0); orphaned grants from crashed readers retain holder pins until restart"
+                );
+            } else if layout.can_push_disk() && retirement_env_unset {
+                tracing::info!(
+                    retirement_bound_ms,
+                    "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS unset on Disk-push holder; defaulting to bounded orphan-grant reclamation"
+                );
+            }
         }
         peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
     }
@@ -404,4 +407,50 @@ pub fn start(
         return Err("the host's peer started twice".to_owned());
     }
     Ok(peer)
+}
+
+/// Default orphan-grant reclamation bound (ms past `SUBMIT_WINDOW`) for v1
+/// holders that can push Disk pages when `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS`
+/// is unset. Leaves ~2x headroom past the ~65s cancel+quarantine window while
+/// ensuring crashed readers cannot permanently pin Disk/Device/Host blocks.
+const DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS: u32 = 90_000;
+
+fn resolve_retirement_bound_ms(
+    env_var: Result<String, std::env::VarError>,
+    can_push_disk: bool,
+) -> Result<u32, String> {
+    match env_var {
+        Ok(s) => Ok(s
+            .parse::<std::num::NonZeroU32>()
+            .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
+            .get()),
+        Err(std::env::VarError::NotPresent) => Ok(if can_push_disk {
+            DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS
+        } else {
+            0
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_bound_defaults_for_disk_holders_and_preserves_explicit_and_non_disk() {
+        assert_eq!(
+            resolve_retirement_bound_ms(Err(std::env::VarError::NotPresent), true),
+            Ok(DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS)
+        );
+        assert_eq!(
+            resolve_retirement_bound_ms(Err(std::env::VarError::NotPresent), false),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_retirement_bound_ms(Ok("45000".into()), true),
+            Ok(45_000)
+        );
+        assert!(resolve_retirement_bound_ms(Ok("0".into()), true).is_err());
+    }
 }

@@ -466,6 +466,41 @@ impl MultiRankReplica {
         quarantine_us: i64,
         custom_pusher: Option<Arc<dyn PagePusher>>,
     ) -> Self {
+        Self::start_with_full_options(
+            width,
+            incarnation,
+            device_lcm_pages,
+            with_disk,
+            advertise_disk_push,
+            versioned_shards,
+            arena_base,
+            arena,
+            semantic,
+            push_us,
+            quarantine_us,
+            0,
+            custom_pusher,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_full_options(
+        width: usize,
+        incarnation: u64,
+        device_lcm_pages: usize,
+        with_disk: bool,
+        advertise_disk_push: bool,
+        versioned_shards: bool,
+        arena_base: u64,
+        arena: &Arena,
+        semantic: [u8; 32],
+        push_us: i64,
+        quarantine_us: i64,
+        retirement_bound_ms: u32,
+        custom_pusher: Option<Arc<dyn PagePusher>>,
+        disk_enabled_flags: Option<Vec<Arc<AtomicBool>>>,
+    ) -> Self {
         let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let name = format!("127.0.0.1:{}", listener.port());
         let fail_writes = Arc::new(AtomicBool::new(false));
@@ -630,7 +665,16 @@ impl MultiRankReplica {
                 with_disk,
                 versioned_shards,
             )));
-            let pusher: Arc<dyn PagePusher> = custom_pusher.clone().unwrap_or(push);
+            let pusher: Arc<dyn PagePusher> = if let Some(custom) = custom_pusher.clone() {
+                custom
+            } else if let Some(flags) = &disk_enabled_flags {
+                Arc::new(ToggleDiskPusher {
+                    inner: push,
+                    can_serve: flags[rank].clone(),
+                })
+            } else {
+                push
+            };
             let mut peer = Peer::start(
                 peer_settings(&name, incarnation, push_us, quarantine_us),
                 PeerProgress::Coordinated,
@@ -649,7 +693,7 @@ impl MultiRankReplica {
                 name.clone(),
                 incarnation,
                 channel_opt.take(),
-                0,
+                retirement_bound_ms,
             );
             let kv_dev_base = arena_base + (rank as u64) * stride_per_rank;
             let st_dev_base = kv_dev_base + 0x40_000;
@@ -1518,4 +1562,182 @@ fn tp8_kvp8_mixed_device_and_disk_and_clean_abort_release() {
     clean_reader.finish_request("tp8-clean-abort");
     holder.assert_no_leaked_pins();
     clean_reader.assert_no_leaked_pins();
+}
+
+struct ToggleDiskPusher {
+    inner: Arc<PushEndpoint>,
+    can_serve: Arc<AtomicBool>,
+}
+
+impl PagePusher for ToggleDiskPusher {
+    fn push(
+        &self,
+        endpoint: &str,
+        session: &str,
+        budget: Duration,
+        items: Vec<PushItem>,
+    ) -> Result<(), String> {
+        self.inner.push(endpoint, session, budget, items)
+    }
+
+    fn push_many(
+        &self,
+        targets: Vec<PushTarget>,
+        budget: Duration,
+        submit_until: std::time::Instant,
+        sealed: &AtomicBool,
+    ) -> PushOutcome {
+        self.inner.push_many(targets, budget, submit_until, sealed)
+    }
+
+    fn can_serve_disk(&self) -> bool {
+        self.can_serve.load(Ordering::Acquire) && self.inner.can_serve_disk()
+    }
+
+    fn activate_offer(&self, incarnation: u64, offer_id: u64) {
+        self.inner.activate_offer(incarnation, offer_id);
+    }
+
+    fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
+        self.inner.cancel_offer(incarnation, offer_id)
+    }
+}
+
+fn read_prom_gauge_state(dir: &std::path::Path, state_label: &str) -> Option<f64> {
+    let path = dir.join(format!("gauge_livemax_{}.db", std::process::id()));
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let used = i32::from_ne_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let end = used.min(bytes.len());
+    let mut pos = 8;
+    let needle_state = format!("\"state\": \"{state_label}\"");
+    while pos + 4 <= end {
+        let key_len = i32::from_ne_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        let key_start = pos + 4;
+        let key_end = key_start + key_len;
+        let padding = 8 - (key_len + 4) % 8;
+        let val_start = key_end + padding;
+        if val_start + 16 > end {
+            break;
+        }
+        let key = std::str::from_utf8(&bytes[key_start..key_end]).ok()?;
+        let value = f64::from_ne_bytes(bytes[val_start..val_start + 8].try_into().ok()?);
+        if key.contains("tokenspeed:peer_scheduler_state") && key.contains(&needle_state) {
+            return Some(value);
+        }
+        pos = val_start + 16;
+    }
+    None
+}
+
+#[test]
+fn non_leader_member_disk_quarantine_truncates_offers_to_device_host_and_reports_metric() {
+    let semantic = [0x88; 32];
+    let arena = Arena::new(ARENA_BASE_OFFSET as usize + 16 * 0x80_000);
+    let flags: Vec<Arc<AtomicBool>> = (0..8).map(|_| Arc::new(AtomicBool::new(true))).collect();
+    let mut holder = MultiRankReplica::start_with_full_options(
+        8,
+        50,
+        HOLDER_DEVICE_LCM,
+        true,
+        true,
+        true,
+        ARENA_BASE_OFFSET,
+        &arena,
+        semantic,
+        5_000_000,
+        10_000,
+        0,
+        None,
+        Some(flags.clone()),
+    );
+    let prom_dir = std::env::temp_dir().join(format!(
+        "ts-peer-quar-prom-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&prom_dir).unwrap();
+    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+        prometheus_dir: Some(prom_dir.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let logical_metrics = Arc::new(ts_metrics::PeerMetrics::new(
+        &exporter,
+        &ts_metrics::EngineLabels {
+            model_name: "test".into(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    ));
+    holder.ranks[0]
+        .peer
+        .set_metrics(Some(logical_metrics), None);
+
+    let mut reader = MultiRankReplica::start(
+        8,
+        51,
+        READER_DEVICE_LCM,
+        false,
+        true,
+        ARENA_BASE_OFFSET + 8 * 0x80_000,
+        &arena,
+        semantic,
+    );
+
+    // Seed an 8-page prompt (4 pages hot on Device + 4 tail pages exclusively on Disk).
+    let base_prefix: Vec<i32> = (1..=4 * PAGE).collect();
+    let mut ext_prefix = base_prefix.clone();
+    ext_prefix.extend(60_000..60_000 + 4 * PAGE);
+    holder.run_to_finish("quar-ext", ext_prefix.clone());
+    holder.evict_all_device_and_host(50_000, 8, 10);
+    holder.run_to_finish("quar-base-hot", base_prefix.clone());
+    holder.drain_disk_cleanings();
+
+    // Healthy state: rank 0 reports `disk_push_quarantined == 0`.
+    holder.round();
+    assert_eq!(
+        read_prom_gauge_state(&prom_dir, "disk_push_quarantined"),
+        Some(0.0),
+        "expected disk_push_quarantined=0 while healthy"
+    );
+
+    // Quarantine ONLY non-leader rank 3 (rank 0 remains healthy!).
+    flags[3].store(false, Ordering::Release);
+    holder.round();
+
+    assert_eq!(
+        read_prom_gauge_state(&prom_dir, "disk_push_quarantined"),
+        Some(1.0),
+        "expected disk_push_quarantined=1 after non-leader rank 3 quarantines"
+    );
+
+    // Reader requests the full extended prompt: rank 0 must propagate rank 3's
+    // quarantine and truncate the offer to the hot 4-page Device/Host prefix
+    // (instead of offering Disk pages and getting rejected at PIN by rank 3).
+    let mut prompt = ext_prefix.clone();
+    prompt.extend(99_000..99_000 + PAGE);
+    let (landed_prefix, _) = drive_peer_landing(&mut holder, &mut reader, "tp8-quar-trunc", prompt);
+    assert_eq!(
+        landed_prefix,
+        base_prefix.len() as i32,
+        "quarantined non-leader member must cleanly truncate offers to Device/Host prefix"
+    );
+    assert!(
+        reader
+            .last_offered_pages
+            .iter()
+            .all(|p| p.tier != PeerTier::Disk),
+        "offer after non-leader quarantine must contain no Disk pages: {:?}",
+        reader.last_offered_pages
+    );
+    reader.finish_request("tp8-quar-trunc");
+    holder.assert_no_leaked_pins();
+    reader.assert_no_leaked_pins();
+    let _ = std::fs::remove_dir_all(&prom_dir);
 }

@@ -547,10 +547,13 @@ struct FencedJobs {
     /// unknown retirements that could not fit in `unknown`.
     unknown_hwm: HashMap<String, HashMap<u32, u64>>,
     unknown_hwm_entries: usize,
-    /// Reader endpoints known to speak v2 (`PUSH_V2`, understanding `UNKNOWN`).
+    /// Reader endpoints that experienced at least one v2 unknown retirement.
     /// Keeps `hwm_overflowed` from sending unrecognized `u` frames in reply to
-    /// stray `CANCEL` frames from legacy `p`-only peers.
+    /// stray `CANCEL` frames from legacy `p`-only peers or freezing unseen v2
+    /// peers that have no unknown-retirement history here.
     v2_peers: HashSet<String>,
+    /// Fails closed if `v2_peers` itself reaches capacity under double overflow.
+    v2_peers_overflowed: bool,
     unknown_overflowed: bool,
     hwm_overflowed: bool,
 }
@@ -567,8 +570,12 @@ impl FencedJobs {
     }
 
     fn note_v2_peer(&mut self, reply_to: &str) {
-        if !self.v2_peers.contains(reply_to) && self.v2_peers.len() < MAX_UNKNOWN_FENCED_JOBS {
-            self.v2_peers.insert(reply_to.to_owned());
+        if !self.v2_peers.contains(reply_to) {
+            if self.v2_peers.len() < MAX_UNKNOWN_FENCED_JOBS {
+                self.v2_peers.insert(reply_to.to_owned());
+            } else {
+                self.v2_peers_overflowed = true;
+            }
         }
     }
 
@@ -590,7 +597,8 @@ impl FencedJobs {
         {
             return true;
         }
-        self.hwm_overflowed && self.v2_peers.contains(key.reply_to.as_str())
+        self.hwm_overflowed
+            && (self.v2_peers_overflowed || self.v2_peers.contains(key.reply_to.as_str()))
     }
 
     fn alloc_seq(&mut self) -> u64 {
@@ -1042,9 +1050,6 @@ impl Holder {
                 Some(Reject::InFlightDuplicate)
             } else {
                 let mut fenced = self.state.fenced.lock();
-                if supports_unknown {
-                    fenced.note_v2_peer(&key.reply_to);
-                }
                 if fenced.may_be_unknown(&key) {
                     if supports_unknown {
                         Some(Reject::FencedUnknown)
@@ -3817,9 +3822,21 @@ mod tests {
             reply_to: "10.0.0.1:7200".into(),
             job: (u64::from(MAX_UNKNOWN_HWM_PEERS as u32 + 10) << 32) | 1,
         }));
-        // Legacy `p`-only peer that never sent `PUSH_V2` is NOT in `v2_peers`, so stray
-        // `CANCEL` frames never trigger an unrecognized `u` (`Unknown`) reply.
+        // Legacy `p`-only peer (or an unseen v2 peer with no unknown-retirement history)
+        // is NOT in `v2_peers`, so it neither receives an unrecognized `u` (`Unknown`)
+        // frame nor freezes freshly allocated destination blocks.
         assert!(!fenced.may_be_unknown(&JobKey {
+            reply_to: "10.0.0.99:7200".into(),
+            job: (9u64 << 32) | 1,
+        }));
+
+        // Once `v2_peers` itself reaches capacity, `v2_peers_overflowed` fails closed so
+        // an unknown retirement can never be downgraded to `Cancelled`.
+        for peer in 0..(MAX_UNKNOWN_FENCED_JOBS as u64) {
+            fenced.note_v2_peer(&format!("10.1.{}.{}:7200", peer >> 8, peer & 0xff));
+        }
+        assert!(fenced.v2_peers_overflowed);
+        assert!(fenced.may_be_unknown(&JobKey {
             reply_to: "10.0.0.99:7200".into(),
             job: (9u64 << 32) | 1,
         }));

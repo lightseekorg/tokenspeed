@@ -41,6 +41,7 @@ pub(super) struct Report {
     legacy: Vec<u8>,
     retirement_bound_ms: u32,
     quarantine_us: i64,
+    can_serve_disk: bool,
     proposals: Vec<(i64, Message, Message)>,
     messages: Vec<Message>,
     votes: Vec<Vote>,
@@ -59,6 +60,7 @@ impl Report {
         w.bytes(&self.legacy);
         w.u32(self.retirement_bound_ms);
         w.i64(self.quarantine_us);
+        w.flag(self.can_serve_disk);
         w.count(self.proposals.len());
         for (issued_at, q, a) in self.proposals {
             w.i64(issued_at);
@@ -83,6 +85,7 @@ impl Report {
         let legacy = r.bytes()?.to_vec();
         let retirement_bound_ms = r.u32()?;
         let quarantine_us = r.i64()?;
+        let can_serve_disk = r.flag()?;
         let proposals = (0..r.count()?)
             .map(|_| Some((r.i64()?, msg(&mut r)?, msg(&mut r)?)))
             .collect::<Option<Vec<_>>>()?;
@@ -103,6 +106,7 @@ impl Report {
             legacy,
             retirement_bound_ms,
             quarantine_us,
+            can_serve_disk,
             proposals,
             messages,
             votes,
@@ -190,10 +194,12 @@ pub(super) struct Control {
     signaled: mpsc::Receiver<Instant>,
     missing: Vec<PeerEventView>,
     admission: bool,
+    replica_can_serve_disk: bool,
     retirement_bound_ms: u32,
     quarantine_us: i64,
     push_timeout: Duration,
     pub meter: Option<Arc<ts_metrics::PeerMetrics>>,
+    pub logical_meter: Option<Arc<ts_metrics::PeerMetrics>>,
 }
 impl Control {
     #[allow(clippy::too_many_arguments)]
@@ -209,6 +215,7 @@ impl Control {
         quarantine_us: i64,
         push_timeout: Duration,
     ) -> (Self, PeerFence) {
+        let replica_can_serve_disk = layout.can_push_disk();
         let (tx, signaled) = mpsc::channel();
         (
             Self {
@@ -232,10 +239,12 @@ impl Control {
                 signaled,
                 missing: Vec::new(),
                 admission: true,
+                replica_can_serve_disk,
                 retirement_bound_ms,
                 quarantine_us: quarantine_us.max(0),
                 push_timeout,
                 meter: None,
+                logical_meter: None,
             },
             PeerFence(tx),
         )
@@ -336,6 +345,7 @@ impl Control {
             legacy,
             retirement_bound_ms: self.retirement_bound_ms,
             quarantine_us: self.quarantine_us,
+            can_serve_disk: self.pusher.can_serve_disk(),
             messages,
             votes: std::mem::take(&mut self.votes),
             proposals: std::mem::take(&mut self.proposals),
@@ -386,8 +396,16 @@ impl Control {
             Message::Lookup(k, ..) if self.rank == 0 => {
                 let existing = self.offers.has(k);
                 let reply = if self.admission {
-                    self.offers
-                        .lookup(k, &self.gen, &self.layout, &m, s, self.pusher.as_ref(), now)
+                    self.offers.lookup(
+                        k,
+                        &self.gen,
+                        &self.layout,
+                        self.replica_can_serve_disk,
+                        &m,
+                        s,
+                        self.pusher.as_ref(),
+                        now,
+                    )
                 } else {
                     Message::Offered(k.clone(), None)
                 };
@@ -474,6 +492,26 @@ impl Control {
     ) -> Result<(), PeerError> {
         if reports.len() != self.layout.members.len() {
             return Err(PeerError::Report);
+        }
+        let all_can_serve_disk = reports.iter().all(|r| r.can_serve_disk);
+        if self.layout.can_push_disk()
+            && self.replica_can_serve_disk
+            && !all_can_serve_disk
+            && self.rank == 0
+        {
+            tracing::error!(
+                holder = %self.gen.name,
+                "holder member quarantined Disk push serving; truncating future peer offers to Device/Host"
+            );
+        }
+        self.replica_can_serve_disk = all_can_serve_disk;
+        if let Some(meter) = &self.logical_meter {
+            if self.rank == 0 {
+                meter.snapshot(
+                    "disk_push_quarantined",
+                    usize::from(self.layout.can_push_disk() && !all_can_serve_disk),
+                );
+            }
         }
         let first = &mut reports[0];
         let retirement_bound_ms = first.retirement_bound_ms;

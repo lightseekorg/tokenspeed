@@ -25,17 +25,19 @@ Wire revision 3 extends cross-layout peer reads to holder Disk-tier pages while
 preserving revision 2's bounded submission window. When every member of a holder
 replica serves Disk pushes, its versioned descriptor (format version 2) advertises
 per-group exclusive Disk virtual block bounds alongside each member's push
-endpoint. A holder that cannot push Disk truncates lookups to its Device/Host
-prefix instead of returning a full miss; a holder that can push Disk answers
-lookups with any mix of Device, Host, and Disk pages, pinning every listed block
-across all tiers under its offer ticket. Each reader member plans one-sided
-READs for Device/Host pages and holder-pushed spans (tagged with the holder's
-`(incarnation, offer_id)` via wire frame `P`) for Disk pages through
-`PeerReadPlan::plan`, running both concurrently without occupying local
-read-worker threads while waiting on Disk pushes. Each holder member authorizes
-an offer's id on its push endpoint once pinned and rejects pushes for inactive
-or mismatched-incarnation offers before touching NVMe. When a Disk push is
-cancelled and the holder does not confirm within a short grace window, the
+endpoint. A holder that cannot push Disk—or whose push endpoint has been
+quarantined on any replica member (propagated via the replica collective and
+exposed through `peer_scheduler_state{state="disk_push_quarantined"}`)—truncates
+lookups to its Device/Host prefix instead of returning a full miss; a holder
+that can push Disk answers lookups with any mix of Device, Host, and Disk pages,
+pinning every listed block across all tiers under its offer ticket. Each reader
+member plans one-sided READs for Device/Host pages and holder-pushed spans
+(tagged with the holder's `(incarnation, offer_id)` via wire frame `P`) for Disk
+pages through `PeerReadPlan::plan`, running both concurrently without occupying
+local read-worker threads while waiting on Disk pushes. Each holder member
+authorizes an offer's id on its push endpoint once pinned and rejects pushes for
+inactive or mismatched-incarnation offers before touching NVMe. When a Disk push
+is cancelled and the holder does not confirm within a short grace window, the
 reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
 the background on its push dispatcher for a bounded retry budget (60 seconds);
 a late `Cancelled`/`Done` reply cleanly unfreezes the landing via
@@ -64,16 +66,18 @@ scheduling pauses after the check, native queues, reconnects, retries, DMA
 drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
 are enabled—push message delivery latency, holder push queue wait, and NVMe/RDMA
 execution time (because a holder anchors each push's deadline at message
-arrival). Deployments enabling Disk-tier v1 peer sharing should configure this
-bound so orphaned source pins are reclaimed if a reader disappears before
-sending `RELEASE`. All ranks
-follow their holder leader's configured value. After the submission interval plus
-this bound, the holder initiates an ABORT, cancels any pushes tagged with the
-offer, and releases its own source references even if the reader disappeared.
-This never releases a reader's frozen target. If the backend has no verified
-bound, leave the setting unset: a granted source remains pinned pending explicit
-closure. A timeout for polling one Mooncake batch alone does not establish the
-bound. No heartbeats extend it.
+arrival). When Disk-tier v1 peer pushes are enabled and this variable is unset,
+the holder defaults to a 90,000 ms bound past the 30-second submission window
+(120 seconds total) so orphaned Device/Host/Disk pins from a crashed reader are
+reclaimed automatically while leaving headroom above the ~65-second
+cancel-and-quarantine window. All ranks follow their holder leader's configured
+value. After the submission interval plus this bound, the holder initiates an
+ABORT, cancels any pushes tagged with the offer, and releases its own source
+references even if the reader disappeared. This never releases a reader's frozen
+target. For non-Disk v1 holders with no verified bound, leaving the setting
+unset preserves `0` (granted sources remain pinned pending explicit closure).
+A timeout for polling one Mooncake batch alone does not establish the bound. No
+heartbeats extend it.
 
 After all reader members have retired their reads (or finished quarantining an
 unknown retirement), a missing RELEASE reply

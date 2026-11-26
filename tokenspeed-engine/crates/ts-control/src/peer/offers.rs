@@ -220,6 +220,7 @@ impl Offers {
         key: &Key,
         local: &Generation,
         layout: &Replica,
+        replica_can_serve_disk: bool,
         msg: &Message,
         scheduler: &mut Scheduler,
         pusher: &dyn PagePusher,
@@ -252,9 +253,10 @@ impl Offers {
         let mut event = p.lookup_event(&lease);
         // Soft offers reserve no source pages. PIN rechecks capacity and the exact manifest.
         // If this holder cannot serve Disk pushes (no staging ring / disk bounds /
-        // quarantined push endpoint), truncate cleanly to its Device/Host prefix
-        // instead of returning a full miss.
-        let can_push_disk = layout.can_push_disk() && pusher.can_serve_disk();
+        // quarantined push endpoint on any replica member), truncate cleanly to
+        // its Device/Host prefix instead of returning a full miss.
+        let can_push_disk =
+            layout.can_push_disk() && replica_can_serve_disk && pusher.can_serve_disk();
         let answer = if can_push_disk {
             scheduler.answer_peer_lookup_bounded(&event, 0)
         } else {
