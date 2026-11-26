@@ -100,9 +100,10 @@ _DTYPES = {
 
 
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    applied_length,
     fake_retained_arguments,
     retained_arguments,
-    retained_length,
+    retained_count,
     retained_row,
 )
 
@@ -686,8 +687,12 @@ class RecoverSsmVerify:
                     )
                     _store_if(Int32(t < valid_tokens), row.toint(), Float32(0.0), True)
         else:
-            # Loaded once, early: phase 1 branches on it.
-            count = retained_length(retained, slot)
+            # Loaded once, early: phase 1 branches on it. Bounded by
+            # ``applied_length`` only once every warp uses it, after the copies.
+            count = retained_count(retained, slot)
+            if const_expr(self.early_history_loads):
+                # The early record loads branch on it at once.
+                count = applied_length(count, self.capacity - W)
             history_keys, history_decays, history_us = self._early_history_registers()
             self._start_early_history(
                 retained,
@@ -755,6 +760,8 @@ class RecoverSsmVerify:
                         stamps, stamp_slot, ring_capacity, start, generation, tidx
                     )
             cute.arch.mbarrier_wait(shared.token_barrier, 0)
+            if const_expr(not self.early_history_loads):
+                count = applied_length(count, self.capacity - W)
             decay_steps = self._project_window(
                 shared,
                 tidx,
@@ -1316,10 +1323,11 @@ class RecoverSsmVerify:
         warp: Int32,
         lane: Int32,
     ):
-        """Prefetch the (slot, head)'s ``count`` records into L2 for the projection.
+        """Prefetch the (slot, head)'s applied records into L2 for the projection.
 
         Records were written rounds ago and are usually only in DRAM; the
-        prefetch overlaps their latency with phase 1. The last warp issues it.
+        prefetch overlaps their latency with phase 1. The last warp issues it,
+        and only it waits for the stored ``count`` it bounds here.
         Lanes 2p and 2p + 1 cover record p, the even one its key row and this
         tile's u, the odd one its decay row, a 128-byte line at a time over
         dense rows (other layouts prefetch lines the replay may not read).
@@ -1327,6 +1335,7 @@ class RecoverSsmVerify:
         K = self.key_dim
         VT = self.value_tile_rows
         if warp == THREADS // 32 - 1:
+            count = applied_length(count, self.capacity - self.window)
             correction, key, decay = retained[1], retained[2], retained[3]
             for group in cutlass.range((count + 15) // 16, unroll=1):
                 record = group * 16 + lane // 2

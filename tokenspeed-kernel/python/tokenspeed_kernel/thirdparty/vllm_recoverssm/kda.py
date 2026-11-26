@@ -5,11 +5,10 @@
 Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Retained records keep
 FP32 U, normalized K and multiplicative decay in resident request slots, and
 each slot's accepted count, which every layer shares. Verify reads each live
-page's dense base plus the records the round's start count covers and writes
-this round's candidate records and stamps; it
-retains the upstream recurrence, static token loop, and one-warp launch. The
-batched prepare before verify and the batched commit after it are TokenSpeed's
-own kernels in ``ops/attention/kda``.
+page's dense base plus the records that count covers and writes this round's
+candidate records and stamps; it retains the upstream recurrence, static
+token loop, and one-warp launch. The batched prepare before verify and the
+batched commit after it are TokenSpeed's own kernels in ``ops/attention/kda``.
 """
 
 from typing import Any
@@ -216,6 +215,14 @@ def _kda_recoverssm_verify_kernel(
                 tl.store(stamp, position, mask=token_offset < query_len)
                 tl.store(stamp + 1, record_generation, mask=token_offset < query_len)
     history_length = tl.load(history_length_ptr + payload_slot * stride_history_length)
+    # Every layer shares the slot's count. One outside
+    # [0, HISTORY_CAPACITY - SPEC_QUERY_LEN] overflowed: the prepare folded its
+    # records into the live page, so the verify applies none.
+    history_length = tl.where(
+        (history_length < 0) | (history_length > HISTORY_CAPACITY - SPEC_QUERY_LEN),
+        0,
+        history_length,
+    )
     valid_history = (history_length >= 0) & (
         history_length + query_len <= HISTORY_CAPACITY
     )

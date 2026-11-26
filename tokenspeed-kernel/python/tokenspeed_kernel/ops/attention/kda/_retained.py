@@ -26,7 +26,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS as DESCRIPTOR_COLUMNS,
 )
 from tokenspeed_kernel.ops.metadata.stop_conditions import (
-    REQUEST_DECODE_STATE_INCONSISTENT,
+    REQUEST_ENDED,
     REQUEST_ENDED_INCOMPLETE,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -149,103 +149,6 @@ def reset_length(length, *, write_indices, record_slots, page_count):
     )
 
 
-def snapshot_length(length, start, faults, *, record_slots, live_indices, page_count):
-    """Copy prefill rows' counts to their start, then clear stored rows' counts.
-
-    length, start and faults are INT32 [record slots, 1]; record_slots holds
-    each prefill row's slot and live_indices the [groups, rows] live pages
-    the scan stores into. A row whose live page lies in the pool in every
-    group has its count cleared; one with none keeps it; one with some keeps
-    it and has its slot's fault set to ``REQUEST_DECODE_STATE_INCONSISTENT``
-    (report_faults raises its row's ``request_ends`` entry).
-    """
-    if (
-        isinstance(page_count, bool)
-        or not isinstance(page_count, int)
-        or page_count < 1
-    ):
-        raise ValueError("page_count must be a positive page-pool size")
-    _check_count("length", length, device=length.device)
-    _check_count("start", start, device=length.device)
-    _check_count("faults", faults, device=length.device)
-    if start.shape != length.shape or faults.shape != length.shape:
-        raise ValueError("start and faults must match length")
-    rows = record_slots.numel()
-    if (
-        record_slots.ndim != 1
-        or live_indices.ndim != 2
-        or live_indices.shape[0] < 1
-        or live_indices.shape[1] != rows
-        or any(
-            x.dtype not in (torch.int32, torch.int64) or x.device != length.device
-            for x in (record_slots, live_indices)
-        )
-    ):
-        raise ValueError(
-            "prefill rows need integer slots and [groups, rows] live pages"
-        )
-    if rows == 0:
-        return
-    # Both vendors share this Triton kernel.
-    from tokenspeed_kernel.ops.attention.kda._triton import retained
-
-    retained.retained_snapshot_kernel[(triton.cdiv(rows, 256),)](
-        length,
-        start,
-        faults,
-        record_slots,
-        live_indices,
-        rows,
-        live_indices.shape[0],
-        *live_indices.stride(),
-        record_slots.stride(0),
-        length.shape[0],
-        length.stride(0),
-        start.stride(0),
-        faults.stride(0),
-        page_count,
-        BLOCK=256,
-        FAULT=REQUEST_DECODE_STATE_INCONSISTENT,
-        num_warps=4,
-    )
-
-
-def report_faults(request_ends, faults, *, record_slots):
-    """Raise each row's ``request_ends`` entry to its record slot's fault.
-
-    request_ends is the contiguous INT32 [rows] stop-condition report,
-    faults the INT32 [record slots, 1] faults and record_slots each row's
-    slot. Entries are only raised; rows whose slot holds no fault keep theirs.
-    """
-    _check_count("faults", faults, device=faults.device)
-    rows = record_slots.numel()
-    if (
-        request_ends.shape != (rows,)
-        or request_ends.dtype != torch.int32
-        or not request_ends.is_contiguous()
-        or record_slots.ndim != 1
-        or record_slots.dtype not in (torch.int32, torch.int64)
-        or any(x.device != faults.device for x in (request_ends, record_slots))
-    ):
-        raise ValueError("request ends must be contiguous INT32, one per slot row")
-    if rows == 0:
-        return
-    # Both vendors share this Triton kernel.
-    from tokenspeed_kernel.ops.attention.kda._triton import retained
-
-    retained.retained_report_faults_kernel[(triton.cdiv(rows, 256),)](
-        request_ends,
-        faults,
-        record_slots,
-        rows,
-        record_slots.stride(0),
-        faults.shape[0],
-        faults.stride(0),
-        BLOCK=256,
-        num_warps=4,
-    )
-
-
 def batched_commit(
     *,
     descriptors,
@@ -262,9 +165,6 @@ def batched_commit(
     retained_key,
     retained_decay,
     replay_length,
-    replay_start,
-    replay_faults,
-    commit_verdicts,
     request_stopped,
     request_ends,
     draft_token_num,
@@ -292,40 +192,31 @@ def batched_commit(
     query_start_loc is the packed [requests + 1] boundary vector. Acceptance is
     clamped to the actual interval and draft_token_num. metadata is contiguous
     INT64 [requests, 3]; stamps is INT64 [layers, slots, ring capacity, 2],
-    including strided layer subsets. Every accepted stamp must match before
-    either phase writes. history_capacity and ring capacity are independent.
+    including strided layer subsets. In each layer, every accepted stamp must
+    match before that layer's convolution and fold write; the shared count
+    publish does not inspect stamps and follows the carried rows, those
+    paged in a group a launched layer lists. history_capacity and ring
+    capacity are independent.
 
     retained_correction, retained_key and retained_decay are the FP32 records
     [record slots, layers, heads, history_capacity, head_dim]. Every layer of
     a request follows one count: replay_length is the INT32 [record slots, 1]
-    count of records accepted since each request's dense base, and
-    replay_start the count the round's prepare left -- the records its verify
-    read before its candidates -- in the same layout. commit_verdicts is
-    contiguous-row INT8 [rows >= requests, layers] scratch that must hold
-    zeros (every layer accepted) when the commit starts, as a zeroed
-    allocation does; each commit leaves it zero. The first launch stores the
-    verdict of each layer that does not accept a request's commit (it rejects
-    it, or does not carry the row), and the second reduces a request's
-    verdicts, clears them, and writes its count once, to
-    replay_start + accepted when every layer accepted and the request's
-    replay_faults entry (INT32 [record slots, 1], set by the prepare) is 0.
-    The two launches are one operation: if this call raises after the first
-    and before the second, the scratch keeps that commit's verdicts and must
-    be zeroed before another commit uses it (serving stops the engine on any
-    forward error, so it never reuses one).
-    A request still decoding that some layers accept and others reject, or
-    whose slot holds a fault, has its request_ends entry raised to
-    ``REQUEST_DECODE_STATE_INCONSISTENT``, and its count stays: one count
-    cannot describe both. request_stopped is a bool per
-    request slot, set for a request that ended in this forward. Such a
-    request's accepted records, through this round's acceptance, are folded
-    into its live page's dense state, and its count is cleared instead of
-    advanced. No other dense checkpoint or record is copied. request_ends is
-    the contiguous INT32 [requests] ``apply_stop_conditions`` report for these
-    rows: a request that ended but whose commit a layer that carried it
-    rejected (stale stamps, an interval past the capacity) keeps records
-    outside its live page, and its entry becomes ``REQUEST_ENDED_INCOMPLETE``
-    so its finish publishes nothing.
+    count of records accepted since each request's dense base. A count H
+    within [0, history_capacity - draft_token_num] is what the round's verify
+    read before its candidates; any other H overflowed, so the prepare folded
+    its records and the verify read none (eff = 0, else eff = H). The first
+    launch reads H in every layer and never writes it; the second writes each
+    carried request's count once, to eff plus its acceptance. request_stopped
+    is a bool per request slot, set for a request that ended in this forward.
+    Such a request's accepted records, through this round's acceptance, are
+    folded into its live page's dense state, and its count is cleared instead
+    of advanced. No other dense checkpoint or record is copied. request_ends
+    is the contiguous INT32 [requests] ``apply_stop_conditions`` report for
+    these rows, ``REQUEST_ENDED`` exactly for the requests set in
+    request_stopped: a request that ended but whose commit a layer that
+    carried it rejected (stale stamps) keeps records outside its live page,
+    and that layer raises its entry to ``REQUEST_ENDED_INCOMPLETE`` so its
+    finish publishes nothing.
     """
     if (
         num_heads <= 0
@@ -413,24 +304,9 @@ def batched_commit(
             "retained records must be FP32 [record slots, layers, heads, "
             "capacity, head_dim]"
         )
-    for name, count in (
-        ("replay_length", replay_length),
-        ("replay_start", replay_start),
-        ("replay_faults", replay_faults),
-    ):
-        _check_count(name, count, device=descriptors.device)
-        if count.shape[0] != record_slot_count:
-            raise ValueError(f"{name} must hold one count per record slot")
-    if (
-        commit_verdicts.ndim != 2
-        or commit_verdicts.shape[0] < batch
-        or commit_verdicts.shape[1] != layers
-        or commit_verdicts.stride(1) != 1
-        or commit_verdicts.dtype != torch.int8
-    ):
-        raise ValueError(
-            "commit verdicts must be INT8 [rows, layers] with contiguous layers"
-        )
+    _check_count("replay_length", replay_length, device=descriptors.device)
+    if replay_length.shape[0] != record_slot_count:
+        raise ValueError("replay_length must hold one count per record slot")
     if request_stopped.ndim != 1 or request_stopped.dtype != torch.bool:
         raise ValueError("request stop flags must be a bool vector")
     if (
@@ -451,7 +327,6 @@ def batched_commit(
             record_metadata,
             record_stamps,
             *records,
-            commit_verdicts,
             request_stopped,
             request_ends,
         )
@@ -473,8 +348,8 @@ def batched_commit(
         record_metadata,
         record_stamps,
         request_stopped,
-        replay_start,
-        commit_verdicts,
+        replay_length,
+        request_ends,
         read_indices.shape[0],
         *read_indices.stride(),
         *write_indices.stride(),
@@ -482,8 +357,7 @@ def batched_commit(
         query_start_loc.stride(0),
         record_slots.stride(0),
         record_slot_count,
-        replay_start.stride(0),
-        commit_verdicts.stride(0),
+        replay_length.stride(0),
         record_stamps.stride(),
         record_stamps.shape[1],
         record_stamps.shape[2],
@@ -499,34 +373,37 @@ def batched_commit(
         HEADS=num_heads,
         DIM=head_dim,
         BLOCK=256,
+        ENDED=REQUEST_ENDED,
+        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
         num_warps=4,
         **options,
     )
-    kernels.retained_batched_publish_kernel[(batch,)](
+    # Every program of the first launch reads the counts this one writes.
+    kernels.retained_batched_publish_kernel[(triton.cdiv(batch, 256),)](
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
         accepted_length,
         query_start_loc,
         record_slots,
         request_stopped,
         replay_length,
-        replay_start,
-        replay_faults,
-        commit_verdicts,
-        request_ends,
+        batch,
         layers,
+        read_indices.shape[0],
+        *read_indices.stride(),
+        *write_indices.stride(),
         accepted_length.stride(0),
         query_start_loc.stride(0),
         record_slots.stride(0),
-        replay_length.stride(0),
-        replay_start.stride(0),
-        replay_faults.stride(0),
-        commit_verdicts.stride(0),
-        request_stopped.numel(),
         record_slot_count,
+        replay_length.stride(0),
+        request_stopped.numel(),
+        CAPACITY=history_capacity,
         WINDOW=draft_token_num,
-        LAYERS=triton.next_power_of_2(layers),
-        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
-        INCONSISTENT=REQUEST_DECODE_STATE_INCONSISTENT,
-        num_warps=1,
+        BLOCK=256,
+        num_warps=4,
         **options,
     )
 
@@ -544,8 +421,6 @@ def batched_prepare(
     retained_key,
     retained_decay,
     replay_length,
-    replay_start,
-    replay_faults,
     history_capacity,
     draft_token_num,
     num_heads,
@@ -563,21 +438,17 @@ def batched_prepare(
     base from; query_start_loc is the packed [requests + 1] boundary vector;
     draft_token_num is the window the verify that follows was built for.
 
-    A request folds when its live page differs from its source in any group
-    or when its count L plus the larger of its window T and draft_token_num
-    exceeds history_capacity: the verify kernels apply at most
-    history_capacity - draft_token_num records, so a request with a shorter
-    window folds as soon as a full one would. Every layer decides alike and
-    writes the source state with records [0, L) applied into its live page.
-    The launch leaves replay_length alone and stores the round's start count
-    in replay_start, INT32 [record slots, 1]: 0 for a request that folded,
-    else L. The verify and the commit read it; the commit alone writes the
-    count. Padding rows (pages at or below 0 or at or past the pool in every
-    group, an empty window or a slot outside the record slots) keep their
-    pages and start counts. Any other row whose L or T is out of range starts
-    from no record, so its verify stays inside the history, and has its
-    replay_faults entry set to ``REQUEST_DECODE_STATE_INCONSISTENT``, which
-    its commit reports.
+    Every layer of a request shares its count H (replay_length, INT32
+    [record slots, 1]), which the launch only reads. H overflows when it lies
+    outside [0, history_capacity - draft_token_num]: the verify kernels apply
+    at most that many records, and they and the commit then apply none. Per
+    layer, a request whose H overflows gets its source state with records
+    [0, H) applied in its live page (in place when the two are one page; an H
+    past history_capacity applies none); otherwise a request whose live page
+    differs from its source in the layer's group gets the source state
+    copied without any record, since the H records stay valid on top of it.
+    Padding rows (pages at or below 0 or at or past the pool, an empty window
+    or a slot outside the record slots) keep their pages.
     """
     if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
         raise ValueError(
@@ -629,14 +500,9 @@ def batched_prepare(
             "retained records must be FP32 [record slots, layers, heads, "
             "capacity, head_dim]"
         )
-    for name, count in (
-        ("replay_length", replay_length),
-        ("replay_start", replay_start),
-        ("replay_faults", replay_faults),
-    ):
-        _check_count(name, count, device=descriptors.device)
-        if count.shape[0] != record_slot_count:
-            raise ValueError(f"{name} must hold one count per record slot")
+    _check_count("replay_length", replay_length, device=descriptors.device)
+    if replay_length.shape[0] != record_slot_count:
+        raise ValueError("replay_length must hold one count per record slot")
     if any(x.device != descriptors.device for x in (*routing, record_slots, *records)):
         raise ValueError("retained preparation tensors must share a device")
     if not layers or not batch:
@@ -644,7 +510,6 @@ def batched_prepare(
     # Both vendors share this Triton kernel.
     from tokenspeed_kernel.ops.attention.kda._triton import retained
 
-    groups = source_indices.shape[0]
     keys = triton.next_power_of_2(head_dim)
     # Split a request's heads over about 16 programs per SM, so every SM keeps
     # loads in flight when few requests fold (a batch-1 fold of 69 layers takes
@@ -662,23 +527,17 @@ def batched_prepare(
         query_start_loc,
         record_slots,
         replay_length,
-        replay_start,
-        replay_faults,
         *records,
-        groups,
+        source_indices.shape[0],
         *source_indices.stride(),
         *live_indices.stride(),
         query_start_loc.stride(0),
         record_slots.stride(0),
         record_slot_count,
         replay_length.stride(0),
-        replay_start.stride(0),
-        replay_faults.stride(0),
         *(x.stride() for x in records),
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
-        FAULT=REQUEST_DECODE_STATE_INCONSISTENT,
-        GROUPS=triton.next_power_of_2(groups),
         STATE=states[recurrent_state_dtype],
         HEADS=num_heads,
         DIM=head_dim,

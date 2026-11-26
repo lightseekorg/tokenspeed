@@ -174,10 +174,11 @@ class KdaRetainedHistory:
 
     correction is FP32 [slot, head, capacity, value]. key and decay are
     FP32 [slot, head, capacity, key] and hold normalized K and multiplicative
-    decay. length is INT32 [slot, 1] and counts the records a reader applies
-    to the dense base of a slot's request page: every layer of a request
-    shares one count, which the runtime snapshots for a forward's readers
-    (``replay_start``) while the commit advances it. record_slots maps
+    decay. length is INT32 [slot, 1] and counts the records a slot has
+    accepted since the dense base of its request's page; every layer of a
+    request shares one count. A verify applies a count only within
+    [0, capacity - window], and none otherwise: the prepare ahead of it folded
+    those records into the live page. record_slots maps
     each request row to its resident record slot; slot zero is valid.
     live_state_indices maps each request row to its private physical page.
     Cache pages hold only dense checkpoints: the owner folds a slot's
@@ -263,7 +264,7 @@ class KdaRetainedHistory:
 #  11: recurrent key stride
 # All strides count elements. Per-layer values support different arena layouts.
 # A request's accepted count is not a layer's: every layer shares it, and the
-# prepare and the commit take it and its round-start snapshot as tensors.
+# prepare and the commit take it as a tensor.
 # Verify already stores U/K/decay records; commit reads them only to fold an
 # ended request's accepted records into its live page. Commit updates the
 # convolution state, then publishes the request's count. The prepare ahead of
@@ -684,8 +685,9 @@ def kda_materialize_retained_state(
     recurrent is the [request, head, V, K] gather output (K,V for k_major).
     source_indices holds each row's source page, and history.record_slots its
     records and the count history.length gives. Rows with nonpositive source
-    pages are skipped. The count stays as it is: a prefill snapshots and
-    clears it once for every layer (kda_snapshot_retained_length).
+    pages are skipped. The count stays as it is: every layer of a request
+    shares it, so the caller clears it once every layer has gathered
+    (kda_reset_retained_length), on the same stream.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -751,70 +753,6 @@ def kda_reset_retained_length(
     )
 
 
-def kda_snapshot_retained_length(
-    length: torch.Tensor,
-    start: torch.Tensor,
-    faults: torch.Tensor,
-    *,
-    record_slots: torch.Tensor,
-    live_indices: torch.Tensor,
-    page_count: int,
-) -> None:
-    """Hand a prefill's counts to its layers' gathers, then clear them once.
-
-    Every layer of a request shares the INT32 [slot, 1] count ``length``.
-    Before the forward, this copies each prefill row's count into ``start``,
-    the count the layers' gathers then read (kda_materialize_retained_state),
-    and clears it for each row whose scan stores a dense state: one whose live
-    page lies in the pool in every state group. A row with live pages in no
-    group (padding) keeps its count; one with live pages in some groups only
-    keeps it too and has its slot's fault set to
-    ``REQUEST_DECODE_STATE_INCONSISTENT``, as one count cannot describe both
-    (kda_report_retained_faults reports it).
-
-    Args:
-        length: The shared INT32 [slot, 1] counts.
-        start: INT32 [slot, 1] counts the forward's readers apply.
-        faults: INT32 [slot, 1] faults; only raised.
-        record_slots: Each prefill row's record slot.
-        live_indices: Integer [groups, rows] live pages of the prefill rows.
-        page_count: The State pool's page count.
-    """
-    from tokenspeed_kernel.ops.attention.kda._retained import snapshot_length
-
-    snapshot_length(
-        length,
-        start,
-        faults,
-        record_slots=record_slots,
-        live_indices=live_indices,
-        page_count=page_count,
-    )
-
-
-def kda_report_retained_faults(
-    request_ends: torch.Tensor,
-    faults: torch.Tensor,
-    *,
-    record_slots: torch.Tensor,
-) -> None:
-    """Raise rows' ``request_ends`` entries to their slots' retained faults.
-
-    Run after the forward's stop conditions wrote ``request_ends``: they
-    overwrite every row, so a fault found before them (the prefill snapshot)
-    reaches the control plane only through this. The decode commit reports
-    its rows' faults itself.
-
-    Args:
-        request_ends: The forward's contiguous INT32 per-row report.
-        faults: INT32 [slot, 1] retained faults.
-        record_slots: Each row's record slot.
-    """
-    from tokenspeed_kernel.ops.attention.kda._retained import report_faults
-
-    report_faults(request_ends, faults, record_slots=record_slots)
-
-
 def resolve_kda_batched_retained_commit(
     dtype: torch.dtype, *, num_heads: int, head_dim: int, recurrent_layout: str
 ):
@@ -825,22 +763,16 @@ def resolve_kda_batched_retained_commit(
     conv page, conv channel and conv tap strides, then the recurrent state
     pointer and its page, head, value and key strides, in elements.
     record_slots selects each request's slot in replay_length, the count
-    every layer shares, and replay_start, the count the round's prepare left.
-    The commit writes a request's count once, after every layer's verdict
-    (commit_verdicts, INT8 [rows >= requests, layers] scratch): replay_start
-    plus its acceptance when every layer accepted and replay_faults holds no
-    fault for its slot. commit_verdicts must be all zeros when a commit
-    starts (allocate it with ``torch.zeros``); a commit that returns leaves
-    it zero, so the next commit reuses it as is. A commit that raises leaves
-    it undefined until zeroed. A request still
-    decoding that some layers reject, or whose slot holds a fault, is
-    reported as ``REQUEST_DECODE_STATE_INCONSISTENT`` in request_ends and
-    keeps its count. A request whose slot is set in request_stopped ended in this
-    forward: its accepted records are folded into its live page and its count
-    is cleared. One whose commit a layer that carried it rejects instead is
-    reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's
-    per-row ``apply_stop_conditions`` report. Metadata and all pointers
-    remain stable during CUDA graph capture.
+    every layer shares. The first launch reads it in every layer; a second,
+    one-dimensional launch then writes each carried request's count once: the
+    records its verify read (the count, or 0 when it lies outside
+    [0, history_capacity - draft_token_num]) plus its acceptance. A request
+    whose slot is set in request_stopped ended in this forward: its accepted
+    records are folded into its live page and its count is cleared. One
+    whose commit a layer that carried it rejects instead is reported as
+    ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's per-row
+    ``apply_stop_conditions`` report. Metadata and all pointers remain stable
+    during CUDA graph capture.
     """
     return _resolve_batched_retained(
         "kda_retained_commit",
@@ -860,19 +792,17 @@ def resolve_kda_batched_retained_prepare(
     commit's descriptors, layer groups, record slots, FP32 records and shared
     counts, plus [groups, requests] source and live pages, the packed
     boundaries and the window (draft_token_num) of the verify that follows.
-    A request whose live page differs from its source in any state group, or
-    whose count L plus the larger of its window T and draft_token_num exceeds
-    the history capacity, gets the source state with records [0, L) applied
-    in its live page, in every layer. One launch decides, folds and stores
-    each request's round-start count in replay_start: 0 after a fold, else L.
-    The verify reads it, so it sees at most capacity - draft_token_num
-    records a request, and the commit derives the new count from it; the
-    launch leaves replay_length to the commit. A request whose count or
-    window is out of range starts from no record and has its replay_faults
-    entry set, which the commit reports. Run it once per verify round,
-    after the round's pages, boundaries and record slots are refreshed and
-    before any layer's verify: a second run would copy the unchanged source
-    over the fold.
+    A request's count H overflows when it lies outside
+    [0, capacity - draft_token_num]; the verify and the commit then apply no
+    record, so a verify sees at most capacity - draft_token_num records a
+    request. In each layer, an overflowing request gets the source state with
+    records [0, H) applied in its live page; otherwise a request whose live
+    page differs from its source in the layer's group gets the source state
+    copied, with no record applied. One launch decides and copies, and only
+    reads the counts: the commit alone writes them. Run it once per verify
+    round, after the round's pages, boundaries and record slots are
+    refreshed and before any layer's verify: a second run would copy the
+    unchanged source over the fold.
     """
     return _resolve_batched_retained(
         "kda_retained_prepare",
@@ -994,8 +924,6 @@ __all__ = [
     "kda_materialize_retained_pages",
     "kda_materialize_retained_state",
     "kda_reset_retained_length",
-    "kda_snapshot_retained_length",
-    "kda_report_retained_faults",
     "resolve_kda_batched_retained_commit",
     "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",

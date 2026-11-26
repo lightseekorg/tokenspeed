@@ -239,10 +239,8 @@ def _case(
         for r, n in enumerate(lengths):
             if n and int(source[r]) > 0:
                 begin, end = starts_list[r : r + 2]
-                if (
-                    int(source[r]) != int(live[r])
-                    or old_lengths[r] + max(n, width) > capacity
-                ):
+                # A count the verify cannot read whole folds into the page.
+                if old_lengths[r] > capacity - width:
                     expected[r] = expected[r].to(state_dtype).float()
                 references.append(
                     _reference(
@@ -364,15 +362,16 @@ def _case(
                         rtol=0,
                     )
                 continue
-            # A request shorter than the window folds as a full one would.
-            consolidated = (
-                dst != src or old_lengths[r] + max(lengths[r], width) > capacity
-            )
-            old = 0 if consolidated else old_lengths[r]
-            assert int(length[int(slots[r]), 0]) == old
+            # A count past capacity - width overflows, a request shorter than
+            # the window included: the prepare folds it, and the verify reads
+            # none of it. A move that fits copies the source and keeps its
+            # records. Only the commit writes the count.
+            overflow = old_lengths[r] > capacity - width
+            old = 0 if overflow else old_lengths[r]
+            assert int(length[int(slots[r]), 0]) == old_lengths[r]
             torch.testing.assert_close(
                 state[dst].float(),
-                expected[r] if consolidated else before[dst].float(),
+                expected[r] if overflow else before[src].float(),
                 atol=2e-6,
                 rtol=2e-5,
             )
@@ -434,9 +433,7 @@ def _case(
         conv_before = conv.clone()
         # Serving commits all layers in one batched launch pair; commit this
         # test's one layer as kda_retained_reference.commit does, building
-        # every argument before a CUDA graph captures the launches. One layer
-        # reads its round-start count and advances its count in the same
-        # history.length, in separate launches.
+        # every argument before a CUDA graph captures the launches.
         commit = resolve_kda_batched_retained_commit(
             original.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
         )
@@ -472,9 +469,6 @@ def _case(
             retained_key=history.key[:, None],
             retained_decay=history.decay[:, None],
             replay_length=history.length,
-            replay_start=history.length,
-            replay_faults=torch.zeros_like(history.length),
-            commit_verdicts=torch.zeros(batch, 1, device="cuda", dtype=torch.int8),
             # No request ends in these rounds.
             request_stopped=torch.zeros(
                 history.length.shape[0], device="cuda", dtype=torch.bool
@@ -507,8 +501,13 @@ def _case(
         else:
             commit(**commit_kwargs)
         if corruption and corruption != "rejected":
+            # The layer rejects the commit and shifts no window. The count
+            # every layer shares still advances: a stale stamp means a layer's
+            # verify did not run, which serving never does.
             torch.testing.assert_close(conv, conv_before, atol=0, rtol=0)
-            torch.testing.assert_close(length, length_before, atol=0, rtol=0)
+            old = 0 if old_lengths[0] > capacity - width else old_lengths[0]
+            take = max(0, min(accepted, lengths[0]))
+            assert int(length[int(slots[0]), 0]) == old + take
             return history
         torch.testing.assert_close(state, dense_before, atol=0, rtol=0)
         for actual, before_record in zip((u, key, decay), records_before):
@@ -524,11 +523,7 @@ def _case(
             take = max(0, min(accepted, n))
             dst = int(live[r])
             # The prepare folded a row shorter than the window as a full one.
-            old = (
-                0
-                if int(source[r]) != dst or old_lengths[r] + max(n, width) > capacity
-                else old_lengths[r]
-            )
+            old = 0 if old_lengths[r] > capacity - width else old_lengths[r]
             assert int(length[int(slots[r]), 0]) == old + take
             if take:
                 expected[r] = references[r][1][take - 1]

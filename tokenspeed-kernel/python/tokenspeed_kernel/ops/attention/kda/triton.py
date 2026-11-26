@@ -287,7 +287,7 @@ def triton_nvidia_kda_batched_retained_commit(**kwargs) -> None:
     },
 )
 def triton_kda_batched_retained_prepare(**kwargs) -> None:
-    """Fold accepted records into live pages across layers; snapshot counts."""
+    """Ready every layer's live pages for verify; the counts stay as they are."""
     from tokenspeed_kernel.ops.attention.kda._retained import batched_prepare
 
     batched_prepare(**kwargs)

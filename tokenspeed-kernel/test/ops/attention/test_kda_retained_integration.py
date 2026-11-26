@@ -25,11 +25,7 @@ import pytest
 import torch
 from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention import kda
-from tokenspeed_kernel.ops.metadata import (
-    REQUEST_DECODE_STATE_INCONSISTENT,
-    REQUEST_ENDED,
-    REQUEST_ENDED_INCOMPLETE,
-)
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, REQUEST_ENDED_INCOMPLETE
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -189,10 +185,10 @@ def _fold(base, records, slot, layer, count):
 def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.float32):
     """Three layers in two State groups commit four rows; row 3 is padding.
 
-    Every layer of a request shares its count: the slots' counts read 7, a
-    value from before the round's prepare, and their start counts 2, which
-    the verify read; the commit derives each new count from the start. With
-    ``stale``, layer 1 rejects row 1's commit.
+    Every layer of a request shares its count: the rows' slots hold 2, the
+    records their verify read, and slot 2, which has no row, holds 7. The
+    commit writes each row's count once, from that and its acceptance. With
+    ``stale``, layer 1 rejects row 1's commit and leaves its window alone.
     """
     heads, dim, channels, layers, capacity = 2, 128, 768, 3, 8
     reads = torch.tensor(
@@ -251,14 +247,11 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         dtype=torch.int32,
     )
     # Strided counts the layers share.
-    length = torch.full((4, 5), 7, device="cuda", dtype=torch.int32)[:, 1:2]
-    start_count = torch.full((4, 3), 2, device="cuda", dtype=torch.int32)[:, 2:3]
+    length = torch.full((4, 5), 2, device="cuda", dtype=torch.int32)[:, 1:2]
+    length[2] = 7
     expected_length = length.clone()
     for row in range(3):
         slot = int(record_slots[row])
-        if stale and row == 1:
-            # Layer 1 rejected it: no count describes the other layers.
-            continue
         expected_length[slot] = 0 if slot in stopped_slots else 2 + int(accepted[row])
     originals, convs, states, descriptors = [], [], [], []
     expected_convs, expected_states = [], []
@@ -322,10 +315,6 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         retained_key=records[1],
         retained_decay=records[2],
         replay_length=length,
-        replay_start=start_count,
-        replay_faults=torch.zeros(4, 1, device="cuda", dtype=torch.int32),
-        # Scratch rows for the largest batch a test commits.
-        commit_verdicts=torch.zeros(64, layers, device="cuda", dtype=torch.int8),
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=window,
@@ -350,19 +339,19 @@ def _resolve_commit():
 
 
 @pytest.mark.parametrize("window", [1, 4])
-def test_batched_retained_commit_packed_groups_and_stamps(window):
-    args, keepalive, actual, expected = _commit_case(window)
+@pytest.mark.parametrize("stale", [False, True])
+def test_batched_retained_commit_packed_groups_and_stamps(window, stale):
+    args, keepalive, actual, expected = _commit_case(window, stale=stale)
     states_before = [state.clone() for state in actual[2]]
-    start_before = args["replay_start"].clone()
     _resolve_commit()(**args)
+    # No request ended, so a stale layer reports nothing.
     assert args["request_ends"].tolist() == [0, 0, 0, 0]
     for value, expected_value in zip(actual[0], expected[0]):
         torch.testing.assert_close(value, expected_value, atol=0, rtol=0)
-    # One count per request: its start count plus its acceptance. Slot 2 has
-    # no row and keeps its count.
+    # One count per request: the records its verify read plus its acceptance.
+    # Slot 2 has no row and keeps its count.
     torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
     assert actual[1][:, 0].tolist() == [2 + window, 2, 7, 2 + max(1, window - 1)]
-    torch.testing.assert_close(args["replay_start"], start_before, atol=0, rtol=0)
     # Without an ended request the commit writes no dense state.
     for state, before in zip(actual[2], states_before):
         torch.testing.assert_close(state, before, atol=0, rtol=0)
@@ -404,116 +393,56 @@ def test_batched_retained_commit_folds_ended_requests(window, stale, state_dtype
         torch.testing.assert_close(state, expected_state, **tolerance)
 
 
-@pytest.mark.parametrize("window", [1, 4])
-def test_a_commit_some_layers_reject_reports_an_inconsistent_state(window):
-    """Every layer shares a request's count, so it cannot advance for some
-    layers and not others: a still-decoding request whose stale stamps one
-    layer rejects keeps its count, and its row reports the state
-    inconsistent; the other rows commit as usual."""
-    args, keepalive, actual, expected = _commit_case(window, stale=True)
-    _resolve_commit()(**args)
-    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
-    torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
-    # Row 1's slot 3 keeps the count it had before the round.
-    assert int(actual[1][3]) == 7
+@pytest.mark.parametrize("count", [-1, 8 - 4 + 1, 8, 9])
+def test_a_commit_applies_no_record_of_an_overflowing_count(count):
+    """A count outside [0, capacity - window] overflowed: the round's prepare
+    folded its records into the live page, and its verify read none. The
+    commit starts that request from zero records, so an ended request folds
+    only this round's, and a decoding one counts only its acceptance."""
+    for stopped in ((), (3,)):
+        args, keepalive, actual, expected = _commit_case(4, stopped_slots=stopped)
+        convs, length, states = actual
+        length[3] = count
+        before = [state.clone() for state in states]
+        _resolve_commit()(**args)
+        take = 3
+        assert int(length[3]) == (0 if stopped else take)
+        # Row 1's commit still shifts every layer's window.
+        for conv, expected_conv in zip(convs, expected[0]):
+            torch.testing.assert_close(conv, expected_conv, atol=0, rtol=0)
+        if stopped:
+            for layer, state in enumerate(states):
+                target = int(
+                    args["write_indices"][int(args["group_indices"][layer]), 1]
+                )
+                expected_state = _fold(
+                    before[layer][target],
+                    (
+                        args["retained_correction"],
+                        args["retained_key"],
+                        args["retained_decay"],
+                    ),
+                    3,
+                    layer,
+                    take,
+                )
+                torch.testing.assert_close(
+                    state[target], expected_state, atol=2e-6, rtol=2e-6
+                )
 
 
-@pytest.mark.parametrize("cause", ["stale", "capacity"])
-def test_a_decoding_row_every_layer_rejects_reports_an_inconsistent_state(cause):
-    """Row 1 (slot 3) is live and every layer that carries it rejects its
-    commit -- stale stamps everywhere, or a start count with no room for the
-    acceptance: it reports the state inconsistent, keeps its count and
-    shifts no convolution window; the other rows commit."""
-    # actual keeps every layer's tensors the descriptors point at alive.
-    args, keepalive, actual, expected = _commit_case(4)
-    convs, length, _ = actual
-    if cause == "stale":
-        args["record_stamps"][:, 0, ..., 1] = -1
-    else:
-        args["replay_start"][3] = 8
-    before = [conv[4].clone() for conv in convs]
-    _resolve_commit()(**args)
-    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
-    assert length[:, 0].tolist() == [2 + 4, 2, 7, 7]
-    for conv, conv_before in zip(convs, before):
-        torch.testing.assert_close(conv[4], conv_before, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "pages,stopped,end",
-    [
-        ("one group", True, REQUEST_ENDED_INCOMPLETE),
-        ("every group", True, REQUEST_ENDED),
-        ("every group", False, 0),
-    ],
-    ids=["stopped_partial", "masked_stopped", "padding"],
-)
-def test_rows_some_layers_never_carry(pages, stopped, end):
-    """Row 1 (slot 3) has invalid pages in group 0 only, or in both groups.
-    An ended row whose group-0 layer never folded reports INCOMPLETE; a row
-    no layer carries -- a masked overlap row that ended earlier, or graph
-    padding -- reports nothing and keeps its count."""
+@pytest.mark.parametrize("stopped", [True, False], ids=["masked_stopped", "padding"])
+def test_rows_no_layer_carries_keep_their_count(stopped):
+    """Row 1 (slot 3) has invalid pages in every group: a masked overlap row
+    whose request ended earlier, or graph padding. No layer carries it, so
+    it reports nothing new and its slot keeps its count."""
     args, keepalive, actual, _ = _commit_case(4, stopped_slots=(3,) if stopped else ())
     length = actual[1]
-    groups = [0] if pages == "one group" else [0, 1]
-    args["read_indices"][groups, 1] = -1
-    args["write_indices"][groups, 1] = -1
-    if pages == "every group":
-        # A row no layer carries reports nothing, not even its slot's fault.
-        args["replay_faults"][3] = REQUEST_DECODE_STATE_INCONSISTENT
+    args["read_indices"][:, 1] = -1
+    args["write_indices"][:, 1] = -1
     _resolve_commit()(**args)
-    assert args["request_ends"].tolist()[1] == end
-    assert int(length[3]) == 7
-
-
-@pytest.mark.parametrize("case", ["accepted", "stale", "partial_pages", "padding"])
-def test_a_commit_leaves_its_verdict_scratch_zero(case):
-    """Only layers that do not accept a row store a verdict, and the publish
-    launch clears the rows it read: whatever the round held -- every layer
-    accepting, a stale layer, a row one group never carries, padding rows no
-    layer carries -- the next commit starts from zeros."""
-    # actual keeps every layer's tensors the descriptors point at alive.
-    args, keepalive, actual, _ = _commit_case(4, stale=case == "stale")
-    if case == "partial_pages":
-        args["read_indices"][0, 1] = -1
-        args["write_indices"][0, 1] = -1
-    if case == "padding":
-        args["read_indices"][:, 2] = -1
-        args["write_indices"][:, 2] = -1
-    _resolve_commit()(**args)
-    assert not args["commit_verdicts"].any()
-
-
-def test_a_row_rejected_in_one_round_commits_in_the_next():
-    """A layer's rejection holds for its round only: once the stamps match
-    again, the same row commits and its count advances."""
-    args, keepalive, actual, _ = _commit_case(4, stale=True)
-    length = actual[1]
-    commit = _resolve_commit()
-    commit(**args)
-    assert args["request_ends"].tolist() == [0, REQUEST_DECODE_STATE_INCONSISTENT, 0, 0]
-    assert int(length[3]) == 7
-    args["record_stamps"][1, 0, 11 % 7, 1] = 8
-    args["request_ends"].zero_()
-    commit(**args)
-    assert args["request_ends"].tolist() == [0, 0, 0, 0]
-    assert int(length[3]) == 2 + 3
-
-
-def test_a_slot_the_prepare_flagged_reports_an_inconsistent_state():
-    """A fault the prepare left in a slot reaches the row's report at the
-    commit, and its count stays; a higher code than a row's end report wins."""
-    args, keepalive, actual, expected = _commit_case(4, stopped_slots=(0,))
-    args["replay_faults"][[1, 0]] = REQUEST_DECODE_STATE_INCONSISTENT
-    _resolve_commit()(**args)
-    assert args["request_ends"].tolist() == [
-        REQUEST_DECODE_STATE_INCONSISTENT,
-        0,
-        REQUEST_DECODE_STATE_INCONSISTENT,
-        0,
-    ]
-    # Slots 1 and 0 keep their counts; slot 3 commits.
-    assert actual[1][:, 0].tolist() == [7, 7, 7, 2 + 3]
+    assert args["request_ends"].tolist()[1] == (REQUEST_ENDED if stopped else 0)
+    assert int(length[3]) == 2
 
 
 @pytest.mark.parametrize(
@@ -614,7 +543,10 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
             running, conv[page].float(), raw, weights, gate, beta, begin, end
         )
         expected_final.append(running)
-    # Every row moves to a private live page, so the prepare copies them all.
+    # Every row moves to a private live page, so the prepare copies them all;
+    # row 2's two records stay valid on top of its copied base.
+    counts = history.length[:, 0].tolist()
+    source_2 = state[2].clone()
     prepare_history(state, history, reads, starts, draft_token_num=window)
     out = kda.kda_fused_paged_verify(
         raw,
@@ -644,33 +576,36 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
     torch.testing.assert_close(state[1], saved, atol=0, rtol=0)
     torch.testing.assert_close(state[3], saved, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(state[4], saved, atol=2e-6, rtol=2e-6)
-    # Each copy to a private live page starts its slot's history over.
-    assert history.length[:, 0].tolist() == [0, 0, 0]
+    torch.testing.assert_close(state[5], source_2, atol=0, rtol=0)
+    assert history.length[:, 0].tolist() == counts
     torch.testing.assert_close(
         out.reshape(total, 2, 128).float(), expected_out, atol=2e-4, rtol=1e-2
     )
     for row in range(3):
         slot = int(history.record_slots[row])
         begin, end = int(starts[row]), int(starts[row + 1])
+        # Candidates follow the records the slot already holds.
+        first = counts[slot]
+        last = first + end - begin
         torch.testing.assert_close(
-            history.correction[slot, :, : end - begin],
+            history.correction[slot, :, first:last],
             expected_u[begin:end].transpose(0, 1),
             atol=2e-4,
             rtol=1e-2,
         )
         torch.testing.assert_close(
-            history.key[slot, :, : end - begin],
+            history.key[slot, :, first:last],
             expected_key[begin:end].transpose(0, 1),
             atol=1e-3,
             rtol=1e-2,
         )
         torch.testing.assert_close(
-            history.decay[slot, :, : end - begin],
+            history.decay[slot, :, first:last],
             expected_decay[begin:end].transpose(0, 1),
             atol=1e-6,
             rtol=1e-6,
         )
-        history.length[slot] = end - begin
+        history.length[slot] = last
     endpoint = state[history.live_state_indices[:3].long()].clone()
     kda.kda_materialize_retained_state(
         endpoint,
@@ -720,7 +655,8 @@ def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, c
     )
 
     prepare_history(state, history, reads, starts, draft_token_num=window)
-    assert int(history.length[slot]) == 0
+    # The count stays; past capacity - window, the verify applies none of it.
+    assert int(history.length[slot]) == count
     torch.testing.assert_close(state[3], endpoint, atol=2e-6, rtol=2e-5)
 
     producer = {}
@@ -819,7 +755,6 @@ def test_retained_commit_graph_refresh_and_layer_subset():
         retained_correction=args["retained_correction"][:, ::2],
         retained_key=args["retained_key"][:, ::2],
         retained_decay=args["retained_decay"][:, ::2],
-        commit_verdicts=args["commit_verdicts"][:, :2],
     )
     before_conv = [x.clone() for x in convs]
     before_length = length.clone()
@@ -844,9 +779,39 @@ def test_retained_commit_graph_refresh_and_layer_subset():
                 convs[layer][target], before_conv[layer][source], atol=0, rtol=0
             )
     torch.testing.assert_close(convs[1], before_conv[1], atol=0, rtol=0)
-    # The replay accepted nothing, so each row's count is its start count;
-    # slot 2 has no row and keeps its count.
+    # The replay accepted nothing, so each row's count stays the records its
+    # verify read; slot 2 has no row and keeps its count.
     assert length[:, 0].tolist() == [2, 2, 7, 2]
+
+    # Rows paged only in group 0, which no launched layer lists, are carried
+    # by no layer: their counts stay, whether the request continues (row 1,
+    # slot 3) or ended in this forward (row 0, slot 1). Row 2 (slot 0) is
+    # paged in group 1 and advances.
+    args, keepalive, (convs, length, _), _ = _commit_case(4, stopped_slots=(1,))
+    args["read_indices"][1, 0] = 0
+    args["write_indices"][1, 1] = 0
+    subset = dict(
+        args,
+        descriptors=args["descriptors"][::2].contiguous(),
+        group_indices=args["group_indices"][::2].contiguous(),
+        record_stamps=args["record_stamps"][::2],
+        retained_correction=args["retained_correction"][:, ::2],
+        retained_key=args["retained_key"][:, ::2],
+        retained_decay=args["retained_decay"][:, ::2],
+    )
+    assert subset["group_indices"].tolist() == [1, 1]
+    before_conv = [x.clone() for x in convs]
+    before_ends = args["request_ends"].clone()
+    commit(**subset)
+    assert length[:, 0].tolist() == [2 + int(args["accepted_length"][2]), 2, 7, 2]
+    for layer in (0, 2):
+        for row in (0, 1):
+            target = int(args["write_indices"][1, row])
+            torch.testing.assert_close(
+                convs[layer][target], before_conv[layer][target], atol=0, rtol=0
+            )
+    torch.testing.assert_close(convs[1], before_conv[1], atol=0, rtol=0)
+    torch.testing.assert_close(args["request_ends"], before_ends, atol=0, rtol=0)
 
 
 def test_retained_commit_does_not_specialize_dynamic_metadata():
@@ -855,8 +820,14 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
     args, keepalive, _, _ = _commit_case(4)
     commit = _resolve_commit()
     args["accepted_length"].zero_()
+    assert args["request_ends"].data_ptr() % 16 == 0
     commit(**args)
     kernels, _ = _kernels()
+    # A mixed forward's decode rows follow its extend rows in the stop
+    # report: their contiguous view starts one INT32 past a 16-byte boundary.
+    ends = torch.zeros(5, device="cuda", dtype=torch.int32)[1:]
+    assert ends.is_contiguous() and ends.data_ptr() % 16 != 0
+    offset = dict(args, request_ends=ends)
     shorter = dict(
         args,
         read_indices=args["read_indices"][:, :2],
@@ -871,6 +842,7 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
     with assert_no_triton_compile(
         kernels.retained_batched_conv_kernel, kernels.retained_batched_publish_kernel
     ):
+        commit(**offset)
         commit(**shorter)
         # Serving packs each [groups, batch] page table contiguously at the
         # start of its buffer, so its row stride is the batch size: 1,
@@ -903,16 +875,17 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
 def _prepare_case(window, *, state_dtype=torch.float32):
     """Three layers in two State groups, each layer with its own arena strides.
 
-    Every layer of a request reads the count its slot keeps. Row 0 moves
-    from a shared source page to its private live page in both groups. Row
-    1 continues its own pages and overflows the capacity by one record. Row
-    2 continues its own pages and fits exactly. Rows 3-6 are padding -- an
-    empty window, a source one past the pool, a slot past the record slots,
-    the null page -- and keep their pages, counts and start counts. Row 7
-    continues its own pages with fewer tokens than the window: its own
-    tokens fit, but it folds whenever a full window would overflow. Row 8
-    moves to a private page in group 0 only and fits: the group-1 layers fold
-    it in place as well, so its one count describes every layer.
+    Every layer of a request reads the count its slot keeps, and a count
+    past capacity - window overflows. Row 0 moves from a shared source page
+    to its private live page in both groups and fits: its live pages get the
+    source state, with no record applied. Row 1 continues its own pages and
+    overflows the capacity by one record: it folds in place. Row 2 continues
+    its own pages and fits exactly. Rows 3-6 are padding -- an empty window,
+    a source one past the pool, a slot past the record slots, the null page
+    -- and keep their pages. Row 7 continues its own pages with fewer tokens
+    than the window: its own tokens fit, but it folds whenever a full window
+    would overflow. Row 8 moves to a private page in group 0 only and fits:
+    the group-0 layer copies its source, and the group-1 layers leave it.
     """
     heads, dim, layers, capacity, slots, pages, rows = 2, 128, 3, 8, 8, 10, 9
     groups = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int32)
@@ -952,30 +925,10 @@ def _prepare_case(window, *, state_dtype=torch.float32):
             torch.rand(shape, device="cuda") * 0.2 + 0.7,
         )
     )
-    # Strided counts the layers share, and start counts a prepare must not
-    # write for padding rows.
+    # Strided counts the layers share.
     length = torch.zeros(slots, 5, device="cuda", dtype=torch.int32)[:, 1:2]
     for slot, count in counts.items():
         length[slot] = count
-    start_count = torch.full((slots, 3), -5, device="cuda", dtype=torch.int32)[:, 2:]
-    expected_start = start_count.clone()
-    folds = []
-    for row in range(rows):
-        slot, tokens = int(record_slots[row]), sizes[row]
-        paged = [
-            0 < int(sources[group, row]) < pages and 0 < int(lives[group, row]) < pages
-            for group in range(2)
-        ]
-        if not (any(paged) and tokens and slot < slots):
-            folds.append(False)
-            continue
-        count = counts[slot]
-        moved = any(
-            paged[group] and int(sources[group, row]) != int(lives[group, row])
-            for group in range(2)
-        )
-        folds.append(moved or count + max(tokens, window) > capacity)
-        expected_start[slot] = 0 if folds[-1] else count
     states, descriptors, expected_states = [], [], []
     for layer in range(layers):
         state = (
@@ -984,12 +937,18 @@ def _prepare_case(window, *, state_dtype=torch.float32):
         expected_state = state.clone()
         group = int(groups[layer])
         for row in range(rows):
-            if folds[row]:
-                source, live = int(sources[group, row]), int(lives[group, row])
-                slot = int(record_slots[row])
+            source, live = int(sources[group, row]), int(lives[group, row])
+            slot, tokens = int(record_slots[row]), sizes[row]
+            if not (
+                0 < source < pages and 0 < live < pages and tokens and slot < slots
+            ):
+                continue
+            if counts[slot] > capacity - window:
                 expected_state[live] = _fold(
                     state[source], records, slot, layer, counts[slot]
                 ).to(state_dtype)
+            elif source != live:
+                expected_state[live] = state[source]
         row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
         row[2] = pages
         row[7:12] = state.data_ptr(), *state.stride()
@@ -1008,15 +967,13 @@ def _prepare_case(window, *, state_dtype=torch.float32):
         retained_key=records[1],
         retained_decay=records[2],
         replay_length=length,
-        replay_start=start_count,
-        replay_faults=torch.zeros(slots, 1, device="cuda", dtype=torch.int32),
         history_capacity=capacity,
         draft_token_num=window,
         num_heads=heads,
         head_dim=dim,
         recurrent_state_dtype=state_dtype,
     )
-    return args, states, (expected_states, expected_start)
+    return args, states, expected_states
 
 
 def _resolve_prepare():
@@ -1033,22 +990,20 @@ def _resolve_prepare():
 def test_batched_retained_prepare_folds_private_and_overflowing_rows(
     window, state_dtype, captured
 ):
-    args, states, (expected_states, expected_start) = _prepare_case(
-        window, state_dtype=state_dtype
-    )
+    args, states, expected_states = _prepare_case(window, state_dtype=state_dtype)
     fields = ("retained_correction", "retained_key", "retained_decay")
     records = [args[name].clone() for name in fields]
     counts = args["replay_length"].clone()
-    initial = [x.clone() for x in (*states, args["replay_start"])]
+    initial = [x.clone() for x in states]
     prepare = _resolve_prepare()
     prepare(**args)
     if captured:
-        for value, before in zip((*states, args["replay_start"]), initial):
+        for value, before in zip(states, initial):
             value.copy_(before)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             prepare(**args)
-        for value, before in zip((*states, args["replay_start"]), initial):
+        for value, before in zip(states, initial):
             value.copy_(before)
         graph.replay()
     tolerance = (
@@ -1060,13 +1015,14 @@ def test_batched_retained_prepare_folds_private_and_overflowing_rows(
         changed = (expected != before).flatten(1).any(1)
         torch.testing.assert_close(state[changed], expected[changed], **tolerance)
         torch.testing.assert_close(state[~changed], before[~changed], atol=0, rtol=0)
-    torch.testing.assert_close(args["replay_start"], expected_start, atol=0, rtol=0)
-    # Rows 0, 1, 7 and 8 fold; row 2 fits and starts from its count; padding
-    # rows' slots (1, 3 and 5) keep their start counts.
-    assert args["replay_start"][:, 0].tolist() == [8 - window, -5, 0, -5, 0, -5, 0, 0]
-    # Row 8 moved in group 0 only, yet layers 0 and 2 (group 1) folded it too.
+    # A move that fits copies the dense base and applies no record: row 0's
+    # live pages and row 8's group-0 live page hold their sources exactly.
+    torch.testing.assert_close(states[1][5], initial[1][1], atol=0, rtol=0)
+    torch.testing.assert_close(states[1][8], initial[1][7], atol=0, rtol=0)
     for layer in (0, 2):
-        assert not torch.equal(states[layer][3], initial[layer][3])
+        torch.testing.assert_close(states[layer][9], initial[layer][2], atol=0, rtol=0)
+        # Row 8 did not move in group 1, so its layers leave its page.
+        torch.testing.assert_close(states[layer][3], initial[layer][3], atol=0, rtol=0)
     # The commit writes the counts; a prepare only reads them.
     torch.testing.assert_close(args["replay_length"], counts, atol=0, rtol=0)
     for name, before in zip(fields, records):
@@ -1100,50 +1056,22 @@ def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
             )
 
 
-def test_a_count_past_the_capacity_flags_its_slot_and_starts_from_no_record():
-    """The prepare cannot fold records past the history; the row starts from
-    no record, so its verify stays inside the history, its pages stay as
-    they are, and its slot's fault reports the state inconsistent."""
-    args, states, (expected_states, expected_start) = _prepare_case(4)
-    # Row 2 (slot 0) fits exactly in the case; make its count overflow.
-    args["replay_length"][0] = 9
+@pytest.mark.parametrize("count", [-1, 9])
+def test_a_count_outside_the_history_applies_no_record(count):
+    """A count below 0 or past the capacity overflows, so the verify applies
+    no record, but the prepare has no records to fold: a row that keeps its
+    page leaves it as it is, and a row that moves gets its source copied."""
+    args, states, _ = _prepare_case(4)
+    # Row 2 (slot 0) keeps its pages; row 0 (slot 2) moves in both groups.
+    args["replay_length"][[0, 2]] = count
     before = [state.clone() for state in states]
     _resolve_prepare()(**args)
-    assert args["replay_faults"][:, 0].tolist() == [
-        REQUEST_DECODE_STATE_INCONSISTENT,
-        *[0] * 7,
-    ]
-    assert int(args["replay_start"][0]) == 0
-    assert int(args["replay_length"][0]) == 9
+    assert args["replay_length"][[0, 2], 0].tolist() == [count, count]
     for layer, state in enumerate(states):
-        page = 3 if layer == 1 else 7
-        torch.testing.assert_close(state[page], before[layer][page], atol=0, rtol=0)
-
-
-def test_a_prefill_snapshot_clears_counts_once_and_flags_partial_rows():
-    """Rows whose live pages lie in every group start from their counts,
-    which clear; a padding row keeps its count; a row with live pages in one
-    group only keeps its count and has its slot flagged, which the report
-    raises its row's request end to."""
-    length = torch.tensor([[4], [5], [6], [7]], device="cuda", dtype=torch.int32)
-    start = torch.full_like(length, -1)
-    faults = torch.zeros_like(length)
-    slots = torch.tensor([2, 0, 3], device="cuda", dtype=torch.int64)
-    live = torch.tensor([[5, -1, 6], [7, -1, -1]], device="cuda", dtype=torch.int32)
-    kda.kda_snapshot_retained_length(
-        length, start, faults, record_slots=slots, live_indices=live, page_count=8
-    )
-    assert start[:, 0].tolist() == [4, -1, 6, 7]
-    assert length[:, 0].tolist() == [4, 5, 0, 7]
-    assert faults[:, 0].tolist() == [0, 0, 0, REQUEST_DECODE_STATE_INCONSISTENT]
-    # The stop conditions wrote every row since; the report raises the third.
-    request_ends = torch.tensor([REQUEST_ENDED, 0, 0], device="cuda", dtype=torch.int32)
-    kda.kda_report_retained_faults(request_ends, faults, record_slots=slots)
-    assert request_ends.tolist() == [
-        REQUEST_ENDED,
-        0,
-        REQUEST_DECODE_STATE_INCONSISTENT,
-    ]
+        kept = 3 if layer == 1 else 7
+        torch.testing.assert_close(state[kept], before[layer][kept], atol=0, rtol=0)
+        source, live = (1, 5) if layer == 1 else (2, 9)
+        torch.testing.assert_close(state[live], before[layer][source], atol=0, rtol=0)
 
 
 def test_far_pages_of_a_pool_past_int32_prepare_like_near_ones():
@@ -1158,19 +1086,20 @@ def test_far_pages_of_a_pool_past_int32_prepare_like_near_ones():
     state = storage.as_strided((3, heads, dim, dim), (page_stride, dim * dim, dim, 1))
     state[1:].normal_(std=0.05)
     history = _history(heads=heads, capacity=capacity)
-    history.length.fill_(3)
+    # Past capacity - window, so the prepare folds the records.
+    history.length.fill_(5)
     reads = torch.tensor([1, 0, 0, 0], device="cuda", dtype=torch.int32)
     history.live_state_indices.copy_(
         torch.tensor([2, 0, 0, 0], device="cuda", dtype=torch.int32)
     )
     starts = torch.tensor([0, 4, 4, 4, 4], device="cuda", dtype=torch.int32)
     slot = int(history.record_slots[0])
-    expected = _endpoint(state[1].float(), history, slot, 3).to(torch.bfloat16)
+    expected = _endpoint(state[1].float(), history, slot, 5).to(torch.bfloat16)
     source = state[1].clone()
     prepare_history(state, history, reads, starts, draft_token_num=4)
     torch.testing.assert_close(state[2], expected, atol=2e-3, rtol=4e-3)
     torch.testing.assert_close(state[1], source, atol=0, rtol=0)
-    assert int(history.length[slot]) == 0
+    assert int(history.length[slot]) == 5
 
 
 def test_retained_capability_requires_every_explicit_contract():

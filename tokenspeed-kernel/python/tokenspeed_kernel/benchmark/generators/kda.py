@@ -588,13 +588,14 @@ def _history_capacity(window: int) -> int:
 
 
 def _retained_benchmark_layer(
-    common, window, generator, reads, live, metadata, stamps, count, start
+    common, window, generator, reads, live, metadata, stamps, count, verified
 ):
     """One layer's verify inputs over the request slots' shared counts.
 
     ``count`` is the INT32 [slots, 1] accepted count every layer shares and
-    ``start`` the round-start count its verify reads (the same tensor when no
-    commit follows).
+    ``verified`` the count its verify reads: the same tensor when no commit
+    follows, else a copy of the round's starting count, which the timed
+    commits leave as it is.
     """
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
@@ -619,7 +620,7 @@ def _retained_benchmark_layer(
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
-        start,
+        verified,
         live,
         metadata[:, 0],
     )
@@ -820,8 +821,7 @@ def prepare_kda_retained_commit(
     generator = _generator(request.seed)
     # Every layer shares a request's count; its verify read the round's start.
     replay_length = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
-    replay_start = torch.zeros_like(replay_length)
-    replay_faults = torch.zeros_like(replay_length)
+    verified = replay_length.clone()
     layer_inputs, descriptors, before = [], [], []
     for layer_idx in range(layers):
         layer = _retained_benchmark_layer(
@@ -833,7 +833,7 @@ def prepare_kda_retained_commit(
             metadata,
             stamps[layer_idx],
             replay_length,
-            replay_start,
+            verified,
         )
         _invoke_retained_layer(layer, common, override=None, solution=None)
         conv = layer["conv"]
@@ -855,8 +855,6 @@ def prepare_kda_retained_commit(
         before.append(conv.clone())
     descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
     initial_count = replay_length.clone()
-    # Zero means every layer accepted; each commit leaves the scratch zero.
-    verdicts = torch.zeros(batch, layers, device="cuda", dtype=torch.int8)
     group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
         layers // groups
     )
@@ -897,9 +895,6 @@ def prepare_kda_retained_commit(
             retained_key=records[1],
             retained_decay=records[2],
             replay_length=replay_length,
-            replay_start=replay_start,
-            replay_faults=replay_faults,
-            commit_verdicts=verdicts,
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,

@@ -46,10 +46,8 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
 )
 from tokenspeed_kernel.ops.attention.kda import (
-    kda_report_retained_faults,
     kda_reset_retained_length,
     kda_retained_supported,
-    kda_snapshot_retained_length,
     kda_verify_conv_update,
     resolve_kda_batched_retained_commit,
     resolve_kda_batched_retained_prepare,
@@ -168,10 +166,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
     advances the count, except in the forward that ends a request, where it
     folds the records into the live State block; a retraction folds them
     before imaging. Before each verify round, one launch over every layer
-    folds the records of requests that move to a private live block or would
-    overflow the history capacity, and stores each request's round-start
-    count, which the verify and the commit read (``_prepare_retained_history``).
-    Standard decode is a one-token window with one accepted token.
+    readies each request's live block: a request whose count would overflow
+    the history capacity has its records folded into it, and a request that
+    moves to a private live block has its dense base copied there
+    (``_prepare_retained_history``). Standard decode is a one-token window
+    with one accepted token.
     KDA also replaces the scan seams: its decay gate is
     per-channel (a low-rank ``f_a``/``f_b`` projection plus raw beta logits)
     where GDN's is scalar per head, and its decode/verify kernels can fuse
@@ -181,14 +180,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
     _prefill_needs_request_slots = True
     # Retraction folds accepted records into the dense page before slot reuse
     # (fold_deferred_state). A recycled or restored slot starts with an
-    # accepted count of zero. A forward's start counts live only within it:
-    # its prepare or prefill snapshot writes them before any reader. A fault
-    # stops the engine at the forward that reports it; a new owner clears it.
+    # accepted count of zero.
     workspace_slot_state = (
         "_retained_records",
         "_replay_length",
-        "_replay_start",
-        "_replay_faults",
     )
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
@@ -265,23 +260,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._retained_records: torch.Tensor | None = None
         # INT32 [request slots, 1]: records accepted since the dense base of
         # each request's live page, one count every layer shares. The decode
-        # commit writes it; prefill and retraction folds clear it once.
+        # commit writes it; prefill and retraction folds clear it once, after
+        # every layer has read it. A verify round applies it only within
+        # [0, capacity - window]; past that its prepare folds the records.
         self._replay_length: torch.Tensor | None = None
-        # INT32 [request slots, 1]: the count a forward's readers apply -- the
-        # verify and commit of a round (after its prepare's fold) and every
-        # layer's prefill gather -- written once before the forward's layers.
-        self._replay_start: torch.Tensor | None = None
-        # INT32 [request slots, 1]: REQUEST_DECODE_STATE_INCONSISTENT once a
-        # prepare or prefill snapshot found the slot's retained history
-        # unsound; the commit or report_request_faults raises the row's
-        # request_ends entry to it, after the stop conditions wrote that.
-        self._replay_faults: torch.Tensor | None = None
-        # INT8 [max_bs, layers]: the layers that do not accept a row's commit,
-        # which the commit reduces before it writes a request's count. Zero
-        # means accepted; the commit leaves it zero, so it is allocated zeroed.
-        # A commit that raises between its two launches leaves it dirty; any
-        # forward error stops the engine, so no later commit reads it.
-        self._commit_verdicts: torch.Tensor | None = None
         self._record_slots: torch.Tensor | None = None
         # The recurrent state dtype every layer shares (validate_cache_pool).
         self._retained_state_dtype: torch.dtype | None = None
@@ -365,8 +347,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 raise ValueError(
                     "retained KDA cache requires supported target verify geometry"
                 )
-            # One commit and fold launch serves every layer, and every layer
-            # of a request decides its fold from the same page bound.
+            # One commit and fold launch serves every layer, and the commit
+            # publishes a request's count against one page bound for all.
             geometries.add(
                 (pages, heads, dim, conv.dtype, recurrent.dtype, recurrent.device)
             )
@@ -395,15 +377,14 @@ class KdaAttnBackend(CapacityPrefillBackend):
         super()._reset_graph_state()
         self._retained_histories: dict[tuple[int, int], KdaRetainedHistory] = {}
 
-    def _history_for_rows(self, layer_id, live_indices, record_slots, lengths):
-        """One layer's records for ``record_slots``, applying ``lengths``."""
+    def _history_for_rows(self, layer_id, live_indices, record_slots):
         row = self._descriptor_row_by_layer[layer_id]
         correction, key, decay = self._retained_records[:, row].unbind(1)
         return KdaRetainedHistory(
             correction,
             key,
             decay,
-            lengths,
+            self._replay_length,
             live_indices,
             record_slots,
         )
@@ -413,10 +394,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         history = self._retained_histories.get(key)
         if history is None or history.live_state_indices is not live_indices:
             history = self._history_for_rows(
-                layer_id,
-                live_indices,
-                self._record_slots[: live_indices.numel()],
-                self._replay_start,
+                layer_id, live_indices, self._record_slots[: live_indices.numel()]
             )
             self._retained_histories[key] = history
         return history
@@ -473,9 +451,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 _, recurrent = self._state_components(layer_id)
                 kda_materialize_retained_pages(
                     recurrent,
-                    history=self._history_for_rows(
-                        layer_id, group_pages, group_slots, self._replay_length
-                    ),
+                    history=self._history_for_rows(layer_id, group_pages, group_slots),
                     source_indices=group_pages,
                     recurrent_layout=self.kda_recurrent_layout,
                 )
@@ -505,85 +481,31 @@ class KdaAttnBackend(CapacityPrefillBackend):
             dtype=dtype,
         )
         if self._retained_records is not None:
-            # The forward's metadata already cleared the counts of rows whose
-            # scan stores a dense live page; every layer reads the snapshot
-            # it took (_snapshot_prefill_lengths).
             slots = self.forward_metadata.req_pool_indices
-            history = self._history_for_rows(
-                layer_id, live_indices, slots, self._replay_start
-            )
+            history = self._history_for_rows(layer_id, live_indices, slots)
             kda_materialize_retained_state(
                 recurrent,
                 history=history,
                 source_indices=source_indices,
                 recurrent_layout=self.kda_recurrent_layout,
             )
+            # The scan starts from the gathered logical state and stores a
+            # dense one into the live page, so these rows' slots hold no
+            # accepted records any more. Every layer's gather reads the count
+            # they share, so it clears once, after the last layer's gather,
+            # in a launch ordered behind it.
+            if layer_id == self._state_layer_ids()[-1]:
+                kda_reset_retained_length(
+                    self._replay_length,
+                    write_indices=live_indices,
+                    record_slots=slots,
+                    page_count=recurrent_states.shape[0],
+                )
         return recurrent, initial
 
     def _state_page_count(self) -> int:
         """The State pool's page count, which every KDA layer shares."""
         return self._state_components(self._state_layer_ids()[0])[1].shape[0]
-
-    @override
-    def init_forward_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        **kwargs,
-    ) -> None:
-        super().init_forward_metadata(
-            bs, num_extends, req_pool_indices, seq_lens, forward_mode, **kwargs
-        )
-        if num_extends and not forward_mode.is_idle():
-            self._snapshot_prefill_lengths(num_extends)
-
-    @override
-    def report_request_faults(
-        self, request_ends: torch.Tensor, *, num_extends: int
-    ) -> None:
-        if (
-            not num_extends
-            or self._replay_faults is None
-            or not self._replay_faults.is_cuda
-        ):
-            # No extend row, or no decode workspace (prefill-only engines,
-            # CPU-only metadata tests): no snapshot ran.
-            return
-        kda_report_retained_faults(
-            request_ends[:num_extends],
-            self._replay_faults,
-            record_slots=self.forward_metadata.req_pool_indices[:num_extends],
-        )
-
-    def _snapshot_prefill_lengths(self, num_extends: int) -> None:
-        """Hand the extend rows' counts to every layer's gather, clearing them.
-
-        Each layer's gather applies the records its row's start count covers,
-        and its scan stores a dense live page holding them, so the shared
-        count clears here, once, before any layer runs: eager or replayed,
-        whole or split from a mixed forward's decode rows.
-        """
-        if self._replay_length is None or not self._replay_length.is_cuda:
-            # No decode workspace (a prefill-only engine), or CPU-only
-            # metadata tests, which run no kernels.
-            return
-        metadata = self.forward_metadata
-        kda_snapshot_retained_length(
-            self._replay_length,
-            self._replay_start,
-            self._replay_faults,
-            record_slots=metadata.req_pool_indices[:num_extends],
-            live_indices=torch.stack(
-                [
-                    metadata.state_out_blocks_by_group[group_id][:num_extends]
-                    for group_id in self._state_groups()
-                ]
-            ),
-            page_count=self._state_page_count(),
-        )
 
     @override
     def reset_request_workspace(
@@ -601,7 +523,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             with stream_scope(stream):
                 slots = request_slots.to(device=self.device, dtype=torch.int64)
                 self._replay_length.index_fill_(0, slots, 0)
-                self._replay_faults.index_fill_(0, slots, 0)
 
     @override
     def import_slot_state(
@@ -616,7 +537,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._replay_length is not None:
             with stream_scope(stream):
                 self._replay_length[slot].zero_()
-                self._replay_faults[slot].zero_()
 
     def _allocate_replay_workspace(self) -> None:
         """Allocate max_bs * T original QKV rows before eager or graph execution.
@@ -669,11 +589,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
             self._replay_length = torch.zeros(
                 (self._record_slot_count, 1), dtype=torch.int32, device=self.device
-            )
-            self._replay_start = torch.zeros_like(self._replay_length)
-            self._replay_faults = torch.zeros_like(self._replay_length)
-            self._commit_verdicts = torch.zeros(
-                (self.max_bs, len(layer_ids)), dtype=torch.int8, device=self.device
             )
             self._record_slots = torch.zeros(
                 self.max_bs, dtype=torch.int64, device=self.device
@@ -879,16 +794,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
         """Ready every layer's retained history for this round's verify.
 
         One launch for all layers, ordered after the refresh wrote the
-        round's pages, boundaries and record slots and before the forward. A
-        request that moves to a private live block in any state group, or
-        whose accepted count plus the round's window exceeds the history
-        capacity (a shorter row folds like a full one: verify reads at most
-        capacity - window records), gets its source state with its records
-        applied in its live block, in every layer. The launch stores each
-        request's round-start count -- 0 after a fold, else its count -- and
-        leaves the count itself to the commit, its only writer. Verify then
-        reads only live blocks and start counts, and never writes a block or
-        a count.
+        round's pages, boundaries and record slots and before the forward.
+        Verify reads at most capacity - window records, so a request whose
+        shared count exceeds that overflows: every layer gets its source state
+        with the records applied in its live block, and the verify and the
+        commit apply none. Otherwise a request that moves to a private live
+        block gets its source state copied there in that group's layers, and
+        its records stay valid on top of it. The launch only reads the count;
+        the commit is its only writer in a decode round. Verify then reads
+        only live blocks, and never writes a block or a count.
         """
         if not self._replay_descriptors.is_cuda:
             # CPU-only metadata tests run no kernels, as in the record refresh.
@@ -922,8 +836,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_key=key,
             retained_decay=decay,
             replay_length=self._replay_length,
-            replay_start=self._replay_start,
-            replay_faults=self._replay_faults,
             history_capacity=capacity,
             draft_token_num=self.speculative_num_draft_tokens,
             num_heads=heads,
@@ -987,8 +899,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self._retained_qkv.nbytes
             + self._retained_records.nbytes
             + self._replay_length.nbytes
-            + self._replay_start.nbytes
-            + self._replay_faults.nbytes
         )
         metadata_bytes = sum(
             tensor.nbytes
@@ -1002,7 +912,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 self._replay_record_metadata,
                 self._replay_record_stamps,
                 self._record_slots,
-                self._commit_verdicts,
             )
             if tensor is not None
         )
@@ -1185,12 +1094,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
         correction, key, decay = self._retained_records.unbind(2)
         # The planner clamps each active interval to at least one accepted
-        # token. A layer whose verify did not run this round therefore fails
-        # the generation-stamp check and leaves its cache fields unchanged;
-        # every layer of a request shares its count, so a request still
-        # decoding that some layers accept and others reject, or whose slot
-        # the prepare found unsound, keeps its count, and its row in
-        # request_ends says its state is inconsistent. A request that
+        # token. Every layer of a request shares its count, which the second
+        # launch writes once from the round's acceptance. A request that
         # ended in this forward has its records folded into its live block,
         # which its finish publishes; if a layer that carried it rejects its
         # commit, its row in request_ends says the block is incomplete.
@@ -1211,9 +1116,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_key=key,
             retained_decay=decay,
             replay_length=self._replay_length,
-            replay_start=self._replay_start,
-            replay_faults=self._replay_faults,
-            commit_verdicts=self._commit_verdicts,
             request_stopped=self._request_stopped,
             request_ends=self._request_ends[first_row : first_row + bs],
             draft_token_num=draft_token_num,

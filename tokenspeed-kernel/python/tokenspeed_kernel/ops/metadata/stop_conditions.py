@@ -30,10 +30,7 @@ overlap schedule already dispatched behind it then keeps nothing. Each row
 also reports to the control plane whether the device ended its request, so
 the control plane publishes a deferred decode state only on the device's
 word: ``REQUEST_ENDED``, which a deferred-state commit that could not
-complete the row's state raises to ``REQUEST_ENDED_INCOMPLETE``. A backend
-that finds a row's deferred decode state inconsistent raises it to
-``REQUEST_DECODE_STATE_INCONSISTENT``, running or ended; the control plane
-stops on either.
+complete the row's state raises to ``REQUEST_ENDED_INCOMPLETE``.
 """
 
 from __future__ import annotations
@@ -49,18 +46,11 @@ from tokenspeed_kernel.signature import (
     format_signatures,
 )
 
-__all__ = [
-    "REQUEST_DECODE_STATE_INCONSISTENT",
-    "REQUEST_ENDED",
-    "REQUEST_ENDED_INCOMPLETE",
-    "apply_stop_conditions",
-]
+__all__ = ["REQUEST_ENDED", "REQUEST_ENDED_INCOMPLETE", "apply_stop_conditions"]
 
 # A row's ``request_ends`` entry: 0 while its request runs on the device.
-# Backends only raise an entry, so the largest code a forward reports wins.
 REQUEST_ENDED = 1
 REQUEST_ENDED_INCOMPLETE = 2
-REQUEST_DECODE_STATE_INCONSISTENT = 3
 
 _BLOCK = 64
 
@@ -262,8 +252,7 @@ def apply_stop_conditions(
         request_ends: ``[batch]`` int32, written for every row:
             ``REQUEST_ENDED`` when the device ended the row's request, in
             this forward or an earlier one, else 0. A later commit that
-            defers decode state may raise it to ``REQUEST_ENDED_INCOMPLETE``
-            or ``REQUEST_DECODE_STATE_INCONSISTENT``.
+            defers decode state may raise it to ``REQUEST_ENDED_INCOMPLETE``.
         num_extends: Leading requests that are extends.
         num_prefill_outputs: Leading extend requests that sampled a token.
         decode_width: Output tokens per decode request.

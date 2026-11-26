@@ -118,21 +118,8 @@ def make_case(
     )
 
 
-# Each history's INT32 [slots, 1] retained faults, kept for graph capture.
-_FAULTS: dict[tuple, torch.Tensor] = {}
-
-
-def retained_faults(history):
-    """The retained faults the prepare and commit keep beside ``history``."""
-    key = (history.length.data_ptr(), tuple(history.length.shape))
-    if key not in _FAULTS:
-        _FAULTS[key] = torch.zeros_like(history.length)
-    return _FAULTS[key]
-
-
-# One layer's (descriptor, group index, accepted counts) per layout, kept for
-# graph capture.
-_PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+# One layer's (descriptor, group index) pair per layout, kept for graph capture.
+_PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def prepare_history(
@@ -141,28 +128,25 @@ def prepare_history(
     """Ready one layer's retained history for its verify, as serving does.
 
     Serving prepares every layer in one launch before the forward; this runs
-    the same batched prepare over a single layer. history.length holds each
-    slot's accepted count on entry and the round's start count, which the
-    verify reads, on return: rows that move to a private live page, or whose
-    records plus the verify's window (draft_token_num) overflow the history
-    capacity, get their source state with accepted records applied in their
-    live page and start at 0. The prepare reads the counts from a copy, as
-    serving keeps them apart from the start counts it writes.
+    the same batched prepare over a single layer. Rows whose count in
+    history.length exceeds the history capacity minus the verify's window
+    (draft_token_num) get their source state with accepted records applied
+    in their live page, and the verify then applies none; other rows that
+    move to a private live page get their source state copied there. The
+    counts stay as they are.
     """
     # Only the page count and recurrent-state columns are read before verify.
     row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
     row[2] = state_pool.shape[0]
     row[7:12] = state_pool.data_ptr(), *state_pool.stride()
     # Uploaded on the first, eager call; a CUDA-graph capture reuses it.
-    key = (*row, history.length.data_ptr(), str(state_pool.device))
+    key = (*row, str(state_pool.device))
     if key not in _PREPARED_LAYERS:
         _PREPARED_LAYERS[key] = (
             torch.tensor([row], device=state_pool.device, dtype=torch.uint64),
             torch.zeros(1, device=state_pool.device, dtype=torch.int32),
-            torch.empty_like(history.length),
         )
-    descriptors, group_indices, counts = _PREPARED_LAYERS[key]
-    counts.copy_(history.length)
+    descriptors, group_indices = _PREPARED_LAYERS[key]
     _, heads, dim, _ = state_pool.shape
     prepare = kda.resolve_kda_batched_retained_prepare(
         torch.bfloat16, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
@@ -179,9 +163,7 @@ def prepare_history(
         retained_correction=history.correction[:, None],
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
-        replay_length=counts,
-        replay_start=history.length,
-        replay_faults=retained_faults(history),
+        replay_length=history.length,
         history_capacity=history.correction.shape[2],
         draft_token_num=draft_token_num,
         num_heads=heads,
@@ -425,15 +407,10 @@ def _run_commit(
     record_stamps,
     request_stopped,
     request_ends,
-    commit_verdicts,
     activation_dtype,
     conv_state_dtype,
 ):
-    """Run the production batched retained commit over a single layer.
-
-    history.length is both the round's start count and the count the commit
-    advances: one layer reads and writes them in separate launches.
-    """
+    """Run the production batched retained commit over a single layer."""
     heads, dim = state.shape[1], state.shape[-1]
     kernel = kda.resolve_kda_batched_retained_commit(
         activation_dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
@@ -454,9 +431,6 @@ def _run_commit(
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
         replay_length=history.length,
-        replay_start=history.length,
-        replay_faults=retained_faults(history),
-        commit_verdicts=commit_verdicts,
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=width,
@@ -507,9 +481,6 @@ def commit(case, accepted, *, ended_slots):
         record_stamps=records.stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
-        commit_verdicts=torch.zeros(
-            accepted.numel(), 1, device="cuda", dtype=torch.int8
-        ),
         activation_dtype=qkv.dtype,
         conv_state_dtype=conv.dtype,
     )
@@ -591,18 +562,10 @@ def publish(
             torch.zeros(1, device=device, dtype=torch.int32),
             torch.zeros(history.length.shape[0], device=device, dtype=torch.bool),
             torch.zeros(batch, device=device, dtype=torch.int32),
-            # Verdict scratch: zero means every layer accepted.
-            torch.zeros(batch, 1, device=device, dtype=torch.int8),
         )
-    (
-        qkv,
-        window,
-        descriptors,
-        group_indices,
-        request_stopped,
-        request_ends,
-        commit_verdicts,
-    ) = _PUBLISHED_LAYERS[layout]
+    qkv, window, descriptors, group_indices, request_stopped, request_ends = (
+        _PUBLISHED_LAYERS[layout]
+    )
     _run_commit(
         descriptors=descriptors,
         group_indices=group_indices,
@@ -616,7 +579,6 @@ def publish(
         record_stamps=record_stamps,
         request_stopped=request_stopped,
         request_ends=request_ends,
-        commit_verdicts=commit_verdicts,
         activation_dtype=qkv.dtype,
         conv_state_dtype=window.dtype,
     )

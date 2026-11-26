@@ -20,7 +20,10 @@
 
 """Retained-history arguments and loads shared by the CuTe verify kernels."""
 
+import cutlass
 from cutlass import Float32, Int32, Int64, cute
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @cute.jit
@@ -43,11 +46,11 @@ def retained_row(history, request):
 
 
 @cute.jit
-def retained_length(history, slot):
-    """Accepted records the request in ``slot`` applies to its dense base.
+def retained_count(history, slot):
+    """The accepted-record count stored for the request in ``slot``.
 
-    The round's start count the prepare stored for the slot: every layer
-    reads the same one.
+    Every layer of a request shares the slot's count. A verify applies
+    ``applied_length`` of it.
     """
     length = history[4]
     return Int32(
@@ -55,6 +58,43 @@ def retained_length(history, slot):
             length.iterator + Int64(slot) * length.stride[0], cute.make_layout((1,))
         )[0]
     )
+
+
+@dsl_user_op
+def applied_length(count: Int32, limit: int, *, loc=None, ip=None) -> Int32:
+    """The records a verify applies of a stored ``count``.
+
+    ``limit`` is the history capacity minus the verify window: a count
+    outside [0, limit] overflowed, and the round's prepare folded its records
+    into the live page, so the verify applies none.
+
+    One select in inline PTX, placed by the caller: ptxas keeps it where it
+    is written, so a kernel that loads the count early bounds it only where
+    every warp uses it, and the loads issued before do not wait for the
+    count. The compilers see no bound on the result either, so the record
+    loads keep the schedule they have for the stored count.
+    """
+    if limit < 0:
+        return Int32(0)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(count).ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; setp.le.u32 p, $1, %d; selp.b32 $0, $1, 0, p; }" % limit,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def retained_length(history, slot, limit: cutlass.Constexpr[int]):
+    """``applied_length`` of the slot's count, for a caller that uses it at once."""
+    return applied_length(retained_count(history, slot), limit)
 
 
 def retained_arguments(state, history):
@@ -73,7 +113,7 @@ def fake_retained_arguments(state, correction, key, *, batch, live_dtype, slot_d
     from quack.compile_utils import make_fake_tensor
 
     decay = make_fake_tensor(Float32, key.shape, leading_dim=None)
-    # The round's start count of each request slot, beside its records.
+    # One accepted-record count per request slot, beside its records.
     length = make_fake_tensor(Int32, (correction.shape[0], 1))
     live = make_fake_tensor(live_dtype, (batch,))
     record_slots = make_fake_tensor(slot_dtype, (batch,), leading_dim=None)

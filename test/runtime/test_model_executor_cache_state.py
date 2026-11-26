@@ -224,9 +224,6 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
 
     executor.attn_backend = CachePoolBinding()
-    # Per row, whether the device ended the request, as ModelExecutor.__init__
-    # sizes it; the forward step reports deferred-state faults into it.
-    executor.request_ends = torch.zeros(1, dtype=torch.int32)
     executor.device_module = SimpleNamespace(current_stream=lambda: None)
     executor.forward_step = SimpleNamespace(draft_overlap=None)
     executor.input_buffers = SimpleNamespace(

@@ -2117,12 +2117,6 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
-        # The stop conditions have written request_ends: a fault found before
-        # them (an extend row's deferred state) reaches the report only now; a
-        # decode commit reports its own.
-        self.attn_backend.report_request_faults(
-            self.request_ends[: ctx.bs], num_extends=ctx.num_extends
-        )
 
         # Offloading must persist accepted target-input KV before completion
         # can publish prefixes or allow a scheduler request slot to be reused.

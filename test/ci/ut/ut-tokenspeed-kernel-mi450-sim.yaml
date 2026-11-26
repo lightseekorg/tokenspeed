@@ -74,7 +74,7 @@ env:
     # packed convolution, uneven groups, stamps, and graph metadata refresh.
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_materialize_shared_source_and_reset_private_lengths[v_major]
-    tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_batched_retained_commit_packed_groups_and_stamps[4]
+    tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_batched_retained_commit_packed_groups_and_stamps[False-4]
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_public_retained_verify_keeps_shared_source_and_materializes_endpoint[1-False]
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_public_retained_verify_keeps_shared_source_and_materializes_endpoint[4-False]
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_packed_verify_convolution_uses_request_boundaries

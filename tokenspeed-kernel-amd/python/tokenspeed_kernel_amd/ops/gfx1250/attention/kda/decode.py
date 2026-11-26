@@ -310,12 +310,16 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         gl.int64
     )
     slot = gl.load(record_slots + sequence_idx.to(gl.int64) * slot_stride).to(gl.int64)
-    # Candidates append after the request slot's accepted records.
+    # Candidates append after the request slot's accepted records. Every
+    # layer shares the slot's count; one outside
+    # [0, CAPACITY - TOKENS_PER_SEQUENCE] overflowed, and the prepare folded
+    # its records into the live page, so none apply.
     start = gl.load(
         retained_length + slot * length_stride,
         mask=(slot >= 0) & (slot < slot_count),
         other=-1,
     ).to(gl.int64)
+    start = gl.where((start < 0) | (start > CAPACITY - TOKENS_PER_SEQUENCE), 0, start)
     valid_read = (
         (read_idx > 0)
         & (read_idx < NUM_POOL_SLOTS)

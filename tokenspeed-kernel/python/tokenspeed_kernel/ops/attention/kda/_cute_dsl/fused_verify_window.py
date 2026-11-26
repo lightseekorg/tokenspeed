@@ -94,9 +94,10 @@ NORM_GROUPS = DIM // 32
 
 
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    applied_length,
     fake_retained_arguments,
     retained_arguments,
-    retained_length,
+    retained_count,
     retained_row,
 )
 
@@ -474,14 +475,18 @@ class FusedVerifyWindow(RecoverSsmVerify):
             # Pairs with the wait before the first store into a peer.
             cute.arch.cluster_arrive_relaxed()
         cute.arch.barrier()
-        # Loaded once, early: phase 1 branches on it.
+        # Loaded once, early: phase 1 branches on it. Bounded by
+        # ``applied_length`` only once every warp uses it, after the row loads.
         count = Int32(0)
         history_keys, history_decays, history_us = self._early_history_registers()
         if const_expr(self.preload_history_channel):
             history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
             history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
         if live:
-            count = retained_length(retained, slot)
+            count = retained_count(retained, slot)
+            if const_expr(self.early_history_loads):
+                # The early record loads branch on it at once.
+                count = applied_length(count, self.capacity - W)
             self._start_early_history(
                 retained,
                 slot,
@@ -584,6 +589,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
             gate_inputs = [_ldg_b32x2(address) for address in gate_addresses]
             raw_beta = _load(beta, beta_offset)
             logits = [_load(gate, offset) for offset in logit_offsets]
+            if const_expr(not self.early_history_loads):
+                # Every warp uses the count from here on.
+                count = applied_length(count, self.capacity - W)
             if const_expr(self.copy_records):
                 if live:
                     self._copy_records(

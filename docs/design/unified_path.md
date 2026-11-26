@@ -643,13 +643,11 @@ groups). Each batch size's buffers are the rows of one `[groups, bs]` table
 reads those buffers before the next refresh rewrites them. KDA's refresh then
 readies every layer's retained history in one launch, outside the graph and
 ahead of the replay, the eager forward or a mixed forward's decode rows: a
-request that moves to its live block in any State group, or would overflow the
-history capacity, folds its accepted records into its live blocks, and every
-request's round-start count lands in a persistent request-slot buffer, so
-verify only reads live blocks and that count
-(`KdaAttnBackend._prepare_retained_history`). An extend's metadata likewise
-hands its rows' counts to the layers' gathers and clears them once, eager or
-replayed.
+request whose accepted count would overflow the history capacity folds its
+records into its live blocks, and one that moves to a live block gets its
+dense base copied there, so verify only reads live blocks
+(`KdaAttnBackend._prepare_retained_history`). An extend clears its rows'
+counts once, after the last KDA layer's gather, eager or replayed.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
