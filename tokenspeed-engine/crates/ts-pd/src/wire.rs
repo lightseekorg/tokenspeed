@@ -421,7 +421,9 @@ impl StatusMessage {
             Some(frame) if !frame.is_empty() => {
                 // Packed int32 rows hold a sampled ID, tail bits and K ID/logq pairs.
                 if frame.len() < 16 || frame.len() % 8 != 0 {
-                    return Err(error("the full-vocabulary Top-K row has invalid byte length"));
+                    return Err(error(
+                        "the full-vocabulary Top-K row has invalid byte length",
+                    ));
                 }
                 Some(frame.to_vec())
             }

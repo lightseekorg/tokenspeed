@@ -629,7 +629,14 @@ impl TransferPeer for FakePeer {
         Ok(events)
     }
 
-    fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>, _bootstrap_topk_row: Option<Vec<u8>>) {}
+    fn record_usage(
+        &mut self,
+        _rid: &str,
+        _cached_tokens: i64,
+        _bootstrap_logprob: Option<f64>,
+        _bootstrap_topk_row: Option<Vec<u8>>,
+    ) {
+    }
 
     fn has_in_flight(&self) -> bool {
         !self.tracked.is_empty()

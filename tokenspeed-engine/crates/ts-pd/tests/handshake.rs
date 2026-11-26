@@ -71,11 +71,17 @@ fn a_request_bootstraps_transfers_and_lands() {
         PdEvent::Bootstrapped(rid.to_owned())
     );
     // The prompt's last chunk commits, then its remote decode runs.
-    let topk_row: Vec<u8> = [777, (-1.0_f32).to_bits() as i32, 777, (-0.5_f32).to_bits() as i32]
-        .into_iter()
-        .flat_map(i32::to_le_bytes)
-        .collect();
-    pair.prefill.record_usage(rid, 128, Some(-0.5), Some(topk_row.clone()));
+    let topk_row: Vec<u8> = [
+        777,
+        (-1.0_f32).to_bits() as i32,
+        777,
+        (-0.5_f32).to_bits() as i32,
+    ]
+    .into_iter()
+    .flat_map(i32::to_le_bytes)
+    .collect();
+    pair.prefill
+        .record_usage(rid, 128, Some(-0.5), Some(topk_row.clone()));
     pair.send(rid, 777, vec![1, 2, 3]).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),

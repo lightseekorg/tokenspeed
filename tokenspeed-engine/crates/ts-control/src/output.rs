@@ -1099,14 +1099,26 @@ impl OutputProcessor {
         }
         state.cached_tokens = cached_tokens;
         if state.full_vocab_top_k > 0 {
-            let packed = bootstrap_topk_row.zip(bootstrap_logprob).and_then(|(mut row, logprob)| {
-                ts_wire::topk::validate_row(&mut row, bootstrap_token, logprob, state.full_vocab_top_k, state.full_vocab_topk_vocab_size)
-                    .is_ok().then_some(row)
-            });
+            let packed =
+                bootstrap_topk_row
+                    .zip(bootstrap_logprob)
+                    .and_then(|(mut row, logprob)| {
+                        ts_wire::topk::validate_row(
+                            &mut row,
+                            bootstrap_token,
+                            logprob,
+                            state.full_vocab_top_k,
+                            state.full_vocab_topk_vocab_size,
+                        )
+                        .is_ok()
+                        .then_some(row)
+                    });
             match packed {
                 Some(row) => state.output_full_vocab_topk.extend(row),
                 None => {
-                    state.finished_reason = Some(FinishReason::abort("remote prefill omitted or corrupted its full-vocabulary row"));
+                    state.finished_reason = Some(FinishReason::abort(
+                        "remote prefill omitted or corrupted its full-vocabulary row",
+                    ));
                     return;
                 }
             }
@@ -1635,7 +1647,10 @@ impl OutputProcessor {
                 .output_token_cumulative_probs
                 .as_ref()
                 .map(|probs| window(probs, pt, output_length));
-            let model_full_vocab = result.full_vocab_topk.as_ref().map(|rows| window_ref(rows, pt, output_length));
+            let model_full_vocab = result
+                .full_vocab_topk
+                .as_ref()
+                .map(|rows| window_ref(rows, pt, output_length));
             let is_decode = i >= batch.num_extends;
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
@@ -1778,8 +1793,15 @@ impl OutputProcessor {
                     match model_full_vocab.and_then(|rows| rows.get(j)) {
                         Some((logprob, packed)) => {
                             let mut packed = packed.clone();
-                            if let Err(error) = ts_wire::topk::validate_row(&mut packed, token, *logprob, state.full_vocab_top_k, state.full_vocab_topk_vocab_size) {
-                                state.finished_reason = Some(FinishReason::abort(error.to_string()));
+                            if let Err(error) = ts_wire::topk::validate_row(
+                                &mut packed,
+                                token,
+                                *logprob,
+                                state.full_vocab_top_k,
+                                state.full_vocab_topk_vocab_size,
+                            ) {
+                                state.finished_reason =
+                                    Some(FinishReason::abort(error.to_string()));
                                 invalid_full_vocab = true;
                                 break;
                             }
@@ -1811,7 +1833,9 @@ impl OutputProcessor {
                     }
                 }
                 if state.return_logprob {
-                    if let Some(lp) = full_logprob.or_else(|| model_logprobs.as_ref().and_then(|lps| lps.get(j)).copied()) {
+                    if let Some(lp) = full_logprob
+                        .or_else(|| model_logprobs.as_ref().and_then(|lps| lps.get(j)).copied())
+                    {
                         state.output_logprobs.push(lp);
                     }
                     if let Some(prob) = model_cumulative_probs
@@ -1896,7 +1920,11 @@ impl OutputProcessor {
             // P role: the final chunk's drafter candidates ride its result,
             // so the remote decode the scheduler emits is self-contained.
             let mut spec_candidate_ids = Vec::new();
-            if self.role == Role::Prefill && !model_ids.is_empty() && !nan_detected && !invalid_full_vocab {
+            if self.role == Role::Prefill
+                && !model_ids.is_empty()
+                && !nan_detected
+                && !invalid_full_vocab
+            {
                 if let Some(candidates) =
                     result.next_input_ids.as_ref().and_then(|rows| rows.get(i))
                 {
@@ -2089,7 +2117,11 @@ impl OutputProcessor {
             spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
             input_logprobs,
             output_top_logprobs,
-            output_full_vocab_topk: state.output_full_vocab_topk.get(sent * (2 + 2 * state.full_vocab_top_k) * 4..).unwrap_or(&[]).to_vec(),
+            output_full_vocab_topk: state
+                .output_full_vocab_topk
+                .get(sent * (2 + 2 * state.full_vocab_top_k) * 4..)
+                .unwrap_or(&[])
+                .to_vec(),
         })
     }
 
@@ -2617,7 +2649,8 @@ mod tests {
                             10,
                             1,
                             None,
-                            None, (SystemTime::now(), Instant::now()),
+                            None,
+                            (SystemTime::now(), Instant::now()),
                         );
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -2742,7 +2775,14 @@ mod tests {
             let remote_admitted = trace.remote_admitted_ms.unwrap();
             assert!(trace.planned_ms.is_none());
 
-            processor.remote_prefill_done("r", 10, 0, None, None, (SystemTime::now(), Instant::now()));
+            processor.remote_prefill_done(
+                "r",
+                10,
+                0,
+                None,
+                None,
+                (SystemTime::now(), Instant::now()),
+            );
             processor.mark_planned(&["r".into()], false);
             processor.mark_scheduled(&["r".into()]);
             let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
@@ -3079,12 +3119,26 @@ mod tests {
         assert!(p.take_decode_ready_at("a").is_none());
 
         register(&mut p, "cancelled", 4, 8, &[]);
-        p.remote_prefill_done("cancelled", 7, 0, None, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "cancelled",
+            7,
+            0,
+            None,
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         p.states.get_mut("cancelled").unwrap().to_abort = true;
         assert!(p.take_decode_ready_at("cancelled").is_none());
 
         register(&mut p, "finished", 4, 1, &[]);
-        p.remote_prefill_done("finished", 7, 0, None, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "finished",
+            7,
+            0,
+            None,
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         p.finish_remote_prefill_only("finished");
         assert!(p.take_decode_ready_at("finished").is_none());
     }
@@ -3607,7 +3661,14 @@ mod tests {
         );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "r",
+            9,
+            0,
+            Some(-0.25),
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             ..result(&[10], &[1])
@@ -3637,7 +3698,14 @@ mod tests {
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "r",
+            9,
+            0,
+            Some(-0.25),
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             output_token_cumulative_probs: Some(vec![0.375]),

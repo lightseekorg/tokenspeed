@@ -30,7 +30,11 @@ pub fn row_bytes(k: usize) -> usize {
 /// Validate an accepted output row and clamp only tiny positive tail roundoff.
 /// The row is little endian and must match the emitted token and logprob.
 pub fn validate_row(
-    row: &mut [u8], token: i32, logprob: f64, k: usize, vocab_size: i64,
+    row: &mut [u8],
+    token: i32,
+    logprob: f64,
+    k: usize,
+    vocab_size: i64,
 ) -> Result<()> {
     let invalid = |reason: &str| Error::Invalid(format!("full-vocabulary top-k: {reason}"));
     if !(1..=128).contains(&k) || row.len() != row_bytes(k) {

@@ -540,9 +540,12 @@ fn refusal(
     }
     if request.full_vocab_topk {
         let k = limits.logprobs.full_vocab_top_k;
-        if !request.return_logprob || request.stream || !(1..=128).contains(&k)
+        if !request.return_logprob
+            || request.stream
+            || !(1..=128).contains(&k)
             || !limits.logprobs.blockwise_logprob_order
-            || request.top_logprobs_num != k as i64 || k as i64 > limits.vocab_size
+            || request.top_logprobs_num != k as i64
+            || k as i64 > limits.vocab_size
             || limits.logprobs.pipeline_parallel
         {
             return Some("binary full-vocabulary top-k requires non-streaming output logprobs, no pipeline, and top_logprobs_num equal to --full-vocab-top-k".to_owned());
@@ -550,14 +553,24 @@ fn refusal(
         if request.logprob_start_len >= 0 && request.logprob_start_len < input_len as i64 - 1 {
             return Some("binary full-vocabulary top-k reports output positions only".to_owned());
         }
-        if params.temperature != 1.0 || params.top_p != 1.0 || params.min_p != 0.0
+        if params.temperature != 1.0
+            || params.top_p != 1.0
+            || params.min_p != 0.0
             || (params.top_k != -1 && params.top_k < limits.vocab_size)
-            || params.frequency_penalty != 0.0 || params.presence_penalty != 0.0
-            || params.repetition_penalty != 1.0 || params.min_new_tokens != 0
-            || params.json_schema.is_some() || params.regex.is_some() || params.ebnf.is_some()
-            || params.structural_tag.is_some() || params.thinking_budget.is_some()
+            || params.frequency_penalty != 0.0
+            || params.presence_penalty != 0.0
+            || params.repetition_penalty != 1.0
+            || params.min_new_tokens != 0
+            || params.json_schema.is_some()
+            || params.regex.is_some()
+            || params.ebnf.is_some()
+            || params.structural_tag.is_some()
+            || params.thinking_budget.is_some()
             || params.logit_bias.as_ref().is_some_and(|v| !v.0.is_empty())
-            || params.custom_params.as_ref().is_some_and(|v| !v.0.is_empty())
+            || params
+                .custom_params
+                .as_ref()
+                .is_some_and(|v| !v.0.is_empty())
         {
             return Some("binary full-vocabulary top-k requires the original temperature-1 model distribution without truncation, penalties, constraints or processors".to_owned());
         }

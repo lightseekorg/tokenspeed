@@ -262,7 +262,10 @@ impl BatchTokenIDOutSlim {
         Ok((0..len).map(move |i| RequestOutput {
             request_timing: self.request_timing.get(i).and_then(Option::as_ref),
             rid: &rids[i],
-            output_full_vocab_topk: self.output_full_vocab_topk.get(i).map_or(&[], Bytes::as_ref),
+            output_full_vocab_topk: self
+                .output_full_vocab_topk
+                .get(i)
+                .map_or(&[], Bytes::as_ref),
             output_ids: &self.output_ids[i],
             finish_reason: Some(self.finished_reasons[i].as_str()).filter(|r| !r.is_empty()),
             prompt_tokens: self.prompt_tokens[i],

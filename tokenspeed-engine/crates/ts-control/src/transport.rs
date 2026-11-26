@@ -446,7 +446,9 @@ pub fn output_batch(
         let (top_values, top_ids) = output.output_top_logprobs.unwrap_or_default();
         batch.output_top_logprobs_val.push(top_values);
         batch.output_top_logprobs_idx.push(top_ids);
-        batch.output_full_vocab_topk.push(output.output_full_vocab_topk.into());
+        batch
+            .output_full_vocab_topk
+            .push(output.output_full_vocab_topk.into());
     }
     // Each optional column is per request only in a frame where some
     // request has an entry.
@@ -464,7 +466,11 @@ pub fn output_batch(
     frame_column(&mut batch.input_top_logprobs_idx);
     frame_column(&mut batch.output_top_logprobs_val);
     frame_column(&mut batch.output_top_logprobs_idx);
-    if batch.output_full_vocab_topk.iter().all(|rows| rows.is_empty()) {
+    if batch
+        .output_full_vocab_topk
+        .iter()
+        .all(|rows| rows.is_empty())
+    {
         batch.output_full_vocab_topk.clear();
     }
     frame_column(&mut batch.output_token_cumulative_probs_val);
