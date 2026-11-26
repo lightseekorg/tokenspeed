@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
@@ -72,8 +72,9 @@ def _make_wrapper() -> BatchSparseMLADecodePagedTSWrapper:
 @dataclass
 class _SparsePlan:
     wrapper: Any
-    offsets: dict[int, torch.Tensor] = field(default_factory=dict)
-    full_lengths: dict[int, torch.Tensor] = field(default_factory=dict)
+    base_offsets: torch.Tensor
+    offsets: torch.Tensor
+    full_lengths: torch.Tensor
     run_initialized: bool = False
 
 
@@ -168,7 +169,23 @@ def _get_plan(
                 return_lse=return_lse,
                 assume_valid_prefix=False,
             )
-        plan = _SparsePlan(wrapper)
+            base_offsets = (
+                torch.arange(batch_capacity + 1, device=q.device, dtype=torch.int32)
+                * query_width
+            )
+            offsets = base_offsets.clone()
+            full_lengths = torch.full(
+                (batch_capacity * query_width,),
+                topk,
+                device=q.device,
+                dtype=torch.int32,
+            )
+        plan = _SparsePlan(
+            wrapper=wrapper,
+            base_offsets=base_offsets,
+            offsets=offsets,
+            full_lengths=full_lengths,
+        )
         if warming:
             _warmed_plans[key] = plan
         else:
@@ -180,18 +197,6 @@ def _get_plan(
         _plans.pop(key, None)
     elif key in _plans:
         _plans.move_to_end(key)
-    if rows not in plan.offsets:
-        if capturing:
-            raise RuntimeError("warm up the Prims-TS DSA row count before capture")
-        with _WORKSPACE_REGION():
-            plan.offsets[rows] = torch.tensor(
-                [min(i * query_width, rows) for i in range(batch_capacity + 1)],
-                device=q.device,
-                dtype=torch.int32,
-            )
-            plan.full_lengths[rows] = torch.full(
-                (rows,), topk, device=q.device, dtype=torch.int32
-            )
     if capturing:
         retain_for_capture(plan)
         _captured_plans[key] = plan
@@ -221,7 +226,15 @@ def _run_plan(
         query_width=query_width,
         return_lse=return_lse,
     )
-    lengths = plan.full_lengths[rows] if topk_lens is None else topk_lens
+    # Clamp preallocated offsets on-device for partial buckets so unseen row
+    # counts never allocate persistent tensors or trigger H2D syncs.
+    max_rows = plan.full_lengths.shape[0]
+    qo_indptr = (
+        plan.base_offsets
+        if rows == max_rows
+        else torch.clamp(plan.base_offsets, max=rows, out=plan.offsets)
+    )
+    lengths = plan.full_lengths[:rows] if topk_lens is None else topk_lens
     if not plan.run_initialized and not torch.cuda.is_current_stream_capturing():
         with _WORKSPACE_REGION():
             plan.wrapper.run(
@@ -229,7 +242,7 @@ def _run_plan(
                 kv_cache,
                 topk_slots,
                 lengths,
-                qo_indptr=plan.offsets[rows],
+                qo_indptr=qo_indptr,
                 softmax_scale=softmax_scale,
                 output_scale=1.0,
                 kv_cache_scale=1.0,
@@ -244,7 +257,7 @@ def _run_plan(
         kv_cache,
         topk_slots,
         lengths,
-        qo_indptr=plan.offsets[rows],
+        qo_indptr=qo_indptr,
         softmax_scale=softmax_scale,
         output_scale=1.0,
         kv_cache_scale=1.0,

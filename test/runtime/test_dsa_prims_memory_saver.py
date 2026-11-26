@@ -141,18 +141,24 @@ def _check_dsa_prims_plans_survive_release() -> None:
         return res.cpu()
 
     # Phase 1: warmup ladder for rows=8 (buckets 1, 2, 4, 8 in _warmed_plans).
-    # Phase 2: lazy row-count growth (rows=3 on warmed bucket 4).
+    # Phase 2: unseen serving partial-bucket row counts (rows=3, rows=5) must
+    #          NOT grow workspace_pools bytes at all.
     # Phase 3: lazy eager bucket growth (rows=16 in _plans LRU).
     expected: dict[int, torch.Tensor] = {}
-    for rows, warm in ((8, True), (3, False), (16, False)):
+    warmed_workspace_bytes: int | None = None
+    for rows, warm, same_pool_as_warmed in (
+        (8, True, False),
+        (3, False, True),
+        (5, False, True),
+        (16, False, False),
+    ):
         expected[rows] = run_prefill(rows, warm)
         all_plans = [*dsa_prims._warmed_plans.values(), *dsa_prims._plans.values()]
         assert all_plans
         plan_tensors = {
             tensor.data_ptr(): tensor
             for plan in all_plans
-            for table in (plan.offsets, plan.full_lengths)
-            for tensor in table.values()
+            for tensor in (plan.base_offsets, plan.offsets, plan.full_lengths)
         }
         assert plan_tensors
         assert _segment_pools(list(plan_tensors)) == workspace_pools
@@ -160,6 +166,10 @@ def _check_dsa_prims_plans_survive_release() -> None:
         plan_bytes = sum(t.numel() * t.element_size() for t in plan_tensors.values())
         torch.cuda.synchronize()
         steady_workspace_bytes = _pool_bytes(workspace_pools)
+        if warm:
+            warmed_workspace_bytes = steady_workspace_bytes
+        elif same_pool_as_warmed:
+            assert steady_workspace_bytes == warmed_workspace_bytes
         for _ in range(3):
             torch.cuda.synchronize()
             retained = [(t, t.data_ptr(), t.cpu()) for t in plan_tensors.values()]

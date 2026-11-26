@@ -518,8 +518,8 @@ def test_workspace_region_wraps_plan_metadata_and_first_eager_run(
     assert events == [("run", False)]
     assert in_region["entries"] == entries_before
 
-    # 3. Lazy eager row-count growth (rows=3 on bucket 4) allocates offsets inside
-    #    the region, while the already-initialized plan's run stays outside.
+    # 3. Unseen partial-bucket row count (rows=3 on warmed bucket 4) clamps the
+    #    preallocated offset buffer in place with zero region entries or allocs.
     events.clear()
     q3, kv3, slots3, lens3 = _inputs(3)
     dsa_prims.sparse_attention(
@@ -533,7 +533,7 @@ def test_workspace_region_wraps_plan_metadata_and_first_eager_run(
         return_lse=False,
         out=None,
     )
-    assert in_region["entries"] == entries_before + 1
+    assert in_region["entries"] == entries_before
     assert events == [("run", False)]
 
     # 4. Lazy eager bucket growth in _plans (rows=8) wraps init, plan, offsets,
@@ -553,15 +553,16 @@ def test_workspace_region_wraps_plan_metadata_and_first_eager_run(
     )
     assert events == [("init", True), ("plan", True), ("run", True)]
 
-    # 5. CUDA graph capture must never enter the workspace region.
+    # 5. CUDA graph capture must never enter the workspace region, even for a
+    #    partial-bucket row count on an already-warmed bucket.
     events.clear()
     entries_before = in_region["entries"]
     capturing["active"] = True
     dsa_prims.sparse_attention(
-        q4,
-        kv4,
-        slots4,
-        lens4,
+        q3,
+        kv3,
+        slots3,
+        lens3,
         mode="prefill",
         query_width=1,
         softmax_scale=1.0,
@@ -570,3 +571,91 @@ def test_workspace_region_wraps_plan_metadata_and_first_eager_run(
     )
     assert events == [("run", False)]
     assert in_region["entries"] == entries_before
+
+
+def test_partial_bucket_clamps_preallocated_offsets_without_sync_or_alloc(
+    fake_prims, monkeypatch
+):
+    planned, runs, _capturing, _stream = fake_prims
+    observed: list[tuple[list[int], list[int]]] = []
+
+    class _RecordingWrapper(_FakeWrapper):
+        def run(self, q, kv_cache, topk_slots, lengths, *, qo_indptr, out, lse, **kw):
+            observed.append((qo_indptr.tolist(), lengths.tolist()))
+            return super().run(
+                q,
+                kv_cache,
+                topk_slots,
+                lengths,
+                qo_indptr=qo_indptr,
+                out=out,
+                lse=lse,
+                **kw,
+            )
+
+    monkeypatch.setattr(
+        dsa_prims, "_make_wrapper", lambda: _RecordingWrapper(planned, runs)
+    )
+
+    # Warm prefill buckets 1..8 and decode buckets (bs=1..4, query_width=2).
+    q8, kv8, slots8, _ = _inputs(8)
+    with kernel_warmup(enabled=True):
+        dsa_prims.sparse_attention(
+            q8,
+            kv8,
+            slots8,
+            None,
+            mode="prefill",
+            query_width=1,
+            softmax_scale=1.0,
+            return_lse=False,
+            out=None,
+        )
+        dsa_prims.sparse_attention(
+            q8,
+            kv8,
+            slots8,
+            None,
+            mode="decode",
+            query_width=2,
+            softmax_scale=1.0,
+            return_lse=False,
+            out=None,
+        )
+
+    # Disallow host-to-device torch.tensor(...) calls during steady-state serving
+    # across unseen partial-bucket row counts.
+    observed.clear()
+    q5, kv5, slots5, _ = _inputs(5)
+    q6, kv6, slots6, _ = _inputs(6)
+
+    def _forbid_tensor(*args, **kwargs):
+        raise AssertionError("unexpected torch.tensor() call during serving")
+
+    monkeypatch.setattr(torch, "tensor", _forbid_tensor)
+    dsa_prims.sparse_attention(
+        q5,
+        kv5,
+        slots5,
+        None,
+        mode="prefill",
+        query_width=1,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    dsa_prims.sparse_attention(
+        q6,
+        kv6,
+        slots6,
+        None,
+        mode="decode",
+        query_width=2,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    assert observed == [
+        ([0, 5], [512] * 5),
+        ([0, 2, 4, 6, 6], [512] * 6),
+    ]
