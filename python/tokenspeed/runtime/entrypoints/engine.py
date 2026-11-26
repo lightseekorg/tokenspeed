@@ -193,6 +193,26 @@ def _scheduler_ranks(server_args: ServerArgs) -> range:
     return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
 
 
+def _cleanup_partial_start(procs: list, readers: list) -> None:
+    """Release only this launch's ranks if a later rank fails to spawn.
+
+    The caller has not received these handles yet, so its ordinary shutdown
+    cannot own them. Startup has no serving requests to drain.
+    """
+    descendants = []
+    for proc in procs:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendants.extend(psutil.Process(proc.pid).children(recursive=True))
+        proc.kill()
+    for proc in procs:
+        proc.join(timeout=5)
+    for descendant in descendants:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendant.kill()
+    for reader in readers:
+        reader.close()
+
+
 def _start_ranks(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -208,20 +228,24 @@ def _start_ranks(
         enable=server_args.enable_memory_saver
     )
     procs, readers = [], []
-    for rank in _scheduler_ranks(server_args):
-        rank_server_args = copy.copy(server_args)
-        rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-        rank_server_args.mapping.rank = rank
-        proc, reader = start_rust_host(
-            binary,
-            rank_server_args,
-            port_args,
-            memory_saver_adapter.configure_subprocess(),
-            metrics_relay.endpoint if metrics_relay is not None else None,
-            parent_death_signal,
-        )
-        procs.append(proc)
-        readers.append(reader)
+    try:
+        for rank in _scheduler_ranks(server_args):
+            rank_server_args = copy.copy(server_args)
+            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+            rank_server_args.mapping.rank = rank
+            proc, reader = start_rust_host(
+                binary,
+                rank_server_args,
+                port_args,
+                memory_saver_adapter.configure_subprocess(),
+                metrics_relay.endpoint if metrics_relay is not None else None,
+                parent_death_signal,
+            )
+            procs.append(proc)
+            readers.append(reader)
+    except BaseException:
+        _cleanup_partial_start(procs, readers)
+        raise
     return procs, readers
 
 
@@ -238,20 +262,24 @@ def _start_encode_ranks(
     encode requests. ``parent_death_signal`` as for ``_start_ranks``."""
     binary = host_binary()
     procs, readers = [], []
-    for rank in _scheduler_ranks(server_args):
-        rank_server_args = copy.copy(server_args)
-        rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-        rank_server_args.mapping.rank = rank
-        proc, reader = start_rust_host(
-            binary,
-            rank_server_args,
-            port_args,
-            contextlib.nullcontext(),
-            metrics_relay.endpoint if metrics_relay is not None else None,
-            parent_death_signal,
-        )
-        procs.append(proc)
-        readers.append(reader)
+    try:
+        for rank in _scheduler_ranks(server_args):
+            rank_server_args = copy.copy(server_args)
+            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+            rank_server_args.mapping.rank = rank
+            proc, reader = start_rust_host(
+                binary,
+                rank_server_args,
+                port_args,
+                contextlib.nullcontext(),
+                metrics_relay.endpoint if metrics_relay is not None else None,
+                parent_death_signal,
+            )
+            procs.append(proc)
+            readers.append(reader)
+    except BaseException:
+        _cleanup_partial_start(procs, readers)
+        raise
     return procs, readers
 
 
@@ -398,9 +426,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
         metrics_service.start(server_args, port_args)
         kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
-        # Nothing else stops a follower node's ranks, so they must not outlive
-        # it, even when it is SIGKILLed; the first node's frontend notices.
-        parent_death_signal = server_args.node_rank >= 1
+        # Every launcher owns its ranks, including node zero. A hard launcher
+        # failure must release them before this independent engine is replaced.
+        parent_death_signal = True
         if server_args.disaggregation_mode != "encode":
             # Fail before any rank loads the model.
             refusals = rust_host_refusals(server_args)
