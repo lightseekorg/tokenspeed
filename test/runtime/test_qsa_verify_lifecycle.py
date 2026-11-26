@@ -465,6 +465,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         ),
         input_buffers=object(),
         config=config,
+        requires_forward_coordination=True,
     )
     # Armed, the runner's padded replays write the very pair every MegaMoE
     # staging reads; otherwise it writes none and MegaMoE routes every row.

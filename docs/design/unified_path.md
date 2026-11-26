@@ -20,6 +20,13 @@ path nothing exercised routinely.
 
 ## Invariants
 
+Graph phase agreement follows the mapping's forward-coordination contract.
+Independent attention DP replicas have no cross-replica forward collectives:
+they select and pad Decode graphs from their local request count, even when
+the scheduler publishes no global counts. Layouts requiring forward
+coordination retain the global Decode/idle agreement and peer-count checks;
+missing metadata never implies that a coordinated layout is independent.
+
 For models with reduce-scattered MoE input, the scheduler already supplies the
 live token count for every attention DP group. Before decode graph replay the
 runner intersects each fixed TP shard with its group's live prefix and copies

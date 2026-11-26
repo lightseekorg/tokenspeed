@@ -1076,6 +1076,7 @@ class ModelExecutor:
             token_to_kv_pool=self.token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=self.config,
+            requires_forward_coordination=self.model_runner.mapping.requires_forward_coordination,
             drafter=self.drafter,
             draft_attn_backend=self.draft_attn_backend,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
