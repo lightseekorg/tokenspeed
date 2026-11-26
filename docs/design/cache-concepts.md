@@ -35,8 +35,16 @@ member plans one-sided READs for Device/Host pages and holder-pushed spans
 (tagged with the holder's `(incarnation, offer_id)` via wire frame `P`) for Disk
 pages through `PeerReadPlan::plan`, running both concurrently without occupying
 local read-worker threads while waiting on Disk pushes. Each holder member
-authorizes an offer's id on its push endpoint once pinned and rejects pushes for
-inactive or mismatched-incarnation offers before touching NVMe. When a Disk push
+authorizes an offer's id on its push endpoint once pinned—recording the holder's
+local monotonic activation time—and rejects pushes for inactive,
+mismatched-incarnation, or expired-window offers before touching NVMe.
+Specifically, offer-bound (`P`) Disk pushes are only accepted within 35 seconds
+of offer activation (covering the reader's 30-second submission window plus
+transit slack), and every accepted job's execution deadline is clamped to at
+most 45 seconds past offer activation (`< 60`-second reader cancel retry budget
+plus `quarantine_us`), so a `Push` stalled inside a kernel TCP socket across a
+network partition cannot deliver late after heal and write into unfrozen reader
+device pages even while the holder's offer pin is still active. When a Disk push
 is cancelled and the holder does not confirm within a short grace window, the
 reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
 the background on its push dispatcher for a bounded retry budget (60 seconds);
@@ -64,9 +72,9 @@ final submission check through the last possible source-memory access can
 set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
 scheduling pauses after the check, native queues, reconnects, retries, DMA
 drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
-are enabled—push message delivery latency, holder push queue wait, and NVMe/RDMA
-execution time (because a holder anchors each push's deadline at message
-arrival). When Disk-tier v1 peer pushes are enabled and this variable is unset,
+are enabled—in-flight NVMe/RDMA execution within the holder's 45-second
+post-activation push deadline (35-second acceptance window plus bounded
+execution cap). When Disk-tier v1 peer pushes are enabled and this variable is unset,
 the holder defaults to a 90,000 ms bound past the 30-second submission window
 (120 seconds total) so orphaned Device/Host/Disk pins from a crashed reader are
 reclaimed automatically while leaving headroom above the ~65-second

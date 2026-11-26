@@ -80,6 +80,17 @@ const CANCEL_RETRY_MAX: Duration = Duration::from_secs(5);
 /// resolving as `PushOutcome::Unknown` so the landing stays safely frozen
 /// without leaking reader state or spinning forever.
 const CANCEL_RETRY_BUDGET: Duration = Duration::from_secs(60);
+/// Maximum elapsed holder monotonic time past `activate_offer` during which an
+/// offer-bound `PUSH_V2` (`P`) frame is accepted. Covers the reader's 30 s
+/// `SUBMIT_WINDOW` plus network transit slack, while rejecting stalled-TCP
+/// retransmits arriving after a partition heals even if the offer pin has not
+/// yet been retired.
+const OFFER_PUSH_ACCEPT_WINDOW: Duration = Duration::from_secs(35);
+/// Absolute upper bound past `activate_offer` on new Disk read / RDMA WRITE
+/// submissions for any offer-bound `PUSH_V2` job. Strictly below
+/// `CANCEL_RETRY_BUDGET` (60 s) by 15 s (plus reader `quarantine_us`), so no
+/// holder can start an RDMA write after a silent-holder landing unfreezes.
+const OFFER_PUSH_DEADLINE: Duration = Duration::from_secs(45);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
 /// holder's Disk block, to the reader's `address`.
@@ -770,9 +781,8 @@ impl Running {
 
 struct QueuedPush {
     guard: JobGuard,
-    arrived: Instant,
+    deadline: Instant,
     session: String,
-    budget: Duration,
     items: Vec<PushItem>,
 }
 
@@ -836,7 +846,11 @@ struct HolderState {
     slots: Slots,
     running: Mutex<HashMap<JobKey, Arc<Running>>>,
     fenced: Mutex<FencedJobs>,
-    active_offers: Mutex<HashSet<(u64, u64)>>,
+    /// Active `(incarnation, offer_id)` authorizations mapped to the holder
+    /// monotonic `Instant` when the offer was activated on PIN.
+    active_offers: Mutex<HashMap<(u64, u64), Instant>>,
+    offer_accept_window: Duration,
+    offer_push_deadline: Duration,
 }
 
 /// Bounded FIFO push queue supporting O(Q) removal of cancelled queued items
@@ -924,6 +938,14 @@ struct Holder {
 
 impl Holder {
     fn new(source: PushSource) -> Result<Self, String> {
+        Self::new_with_offer_windows(source, OFFER_PUSH_ACCEPT_WINDOW, OFFER_PUSH_DEADLINE)
+    }
+
+    fn new_with_offer_windows(
+        source: PushSource,
+        offer_accept_window: Duration,
+        offer_push_deadline: Duration,
+    ) -> Result<Self, String> {
         let slots = source.ring.size() / source.slot_bytes.max(1);
         if slots == 0 || source.slot_bytes % ts_disk::ALIGNMENT != 0 {
             return Err("the staging ring holds no aligned slot".to_owned());
@@ -947,7 +969,9 @@ impl Holder {
             },
             running: Mutex::new(HashMap::new()),
             fenced: Mutex::new(FencedJobs::default()),
-            active_offers: Mutex::new(HashSet::new()),
+            active_offers: Mutex::new(HashMap::new()),
+            offer_accept_window,
+            offer_push_deadline,
         });
         let worker_count = slots.clamp(1, MAX_PUSH_WORKERS);
         let queue = Arc::new(PushQueue::new());
@@ -961,7 +985,7 @@ impl Holder {
                         return;
                     };
                     let started = Instant::now();
-                    let deadline = queued.arrived + queued.budget;
+                    let deadline = queued.deadline;
                     // Isolate a per-job panic so a fixed-size worker pool is never
                     // permanently drained by an unexpected fault in a single push
                     // (e.g. an external writer/FFI panic). During unwind, `SlotGuard`
@@ -1044,6 +1068,7 @@ impl Holder {
             Quarantined,
             Clean,
         }
+        let mut offer_deadline: Option<Instant> = None;
         let reject = {
             let mut running_map = self.state.running.lock();
             if running_map.contains_key(&key) {
@@ -1065,7 +1090,20 @@ impl Holder {
                     Some(Reject::Quarantined)
                 } else {
                     let offer_unauthorized = match active_offer {
-                        Some(pair) => !self.state.active_offers.lock().contains(&pair),
+                        Some(pair) => {
+                            let active = self.state.active_offers.lock();
+                            match active.get(&pair).copied() {
+                                Some(activated_at)
+                                    if arrived.saturating_duration_since(activated_at)
+                                        < self.state.offer_accept_window =>
+                                {
+                                    offer_deadline =
+                                        Some(activated_at + self.state.offer_push_deadline);
+                                    false
+                                }
+                                _ => true,
+                            }
+                        }
                         None => false,
                     };
                     if offer_unauthorized || fenced.contains(&key) {
@@ -1148,11 +1186,14 @@ impl Holder {
             supports_unknown,
             outcome: RunOutcome::RetiredFailed,
         };
+        let mut deadline = arrived + budget.min(MAX_PUSH_BUDGET);
+        if let Some(cap) = offer_deadline {
+            deadline = deadline.min(cap);
+        }
         let queued = QueuedPush {
             guard,
-            arrived,
+            deadline,
             session,
-            budget: budget.min(MAX_PUSH_BUDGET),
             items,
         };
         // Drop any rejected `QueuedPush` (and its `JobGuard`) AFTER releasing
@@ -1226,7 +1267,8 @@ impl Holder {
         self.state
             .active_offers
             .lock()
-            .insert((incarnation, offer_id));
+            .entry((incarnation, offer_id))
+            .or_insert_with(Instant::now);
     }
 
     /// Revokes authorization for `(incarnation, offer_id)`, evicts still-queued
@@ -1983,6 +2025,24 @@ impl PushEndpoint {
     /// Serve pushes of `source`'s Disk pages from now on.
     pub fn serve(&self, source: PushSource) -> Result<(), PushError> {
         let next = Arc::new(Holder::new(source).map_err(PushError::Settings)?);
+        let prev = self.holder.lock().replace(next);
+        if let Some(prev) = prev {
+            prev.shutdown();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn serve_with_offer_windows(
+        &self,
+        source: PushSource,
+        accept_window: Duration,
+        push_deadline: Duration,
+    ) -> Result<(), PushError> {
+        let next = Arc::new(
+            Holder::new_with_offer_windows(source, accept_window, push_deadline)
+                .map_err(PushError::Settings)?,
+        );
         let prev = self.holder.lock().replace(next);
         if let Some(prev) = prev {
             prev.shutdown();
@@ -3840,5 +3900,163 @@ mod tests {
             reply_to: "10.0.0.99:7200".into(),
             job: (9u64 << 32) | 1,
         }));
+    }
+
+    #[test]
+    fn delayed_push_past_offer_accept_window_is_rejected_and_exec_deadline_is_capped() {
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicUsize;
+        use ts_disk::{Backend, DiskFile, ExecutorConfig};
+
+        assert!(
+            OFFER_PUSH_ACCEPT_WINDOW >= super::super::v1::SUBMIT_WINDOW,
+            "offer push acceptance window must cover SUBMIT_WINDOW"
+        );
+        assert!(
+            OFFER_PUSH_DEADLINE + Duration::from_secs(10) < CANCEL_RETRY_BUDGET,
+            "holder absolute push deadline must strictly precede reader cancel retry budget expiry"
+        );
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-offer-win-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (2 * BLOCK) as u64).unwrap();
+        let ring = Arc::new(Memory::map(BLOCK).unwrap());
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[(ring.address(), ring.size())],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+
+        struct CountingWriter {
+            calls: AtomicUsize,
+            delay: Duration,
+        }
+        impl PageWriter for CountingWriter {
+            fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if !self.delay.is_zero() {
+                    thread::sleep(self.delay);
+                }
+                Ok(())
+            }
+        }
+        let writer = Arc::new(CountingWriter {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(60),
+        });
+        let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 302).unwrap();
+        holder
+            .serve_with_offer_windows(
+                PushSource {
+                    executor,
+                    disk_layout: HostLayout {
+                        groups: vec![ts_l3::GroupLayout {
+                            packing: 1,
+                            block_bytes: BLOCK,
+                            shard_count: 1,
+                        }],
+                        lcm_block_bytes: BLOCK,
+                        num_lcm_blocks: 2,
+                        owner_rank: 0,
+                        tp_rank: 0,
+                    },
+                    writer: writer.clone(),
+                    ring,
+                    slot_bytes: BLOCK,
+                },
+                Duration::from_millis(80),
+                Duration::from_millis(120),
+            )
+            .unwrap();
+
+        let (rtx, rrx) = mpsc::channel::<Vec<Bytes>>();
+        let raw_reader = Sockets::start_at("127.0.0.1", 0, rtx).unwrap();
+        let reply_ep = format!("127.0.0.1:{}", raw_reader.port());
+        let (h_host, h_port) = split_endpoint(holder.name()).unwrap();
+        let make_items = |n: usize| -> Vec<PushItem> {
+            (0..n)
+                .map(|_| PushItem {
+                    group: 0,
+                    block: 1,
+                    spans: vec![PushSpan {
+                        offset: 0,
+                        address: 2048,
+                        length: 64,
+                    }],
+                })
+                .collect()
+        };
+
+        // 1. Activate offer 10, sleep past accept_window (80ms) WITHOUT closing
+        //    the offer (simulating stalled-TCP retransmit after partition heal
+        //    while retirement_bound_ms is unset or long). Must reject cleanly
+        //    with Done{ok:false} and ZERO RDMA writes.
+        holder.activate_offer(600, 10);
+        thread::sleep(Duration::from_millis(110));
+        let late_push = Message::Push {
+            job: 10,
+            offer: Some((600, 10)),
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: make_items(1),
+        };
+        raw_reader.send(h_host, h_port, late_push.frames()).unwrap();
+        let reply = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(reply, Some(Message::Done { job: 10, ok: false }));
+        assert_eq!(
+            writer.calls.load(Ordering::SeqCst),
+            0,
+            "stalled-TCP Push arriving past offer accept window must not execute any RDMA write"
+        );
+
+        // 2. Activate offer 11 and submit a multi-block push with a huge 10s
+        //    budget; execution must be capped by `offer_push_deadline` (120ms)
+        //    so it aborts long before the 10s wire budget elapses.
+        holder.activate_offer(600, 11);
+        let started = Instant::now();
+        let capped_push = Message::Push {
+            job: 11,
+            offer: Some((600, 11)),
+            reply_to: reply_ep,
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: make_items(20),
+        };
+        raw_reader
+            .send(h_host, h_port, capped_push.frames())
+            .unwrap();
+        let reply2 = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(reply2, Some(Message::Done { job: 11, ok: false }));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "offer_push_deadline must cap execution well below the 10s wire budget (elapsed {:?})",
+            started.elapsed()
+        );
+        assert!(
+            writer.calls.load(Ordering::SeqCst) < 20,
+            "capped push must stop submitting RDMA writes once offer_push_deadline elapses"
+        );
     }
 }
