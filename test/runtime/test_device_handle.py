@@ -43,6 +43,7 @@ import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from test.ci_system.ci_register import register_cuda_ci
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
 from types import SimpleNamespace
 from unittest import mock
 
@@ -71,6 +72,7 @@ from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import PlannedForward
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -115,7 +117,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     expected_rewarm,
     declares_padded_replay,
 ):
-    """Drive real startup/rebind; substitute unavailable weights/cache/device work."""
+    """Drive real startup/rebind with CPU pools; substitute weights/device work."""
     from tokenspeed.runtime.engine import scheduler_utils
     from tokenspeed.runtime.execution import (
         cudagraph_memory,
@@ -138,10 +140,11 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         # Read by Kimi-K3.1's aggregated plan agreement, faked out below.
         prefill_graph = None
 
-        def __init__(self):
+        def __init__(self, token_to_kv_pool):
             self.config = SimpleNamespace(prefill_only=prefill_only)
             self.forward_step = self
             self.generation = 0
+            self.token_to_kv_pool = token_to_kv_pool
 
         def warmup_decode_path(self, *, batch_sizes, graph_phase):
             events.append(("warmup", self.generation, batch_sizes, graph_phase))
@@ -168,8 +171,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             events.append(("release", self.generation))
 
         def set_cache_pool(self, target, draft):
+            self.token_to_kv_pool = target
             self.generation += 1
-            events.append(("rebind", self.generation, target.name, draft))
+            events.append(("rebind", self.generation, target, draft))
 
         def capture_graphs(self, *, entries, observer):
             events.append(("capture", self.generation, entries))
@@ -181,19 +185,24 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         prepare_multimodal_runtime=lambda: None,
         prepare_communication_runtime=lambda count: None,
     )
-    pool_generation = [0]
+    pools = []
+    group = CacheGroupSpec(
+        group_id="full_attention",
+        attn_kind="full_history",
+        rows_per_page=16,
+        entry_stride_tokens=1,
+        replayable=False,
+    )
 
     def build(*args, **kwargs):
-        pool_generation[0] += 1
+        pool = make_mha_pool_for_groups((group,), device="cpu")
+        pools.append(pool)
         return SimpleNamespace(
             # The scheduler's group configs read which groups defer decode state.
             attn_backend=SimpleNamespace(deferred_decode_state_groups=frozenset),
             draft_attn_backend=None,
-            token_to_kv_pool=SimpleNamespace(
-                name=f"target{pool_generation[0]}",
-                arena=SimpleNamespace(runtime_contract=None),
-            ),
-            draft_token_to_kv_pool=f"draft{pool_generation[0]}",
+            token_to_kv_pool=pool,
+            draft_token_to_kv_pool=f"draft{len(pools)}",
             profiled_cache_bytes=4096,
         )
 
@@ -206,7 +215,11 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         "create_model_runner",
         lambda *args: (model, model if has_draft else None),
     )
-    monkeypatch.setattr(factory, "create_model_executor", lambda **kwargs: Executor())
+    monkeypatch.setattr(
+        factory,
+        "create_model_executor",
+        lambda **kwargs: Executor(kwargs["token_to_kv_pool"]),
+    )
     monkeypatch.setattr(
         factory,
         "ModelExecutorConfig",
@@ -294,7 +307,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     assert (rebound_warmup in events) == expected_rewarm
     if reserve:
         probe_index = events.index(("capture", 0, 5))
-        rebind_index = events.index(("rebind", 1, "target2", "draft2"))
+        rebind_index = events.index(("rebind", 1, pools[1], "draft2"))
         assert probe_index < rebind_index
         if has_draft and not prefill_only:
             assert events.index(("warmup", 0, (2,), False)) < probe_index
