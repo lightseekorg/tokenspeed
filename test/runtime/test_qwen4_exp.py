@@ -48,7 +48,11 @@ import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
 import tokenspeed.runtime.layers.logits_processor as logits_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.load_config import LoadConfig
-from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
+from tokenspeed.runtime.configs.model_config import (
+    AttentionArch,
+    ModelConfig,
+    is_qwen4_exp,
+)
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -138,6 +142,7 @@ from tokenspeed.runtime.models.qwen4_exp import (
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
 )
+from tokenspeed.runtime.utils.server_args import prepare_server_args
 
 _requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -3434,6 +3439,8 @@ def _ple_checkpoint_loader_stub(
     torch.nn.Module.__init__(ple)
     ple.lookup = PLELookup.__new__(PLELookup)
     torch.nn.Module.__init__(ple.lookup)
+    ple.lookup.shared_table = None
+    ple.lookup.peer_ptrs = None
     ple.lookup.table_group = (0,)
     ple.lookup.head_dim = 4
     ple.lookup.embed_store_dtype = (
@@ -3688,7 +3695,6 @@ def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
 @pytest.mark.parametrize("enabled", [False, True])
 def test_ple_hot_cache_cli_reaches_model_config(tmp_path, enabled):
     from tokenspeed.runtime.engine.rank_setup import load_model_config
-    from tokenspeed.runtime.utils.server_args import prepare_server_args
 
     _tiny_ple_config(
         architectures=["Qwen4ExpForCausalLM"], ple_offload_embedding=True
@@ -3716,7 +3722,6 @@ def test_ple_hot_cache_cli_rejects_targets_without_ple(tmp_path, qwen4_exp):
     from transformers import LlamaConfig
 
     from tokenspeed.runtime.engine.rank_setup import load_model_config
-    from tokenspeed.runtime.utils.server_args import prepare_server_args
 
     config = (
         _tiny_ple_config(architectures=["Qwen4ExpForCausalLM"], ple_layer_ids=[])
@@ -3762,6 +3767,50 @@ def test_ple_table_storage_follows_checkpoint(
 
     expected = torch.float8_e4m3fn if expect_fp8 else torch.get_default_dtype()
     assert layer.ple_embedding.lookup.ngram_embedding.weight.dtype == expected
+
+
+@pytest.mark.parametrize("layout", [None, "attn_tp_sharded", "shared", "peer_sharded"])
+def test_ple_sharding_from_server_args(tmp_path, layout):
+
+    Qwen4ExpConfig(
+        architectures=["Qwen4ExpForCausalLM"],
+        text_config=_tiny_ple_config(ple_offload_embedding=False).to_dict(),
+    ).save_pretrained(tmp_path)
+    argv = [
+        "--model",
+        str(tmp_path),
+        "--world-size",
+        "8",
+        "--attn-tp-size",
+        "2",
+        "--data-parallel-size",
+        "4",
+    ]
+    if layout:
+        argv.extend(["--ple-table-layout", layout])
+    args = prepare_server_args(argv)
+    args.mapping.rank = 5
+    model = ModelConfig(
+        str(tmp_path),
+        trust_remote_code=False,
+        model_override_args="{}",
+        server_args=args,
+        dtype="float32",
+    )
+    assert model.hf_text_config.ple_table_layout == (layout or "global_sharded")
+
+    def build():
+        return Qwen4ExpNGramEmbedding(
+            model.hf_text_config, args.mapping, 64, 0, None, "ple_embedding"
+        ).lookup
+
+    if layout in ("shared", "peer_sharded"):
+        with pytest.raises(ValueError, match="requires host offloading"):
+            build()
+    else:
+        assert build().table_group == (
+            (4, 5) if layout == "attn_tp_sharded" else tuple(range(8))
+        )
 
 
 def test_ple_table_rejects_unsupported_storage_dtype() -> None:

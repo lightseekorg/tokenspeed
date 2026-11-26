@@ -385,10 +385,12 @@ class _Shared(NamedTuple):
     norm: cute.Tensor | None
     history: cute.Tensor | None
     history_addr: Int32 | None
+    records: cute.Tensor | None
     token_barrier: object
     state_barrier: object
     weight_barrier: object
     norm_barrier: object
+    records_barrier: object | None
 
 
 class RecoverSsmVerify:
@@ -408,6 +410,9 @@ class RecoverSsmVerify:
       norm: (subclasses that set ``norm_words``) FP32 output-norm sums.
       history: the history rows' products w_p . M as [history_rows,
         padded_columns], then the records' total decay of each key channel.
+      records: (subclasses that set ``copy_records``) the accepted records'
+        keys and decays as [history_rows, K] each, then this tile's U as
+        [history_rows, VT], bulk-copied from global memory.
     """
 
     def __init__(
@@ -478,6 +483,14 @@ class RecoverSsmVerify:
         # store them while the others solve, from the gate steps the tile's
         # threads leave in M's place once the product has read it.
         self.defer_window_records = self.preload_history_us
+        # Subclasses may bulk-copy the records' keys, decays and the tile's U
+        # into shared memory (``copy_records``); word offsets of the three
+        # [history_rows, ...] parts of that region and its size.
+        self.copy_records = False
+        self.record_keys = 0
+        self.record_decays = 0
+        self.record_us = 0
+        self.record_words = 0
         assert not self.defer_window_records or (
             value_tile_rows < THREADS
             and key_dim * self.padded_columns >= value_tile_rows * window
@@ -861,7 +874,7 @@ class RecoverSsmVerify:
         decay_steps = cute.make_rmem_tensor((W,), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
-            if const_expr(late_loads and not channel_loaded):
+            if const_expr(late_loads and not channel_loaded and not self.copy_records):
                 if record_start > 0:
                     # In flight during the key channel's work.
                     self._load_history_channel(
@@ -888,7 +901,20 @@ class RecoverSsmVerify:
                     tidx,
                     steps,
                 )
-            if const_expr(has_history):
+            if const_expr(has_history and self.copy_records):
+                if record_start > 0:
+                    # The copies the CTA issued after its row loads.
+                    cute.arch.mbarrier_wait(shared.records_barrier, 0)
+                    # Views of this channel's copied rows: the store reads only
+                    # the rows below the count, the ones the copies wrote.
+                    rows = cute.make_layout((self.history_rows,), stride=(K,))
+                    channel = shared.records.iterator + tidx
+                    key_rows = cute.make_tensor(channel + self.record_keys, rows)
+                    decay_rows = cute.make_tensor(channel + self.record_decays, rows)
+                    self._store_history_rows(
+                        shared, key_rows, decay_rows, record_start, tidx
+                    )
+            elif const_expr(has_history):
                 if record_start > 0:
                     self._store_history_rows(
                         shared, history_keys, history_decays, record_start, tidx
@@ -900,7 +926,7 @@ class RecoverSsmVerify:
             cute.arch.barrier()
             self._finalize_coefficients(shared.sums, tidx)
 
-        if const_expr(self.preload_history_us):
+        if const_expr(self.preload_history_us and not self.copy_records):
             if record_start > 0:
                 self._load_history_us(
                     retained,
@@ -1144,7 +1170,12 @@ class RecoverSsmVerify:
                 Float32, cute.make_layout((self.history_words,)), byte_alignment=16
             )
             history_addr = Int32(history.iterator.toint())
-        barriers = smem.allocate_array(Int64, num_elems=4)
+        records = None
+        if const_expr(self.copy_records):
+            records = smem.allocate_tensor(
+                Float32, cute.make_layout((self.record_words,)), byte_alignment=128
+            )
+        barriers = smem.allocate_array(Int64, num_elems=5 if self.copy_records else 4)
         return _Shared(
             tile=tile,
             tile_addr=Int32(tile.iterator.toint()),
@@ -1157,10 +1188,12 @@ class RecoverSsmVerify:
             norm=norm,
             history=history,
             history_addr=history_addr,
+            records=records,
             token_barrier=barriers,
             state_barrier=barriers + 1,
             weight_barrier=barriers + 2,
             norm_barrier=barriers + 3,
+            records_barrier=barriers + 4 if self.copy_records else None,
         )
 
     @cute.jit
@@ -1636,12 +1669,25 @@ class RecoverSsmVerify:
         groups = THREADS // VT
         channel = tidx % VT
         group = tidx // VT
-        if const_expr(not self.early_history_loads and not self.preload_history_us):
+        if const_expr(
+            not self.early_history_loads
+            and not self.preload_history_us
+            and not self.copy_records
+        ):
             # All in flight before the first use.
             self._load_history_us(
                 retained, slot, head, count, value_start, tidx, history_us
             )
-        us = [history_us[p] for p in range(self._history_u_count())]
+        us = []
+        if const_expr(self.copy_records):
+            # Rows past the count reuse the last record, whose u meets a zero D row.
+            last = count - 1
+            for i in cutlass.range_constexpr(4 // groups):
+                for j in cutlass.range_constexpr(block):
+                    at = cutlass.min((group + i * groups) * block + j, last)
+                    us.append(shared.records[self.record_us + at * VT + channel])
+        else:
+            us = [history_us[p] for p in range(self._history_u_count())]
         sums = cute.make_rmem_tensor((columns,), Float32)
         for i in cutlass.range_constexpr(4 // groups):
             b = group + i * groups
