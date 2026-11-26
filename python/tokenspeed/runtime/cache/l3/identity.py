@@ -233,6 +233,14 @@ def l3_checkpoint_id(
         fmt = raw_fmt
     extra_json = json.dumps(extra_for_id, sort_keys=True, separators=(",", ":"))
     ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
+    from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+    if is_object_store_uri(model_path):
+        raise ValueError(
+            "L3 namespace needs an immutable checkpoint id; object-store URIs "
+            "have no immutable commit (pin --revision to a Hub commit or load "
+            "from a local snapshot)"
+        )
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:
@@ -362,6 +370,10 @@ def _snapshot_commit_hash(snapshot_path: str) -> str | None:
 def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
     if os.path.isdir(model_path):
         return model_path
+    from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+    if is_object_store_uri(model_path):
+        return None
     try:
         from huggingface_hub import snapshot_download
 

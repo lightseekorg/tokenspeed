@@ -750,6 +750,8 @@ def _apply_constrained_decoding_policy(
 
 
 class ModelConfig:
+    download_dir: str | None = None
+
     def __init__(
         self,
         model_path: str,
@@ -789,6 +791,7 @@ class ModelConfig:
             kwargs["_configuration_file"] = override_config_file.strip()
 
         download_dir = server_args.download_dir if server_args is not None else None
+        self.download_dir = download_dir
         self.hf_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
@@ -861,6 +864,7 @@ class ModelConfig:
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,
+                download_dir=download_dir,
             )
             if dspark_num_stages is None:
                 raise ValueError(
@@ -1178,10 +1182,18 @@ class ModelConfig:
         fallback = quant_cfg is None or is_inkling2_manifest_stub(quant_cfg)
         if fallback or inkling2_summary:
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
-            # Resolve the local snapshot directory (model_path may be a HF hub ID)
-            if os.path.isdir(self.model_path):
-                model_dir = self.model_path
-            else:
+            # Resolve the local snapshot directory (model_path may be a local dir,
+            # object-store URI, or HF hub ID)
+            from tokenspeed.runtime.model_loader.object_store import (
+                resolve_checkpoint_metadata_dir,
+            )
+
+            model_dir = resolve_checkpoint_metadata_dir(
+                self.model_path,
+                download_dir=self.download_dir,
+                sync=True,
+            )
+            if model_dir is None:
                 try:
                     from huggingface_hub import snapshot_download
 

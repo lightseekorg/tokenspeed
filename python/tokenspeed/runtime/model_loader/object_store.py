@@ -355,6 +355,16 @@ def read_object_store_range(uri: str, start: int, end_exclusive: int) -> bytes:
     raise ValueError(f"Unsupported object-store scheme: {scheme!r}")
 
 
+def _metadata_cache_paths(
+    uri: str, cache_dir: str | None = None
+) -> tuple[str, str, str]:
+    """Return ``(normalized_uri, base_cache, local_dir)`` for ``uri``."""
+    normalized = uri.rstrip("/")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    base_cache = resolve_metadata_cache_dir(cache_dir)
+    return normalized, base_cache, os.path.join(base_cache, digest)
+
+
 def sync_object_store_metadata(
     uri: str,
     cache_dir: str | None = None,
@@ -374,10 +384,7 @@ def sync_object_store_metadata(
     """
     from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-    normalized = uri.rstrip("/")
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-    base_cache = resolve_metadata_cache_dir(cache_dir)
-    local_dir = os.path.join(base_cache, digest)
+    normalized, base_cache, local_dir = _metadata_cache_paths(uri, cache_dir)
     marker_path = os.path.join(local_dir, _METADATA_MARKER_FILENAME)
 
     list_fn = _list_object_store_objects if list_objects is None else list_objects
@@ -458,6 +465,50 @@ def sync_object_store_metadata(
             sort_keys=True,
         )
         _write_text_atomic(marker_path, manifest_payload + "\n")
+    return local_dir
+
+
+def resolve_checkpoint_metadata_dir(
+    model_path: str,
+    *,
+    sync: bool,
+    download_dir: str | None = None,
+) -> str | None:
+    """Resolve a local metadata directory for a local path or object-store URI.
+
+    Args:
+        model_path: Local directory, object-store URI (``gs://`` / ``s3://``),
+            or Hugging Face Hub repository id.
+        sync: When ``True``, sync remote metadata via
+            :func:`sync_object_store_metadata` for object-store URIs. When
+            ``False``, return an already-synced cache directory only if it
+            exists, passes ownership checks, and carries a valid manifest for
+            ``model_path`` (making no network calls), or ``None`` otherwise.
+        download_dir: Optional base cache directory (``ServerArgs.download_dir``).
+
+    Returns:
+        A local directory path for local directories and object-store URIs
+        (when ``sync=True`` or already cached), or ``None`` for non-local
+        non-object-store identifiers (such as Hugging Face Hub repo ids) or
+        uncached object-store URIs when ``sync=False``.
+    """
+    if not model_path:
+        return None
+    if os.path.isdir(model_path):
+        return model_path
+    if not is_object_store_uri(model_path):
+        return None
+    if sync:
+        return sync_object_store_metadata(model_path, cache_dir=download_dir)
+    normalized, _, local_dir = _metadata_cache_paths(model_path, download_dir)
+    if not os.path.lexists(local_dir):
+        return None
+    _verify_owned_path(local_dir, expect_dir=True)
+    manifest = _read_metadata_manifest(
+        os.path.join(local_dir, _METADATA_MARKER_FILENAME)
+    )
+    if manifest is None or manifest["uri"] != normalized:
+        return None
     return local_dir
 
 

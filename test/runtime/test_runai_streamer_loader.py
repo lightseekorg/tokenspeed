@@ -700,5 +700,241 @@ class TestRunaiStreamerLocalParity:
                 assert torch.equal(got[name], ref_tensor)
 
 
+class TestObjectStoreMetadataResolution:
+    def test_resolve_checkpoint_metadata_dir_handles_local_cache_and_hub(
+        self, monkeypatch
+    ) -> None:
+        from tokenspeed.runtime.model_loader import object_store
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_model = os.path.join(tmpdir, "local-model")
+            os.makedirs(local_model)
+            assert (
+                object_store.resolve_checkpoint_metadata_dir(local_model, sync=True)
+                == local_model
+            )
+            assert (
+                object_store.resolve_checkpoint_metadata_dir("org/hub-model", sync=True)
+                is None
+            )
+
+            uri = "gs://example-bucket/org/cached-model"
+            cache_root = os.path.join(tmpdir, "cache")
+
+            def forbid_sync(*args, **kwargs):
+                raise AssertionError("sync_object_store_metadata must not be called")
+
+            monkeypatch.setattr(object_store, "sync_object_store_metadata", forbid_sync)
+            # Uncached URI with sync=False returns None with no network call.
+            assert (
+                object_store.resolve_checkpoint_metadata_dir(
+                    uri, download_dir=cache_root, sync=False
+                )
+                is None
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            uri = "gs://example-bucket/org/cached-model"
+            cache_root = os.path.join(tmpdir, "cache")
+            synced_dir = sync_object_store_metadata(
+                uri,
+                cache_dir=cache_root,
+                list_objects=lambda _u: [("config.json", "gen:1")],
+                download_object=lambda _src, dst: Path(dst).write_text(
+                    '{"architectures": ["LlamaForCausalLM"]}', encoding="utf-8"
+                ),
+            )
+            monkeypatch.setattr(object_store, "sync_object_store_metadata", forbid_sync)
+            # Cached URI with sync=False returns the local synced dir without network.
+            assert (
+                object_store.resolve_checkpoint_metadata_dir(
+                    uri, download_dir=cache_root, sync=False
+                )
+                == synced_dir
+            )
+
+    def test_count_dspark_stages_resolves_object_store_uri(self, monkeypatch) -> None:
+        from tokenspeed.runtime.model_loader import object_store
+        from tokenspeed.runtime.utils import spec_block_geometry
+
+        uri = "gs://example-bucket/org/dspark-model"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            synced_dir = os.path.join(tmpdir, "synced")
+            os.makedirs(synced_dir)
+            index_payload = {
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001.safetensors",
+                    "mtp.0.proj.weight": "model-00002.safetensors",
+                    "mtp.1.proj.weight": "model-00002.safetensors",
+                    "mtp.2.proj.weight": "model-00002.safetensors",
+                }
+            }
+            Path(os.path.join(synced_dir, "model.safetensors.index.json")).write_text(
+                json.dumps(index_payload), encoding="utf-8"
+            )
+
+            seen: list[tuple[str, str | None]] = []
+
+            def fake_sync(target_uri: str, cache_dir: str | None = None) -> str:
+                seen.append((target_uri, cache_dir))
+                return synced_dir
+
+            def forbid_hf(*args, **kwargs):
+                raise AssertionError(
+                    "hf_hub_download must not be called for object-store URIs"
+                )
+
+            monkeypatch.setattr(object_store, "sync_object_store_metadata", fake_sync)
+            monkeypatch.setattr(spec_block_geometry, "hf_hub_download", forbid_hf)
+
+            stages = spec_block_geometry.count_dspark_stages(
+                uri, download_dir="/custom/cache"
+            )
+            assert stages == 3
+            assert seen == [(uri, "/custom/cache")]
+
+    def test_checkpoint_architectures_and_defaults_for_object_store_uri(
+        self, monkeypatch
+    ) -> None:
+        import huggingface_hub
+
+        from tokenspeed.runtime.model_loader import object_store
+        from tokenspeed.runtime.utils import server_args as server_args_mod
+        from tokenspeed.runtime.utils.server_args import (
+            ServerArgs,
+            _checkpoint_architectures,
+        )
+
+        uri = "gs://example-bucket/org/beam-model"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_cache = os.path.join(tmpdir, "empty-cache")
+            populated_cache = os.path.join(tmpdir, "populated-cache")
+            synced_dir = sync_object_store_metadata(
+                uri,
+                cache_dir=populated_cache,
+                list_objects=lambda _u: [("config.json", "gen:1")],
+                download_object=lambda _src, dst: Path(dst).write_text(
+                    '{"architectures": ["BeamForCausalLM"]}', encoding="utf-8"
+                ),
+            )
+
+            def forbid_hf(*args, **kwargs):
+                raise AssertionError("HF hub must not be queried for object-store URIs")
+
+            monkeypatch.setattr(huggingface_hub, "hf_hub_download", forbid_hf)
+            monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", forbid_hf)
+
+            # Uncached + download=False: returns None without touching HF hub or syncing.
+            assert (
+                _checkpoint_architectures(
+                    uri, None, download=False, download_dir=empty_cache
+                )
+                is None
+            )
+            # Cached + download=False: reads synced config.json without network.
+            assert _checkpoint_architectures(
+                uri, None, download=False, download_dir=populated_cache
+            ) == ["BeamForCausalLM"]
+
+            # download=True: syncs metadata and applies Beam defaults on ServerArgs.
+            seen: list[tuple[str, str | None]] = []
+
+            def fake_sync(target_uri: str, cache_dir: str | None = None) -> str:
+                seen.append((target_uri, cache_dir))
+                return synced_dir
+
+            monkeypatch.setattr(object_store, "sync_object_store_metadata", fake_sync)
+            monkeypatch.setattr(
+                server_args_mod, "get_amdgpu_memory_capacity", lambda: 80000
+            )
+            monkeypatch.setattr(
+                server_args_mod, "get_nvgpu_memory_capacity", lambda: 80000
+            )
+            args = ServerArgs(
+                model=uri,
+                load_format="runai_streamer",
+                download_dir=empty_cache,
+            )
+            assert not args.disable_tf32
+            args.resolve_model_defaults(download=True)
+            assert args.disable_tf32 is True
+            assert seen == [(uri, empty_cache)]
+
+    def test_model_config_reads_hf_quant_config_from_object_store_uri(
+        self, monkeypatch
+    ) -> None:
+        import huggingface_hub
+        from transformers import PretrainedConfig
+
+        from tokenspeed.runtime.configs.model_config import ModelConfig
+        from tokenspeed.runtime.model_loader import object_store
+
+        uri = "gs://example-bucket/org/nvfp4-model"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(os.path.join(tmpdir, "hf_quant_config.json")).write_text(
+                json.dumps({"quantization": {"quant_algo": "NVFP4"}}),
+                encoding="utf-8",
+            )
+
+            def fake_sync(target_uri: str, cache_dir: str | None = None) -> str:
+                assert target_uri == uri
+                assert cache_dir == "/custom/cache"
+                return tmpdir
+
+            def forbid_snapshot(*args, **kwargs):
+                raise AssertionError(
+                    "snapshot_download must not be called for object-store URIs"
+                )
+
+            monkeypatch.setattr(object_store, "sync_object_store_metadata", fake_sync)
+            monkeypatch.setattr(huggingface_hub, "snapshot_download", forbid_snapshot)
+
+            cfg = ModelConfig.__new__(ModelConfig)
+            cfg.model_path = uri
+            cfg.revision = None
+            cfg.download_dir = "/custom/cache"
+            cfg.hf_config = PretrainedConfig()
+
+            parsed = cfg._parse_quant_hf_config()
+            assert parsed == {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+
+    def test_l3_checkpoint_id_and_resolved_model_dir_reject_object_store_uri(
+        self, monkeypatch
+    ) -> None:
+        import huggingface_hub
+
+        from tokenspeed.runtime.cache.l3.identity import _resolved_model_dir
+
+        def forbid_snapshot(*args, **kwargs):
+            raise AssertionError(
+                "snapshot_download must not be called for object-store URIs"
+            )
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", forbid_snapshot)
+        uri = "gs://example-bucket/org/model"
+        assert _resolved_model_dir(uri, revision="") is None
+        with pytest.raises(ValueError, match="immutable checkpoint id"):
+            l3_checkpoint_id(
+                model_path=uri,
+                revision="",
+                hf_config=object(),
+                load_format="runai_streamer",
+                model_loader_extra_config={"concurrency": 16},
+                ext_yaml=None,
+            )
+
+    def test_non_runai_loaders_reject_object_store_uri(self) -> None:
+        from tokenspeed.runtime.model_loader.loader import ShardedStateLoader
+
+        uri = "gs://example-bucket/org/model"
+        default_loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+        with pytest.raises(ValueError, match="runai_streamer"):
+            default_loader._prepare_weights(uri, None, False, None)
+
+        sharded_loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+        with pytest.raises(ValueError, match="runai_streamer"):
+            sharded_loader._prepare_weights(uri, None)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

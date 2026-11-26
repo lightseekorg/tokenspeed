@@ -168,18 +168,35 @@ def expert_placement_requested(server_args) -> bool:
 
 
 def _checkpoint_architectures(
-    model: str, revision: str | None, download: bool = False
+    model: str,
+    revision: str | None,
+    download: bool = False,
+    download_dir: str | None = None,
 ) -> list[str] | None:
     """The ``architectures`` of ``model``'s ``config.json``: from the model
-    directory, else from the local Hugging Face cache, else, with ``download``,
-    by downloading that file alone as ``get_config`` resolves a hub id
-    (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
-    the Hugging Face Hub). None when it cannot be read.
+    directory (or synced object-store metadata cache), else from the local
+    Hugging Face cache, else, with ``download``, by downloading that file alone
+    as ``get_config`` resolves a hub id (HF_HUB_OFFLINE keeps it to the cache;
+    a ModelScope id is not looked up on the Hugging Face Hub). None when it
+    cannot be read.
     """
     if not model:
         return []
-    path = os.path.join(model, "config.json")
-    if not os.path.isdir(model):
+    from tokenspeed.runtime.model_loader.object_store import (
+        is_object_store_uri,
+        resolve_checkpoint_metadata_dir,
+    )
+
+    local_dir = resolve_checkpoint_metadata_dir(
+        model,
+        download_dir=download_dir,
+        sync=download,
+    )
+    if local_dir is not None:
+        path = os.path.join(local_dir, "config.json")
+    elif is_object_store_uri(model):
+        return None
+    else:
         import huggingface_hub.constants
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
@@ -1226,7 +1243,12 @@ class ServerArgs:
         network, ``_beam_checkpoint`` is None for a hub id the cache does not
         hold yet; engine setup calls this again with ``download``.
         """
-        architectures = _checkpoint_architectures(self.model, self.revision, download)
+        architectures = _checkpoint_architectures(
+            self.model,
+            self.revision,
+            download,
+            download_dir=self.download_dir,
+        )
         if (
             (
                 self.owned_attention_output != "reduce-scatter"

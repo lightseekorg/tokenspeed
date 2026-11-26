@@ -308,6 +308,13 @@ class DefaultModelLoader(BaseModelLoader):
             self._maybe_download_from_modelscope(model_name_or_path, revision)
             or model_name_or_path
         )
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        if is_object_store_uri(model_name_or_path):
+            raise ValueError(
+                f"Object-store URI {model_name_or_path!r} requires "
+                f"--load-format runai_streamer, not {self.load_config.load_format!r}"
+            )
 
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
@@ -857,6 +864,13 @@ class ShardedStateLoader(BaseModelLoader):
     def _prepare_weights(self, model_name_or_path: str, revision: str | None):
         if os.path.isdir(model_name_or_path):
             return model_name_or_path
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        if is_object_store_uri(model_name_or_path):
+            raise ValueError(
+                f"Object-store URI {model_name_or_path!r} requires "
+                f"--load-format runai_streamer, not {self.load_config.load_format!r}"
+            )
 
         allow_patterns = ["*.safetensors"]
         return download_weights_from_hf(

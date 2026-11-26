@@ -457,15 +457,13 @@ def get_config(
     raw_config = None
     raw_config_converted = False
     from tokenspeed.runtime.model_loader.object_store import (
-        is_object_store_uri,
-        sync_object_store_metadata,
+        resolve_checkpoint_metadata_dir,
     )
 
-    if is_object_store_uri(model):
-        model_path = sync_object_store_metadata(model, cache_dir=download_dir)
-        is_remote_model = False
-    else:
-        is_remote_model = not os.path.isdir(model)
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
+    is_remote_model = resolved_dir is None
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
@@ -524,7 +522,7 @@ def get_config(
                         "Remote-code sibling imports may fail in this layout.",
                     )
     else:
-        model_path = model_path if is_object_store_uri(model) else model
+        model_path = resolved_dir
 
     if raw_config is None:
         raw_config, raw_config_converted = load_raw_config(model_path)
@@ -693,13 +691,15 @@ def get_generation_config(
     """Load generation metadata from one revision-pinned local snapshot."""
     try:
         from tokenspeed.runtime.model_loader.object_store import (
-            is_object_store_uri,
-            sync_object_store_metadata,
+            resolve_checkpoint_metadata_dir,
         )
 
-        if is_object_store_uri(model):
-            model_path = sync_object_store_metadata(model, cache_dir=download_dir)
-        elif not os.path.isdir(model):
+        resolved_dir = resolve_checkpoint_metadata_dir(
+            model, download_dir=download_dir, sync=True
+        )
+        if resolved_dir is not None:
+            model_path = resolved_dir
+        else:
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
             def download_generation_config() -> str:
@@ -715,8 +715,6 @@ def get_generation_config(
                     f"downloading generation config of {model}",
                     download_generation_config,
                 )
-        else:
-            model_path = model
         return GenerationConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, **kwargs
         )
@@ -988,15 +986,15 @@ def get_tokenizer(
         return loaded_tokenizer
 
     from tokenspeed.runtime.model_loader.object_store import (
-        is_object_store_uri,
-        sync_object_store_metadata,
+        resolve_checkpoint_metadata_dir,
     )
 
-    if is_object_store_uri(tokenizer_name):
-        tokenizer_path = sync_object_store_metadata(
-            tokenizer_name, cache_dir=download_dir
-        )
-    elif not os.path.isdir(tokenizer_name):
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        tokenizer_name, download_dir=download_dir, sync=True
+    )
+    if resolved_dir is not None:
+        tokenizer_path = resolved_dir
+    else:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
         def download_tokenizer_files() -> str:
