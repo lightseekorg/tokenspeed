@@ -66,6 +66,7 @@ from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 VOCAB = 64
 HIDDEN = 32
@@ -545,6 +546,7 @@ def capture_input(
             series: ladder_from_plan(graphs, entries) for series, graphs in plan.items()
         },
         stream=stream,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False),
         num_warmup=2,
         target_hidden_width=width,
         target_hidden_dtype=torch.float32,

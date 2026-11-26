@@ -198,6 +198,7 @@ class TestPrefillCaptureStreamTest:
 
             def __init__(self):
                 self.num_warmup = 2
+                self.memory_saver_adapter = TorchMemorySaverAdapter.create(False)
                 self._pool = None
                 self._handoff_storage = {}
                 self._outputs: list[torch.Tensor] | None = None
@@ -1734,6 +1735,7 @@ def test_all_capture_stages_warm_the_execution_stream():
             fresh = torch.ones_like(x)
             owner = PrefillGraph.__new__(PrefillGraph)
             owner.num_warmup = 2
+            owner.memory_saver_adapter = TorchMemorySaverAdapter.create(False)
             owner._pool = None
             owner._ctx = None
             owner._handoff_storage = {}

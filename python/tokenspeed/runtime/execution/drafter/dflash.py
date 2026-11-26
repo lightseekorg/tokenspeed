@@ -1753,6 +1753,7 @@ class DFlash(BaseDrafter):
             pool=self._block_graph_pool,
             stream=capture.stream,
             handoff_storage=self._block_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
             run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())

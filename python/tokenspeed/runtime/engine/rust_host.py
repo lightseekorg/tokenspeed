@@ -1144,6 +1144,8 @@ class HostDataPlane:
         """Free memory regions, in order; the scheduler has drained."""
         for tag in tags:
             self._regions[tag].release()
+        # A released engine must return unused eager allocator segments too.
+        self._device.empty_cache()
 
     def resume_memory(self, tags: list[str]) -> None:
         """Restore memory regions, in order."""

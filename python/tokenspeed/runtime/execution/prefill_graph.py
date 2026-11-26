@@ -611,12 +611,13 @@ class PrefillGraph:
         if self.disable:
             return
         weight = self.inner_model.embed_tokens.weight
-        self._input_embeds_buf = torch.zeros(
-            max(self.capture_buckets),
-            weight.shape[1],
-            dtype=weight.dtype,
-            device=weight.device,
-        )
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self._input_embeds_buf = torch.zeros(
+                max(self.capture_buckets),
+                weight.shape[1],
+                dtype=weight.dtype,
+                device=weight.device,
+            )
         # Seam: backends alloc static buffers or refuse capture; kept
         # outside inference mode (in-place refresh). Base default: no-op.
         self._captures.clear()
@@ -914,7 +915,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            memory_saver_adapter=self.memory_saver_adapter,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -942,6 +946,7 @@ class PrefillGraph:
             pool=self._pool,
             stream=stream,
             handoff_storage=self._encoder_handoff_storage,
+            memory_saver_adapter=self.memory_saver_adapter,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -971,7 +976,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            memory_saver_adapter=self.memory_saver_adapter,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -1014,10 +1022,11 @@ class PrefillGraph:
                 if self._narrowing is None
                 else self.decoder_buckets
             )
-            self._outputs = [
-                torch.empty((max(ladder), *shape[1:]), dtype=dtype, device=device)
-                for shape, dtype, device in spec
-            ]
+            with self.memory_saver_adapter.named_region("workspace"):
+                self._outputs = [
+                    torch.empty((max(ladder), *shape[1:]), dtype=dtype, device=device)
+                    for shape, dtype, device in spec
+                ]
         reserved = [(tuple(b.shape[1:]), b.dtype, b.device) for b in self._outputs]
         wanted = [(shape[1:], dtype, device) for shape, dtype, device in spec]
         if wanted != reserved:
@@ -1246,7 +1255,9 @@ class PrefillGraph:
         length, remainder = divmod(num_tokens, bs)
         seq_lens = [length + (row < remainder) for row in range(bs)]
         seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
-        seq_lens_gpu = seq_lens_cpu.to(self.config.device)
+        with self.memory_saver_adapter.named_region("attention_state"):
+            seq_lens_gpu = seq_lens_cpu.to(self.config.device)
+            gather_ids = torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1
         ib.input_ids_buf[:num_tokens].fill_(1)
         ib.positions_buf[:num_tokens].copy_(
             torch.cat([torch.arange(l, device=self.config.device) for l in seq_lens])
@@ -1288,7 +1299,7 @@ class PrefillGraph:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
+            gather_ids=gather_ids,
             query_shard=query_shard,
         )
         if self.dp_size > 1:

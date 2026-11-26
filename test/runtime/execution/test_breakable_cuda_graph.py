@@ -621,6 +621,11 @@ class TestPrefillGraphSharedOutputs:
             return out, a @ w2
 
         graph = PrefillGraph.__new__(PrefillGraph)
+        from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+            TorchMemorySaverAdapter,
+        )
+
+        graph.memory_saver_adapter = TorchMemorySaverAdapter.create(False)
         graph.num_warmup, graph._pool, graph._ctx = 2, None, None
         graph.capture_buckets, graph.decoder_buckets = [8, 16], []
         graph._narrowing, graph._outputs, graph._handoff_storage = None, None, {}
@@ -1217,3 +1222,24 @@ class TestPoolReuseAcrossCaptures:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_breakable_graph_storage_growth_survives_memory_release():
+    import subprocess
+    from pathlib import Path
+
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    saver = TorchMemorySaverAdapter.create(True)
+    with saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("breakable_graph_memory.py")),
+            ],
+            check=True,
+            timeout=180,
+        )

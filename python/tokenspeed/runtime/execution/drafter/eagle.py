@@ -1093,6 +1093,7 @@ class Eagle(HiddenStateDrafter):
             pool=self._extend_graph_pool,
             stream=capture.stream,
             handoff_storage=self._extend_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -1378,6 +1379,7 @@ class Eagle(HiddenStateDrafter):
             pool=self._extend_graph_pool,
             stream=capture.stream,
             handoff_storage=self._extend_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
             run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
