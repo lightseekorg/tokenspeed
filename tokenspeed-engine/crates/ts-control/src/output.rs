@@ -1800,8 +1800,9 @@ impl OutputProcessor {
                                 state.full_vocab_top_k,
                                 state.full_vocab_topk_vocab_size,
                             ) {
-                                state.finished_reason =
-                                    Some(FinishReason::abort(error.to_string()));
+                                state
+                                    .finished_reason
+                                    .get_or_insert_with(|| FinishReason::abort(error.to_string()));
                                 invalid_full_vocab = true;
                                 break;
                             }
@@ -1809,7 +1810,7 @@ impl OutputProcessor {
                             Some(*logprob)
                         }
                         _ => {
-                            state.finished_reason = Some(FinishReason::abort("full-vocabulary export is missing or invalid for an accepted token"));
+                            state.finished_reason.get_or_insert_with(|| FinishReason::abort("full-vocabulary export is missing or invalid for an accepted token"));
                             invalid_full_vocab = true;
                             break;
                         }
@@ -2117,11 +2118,17 @@ impl OutputProcessor {
             spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
             input_logprobs,
             output_top_logprobs,
-            output_full_vocab_topk: state
-                .output_full_vocab_topk
-                .get(sent * (2 + 2 * state.full_vocab_top_k) * 4..)
-                .unwrap_or(&[])
-                .to_vec(),
+            output_full_vocab_topk: if state.full_vocab_top_k > 0 {
+                let row_bytes = ts_wire::topk::row_bytes(state.full_vocab_top_k);
+                assert_eq!(
+                    state.output_full_vocab_topk.len(),
+                    state.output_ids.len() * row_bytes,
+                    "full-vocabulary rows must match committed tokens"
+                );
+                state.output_full_vocab_topk[sent * row_bytes..].to_vec()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -2444,6 +2451,152 @@ mod tests {
             computes_prompt_logprobs,
         });
         register_state(p, rid.to_owned(), state);
+    }
+
+    fn register_full_vocab(p: &mut OutputProcessor, max_new: i64, stop: &[i32]) {
+        let mut state = RequestState::new(
+            vec![1, 2],
+            max_new,
+            stop.iter().copied().collect(),
+            false,
+            None,
+            true,
+        );
+        state.full_vocab_top_k = 2;
+        state.full_vocab_topk_vocab_size = 8;
+        register_state(p, "binary".into(), state);
+    }
+
+    fn full_vocab_row(token: i32) -> Vec<u8> {
+        [
+            token,
+            (-1f32).to_bits() as i32,
+            token,
+            (token + 1) % 8,
+            (-0.5f32).to_bits() as i32,
+            (-2f32).to_bits() as i32,
+        ]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect()
+    }
+
+    fn full_vocab_result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
+        ForwardResult {
+            full_vocab_topk: Some(
+                tokens
+                    .iter()
+                    .map(|&token| (-0.5, full_vocab_row(token)))
+                    .collect(),
+            ),
+            // Binary requests must use the original-distribution value above.
+            output_logprobs: Some(vec![-9.0; tokens.len()]),
+            ..result(tokens, lengths)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "full-vocabulary rows must match committed tokens")]
+    fn binary_output_refuses_a_short_committed_buffer() {
+        let mut p = processor(None);
+        register_full_vocab(&mut p, 1, &[]);
+        let state = p.states.get_mut("binary").unwrap();
+        state.output_ids.push(3);
+        state.finished_reason = Some(FinishReason::Length(1));
+        p.stream(&["binary"], &mut Vec::new());
+    }
+
+    #[test]
+    fn binary_rows_follow_accepted_tokens_and_stop_trimming() {
+        let mut p = processor(Some(3));
+        register_full_vocab(&mut p, 10, &[5]);
+        let first = p
+            .commit(
+                &batch(&[("binary", 2, 0, 2)], 1),
+                None,
+                &full_vocab_result(&[3], &[1]),
+            )
+            .unwrap();
+        assert!(first.outputs.is_empty());
+        let mut step = full_vocab_result(&[4, 5, 6], &[3]);
+        // A row after the stop is not committed or validated.
+        step.full_vocab_topk.as_mut().unwrap()[2].1.fill(0);
+        let done = p
+            .commit(&batch(&[("binary", 3, 0, 2)], 0), None, &step)
+            .unwrap();
+        let output = &done.outputs[0];
+        assert_eq!(output.output_ids, [3, 4, 5]);
+        assert_eq!(output.output_logprobs, [-0.5; 3]);
+        assert_eq!(
+            output.output_full_vocab_topk,
+            [full_vocab_row(3), full_vocab_row(4), full_vocab_row(5)].concat()
+        );
+        assert_eq!(output.finish_reason, Some("stop"));
+        assert_eq!(done.released, ["binary"]);
+    }
+
+    #[test]
+    fn missing_or_corrupt_binary_rows_abort_without_contaminating_the_prefix() {
+        for rows in [
+            None,
+            Some(vec![(-0.5, vec![0; ts_wire::topk::row_bytes(2)])]),
+        ] {
+            let mut p = processor(None);
+            register_full_vocab(&mut p, 10, &[]);
+            p.commit(
+                &batch(&[("binary", 2, 0, 2)], 1),
+                None,
+                &full_vocab_result(&[3], &[1]),
+            )
+            .unwrap();
+            let step = ForwardResult {
+                full_vocab_topk: rows,
+                ..result(&[4], &[1])
+            };
+            let done = p
+                .commit(&batch(&[("binary", 1, 0, 2)], 0), None, &step)
+                .unwrap();
+            let output = &done.outputs[0];
+            assert_eq!(output.finish_reason, Some("abort"));
+            assert_eq!(output.output_ids, [3]);
+            assert_eq!(output.output_logprobs, [-0.5]);
+            assert_eq!(output.output_full_vocab_topk, full_vocab_row(3));
+            assert_eq!(done.released, ["binary"]);
+        }
+    }
+
+    #[test]
+    fn binary_row_errors_preserve_the_nan_abort_reason() {
+        for rows in [
+            None,
+            Some(vec![(f64::NAN, vec![0; ts_wire::topk::row_bytes(2)])]),
+        ] {
+            let mut p = processor(None);
+            register_full_vocab(&mut p, 10, &[]);
+            let step = ForwardResult {
+                full_vocab_topk: rows,
+                nan_flags: Some(vec![1]),
+                ..result(&[3], &[1])
+            };
+            let done = p
+                .commit(&batch(&[("binary", 2, 0, 2)], 1), None, &step)
+                .unwrap();
+            assert_eq!(done.stats.nan_aborts, 1);
+            assert_eq!(done.outputs[0].finish_reason, Some("abort"));
+            assert_eq!(
+                done.outputs[0].finish_details,
+                Some(
+                    FinishReason::Abort {
+                        message: NUMERICAL_ERROR.to_owned(),
+                        err_type: AbortCode::NumericalError,
+                        status_code: None,
+                    }
+                    .details()
+                )
+            );
+            assert!(done.outputs[0].output_ids.is_empty());
+            assert!(done.outputs[0].output_full_vocab_topk.is_empty());
+        }
     }
 
     /// The forward result of a plan's rows: each row's logprob is

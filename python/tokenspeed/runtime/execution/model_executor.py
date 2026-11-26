@@ -147,7 +147,7 @@ from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     request_vocab_mask,
 )
-from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch, accepted_path_rows
 from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -1869,8 +1869,6 @@ class ModelExecutor:
             ),
         )
         if full_scores is not None:
-            from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
-
             prediction_rows = None
             if self.tree_spec is not None and ctx.num_extends == 0:
                 prediction_rows = accepted_path_rows(

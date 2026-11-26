@@ -151,6 +151,7 @@ class FullVocabTopK:
             if self.form == "direct"
             else -(log_z[:, None] - selected)
         )
-        tail_logits = logits.scatter(1, ids, -torch.inf)
-        tail = torch.logsumexp(tail_logits, dim=-1) - (row_max + log_z)
+        # Removing the common offset avoids cancellation between large log sums.
+        tail_logits = shifted.scatter(1, ids, -torch.inf)
+        tail = torch.logsumexp(tail_logits, dim=-1) - log_z
         return FullVocabScores(shifted, log_z, ids, head, tail, self.form)

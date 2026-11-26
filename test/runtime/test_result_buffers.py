@@ -128,3 +128,36 @@ def test_completed_result_keeps_absent_columns_absent():
         result, serving_compiles=None, grammar_terminated_at=None
     )
     assert exported == ([7], [1], None, None, None, None, None, None, None, None)
+
+
+def test_completed_result_exports_owned_binary_rows_with_their_sampled_scores():
+    packed = torch.arange(12, dtype=torch.int32).reshape(2, 6)
+    sampled = torch.tensor([-0.5, -1.25], dtype=torch.float32)
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor([3, 4], dtype=torch.int32),
+        output_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        full_vocab_topk=packed,
+        full_vocab_logprobs=sampled,
+    )
+    exported = completed_result(
+        result, serving_compiles=None, grammar_terminated_at=None
+    )[7][3]
+    expected = [
+        (score, row.numpy().astype("<i4", copy=False).tobytes())
+        for score, row in zip(sampled.tolist(), packed, strict=True)
+    ]
+    packed.zero_()
+    sampled.zero_()
+    assert exported == expected
+
+
+@pytest.mark.parametrize("score_rows,packed_rows", [(1, 2), (2, 1)])
+def test_completed_result_rejects_mismatched_binary_columns(score_rows, packed_rows):
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor([3, 4], dtype=torch.int32),
+        output_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        full_vocab_topk=torch.zeros((packed_rows, 6), dtype=torch.int32),
+        full_vocab_logprobs=torch.zeros(score_rows, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="zip"):
+        completed_result(result, serving_compiles=None, grammar_terminated_at=None)

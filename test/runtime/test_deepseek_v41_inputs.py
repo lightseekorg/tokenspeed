@@ -43,7 +43,10 @@ from tokenspeed.runtime.execution import input_buffer, model_executor, weight_lo
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
-from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.model_executor import (
+    ModelExecutor,
+    ModelExecutorConfig,
+)
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
@@ -809,7 +812,7 @@ def test_executor_input_capacity_covers_decode_capture(
     )
     monkeypatch.setattr(model_executor.NanGuard, "create", stop_before_model_setup)
     executor = ModelExecutor.__new__(ModelExecutor)
-    config = SimpleNamespace(
+    config = ModelExecutorConfig(
         device="cpu",
         max_num_seqs=4,
         data_parallel_size=1,
@@ -826,6 +829,27 @@ def test_executor_input_capacity_covers_decode_capture(
         enable_nan_detection=False,
         enable_speculative_sampling=False,
         state_checkpoint_in_forward=False,
+        enforce_eager=False,
+        enable_dp_local_cuda_graph=False,
+        prefix_granularity=1,
+        context_len=32,
+        physical_context_len=64,
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 4],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        full_vocab_top_k=0,
+        full_vocab_top_k_solution=None,
+        input_logprob_chunk_tokens=16,
+        query_shard_size=1,
+        query_shard_rank=0,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),

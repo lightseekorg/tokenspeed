@@ -52,6 +52,7 @@ from tokenspeed.runtime.execution.memory_delta import (
     MemoryDeltaObserver,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.types import ForwardLogprobs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -314,8 +315,6 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
     rows = bs * max_tokens_per_req
     if forward_logprobs is not None:
-        from tokenspeed.runtime.execution.types import ForwardLogprobs
-
         if any(
             value is not None
             for value in (

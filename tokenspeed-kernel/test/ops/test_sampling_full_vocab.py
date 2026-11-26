@@ -20,6 +20,8 @@
 
 """Bit-pattern regression for the configured full-vocabulary logprob form."""
 
+import math
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling import FullVocabTopK
@@ -45,3 +47,45 @@ def test_full_vocab_preserves_zero_sign(form, zero_bits):
     )
     # The packed head is a bit reinterpretation; it must preserve signed zero too.
     assert torch.equal(packed[:, 4], sampled.view(torch.int32))
+
+
+@pytest.mark.parametrize("form", ["direct", "negative-cross-entropy"])
+def test_tail_is_invariant_to_a_large_common_logit_offset(form):
+    vocab, k = 32768, 128
+    scorer = FullVocabTopK(k=k, vocab_block=32768, form=form, solution="torch")
+    baseline = scorer.prepare(torch.zeros((1, vocab), dtype=torch.float32))
+    logits = torch.full((1, vocab), 1e8, dtype=torch.float32)
+    shifted = scorer.prepare(logits)
+    torch.testing.assert_close(
+        shifted.log_tail,
+        torch.tensor([math.log1p(-k / vocab)], dtype=torch.float32),
+        atol=1e-6,
+        rtol=0,
+    )
+    assert torch.equal(
+        shifted.log_tail.view(torch.int32), baseline.log_tail.view(torch.int32)
+    )
+    packed, sampled = shifted.pack(torch.tensor([0]), prediction_rows=None)
+    baseline_packed, baseline_sampled = baseline.pack(
+        torch.tensor([0]), prediction_rows=None
+    )
+    assert torch.equal(packed, baseline_packed)
+    assert torch.equal(sampled.view(torch.int32), baseline_sampled.view(torch.int32))
+    assert torch.all(logits == 1e8)
+
+
+def test_full_vocab_packs_tree_prediction_rows_in_accepted_order():
+    logits = torch.arange(48, dtype=torch.float32).reshape(6, 8) % 11
+    scores = FullVocabTopK(k=2, vocab_block=8, form="direct", solution="torch").prepare(
+        logits
+    )
+    # Two three-node trees with distinct accepted paths and identity padding.
+    prediction_rows = torch.tensor([0, 2, 2, 3, 5, 5])
+    tokens = torch.tensor([3, 4, -1, 6, 7, -1])
+    packed, sampled = scores.pack(tokens, prediction_rows=prediction_rows)
+    reference = torch.log_softmax(logits.double(), dim=-1)[prediction_rows]
+    expected = reference.gather(1, tokens.clamp(0, 7)[:, None]).squeeze(1)
+    torch.testing.assert_close(sampled.double(), expected, atol=1e-6, rtol=0)
+    assert torch.equal(packed[:, 0], tokens.to(torch.int32))
+    assert torch.equal(packed[:, 2:4], scores.ids[prediction_rows].to(torch.int32))
+    assert torch.equal(packed[:, 1], scores.log_tail[prediction_rows].view(torch.int32))

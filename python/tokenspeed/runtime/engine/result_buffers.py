@@ -84,6 +84,7 @@ def completed_result(
                                 "<i4", copy=False
                             )
                         ),
+                        strict=True,
                     )
                 )
                 if results.full_vocab_topk is not None

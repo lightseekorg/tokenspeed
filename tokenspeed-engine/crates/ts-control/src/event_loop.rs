@@ -3374,7 +3374,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             rid,
                             state.cached_tokens,
                             state.output_logprobs.first().copied(),
-                            (state.full_vocab_top_k > 0)
+                            (!state.output_full_vocab_topk.is_empty())
                                 .then(|| state.output_full_vocab_topk.clone()),
                         );
                     }
