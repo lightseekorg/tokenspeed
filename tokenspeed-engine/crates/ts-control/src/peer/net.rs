@@ -128,6 +128,19 @@ impl PeerNet {
         self.send(endpoint, REPLY, reply.encode())
     }
 
+    /// Route a v1 frame using the same public DP endpoint as legacy traffic.
+    pub fn versioned(
+        &self,
+        endpoint: &str,
+        message: &super::v1::Message,
+    ) -> Result<(), PeerSendError> {
+        self.send(
+            endpoint,
+            if message.reply() { REPLY } else { REQUEST },
+            message.encode(),
+        )
+    }
+
     fn send(
         &self,
         endpoint: &str,

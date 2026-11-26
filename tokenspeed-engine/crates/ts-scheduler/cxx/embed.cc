@@ -19,13 +19,14 @@
 // SOFTWARE.
 
 // Moving scheduler objects between the binary and the embedded interpreter.
-// Both functions run with the GIL held and need the built-in
+// Every function runs with the GIL held and needs the built-in
 // `tokenspeed_scheduler_ext` module imported, which registers the types.
 
 #include <nanobind/nanobind.h>
 
 #include <memory>
 
+#include "cache/tier/shared_l2_pool.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/scheduler.h"
 
@@ -40,6 +41,17 @@ extern "C" tokenspeed::Scheduler* ts_scheduler_from_python(PyObject* object) {
         return nullptr;
     }
     return nb::inst_ptr<tokenspeed::Scheduler>(handle);
+}
+
+// The C++ pool behind a Python `tokenspeed_scheduler.SharedL2Pool`, which
+// keeps owning it. Null with a Python error set if `object` is something else.
+extern "C" tokenspeed::SharedL2Pool* ts_shared_l2_pool_from_python(PyObject* object) {
+    nb::handle handle(object);
+    if (!nb::isinstance<tokenspeed::SharedL2Pool>(handle)) {
+        PyErr_SetString(PyExc_TypeError, "expected a tokenspeed_scheduler.SharedL2Pool");
+        return nullptr;
+    }
+    return nb::inst_ptr<tokenspeed::SharedL2Pool>(handle);
 }
 
 // A new reference to a Python `ExecutionPlan` that takes over `plan`, which

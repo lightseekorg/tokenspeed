@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.layers import ple_lookup
 
 
@@ -41,7 +42,7 @@ def _mapping_class():
     return module.Mapping
 
 
-def _lookup(mapping):
+def _lookup(mapping, *, use_attn_tp=False):
     return ple_lookup.PLELookup(
         mapping,
         vocab_size=256,
@@ -50,6 +51,7 @@ def _lookup(mapping):
         storage_dtype=None,
         output_dtype=torch.float32,
         offload=False,
+        table_layout="attn_tp_sharded" if use_attn_tp else "global_sharded",
         enable_hot_cache=False,
         prefix="",
     )
@@ -65,12 +67,13 @@ def test_hot_cache_requires_offloading():
             storage_dtype=None,
             output_dtype=torch.bfloat16,
             offload=False,
+            table_layout="global_sharded",
             enable_hot_cache=True,
             prefix="",
         )
 
 
-def _worker(rank, rendezvous, tp_size):
+def _worker(rank, rendezvous, tp_size, use_attn_tp):
     dist.init_process_group(
         "gloo",
         init_method=rendezvous,
@@ -85,7 +88,13 @@ def _worker(rank, rendezvous, tp_size):
             ranks = tuple(range(lane, 4, tp_size))
             groups[ranks] = dist.new_group(ranks, backend="gloo")
 
+        for start in range(0, 4, tp_size):
+            ranks = tuple(range(start, start + tp_size))
+            groups[ranks] = dist.new_group(ranks, backend="gloo")
+        groups[(0, 1, 2, 3)] = dist.group.WORLD
+
         def gather(output, ids, group):
+            assert not use_attn_tp
             dist.all_gather_single(output, ids, group=groups[group])
 
         ple_lookup._all_gather_ids = gather
@@ -95,17 +104,18 @@ def _worker(rank, rendezvous, tp_size):
             attn_tp_size=tp_size,
             attn_dp_size=dp_size,
         )
-        lookup = _lookup(mapping)
-        assert lookup.table_group == (0, 1, 2, 3)
-        assert lookup.table_rank == rank
+        lookup = _lookup(mapping, use_attn_tp=use_attn_tp)
+        table_group = mapping.attn.tp_group if use_attn_tp else (0, 1, 2, 3)
+        assert lookup.table_group == table_group
+        assert lookup.table_rank == table_group.index(rank)
         full_table = torch.arange(256 * 3).reshape(256, 3).float()
         lookup.ngram_embedding.weight.data.zero_()
         lookup.load_shard(full_table, 0, 1, prescanned=False)
 
         def reduce(values, group):
             assert values.ndim == 2
-            assert group == (0, 1, 2, 3)
-            dist.all_reduce(values)
+            assert group == table_group
+            dist.all_reduce(values, group=groups[group])
             return values
 
         ple_lookup._all_reduce = reduce
@@ -123,7 +133,9 @@ def _worker(rank, rendezvous, tp_size):
                 live = max(0, n - 1) if sizes == [2] * dp_size else n
                 ids = (torch.arange(live * 2).reshape(live, 2) + dp * 63 + shift) % 256
                 counts = [sizes[r // tp_size] for r in range(4)]
-                layout = lookup.make_layout(counts, ids.shape[0])
+                layout = lookup.make_layout(
+                    None if use_attn_tp else counts, ids.shape[0]
+                )
                 pending = lookup.start(ids, layout)
                 values = lookup.finish(pending)
                 expected = ids.unsqueeze(-1) * 3 + torch.arange(3)
@@ -134,10 +146,11 @@ def _worker(rank, rendezvous, tp_size):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_global_table_matches_unsharded_lookup(tmp_path, tp_size):
+@pytest.mark.parametrize("use_attn_tp", [False, True])
+def test_sharded_table_matches_unsharded_lookup(tmp_path, tp_size, use_attn_tp):
     mp.spawn(
         _worker,
-        args=((tmp_path / "rendezvous").as_uri(), tp_size),
+        args=((tmp_path / "rendezvous").as_uri(), tp_size, use_attn_tp),
         nprocs=4,
         join=True,
     )
@@ -147,9 +160,6 @@ def _cached_lookup_worker(rank, rendezvous, tp_size):
     from tokenspeed.runtime.distributed.comm_backend import set_global_backend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager,
-    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -172,6 +182,7 @@ def _cached_lookup_worker(rank, rendezvous, tp_size):
             storage_dtype=table_dtype,
             output_dtype=torch.bfloat16,
             offload=True,
+            table_layout="global_sharded",
             enable_hot_cache=True,
             prefix="",
         )
@@ -241,6 +252,7 @@ def test_online_fp8_host_lookup_uses_hot_cache(monkeypatch):
         storage_dtype=torch.float8_e4m3fn,
         output_dtype=torch.bfloat16,
         offload=True,
+        table_layout="global_sharded",
         enable_hot_cache=True,
         prefix="",
     )
@@ -348,6 +360,54 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
         ple_lookup.LookupTokenLayout(sizes)
 
 
+def _mapped_lookup_worker(rank, rendezvous):
+
+    torch.cuda.set_device(rank)
+    mapping = _mapping_class()(rank=rank, world_size=2, attn_tp_size=1, attn_dp_size=2)
+    process_group_manager.init_distributed(
+        mapping, rendezvous, device_id=torch.device("cuda", rank)
+    )
+    process_group_manager.init_process_group(mapping.attn.world_group)
+    try:
+        for mode in ("shared", "peer_sharded"):
+            lookup = ple_lookup.PLELookup(
+                mapping,
+                vocab_size=250,
+                ngram_heads=2,
+                head_dim=16,
+                storage_dtype=torch.float8_e4m3fn,
+                output_dtype=torch.bfloat16,
+                offload=True,
+                table_layout=mode,
+                enable_hot_cache=False,
+                prefix="",
+            )
+            src = (torch.arange(250 * 16).reshape(250, 16) % 101).to(
+                torch.float8_e4m3fn
+            )
+            lookup.load_shard(src, 0, 1, prescanned=False)
+            lookup.load_scale(torch.tensor(0.125))
+            lookup.shared_table.publish()
+            ids = torch.tensor(
+                [[1 + rank, 139 + rank], [249, 127]], device="cuda"
+            ).repeat(65, 1)
+            layout = lookup.make_layout(None, ids.shape[0])
+            result = lookup.finish(lookup.start(ids, layout))
+            expected = (
+                (src.float()[ids.cpu()] * 0.125).bfloat16().view(ids.shape[0], 32)
+            )
+            torch.testing.assert_close(result.cpu(), expected, atol=0, rtol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires two GPUs for mapped PLE lookup"
+)
+def test_mapped_tables_lookup_local_ids(tmp_path):
+    mp.spawn(_mapped_lookup_worker, args=((tmp_path / "mapped").as_uri(),), nprocs=2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_host_lookup_stream_handoff(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
@@ -360,6 +420,7 @@ def test_host_lookup_stream_handoff(monkeypatch):
         storage_dtype=None,
         output_dtype=torch.bfloat16,
         offload=True,
+        table_layout="global_sharded",
         enable_hot_cache=False,
         prefix="",
     )

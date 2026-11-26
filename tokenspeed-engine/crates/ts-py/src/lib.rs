@@ -39,6 +39,7 @@
 
 mod bootstrap;
 mod l3;
+mod transfer_engine;
 
 #[cfg(test)]
 mod tests;
@@ -564,6 +565,7 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<bootstrap::BootstrapServer>()?;
     module.add_class::<l3::L3Executor>()?;
+    module.add_class::<transfer_engine::TransferEngine>()?;
     module.add_class::<FrontendListener>()?;
     module.add_class::<PendingFrontend>()?;
     module.add_class::<Frontend>()?;

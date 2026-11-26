@@ -94,8 +94,9 @@ class WorkspacePool:
             initial_nbytes = envs.TOKENSPEED_WORKSPACE_INITIAL_MB.get() * (1 << 20)
         self.device = torch.device(device)
         self._memory_saver = TorchMemorySaverAdapter.create(
-            enable=self.device.type == "cuda"
-            and global_server_args_dict["enable_memory_saver"]
+            enable=self.device.type in ("cuda", "npu")
+            and global_server_args_dict["enable_memory_saver"],
+            device=self.device.type,
         )
         self._block = self._new_block(initial_nbytes)
         self._frozen = False

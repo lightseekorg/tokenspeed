@@ -22,7 +22,7 @@
 
 import ctypes
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -57,8 +57,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
 from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
 
 
-@pytest.mark.parametrize("prefix_granularity", [8, 16])
-def test_segmented_host_device_contract_and_budget(prefix_granularity):
+def _mixed_arena(prefix_granularity):
     group = CacheGroupSpec(
         group_id="full_attention",
         attn_kind="full_history",
@@ -94,6 +93,12 @@ def test_segmented_host_device_contract_and_budget(prefix_granularity):
         cache_group_specs=(group,),
         storage_plan=plan_cache_storage(layout.bind(16), (group,), offload=config),
     )
+    return arena, names
+
+
+@pytest.mark.parametrize("prefix_granularity", [8, 16])
+def test_segmented_host_device_contract_and_budget(prefix_granularity):
+    arena, names = _mixed_arena(prefix_granularity)
     assert arena.field(names[0]).is_cuda
     assert arena.field(names[1]).is_pinned()
     contract, _ = build_arena_cache_transfer_contract(arena)
@@ -132,3 +137,43 @@ def test_segmented_host_device_contract_and_budget(prefix_granularity):
     assert device_pages[1].eq(0).all()
     with pytest.raises(ValueError, match="complete plan"):
         replace(contract, field_addresses={names[1]: destination})
+
+
+@pytest.mark.parametrize("warmed", [False, True])
+def test_probe_release_discards_offload_storage_with_retained_views(warmed):
+    for _ in range(2):
+        probe, names = _mixed_arena(8)
+        if warmed:
+            probe.offload.begin(
+                torch.tensor([1], dtype=torch.int32, device="cuda"),
+                num_extends=0,
+                stream=torch.cuda.current_stream(),
+            )
+        buffers = list(probe.regions.values())
+        for state in probe.offload.fields.values():
+            buffers.extend(
+                value
+                for field in fields(state)
+                if isinstance(value := getattr(state, field.name), torch.Tensor)
+            )
+        buffers.extend(
+            tensor
+            for tensor in (probe.offload.requests, probe.offload.valid_requests)
+            if tensor is not None
+        )
+        retained_views = [tensor.view(-1) for tensor in buffers if tensor.numel()]
+        assert all(view.untyped_storage().nbytes() > 0 for view in retained_views)
+
+        # The startup caller drains every stream and destroys graphs before release.
+        torch.cuda.synchronize()
+        probe.release_probe_storage()
+        probe.release_probe_storage()
+        assert all(view.untyped_storage().nbytes() == 0 for view in retained_views)
+
+        serving, _ = _mixed_arena(8)
+        for name in names:
+            serving.field(name).fill_(7)
+            serving.compute_field(name).fill_(3)
+        torch.cuda.synchronize()
+        assert serving.field(names[1]).eq(7).all()
+        assert all(serving.compute_field(name).eq(3).all() for name in names)

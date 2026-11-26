@@ -27,6 +27,7 @@
 
 #include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -134,6 +135,11 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // A shared L2 pool as the rank's Host L2: the Host allocator then sizes
+    // the proxy tier (no bytes; at least the pool's blocks), and published
+    // entries are written to the pool as a write-through Host store would be.
+    // P and fused roles, replicated groups, never with L3 or a snapshot pool.
+    std::optional<SharedL2Config> shared_l2_config;
     // Sharing cached prefixes with other replicas
     // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
     std::optional<PeerConfig> peer_config;

@@ -549,7 +549,7 @@ class HostCacheExecutor:
         self.load_stream = new_cache_stream(load_stream_priority())
         # Both streams consume these immutable tables; the kernel backend
         # publishes them to the Device once. One geometry per Host buffer.
-        with self._memory_saver_adapter.named_region("workspace"):
+        with self._memory_saver_adapter.named_region("cache_transfer"):
             if l2_tier:
                 self._transfer_geometry = build_transfer_geometry(
                     self.layout, self.host_storage, io_backend=io_backend
@@ -620,7 +620,7 @@ class HostCacheExecutor:
             ):
                 with (
                     device_module.stream(stream),
-                    self._memory_saver_adapter.named_region("workspace"),
+                    self._memory_saver_adapter.named_region("cache_transfer"),
                 ):
                     for workspace in workspaces:
                         workspace.prepare_backend(
@@ -1309,7 +1309,7 @@ class HostCacheExecutor:
             # Resolve the transport before choosing the consumer wait protocol.
             with (
                 device_module.stream(self.load_stream),
-                self._memory_saver_adapter.named_region("workspace"),
+                self._memory_saver_adapter.named_region("cache_transfer"),
             ):
                 mode = workspace.prepare_backend(
                     self.layout.buffers,

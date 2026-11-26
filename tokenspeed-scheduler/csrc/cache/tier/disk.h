@@ -54,6 +54,14 @@ struct DiskConfig {
     // local hit, and how long the prefetched Host entries are held for it.
     std::int64_t wait_timeout_us;
     std::int64_t ready_timeout_us;
+    // Cleaning admission gates (0 / false disables each gate):
+    // - `min_clean_tokens`: minimum logical token length of a branch tip
+    //   eligible for cleaning to Disk (ancestors of a qualifying branch are
+    //   still cleaned so no prefix gap opens).
+    // - `require_reuse_for_cleaning`: when true, skip cleaning branch tips
+    //   that have never been reused (`was_acquired == false`, 2-hit filter).
+    std::int32_t min_clean_tokens{0};
+    bool require_reuse_for_cleaning{false};
     void Validate() const;
 };
 

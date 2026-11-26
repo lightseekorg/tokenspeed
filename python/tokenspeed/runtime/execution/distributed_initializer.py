@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -165,7 +166,11 @@ class DistributedConfig:
 
 class DistributedInitializer:
     @staticmethod
-    def initialize(config: DistributedConfig) -> float:
+    def initialize(
+        config: DistributedConfig,
+        *,
+        before_memory_profile: Callable[[], None] | None = None,
+    ) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
         logger.info(
             "Init torch distributed begin. Avail mem="
@@ -305,6 +310,10 @@ class DistributedInitializer:
             f"attn_tp_rank: {mapping.attn.tp_rank!s}  attn_dp_rank: "
             f"{mapping.attn.dp_rank!s}",
         )
+
+        # Include startup-owned communication resources in the memory floor.
+        if before_memory_profile is not None:
+            before_memory_profile()
 
         # Get minimum available GPU memory across all ranks
         min_per_gpu_memory = get_available_gpu_memory(
