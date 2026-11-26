@@ -5693,7 +5693,7 @@ TEST_P(HostSuffixHitTest, AStorageQueryAboveADeviceTailReachesALongerTailInTheSa
     EXPECT_EQ(query.max_tokens, 19);
     EXPECT_EQ(query.keys, checkpoints);
     const StorageReservation reservation =
-        coordinator_.Storage().ReserveStoragePrefix(prompt, query.keys, /*max_blocks=*/64);
+        coordinator_.Storage().ReserveStoragePrefix(prompt, query.keys, /*max_blocks=*/64, /*source_pool=*/nullptr);
     EXPECT_EQ(reservation.keys, checkpoints);
     EXPECT_EQ(reservation.blocks.size(), 3u);
     EXPECT_EQ(reservation.tail_prior, ContentHash{hashes_[3]});
@@ -17366,7 +17366,7 @@ TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
                                 .hash = ContentHash{HashPrefixPage(token_span(tokens.data() + 6, 1), hashes.back())}}};
     const auto query = coordinator.Storage().MissingStorageKeys(prompt, 16);
     ASSERT_EQ(query.keys.size(), 4u);
-    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4);
+    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4, /*source_pool=*/nullptr);
     ASSERT_EQ(reservation.blocks.size(), 4u);
     ASSERT_TRUE(reservation.tail);
     EXPECT_EQ(reservation.keys.back().content_hash, prompt.tail->hash);
@@ -17411,7 +17411,7 @@ TEST(StoragePrefixReservationTest, QueryBudgetIncludesPromptEndStateBeforeHistor
     for (const auto& key : query.keys) {
         if (key.group_id == 0 || key.content_hash == tail.hash) hits.push_back(key);
     }
-    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prompt, hits, 128);
+    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prompt, hits, 128, /*source_pool=*/nullptr);
     ASSERT_TRUE(reservation.tail);
     EXPECT_EQ(reservation.tail->hash, tail.hash);
     EXPECT_EQ(reservation.keys.size(), 40u);

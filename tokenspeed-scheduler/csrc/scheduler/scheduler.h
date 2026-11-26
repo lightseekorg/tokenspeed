@@ -259,7 +259,7 @@ public:
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
     PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases,
-                                bool include_disk = true) const {
+                                bool include_disk) const {
         if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
             return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
         }

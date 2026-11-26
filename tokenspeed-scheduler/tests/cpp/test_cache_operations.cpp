@@ -1095,7 +1095,7 @@ TEST_F(AsyncStorageTailTest, QueryBudgetPrioritizesTheCompleteTail) {
     const auto query = coordinator.Storage().MissingStorageKeys(prefix, 12);
     EXPECT_EQ(query.max_tokens, 11);
     EXPECT_LE(query.keys.size(), 12u);
-    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 9);
+    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 9, /*source_pool=*/nullptr);
     ASSERT_TRUE(reservation.tail);
     EXPECT_EQ(reservation.tail->hash, prefix.tail->hash);
     EXPECT_EQ(reservation.blocks.size(), 9u);
@@ -1104,7 +1104,7 @@ TEST_F(AsyncStorageTailTest, QueryBudgetPrioritizesTheCompleteTail) {
 TEST_F(AsyncStorageTailTest, HostBudgetRetriesTheImmediatelyPrecedingAlignedBoundary) {
     const auto prefix = prompt(11, true);
     const auto query = coordinator.Storage().MissingStorageKeys(prefix, 64);
-    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 8);
+    const auto reservation = coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 8, /*source_pool=*/nullptr);
     // T=11 needs nine references; T=8 needs seven. Subtracting a full
     // prefix granularity from 11 would incorrectly skip this boundary.
     EXPECT_EQ(reservation.blocks.size(), 7u);
@@ -1625,13 +1625,13 @@ TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHo
     const auto query = coordinator.Storage().MissingStorageKeys(prompt, 16);
     ASSERT_EQ(query.keys.size(), 3u);
     // Bucket 2 cannot accept h2, so only the shorter complete prefix fits.
-    auto short_read = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4);
+    auto short_read = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4, /*source_pool=*/nullptr);
     ASSERT_EQ(short_read.keys.size(), 1u);
     EXPECT_EQ(short_read.keys[0].content_hash, ContentHash{"h1"});
     EXPECT_EQ(coordinator.Allocator(0).BucketOf(short_read.blocks[0]->Location()), 1);
     short_read.blocks.clear();
     pinned.clear();
-    const auto full_read = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4);
+    const auto full_read = coordinator.Storage().ReserveStoragePrefix(prompt, query.keys, 4, /*source_pool=*/nullptr);
     ASSERT_EQ(full_read.keys.size(), 3u);
     for (std::size_t i = 0; i < full_read.keys.size(); ++i) {
         EXPECT_EQ(full_read.keys[i].content_hash, ContentHash{hashes[i + 1]});
@@ -1659,7 +1659,8 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
     second.reset();
     const std::array hashes{std::string{"h0"}, std::string{"h1"}};
     auto reservation = coordinator.Storage().ReserveStoragePrefix(
-        StoragePrompt(hashes, 2), std::array{CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}}, 2);
+        StoragePrompt(hashes, 2), std::array{CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}}, 2,
+        /*source_pool=*/nullptr);
     ASSERT_EQ(reservation.blocks.size(), 1u);
     EXPECT_EQ(coordinator.Host().NumPinnedHostCachedBlocks(), 0);
     EXPECT_TRUE(coordinator.Host().ContainsHostCachedBlock(later));

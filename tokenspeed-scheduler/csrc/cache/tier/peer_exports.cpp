@@ -83,7 +83,7 @@ PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens
 // `include_disk` is set and its Disk tier extends that, the Disk-extended
 // listing, whose Disk pages the holder pushes (docs/rfcs/0006-disk-tier.md).
 PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt,
-                                           bool include_disk = true) {
+                                           bool include_disk) {
     PrefixProber::PrefixListing listing =
         coordinator.Prober().ListPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
     if (include_disk && coordinator.Disk().HasPool()) {
@@ -97,7 +97,7 @@ PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, 
 // The listing's blocks, held and refreshed (CacheCoordinator::ExportPrefix).
 CacheCoordinator::PrefixExport ExportPeerPrefix(CacheCoordinator& coordinator, const PromptPrefix& prompt) {
     if (coordinator.Disk().HasPool()) {
-        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt);
+        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt, /*include_disk=*/true);
         if (std::ranges::any_of(listing.pages,
                                 [](const PrefixProber::ListedPage& page) { return page.tier == CacheTier::kDisk; })) {
             return coordinator.ExportListing(listing);
@@ -138,8 +138,8 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
         return false;
     }
-    const PrefixProber::PrefixListing listing =
-        ListPeerPrefix(coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()));
+    const PrefixProber::PrefixListing listing = ListPeerPrefix(
+        coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()), /*include_disk=*/true);
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 

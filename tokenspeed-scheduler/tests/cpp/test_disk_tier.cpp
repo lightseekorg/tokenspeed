@@ -511,7 +511,7 @@ TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
                                    .prefix_hashes = prompt.hashes,
                                    .tokens = prompt.tokens,
                                    .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
-    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
     EXPECT_EQ(answer.num_tokens, 16) << "the Disk extends the Host's two pages";
     ASSERT_EQ(answer.pages.size(), 4u);
     for (std::int32_t slot = 0; slot < 4; ++slot) {
@@ -550,7 +550,7 @@ TEST(DiskTierTest, APeerListingWithoutADiskGainIsTheDeviceAndHostOne) {
                                    .prefix_hashes = prompt.hashes,
                                    .tokens = prompt.tokens,
                                    .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
-    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
     EXPECT_EQ(answer.num_tokens, 12);
     EXPECT_TRUE(std::ranges::none_of(answer.pages, [](const PeerPage& page) { return page.tier == CacheTier::kDisk; }));
 }
@@ -1099,7 +1099,7 @@ TEST(DiskTierTest, HybridPeerListAndPinKeepsDeviceStateWhenKvIsOnDisk) {
                                    .prefix_hashes = prompt.hashes,
                                    .tokens = prompt.tokens,
                                    .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
-    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
     ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.tokens.size()));
     ASSERT_EQ(answer.pages.size(), 3u);
     auto find_page = [&](std::uint32_t group, std::int32_t slot) {
@@ -1182,8 +1182,7 @@ TEST(DiskTierTest, HybridPeerListWithoutDiskKeepsDeviceStateWhenKvIsOnHost) {
     EXPECT_EQ(find_page(0u, 1).tier, CacheTier::kHost);
     EXPECT_EQ(find_page(1u, kPeerStateSlot).tier, CacheTier::kDevice);
 
-    const auto exported =
-        cache.coordinator.ExportPrefix(cache.coordinator.Prober().ProbePromptPrefix(prompt.Prefix()));
+    const auto exported = cache.coordinator.ExportPrefix(cache.coordinator.Prober().ProbePromptPrefix(prompt.Prefix()));
     EXPECT_EQ(exported.num_tokens, answer.num_tokens);
     ASSERT_EQ(exported.blocks.size(), 3u);
     EXPECT_EQ(exported.blocks[2].tier, CacheTier::kDevice);
