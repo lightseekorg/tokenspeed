@@ -91,9 +91,18 @@ PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const Group
 // Empty LCM parents later groups (j > group_index) still need in this
 // admission under hole-first accounting. Earlier groups keep at least this many
 // empty parents untouched before falling back to their own bound-parent holes.
-std::int64_t reservedEmptyParentsForLaterGroups(const BlockPool& pool, std::span<const CacheGroup> groups,
-                                                std::span<const BlockPlacementDemand> block_demands,
-                                                std::size_t group_index) {
+// Returns 0 when no reserve applies: the last group has no later groups to
+// protect, State groups stay compact hole-first, and packing == 1 bypasses
+// parent affinity in BlockPool.
+inline std::int64_t reservedEmptyParentsForLaterGroups(const CacheStore& store,
+                                                       std::span<const BlockPlacementDemand> block_demands,
+                                                       std::size_t group_index) {
+    const std::span<const CacheGroup> groups = store.Groups();
+    if (group_index + 1 == groups.size() || store.GroupIsState(group_index) ||
+        store.DevicePool().Packing(groups[group_index].Id()) == 1) {
+        return 0;
+    }
+    const BlockPool& pool = store.DevicePool();
     _assert(block_demands.size() == groups.size(), "every group of the admission carries its planned block demand");
     std::int64_t reserved = 0;
     for (std::size_t j = group_index + 1; j < groups.size(); ++j) {
@@ -376,11 +385,7 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             }
             held.clear();  // the unused ones go back
         }
-        const std::int64_t reserved_for_later =
-            (GroupIsState(i) || i + 1 == store_.Groups().size() ||
-             store_.DevicePool().Packing(store_.Groups()[i].Id()) == 1)
-                ? 0
-                : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), plan.block_demands, i);
+        const std::int64_t reserved_for_later = reservedEmptyParentsForLaterGroups(store_, plan.block_demands, i);
         // A first admission's table ends in the tail's blocks: shared full
         // pages, then this request's own copies.
         bool privatized_tail = false;
@@ -667,11 +672,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
         GroupAllocator& allocator = store_.Groups()[i].Allocator();
         BlockTable& table = *demands[i].table;
         const ImageTable& shape = image.tables[i];
-        const std::int64_t reserved_for_later =
-            (GroupIsState(i) || i + 1 == store_.Groups().size() ||
-             store_.DevicePool().Packing(store_.Groups()[i].Id()) == 1)
-                ? 0
-                : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), candidate->block_demands, i);
+        const std::int64_t reserved_for_later = reservedEmptyParentsForLaterGroups(store_, candidate->block_demands, i);
         const std::optional<ParentAffinity> shape_affinity =
             GroupIsState(i) ? std::nullopt
                             : std::optional<ParentAffinity>{ParentAffinity{
