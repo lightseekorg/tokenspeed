@@ -92,8 +92,11 @@ pub fn is_registration(frames: &[Bytes]) -> bool {
 /// A registration's reply route, readable even when its layout is rejected
 /// (`KVArgsRegisterInfo.route_header_from_zmq`): endpoint, port, cache identity.
 pub fn registration_route(frames: &[Bytes]) -> Result<(String, u16, String), WireError> {
-    if !matches!(frames.len(), 9 | 10) || !is_registration(frames) {
-        return Err(error("CachePD slab registration requires 9 or 10 frames"));
+    if !(9..=11).contains(&frames.len()) || !is_registration(frames) {
+        return Err(error("CachePD slab registration requires 9 to 11 frames"));
+    }
+    if frames.get(10).is_some_and(Bytes::is_empty) {
+        return Err(error("CachePD state registration extension is empty"));
     }
     let endpoint = text(&frames[1], "CachePD registration endpoint")?;
     let cache_id = text(&frames[8], "CachePD registration cache identity")?;

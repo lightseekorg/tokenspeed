@@ -603,6 +603,7 @@ class HostConfig:
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
+    requires_cache_coordination: bool
     startup_requests: bool
     max_batch_size: int
     chunked_prefill_size: int
@@ -842,6 +843,7 @@ class HostDataPlane:
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
         history: tuple[list[int], list[int], list[list[int]]] | None,
         retirement_id: int | None = None,
+        coordinate_cache: bool = False,
     ) -> _Dispatched | None:
         """Run one round's plan; the forward to complete later, if one ran.
 
@@ -863,6 +865,7 @@ class HostDataPlane:
                 slots, prefix lengths and tokens); None when no row needs
                 one.
             retirement_id: The host's fence for snapshots and scheduler aborts.
+            coordinate_cache: All distributed page owners participate in this round.
         """
         dp_metadata = None
         idle_forward = False
@@ -963,6 +966,8 @@ class HostDataPlane:
                 request.replay_slot = slot
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
+        if coordinate_cache:
+            self._device.coordinate_cache_round(cache_ops.device)
         with kernel_warmup(enabled=self._starting):
             results = self._device.execute(
                 plan,
@@ -1695,6 +1700,7 @@ class HostBootstrap:
                 ),
                 kv_total_pages=geometry.num_usable_pages,
                 kv_token_capacity=geometry.token_capacity,
+                requires_cache_coordination=specs.requires_cache_coordination,
                 startup_requests=server_args.enable_startup_requests,
                 max_batch_size=max_batch_size,
                 chunked_prefill_size=server_args.chunked_prefill_size,
@@ -1717,7 +1723,10 @@ class HostBootstrap:
                 pp_ranks=tuple(mapping.pp_group) if mapping.has_pp else None,
                 dp_ranks=dp_coordination_ranks(
                     mapping,
-                    requires_forward_coordination=specs.requires_forward_coordination,
+                    requires_forward_coordination=(
+                        specs.requires_forward_coordination
+                        or specs.requires_cache_coordination
+                    ),
                     shared_l3=l3 is not None,
                 ),
                 # One node's ranks reach each other on loopback; across nodes

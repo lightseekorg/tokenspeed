@@ -309,6 +309,7 @@ struct HostConfig {
     kv_total_pages: i64,
     /// Effective token capacity of the usable KV pool.
     kv_token_capacity: i64,
+    requires_cache_coordination: bool,
     /// With `--enable-startup-requests`, what sizes the requests the engine
     /// serves itself before it registers.
     startup: Option<startup::Limits>,
@@ -584,6 +585,9 @@ impl HostConfig {
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
             kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+            requires_cache_coordination: config
+                .getattr("requires_cache_coordination")?
+                .extract()?,
             startup: if config.getattr("startup_requests")?.extract()? {
                 Some(startup::Limits {
                     max_batch_size: config.getattr("max_batch_size")?.extract()?,
@@ -974,6 +978,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         limits: config.limits,
         kv_total_pages: config.kv_total_pages,
         kv_token_capacity: config.kv_token_capacity,
+        requires_cache_coordination: config.requires_cache_coordination,
         ngram_context_len: config.ngram_context_len,
         request_token_history: config.request_token_history,
         request_token_history_lookback: config.request_token_history_lookback,

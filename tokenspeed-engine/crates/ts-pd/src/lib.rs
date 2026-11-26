@@ -43,6 +43,7 @@ mod http;
 pub mod layout;
 mod net;
 mod prefill;
+mod state_shards;
 mod status;
 mod wire;
 

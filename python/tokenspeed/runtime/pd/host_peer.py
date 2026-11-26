@@ -42,11 +42,12 @@ import importlib.util
 import ipaddress
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.pd.state_shards import StateShardField, StateShardRegistration
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
@@ -264,9 +265,28 @@ class HostPrefillPeer(_HostPeer):
 
 
 class HostDecodePeer(_HostPeer):
-    """A Decode rank's peer: its settings."""
+    """The scheduler replica receiving KV and any distributed state fields."""
 
     mode = "decode"
+
+    def __init__(self, outbox, settings: PeerSettings, role_settings: DecodeSettings):
+        super().__init__(outbox, settings, role_settings)
+        self.state_shards = StateShardRegistration(
+            settings.engine_rank, role_settings.tp_size
+        )
+
+    def register_state_shards(
+        self,
+        group,
+        fields: dict[str, StateShardField],
+        *,
+        regions: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Register the backend's physical state buffers before the transport starts."""
+        regions = self.state_shards.add(
+            group, fields, regions=regions, registered_regions=self.settings.regions
+        )
+        self.settings = replace(self.settings, regions=regions)
 
 
 def build_host_peer(
@@ -325,7 +345,7 @@ def build_host_peer(
             _prefill_settings(server_args, kv_args, topology, local_ip),
         )
     if server_args.disaggregation_mode == "decode":
-        return HostDecodePeer(
+        peer = HostDecodePeer(
             outbox,
             settings,
             DecodeSettings(
@@ -344,6 +364,16 @@ def build_host_peer(
                 ),
             ),
         )
+        extensions = executor.attn_backend.decode_cache_extensions()
+        if extensions and server_args.enable_prefix_caching:
+            raise ValueError(
+                "distributed state requires Decode prefix caching to be disabled"
+            )
+        for extension in extensions:
+            extension.register(peer, topology.global_rank)
+        if extensions and not peer.state_shards.fields:
+            raise ValueError("decode cache extension did not register its state fields")
+        return peer
     raise NotImplementedError(
         f"the Rust engine host has no {server_args.disaggregation_mode} peer"
     )

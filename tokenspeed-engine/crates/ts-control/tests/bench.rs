@@ -436,6 +436,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
         },
         kv_total_pages: pages as i64,
         kv_token_capacity: (pages * shape.page) as i64,
+        requires_cache_coordination: false,
         ngram_context_len: 0,
         request_token_history: false,
         request_token_history_lookback: None,

@@ -82,8 +82,14 @@ impl NativeLibrary {
     /// Dropping this library fails held writes without copying after a panic.
     #[allow(dead_code)] // Shared by lifecycle tests that do not all hold native writes.
     pub(crate) fn block_writes(&self) {
+        self.block_writes_to("");
+    }
+
+    /// Pause writes to just one session, leaving earlier fan-out edges live.
+    #[allow(dead_code)]
+    pub(crate) fn block_writes_to(&self, session: &str) {
         let _ = std::fs::remove_file(self.directory.join("write-entered"));
-        std::fs::write(self.directory.join("write-blocked"), b"")
+        std::fs::write(self.directory.join("write-blocked"), session)
             .expect("block native test writes");
     }
 
@@ -168,8 +174,13 @@ static Engine *engines[ENGINES];
 static uint64_t next_incarnation = 1;
 
 /* The barrier is private to this library and never holds the engine mutex. */
-static int wait_for_write_release(void) {
-    if (access(WRITE_BLOCK_PATH, F_OK) == 0) {
+static int wait_for_write_release(const char *session) {
+    FILE *blocked = fopen(WRITE_BLOCK_PATH, "r");
+    if (blocked) {
+        char target[1024] = {0};
+        size_t count = fread(target, 1, sizeof(target) - 1, blocked);
+        fclose(blocked);
+        if (count && strcmp(target, session) != 0) return 1;
         FILE *entered = fopen(WRITE_ENTERED_PATH, "w");
         if (entered) fclose(entered);
         while (access(WRITE_BLOCK_PATH, F_OK) == 0) usleep(1000);
@@ -270,7 +281,7 @@ static int copy(Engine *sender, Engine *receiver,
 int ts_mooncake_write(void *raw, const char *session, const uint64_t *sources,
                       const uint64_t *destinations, const uint64_t *lengths, size_t count) {
     Engine *sender = raw;
-    if (!wait_for_write_release()) return -4;
+    if (!wait_for_write_release(session)) return -4;
     pthread_mutex_lock(&mutex);
     Engine *receiver = target(sender, session);
     int result = receiver ? 0 : -2;
@@ -284,7 +295,7 @@ int ts_mooncake_write_pages(void *raw, const char *session, const int64_t *sourc
                             const int64_t *destinations, size_t count, const int64_t *fields,
                             size_t field_count, size_t max_batch) {
     Engine *sender = raw;
-    if (!wait_for_write_release()) return -4;
+    if (!wait_for_write_release(session)) return -4;
     pthread_mutex_lock(&mutex);
     Engine *receiver = target(sender, session);
     int result = receiver ? 0 : -2;

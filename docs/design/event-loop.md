@@ -1837,3 +1837,33 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+### Distributed state pages on Decode
+
+A backend can return a `DecodeCacheExtension` when a request's ordinary KV
+belongs to one scheduler replica and its latest state snapshot spans several
+devices. The backend registers the physical allocations and row partition of
+each state field on the Decode peer. Members exchange native session and cache
+identities once over their ordered CPU group. Each member checks that its fields
+fit its registered memory before the group can serve requests.
+
+The request owner grants its existing logical pages. Each physical member
+reserves a disjoint page interval for each owner, including its null page.
+Prefill uses the ordinary typed route for the KV fields. It splits each row
+of the declared state fields equally in group order and sends the slices to
+the members' registered addresses. It plans every destination before issuing
+a write and reports completion after all writes have returned. A fresh
+bootstrap room and the owner's cache incarnation identify the grant.
+
+Remote admission and retraction snapshot stores and restores use the existing
+DP round agreement to schedule a cache callback on every rank, including idle
+ranks. The backend fences the members' device work and finishes any snapshot
+I/O before it returns. The owner may then publish pages or acknowledge the
+ordinary snapshot. A regular decode step runs no cache callback or additional state barrier.
+
+This placement currently supports cold, whole-request transfers to attention
+TP1 replicas with full source state fields. The group stays fixed for the
+deployment. A failed transfer whose writes cannot be fenced keeps its pages
+pinned. Releasing memory or replacing a group requires draining and restarting
+the participating peers together. Decode prefix caching must be disabled. A
+backend must validate scheduler copy pairs before the ordinary arena copies them.

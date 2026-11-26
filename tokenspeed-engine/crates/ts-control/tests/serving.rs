@@ -774,6 +774,14 @@ impl DataPlane for FakeDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if dispatch.coordinate_cache {
+            let operation = if plan.remote_prefill().is_some() {
+                "cache owner"
+            } else {
+                "cache participant"
+            };
+            self.device_ops.lock().unwrap().push(operation.to_owned());
+        }
         if let Some(id) = dispatch.retirement_id {
             self.replay_pending
                 .push_back((id, self.replay_ack_polls.unwrap()));
@@ -1674,6 +1682,7 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    requires_cache_coordination: bool,
     /// A separate metrics directory for each rank.
     metrics_dir: Option<PathBuf>,
     /// Resident slots; decode can hold more requests than it forwards.
@@ -1793,6 +1802,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         },
         kv_total_pages,
         kv_token_capacity: kv_total_pages * 16,
+        requires_cache_coordination: setup.requires_cache_coordination,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         request_token_history_lookback: setup.request_token_history_lookback,
@@ -9147,6 +9157,47 @@ fn exported_gauges(directory: &Path) -> HashMap<String, f64> {
             .extract()
             .unwrap()
     })
+}
+
+#[test]
+fn cold_landing_coordinates_an_idle_rank_only_on_the_grant_round() {
+    interpreter();
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        rooms: [(
+            42,
+            WireRoom {
+                sent: Some(1000),
+                sent_by: vec![0],
+                ..WireRoom::default()
+            },
+        )]
+        .into(),
+        ..Wire::default()
+    }));
+    let mut active = vec![Vec::new(); 24];
+    active[0].push(EngineRequest::Add(Box::new(disaggregated(
+        "owner", 42, 16, 3,
+    ))));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            requires_cache_coordination: true,
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire,
+            }),
+            ..Setup::default()
+        },
+        vec![active, vec![Vec::new(); 24]],
+        no_reaction,
+    );
+    assert!(ranks.iter().all(|r| r.outcome.is_ok()));
+    assert_eq!(ranks[0].device_ops, ["cache owner"]);
+    assert_eq!(ranks[1].device_ops, ["cache participant"]);
+    assert!(ranks[0].forwards > 0);
 }
 
 #[test]

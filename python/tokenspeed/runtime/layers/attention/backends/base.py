@@ -42,9 +42,9 @@ from __future__ import annotations
 
 from abc import ABC
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import torch
 
@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+    from tokenspeed.runtime.pd.host_peer import HostDecodePeer
     from tokenspeed.runtime.pd.utils import StepCounter
 
 
@@ -174,6 +175,22 @@ class SparseTopKShare:
         self.write_slots = []
 
 
+class DecodeCacheExtension(Protocol):
+    """A backend whose physical state pages span scheduler replicas."""
+
+    def register(self, peer: HostDecodePeer, rank: int) -> None:
+        """Declare this rank's fields and backing regions on the peer."""
+
+    def coordinate_cache_round(self, stream, ops, group_names, max_slots: int) -> None:
+        """Return after all shard owners retire prior writes and finish any snapshot I/O."""
+
+    def validate_copy(self, pairs: Mapping) -> None:
+        """Reject a local copy that would omit remote state slices."""
+
+    def rebound_draft_warmup(self) -> AbstractContextManager:
+        """Scope temporary state reads during draft warmup on a rebound cache."""
+
+
 class CachePoolBinding:
     """A node's bound cache pool."""
 
@@ -201,6 +218,14 @@ class CachePoolBinding:
     def child_backends(self) -> tuple[CachePoolBinding, ...]:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
+
+    def decode_cache_extensions(self) -> tuple[DecodeCacheExtension, ...]:
+        """Distributed page owners, in collective order across the decode ranks."""
+        return tuple(
+            extension
+            for child in self.child_backends()
+            for extension in child.decode_cache_extensions()
+        )
 
     def prepare_pending_recurrent_state(
         self, slots: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
