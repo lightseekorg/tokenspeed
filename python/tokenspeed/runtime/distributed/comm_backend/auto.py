@@ -869,9 +869,10 @@ class AutoBackend(CommBackend):
             not current_platform().is_nvidia
             or dtype != torch.bfloat16
             or world_size not in (2, 4, 8)
+            or channels <= 0
             or channels % (2 * world_size)
             or max_rows < 1
-            or 3 * max_rows * channels // 2 > 2**31 - 1
+            or 3 * (max_rows * channels // 2) + 2 * world_size > 2**31 - 1
             or self._group_spans_nodes(group)
         ):
             return False
