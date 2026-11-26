@@ -530,11 +530,20 @@ pub struct RequestMetrics {
     pub spec_decode_accept_length_samples: Vec<f64>,
 }
 
+/// An output owner awaiting abort feedback or scheduler retirement. This is
+/// not a resource lease: the scheduler and data plane retain those owners.
+struct Aborting {
+    rid: String,
+    admission: u64,
+    forwarded: bool,
+}
+
 /// The admitted requests and their outputs.
 pub struct OutputProcessor {
     states: HashMap<String, RequestState>,
     /// Aborts for requests not registered yet, oldest first.
     pending_aborts: VecDeque<(String, Instant)>,
+    aborting: Vec<Aborting>,
     /// Verify width with speculation.
     spec_num_tokens: Option<usize>,
     /// The server's streaming interval.
@@ -596,6 +605,7 @@ impl OutputProcessor {
         Self {
             states: HashMap::new(),
             pending_aborts: VecDeque::new(),
+            aborting: Vec::new(),
             spec_num_tokens,
             stream_interval,
             physical_context_len,
@@ -1003,6 +1013,13 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
         }
+        if state.to_abort {
+            self.aborting.push(Aborting {
+                rid: rid.clone(),
+                admission: state.admission,
+                forwarded: false,
+            });
+        }
         if self.role == Role::Decode {
             // The prompt was computed on the prefill node.
             state.computed_length = state.prompt_len;
@@ -1197,6 +1214,13 @@ impl OutputProcessor {
             "abort requested"
         );
         if let Some(state) = self.states.get_mut(rid) {
+            if !state.to_abort {
+                self.aborting.push(Aborting {
+                    rid: rid.to_owned(),
+                    admission: state.admission,
+                    forwarded: false,
+                });
+            }
             let message = if notify_client {
                 "Aborted by pause"
             } else {
@@ -1208,6 +1232,43 @@ impl OutputProcessor {
         self.sweep_pending_aborts();
         self.pending_aborts
             .push_back((rid.to_owned(), Instant::now()));
+    }
+
+    /// Return aborts for the round's central feedback queue, without waiting
+    /// for another forward. Keep output state until a commit/PD result reaps
+    /// it, or until the scheduler has removed it. Unscheduled requests stay
+    /// with the grammar, embedding or withheld-admission owner that reaps them.
+    pub(crate) fn abort_feedback(&mut self, scheduled: impl Fn(&str) -> bool) -> Committed {
+        let mut committed = Committed::default();
+        for mut abort in std::mem::take(&mut self.aborting) {
+            let Some(state) = self.states.get(&abort.rid) else {
+                continue;
+            };
+            if state.admission != abort.admission {
+                continue;
+            }
+            if scheduled(&abort.rid) {
+                if !abort.forwarded {
+                    committed.events.push(event(
+                        ForwardEventKind::Abort,
+                        &abort.rid,
+                        Vec::new(),
+                        0,
+                    ));
+                    abort.forwarded = true;
+                }
+                self.aborting.push(abort);
+            } else if abort.forwarded {
+                if state.abort_notify_client {
+                    committed
+                        .outputs
+                        .extend(self.stream(&[&abort.rid], &mut committed.released));
+                } else {
+                    self.release(&abort.rid, &mut committed);
+                }
+            }
+        }
+        committed
     }
 
     /// Drop aborts that waited too long for their request.

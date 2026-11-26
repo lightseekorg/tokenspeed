@@ -306,7 +306,7 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 
 /// Stands in for the device: results are ready when the forward returns,
 /// and a cache op is acknowledged once, on the first poll after it ran or
-/// `ack_polls` polls later, and never while `ack_gate` is closed.
+/// `ack_polls` polls later. A closed `ack_gate` holds the selected op kinds.
 #[derive(Default)]
 struct FakeDevice {
     /// Exported gauges checked against the actual dispatch.
@@ -333,8 +333,9 @@ struct FakeDevice {
     replay_completed: u64,
     /// Cache-event polls so far.
     polls: usize,
-    /// While closed, a poll acknowledges nothing.
+    /// While closed, a poll holds the selected kind, or all kinds when unset.
     ack_gate: Arc<Gate>,
+    held_cache_kind: Option<CacheOpKind>,
     /// Every acknowledgment sent, in order: the poll that sent it, its kind
     /// and op id.
     acknowledged: Arc<Mutex<Vec<(usize, CacheEventKind, u32)>>>,
@@ -874,10 +875,12 @@ impl DataPlane for FakeDevice {
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         self.polls += 1;
         let mut events = Vec::new();
-        if !*self.ack_gate.open.lock().unwrap() {
-            return Ok(events);
-        }
+        let held = !*self.ack_gate.open.lock().unwrap();
         for (polls_left, op) in std::mem::take(&mut self.unacknowledged) {
+            if held && self.held_cache_kind.is_none_or(|kind| kind == op.kind) {
+                self.unacknowledged.push((polls_left, op));
+                continue;
+            }
             if polls_left > 0 {
                 self.unacknowledged.push((polls_left - 1, op));
                 continue;
@@ -1580,6 +1583,30 @@ impl Engine {
         }
         panic!("mirrored ranks did not release the same requests");
     }
+
+    /// Observe native removal, independently of frontend/control replies.
+    async fn wait_for_removal(&self, rid: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for member in &self.ranks {
+                let scheduler = member.scheduler.lock().unwrap().clone().unwrap();
+                loop {
+                    let scheduler = scheduler.clone();
+                    let rid = rid.to_owned();
+                    let dead = tokio::task::spawn_blocking(move || {
+                        scheduler.lock().request_token_size(&rid) == -1
+                    })
+                    .await
+                    .unwrap();
+                    if dead {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+        .await
+        .expect("client abort must remove the request before ACK release");
+    }
 }
 
 impl Drop for Engine {
@@ -1695,8 +1722,10 @@ struct Setup {
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
-    /// The devices acknowledge no cache op until the test opens their gates.
+    /// Close the devices' cache gates until the test opens them.
     held_cache_acks: bool,
+    /// Limit a closed cache gate to this kind, allowing earlier image stores to land.
+    held_cache_kind: Option<CacheOpKind>,
     /// Polls each rank waits to complete recurrent State retirement.
     replay_ack_polls: Option<fn(usize) -> usize>,
     /// A rank whose device refuses a weight load.
@@ -1983,6 +2012,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
+        held_cache_kind: setup.held_cache_kind,
         replay_ack_polls: setup.replay_ack_polls.map(|polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
             Gate::closed()
@@ -2489,6 +2519,118 @@ fn duplicate_submissions_preserve_the_original_stream_on_every_rank() {
             }
         }
     }
+}
+
+#[test]
+fn client_aborts_cover_registration_forward_and_terminal_races() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Pp(2)] {
+        for depth in 0..=2 {
+            for (add_round, abort_round, abort_first, terminal) in [
+                (2, 0, false, false),
+                (0, 0, true, false),
+                (0, 0, false, false),
+                (0, 3, false, false),
+                (0, 10, false, true),
+            ] {
+                let mut script = vec![Vec::new(); 30];
+                script[add_round].push(EngineRequest::Add(Box::new(request(
+                    "victim",
+                    20,
+                    budget(if terminal { 1 } else { 100 }),
+                ))));
+                // Repeated and unknown aborts must neither replace state nor
+                // duplicate release. A later request always uses a fresh RID.
+                let abort = EngineRequest::Abort(vec![
+                    "victim".to_owned(),
+                    "victim".to_owned(),
+                    "unknown".to_owned(),
+                ]);
+                if abort_first {
+                    script[abort_round].insert(0, abort);
+                } else {
+                    script[abort_round].push(abort);
+                }
+                script[12].push(EngineRequest::Add(Box::new(request(
+                    "healthy",
+                    21,
+                    budget(3),
+                ))));
+                let ranks = run_scripted(
+                    layout,
+                    depth,
+                    Tiers::DeviceOnly,
+                    Setup {
+                        // Planning reads output-owned history even if an older
+                        // commit will release the same RID this round.
+                        request_token_history: true,
+                        ngram_context_len: 2,
+                        ..Setup::default()
+                    },
+                    vec![script],
+                    no_reaction,
+                );
+                for rank in &ranks {
+                    assert_eq!(rank.outcome, Ok(()));
+                    assert_eq!(
+                        rank.released
+                            .iter()
+                            .filter(|(rid, _)| rid == "victim")
+                            .count(),
+                        1
+                    );
+                    assert!(!rank.released.iter().any(|(rid, _)| rid == "unknown"));
+                    if !terminal {
+                        assert!(!rank.finished.iter().any(|(rid, _)| rid == "victim"));
+                        assert!(
+                            rank.released
+                                .iter()
+                                .find(|(rid, _)| rid == "victim")
+                                .unwrap()
+                                .1
+                                < 100
+                        );
+                    }
+                }
+                if terminal {
+                    assert_scripted_tokens(&ranks[0], "victim", 1);
+                }
+                assert_scripted_tokens(&ranks[0], "healthy", 3);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_client_abort_while_withheld_stays_with_its_admission_owner() {
+    let mut script = vec![Vec::new(); 20];
+    script[0].push(EngineRequest::Control(Box::new(pause("keep"))));
+    script[1].push(EngineRequest::Add(Box::new(request(
+        "withheld",
+        20,
+        budget(5),
+    ))));
+    script[2].push(EngineRequest::Abort(vec!["withheld".to_owned()]));
+    script[4].push(EngineRequest::Control(Box::new(resume())));
+    script[5].push(EngineRequest::Add(Box::new(request(
+        "healthy",
+        21,
+        budget(3),
+    ))));
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![script],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert!(rank.released.contains(&("withheld".to_owned(), 0)));
+        assert_eq!(rank.released.len(), 2);
+        assert!(!rank.outputs.iter().any(|output| output.rid == "withheld"));
+    }
+    assert_scripted_tokens(&ranks[0], "healthy", 3);
 }
 
 #[test]
@@ -3330,6 +3472,237 @@ async fn a_fused_engine_writes_back_what_it_evicts_and_loads_it_back() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_client_abort_reaches_the_scheduler_before_a_held_restore_ack() {
+    use ts_scheduler::{CacheEventObserver, CacheObservationKind};
+
+    for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                layout,
+                depth,
+                Tiers::HostL2WriteBackForcedRetraction,
+                Setup {
+                    debug_force_retraction_interval: Some(5),
+                    held_cache_acks: true,
+                    held_cache_kind: Some(CacheOpKind::SnapshotRestore),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let mut observations = Vec::new();
+            for member in &engine.ranks {
+                let records = Arc::new(Mutex::new(Vec::new()));
+                let captured = records.clone();
+                let (observer, losses) = CacheEventObserver::new(move |event, rid| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((event.clone(), rid.to_owned()));
+                });
+                // Frontend registration may precede a peer rank publishing its
+                // scheduler handle. Install the observer before sending work.
+                let scheduler = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let ready = member.scheduler.lock().unwrap().clone();
+                        if let Some(scheduler) = ready {
+                            break scheduler;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the rank published its scheduler before observer installation");
+                tokio::task::spawn_blocking(move || {
+                    scheduler
+                        .lock()
+                        .install_cache_event_observer(observer)
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+                observations.push((records, losses));
+            }
+            let mut victim = engine
+                .client
+                .generate(request("victim", 20, budget(100)))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while engine.cache_ops(CacheOpKind::SnapshotRestore) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the victim reached its held restore");
+
+            assert!(engine.client.abort("victim").await.unwrap());
+            // This orders message processing only. Read the real scheduler
+            // below to prove abort application while every restore ACK is held.
+            control(
+                &engine,
+                ControlRequest::IsSchedulerPaused(IsSchedulerPausedReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                }),
+            )
+            .await;
+            engine.wait_for_removal("victim").await;
+            for member in &engine.ranks {
+                assert!(!*member.ack_gate.open.lock().unwrap());
+                assert!(member
+                    .acknowledged
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, kind, _)| *kind != CacheEventKind::RestoreDone));
+                let scheduler = member.scheduler.lock().unwrap().clone().unwrap();
+                tokio::task::spawn_blocking(move || {
+                    let scheduler = scheduler.lock();
+                    let sizes = scheduler.sizes();
+                    assert_eq!(sizes.allocated_request_slots, 1, "the ticket owns the row");
+                    assert_eq!(
+                        sizes.active_decode_slots, 0,
+                        "fused roles use no decode permits"
+                    );
+                    assert!(
+                        !scheduler.can_clear_cache(),
+                        "the restore still owns its pins"
+                    );
+                })
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while engine
+                    .ranks
+                    .iter()
+                    .any(|rank| rank.released.lock().unwrap().is_empty())
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the aborted output owner was released");
+            let released = engine.released();
+            assert_eq!(released.len(), 1);
+            assert_eq!(released[0].0, "victim");
+            let restores: Vec<_> = observations
+                .iter()
+                .map(|(records, losses)| {
+                    assert_eq!(losses.take(), 0);
+                    let records = records.lock().unwrap();
+                    let restore = records
+                        .iter()
+                        .find(|(event, rid)| {
+                            event.kind == CacheObservationKind::RestoreScheduled && rid == "victim"
+                        })
+                        .unwrap()
+                        .0
+                        .clone();
+                    assert!(
+                        !records.iter().any(|(event, _)| {
+                            event.kind == CacheObservationKind::SlotReleased
+                                && event.slot == restore.slot
+                                && event.slot_generation == restore.slot_generation
+                        }),
+                        "the restore destination cannot be released before ACK"
+                    );
+                    restore
+                })
+                .collect();
+            let plans_before = engine.ranks[0].plans.lock().unwrap().clone();
+            // No manufactured ACK: the device retains the actual dispatched op
+            // and emits it once when its gate opens.
+            for member in &engine.ranks {
+                member.ack_gate.open();
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut retired = true;
+                    for member in &engine.ranks {
+                        let scheduler = member.scheduler.lock().unwrap().clone().unwrap();
+                        retired &= tokio::task::spawn_blocking(move || {
+                            let scheduler = scheduler.lock();
+                            let sizes = scheduler.sizes();
+                            assert_eq!(scheduler.request_token_size("victim"), -1);
+                            sizes.allocated_request_slots == 0
+                                && sizes.active_decode_slots == 0
+                                && scheduler.can_clear_cache()
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    if retired {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("late restore ACK retired its native ticket");
+            for member in &engine.ranks {
+                assert_eq!(*member.plans.lock().unwrap(), plans_before, "no resumption");
+                assert_eq!(
+                    member
+                        .acknowledged
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, kind, _)| *kind == CacheEventKind::RestoreDone)
+                        .count(),
+                    1,
+                );
+            }
+            assert_eq!(engine.released(), released, "released exactly once");
+            // The client's abort is silent: earlier queued tokens are allowed,
+            // but no terminal chunk is fabricated and the stream stays attached.
+            assert!(tokio::time::timeout(Duration::from_millis(20), async {
+                while let Some(chunk) = victim.next().await {
+                    assert!(chunk.unwrap().finish_reason.is_none());
+                }
+                panic!("client abort must not close the stream with a terminal output");
+            })
+            .await
+            .is_err());
+            // Fresh admissions fill the row pool, including the retired
+            // restore's numeric slot. Their exact outputs remain unaffected.
+            let requests = (0..8)
+                .map(|i| request(&format!("survivor-{i}"), 21 + i, budget(12)))
+                .collect();
+            for chunks in run_all(&engine.client, requests).await {
+                assert_eq!(tokens(&chunks), (1000..1012).collect::<Vec<_>>());
+            }
+            engine.settle().await;
+            for ((records, losses), restore) in observations.iter().zip(&restores) {
+                assert_eq!(losses.take(), 0);
+                let records = records.lock().unwrap();
+                let releases: Vec<_> = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (event, _))| {
+                        event.kind == CacheObservationKind::SlotReleased
+                            && event.slot == restore.slot
+                            && event.slot_generation == restore.slot_generation
+                    })
+                    .collect();
+                assert_eq!(releases.len(), 1);
+                assert!(
+                    records.iter().enumerate().any(|(index, (event, rid))| {
+                        event.kind == CacheObservationKind::SlotAssigned
+                            && rid.starts_with("survivor-")
+                            && event.slot == restore.slot
+                            && event.slot_generation > restore.slot_generation
+                            && event.admission_id != restore.admission_id
+                            && index > releases[0].0
+                    }),
+                    "a fresh admission reused the retired row"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
     // The devices acknowledge nothing until the test opens their gates; then
     // the odd ranks of a mirrored replica acknowledge three polls late.
@@ -3422,11 +3795,9 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
         }
         drop(engine);
 
-        // A request retracted while its image is in flight, so its restore
-        // cannot have run, is aborted. The engine ends a client's abort at the
-        // request's next forward: once its image lands it is restored, ends
-        // short of its budget and is released once, on every rank, and the
-        // requests after it run to the end.
+        // Abort while the retraction image is held. The scheduler removes
+        // the request before the image lands: no restore or forward is needed
+        // to process the abort, and the image tickets still retire normally.
         let engine = start_ranks_with(
             layout,
             1,
@@ -3467,6 +3838,8 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
             [("IsSchedulerPausedReqOutput", false)],
             "{layout:?}"
         );
+        engine.wait_for_removal("r0").await;
+        assert_eq!(engine.cache_ops(CacheOpKind::SnapshotRestore), 0);
         for rank in &engine.ranks {
             assert!(rank.acknowledged.lock().unwrap().is_empty(), "{layout:?}");
             rank.ack_gate.open();

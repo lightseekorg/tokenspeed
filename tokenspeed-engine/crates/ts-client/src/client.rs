@@ -660,6 +660,8 @@ impl EngineClient {
     /// The engine may retire it without a terminal output. Returns `false`
     /// if it is not in flight; `true` means only that the abort was sent.
     /// Use [`Self::cancel`] to end the local stream as well.
+    /// Success is not a scheduler cancellation or transfer retirement fence.
+    /// Use a fresh RID for a new request.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
         let engine = match lock(&self.shared.requests).get(rid) {
             Some(pending) => pending.engine,

@@ -1058,6 +1058,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.record_storage_metrics()?;
 
         let mut events = Vec::new();
+        // Aborts lead this round's results at the existing tail feedback
+        // point. A retracted/restoring request may never produce another
+        // result; in-flight forwards and transfers keep their native owners.
+        absorb(
+            self.outputs
+                .abort_feedback(|rid| self.scheduler.request_token_size(rid) >= 0),
+            &mut events,
+            &mut outputs,
+            &mut released,
+        );
         if !forward_allowed {
             // Frozen: what is dispatched commits, no forward is planned, and
             // the attention-DP ranks stay in step. With memory released not
@@ -1123,8 +1133,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             )?;
             self.poll_transfers(&mut events, &mut outputs, &mut released)?;
         }
-        // The forward-result feedback point: everything committed this round
-        // reaches the scheduler before the next round plans.
+        // The feedback point: aborts and everything committed this round
+        // reach the scheduler before the next round plans.
         if !events.is_empty() {
             // An ended request's transfer stops; its pages wait for that
             // (PdEvent::Stopped) unless it succeeds first.
