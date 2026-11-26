@@ -146,17 +146,22 @@ def _splits(tiles: int, k: int) -> int:
     return blocks
 
 
-def _weight_rows_per_program(programs: int, device: torch.device) -> int:
-    """16 weight rows per program where four times the 64-row launch still
-    fits one wave (a router's 384 rows: 36 -> 144 programs, 6.0 -> 3.9 us on
-    B300), else 64; bigger launches gain nothing from narrower tiles."""
+def _weight_rows_per_program(
+    programs: int, device: torch.device, *, allow_two_waves: bool = False
+) -> int:
+    """Narrow weight tiles (16 or 32 rows) when more programs better fill SMs."""
     sms = _SM_COUNTS.get(device)
     if sms is None:
         sms = _SM_COUNTS[device] = torch.cuda.get_device_properties(
             device
         ).multi_processor_count
     narrow = _BLOCK_W // _NARROW_BLOCK_W
-    return _NARROW_BLOCK_W if programs * narrow <= sms else _BLOCK_W
+    limit = 2 * sms if allow_two_waves else sms
+    if programs * narrow <= limit:
+        return _NARROW_BLOCK_W
+    if programs * 2 <= limit:
+        return _BLOCK_W // 2
+    return _BLOCK_W
 
 
 def skinny_mm_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -178,12 +183,34 @@ def skinny_mm_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+def _select_compact_schedule(
+    n: int, k: int, rows: int, device: torch.device
+) -> tuple[int, int, int, int, int, int]:
+    """Return ``(block_w, block_k, splits, block_t, num_warps, num_stages)`` for compact_m=True.
+
+    Derives tile sizes and K-splits from the operand dimensions and the
+    device's SM count when cross-batch bitwise invariance is not required,
+    while keeping default ``compact_m=False`` bit-identical.
+    """
+    block_t = 16 if rows <= 16 else _BLOCK_T
+    base_tiles = triton.cdiv(n, _BLOCK_W)
+    splits = _splits(base_tiles, k)
+    block_w = _weight_rows_per_program(
+        base_tiles * splits,
+        device,
+        allow_two_waves=rows <= 16,
+    )
+    num_warps = 4 if block_w >= 32 else 2
+    return block_w, _BLOCK_K, splits, block_t, num_warps, 4
+
+
 def skinny_mm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     *,
     out_dtype: torch.dtype,
+    compact_m: bool = False,
 ) -> torch.Tensor:
     """``x @ weight.T (+ bias)`` with FP32 accumulation and one rounding.
 
@@ -193,9 +220,14 @@ def skinny_mm(
             (a column slice of a wider weight works), ``K`` a multiple of 256.
         bias: Optional ``[N]`` added in FP32 before the store.
         out_dtype: ``torch.float32`` or ``torch.bfloat16``.
+        compact_m: When True, allow M- and N-dependent tile schedules (e.g.
+            16-row token tiles, Hopper wave-aligned split-K, and BK=128) for
+            lower decode latency when cross-batch bitwise invariance is not
+            required.
 
     Returns:
-        ``[M, N]`` in ``out_dtype``; each row is independent of ``M``.
+        ``[M, N]`` in ``out_dtype``; each row is independent of ``M`` when
+        ``compact_m=False``.
     """
     if not skinny_mm_supported(x, weight) or out_dtype not in (
         torch.float32,
@@ -204,20 +236,33 @@ def skinny_mm(
         raise ValueError("skinny_mm needs decode-size BF16 rows and weights")
     rows, k = x.shape
     n = weight.shape[0]
-    splits = _splits(triton.cdiv(n, _BLOCK_W), k)
-    block_w = _weight_rows_per_program(triton.cdiv(n, _BLOCK_W) * splits, x.device)
+    if compact_m:
+        block_w, block_k, splits, block_t, num_warps, num_stages = (
+            _select_compact_schedule(n, k, rows, x.device)
+        )
+    else:
+        block_t = _BLOCK_T
+        block_k = _BLOCK_K
+        splits = _splits(triton.cdiv(n, _BLOCK_W), k)
+        block_w = _weight_rows_per_program(
+            triton.cdiv(n, _BLOCK_W) * splits,
+            x.device,
+            allow_two_waves=False,
+        )
+        num_warps = 4 if block_w >= 32 else 2
+        num_stages = 4
     tiles = triton.cdiv(n, block_w)
     out = torch.empty((rows, n), dtype=out_dtype, device=x.device)
     partials = (
         torch.empty(
-            (tiles * splits * block_w * _BLOCK_T,),
+            (tiles * splits * block_w * block_t,),
             dtype=torch.float32,
             device=x.device,
         )
         if splits > 1
         else out
     )
-    key = (x.device, n, k)
+    key = (x.device, tiles, k)
     counters = _COUNTERS.get(key)
     if counters is None:
         counters = _COUNTERS[key] = torch.zeros(
@@ -227,7 +272,7 @@ def skinny_mm(
     _skinny_mm_kernel[(tiles * splits,)](
         x,
         weight,
-        TensorDescriptor.from_tensor(weight, [block_w, _BLOCK_K]),
+        TensorDescriptor.from_tensor(weight, [block_w, block_k]),
         bias,
         out,
         partials,
@@ -238,12 +283,12 @@ def skinny_mm(
         K=k,
         SPLITS=splits,
         BW=block_w,
-        BT=_BLOCK_T,
-        BK=_BLOCK_K,
+        BT=block_t,
+        BK=block_k,
         HAS_BIAS=bias is not None,
         ENABLE_PDL=enable_pdl,
-        num_warps=4 if block_w == _BLOCK_W else 2,
-        num_stages=4,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out

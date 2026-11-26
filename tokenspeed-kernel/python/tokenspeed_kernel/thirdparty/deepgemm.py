@@ -80,11 +80,26 @@ def block_fp8_mm(
 
     m, k = a.shape
     n = b.shape[0]
-    sa = deep_gemm.transform_sf_into_required_layout(
-        a_scale, m, k, (1, 128), disable_ue8m0_cast=True
+    aligned_m = (m + 3) // 4 * 4
+    # Hopper FP8 WGMMA reads 16-byte TMA-aligned MN-major FP32 activation
+    # scales (stride(1) == ceil(M/4)*4) and contiguous row-major FP32 weight
+    # scales directly; skip DeepGEMM's relayout calls when already aligned.
+    a_is_native_mn = a_scale.stride(0) == 1 and (
+        a_scale.shape[1] == 1 or a_scale.stride(1) == aligned_m
     )
-    sb = deep_gemm.transform_sf_into_required_layout(
-        b_scale, n, k, (128, 128), disable_ue8m0_cast=True
+    sa = (
+        a_scale
+        if a_is_native_mn
+        else deep_gemm.transform_sf_into_required_layout(
+            a_scale, m, k, (1, 128), disable_ue8m0_cast=True
+        )
+    )
+    sb = (
+        b_scale
+        if b_scale.is_contiguous()
+        else deep_gemm.transform_sf_into_required_layout(
+            b_scale, n, k, (128, 128), disable_ue8m0_cast=True
+        )
     )
     deep_gemm.fp8_gemm_nt(
         (a, sa),

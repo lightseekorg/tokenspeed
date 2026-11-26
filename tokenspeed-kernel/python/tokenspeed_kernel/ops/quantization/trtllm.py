@@ -38,14 +38,19 @@ __all__ = []
 
 
 def _per_token_group_quant_8bit(
-    x: torch.Tensor, group_size: int, use_ue8m0: bool, *, mn_major: bool
+    x: torch.Tensor,
+    group_size: int,
+    use_ue8m0: bool,
+    *,
+    mn_major: bool,
+    pad_mn_to_4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if group_size != 128:
         raise ValueError(
             "trtllm fp8_quantize_1x128 only supports group_size=128, "
             f"got {group_size}"
         )
-    return fp8_quantize_1x128(x, use_ue8m0, mn_major=mn_major)
+    return fp8_quantize_1x128(x, use_ue8m0, mn_major=mn_major, pad_mn_to_4=pad_mn_to_4)
 
 
 if _IS_NVIDIA:
@@ -155,6 +160,43 @@ if _IS_NVIDIA:
             raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
         return _per_token_group_quant_8bit(
             x, group_size, use_ue8m0=False, mn_major=True
+        )
+
+    @register_kernel(
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_mn_major_tma",
+        solution="trtllm",
+        capability=CapabilityRequirement(
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32"}),
+            "scale_layout": frozenset({"mn_major"}),
+        },
+        features=frozenset({"mn_major_scales"}),
+        priority=Priority.REFERENCE,
+    )
+    def trtllm_quantize_fp8_mn_major_tma(
+        x: torch.Tensor,
+        *,
+        granularity: str,
+        group_size: int,
+        scale_encoding: str,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return FP8 values and TMA-aligned MN-major ``[M, K/128]`` FP32 scales."""
+        if granularity != "token_group" or scale_encoding != "float32":
+            raise ValueError(
+                "TMA MN-major FP8 quantization requires FP32 token-group scales"
+            )
+        if enable_pdl:
+            raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
+        return _per_token_group_quant_8bit(
+            x, group_size, use_ue8m0=False, mn_major=True, pad_mn_to_4=True
         )
 
     __all__ = [

@@ -25,6 +25,11 @@ from functools import cache
 import torch
 from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.gemm.hopper_small_m_fp8 import (
+    HOPPER_SMALL_M_FP8_MAX_ROWS,
+    hopper_small_m_fp8_mm,
+    hopper_small_m_fp8_supported,
+)
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -413,6 +418,14 @@ def deepgemm_mm_fp8_blockscale(
     if not m:
         return out
     enable_pdl = pdl_enabled()
+    if (
+        not packed
+        and m <= HOPPER_SMALL_M_FP8_MAX_ROWS
+        and hopper_small_m_fp8_supported(A, B, A_scales, B_scales, out_dtype)
+    ):
+        return hopper_small_m_fp8_mm(
+            A, B, A_scales, B_scales, out=out, enable_pdl=enable_pdl
+        )
     if packed and n <= 4096 and k >= 4096:
         return block_fp8_mm_tuned(A, B, A_scales, B_scales, out, enable_pdl=enable_pdl)
     return block_fp8_mm(A, B, A_scales, B_scales, out, enable_pdl=enable_pdl)
