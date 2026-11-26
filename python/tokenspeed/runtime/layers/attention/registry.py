@@ -1645,6 +1645,7 @@ def create_attn_components(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
+        backup_device_kv=server_args.backup_device_kv,
     )
     backend, pool = _create_target_components(
         backend=reuse_target_backend,

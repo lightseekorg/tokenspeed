@@ -190,7 +190,9 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
         request_token_history: false,
         request_token_history_lookback: None,
         controls: ControlConfig {
+            backup_device_kv: false,
             memory_saver: true,
+            replica_memory_transitions: false,
             memory_regions: vec!["kv_cache".into(), "weights".into()],
             shared_weight_version: None,
             allow_reload_forward: true,
@@ -407,6 +409,13 @@ impl DataPlane for HookedDevice {
     }
     fn profile(&mut self, _: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
         Ok((true, "ok".into()))
+    }
+    fn check_memory_transition(
+        &mut self,
+        _tags: &[String],
+        _release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("peer-only tests use protocol 2")
     }
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         self.hooks
@@ -859,6 +868,7 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
 
     fe0.push(EngineRequest::Control(Box::new(
         ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            transition_id: None,
             rid: None,
             http_worker_ipc: None,
             tags: Some(vec!["kv_cache".into()]),

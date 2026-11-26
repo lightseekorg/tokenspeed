@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
@@ -1990,7 +1991,7 @@ def test_kv_release_quiesces_copies_and_deregisters_the_peer():
     ]
     trace.clear()
 
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     # Zero the re-mapped garbage before a peer can write into it again.
     assert trace == ["clear_kv_buffers", "peer.register"]
 
@@ -2000,7 +2001,7 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     handle = DeviceHandle(_SleepExecutor(trace))
 
     handle.prepare_kv_release()
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     handle.synchronize()
 
     assert trace == [
@@ -2009,6 +2010,144 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
         "clear_kv_buffers",
         "device.synchronize",
     ]
+
+
+def test_replica_kv_resume_completes_clear_before_registration_and_reply():
+    trace = []
+    handle = DeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    with handle.complete_memory_transition():
+        handle.finish_kv_resume(synchronize_before_registration=True)
+
+    assert trace == [
+        "clear_kv_buffers",
+        "device.synchronize",
+        "peer.register",
+        "device.synchronize",
+    ]
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_NPU_MEMORY_SAVER_TESTS") != "1",
+    reason="requires an exclusively assigned NPU",
+)
+def test_ascend_weights_only_sleep_keeps_cache_pages_usable():
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+    from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+        pack,
+    )
+
+    torch.npu.set_device(0)
+    group = CacheGroupSpec("kv", "full_history", 16, 1, replayable=False)
+    field = CacheFieldSpec("data", "kv.0", (16, 8), "float16")
+    layout = pack([(group, (field,))], prefix_granularity=16)
+    arena = CacheArena(
+        layout.bind(4),
+        "npu",
+        cache_group_specs=(group,),
+        enable_memory_saver=True,
+        backup_device_kv=True,
+    )
+    saver = arena.memory_saver_adapter
+    with saver.region(tag="weights", enable_cpu_backup=True):
+        weight = torch.full((16,), 17, device="npu")
+
+    executor = _SleepExecutor([])
+    executor.model_runner = SimpleNamespace(memory_saver_adapter=saver)
+    executor.device = "npu"
+    executor.device_module = torch.npu
+    executor.copy_cache_pages = arena.copy_blocks
+    executor.zero_cache_pages = lambda pages: arena.zero_blocks(
+        {group: np.asarray(ids, np.int32) for group, ids in pages.items()}
+    )
+    handle = AscendMemorySaverDeviceHandle(
+        executor, weight_memory=WeightMemoryState(policy="cpu_backup", models=[])
+    )
+    plan = _plan(pages_to_copy={"kv": [(1, 2)]}, pages_to_zero=[1])
+    pages = arena.field("data").view(-1, 16, 8)
+    pages[1].fill_(5)
+    pages[2].zero_()
+    try:
+        handle.release_weights(saver)
+        with pytest.raises(RuntimeError, match="weights"):
+            handle.run_idle_forward(None)
+        handle.execute(plan, None, cache_ops=())
+        torch.testing.assert_close(
+            pages[1].cpu(), torch.zeros(16, 8, dtype=pages.dtype)
+        )
+        torch.testing.assert_close(
+            pages[2].cpu(), torch.full((16, 8), 5, dtype=pages.dtype)
+        )
+        saver.pause("kv_cache")
+        with pytest.raises(RuntimeError, match="kv_cache"):
+            handle.execute(plan, None, cache_ops=())
+        saver.pause("acl_graph")
+        saver.resume("kv_cache")
+        # The copy uses resident geometry and restored KV even with the graph asleep.
+        torch.testing.assert_close(
+            pages[2].cpu(), torch.full((16, 8), 5, dtype=pages.dtype)
+        )
+        pages[1].fill_(9)
+        handle.execute(plan, None, cache_ops=())
+        torch.testing.assert_close(
+            pages[2].cpu(), torch.full((16, 8), 9, dtype=pages.dtype)
+        )
+        handle.resume_weights(saver)
+    finally:
+        saver.resume()
+    torch.testing.assert_close(weight.cpu(), torch.full((16,), 17))
+
+
+def test_ascend_saver_forwards_replay_retirement():
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+
+    executor = _SleepExecutor([])
+    saver = SimpleNamespace(assert_active=mock.Mock())
+    executor.model_runner = SimpleNamespace(memory_saver_adapter=saver)
+    handle = AscendMemorySaverDeviceHandle(executor)
+    with mock.patch.object(handle, "retire_replay") as retire:
+        handle.execute(
+            _plan(), None, cache_ops=(), retirement_slots=[2], retirement_id=9
+        )
+    saver.assert_active.assert_called_once_with()
+    retire.assert_called_once_with(9, [2])
+
+
+@pytest.mark.parametrize("operation", ["plan_without_forward", "idle_forward"])
+def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+    from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
+
+    class UnavailableMemorySaver:
+        def assert_active(self):
+            raise RuntimeError("Memory is unavailable")
+
+    executor = _SleepExecutor([])
+    executor.model_runner = SimpleNamespace(
+        memory_saver_adapter=UnavailableMemorySaver()
+    )
+    handle = AscendMemorySaverDeviceHandle(
+        executor, weight_memory=WeightMemoryState(policy="cpu_backup", models=[])
+    )
+
+    with pytest.raises(RuntimeError, match="Memory is unavailable"):
+        if operation == "plan_without_forward":
+            handle.execute(
+                None, None, cache_ops=(), retirement_slots=[2], retirement_id=9
+            )
+        else:
+            handle.run_idle_forward(None)
 
 
 @pytest.mark.parametrize(

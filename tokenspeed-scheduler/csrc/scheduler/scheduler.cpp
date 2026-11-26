@@ -225,6 +225,10 @@ bool Scheduler::ClearL1Cache() {
     return clearCache(false);
 }
 
+bool Scheduler::CanClearL1Cache() const {
+    return cacheIsClearable(false);
+}
+
 bool Scheduler::ClearCache() {
     return clearCache(true);
 }
