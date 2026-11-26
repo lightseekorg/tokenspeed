@@ -233,7 +233,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Bootstrapped("original".to_owned())
     );
-    pair.prefill.record_usage("original", 128, Some(-0.5));
+    pair.prefill.record_usage("original", 128, Some(-0.5), None);
     pair.send("original", 777, vec![1, 2, 3]).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),

@@ -797,6 +797,7 @@ fn generate_from_an_older_client_preserves_session_and_tokens() {
     let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
         panic!("generate messages must be arrays");
     };
+    assert_eq!(fields.pop(), Some(Value::from(false)));
     assert_eq!(fields.pop(), Some(Value::from(128)));
     expected.peer_expected_tokens = None;
     assert_eq!(fields.pop(), Some(Value::from("10.0.0.2:7100")));
@@ -853,6 +854,7 @@ fn output_without_request_timing_preserves_the_existing_load_tail() {
         panic!("output messages must be arrays");
     };
     assert_eq!(fields.pop(), Some(Value::Array(vec![])));
+    assert_eq!(fields.pop(), Some(Value::Array(vec![])));
     assert_eq!(fields.last(), Some(&Value::from(3_000_000_000_i64)));
     let legacy_frames = encode_frames(&Value::Array(fields));
     let decoded: BatchTokenIDOutSlim = decode_frames(&legacy_frames).unwrap();
@@ -860,6 +862,7 @@ fn output_without_request_timing_preserves_the_existing_load_tail() {
     assert_eq!(decoded.num_resident_tokens, Some(5_000_000_000));
     assert_eq!(decoded.num_waiting_uncached_tokens, Some(3_000_000_000));
     assert!(decoded.request_timing.is_empty());
+    assert!(decoded.output_full_vocab_topk.is_empty());
 }
 
 #[test]
