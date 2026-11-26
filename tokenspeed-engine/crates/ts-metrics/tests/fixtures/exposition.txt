@@ -39,6 +39,7 @@
 # HELP tokenspeed:prefix_host_hit_ratio Admission Host cache hits divided by prompt tokens, weighted by prompt tokens.
 # HELP tokenspeed:prefix_host_hit_tokens_total Admitted prompt tokens loaded from the Host cache (L2, including L3-supplied).
 # HELP tokenspeed:prefix_l3_hit_tokens_total Token spans of successful storage keys (L3), counted per cache group.
+# HELP tokenspeed:prefix_peer_hit_tokens_total Additional Device peer tokens used at first prefill dispatch.
 # HELP tokenspeed:prefix_prompt_tokens_total Prompt tokens of admitted requests.
 # HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that ended, including aborted requests.
 # HELP tokenspeed:request_completion_tokens Output tokens per ended request, including a prefill bootstrap token.
@@ -92,6 +93,7 @@
 # TYPE tokenspeed:prefix_host_hit_ratio histogram
 # TYPE tokenspeed:prefix_host_hit_tokens_total counter
 # TYPE tokenspeed:prefix_l3_hit_tokens_total counter
+# TYPE tokenspeed:prefix_peer_hit_tokens_total counter
 # TYPE tokenspeed:prefix_prompt_tokens_total counter
 # TYPE tokenspeed:prompt_tokens_total counter
 # TYPE tokenspeed:request_completion_tokens histogram
@@ -222,10 +224,10 @@ tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_
 tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
 tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 0.0
 tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 0.0
-tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 100.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 0.0
 tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 100.0
 tokenspeed:prefix_cache_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 100.0
-tokenspeed:prefix_cache_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 70.0
+tokenspeed:prefix_cache_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 82.0
 tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0
 tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
 tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 0.0
@@ -245,6 +247,7 @@ tokenspeed:prefix_host_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 10
 tokenspeed:prefix_host_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_host_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_l3_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 10.0
+tokenspeed:prefix_peer_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 12.0
 tokenspeed:prefix_prompt_tokens_total{app_key="",dp_rank="0",model_name="m"} 100.0
 tokenspeed:prompt_tokens_total{app_key="",dp_rank="0",model_name="m"} 100.0
 tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0

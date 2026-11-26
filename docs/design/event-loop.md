@@ -1196,7 +1196,12 @@ obtain the normal retirement acknowledgments.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
 which transfers changed state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together.
+transfer aborts its request on every rank together. The loop releases its
+scheduler mutex during the transport poll and reacquires it before handling
+the agreed events. Decode can therefore serve a prefix lookup from the very
+Prefill whose KV it is waiting for. On contention the autonomous holder can
+wait briefly for a round-boundary handoff once per pass, then returns to its
+control queue so unrelated releases can retire.
 Under `deferred` decode allocation (`scheduler.md` §3.1) the peers keep the
 order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the

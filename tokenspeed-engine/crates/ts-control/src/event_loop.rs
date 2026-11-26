@@ -622,6 +622,19 @@ pub struct Subsystems {
     pub peer: Option<Peer>,
 }
 
+// Only independent peers can use the scheduler during a device or collective wait.
+fn during_peer_wait<T>(
+    peer: Option<&Peer>,
+    scheduler: &mut ArcMutexGuard<RawMutex, Scheduler>,
+    wait: impl FnOnce() -> T,
+) -> T {
+    if peer.is_some_and(Peer::autonomous) {
+        ArcMutexGuard::unlocked(scheduler, wait)
+    } else {
+        wait()
+    }
+}
+
 /// Fences issued through the forward queue, and the prefix every replica
 /// member has completed. IDs start at one.
 #[derive(Default)]
@@ -956,13 +969,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
-        // A peer servicer answers from the scheduler between rounds, and the
-        // loop releases it only while it waits on the device or on an idle
-        // frontend. A loop waiting on a transfer -- a prefill engine on its
-        // PD sends, a landing on its reads -- does neither and spins
-        // through empty rounds, so it hands the scheduler to a waiting
-        // servicer once per round; with none waiting this costs one atomic
-        // read.
+        // Hand off to a waiting servicer even in rounds with no device,
+        // transfer or frontend wait. With no waiter this is one atomic read.
         ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
@@ -1103,7 +1111,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && memory_resident {
-                    self.data_plane.idle_forward(&dp)?;
+                    during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+                        self.data_plane.idle_forward(&dp)
+                    })?;
                     forwarded = true;
                 }
             }
@@ -1334,7 +1344,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut forwarded = idle_forward;
         let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
-            if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
+            let pending = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+                self.data_plane.execute(plan, &dispatch)
+            })?;
+            if let Some(pending) = pending {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
@@ -1440,6 +1453,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     peer.end_lookup(&rid, outcome);
                 }
             }
+            for reason in request.peer_local_reasons {
+                metrics.peer.decision(&reason);
+            }
             for (expected, actual, outcome) in request.peer_usage {
                 metrics.peer.usage(expected, actual, outcome);
             }
@@ -1474,11 +1490,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     delta.device_hit_tokens + delta.host_hit_tokens,
                 );
             }
-            metrics.record_prefix_hits(
+            metrics.record_prefix_hits_with_peer(
                 delta.prompt_tokens,
                 delta.device_hit_tokens,
                 delta.host_hit_tokens,
                 delta.l3_hit_tokens,
+                delta.peer_hit_tokens,
             );
         }
 
@@ -2997,6 +3014,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     usage.disposition = result;
                     if result == "admission" {
                         usage.admission_at = Some(Instant::now());
+                    } else if result == "landing" {
+                        usage.admission_at = None;
                     } else if let Some(start) = usage.lookup_at.take() {
                         metrics.peer.stage(
                             "lookup_to_ready",
@@ -3033,6 +3052,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let fetches = plan.peer_fetches();
             let lookups = self.scheduler.take_peer_lookups();
             if let Some(metrics) = &self.metrics {
+                for choice in plan.peer_local_choices() {
+                    if let Some(usage) = self.outputs.peer_usage(&choice.request_id) {
+                        usage.local_reason = Some(choice.reason);
+                    }
+                }
                 let now = Instant::now();
                 for lookup in &lookups {
                     if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
@@ -3105,7 +3129,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = self.ranks.mesh.all_gather_i64(world, &row)?;
+        let rows = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
+            self.ranks.mesh.all_gather_i64(world, &row)
+        })?;
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;
@@ -3237,7 +3263,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         };
         let _span = profile::span("EventLoop::poll_transfers");
-        let polled = transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)?;
+        // Decode may be waiting for KV from a Prefill that needs a lookup
+        // from this same Decode. Only the transport participates in this poll.
+        let polled = ArcMutexGuard::unlocked(&mut self.scheduler, || {
+            transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)
+        })?;
         for event in polled {
             tracing::debug!(?event, "transfer event");
             match event {
@@ -3623,6 +3653,7 @@ fn prefix_hit_delta(
     let last = std::mem::replace(previous, hits);
     ts_scheduler::PrefixHitView {
         prompt_tokens: hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+        peer_hit_tokens: hits.peer_hit_tokens.saturating_sub(last.peer_hit_tokens),
         device_hit_tokens: hits
             .device_hit_tokens
             .saturating_sub(last.device_hit_tokens),
@@ -3642,6 +3673,7 @@ mod tests {
             prompt_tokens: 48,
             device_hit_tokens: 16,
             host_hit_tokens: 8,
+            peer_hit_tokens: 12,
             l3_hit_tokens: 4,
         };
         assert_eq!(prefix_hit_delta(&mut previous, hits), hits);

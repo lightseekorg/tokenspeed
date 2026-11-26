@@ -39,7 +39,7 @@ use ts_control::{
         landing::Timeouts,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        Peer, PeerFence, PeerListener, PeerSettings,
+        Peer, PeerFence, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_scheduler::Scheduler;
@@ -254,9 +254,13 @@ pub fn start(
             .collect::<Vec<_>>(),
         "peer geometry"
     );
+    let progress = PeerProgress::for_replica(geometries.len(), &mut scheduler.lock())
+        .map_err(|error| error.to_string())?;
     // Replicas read only holders of the same namespace; a mismatch answers
     // as a miss, so the namespace is worth seeing in the log.
     tracing::info!(
+        ?progress,
+        members = geometries.len(),
         name = settings.peer.name,
         session = engine.session_id(),
         incarnation = settings.peer.incarnation,
@@ -280,12 +284,15 @@ pub fn start(
     };
     let peer = Peer::start(
         settings.peer,
+        progress,
         replica.index(),
         geometries,
         listener,
         scheduler,
-        Arc::new(EngineReader(engine)),
-        Arc::new(push),
+        PeerTransfers {
+            reader: Arc::new(EngineReader(engine)),
+            pusher: Arc::new(push),
+        },
     )
     .map_err(|error| error.to_string())?;
     // A second start would be a second peer; there is one per process.

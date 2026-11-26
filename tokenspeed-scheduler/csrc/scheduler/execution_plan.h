@@ -139,6 +139,7 @@ public:
     // pin and reports PeerFetchDone. Like the remote streams, they take no
     // batch slot or token budget.
     std::vector<PeerFetchOperation> peer_fetches;
+    std::vector<std::pair<std::string, std::string>> peer_local_choices;
 
     // Requests the scheduler aborted while building this plan (none on most
     // rounds): the last resort of a retraction whose victim could not be

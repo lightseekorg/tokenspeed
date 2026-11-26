@@ -140,6 +140,7 @@ def _run_scenario() -> None:
         device_hit_tokens=40,
         host_hit_tokens=30,
         l3_hit_tokens=10,
+        peer_hit_tokens=12,
     )
 
     transfer = KVTransferMetrics(

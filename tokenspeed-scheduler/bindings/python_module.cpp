@@ -441,6 +441,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::PrefixHitStats>(m, "PrefixHitStats")
         .def_ro("prompt_tokens", &tokenspeed::PrefixHitStats::prompt_tokens)
         .def_ro("device_hit_tokens", &tokenspeed::PrefixHitStats::device_hit_tokens)
+        .def_ro("peer_hit_tokens", &tokenspeed::PrefixHitStats::peer_hit_tokens)
         .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
         .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
         .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
