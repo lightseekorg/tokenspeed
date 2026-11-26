@@ -20,12 +20,14 @@
 
 #include <gtest/gtest.h>
 
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
+#include "cache/tier/peer_exports.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -42,6 +44,57 @@ static_assert(std::is_copy_constructible_v<CacheBlockRef>);
 static_assert(std::is_copy_assignable_v<CacheBlockRef>);
 static_assert(std::is_nothrow_move_constructible_v<CacheBlockRef>);
 static_assert(std::is_same_v<decltype(std::declval<const CacheBlockRef&>().operator->()), const CacheBlock*>);
+
+TEST(CacheBlockRefTest, PeerUnpinDropsStrongReferenceBeforeOwnerCallbacks) {
+    BlockPool pool(4, {1});
+    const auto initial = pool.NumEmptyLcmBlocks();
+    auto owner = pool.AcquireBlock(0);
+    std::vector<CacheBlockRef> held{owner};
+    PeerPinRelease ticket(held);
+    int callbacks = 0;
+    CacheBlockUniqueObserver observer;
+    observer.Observe(owner, [](void* count) noexcept { ++*static_cast<int*>(count); }, &callbacks);
+    std::thread peer([&] {
+        EXPECT_TRUE(ticket.Release());
+        EXPECT_TRUE(ticket.Release());
+    });
+    peer.join();
+    EXPECT_EQ(owner.use_count(), 1);
+    EXPECT_EQ(callbacks, 0);
+    ticket.Close();
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(owner.use_count(), 1);
+    owner.reset();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), initial);
+}
+
+TEST(CacheBlockRefTest, TwoRemoteUnpinsKeepControlUntilOwnerRetiresIt) {
+    BlockPool pool(4, {1});
+    const auto initial = pool.NumEmptyLcmBlocks();
+    auto owner = pool.AcquireBlock(0);
+    std::vector<CacheBlockRef> left{owner};
+    std::vector<CacheBlockRef> right{std::move(owner)};
+    PeerPinRelease a(left), b(right);
+    std::thread first([&] { EXPECT_TRUE(a.Release()); });
+    std::thread second([&] { EXPECT_TRUE(b.Release()); });
+    first.join();
+    second.join();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), initial - 1);
+    b.Close();
+    a.Close();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), initial);
+}
+
+TEST(CacheBlockRefTest, ClosingUnreleasedTicketRevokesItsSpan) {
+    BlockPool pool(4, {1});
+    auto owner = pool.AcquireBlock(0);
+    std::vector<CacheBlockRef> held{owner};
+    PeerPinRelease ticket(held);
+    ticket.Close();
+    held.clear();
+    EXPECT_FALSE(ticket.Release());
+    EXPECT_TRUE(owner.unique());
+}
 
 TEST(CacheBlockRefTest, AcquireReturnsUniqueOwningHandle) {
     BlockPool pool(/*num_lcm_blocks=*/4, {1});

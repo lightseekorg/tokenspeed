@@ -299,7 +299,7 @@ fn pair_configured(
     let parse = |wire: String| Contract::from_wire(wire.as_bytes()).unwrap();
     let (prefill, prefill_outbox) = PrefillPeer::start(PrefillConfig {
         peer: PeerConfig {
-            metrics,
+            metrics: metrics.clone(),
             ..peer_config(library.clone(), source)
         },
         layout: PrefillLayout {
@@ -336,7 +336,10 @@ fn pair_configured(
     .unwrap();
     let destination_base = destination.as_ptr() as u64;
     let (decode, decode_outbox) = DecodePeer::start(DecodeConfig {
-        peer: peer_config(library, destination),
+        peer: PeerConfig {
+            metrics,
+            ..peer_config(library, destination)
+        },
         arena_base: destination_base,
         layout: layout(Some(destination_base)).into_bytes(),
         tp_size: 1,

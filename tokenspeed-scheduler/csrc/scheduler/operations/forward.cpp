@@ -94,7 +94,8 @@ void recordPrefillBypass(std::span<Request* const> candidates, const Request* ad
             break;
         }
         if (auto* waiting = older->GetIf<fsm::Submitted>()) {
-            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
+            waiting->admission.prefill_bypasses =
+                std::min(kMaxPrefillBypasses, waiting->admission.prefill_bypasses + 1);
             break;
         }
     }
@@ -398,6 +399,13 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
         .prepared_keys = prepared_keys,
     };
     match.probe = probe(prompt);
+    // KV a shared L2 pool holds past its last checkpoint is a junction too:
+    // the checkpoint cut there is where the next prompt sharing that KV, on
+    // any rank, resumes. The proxy mirrors only the hit, so the reach comes
+    // from the lookup's answer, which lies within the probe bound
+    // (ApplySharedL2Answers).
+    match.probe.host.kv_tokens =
+        std::max(match.probe.host.kv_tokens, request->GetIf<fsm::Submitted>()->admission.shared_l2_kv_tokens);
     request->GetIf<fsm::Submitted>()->admission.cached_prefix_tokens =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     if (config_.role != Role::kD && coordinator_.Prober().EvictionStoresExtendPrefix(prompt, match.probe)) {
@@ -554,9 +562,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
                                      : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
                                                                            : 0;
-    if (source == fsm::PrefillSource::kPeer &&
-        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
-        return FirstChunkOutcome{};
+    if (source == fsm::PrefillSource::kPeer) {
+        if (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens) {
+            request->peer_local_reason = landing_end <= hit_tokens ? "local_caught_up" : "below_min_fetch";
+            return FirstChunkOutcome{};
+        }
+        if (landing_end > kv_token_limit) {
+            request->peer_local_reason = "kv_budget";
+            return FirstChunkOutcome{};
+        }
     }
     // KV coverage beyond the state checkpoint the hit resumes from is the
     // junction: the first chunk is cut there so its natural checkpoint lands
@@ -753,9 +767,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         spdlog::info("[PrefixCacheDiagnostic] {} device_hit_tokens={} host_hit_tokens={} host_gain_tokens={}",
                      match.prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
     }
-    prefix_hit_stats_.prompt_tokens += request->PrefillSize();
-    prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
-    prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
+    if (source == fsm::PrefillSource::kPeer) {
+        request->pending_peer_hit = Request::PeerPrefixHit{hit_tokens, host_hit_tokens, landing_end};
+    } else {
+        prefix_hit_stats_.prompt_tokens += request->PrefillSize();
+        prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
+        prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
+    }
     prefix_hit_stats_.host_gain_tokens += host_gain_tokens;
     prefix_hit_stats_.unresumable_kv_tokens += junction_tokens > 0 ? junction_tokens - hit_tokens : 0;
 
@@ -1130,11 +1148,22 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
         }
         return std::nullopt;
     }
+    const bool local_over_peer = adaptive_device_peer_ && request->GetIf<fsm::Submitted>() &&
+                                 request->GetIf<fsm::Submitted>()->admission.peer_hit.has_value();
     FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
                                                           kv_token_limit, yield_tokens, must_complete,
                                                           /*peer_landing_tokens=*/0);
     if (outcome.event) {
+        if (local_over_peer && !request->peer_local_reason) request->peer_local_reason = "local_scheduled_first";
+        const auto* reason = std::exchange(request->peer_local_reason, nullptr);
+        if (reason) plan.peer_local_choices.emplace_back(request->Id(), reason);
+        const auto holder_tokens =
+            local_over_peer ? request->GetIf<fsm::Submitted>()->admission.peer_hit->num_tokens : 0;
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
+        if (local_over_peer) {
+            spdlog::debug("[PeerChoice] rid={} local reason={} local_tokens={} holder_tokens={}", request->Id(), reason,
+                          operation.extend_prefix_len, holder_tokens);
+        }
         operation.state_prefix_cached = outcome.state_prefix_cached;
         return operation;
     }
@@ -1931,8 +1960,8 @@ PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending) {
     // min_element preserves submission order for equal work or protected requests.
     const auto selected =
         std::min_element(pending.begin(), pending.end(), [](const PendingPrefill& a, const PendingPrefill& b) {
-            const bool aged_a = a.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
-            const bool aged_b = b.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
+            const bool aged_a = a.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
+            const bool aged_b = b.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
             if (aged_a != aged_b) {
                 return aged_a;
             }
@@ -2185,7 +2214,10 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             }
             // A prompt whose peer landing waits for room is admitted only as one.
             if (!resident && request->GetIf<fsm::Submitted>()->admission.peer_hit) {
-                continue;
+                if (!adaptive_device_peer_) continue;
+                // Respect the normal priority order before committing pages.
+                schedulePeerLandings(feedback, build, std::span(&request, 1), new_prompts_sealed);
+                if (build.Scheduled(*request)) continue;
             }
             if (!prefillAllowed(*request, build)) {
                 // Recheck after every admission: a resident's final chunk or
@@ -2333,6 +2365,14 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
     }
 }
 
+void Scheduler::schedulePrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                    bool new_prompts_sealed) {
+    if (!adaptive_device_peer_) schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    if (adaptive_device_peer_ && build.Full(config_.max_batch_size))
+        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
+}
+
 // P role: prefill worker. Completed prompts leave on plan.remote_decode
 // first -- their KV pages stay pinned until the transfer finishes
 // (pdTransferInFlight: on this role every page-holding state is pinned, from
@@ -2363,8 +2403,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
+    schedulePrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2507,8 +2546,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
-        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
-        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+        schedulePrefillWork(feedback, build, candidates, new_prompts_sealed);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

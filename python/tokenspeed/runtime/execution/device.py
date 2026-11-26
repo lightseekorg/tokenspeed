@@ -62,6 +62,9 @@ hold each piece:
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
+- ``shared_l2_client_config`` — the rank's client config for the shared L2
+  pool (``--shared-l2-config``), or None without a pool. The rank's client of the
+  pool's owner runs in the engine host.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
@@ -109,7 +112,7 @@ The two planes exchange information ONLY through the two channels below.
    shape rather than by anyone remembering them: what the loop cannot see,
    it cannot pass implicitly or mutate afterwards.
 
-5. Two registered exceptions — and new ones belong in this list, not in a
+5. Three registered exceptions — and new ones belong in this list, not in a
    comment at the call site:
 
    - Grammar matchers. ``GrammarStepInputs.grammars`` holds handles to the
@@ -130,6 +133,18 @@ The two planes exchange information ONLY through the two channels below.
      release of the shared SHM handles, behind any forward still reading
      them. What the shallow copy does freeze is the OUTER struct —
      ``mrope_positions`` and its siblings, which the next gather rebinds.
+
+   - Shared L2 proxy pages. With a shared L2 pool the control thread hands
+     the host's pool client the pool page behind each proxy Host block an
+     answer created (``map_proxy_blocks``), and the forward thread's
+     hand-over of a plan's load-backs reads that map
+     (``SharedL2LoadExecutor.submit_load_backs``, through the host's shared
+     L2 handle, ``SharedL2Handle.submit_load``). The discipline is ordering:
+     the map is
+     written right before the plan that may load from those blocks is
+     queued, and the scheduler holds a proxy block a planned
+     load reads until the load is acknowledged, so no later answer remaps it
+     first.
 """
 
 from __future__ import annotations
@@ -138,7 +153,8 @@ import contextlib
 import enum
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -190,6 +206,7 @@ logger = get_colorful_logger(__name__)
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.cache.peer import PeerGeometry
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2ClientConfig
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
@@ -347,6 +364,9 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
+        shared_l2_client_config: The rank's client config for the shared L2
+            pool (``--shared-l2-config``), or None without a pool. The pool's
+            loads run behind ``handle`` like Host L2 loads.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts the
             EPD receive needs (``EncoderModelFacts``). A callable, not a
@@ -362,6 +382,7 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
+    shared_l2_client_config: SharedL2ClientConfig | None
     encoder_model_facts: Any
     peer_geometry: PeerGeometry | None
 
@@ -406,6 +427,8 @@ class DeviceHandle:
     anything the caller could then use to bypass the rest.
     """
 
+    _additional_discard_reload_types: tuple[type, ...] = ()
+
     def __init__(
         self,
         executor,
@@ -434,9 +457,11 @@ class DeviceHandle:
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
-        # with the write-backs and restores with the load-backs; all four
-        # ACK kinds ride the cache poll.
+        # with the write-backs and restores with the load-backs; their ACKs
+        # ride the cache poll.
         self._l2 = host_cache_executor
+        self._replay_retirements: deque[tuple[Any, int, torch.Tensor | None]] = deque()
+        self._completed_replay_retirement = 0
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -464,12 +489,30 @@ class DeviceHandle:
     # Per-round work
     # ------------------------------------------------------------------
 
+    def retire_replay(self, retirement_id: int, slots: Sequence[int]) -> None:
+        """Materialize old slots after settling drafting, ahead of their reuse."""
+        event = None
+        staged_slots = None
+        if slots:
+            executor = self._executor
+            # Keep the pinned upload alive until the execution stream uses it.
+            staged_slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True)
+            with executor.device_module.stream(executor.execution_stream):
+                device_slots = staged_slots.to(executor.device, non_blocking=True)
+                executor.attn_backend.materialize_recurrent_state(device_slots)
+                event = executor.device_module.Event()
+                event.record(executor.execution_stream)
+            executor.default_stream.wait_event(event)
+        self._replay_retirements.append((event, retirement_id, staged_slots))
+
     def execute(
         self,
         execution_plan,
         planned: "PlannedForward | None",
         *,
         cache_ops: Sequence,
+        retirement_slots: Sequence[int] = (),
+        retirement_id: int | None = None,
     ) -> ModelExecutionResult | None:
         """Execute one scheduler plan; never waits for the device on the
         per-round path.
@@ -532,12 +575,17 @@ class DeviceHandle:
 
             cache_ops: The plan's Device-copy operations, the ones the control
                 plane counts; its storage operations go to the L3 executor.
+            retirement_slots: Slots of old owners to materialize before this
+                plan touches their pages.
+            retirement_id: Host fence covering the retirements, if issued.
 
         Returns:
             The launched forward's result, its host copies landing behind its
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if retirement_slots and retirement_id is None:
+            raise ValueError("Replay retirement slots require a host fence")
         if planned is not None and self._weight_memory is not None:
             self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
@@ -546,6 +594,8 @@ class DeviceHandle:
                 raise TypeError(
                     f"unsupported Device cache op: {type(operation).__name__}"
                 )
+        if cache_ops and self._l2 is None:
+            raise RuntimeError("Device cache operations require a Host cache executor")
 
         executor = self._executor
         copies = {
@@ -579,6 +629,7 @@ class DeviceHandle:
             or folds
             or fence is not None
             or peer_fetches
+            or retirement_slots
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -586,6 +637,8 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
+        if retirement_id is not None:
+            self.retire_replay(retirement_id, retirement_slots)
         l2 = self._l2
         if folds:
             # The victims' last forwards ran on the execution stream, and the
@@ -782,7 +835,8 @@ class DeviceHandle:
         queries plus queue drains (serialized against the forward thread's
         submissions by the executor's own lock). Queued behind the forward
         thread's work, the round head would wait for every forward still
-        being launched.
+        being launched. A rank with a shared L2 pool is not asked: the host
+        acknowledges its loads from its own loader.
 
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
@@ -791,6 +845,16 @@ class DeviceHandle:
         if self._l2 is not None:
             results.extend(self._l2.poll_results())
         return results
+
+    def poll_replay_retirement(self) -> int:
+        """Return the latest completed host fence without waiting for CUDA."""
+        while self._replay_retirements:
+            event, retirement_id, _staged_slots = self._replay_retirements[0]
+            if event is not None and not event.query():
+                break
+            self._replay_retirements.popleft()
+            self._completed_replay_retirement = retirement_id
+        return self._completed_replay_retirement
 
     def poll_cache_observations(self) -> tuple[list[dict], int]:
         """Drain completed CPU diagnostics only; no event query or device work."""
@@ -856,6 +920,26 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    @contextlib.contextmanager
+    def complete_memory_transition(self) -> Iterator[None]:
+        """Wait for device work before reporting a successful transition."""
+        with allow_host_sync(
+            "memory transitions wait for the device before rank agreement"
+        ):
+            yield
+            self.synchronize()
+
+    def check_memory_transition(
+        self, tags: list[str], *, release: bool
+    ) -> tuple[bool, str]:
+        """Check the local weight and KV state without changing either."""
+        if self._weight_memory is not None:
+            try:
+                self._weight_memory.check_memory_transition(tags, release=release)
+            except RuntimeError as error:
+                return False, str(error)
+        return True, ""
+
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
         if self._forward_device.type == "cuda" and (
@@ -909,18 +993,22 @@ class DeviceHandle:
         else:
             self._weight_memory.resume(operation)
 
-    def finish_kv_resume(self) -> None:
+    def _restore_kv_contents(self) -> None:
+        self._executor.token_to_kv_pool.clear_kv_buffers()
+
+    def finish_kv_resume(self, *, synchronize_before_registration: bool) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
 
-        Re-mapped memory holds garbage, so the arena is zeroed first. The
-        draft pool names the same arena, so clearing the target's clears both.
-        FP8 KV scales ride with the weights region and need no reset. The
-        arena then goes back to the PD transfer engine, which registers the
-        new physical pages.
+        The target and draft share an arena. Restore its contents before
+        registering the new physical pages with the PD transfer engine.
         """
         self.settle()
-        self._executor.token_to_kv_pool.clear_kv_buffers()
+        self._restore_kv_contents()
         if self._kv_transfer is not None:
+            if synchronize_before_registration:
+                # NPU transfer registration can expose pages without ordering
+                # against the stream that cleared them.
+                self._executor.device_module.synchronize()
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
             self._weight_memory.mark_kv_resumed()
@@ -1143,6 +1231,7 @@ class DeviceHandle:
         if (
             state.policy == "discard"
             and type(req) is not UpdateWeightsFromMooncakeReqInput
+            and type(req) not in self._additional_discard_reload_types
         ):
             return False, "Discard policy requires a complete Model Updater SDK update"
         try:
@@ -1646,6 +1735,7 @@ def build_device_side(
     max_resident_requests: int,
     kv_transfer_builder,
     peer_outbox,
+    shared_l2_handle,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
 
@@ -1683,6 +1773,11 @@ def build_device_side(
         peer_outbox: With peer prefix sharing, the host's ``PeerOutbox``,
             which the handle tells when a plan's landings may be read (see
             ``cache/peer.py``); None without.
+        shared_l2_handle: The host's shared L2 handle (``SharedL2Handle``),
+            where a rank with ``--shared-l2-config`` starts its client of the
+            pool's owner and hands over its loads (see
+            ``cache/shared_l2/rank.py``); a rank without a pool leaves it
+            unused.
 
     Returns:
         A ``DeviceBuild``. No device object escapes except inside the
@@ -1979,17 +2074,60 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    if server_args.enable_kvstore or not snapshot_pool.disabled:
-        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+    shared_l2_client_config = None
+    if server_args.has_host_tier or not snapshot_pool.disabled:
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager as pg_manager,
         )
 
+        # What the Host cache executor's side and a shared L2 pool both
+        # read: the world's Gloo group, for their collectives, and the groups
+        # whose checkpoints are coarser than a page, part of the identity L3
+        # names its objects under and a pool admits its ranks by.
         cpu_group = (
             pg_manager.get_process_group("gloo", server_args.mapping.world_group)
             if server_args.mapping.world_size > 1
             else None
         )
+        checkpoint_granularities = tuple(
+            (spec.group_id, spec.checkpoint_granularity)
+            for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+            if spec.checkpoint_granularity is not None
+            and spec.checkpoint_granularity > 1
+        )
+    if server_args.shared_l2_config is not None:
+        from tokenspeed.runtime.cache.shared_l2.rank import join_shared_l2_pool
+
+        # The pool is this rank's Host L2: the scheduler's Host tier is its
+        # proxy and Host loads read it by RDMA, so its executor takes the
+        # Host cache executor's place (no local Host bytes, no snapshot pool).
+        shared_l2_client_config, host_cache_executor = join_shared_l2_pool(
+            server_args,
+            model_config,
+            draft_model_config,
+            device_pool=views.token_to_kv_pool,
+            draft_pool=views.draft_token_to_kv_pool,
+            cache_groups=views.cache_groups,
+            prefix_granularity=views.cache_geometry.prefix_granularity,
+            checkpoint_granularities=checkpoint_granularities,
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
+            world_cpu_group=cpu_group,
+            gpu_id=gpu_id,
+            shared_l2_handle=shared_l2_handle,
+        )
+        if cache_observation_capacity > 0:
+            # TODO: record the pool's loads in the engine host's loader, which
+            # runs them. Until then a pool rank records no completed copy, so
+            # its plans keep the loads in their unobserved form.
+            logger.warning(
+                "TOKENSPEED_CACHE_EVENT_LOG=1 logs no prefix_load_completed "
+                "record on a shared L2 rank: the engine host runs its loads"
+            )
+            cache_observation_capacity = 0
+    elif server_args.enable_kvstore or not snapshot_pool.disabled:
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+
         if server_args.kvstore_release_checkpoint_cache:
             from tokenspeed.runtime.cache.l2.executor import (
                 release_checkpoint_file_cache,
@@ -2055,17 +2193,12 @@ def build_device_side(
             memory_plan=views.token_to_kv_pool.arena.plan,
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
-            checkpoint_granularities=tuple(
-                (spec.group_id, spec.checkpoint_granularity)
-                for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
-                if spec.checkpoint_granularity is not None
-                and spec.checkpoint_granularity > 1
-            ),
+            checkpoint_granularities=checkpoint_granularities,
         )
 
     peer_geometry = None
     if peer_outbox is not None:
-        from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.cache.peer import build_peer_geometry, peer_semantic_id
         from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
         if host_cache is None:
@@ -2073,6 +2206,27 @@ def build_device_side(
                 "peer prefix sharing needs the Host tier (--enable-kvstore)"
             )
         arena = views.token_to_kv_pool.arena
+        transfer_contract = b""
+        mapping = server_args.mapping
+        topology = (
+            server_args.disaggregation_mode,
+            mapping.attn.tp_size,
+            mapping.attn.kvp_size,
+        )
+        if draft_model_config is None and topology in (
+            ("prefill", 8, 8),
+            ("decode", 1, 1),
+        ):
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+                build_cache_transfer_schema,
+            )
+            from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
+
+            transfer_contract = CacheTransferContract(
+                arena.plan,
+                tuple(arena.cache_group_specs),
+                build_cache_transfer_schema(arena.plan, model_config=model_config),
+            ).to_wire_bytes()
         peer_geometry = build_peer_geometry(
             scheduler_group_ids=tuple(
                 spec.group_id for spec in arena.runtime_contract.group_specs
@@ -2085,6 +2239,18 @@ def build_device_side(
             },
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
+            transfer_contract=transfer_contract,
+            semantic_id=(
+                peer_semantic_id(
+                    server_args.served_model_name,
+                    model_config.revision,
+                    server_args.weight_version,
+                    attention.peer_state_abi,
+                )
+                if transfer_contract
+                else b""
+            ),
+            host_virtual_bounds=host_cache.ownership.host_virtual_counts,
             host_region_planner=get_peer_host_region_planner(server_args.device),
         )
 
@@ -2169,13 +2335,21 @@ def build_device_side(
             policy=server_args.weight_memory_policy, models=update_models
         )
 
+    handle_type: type[DeviceHandle] = DeviceHandle
+    if server_args.enable_memory_saver and executor.device == "npu":
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        handle_type = AscendMemorySaverDeviceHandle
     return DeviceBuild(
         host_cache=host_cache,
+        shared_l2_client_config=shared_l2_client_config,
         peer_geometry=peer_geometry,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
-        handle=DeviceHandle(
+        handle=handle_type(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,

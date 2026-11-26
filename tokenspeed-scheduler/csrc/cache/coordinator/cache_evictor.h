@@ -222,6 +222,9 @@ public:
         // A segment plan took it as clean Host-only cache -- the Disk holds
         // its key too -- before any dirty entry (docs/rfcs/0006-disk-tier.md).
         HostEvictionCounts clean;
+        // A shared L2 rank's proxy entry nothing held any more
+        // (HostCache::TryEvictHostEntry): the pool keeps the page it stood for.
+        HostEvictionCounts released;
     };
 
     // Disk entries evicted for one reason, each also counted as host_resident

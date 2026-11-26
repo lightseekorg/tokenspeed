@@ -481,7 +481,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("mode", ["verify", "chain", "mtp", "block"])
 def test_split_counts_follow_live_lengths_during_graph_replay(cache_dtype, mode):
-    from tokenspeed_mla import get_num_sm
+    from tokenspeed_mla import tokenspeed_mla_decode_split_kvs
 
     from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
         CuteDSLMLABackend,
@@ -532,11 +532,24 @@ def test_split_counts_follow_live_lengths_during_graph_replay(cache_dtype, mode)
         else:
             leaf.refresh_decode_metadata(2, 2, lengths, tables)
 
+    def planned(values):
+        expected = torch.empty(2, dtype=torch.int32, device="cuda")
+        tokenspeed_mla_decode_split_kvs(
+            torch.tensor(values, dtype=torch.int32, device="cuda"),
+            expected,
+            torch.empty(3, dtype=torch.int32, device="cuda"),
+            torch.empty_like(leaf._decode_split_tasks_buf),
+            num_heads=96,
+            q_len=1 if mode == "chain" else 4,
+            max_seq_len=16384,
+            min_split_kv=1,
+            dtype=cache_dtype,
+        )
+        return expected.tolist()
+
     update()
-    query_tiles = 1 if mode == "chain" else 3
-    uniform = min(32, max(1, get_num_sm(lengths.device) // (2 * query_tiles * 2)))
-    chunk = (512 + 8192 + 2 * uniform - 1) // (2 * uniform)
-    expected = [min(32, (length + chunk - 1) // chunk) for length in (512, 8192)]
+    expected = planned([512, 8192])
+    assert expected[0] < expected[1]
     assert counts.tolist() == expected
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

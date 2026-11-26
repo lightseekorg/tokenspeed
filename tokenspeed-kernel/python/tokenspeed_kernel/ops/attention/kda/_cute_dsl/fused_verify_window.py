@@ -204,7 +204,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
     """Multi-token verify with fused producers for one head count, window and value tile.
 
     ``smem_floor`` is the least shared memory a CTA claims, which bounds how
-    many CTAs share an SM (0 for what the kernel needs).
+    many CTAs share an SM (0 for what the kernel needs). ``copy_records``
+    (64-row tiles with room for records only) bulk-copies each accepted
+    record's key, decay and this tile's U into shared memory, instead of an
+    L2 prefetch and per-thread register loads; ``_copies_records`` decides it.
     """
 
     def __init__(
@@ -218,6 +221,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         has_metadata: bool,
         gated_norm: bool,
         smem_floor: int,
+        copy_records: bool,
     ) -> None:
         super().__init__(
             DIM,
@@ -242,6 +246,15 @@ class FusedVerifyWindow(RecoverSsmVerify):
         tile_words = max(self.tile_words, value_tile_rows * DIM + weight_words)
         self.smem_bytes += 4 * (tile_words - self.tile_words)
         self.tile_words = tile_words
+        if copy_records:
+            assert value_tile_rows == 64 and self.history_rows > 0
+            self.copy_records = True
+            self.record_keys = 0
+            self.record_decays = self.history_rows * DIM
+            self.record_us = 2 * self.history_rows * DIM
+            self.record_words = self.record_us + self.history_rows * value_tile_rows
+            # The region, its alignment and the records' mbarrier.
+            self.smem_bytes += 4 * self.record_words + 128 + 8
         self.smem_bytes = max(self.smem_bytes, smem_floor)
         # Where a tile starts its key channel's loads of the records' keys and
         # decays, so they fly before phase 1 uses them (phase 1 used to wait
@@ -252,8 +265,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
         # registers already many, they slowed a batch-16 round 2-3%), and a
         # 128-row tile with the CTA (``early_history_loads``); otherwise
         # phase 1 loads them.
+        # Copied records need neither.
         self.history_channel_start = None
-        if self.history_rows > 0 and value_tile_rows == 32:
+        if self.copy_records:
+            pass
+        elif self.history_rows > 0 and value_tile_rows == 32:
             self.history_channel_start = "gate"
         elif value_tile_rows == 64 and self.preload_history_us:
             self.history_channel_start = "rows"
@@ -439,6 +455,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         if tidx == 0:
             cute.arch.mbarrier_init(shared.state_barrier, 1)
             cute.arch.mbarrier_init(shared.weight_barrier, 1)
+            if const_expr(self.copy_records):
+                cute.arch.mbarrier_init(shared.records_barrier, 1)
             if const_expr(self.cluster > 1):
                 cute.arch.mbarrier_init(shared.token_barrier, 1)
                 # The cluster's q, k and gate rows of every token land on it.
@@ -521,9 +539,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
             prefetched = count
             if const_expr(self.value_tile_rows == 32):
                 prefetched = Int32(max(self.capacity - W, 0))
-            self._prefetch_records(
-                retained, slot, head, value_start, prefetched, warp, lane
-            )
+            if const_expr(not self.copy_records):
+                self._prefetch_records(
+                    retained, slot, head, value_start, prefetched, warp, lane
+                )
 
         # The metadata was written before this forward; the previous launch's
         # rows are not, but their addresses need only the batch layout, so
@@ -565,6 +584,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
             gate_inputs = [_ldg_b32x2(address) for address in gate_addresses]
             raw_beta = _load(beta, beta_offset)
             logits = [_load(gate, offset) for offset in logit_offsets]
+            if const_expr(self.copy_records):
+                if live:
+                    self._copy_records(
+                        shared, retained, slot, head, count, value_start, warp, lane
+                    )
             if const_expr(self.history_channel_start == "rows"):
                 if live:
                     self._start_history_channel(
@@ -711,6 +735,75 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         _store_if(
                             Int32(t < valid_tokens), row.toint(), Float32(0.0), True
                         )
+
+    @cute.jit
+    def _copy_records(
+        self,
+        shared,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        count: Int32,
+        value_start: Int32,
+        warp: Int32,
+        lane: Int32,
+    ):
+        """Bulk-copy each accepted record's key, decay and this tile's U into shared memory.
+
+        The last warp issues them, lane l for records l, l + 32, ..., after
+        lane 0 posts their bytes on the records' mbarrier, which phase 1 waits
+        on. The prepare leaves at most ``capacity - window`` records, so they
+        fit the region's ``history_rows`` rows.
+        """
+        K = self.key_dim
+        VT = self.value_tile_rows
+        if (count > 0) & (warp == THREADS // 32 - 1):
+            copies = cutlass.min(count, Int32(self.history_rows))
+            barrier = Int32(shared.records_barrier.toint())
+            if lane == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    shared.records_barrier, copies * ((2 * K + VT) * 4)
+                )
+            correction, key, decay = retained[1], retained[2], retained[3]
+            region = Int32(shared.records.iterator.toint())
+            for i in cutlass.range_constexpr((self.history_rows + 31) // 32):
+                p = lane + 32 * i
+                if p < copies:
+                    position = Int64(p)
+                    key_row = key.iterator + (
+                        slot * key.stride[0]
+                        + Int64(head) * key.stride[1]
+                        + position * key.stride[2]
+                    )
+                    decay_row = decay.iterator + (
+                        slot * decay.stride[0]
+                        + Int64(head) * decay.stride[1]
+                        + position * decay.stride[2]
+                    )
+                    u_row = correction.iterator + (
+                        slot * correction.stride[0]
+                        + Int64(head) * correction.stride[1]
+                        + position * correction.stride[2]
+                        + Int64(value_start)
+                    )
+                    _bulk_load(
+                        region + (self.record_keys + p * K) * 4,
+                        key_row.toint(),
+                        K * 4,
+                        barrier,
+                    )
+                    _bulk_load(
+                        region + (self.record_decays + p * K) * 4,
+                        decay_row.toint(),
+                        K * 4,
+                        barrier,
+                    )
+                    _bulk_load(
+                        region + (self.record_us + p * VT) * 4,
+                        u_row.toint(),
+                        VT * 4,
+                        barrier,
+                    )
 
     @cute.jit
     def _start_history_channel(
@@ -974,6 +1067,7 @@ def _compile(
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
     smem_floor: int,
+    copy_records: bool,
 ):
     tokens = cute.sym_int()
     slots = cute.sym_int()
@@ -1026,6 +1120,7 @@ def _compile(
         has_metadata,
         norm_dtype is not None,
         smem_floor,
+        copy_records,
     )
     return cute.compile(
         kernel,
@@ -1060,6 +1155,71 @@ def _two_per_sm(device_index: int) -> tuple[int, int]:
     """The device's SM count and the CTA shared memory that leaves room for two per SM."""
     props = torch.cuda.get_device_properties(device_index)
     return props.multi_processor_count, props.shared_memory_per_multiprocessor // 3 + 1
+
+
+@functools.cache
+def _smem_per_block(device_index: int) -> int:
+    """The most shared memory a CTA of this device can claim."""
+    return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+
+
+@functools.cache
+def _record_copy_smem(
+    heads: int,
+    window: int,
+    capacity: int,
+    bounded_gate: bool,
+    factored: bool,
+    has_metadata: bool,
+    gated_norm: bool,
+) -> int:
+    """Shared memory of a 64-row-tile CTA that copies its records."""
+    return FusedVerifyWindow(
+        heads,
+        window,
+        64,
+        capacity,
+        bounded_gate,
+        factored,
+        has_metadata,
+        gated_norm,
+        0,
+        True,
+    ).smem_bytes
+
+
+def _copies_records(
+    value_tile_rows: int,
+    ctas: int,
+    packed_records: bool,
+    heads: int,
+    window: int,
+    capacity: int,
+    bounded_gate: bool,
+    factored: bool,
+    has_metadata: bool,
+    gated_norm: bool,
+    device: torch.device,
+) -> bool:
+    """Whether a launch bulk-copies its records into shared memory (``copy_records``).
+
+    Only 64-row tiles with room for records do: on 32-row tiles the copies
+    were slower than the prefetch and register loads, and 128-row tiles load
+    their records with the CTA (GB300, Kimi-K3 TP8 rank). Their region (20 KiB
+    at a capacity of window + 12) can cost a 64-row tile a CTA per SM: it
+    lowered the shared-memory CTA limit of the profiled 64-row configurations
+    by one. So only grids of at most one CTA per SM take it, where it costs
+    none; the boundary is ``_smem_floor``'s, so batches of a bucket share one
+    compile.
+    The records must be dense rows a 16-byte bulk copy can address
+    (``packed_record_width``), and the region must fit the CTA.
+    """
+    if value_tile_rows != 64 or capacity <= window or not packed_records:
+        return False
+    sms, _ = _two_per_sm(device.index)
+    return ctas <= sms and _record_copy_smem(
+        heads, window, capacity, bounded_gate, factored, has_metadata, gated_norm
+    ) <= _smem_per_block(device.index)
 
 
 def _smem_floor(ctas: int, device: torch.device) -> int:
@@ -1239,17 +1399,33 @@ def fused_verify_window(
         state_indices.shape[0], num_heads, window, head_dim
     )
     ctas = state_indices.shape[0] * num_heads * (head_dim // value_tile_rows)
+    factored = bounded and window * abs(lower_bound) <= FACTORED_DECAY
+    capacity = correction_cache.shape[2]
+    has_metadata = record_metadata is not None
+    copy_records = _copies_records(
+        value_tile_rows,
+        ctas,
+        retained_history.packed_record_width == head_dim,
+        num_heads,
+        window,
+        capacity,
+        bounded,
+        factored,
+        has_metadata,
+        output_norm is not None,
+        mixed_qkv.device,
+    )
     kernel = _compile(
         num_heads,
         window,
         value_tile_rows,
-        correction_cache.shape[2],
+        capacity,
         checkpoint_state.dtype,
         retained_history.live_state_indices.dtype,
         retained_history.record_slots.dtype,
         bounded,
-        bounded and window * abs(lower_bound) <= FACTORED_DECAY,
-        record_metadata is not None,
+        factored,
+        has_metadata,
         None if output_norm is None else output_norm.weight.dtype,
         beta_logits.dtype,
         A_log.dtype,
@@ -1257,6 +1433,7 @@ def fused_verify_window(
         query_start_loc.dtype,
         state_indices.dtype,
         _smem_floor(ctas, mixed_qkv.device),
+        copy_records,
     )
     kernel(
         mixed_qkv,

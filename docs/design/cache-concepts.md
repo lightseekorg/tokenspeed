@@ -6,6 +6,48 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Cross-layout peer prefix reads
+
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
+All source members must pin the proposed checkpoint before the holder grants a
+read. All reader members must report retirement before sending RELEASE.
+Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
+Unknown retirement freezes the landing. A restarted holder or a conflicting
+close ends the business attempt with zero reused tokens.
+
+Wire revision 2 bounds the start of each member's last native read. Its local
+30-second monotonic submission window starts before the member votes READY.
+Workers check the same deadline at each batch, including after queue and
+destination-fence waits. The holder starts its own 30-second interval at
+GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
+Mixed wire revisions fall back to local prefill.
+
+A deployment with a guaranteed upper bound on the time from the reader's
+final submission check through the last possible source-memory access can
+set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
+scheduling pauses after the check, native queues, reconnects, retries, DMA
+drain after process failure, and timer drift/margin. All ranks follow their
+holder leader's configured value. After the submission interval plus this
+bound, the holder initiates an ABORT and releases its own source references
+even if the reader disappeared. This never releases a reader's frozen target.
+If the backend has no verified bound, leave the setting unset: a granted
+source remains pinned pending explicit closure. A timeout for polling one
+Mooncake batch alone does not establish the bound. No heartbeats extend it.
+
+After all reader members have retired their reads, a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement keeps the original landing frozen and cannot enter this retry path.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -126,6 +168,19 @@ pool; no capacity is reserved for State or history.
 Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
+
+A shared L2 pool (`--shared-l2-config`) uses the compact Host geometry too. A
+pool page holds one block exactly as a Host block does, and a rank reports the
+pool's `host_group_packing` for its Host tier, which is then a proxy: its
+blocks hold no bytes and stand for pinned pool pages. Only the parents are
+spread over the provider processes' memory, in the order the providers
+joined: a page lies in its parent as a Host block does, on the provider that
+holds the parent (`shared_l2/geometry.rs` of `ts-control`, from the sizes
+`runtime/cache/shared_l2/layout.py` reads off the Host layout); the bytes
+move between a rank's Device blocks and pool pages by RDMA and never pass
+through the rank's host memory. The pool's capacity follows from the same
+geometry: a State checkpoint costs one parent for each State group, and KV
+pages share parents by their group's packing.
 
 Host allocations follow PyTorch's existing allocator configuration, including
 `PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
@@ -570,6 +625,16 @@ capacity layout without these slots keeps such a forward on its live metadata
 (`prepare_prefill_metadata` returns False), so the layer runs at its eager
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
+
+Checkpoint positions and scan indices are planned on the host. Each metadata
+preparation packs its related tensors into one pinned upload without
+synchronizing the model stream. Checkpoint writers reuse the uploaded row
+and offset views. These mirrors stay live-sized; only the token and block
+slots consumed by captured
+state writers keep the fixed capacity shape. Retained device views belong to
+the existing `attention_state` region and follow its `weights` release/resume
+lifecycle. Each upload has fresh host staging storage so overlapping forwards
+cannot overwrite metadata whose transfer is still in flight.
 
 For PD landing into a partial history block, follow the
 [block-table export contract](#block-tables-and-exported-page-ids) above.
@@ -3496,3 +3561,17 @@ unusable State checkpoint eligible for an optimistic storage query.
 Query/GET still requires all Full, State and window
 objects; diverging prompts therefore cannot reuse a checkpoint solely because
 they share a group or boundary length.
+
+## Deferred recurrent state workspace
+
+Deferred GDN payloads are execution workspace, rather than a cache group:
+they never enter prefix matching, tier storage, retraction images or PD
+transfers. Two batch-sized banks retain replay inputs until the next forward
+consumes them or materializes dropouts. Only the small slot/generation records
+are slot state, owned by `GdnPendingState` through `SlotStateExporter`.
+Export and import reject records that still name a pending payload.
+
+The runtime retires replay before reading or reusing its old State block or
+request slot. It materializes the state at a request exit to cover published
+checkpoints and snapshots. Until then the bank and live block together
+describe the logical frontier. This adds no State slot or cache span.

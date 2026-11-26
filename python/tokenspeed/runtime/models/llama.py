@@ -207,6 +207,9 @@ class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
     supports_aux_capture = True
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
         return [
             ("qkv_proj", "q_proj", "q"),

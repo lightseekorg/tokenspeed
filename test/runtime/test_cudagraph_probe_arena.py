@@ -488,6 +488,10 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         enable_prefix_caching=False,
         enable_memory_saver=False,
         enable_kvstore=False,
+        # Read where the Host cache executor is built: no Host tier and no
+        # shared L2 pool here.
+        has_host_tier=False,
+        shared_l2_config=None,
         spec_context_pad=0,
         device="cuda",
     )
@@ -512,6 +516,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     return charged, set(reads), stack[0]
 

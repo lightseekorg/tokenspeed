@@ -28,6 +28,7 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "dequantize_fp8_block",
     "quantize_fp8",
     "output_fp8_quant_pack",
     "try_output_fp8_quant_pack",
@@ -1039,3 +1040,38 @@ def output_fp8_quant_pack(
         sigmoid_gate=sigmoid_gate,
         enable_pdl=enable_pdl,
     )
+
+
+def dequantize_fp8_block(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode contiguous [N,K] or [E,N,K] E4M3 with 128x128 FP32 scales.
+
+    Returns a temporary BF16 tensor. Multiplication takes place in FP32 before
+    BF16 rounding; codes and scales are never mutated or requantized.
+    """
+    if (
+        codes.ndim not in (2, 3)
+        or codes.dtype != torch.float8_e4m3fn
+        or scales.dtype != torch.float32
+        or scales.device != codes.device
+        or not codes.is_contiguous()
+        or not scales.is_contiguous()
+        or tuple(scales.shape)
+        != (
+            *codes.shape[:-2],
+            (codes.shape[-2] + 127) // 128,
+            (codes.shape[-1] + 127) // 128,
+        )
+    ):
+        raise ValueError(
+            "Expected contiguous E4M3 matrices and matching 128x128 FP32 block scales"
+        )
+    kernel = select_kernel(
+        "quantization",
+        "dequantize_fp8_block",
+        format_signature(x=dense_tensor_format(codes.dtype)),
+        traits={},
+        features=frozenset({"batch_invariant"}),
+        override=None,
+        solution=None,
+    )
+    return kernel(codes, scales)

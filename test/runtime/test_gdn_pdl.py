@@ -273,6 +273,7 @@ def test_gdn_chain_pdl_toggle(
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
                 tree_ancestors=None,
+                pending_replay=None,
             )
         return rmsnorm_fn(
             out.reshape(rows, -1),
@@ -420,6 +421,7 @@ def test_gdn_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
             tree_ancestors=chain,
             solution="triton",
             override=None,
+            pending_replay=None,
         )
 
     pdl_enabled(True)

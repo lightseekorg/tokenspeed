@@ -212,6 +212,8 @@ struct TailPublication {
     // HashPrefixPage(tokens[kP, T), prior) with prior = the chain hash of
     // page k - 1 (prefix_hashes.back(), or "" for k = 0).
     ContentHash hash{};
+
+    bool operator==(const TailPublication&) const = default;
 };
 
 // What the owner of a published partial page does with its blocks of that

@@ -372,11 +372,12 @@ def warn_past_rope_table(
     else:
         table_len = get_context_length(model_config.hf_text_config)
     if physical_context_len > table_len:
+        role = "draft" if model_config.is_draft_worker else "target"
         logger.warning(
             f"physical context extent {physical_context_len!s} (context_len "
             f"{context_len!s} + spec overshoot "
             f"pad {physical_context_len - context_len!s}) exceeds the "
-            f"{table_len!s} positions of the model's rope tables; "
+            f"{table_len!s} positions of the {role} model's rope tables; "
             "positions in the pad index past the precomputed rope tables. "
             "Lower --max-model-len by at least "
             f"{physical_context_len - table_len!s} to stay in bounds.",
@@ -418,6 +419,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    acl_graph_memory_policy: str
     enable_dp_local_cuda_graph: bool
     prefix_granularity: int
     max_num_seqs: int
@@ -592,6 +594,7 @@ class ModelExecutorConfig:
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
+            acl_graph_memory_policy=server_args.acl_graph_memory_policy,
             data_parallel_size=server_args.mapping.attn.dp_size,
             attention_tp_size=server_args.mapping.attn.tp_size,
             moe_tp_ep_size=server_args.mapping.moe.tp_ep_size,
@@ -643,7 +646,7 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=config.device
         )
         register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
@@ -669,6 +672,15 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
+        if draft_model_runner is not None and isinstance(
+            draft_model_runner.model, RopeTableModel
+        ):
+            warn_past_rope_table(
+                draft_model_runner.model,
+                draft_model_runner.model_config,
+                config.context_len,
+                config.physical_context_len,
+            )
         self._draft_final_step_counter = None
         self._pp_wire_logged = False
 
@@ -797,12 +809,7 @@ class ModelExecutor:
                 f"{shard_top_k} candidates per shard instead of gathering logits"
             )
         # After the target's shard decision: a drafter sharded alike records q over its shard.
-        self._init_draft_probs(config, spec_num_tokens)
-        if self.drafter is not None:
-            # Draft-prob sampling reads the request's temperature / top-k /
-            # seed from the verifier's pool buffers: one owner of per-request
-            # sampling state.
-            self.drafter.bind_sampling_backend(self.sampling_backend)
+        self._init_sampled_drafting(config, spec_num_tokens)
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -1139,12 +1146,12 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
-        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
-        if self.forward_step.disable and self.prefill_graph.disable:
-            return
-
-        # Freeze once for all captures; prefill and drafter captures collect on entry.
-        with freeze_gc(self.config.enable_cudagraph_gc):
+        # Eager and prefill-only boots still validate their managed weights and KV.
+        with (
+            contextlib.nullcontext()
+            if self.forward_step.disable and self.prefill_graph.disable
+            else freeze_gc(self.config.enable_cudagraph_gc)
+        ):
             if not self.forward_step.disable:
                 self.forward_step.capture(entries=entries, observer=observer)
             if not self.prefill_graph.disable:
@@ -1172,6 +1179,16 @@ class ModelExecutor:
                         ),
                         observer=observer,
                     )
+
+        if self.device == "npu" and self.config.enable_memory_saver:
+            models = [("target", self.model_runner.model)]
+            if self._draft_model_runner is not None:
+                models.append(("draft", self._draft_model_runner.model))
+            self.model_runner.memory_saver_adapter.validate_startup(
+                models=models,
+                kv_regions=self.token_to_kv_pool.arena.regions,
+                graphs=self.forward_step.graphs.values(),
+            )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:
@@ -2047,6 +2064,16 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        self.attn_backend.prepare_pending_recurrent_state(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            self.runtime_states.valid_cache_lengths,
+            allow_defer=(
+                ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+                and ctx.output_layout.decode_width == 4
+            ),
+        )
+
         # KV offloading uses scheduler request slots to bind hot partitions;
         # ordinary backends keep their existing path through a no-op hook.
         self.attn_backend.prepare_cache_batch(
@@ -2227,17 +2254,39 @@ class ModelExecutor:
             ib.state_write_padding_pool_index,
         )
 
+    def _init_sampled_drafting(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate and bind the state --enable-speculative-sampling keeps.
+
+        The recorded draft q rows and the drafter's sampling scratch live across
+        rounds and inside captured graphs, so they join the CPU-backed
+        ``runtime_states`` region: a weights release unmaps them and a resume
+        restores their addresses and contents.
+
+        Args:
+            config: The executor config.
+            spec_num_tokens: Verify chain width.
+        """
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self._init_draft_probs(config, spec_num_tokens)
+            if self.drafter is not None:
+                # Draft-prob sampling reads the request's temperature / top-k /
+                # seed from the verifier's pool buffers: one owner of per-request
+                # sampling state.
+                self.drafter.bind_sampling_backend(self.sampling_backend)
+
     def _init_draft_probs(
         self, config: ModelExecutorConfig, spec_num_tokens: int
     ) -> None:
         """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
 
-        Trees keep their draft q per tree instead (bind_tree), and DFLASH
-        (DFlash2) records a sparse q over its selector's candidates
+        Trees keep their draft q per tree instead (bind_tree), and DFlash2
+        records a sparse q over its selector's candidates
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
-        The step drafters and DSpark sample from full-vocab logits and need
-        the dense rows: whole-vocabulary rows, or this rank's columns when
-        the verifier reads q per shard and the drafter can record them
+        The step drafters, DSpark and base DFLASH sample from full-vocab logits
+        and need the dense rows: whole-vocabulary rows, or this rank's columns
+        when the verifier reads q per shard and the drafter can record them
         (``_draft_probs_shard``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
@@ -2247,7 +2296,11 @@ class ModelExecutor:
                 "enable_speculative_sampling needs a speculative drafter to "
                 "record proposal distributions for"
             )
-        if config.spec_algo != "DFLASH":
+        # DFlash2 records a sparse q instead. A stage without a drafter (a
+        # pipeline stage before the last) keeps the old rule: no rows for DFLASH.
+        if config.spec_algo != "DFLASH" or (
+            self.drafter is not None and not self.drafter.records_sparse_draft_q
+        ):
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,

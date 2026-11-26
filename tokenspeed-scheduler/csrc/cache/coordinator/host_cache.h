@@ -30,6 +30,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -96,7 +98,11 @@ public:
     // demoted entries (SetCheckpointDemotion): free Host space would take
     // them back.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores();
+    // The oldest store candidates, at most max_candidates of them (all of
+    // them by default); the rest stay queued for a later drain. A candidate
+    // of an ended session is dropped.
+    std::vector<StoreCandidate> TakePendingStores(std::size_t max_candidates = std::numeric_limits<std::size_t>::max());
+    bool HasPendingStores() const { return !pending_stores_.empty(); }
     // One Host block per (group, bucket), with free capacity assigned first
     // in input order. The shared eviction plan funds remaining rows globally;
     // failed rows and unnecessary tentative victims evict nothing. A State
@@ -186,6 +192,18 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
                         std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
+    // Refreshes the Host entries of `keys` as a Device hit on them does; a
+    // key the Host does not hold is skipped. For the owner of a shared L2
+    // pool (SharedL2Pool), whose ranks' Device hits reach it as keys.
+    void TouchHostKeys(std::span<const CacheKey> keys);
+    // A rank whose Host tier is a proxy of a shared L2 pool (SharedL2Proxy)
+    // mirrors the pool's pinned pages as Host entries and gives each up once
+    // nothing on the rank holds it.
+    //
+    // Evicts key's Host entry, as Host eviction does (a State checkpoint's
+    // unpinned State siblings leave with it), unless something holds its
+    // block: false then. A key the Host no longer holds is dropped already.
+    bool TryEvictHostEntry(const CacheKey& key);
     // Queues a newly published Device entry for D2H Store (write-through).
     void QueueStore(CacheKey key) { pending_stores_.push_back(StoreCandidate{.key = std::move(key)}); }
     // Drops the queued stores no drain took (ClearDeviceCache), counting them.
@@ -254,7 +272,7 @@ private:
     CacheEvictor& evictor_;
     AdmissionHistory& history_;
     bool write_back_evictions_{false};
-    std::vector<StoreCandidate> pending_stores_;
+    std::deque<StoreCandidate> pending_stores_;
     // Accounting only.
     std::uint64_t store_candidates_dropped_by_flush_{0};
 };

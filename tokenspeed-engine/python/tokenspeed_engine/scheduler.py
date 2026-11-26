@@ -53,6 +53,8 @@ RequestSpec = _ext.RequestSpec
 Scheduler = _ext.Scheduler
 SchedulerAbort = _ext.SchedulerAbort
 SchedulerConfig = _ext.SchedulerConfig
+SharedL2Config = _ext.SharedL2Config
+SharedL2Pool = _ext.SharedL2Pool
 
 StorageStats = _ext.StorageStats
 HostCacheStats = _ext.HostCacheStats
@@ -94,6 +96,8 @@ __all__ = [
     # Core
     "Scheduler",
     "SchedulerConfig",
+    "SharedL2Config",
+    "SharedL2Pool",
     "StorageConfig",
     "StoragePressure",
     "StorageStats",
