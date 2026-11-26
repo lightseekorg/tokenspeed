@@ -87,6 +87,7 @@ struct PeerConfig {
     // Device landings, which use neither.
     std::int32_t max_host_landing_blocks;
     std::int64_t host_ready_timeout_us;
+    bool versioned_shards{false};
     void Validate() const;
 };
 
@@ -219,6 +220,8 @@ struct PeerFetchDone {
     std::int64_t dispatch_us{0};
     std::int64_t writable_us{0};
     std::int64_t terminal_us{0};
+    PeerLeaseId lease;
+    bool frozen{false};
 };
 
 }  // namespace cache

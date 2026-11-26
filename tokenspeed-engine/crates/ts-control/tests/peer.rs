@@ -109,12 +109,12 @@ fn scheduler(
     };
     let tier = match landing {
         Landing::Device => {
-            "landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0, host_ready_timeout_us=0"
+            "landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False"
                 .to_owned()
         }
         Landing::Host => format!(
             "landing_tier=ts.PeerLandingTier.Host, max_host_landing_blocks={}, \
-             host_ready_timeout_us=1_000_000",
+             host_ready_timeout_us=1_000_000, versioned_shards=False",
             pages - 1
         ),
     };
@@ -479,6 +479,53 @@ fn rounds_until_prefill(
         std::thread::sleep(Duration::from_millis(2));
     }
     panic!("the reader never prefilled {request}");
+}
+
+#[test]
+fn coordinated_members_use_the_leaders_clock_despite_skewed_reports() {
+    let arena = Arena::new(200_000);
+    let mut listener = Some(PeerListener::bind("127.0.0.1", 0).unwrap());
+    let name = format!("127.0.0.1:{}", listener.as_ref().unwrap().port());
+    let settings = settings(&name, "v1");
+    let sched = Arc::new(Mutex::new(scheduler(
+        &name,
+        settings.peer.incarnation,
+        "Fused",
+        Landing::Device,
+        settings.peer.timeouts.answer_us,
+        settings.pages,
+        settings.soft_pin_us,
+    )));
+    let geometries = vec![geometry(HOLDER_BASE); 8];
+    let mut members: Vec<_> = (0..8)
+        .map(|i| {
+            Peer::start(
+                settings.peer.clone(),
+                PeerProgress::Coordinated,
+                i,
+                geometries.clone(),
+                listener.take(),
+                sched.clone(),
+                PeerTransfers {
+                    reader: Arc::new(arena.clone()),
+                    pusher: Arc::new(NoPushes),
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut reports: Vec<_> = members.iter_mut().map(Peer::report).collect();
+    // The first i64 in the coordinated report is the member's elapsed microseconds.
+    // Place the local clocks on opposite sides of the two-second soft deadline.
+    for (i, report) in reports.iter_mut().enumerate() {
+        report[..8].copy_from_slice(&(10_000_000_i64 * i as i64).to_le_bytes());
+    }
+    for leader_now in [1_999_999_i64, 2_000_000] {
+        reports[0][..8].copy_from_slice(&leader_now.to_le_bytes());
+        for member in &mut members {
+            assert_eq!(member.agree(&reports).unwrap().now_us, leader_now);
+        }
+    }
 }
 
 #[test]

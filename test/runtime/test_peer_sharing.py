@@ -41,6 +41,7 @@ from tokenspeed.runtime.cache.peer import (  # noqa: E402
     peer_host_regions,
     peer_incarnation,
     peer_scheduler_config,
+    peer_semantic_id,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -56,6 +57,19 @@ from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 NUM_LCM_BLOCKS = 6
+
+
+def test_peer_identity_binds_the_generation_and_effective_state_encoding():
+    abi = {"state": "native-kda-v1", "index_rope": False}
+    base = peer_semantic_id("model", None, "7", abi)
+    assert len(base) == 32
+    assert peer_semantic_id("model", "main", "7", dict(reversed(abi.items()))) == base
+    assert peer_semantic_id("another-model", None, "7", abi) != base
+    assert peer_semantic_id("model", None, "8", abi) != base
+    assert peer_semantic_id("model", None, "7", {**abi, "index_rope": True}) != base
+    assert peer_semantic_id("model", "main", "default", abi) == b""
+    assert len(peer_semantic_id("model", "a" * 40, "default", abi)) == 32
+    assert peer_semantic_id("model", None, "7", None) == b""
 
 
 def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
@@ -270,6 +284,7 @@ def test_host_landings_take_a_share_of_the_host_blocks():
         answer_timeout_ms=50,
         min_fetch_tokens=256,
         num_host_blocks=100,
+        versioned_shards=False,
     )
     host = peer_scheduler_config(landing_tier="host", **common)
     assert host.landing_tier == ts.PeerLandingTier.Host
@@ -287,6 +302,7 @@ def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeou
         "incarnation": 3,
         "min_fetch_tokens": 256,
         "num_host_blocks": 100,
+        "versioned_shards": False,
     }
     # 50 ms: soft_pin = max(2.0, 2*0.05 + 2.0) = 2.1s, host_ready = max(5.0, 0.05 + 5.0) = 5.05s
     low = peer_scheduler_config(landing_tier="host", answer_timeout_ms=50, **base)

@@ -303,12 +303,18 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                     .checkpoint = {event.checkpoint.begin(), event.checkpoint.end()}});
                 break;
             }
+            case PeerEventKind::TargetRetired:
+                scheduler.RetirePeerTarget(FromView(event.lease));
+                break;
+            case PeerEventKind::FetchFrozen:
             case PeerEventKind::FetchDone:
                 execution_event.With(tokenspeed::cache::PeerFetchDone{.request_id = std::string(event.request_id),
                                                                       .num_tokens = event.num_tokens,
                                                                       .dispatch_us = event.dispatch_us,
                                                                       .writable_us = event.writable_us,
-                                                                      .terminal_us = event.terminal_us});
+                                                                      .terminal_us = event.terminal_us,
+                                                                      .lease = FromView(event.lease),
+                                                                      .frozen = event.kind == PeerEventKind::FetchFrozen});
                 break;
         }
     }
@@ -1290,6 +1296,17 @@ rust::Vec<PeerFetchView> reserve_peer_host(tokenspeed::Scheduler& scheduler, con
     rust::Vec<PeerFetchView> out;
     if (auto fetch = scheduler.ReservePeerHost(FromView(lease), tokens, retry)) out.push_back(FetchView(*fetch));
     return out;
+}
+
+bool pin_peer_offer(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us) {
+    auto checkpoint = LookupFromView(event);
+    return scheduler.PinPeerOffer(checkpoint, tokenspeed::cache::PeerPin{
+        .lease = checkpoint.lease, .num_tokens = event.num_tokens,
+        .pages = FromView(rust::Slice<const PeerPageView>(event.pages.data(), event.pages.size()))}, now_us);
+}
+
+bool close_peer_offer(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int64_t now_us) {
+    return scheduler.ClosePeerOffer(FromView(lease), now_us);
 }
 
 bool apply_peer_export(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us) {

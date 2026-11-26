@@ -39,6 +39,7 @@ use ts_control::{
         landing::Timeouts,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
+        registered::{Member, Replica},
         Peer, PeerFence, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
@@ -89,6 +90,10 @@ pub struct Settings {
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
     host: HostPool,
+    contract: Vec<u8>,
+    host_bounds: Vec<i64>,
+    semantic_id: Vec<u8>,
+    source_role: String,
 }
 
 fn micros(seconds: f64) -> i64 {
@@ -165,6 +170,10 @@ impl Settings {
             protocol: settings.getattr("protocol")?.extract()?,
             ib_device: settings.getattr("ib_device")?.extract()?,
             regions: geometry.getattr("regions")?.extract()?,
+            contract: geometry.getattr("transfer_contract")?.extract()?,
+            host_bounds: geometry.getattr("host_virtual_bounds")?.extract()?,
+            semantic_id: settings.getattr("semantic_id")?.extract()?,
+            source_role: settings.getattr("source_role")?.extract()?,
             device,
             host,
         }))
@@ -234,6 +243,58 @@ pub fn start(
         .map(|bytes| RankGeometry::decode(bytes))
         .collect::<Option<Vec<_>>>()
         .ok_or("a replica member's peer geometry does not decode")?;
+    // Agree capability and rank-independent contract before any conditional
+    // collective. All ranks participate even when one lacks a pinned identity.
+    let mut capability = Vec::new();
+    if !settings.contract.is_empty()
+        && settings.semantic_id.len() == 32
+        && matches!(
+            (settings.source_role.as_str(), geometries.len()),
+            ("prefill", 8) | ("decode", 1)
+        )
+    {
+        capability.extend_from_slice(&settings.semantic_id);
+        capability.extend_from_slice(&settings.contract);
+    }
+    let capabilities = mesh
+        .all_gather(replica, &capability)
+        .map_err(|e| e.to_string())?;
+    let registered =
+        if !capability.is_empty() && capabilities.iter().all(|other| other == &capability) {
+            let member = Member {
+                geometry: local.clone(),
+                bounds: settings.host_bounds,
+                regions: settings
+                    .regions
+                    .iter()
+                    .map(|&(a, n)| (a as u64, n as u64))
+                    .collect(),
+            };
+            let members = mesh
+                .all_gather(replica, &member.encode(replica.index()))
+                .map_err(|e| e.to_string())?;
+            let digest = settings
+                .semantic_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| "invalid peer semantic digest")?;
+            Some(Arc::new(
+                Replica::register(digest, &settings.contract, &members)
+                    .ok_or("invalid registered peer layout")?,
+            ))
+        } else {
+            None
+        };
+    if !settings.contract.is_empty()
+        && settings.source_role == "prefill"
+        && geometries.len() == 8
+        && registered.is_none()
+    {
+        return Err(
+            "TP8/KVP8 peer reader requires a pinned weight identity and a common registered layout"
+                .into(),
+        );
+    }
     if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
         push.serve(PushSource {
             executor,
@@ -271,7 +332,7 @@ pub fn start(
         weight_version = settings.peer.weight_version,
         "peer prefix sharing up"
     );
-    let listener = if replica.index() == 0 {
+    let mut listener = if replica.index() == 0 {
         Some(
             PeerListener::bind_node(
                 mesh,
@@ -285,7 +346,13 @@ pub fn start(
     } else {
         None
     };
-    let peer = Peer::start(
+    if let (Some(listener), Some(layout)) = (listener.as_mut(), registered.as_ref()) {
+        listener.set_registered_layout(layout.clone());
+    }
+    let channel = listener.as_ref().map(PeerListener::versioned_channel);
+    let name = settings.peer.name.clone();
+    let incarnation = settings.peer.incarnation;
+    let mut peer = Peer::start(
         settings.peer,
         progress,
         replica.index(),
@@ -298,6 +365,22 @@ pub fn start(
         },
     )
     .map_err(|error| error.to_string())?;
+    if let Some(layout) = registered {
+        let retirement_bound_ms = match std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS") {
+            Ok(s) => s
+                .parse::<std::num::NonZeroU32>()
+                .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
+                .get(),
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(e) => return Err(e.to_string()),
+        };
+        if replica.index() == 0 && retirement_bound_ms == 0 {
+            tracing::warn!(
+                "peer READ retirement bound unset; orphaned grants require explicit recovery"
+            );
+        }
+        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
+    }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {
         return Err("the host's peer started twice".to_owned());

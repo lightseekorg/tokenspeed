@@ -629,6 +629,7 @@ def _with_peer_sharing(cfg):
         landing_tier=ts.PeerLandingTier.Device,
         max_host_landing_blocks=0,
         host_ready_timeout_us=0,
+        versioned_shards=False,
     )
 
 

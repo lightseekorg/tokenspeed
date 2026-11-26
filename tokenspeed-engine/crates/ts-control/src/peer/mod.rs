@@ -32,14 +32,20 @@
 //! from the holder's member of the same index, once its plan's device work
 //! has run.
 
+mod attempt;
 mod autonomous;
+mod coordinated;
+mod offers;
 pub use autonomous::Peer;
 pub mod geometry;
 pub mod landing;
+pub mod layout;
 pub mod net;
 pub mod push;
 pub mod read;
+pub mod registered;
 pub mod servicer;
+pub mod v1;
 pub mod wire;
 
 use std::{
@@ -305,6 +311,8 @@ struct Layout {
 pub struct PeerListener {
     net: Arc<PeerNet>,
     received: mpsc::Receiver<Vec<Bytes>>,
+    registered: Option<Arc<registered::Replica>>,
+    inbox: Arc<Mutex<VecDeque<v1::Message>>>,
 }
 
 /// The public listener dispatches both holder requests and reader replies.
@@ -383,7 +391,12 @@ impl PeerListener {
     pub fn bind(host: &str, port: u16) -> Result<Self, PeerError> {
         let (incoming, received) = mpsc::channel();
         let net = Arc::new(PeerNet::start(host, port, incoming)?);
-        Ok(Self { net, received })
+        Ok(Self {
+            net,
+            received,
+            registered: None,
+            inbox: Arc::default(),
+        })
     }
 
     /// Bind one public control endpoint for the node. Its replica leaders
@@ -428,6 +441,25 @@ impl PeerListener {
     pub fn port(&self) -> u16 {
         self.net.port()
     }
+
+    /// Attach the v1 layout only after every replica member has registered its MR.
+    pub fn set_registered_layout(&mut self, layout: Arc<registered::Replica>) {
+        self.registered = Some(layout);
+    }
+
+    /// Leader's versioned traffic, already routed by DP.
+    pub fn versioned_channel(&self) -> VersionedChannel {
+        VersionedChannel {
+            net: self.net.clone(),
+            inbox: self.inbox.clone(),
+        }
+    }
+}
+
+/// Communication endpoints owned by a registered replica leader.
+pub struct VersionedChannel {
+    net: Arc<PeerNet>,
+    inbox: Arc<Mutex<VecDeque<v1::Message>>>,
 }
 
 #[derive(Default)]
@@ -450,6 +482,7 @@ impl DriverWake {
 /// The first member's endpoint and the threads around it.
 struct Endpoint {
     net: Arc<PeerNet>,
+    discovery: Arc<Mutex<Option<Arc<registered::Replica>>>>,
     holder: Arc<Mutex<Holder>>,
     replies: Arc<Mutex<VecDeque<(Instant, Reply)>>>,
     driver: Arc<DriverWake>,
@@ -858,6 +891,7 @@ impl Protocol {
         self.self_lookup_answers.clear();
         if let Some(endpoint) = &self.endpoint {
             endpoint.holder.lock().set_identity(self.identity.clone());
+            *endpoint.discovery.lock() = None;
         }
     }
 
@@ -1188,7 +1222,21 @@ fn start_endpoint(
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
 ) -> Result<Endpoint, PeerError> {
-    let PeerListener { net, received } = listener;
+    let PeerListener {
+        net,
+        received,
+        registered,
+        inbox,
+    } = listener;
+    let sharded = registered
+        .as_ref()
+        .is_some_and(|layout| layout.members.len() == 8);
+    let discovery = Arc::new(Mutex::new(registered));
+    let generation = v1::Generation {
+        name: settings.name.clone(),
+        incarnation: settings.incarnation,
+        epoch: 1,
+    };
     let holder = Arc::new(Mutex::new(Holder::new(
         Stamp {
             name: settings.name.clone(),
@@ -1213,6 +1261,7 @@ fn start_endpoint(
     // autonomous holder queues, and in coordinated mode answers
     // `Request::Layout` immediately without ever blocking on `scheduler.lock()`.
     let demux = {
+        let discovery = discovery.clone();
         let (requests, control) = (requests.clone(), control.clone());
         let (incoming, wake) = (replies.clone(), driver.clone());
         let (net, holder) = (Arc::downgrade(&net), holder.clone());
@@ -1220,6 +1269,46 @@ fn start_endpoint(
             .name("ts-peer-demux".to_owned())
             .spawn(move || {
                 for frames in received {
+                    if let [kind, payload] = frames.as_slice() {
+                        if kind.as_ref() == b"q" && payload.first() == Some(&0x10) {
+                            if let (Some(v1::Message::LayoutReq(id, to)), Some(layout)) = (
+                                v1::Message::decode(payload, false),
+                                discovery.lock().clone(),
+                            ) {
+                                let reply = v1::Message::LayoutReply(
+                                    id,
+                                    generation.clone(),
+                                    layout.semantic,
+                                    layout.digest,
+                                    layout.descriptor.clone(),
+                                );
+                                let Some(net) = net.upgrade() else { return };
+                                if let Err(error) = net.versioned(&to, &reply) {
+                                    tracing::warn!(to, %error, "peer layout reply not sent");
+                                }
+                            }
+                            continue;
+                        }
+                        if payload
+                            .first()
+                            .is_some_and(|tag| (0x11..=0x18).contains(tag))
+                        {
+                            if matches!(kind.as_ref(), b"q" | b"r") {
+                                if let Some(message) =
+                                    v1::Message::decode(payload, kind.as_ref() == b"r")
+                                {
+                                    let mut queue = inbox.lock();
+                                    if queue.len() < 128 {
+                                        queue.push_back(message);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if sharded {
+                            continue;
+                        }
+                    }
                     match Inbound::decode(&frames) {
                         Ok(Inbound::Request(request)) if autonomous => {
                             if matches!(
@@ -1295,6 +1384,7 @@ fn start_endpoint(
         })
         .transpose()?;
     Ok(Endpoint {
+        discovery,
         net,
         holder,
         replies,

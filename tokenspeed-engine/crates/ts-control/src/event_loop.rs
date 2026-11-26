@@ -3149,7 +3149,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let Some(peer) = self.peer.as_mut() else {
             return Ok(false);
         };
-        let round = peer.agree(reports)?;
+        let round = peer.agree_with_scheduler(reports, &mut self.scheduler)?;
         self.peer_now_us = round.now_us;
         if let Some(metrics) = &self.metrics {
             for (rid, result) in round.decisions {

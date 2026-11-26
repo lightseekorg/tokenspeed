@@ -2171,7 +2171,7 @@ def build_device_side(
 
     peer_geometry = None
     if peer_outbox is not None:
-        from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.cache.peer import build_peer_geometry, peer_semantic_id
         from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
         if host_cache is None:
@@ -2179,6 +2179,27 @@ def build_device_side(
                 "peer prefix sharing needs the Host tier (--enable-kvstore)"
             )
         arena = views.token_to_kv_pool.arena
+        transfer_contract = b""
+        mapping = server_args.mapping
+        topology = (
+            server_args.disaggregation_mode,
+            mapping.attn.tp_size,
+            mapping.attn.kvp_size,
+        )
+        if draft_model_config is None and topology in (
+            ("prefill", 8, 8),
+            ("decode", 1, 1),
+        ):
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+                build_cache_transfer_schema,
+            )
+            from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
+
+            transfer_contract = CacheTransferContract(
+                arena.plan,
+                tuple(arena.cache_group_specs),
+                build_cache_transfer_schema(arena.plan, model_config=model_config),
+            ).to_wire_bytes()
         peer_geometry = build_peer_geometry(
             scheduler_group_ids=tuple(
                 spec.group_id for spec in arena.runtime_contract.group_specs
@@ -2191,6 +2212,18 @@ def build_device_side(
             },
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
+            transfer_contract=transfer_contract,
+            semantic_id=(
+                peer_semantic_id(
+                    server_args.served_model_name,
+                    model_config.revision,
+                    server_args.weight_version,
+                    attention.peer_state_abi,
+                )
+                if transfer_contract
+                else b""
+            ),
+            host_virtual_bounds=host_cache.ownership.host_virtual_counts,
             host_region_planner=get_peer_host_region_planner(server_args.device),
         )
 

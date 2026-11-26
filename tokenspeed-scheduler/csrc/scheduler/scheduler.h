@@ -287,6 +287,10 @@ public:
     bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
     void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint);
     void ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us);
+    // v1 member tickets are independent of legacy messages and timers.
+    bool PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us);
+    bool ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us);
+    void RetirePeerTarget(const PeerLeaseId& lease) { peer_target_holds_.erase(lease); }
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
     }
@@ -1020,6 +1024,9 @@ private:
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
     std::unique_ptr<PeerExports> peer_exports_;
+    std::unique_ptr<PeerExports> peer_offer_tickets_;
+    std::unordered_map<std::string, PeerLeaseId> peer_target_attempts_;
+    std::unordered_map<PeerLeaseId, std::vector<CacheBlockRef>, PeerLeaseIdHash> peer_target_holds_;
     // A reader's landings into Host, with PeerLandingTier::kHost; null
     // otherwise. The fetches started since the last plan go out with it.
     std::unique_ptr<PeerHostLandings> peer_host_landings_;

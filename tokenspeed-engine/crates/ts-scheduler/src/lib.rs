@@ -714,6 +714,10 @@ mod ffi {
         LookupAnswered,
         /// Reader: a landing's outcome (`cache::PeerFetchDone`).
         FetchDone,
+        /// Business fallback while the independently retained target may still be written.
+        FetchFrozen,
+        /// All members certified retirement of a previously frozen target.
+        TargetRetired,
     }
 
     /// A peer event the replica agreed on. Fields other kinds do not use
@@ -970,6 +974,16 @@ mod ffi {
         fn apply_peer_export(
             scheduler: Pin<&mut Scheduler>,
             event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
+        fn pin_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
+        fn close_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
             now_us: i64,
         ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
@@ -1399,6 +1413,24 @@ impl Scheduler {
         now_us: i64,
     ) -> Result<bool, cxx::Exception> {
         ffi::apply_peer_export(self.pinned(), event, now_us)
+    }
+
+    /// Acquire one exact v1 member ticket, isolated from legacy timers.
+    pub fn pin_peer_offer(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::pin_peer_offer(self.pinned(), event, now_us)
+    }
+
+    /// Release this member's exact v1 ticket without demoting the source.
+    pub fn close_peer_offer(
+        &mut self,
+        lease: &PeerLeaseView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::close_peer_offer(self.pinned(), lease, now_us)
     }
 
     /// A reader's lookups since the last take, to send to their holders.
