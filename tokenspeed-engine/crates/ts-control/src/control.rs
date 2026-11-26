@@ -88,6 +88,7 @@ pub struct ControlConfig {
     /// The regions this engine can release (`nccl` needs an NCCL that can
     /// suspend its communicators).
     pub memory_regions: Vec<String>,
+    /// Preserve the L1 prefix index when device KV is backed up across a release.
     pub backup_device_kv: bool,
     /// With a cache shared beyond this engine -- the L3 storage tier or
     /// peer prefix sharing -- the checkpoint identity its pages are named

@@ -1408,7 +1408,7 @@ class HostBootstrap:
         self._gpu_id = gpu_id
         self._port_args = port_args
         self._memory_sampler: MemoryMetricSampler | None = None
-        self._hccl_saver: AscendMemorySaverAdapter | None = None
+        self._hccl_saver = None
         attn_tp_rank = mapping.attn.tp_rank
         dp_rank = mapping.attn.dp_rank
         global_rank = mapping.rank
