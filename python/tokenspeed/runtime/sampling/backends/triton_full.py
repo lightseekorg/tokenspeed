@@ -84,6 +84,10 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
     # verify() here adds penalties and logit processors with no tree path yet.
     supports_tree_verify = False
 
+    def reads_sparse_draft_q(self) -> bool:
+        # Its verify is a target-sampled exact match and reads no recorded q.
+        return False
+
     def _init_vocab_shard_buffers(self, config: SamplingBackendConfig) -> None:
         """No vocab-shard selection: sample() and verify() here apply penalties
         and logit bias to whole rows, so the logits processor must gather them."""

@@ -291,6 +291,22 @@ void SchedulerConfig::Validate() const {
             "Scheduler: max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) requires "
             "prefill_decode_interval (--prefill-decode-interval) > 0");
     }
+    if (prefill_interval_min_decoding < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_interval_min_decoding (--prefill-interval-min-decoding) must be >= 0");
+    }
+    if (prefill_interval_min_decoding != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_interval_min_decoding (--prefill-interval-min-decoding) applies to the fused role "
+            "only: a P node runs no decodes and a D node no local prefill");
+    }
+    // Below the threshold the cap is what bounds how long running decodes
+    // stall, so the threshold needs one (and the cap needs the interval).
+    if (prefill_interval_min_decoding != 0 && max_consecutive_prefill_rounds == 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_interval_min_decoding (--prefill-interval-min-decoding) requires "
+            "max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) > 0");
+    }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
             throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");

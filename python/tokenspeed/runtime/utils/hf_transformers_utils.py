@@ -225,8 +225,13 @@ def get_hf_text_config(config: PretrainedConfig):
     if text_config is None:
         return config
 
-    if hasattr(config, "quantization_config") and not hasattr(
-        text_config, "quantization_config"
+    if (
+        hasattr(config, "quantization_config")
+        and config.quantization_config is not None
+        and (
+            not hasattr(text_config, "quantization_config")
+            or text_config.quantization_config is None
+        )
     ):
         quantization_config = config.quantization_config
         for key in ["ignore", "ignored_layers", "modules_to_not_convert"]:
@@ -539,7 +544,12 @@ def get_config(
 
     # quantization config will copy to text_config
     if hasattr(text_config, "quantization_config"):
-        if "modules_to_not_convert" in text_config.quantization_config:
+        # An explicit null describes an unquantized checkpoint, just like
+        # omitted metadata. Some registered config classes declare it eagerly.
+        if (
+            text_config.quantization_config is not None
+            and "modules_to_not_convert" in text_config.quantization_config
+        ):
             text_config.quantization_config["ignored_layers"] = (
                 text_config.quantization_config["modules_to_not_convert"]
             )

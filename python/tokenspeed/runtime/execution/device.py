@@ -138,12 +138,14 @@ import contextlib
 import enum
 import json
 import os
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -153,6 +155,7 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
 from tokenspeed.runtime.cache.transfer.observations import (
     cache_observation_capacity_from_env,
 )
@@ -418,6 +421,10 @@ class DeviceHandle:
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
+        # State commit fences (``ExecutionPlan.state_commit_fence``): each
+        # one's ACK waits on an event behind its plan's retraction commits.
+        # Its own queue, as the fence needs no Host cache.
+        self._state_commits = CompletionQueue()
         self._weight_memory = weight_memory
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
@@ -430,9 +437,11 @@ class DeviceHandle:
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
-        # with the write-backs and restores with the load-backs; all four
-        # ACK kinds ride the cache poll.
+        # with the write-backs and restores with the load-backs; their ACKs
+        # ride the cache poll.
         self._l2 = host_cache_executor
+        self._replay_retirements: deque[tuple[Any, int, torch.Tensor | None]] = deque()
+        self._completed_replay_retirement = 0
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -460,19 +469,42 @@ class DeviceHandle:
     # Per-round work
     # ------------------------------------------------------------------
 
+    def retire_replay(self, retirement_id: int, slots: Sequence[int]) -> None:
+        """Materialize old slots after settling drafting, ahead of their reuse."""
+        event = None
+        staged_slots = None
+        if slots:
+            executor = self._executor
+            # Keep the pinned upload alive until the execution stream uses it.
+            staged_slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True)
+            with executor.device_module.stream(executor.execution_stream):
+                device_slots = staged_slots.to(executor.device, non_blocking=True)
+                executor.attn_backend.materialize_recurrent_state(device_slots)
+                event = executor.device_module.Event()
+                event.record(executor.execution_stream)
+            executor.default_stream.wait_event(event)
+        self._replay_retirements.append((event, retirement_id, staged_slots))
+
     def execute(
         self,
         execution_plan,
         planned: "PlannedForward | None",
         *,
         cache_ops: Sequence,
+        retirement_slots: Sequence[int] = (),
+        retirement_id: int | None = None,
     ) -> ModelExecutionResult | None:
         """Execute one scheduler plan; never waits for the device on the
         per-round path.
 
         The whole plan, explicitly ordered streams, in an order
         that IS the correctness argument for same-round page reuse: the
-        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: the
+        retraction victims' state completed in their live pages first
+        (``state_folds``: the pages a retraction publishes and, unless its
+        image is refused, images; with peers, ``state_commit_fence`` is
+        acknowledged behind the folds, so a peer pins those pages only then),
+        then the Host-bound stores
+        (``WriteBackOp`` and ``SnapshotOp``: the
         stream-ordered ones -- a retraction image's two legs (the L2
         write-back of the victim's hash-complete pages, the snapshot store of
         its tail pages and slot state) and, under ``--kvstore-write-policy
@@ -523,12 +555,17 @@ class DeviceHandle:
 
             cache_ops: The plan's Device-copy operations, the ones the control
                 plane counts; its storage operations go to the L3 executor.
+            retirement_slots: Slots of old owners to materialize before this
+                plan touches their pages.
+            retirement_id: Host fence covering the retirements, if issued.
 
         Returns:
             The launched forward's result, its host copies landing behind its
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if retirement_slots and retirement_id is None:
+            raise ValueError("Replay retirement slots require a host fence")
         if planned is not None and self._weight_memory is not None:
             self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
@@ -537,6 +574,8 @@ class DeviceHandle:
                 raise TypeError(
                     f"unsupported Device cache op: {type(operation).__name__}"
                 )
+        if cache_ops and self._l2 is None:
+            raise RuntimeError("Device cache operations require a Host cache executor")
 
         executor = self._executor
         copies = {
@@ -551,6 +590,14 @@ class DeviceHandle:
             for group_id, page_ids in execution_plan.pages_to_zero.items()
             if len(page_ids)
         }
+        # A retraction victim's live blocks in groups that defer their decode
+        # state, as (request slot, page id), whether or not its image was taken.
+        folds = {
+            group_id: torch.from_numpy(pairs.copy())
+            for group_id, pairs in execution_plan.state_folds_arrays().items()
+            if len(pairs)
+        }
+        fence = execution_plan.state_commit_fence
         peer = self._kv_transfer
         remote_decode = execution_plan.remote_decode
         remote_prefill = execution_plan.remote_prefill
@@ -559,7 +606,10 @@ class DeviceHandle:
             cache_ops
             or copies
             or pages
+            or folds
+            or fence is not None
             or peer_fetches
+            or retirement_slots
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -567,7 +617,25 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
+        if retirement_id is not None:
+            self.retire_replay(retirement_id, retirement_slots)
         l2 = self._l2
+        if folds:
+            # The victims' last forwards ran on the execution stream, and the
+            # stores, the copies, the zeroing and this plan's forward all
+            # order behind it, so each of them reads the completed pages.
+            executor.attn_backend.fold_deferred_state(
+                folds, stream=executor.execution_stream
+            )
+        if fence is not None:
+            # A peer reads from outside the streams: the scheduler lets it pin
+            # the endpoints these retractions published once every replica
+            # member acknowledges the commit enqueued above.
+            committed = executor.device_module.Event()
+            committed.record(executor.execution_stream)
+            done = Cache.StateCommitDoneEvent()
+            done.op_id = fence
+            self._state_commits.push(committed, done)
         if l2 is not None and cache_ops:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
@@ -735,11 +803,13 @@ class DeviceHandle:
             )
 
     def poll_cache_results(self) -> list:
-        """Collect completed Host cache ops (both tiers); never blocks.
+        """Collect completed cache ops; never blocks.
 
-        Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
-        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
-        for the control plane to replica-intersect and advance.
+        Yields the scheduler's ACK kinds -- the Host cache's (both tiers)
+        ``WriteBackDoneEvent``, ``LoadBackDoneEvent``, ``SnapshotDoneEvent``,
+        ``RestoreDoneEvent``, and the state commit fences'
+        ``StateCommitDoneEvent`` -- for the control plane to
+        replica-intersect and advance.
 
         The control thread calls it, deliberately: completion is CUDA event
         queries plus queue drains (serialized against the forward thread's
@@ -750,13 +820,20 @@ class DeviceHandle:
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
         """
-        l2 = self._l2
-        if l2 is None:
-            raise RuntimeError(
-                "cache results polled without --enable-kvstore or a retraction "
-                "snapshot pool"
-            )
-        return l2.poll_results()
+        results = self._state_commits.pop_ready()
+        if self._l2 is not None:
+            results.extend(self._l2.poll_results())
+        return results
+
+    def poll_replay_retirement(self) -> int:
+        """Return the latest completed host fence without waiting for CUDA."""
+        while self._replay_retirements:
+            event, retirement_id, _staged_slots = self._replay_retirements[0]
+            if event is not None and not event.query():
+                break
+            self._replay_retirements.popleft()
+            self._completed_replay_retirement = retirement_id
+        return self._completed_replay_retirement
 
     def poll_cache_observations(self) -> tuple[list[dict], int]:
         """Drain completed CPU diagnostics only; no event query or device work."""
@@ -1462,11 +1539,19 @@ def pool_views(attention: AttentionBuild) -> PoolViews:
     )
 
     pool = attention.token_to_kv_pool
+    cache_groups = pool_to_cache_groups(pool)
+    # The State groups whose decode state the backend commits to the live
+    # block only at a request's end or a retraction: the scheduler lists a
+    # retraction victim's live blocks there for the fold, and withholds the
+    # endpoints it publishes from peers until the data plane acknowledges it.
+    deferred = attention.attn_backend.deferred_decode_state_groups()
+    for group in cache_groups:
+        group.deferred_decode_state = group.group_id in deferred
     return PoolViews(
         token_to_kv_pool=pool,
         draft_token_to_kv_pool=attention.draft_token_to_kv_pool,
         cache_geometry=scheduler_cache_geometry_from_pool(pool),
-        cache_groups=pool_to_cache_groups(pool),
+        cache_groups=cache_groups,
     )
 
 

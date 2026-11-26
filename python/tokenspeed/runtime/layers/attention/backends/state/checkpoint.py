@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LIVE_SLOT,
     STATE_TABLE_SLOTS,
 )
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 __all__ = [
     "STATE_CHECKPOINT_SLOT",
@@ -78,13 +79,16 @@ class InForwardStateCheckpoints:
     which the scheduler publishes as a prefix-cache checkpoint.
 
     Capacity-shaped (graph) metadata keeps one fixed slot per request slot
-    in the device tensors: slots past the live checkpoints hold block ``-1``,
-    which the masked state writers skip, and an in-range token index.
+    in ``token_index`` and ``blocks_by_group``: slots past the live checkpoints
+    hold block ``-1``, which the masked state writers skip, and an in-range
+    token index. Both host and device row/offset mirrors remain live-sized.
 
     Args:
         rows: Host int64 batch rows that write a checkpoint.
         offsets: Host int64 tokens of each such row's chunk before its
             checkpoint (a positive multiple of the prefix page).
+        device_rows: Device int64 mirror of ``rows`` for device-side indexing.
+        device_offsets: Device int64 copy of ``offsets``.
         token_index: Device int64 packed-input index of the first token after
             each checkpoint (the row's first token plus its offset).
         blocks_by_group: Per State group, the device int32 receiving block of
@@ -93,6 +97,8 @@ class InForwardStateCheckpoints:
 
     rows: torch.Tensor
     offsets: torch.Tensor
+    device_rows: torch.Tensor
+    device_offsets: torch.Tensor
     token_index: torch.Tensor
     blocks_by_group: dict[str, torch.Tensor]
 
@@ -113,7 +119,7 @@ def in_forward_state_checkpoints(
         extend_seq_lens_cpu: Host ``[>= num_extends]`` new tokens per extend
             row, which pack the input in row order.
         num_extends: Leading extend rows.
-        block_tables: The forward's raw per-group block tables.
+        block_tables: The forward's raw per-group block tables on one device.
         group_ids: The State groups the caller writes.
 
     Returns:
@@ -152,23 +158,27 @@ def in_forward_state_checkpoints(
         )
     starts = torch.cumsum(seq_lens, 0) - seq_lens
     blocks_by_group: dict[str, torch.Tensor] = {}
-    device = None
+    device = block_tables[group_ids[0]].device
+    # The runner's attention_state region owns these retained views. One fresh
+    # pinned staging allocation keeps overlapping forwards' uploads independent.
+    device_rows, device_offsets, token_index = upload_packed(
+        (rows, offsets, starts[rows] + offsets), device
+    )
     for group_id in group_ids:
         table = block_tables[group_id]
         if table.shape[1] <= STATE_CHECKPOINT_SLOT:
             raise RuntimeError(
                 f"state paging: {group_id!r} rows lack the in-forward checkpoint block"
             )
-        device = table.device
         blocks_by_group[group_id] = (
-            table[rows.to(table.device), STATE_CHECKPOINT_SLOT]
-            .to(torch.int32)
-            .contiguous()
+            table[device_rows, STATE_CHECKPOINT_SLOT].to(torch.int32).contiguous()
         )
     return InForwardStateCheckpoints(
         rows=rows,
         offsets=offsets,
-        token_index=(starts[rows] + offsets).to(device),
+        device_rows=device_rows,
+        device_offsets=device_offsets,
+        token_index=token_index,
         blocks_by_group=blocks_by_group,
     )
 

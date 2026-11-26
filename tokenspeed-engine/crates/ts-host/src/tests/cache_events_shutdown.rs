@@ -185,9 +185,10 @@ class CpuDevice:
             time.sleep(0.02)
         return rows
     def complete(self, rows):
-        return ([3] * rows, [1] * rows, None, None, None, None, None, None, None)
+        return ([3] * rows, [1] * rows, None, None, None, None, None, None, None, None)
     def note_committed(self, result): pass
     def release(self, rids): pass
+    def replay_retirement_enabled(self): return False
     def poll_cache_events(self): return []
     def poll_cache_observations(self): return ([], 0)
 

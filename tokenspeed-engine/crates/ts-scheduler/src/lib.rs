@@ -244,6 +244,9 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
+        /// The commit of the deferred decode state a plan's retractions
+        /// published (`ExecutionPlan::state_commit_fence`).
+        StateCommit,
     }
 
     /// The kind of a plan's storage operation.
@@ -304,6 +307,9 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
+        /// The runtime committed a plan's retracted decode state
+        /// (`cache::StateCommitDone`).
+        StateCommitDone,
     }
 
     /// A cache op's acknowledgment, fed back to the scheduler.
@@ -836,6 +842,7 @@ mod ffi {
         fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
+        fn defers_decode_state(scheduler: &Scheduler) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_current_pending(scheduler: &Scheduler) -> bool;
         fn storage_progress_pending(scheduler: &Scheduler) -> bool;
@@ -1210,6 +1217,14 @@ impl Scheduler {
     /// without the forward or PD completion fence.
     pub fn can_abort_before_admission(&self, request_id: &str) -> bool {
         ffi::can_abort_before_admission(self.get(), request_id)
+    }
+
+    /// Whether a cache group defers its decode state to a request's end
+    /// (`CacheGroupConfig::deferred_decode_state`): a finish only the host
+    /// saw must then end with `ForwardEventKind::Abort`, which publishes
+    /// nothing.
+    pub fn defers_decode_state(&self) -> bool {
+        ffi::defers_decode_state(self.get())
     }
 
     /// Whether storage operations are in flight.

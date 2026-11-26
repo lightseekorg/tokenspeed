@@ -1,5 +1,13 @@
 # KDA kernels
 
+Each physical checkpoint holds only a dense recurrent base. Each resident
+request slot holds its FP32 correction U, normalized K and multiplicative decay
+records plus an INT32 accepted length: the number of records accepted since the
+dense base of the request's page. The logical endpoint is the base followed by
+`S = S * decay + outer(U, K)` in record order. The base follows
+`--mamba-ssm-dtype` (FP32 or BF16). Accumulation and history remain FP32.
+Materialization casts the result to the dense base dtype.
+
 ## CuTe prefill (`cutedsl_kda`)
 
 The backend selects FlashInfer's ordinary or persistent CuTe KDA scan, reading
@@ -19,150 +27,140 @@ pool; only compiled code is cached. The FlashInfer adapter owns the pinned
 native launch ABI, avoiding the public wrapper's in-place state updates and
 persistent GPU scratch.
 
-## RecoverSSM verify (`kda_recoverssm_verify`)
+## Verify and publication
 
-Speculative verify reads each request's checkpoint, runs the candidate window
-through the KDA recurrence, and writes the outputs plus the recovery records
-(FP32 corrections, raw key and gate, position stamps) that commit later
-consumes. The checkpoint itself is never written. Two kernels are registered:
+`KdaRetainedRecords` supplies original pre-convolution QKV, the retained history,
+packed request boundaries, and generation/position stamps. For each batch row,
+`live_state_indices` selects the private physical page and `record_slots` selects
+the record storage and accepted length. Record slot zero is valid. Shared source
+pages hold dense checkpoints; the slot of a request starting from one holds no
+accepted records. Each live destination may alias only its own source.
 
-| Kernel | Platforms | Admits |
-|---|---|---|
-| `cute_dsl_kda_recoverssm_verify` | NVIDIA SM100 to SM103 | BF16 activations and key/gate records, FP32 state and corrections, key dim a multiple of 32 up to 128, value dim a multiple of 32, windows up to 16 |
-| `vllm_triton_kda_recoverssm_verify` | NVIDIA | the reference; FP16 or BF16, any state dtype |
+When source equals live and the accepted prefix plus candidate window fits,
+verify reads the base plus accepted history without changing either. A source
+copy or capacity overflow materializes the logical endpoint into the live base,
+then clears the slot's accepted length in a separate ordered launch. Verify
+writes candidate U/K/decay into the request slot after that length. Rejected
+candidate suffixes need no clearing.
 
-The split verify producer selects between them through the registry, so
-shapes the CuTe DSL kernel does not admit fall back to Triton; layouts it
-cannot address (token rows or state not 16-byte aligned, state tiles that are
-not dense, strided indices or record channels, a strided one-element `A_log`)
-and positive lower bounds, which would grow rather than decay, also run the
-Triton kernel. Both share input validation and write
-the same key/gate records and stamps.
+Commit validates candidate stamps, updates convolution from original QKV, then
+publishes only the slot's accepted retained length. Its UINT64 `[layers, 14]`
+descriptors contain QKV/conv/length pointers, the page count, five strides
+(the length stride steps request slots), then the v-major recurrent-state
+pointer and its page, head, value and key strides; they carry no raw key/gate
+pointers. `record_slots` selects each request's length. A request whose slot
+is set in `request_stopped` ended in this forward: the convolution launch
+also folds its records, through this round's acceptance, into its live page
+(each program of a row takes some heads), and the length launch clears its
+length instead of advancing it. Other commits read no record and write no
+dense state. Stamp-ring capacity is independent of retained-history
+capacity. Padding rows (a page at or below 0, or one past the checkpoint
+pool) leave all pages and lengths untouched.
 
-The Triton kernel replays the recurrence token by token, one warp per value
-slice. The CuTe DSL kernel solves the window in chunked form instead, one CTA
-per (value tile, request, head):
+## NVIDIA verification
 
-1. Bulk copies bring the window's q, k, gate, and v rows and the CTA's
-   `[rows, K]` checkpoint tile into shared memory once.
-2. One thread per key forms the cumulative gate `G_t` and the decayed keys and
-   queries `k_t e^G_t`, `q_t e^G_t`.
-3. The checkpoint tile times those columns gives every token's view of the
-   initial state, on CUDA cores in FP32.
-4. One thread per value channel solves the window's lower-triangular system
-   for the corrections and outputs.
+The registry keeps the same split, one-token and multi-token producer choices:
 
-The pairwise decayed key products of the triangular system come from the same
-product as extra tile rows `k_j e^-G_j` and `q_j e^-G_j` when the gate is
-bounded and `spec_query_len * |lower_bound| <= 48`, so `e^-G` stays a normal
-FP32 number. Otherwise, they are summed pairwise with `e^(G_t - G_j)`, where
-`G_t - G_j` adds up the gates in between rather than subtracting prefix sums,
-so an early gate that dwarfs later ones cannot swallow them; the prefix sums
-used for `e^G` are compensated. The exp, sigmoid, and normalization
-approximations match the Triton kernel's. The products use unnormalized keys
-and queries, which assumes activations far below the FP32 range (model
-activations are), and `e^G` is formed before the checkpoint product, so a
-checkpoint decayed past `e^-87` contributes exactly zero instead of a value
-below `|state| * 1.2e-38`.
+| Kernel | Selection |
+| --- | --- |
+| `vllm_triton_kda_recoverssm_verify` | FP16/BF16 activations and generic head geometry |
+| `cute_dsl_kda_recoverssm_verify` | SM100/103, BF16 activations, key dimensions aligned to 32 and at most 128, value dimensions aligned to 32, windows up to 16 |
+| `cute_dsl_kda_fused_paged_verify_step` | SM100/103, BF16, 128-wide heads/gate rank, one-token windows |
+| `cute_dsl_kda_fused_paged_verify_window` | The same fused producers for windows 2–16 and batches up to 16 |
 
-The value tile is 32, 64, or 128 rows, chosen from the number of
-(request, head) pairs to balance occupancy against repeating the token-side
-work in every tile; windows above 8 tokens use 32 rows, and the tile halves
-until it divides the value dim.
+`kda_fused_paged_verify_fuses_producers` resolves the fixed window and padded
+batch geometry before the caller prepares projections. Split verification uses
+the shared packed-boundary convolution producer and registry-selected core.
+All choices store the same persistent FP32 normalized K/decay/U representation.
+The CuTe fused kernels require unit-stride physical page indices, query
+boundaries and correction channels. Record slot indices may be strided. Other strides use split producers and the stride-aware retained
+verify core.
 
-## Fused one-token verify (`kda_fused_paged_verify`)
+The one-token fused kernel projects the accepted history onto the current
+query and key. For 1–16 accepted records, it scales the query and key by
+the cumulative decay before multiplying them by the dense base. It adds
+each retained U vector weighted by its key's two dot products. Its CTA has
+eight warps, so two share an SM: four compute the convolution; the other
+four compute the gate, from weights held as packed BF16 pairs, and then
+apply the accepted decay factors to the retained keys. The checkpoint and
+packed history have independent bulk-copy completion barriers. Strided
+history uses its tensor strides. Once the gate and convolution are ready,
+four warps project the checkpoint while the other four project the retained
+records. Each history warp computes both products for up to four keys. It
+combines the even and odd U contributions in FP32. Empty histories use only
+the checkpoint products.
+Longer histories replay in record order into a private FP32 state tile.
+Convolution and accepted-length publication use the common retained commit
+ABI. A request that ended in the forward has its records folded into its live
+page by the commit; if a layer rejects its commit (stale stamps, an interval
+past the capacity), the commit raises the row's `request_ends` entry to
+`REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
+page that lacks accepted tokens.
 
-Decode without speculation verifies one-token windows.
-`cute_dsl_kda_fused_paged_verify_step` (NVIDIA SM100 to SM103) runs that
-verify together with its two producers, the gate projection `f_a @ f_b.T` and
-the convolution, in one launch; `cute_dsl_kda_fused_paged_verify_window` does
-the same for windows of 2 to 16 tokens (below). Results
-match the split producers followed by `kda_recoverssm_verify`: the same
-outputs, correction and key/gate records, stamps, and retained
-pre-convolution rows, so commit is unchanged. The gate projection sums in its
-own order, so a raw gate may differ from cuBLAS's by one BF16 step.
+## Retained preparation
 
-`kda_fused_paged_verify_fuses_producers` tells the caller whether the selected
-kernel runs the producers itself for a window length; the kernels declare
-`spec_query_len_max` 1 and 16, so callers that state no window length never
-select them; the window kernel also declares `batch_size_max` 16, past which
-the split producers' GEMM outruns its CUDA-core gate projection. They take
-BF16 activations. Inputs it cannot address (rows or state not 16-byte
-aligned, head widths or gate ranks other than 128, positive lower bounds) run
-the split producers inside the same call.
+Verify reads each request's live page as its dense base and never writes a page
+or an accepted length. Before a verify forward, the caller runs
+`resolve_kda_batched_retained_prepare` once for every layer: one launch folds,
+and a second, ordered launch clears the folded slots' lengths. A request folds
+when its live page differs from its source page, or when its accepted count L
+plus the larger of its window T and the verify's window (`draft_token_num`)
+exceeds the history capacity: its live page receives the source state with
+records [0, L) applied. The verify kernels read at most capacity minus the
+verify window records, so a request with a shorter window folds as soon as a
+full one would. Each layer decides on its own count. Padding rows keep their
+pages and lengths; an out-of-range L or T fails a device assertion. The launches
+take the commit's per-layer descriptors, the layer-to-group map and
+`[groups, requests]` source and live page tables. The fold splits a request's
+heads across programs only when few requests and layers would leave SMs idle.
+Both vendors share these Triton kernels. Running the prepare twice in one round
+would copy the unchanged source over the fold.
 
-One CTA of four warps covers one (request, head). It bulk-copies the head's
-checkpoint into shared memory while thread t convolves channel t of q, k and
-v. For the gate projection and the checkpoint product, warp w takes 32 keys or
-32 checkpoint rows and lane l elements [4l, 4l + 4) of each, so every
-warp-wide load reads one contiguous row, and a transposing butterfly leaves
-each row's total in the lane of the matching thread. Weights load (or are
-prefetched into L2) before the programmatic dependency wait, and so do the
-checkpoint copy and the convolution history, which the forward never writes
-(acceptance commits them after it); the projection's rows load after it.
+The core CuTe window solver keeps main's chunked equations, compensated gate
+prefix sums, value tiles and clustered producer sharing. Bounded windows with
+`window * abs(lower_bound) <= 48` form pairwise products through factored rows;
+other windows sum intermediate gates directly so a large early gate cannot
+erase later decay. Runtime counts, arena strides and stamp-ring capacity remain
+runtime values in compiled launch interfaces. The window and split cores load
+the live page's base tile with one bulk copy and prefetch the accepted records
+into L2. The fused window kernel instead bulk-copies each packed record's
+key, decay and its tile's U into shared memory on 64-row value tiles, when the
+grid holds at most one CTA per SM and the CTA's footprint with the copy region
+fits the device's opt-in shared memory per block. Larger grids keep the
+prefetch to preserve occupancy, since the region can cost a 64-row tile a CTA
+per SM; so do other tile sizes and records that are not packed. Like the
+one-token kernel, both cores project the history instead of replaying it:
+the base rows are scaled by the records' cumulative decay, each
+record's key, weighted by the later decays, becomes a row that a separate pass
+multiplies by the window's decayed keys and queries while the base copy lands,
+and each value channel adds its records' U weighted by those rows' products.
+Requests without records skip all of it.
 
-### Multi-token windows
+## Output norm and prefill
 
-The window kernel keeps the RecoverSSM verify's grid, value tiles and window
-math, and makes the C = 128 / VT tiles of a head one cluster that shares the
-producers. CTA r convolves q and k channels [r VT, (r + 1) VT) and its own v
-tile, projects the gate for keys [r VT, (r + 1) VT) (the one-token kernel's
-lane mapping, two tokens per pass), and stores the BF16 rows, rounded as the
-split producers store them, into the token rows of every CTA of the cluster
-over distributed shared memory. The rows travel as asynchronous BF16-pair
-stores that the receiving CTA's mbarrier counts, so a CTA waits only until
-its own rows have landed; the window math then runs as in
-`kda_recoverssm_verify`. Before the programmatic dependency wait the CTA
-bulk-copies its checkpoint tile and f_b rows (into tile rows that phase 1
-fills only after the gate projection) into shared memory and issues the
-loads of the convolution taps and history and the gate and norm parameters,
-first using any of them after the wait; every read of the projection rows
-is issued right after it. A grid of one to two CTAs per SM claims enough
-shared memory per CTA that two at most share an SM; left alone, the
-scheduler packs it onto fewer SMs.
+`kda_fused_paged_verify` accepts explicit `output_norm: KdaOutputNorm | None`.
+The CuTe fused producers apply gated RMSNorm in their epilogue using the BF16
+core output and return `[tokens, heads * head_dim]`; other retained kernels
+apply the same norm after attention. A missing norm returns ordinary attention
+output. The norm's FP32 math and rounding order follow `rmsnorm_gated_sigmoid`.
 
-### Output norm
+Prefill keeps the capacity-aware scan, native state layout, prepared CuTe plans,
+and cuDNN graph paths. A retained source is gathered and reconstructed in FP32
+before the scan, and a separate ordered launch then clears the rows' slot
+lengths; it skips padding rows (a live page at or below 0, or at or past the
+pool's `page_count`) as the gather does. Final/checkpoint dense stores use the
+selected base dtype. Before a retraction stores its image or anything reads
+the endpoint it published, `kda_materialize_retained_pages` folds each
+victim's records into the live page the scheduler lists and then clears the
+slots' lengths.
 
-A KDA layer feeds its o-projection the gated RMSNorm of the attention output,
-`rmsnorm(out) * w * sigmoid(gate)` per head. `try_kda_fused_paged_verify`
-takes it as `output_norm` (`KdaOutputNorm`: the gate view, the weight, eps)
-and then returns the normed `[tokens, heads * head_dim]` rows. The one-token
-step applies it before its store: the thread of each channel holds the BF16
-output, a warp sum and four shared-memory partials give the head's sum of
-squares, and the rest is the norm kernel's math in its order. The window
-kernel does the same per token, with each warp storing its partial to every
-CTA of the cluster (counted on an mbarrier like the rows), so the four
-partials add up in the same order. Only the order
-of that sum differs from `rmsnorm_gated_sigmoid` on the stored output, so an
-element may move by one BF16 step. Every other verify kernel, and the
-backend's non-verify paths, run `rmsnorm_gated_sigmoid` after the attention
-(`apply_kda_output_norm`).
+Retained numerical tests cover accepted-prefix rounds, boundary materialization,
+the fold at a request's end, private/shared pages, stale stamps, graph
+metadata refresh, strided arenas, FP32/BF16 base, norm fusion and scalar
+compile reuse. AMD uses the same retained
+contract through its registered Gluon kernels and the shared prepare.
 
-## Batched commit (`kda_replay_commit`)
-
-After sampling, one launch per state kind commits every layer's accepted
-tokens: the recurrent states fold the accepted corrections and key/gate
-records into the checkpoint, and the convolution histories take the accepted
-window. Two kernels are registered for the recurrent half on NVIDIA:
-
-| Kernel | Platforms | Admits |
-|---|---|---|
-| `cute_dsl_kda_batched_replay_commit` | NVIDIA SM100 to SM103 | BF16 records, FP32 state, 128-wide heads, windows up to 15 tokens (`spec_query_len_max`), a bounded gate |
-| `triton_nvidia_kda_batched_replay_commit` | NVIDIA | FP16 or BF16, FP32 or BF16 state, any window |
-
-The CuTe DSL kernel reproduces the Triton commit's CUDA-core path bit for bit:
-`S <- fma(u_t, kn_t, S * d_t)` per token, with the normalized key `kn_t` and
-decay `d_t` formed with the same instructions, the key's sum of squares in the
-Triton kernel's one-warp lane order. Windows of 16 to 32 tokens, where the
-Triton commit switches to a TF32x3 Tensor Core product, stay on Triton, and an
-unbounded gate runs the Triton commit inside the same call. Both share input
-validation and the convolution commit.
-
-Where the Triton commit splits a head over 8 or 32 one-warp programs that each
-rebuild the token operands, the CuTe DSL kernel runs 2 CTAs of 256 threads
-per (layer, head, request), one per half of the value rows. Each thread issues
-the loads of its 8 rows x 4 keys of the source state first, warp w forms
-tokens w and w + 8 into shared memory, and after one barrier every thread
-folds its values and stores them, so each state byte is read once and written
-once (GB300, 69 layers x 12 heads, 8-token windows: 28 us per commit at 1
-request and 179 us at 8, against 50 us and 228 us).
+The `kda_fused_paged_verify` benchmark accepts `history_length`. It defaults to
+zero and can cover the accepted prefix up to `max(16, draft_token_num) -
+draft_token_num`, so the candidate window fits beside that prefix. Each
+measurement uses the same accepted records.

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -495,6 +496,49 @@ TEST_P(PeerSchedulerTest, AHolderPinsLoadedDevicePagesOnlyAfterTheirLoadAcknowle
     }
     for (const PeerLookupRequest& lookup : lookups) {
         EXPECT_TRUE(servicer_.Pin(lookup.lease).held);
+    }
+}
+
+// A retraction publishes a decoding victim's frontier. When the State group
+// defers its decode state, the runtime commits it into the published block
+// only while it runs that plan, so no PIN exports the block until the plan's
+// commit fence is acknowledged; without deferral the endpoint is readable at
+// once.
+TEST(PeerStateCommitTest, ARetractedDecodeEndpointIsPinnedOnlyAfterItsCommit) {
+    for (const bool deferred : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "deferred=" << deferred);
+        auto cfg = PeerConfigFor("holder", /*hybrid=*/true);
+        cfg.cache_groups.back().deferred_decode_state = deferred;
+        cfg.debug_force_retraction_interval = 1;
+        Scheduler holder{std::move(cfg)};
+        Scheduler reader{PeerConfigFor("reader", /*hybrid=*/true)};
+        HolderServicer servicer{holder};
+
+        holder.SubmitRequests({RequestSpec{.request_id = "seed", .tokens = {11, 12, 13}, .max_new_tokens = 8}});
+        ASSERT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+        Send(holder, forward::ExtendResult{.request_id = "seed", .tokens = {14}});
+        // The first decode consumes 14; the retraction then publishes the
+        // state after four tokens.
+        ASSERT_NE(FindForwardBatch(Plan(holder)), nullptr);
+        Send(holder, forward::ExtendResult{.request_id = "seed", .tokens = {15}});
+        std::optional<ExecutionPlan> retraction;
+        for (int round = 0; round < 3 && holder.RetractedSize() == 0; ++round) {
+            retraction = Plan(holder);
+        }
+        ASSERT_EQ(holder.RetractedSize(), 1u);
+        EXPECT_EQ(retraction->state_commit_fence.has_value(), deferred);
+
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "hit", .peer_holder = "holder", .tokens = {11, 12, 13, 14, 80, 81}}});
+        Plan(reader);
+        const auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        ASSERT_EQ(servicer.Lookup(lookups.front()).num_tokens, 4);
+        EXPECT_EQ(servicer.Pin(lookups.front().lease).held, !deferred);
+        if (deferred) {
+            Send(holder, cache::StateCommitDone{.op_id = *retraction->state_commit_fence});
+            EXPECT_TRUE(servicer.Pin(lookups.front().lease).held);
+        }
     }
 }
 

@@ -581,7 +581,7 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle) -> HostDataPlane:
+def _data_plane(handle: DeviceHandle, *, defer_recurrent_state=False) -> HostDataPlane:
     """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
@@ -602,6 +602,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         epd_publisher=None,
         replica_memory_transitions=False,
         starting=False,
+        defer_recurrent_state=defer_recurrent_state,
     )
 
 
@@ -638,9 +639,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     assert pending is not None
     completed = plane.complete(pending)
     assert completed[2].tolist() == [-0.5]
+    # The stand-in executor reports no request ends.
     assert completed[:2] + completed[3:] == (
         [100],
         [1],
+        None,
         None,
         None,
         None,
@@ -675,7 +678,8 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
     )
 
-    *_, logprobs, returned_cumulative_probs = plane.complete(pending)
+    *_, logprobs, returned_cumulative_probs, request_ends = plane.complete(pending)
+    assert request_ends is None
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:

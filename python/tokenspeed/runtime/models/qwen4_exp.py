@@ -877,6 +877,10 @@ def load_qwen4_exp_weights(
             loader = getattr(params[name], "weight_loader", default_weight_loader)
             loader(params[name], loaded_weight)
             loaded.add(name)
+    for embedding in ple_modules.values():
+        table = embedding.lookup.shared_table
+        if table is not None:
+            table.publish()
     return loaded
 
 
