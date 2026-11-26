@@ -263,17 +263,20 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     from tokenspeed.runtime.utils.env import envs
 
     if envs.TOKENSPEED_USE_MODELSCOPE.get():
-        if not os.path.exists(model_path):
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        if not is_object_store_uri(model_path) and not os.path.exists(model_path):
             from modelscope import snapshot_download
 
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
             with get_lock(model_path):
                 model_path = snapshot_download(model_path)
-            with get_lock(tokenizer_path):
-                tokenizer_path = snapshot_download(
-                    tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-                )
+            if not is_object_store_uri(tokenizer_path):
+                with get_lock(tokenizer_path):
+                    tokenizer_path = snapshot_download(
+                        tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                    )
     return model_path, tokenizer_path
 
 

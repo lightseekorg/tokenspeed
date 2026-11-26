@@ -120,6 +120,41 @@ class TestRunaiStreamerConfig:
                 args._parse_model_loader_extra_config()
 
     @pytest.mark.parametrize(
+        ("kwargs", "expected_flag"),
+        [
+            ({"model": "gs://example-bucket/model"}, "--model"),
+            (
+                {"model": "s3://example-bucket/model", "load_format": "safetensors"},
+                "--model",
+            ),
+            (
+                {"model": "/tmp/local-model", "tokenizer": "gs://example-bucket/tok"},
+                "--tokenizer",
+            ),
+            (
+                {
+                    "model": "/tmp/local-model",
+                    "speculative_algorithm": "EAGLE3",
+                    "speculative_draft_model_path": "s3://example-bucket/draft",
+                },
+                "--speculative-draft-model-path",
+            ),
+        ],
+    )
+    def test_server_args_rejects_object_store_uri_without_runai_streamer(
+        self, monkeypatch, kwargs: dict, expected_flag: str
+    ) -> None:
+        from tokenspeed.runtime.utils import server_args as server_args_mod
+
+        monkeypatch.setattr(
+            server_args_mod, "get_amdgpu_memory_capacity", lambda: 80000
+        )
+        monkeypatch.setattr(server_args_mod, "get_nvgpu_memory_capacity", lambda: 80000)
+        with pytest.raises(ValueError, match="runai_streamer") as exc_info:
+            ServerArgs(**kwargs)
+        assert expected_flag in str(exc_info.value)
+
+    @pytest.mark.parametrize(
         "bad_config",
         [
             {"unknown_option": 1},
@@ -273,9 +308,19 @@ class TestSyncObjectStoreMetadata:
         uri = "gs://example-bucket/org/model"
         remote_state: dict[str, tuple[str, bytes]] = {
             "config.json": ("gen:1", b'{"v": 1}'),
+            "chat_template.jinja": ("gen:1", b"{{ messages }}"),
+            "tokenizer.model": ("gen:1", b"spiece"),
+            "vocab.txt": ("gen:1", b"tok0\n"),
             "encoding/encoding.py": ("gen:1", b"ENC = 1\n"),
+            "encoding/vocab.bpe": ("gen:1", b"a b\n"),
             "model-00001-of-00001.safetensors": ("gen:1", b"HUGE_WEIGHTS"),
             "legacy.bin": ("gen:1", b"BIN_WEIGHTS"),
+            "quantized.gguf": ("gen:1", b"GGUF_WEIGHTS"),
+            "tf_model.h5": ("gen:1", b"TF_WEIGHTS"),
+            "epoch_0.ckpt": ("gen:1", b"CKPT_WEIGHTS"),
+            "original/consolidated.00.pth.tar": ("gen:1", b"PTH_TAR"),
+            "dataset.parquet": ("gen:1", b"PARQUET"),
+            "__pycache__/cached.py": ("gen:1", b"CACHED"),
         }
         downloaded: list[str] = []
 
@@ -294,13 +339,29 @@ class TestSyncObjectStoreMetadata:
             list_objects=fake_list,
             download_object=fake_download,
         )
-        assert sorted(downloaded) == ["config.json", "encoding/encoding.py"]
+        assert sorted(downloaded) == [
+            "chat_template.jinja",
+            "config.json",
+            "encoding/encoding.py",
+            "encoding/vocab.bpe",
+            "tokenizer.model",
+            "vocab.txt",
+        ]
         assert (Path(local_dir) / "config.json").read_bytes() == b'{"v": 1}'
         assert (
             Path(local_dir) / "encoding" / "encoding.py"
         ).read_bytes() == b"ENC = 1\n"
-        assert not (Path(local_dir) / "model-00001-of-00001.safetensors").exists()
-        assert not (Path(local_dir) / "legacy.bin").exists()
+        for skipped in (
+            "model-00001-of-00001.safetensors",
+            "legacy.bin",
+            "quantized.gguf",
+            "tf_model.h5",
+            "epoch_0.ckpt",
+            "original/consolidated.00.pth.tar",
+            "dataset.parquet",
+            "__pycache__/cached.py",
+        ):
+            assert not (Path(local_dir) / skipped).exists()
         assert stat.S_IMODE(os.lstat(local_dir).st_mode) == 0o700
 
         # Repeat sync with unchanged remote versions must reuse cache without downloads.
@@ -329,6 +390,25 @@ class TestSyncObjectStoreMetadata:
         assert (Path(local_dir) / "config.json").read_bytes() == b'{"v": 2}'
         assert (Path(local_dir) / "tokenizer.json").read_bytes() == b"{}"
         assert not (Path(local_dir) / "encoding" / "encoding.py").exists()
+
+    def test_sync_warns_on_oversized_metadata_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog
+    ) -> None:
+        from tokenspeed.runtime.model_loader import object_store
+
+        monkeypatch.setattr(object_store, "_METADATA_WARN_BYTES", 16)
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            object_store.logger, "warning", lambda msg: warnings.append(str(msg))
+        )
+        sync_object_store_metadata(
+            "gs://example-bucket/org/big-meta",
+            cache_dir=str(tmp_path / "cache"),
+            list_objects=lambda _u: [("huge_vocab.json", "gen:1")],
+            download_object=lambda _u, dst: Path(dst).write_bytes(b"x" * 64),
+        )
+        assert len(warnings) == 1
+        assert "huge_vocab.json" in warnings[0]
 
     def test_sync_rejects_path_traversal(self, tmp_path: Path) -> None:
         uri = "gs://example-bucket/org/evil"
@@ -921,17 +1001,20 @@ class TestObjectStoreMetadataResolution:
             cfg = ModelConfig.__new__(ModelConfig)
             cfg.model_path = uri
             cfg.revision = None
-            cfg.download_dir = "/custom/cache"
             cfg.hf_config = PretrainedConfig()
+            with pytest.raises(AttributeError):
+                cfg._parse_quant_hf_config()
+            cfg.download_dir = "/custom/cache"
 
             parsed = cfg._parse_quant_hf_config()
             assert parsed == {"quant_method": "modelopt", "quant_algo": "NVFP4"}
 
-    def test_l3_checkpoint_id_and_resolved_model_dir_reject_object_store_uri(
+    def test_l3_checkpoint_id_fingerprints_object_store_uri_without_hf_hub(
         self, monkeypatch
     ) -> None:
         import huggingface_hub
 
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
         from tokenspeed.runtime.cache.l3.identity import _resolved_model_dir
 
         def forbid_snapshot(*args, **kwargs):
@@ -942,20 +1025,68 @@ class TestObjectStoreMetadataResolution:
         monkeypatch.setattr(huggingface_hub, "snapshot_download", forbid_snapshot)
         uri = "gs://example-bucket/org/model"
         assert _resolved_model_dir(uri, revision="") is None
-        with pytest.raises(ValueError, match="immutable checkpoint id"):
-            l3_checkpoint_id(
-                model_path=uri,
-                revision="",
-                hf_config=object(),
-                load_format="runai_streamer",
-                model_loader_extra_config={"concurrency": 16},
-                ext_yaml=None,
-            )
 
-    def test_non_runai_loaders_reject_object_store_uri(self) -> None:
+        l3_identity._object_store_checkpoint_fingerprint.cache_clear()
+        monkeypatch.setattr(
+            l3_identity,
+            "_list_object_store_versions",
+            lambda _u: (
+                ("config.json", "gen:1"),
+                ("model.safetensors", "gen:2"),
+            ),
+        )
+        id_runai = l3_checkpoint_id(
+            model_path=uri,
+            revision="",
+            hf_config=object(),
+            load_format="runai_streamer",
+            model_loader_extra_config={
+                "concurrency": 16,
+                "distributed": True,
+                "distributed_scope": "global",
+            },
+            ext_yaml="",
+        )
+        id_safetensors = l3_checkpoint_id(
+            model_path=uri + "/",
+            revision="",
+            hf_config=object(),
+            load_format="safetensors",
+            model_loader_extra_config={},
+            ext_yaml="",
+        )
+        assert id_runai.startswith("objstore-")
+        assert id_runai.endswith(":safetensors")
+        assert id_runai == id_safetensors
+
+    def test_non_runai_loaders_reject_object_store_uri(self, monkeypatch) -> None:
         from tokenspeed.runtime.model_loader.loader import ShardedStateLoader
+        from tokenspeed.runtime.utils.common import prepare_model_and_tokenizer
 
         uri = "gs://example-bucket/org/model"
+        monkeypatch.setenv("TOKENSPEED_USE_MODELSCOPE", "1")
+        fake_ms = types.ModuleType("modelscope")
+        fake_ms_hub = types.ModuleType("modelscope.hub")
+        fake_ms_snap = types.ModuleType("modelscope.hub.snapshot_download")
+
+        def forbid_modelscope(*args, **kwargs):
+            raise AssertionError(
+                "ModelScope snapshot_download must not be called for object-store URIs"
+            )
+
+        fake_ms.snapshot_download = forbid_modelscope  # type: ignore[attr-defined]
+        fake_ms_snap.snapshot_download = forbid_modelscope  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "modelscope", fake_ms)
+        monkeypatch.setitem(sys.modules, "modelscope.hub", fake_ms_hub)
+        monkeypatch.setitem(
+            sys.modules, "modelscope.hub.snapshot_download", fake_ms_snap
+        )
+
+        assert prepare_model_and_tokenizer(uri, "s3://example-bucket/tok") == (
+            uri,
+            "s3://example-bucket/tok",
+        )
+
         default_loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
         with pytest.raises(ValueError, match="runai_streamer"):
             default_loader._prepare_weights(uri, None, False, None)
@@ -986,7 +1117,7 @@ class TestRunaiStreamerDistributedContract:
         expected_dist_global: str,
     ) -> None:
         stream_calls: list[tuple[list[str], str | None, bool]] = []
-        env_during_stream: list[str | None] = []
+        env_during_stream: list[tuple[str | None, str | None]] = []
         empty_cache_calls: list[bool] = []
 
         # Single reusable staging buffer mimicking runai_model_streamer's
@@ -1000,7 +1131,12 @@ class TestRunaiStreamerDistributedContract:
 
         class _ContractEnforcingStreamer:
             def __enter__(self):
-                env_during_stream.append(os.environ.get("RUNAI_STREAMER_DIST_GLOBAL"))
+                env_during_stream.append(
+                    (
+                        os.environ.get("RUNAI_STREAMER_DIST"),
+                        os.environ.get("RUNAI_STREAMER_DIST_GLOBAL"),
+                    )
+                )
                 return self
 
             def __exit__(self, exc_type, exc, tb) -> None:
@@ -1012,12 +1148,19 @@ class TestRunaiStreamerDistributedContract:
                 device: str | None = None,
                 is_distributed: bool = False,
             ) -> None:
-                if is_distributed and (
-                    not isinstance(device, str) or not device.startswith("cuda:")
-                ):
-                    raise RuntimeError(
-                        "distributed streaming requires a cuda:<idx> device"
-                    )
+                if is_distributed:
+                    if not isinstance(device, str) or not device.startswith("cuda:"):
+                        raise RuntimeError(
+                            "distributed streaming requires a cuda:<idx> device"
+                        )
+                    enable_dist = os.environ.get("RUNAI_STREAMER_DIST", "auto")
+                    if enable_dist == "0" or (
+                        enable_dist == "auto"
+                        and torch.distributed.get_backend() != "nccl"
+                    ):
+                        raise RuntimeError(
+                            "Run:ai would silently downgrade to non-distributed streaming"
+                        )
                 stream_calls.append((list(files), device, is_distributed))
 
             def get_tensors(self):
@@ -1031,6 +1174,7 @@ class TestRunaiStreamerDistributedContract:
         fake_mod.__version__ = "0.16.1"  # type: ignore[attr-defined]
         fake_mod.SafetensorsStreamer = _ContractEnforcingStreamer  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "runai_model_streamer", fake_mod)
+        monkeypatch.setenv("RUNAI_STREAMER_DIST", "0")
         monkeypatch.setenv("RUNAI_STREAMER_DIST_GLOBAL", "preexisting")
         monkeypatch.setattr(torch.cuda, "is_available", lambda: distributed)
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
@@ -1051,10 +1195,13 @@ class TestRunaiStreamerDistributedContract:
             index_weight_map=None,
         )
         for name, tensor in it:
+            assert os.environ.get("RUNAI_STREAMER_DIST") == "0"
             assert os.environ.get("RUNAI_STREAMER_DIST_GLOBAL") == "preexisting"
             stashed[name] = tensor
 
-        assert env_during_stream == [expected_dist_global]
+        assert env_during_stream == [
+            ("1" if distributed else "0", expected_dist_global)
+        ]
         assert stream_calls == [
             (
                 ["gs://example-bucket/model/model-00001-of-00001.safetensors"],

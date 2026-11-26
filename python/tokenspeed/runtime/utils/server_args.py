@@ -3164,6 +3164,24 @@ class ServerArgs:
                 "after loading, and no weight update rebuilds them"
             )
 
+    def _validate_object_store_options(self) -> None:
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        for flag, value in (
+            ("--model", self.model),
+            ("--tokenizer", self.tokenizer),
+            ("--speculative-draft-model-path", self.speculative_draft_model_path),
+        ):
+            if (
+                isinstance(value, str)
+                and is_object_store_uri(value)
+                and self.load_format != "runai_streamer"
+            ):
+                raise ValueError(
+                    f"{flag}={value!r} is an object-store URI and requires "
+                    f"--load-format runai_streamer, got {self.load_format!r}"
+                )
+
     def _parse_model_loader_extra_config(self) -> None:
         raw = self.model_loader_extra_config
         if raw is None or raw == "":
@@ -3502,6 +3520,7 @@ class ServerArgs:
             )
 
         self.validate_model_update_options()
+        self._validate_object_store_options()
         self._parse_model_loader_extra_config()
 
         if (

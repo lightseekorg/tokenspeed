@@ -304,10 +304,6 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        model_name_or_path = (
-            self._maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
-        )
         from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
 
         if is_object_store_uri(model_name_or_path):
@@ -315,6 +311,10 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Object-store URI {model_name_or_path!r} requires "
                 f"--load-format runai_streamer, not {self.load_config.load_format!r}"
             )
+        model_name_or_path = (
+            self._maybe_download_from_modelscope(model_name_or_path, revision)
+            or model_name_or_path
+        )
 
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format

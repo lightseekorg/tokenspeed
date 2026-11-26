@@ -1057,12 +1057,15 @@ def runai_streamer_weights_iterator(
     (``RUNAI_STREAMER_DIST_GLOBAL=0``, intra-node broadcast) or ``"global"``
     (``RUNAI_STREAMER_DIST_GLOBAL=1``, cross-host broadcast across the default
     NCCL process group). Distributed streaming requires CUDA and a multi-rank
-    process group with NCCL serving CUDA, and passes
-    ``device="cuda:<current_device>"`` so Run:ai does not silently downgrade to
-    non-distributed streaming. In both distributed and non-distributed modes,
-    every yielded tensor is copied out of Run:ai's reusable staging buffers to
-    standalone CPU storage so callers that stash tensors across iterations
-    never alias overwritten memory or pin streamer buffers.
+    process group with NCCL serving CUDA, and sets ``RUNAI_STREAMER_DIST=1``
+    alongside ``device="cuda:<current_device>"`` so Run:ai does not fall back to
+    non-distributed streaming on composite ``torch.distributed`` backends (note
+    ``runai-model-streamer`` 0.16.1 still retains an internal free-VRAM fallback
+    when available CUDA memory is below ``2 * max_chunk``). In both distributed
+    and non-distributed modes, every yielded tensor is copied out of Run:ai's
+    reusable staging buffers to standalone CPU storage so callers that stash
+    tensors across iterations never alias overwritten memory or pin streamer
+    buffers.
     """
     if distributed:
         if distributed_scope not in ("local", "global"):
@@ -1144,6 +1147,7 @@ def runai_streamer_weights_iterator(
                 f"in torch.distributed, got {backend!r}."
             )
         stream_device = f"cuda:{torch.cuda.current_device()}"
+        env_overrides["RUNAI_STREAMER_DIST"] = "1"
         env_overrides["RUNAI_STREAMER_DIST_GLOBAL"] = (
             "1" if distributed_scope == "global" else "0"
         )

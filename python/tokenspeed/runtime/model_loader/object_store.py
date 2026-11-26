@@ -42,14 +42,43 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 _OBJECT_STORE_SCHEMES = ("gs://", "s3://")
-_WEIGHT_FILE_SUFFIXES = (
+_METADATA_FILE_SUFFIXES = (
+    ".json",
+    ".py",
+    ".jinja",
+    ".tiktoken",
+    ".model",
+    ".spm",
+    ".txt",
+    ".yaml",
+    ".yml",
+)
+_NON_METADATA_SUFFIXES = (
     ".safetensors",
     ".bin",
     ".pt",
     ".pth",
+    ".gguf",
+    ".h5",
+    ".hdf5",
+    ".ckpt",
     ".onnx",
     ".msgpack",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".zip",
+    ".zst",
+    ".bz2",
+    ".xz",
+    ".parquet",
+    ".arrow",
+    ".npz",
+    ".npy",
+    ".ot",
+    ".tflite",
 )
+_METADATA_WARN_BYTES = 64 * 1024 * 1024
 _METADATA_MARKER_FILENAME = ".tokenspeed_metadata_synced"
 _METADATA_MANIFEST_VERSION = 1
 _SOURCE_URI_FILENAME = ".tokenspeed_source_uri"
@@ -152,9 +181,21 @@ def read_source_uri(local_dir: str) -> str | None:
     return uri if is_object_store_uri(uri) else None
 
 
-def _is_weight_object(relative_name: str) -> bool:
+def _is_metadata_object(relative_name: str) -> bool:
+    """Return whether ``relative_name`` matches the checkpoint metadata allowlist."""
+    clean_parts = [
+        part for part in relative_name.split("/") if part and part not in (".", "..")
+    ]
+    if not clean_parts:
+        return False
+    if any(part == "__pycache__" or part.startswith(".") for part in clean_parts):
+        return False
     lower = relative_name.lower()
-    return any(lower.endswith(suffix) for suffix in _WEIGHT_FILE_SUFFIXES)
+    if lower.endswith(_NON_METADATA_SUFFIXES):
+        return False
+    if clean_parts[0] == "encoding":
+        return True
+    return lower.endswith(_METADATA_FILE_SUFFIXES)
 
 
 class _ClientLocal(threading.local):
@@ -247,7 +288,13 @@ def _list_object_store_objects(uri: str) -> list[tuple[str, str]]:
                 rel = obj["Key"][len(list_prefix) :]
                 if rel and not rel.endswith("/"):
                     etag = str(obj.get("ETag", "")).strip('"')
-                    entries.append((rel, f"etag:{etag}"))
+                    size = obj.get("Size")
+                    version = (
+                        f"etag:{etag}:size:{size}"
+                        if size is not None
+                        else f"etag:{etag}"
+                    )
+                    entries.append((rel, version))
     else:
         raise ValueError(f"Unsupported object-store scheme: {scheme!r}")
     entries.sort(key=lambda item: item[0])
@@ -397,7 +444,7 @@ def sync_object_store_metadata(
     # objects so a metadata listing is inexpensive compared to model loading.
     remote_entries = list_fn(normalized)
     expected_objects = {
-        rel: version for rel, version in remote_entries if not _is_weight_object(rel)
+        rel: version for rel, version in remote_entries if _is_metadata_object(rel)
     }
 
     if os.path.lexists(local_dir):
@@ -452,6 +499,14 @@ def sync_object_store_metadata(
             target = resolved_targets[rel]
             os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
             download_fn(join_object_store_uri(normalized, rel), target)
+            if os.path.isfile(target):
+                size_bytes = os.path.getsize(target)
+                if size_bytes > _METADATA_WARN_BYTES:
+                    logger.warning(
+                        f"Synced metadata object {rel!r} from {normalized} is "
+                        f"{size_bytes / (1024 * 1024):.1f} MiB (> "
+                        f"{_METADATA_WARN_BYTES // (1024 * 1024)} MiB)."
+                    )
 
         _write_text_atomic(
             os.path.join(local_dir, _SOURCE_URI_FILENAME), normalized + "\n"

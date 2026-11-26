@@ -750,7 +750,7 @@ def _apply_constrained_decoding_policy(
 
 
 class ModelConfig:
-    download_dir: str | None = None
+    download_dir: str | None
 
     def __init__(
         self,
