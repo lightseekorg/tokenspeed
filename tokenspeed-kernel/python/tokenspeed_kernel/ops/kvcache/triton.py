@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _ue8m0_word,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
@@ -245,10 +246,13 @@ def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
     _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
 
 
-# A transfer's geometry rows and their offset follow the cache group it copies,
-# so they change between transfers: specializing on them (value 1, a multiple
-# of 16) would compile again mid-serve.
-@triton.jit(do_not_specialize=["num_geometry_rows", "geometry_offset"])
+# A transfer's geometry rows, offset, and layer count follow the cache group it
+# copies, and layer-ready pointers may slice a ring buffer at non-16-byte
+# boundaries: specializing on them would compile again mid-serve.
+@triton.jit(
+    do_not_specialize=["num_geometry_rows", "geometry_offset", "num_layers"],
+    do_not_specialize_on_alignment=["layer_ready_flags_ptr", "layer_cta_counts_ptr"],
+)
 def _transfer_cache_blocks_kernel(
     buffer_addresses_ptr,
     geometry_ptr,
@@ -320,7 +324,12 @@ def _ld_acquire_i32(ptr):
     )
 
 
-@triton.jit
+# layer_index varies over every layer (0, 1, 2, ...) and flag_ptr may slice a
+# ring buffer at any 4-byte offset; unspecialize both so one binary serves all.
+@triton.jit(
+    do_not_specialize=["layer_index"],
+    do_not_specialize_on_alignment=["flag_ptr"],
+)
 def _wait_layer_ready_kernel(flag_ptr, layer_index):
     pending = _ld_acquire_i32(flag_ptr + layer_index)
     while pending == 0:
@@ -1559,7 +1568,7 @@ def set_mla_kv_buffer_triton(
         else:
             block_loc, num_warps, num_stages = 2, 4, 2
         grid = (triton.cdiv(n_loc, block_loc),)
-        _set_mla_kv_buffer_per_loc_kernel[grid](
+        kernel_launcher(_set_mla_kv_buffer_per_loc_kernel, grid)(
             kv_buffer,
             cache_k_nope,
             cache_k_rope,
@@ -1607,6 +1616,16 @@ def set_mla_kv_buffer_triton(
             MAX_FINITE=max_finite,
             **extra_kwargs,
         )
+
+
+# n_loc picks (BLOCK_LOC, num_warps) from three buckets in set_mla_kv_buffer_triton.
+register_triton_warmup(
+    _set_mla_kv_buffer_per_loc_kernel,
+    variants=(
+        {"BLOCK_LOC": (2,), "num_warps": (4,)},
+        {"BLOCK_LOC": (4,), "num_warps": (1, 4)},
+    ),
+)
 
 
 @dataclass(frozen=True, eq=False)

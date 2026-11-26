@@ -308,6 +308,32 @@ def test_quantize_index_query_weights_compiles_once_per_bucket():
         run(127, 32 * 128, 192, 0.125)
 
 
+@requires_cuda
+def test_quantize_index_query_weights_warmup_covers_both_buckets():
+    """One launch under kernel_warmup prepares both (1, 1) and (8, 4) buckets."""
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _quantize_index_query_weights_kernel,
+    )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from utils import assert_warmup_covers
+
+    def run(tokens: int) -> None:
+        q = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(tokens, 32, device="cuda", dtype=torch.bfloat16)
+        quantize_index_query_weights(q, weights, 0.25)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(256)
+
+    assert_warmup_covers(
+        (_quantize_index_query_weights_kernel,),
+        warm,
+        run,
+        (1, 16, 128, 129, 256),
+    )
+
+
 # ---------------------------------------------------------------------------
 # _prepare_logits_for_topk (DeepGEMM narrowed-logits widening + NaN/inf scrub)
 # ---------------------------------------------------------------------------

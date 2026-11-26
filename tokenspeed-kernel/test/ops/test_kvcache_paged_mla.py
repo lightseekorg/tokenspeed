@@ -93,3 +93,41 @@ def test_index_scatter_uses_physical_page_stride():
     torch.testing.assert_close(scale_view[page[mask], offset[mask]], scales[mask])
     assert torch.all(key_view[page[~mask], offset[~mask]] == 17)
     assert torch.all(storage[:, page_size:] == 17)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_set_mla_kv_buffer_per_loc_warmup_covers_all_buckets():
+    """One launch under kernel_warmup prepares every (BLOCK_LOC, num_warps) bucket."""
+    from tokenspeed_kernel.ops.kvcache.triton import _set_mla_kv_buffer_per_loc_kernel
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from utils import assert_warmup_covers
+
+    rank, rope, page_size = 512, 64, 64
+    max_rows = 16384
+    pages = max_rows // page_size + 2
+    cache = torch.zeros(
+        pages, page_size, 1, rank + rope, device="cuda", dtype=torch.bfloat16
+    )
+    src = torch.randn(max_rows, 1, rank + rope, device="cuda", dtype=torch.bfloat16)
+    slots = torch.arange(max_rows, device="cuda", dtype=torch.int64)
+
+    def run(rows: int) -> None:
+        set_mla_kv_buffer_triton(
+            cache,
+            slots[:rows],
+            src[:rows, :, :rank],
+            src[:rows, :, rank:],
+            enable_pdl=False,
+            write_mask=None,
+        )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(2048)
+
+    assert_warmup_covers(
+        (_set_mla_kv_buffer_per_loc_kernel,),
+        warm,
+        run,
+        (512, 1024, 2048, 4096, 16384),
+    )
