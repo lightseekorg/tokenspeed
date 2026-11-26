@@ -2658,6 +2658,7 @@ class KimiLinearMoE(nn.Module):
             not plan.owns_ep_communication
             and not plan.use_native
             and not plan.use_marlin
+            and not plan.petit_tp_attention
         ):
             if not (plan.use_trtllm or plan.use_cutedsl):
                 raise RuntimeError(
@@ -2698,7 +2699,11 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode=("precomputed_topk" if mapping.attn.dp_size > 1 else None),
+            routing_mode=(
+                "precomputed_topk"
+                if mapping.attn.dp_size > 1 or plan.petit_tp_attention
+                else None
+            ),
             # Native gfx950 accepts bf16 model activations; the selected kernel
             # may quantize them internally. Hopper Marlin runs A16W4.
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
@@ -2718,6 +2723,9 @@ class KimiLinearMoE(nn.Module):
                 )
             ),
             expert_layout=expert_layout,
+            # Gluon Petit under attention TP: LatentMoELayer hands Petit this
+            # rank's share of the replicated rows (split_replicated_rows).
+            petit_splits_replicated_rows=plan.petit_tp_attention,
         )
 
         if mapping.attn.dp_size > 1:
@@ -2758,7 +2766,9 @@ class KimiLinearMoE(nn.Module):
             # without a cast. This setting is unused by kernel-routing plans.
             topk_weights_dtype=(
                 torch.bfloat16
-                if plan.use_trtllm or plan.owns_ep_communication
+                if plan.use_trtllm
+                or plan.owns_ep_communication
+                or plan.petit_tp_attention
                 else torch.float32
             ),
         )
@@ -2937,14 +2947,36 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
-                input_projections=self._latent_input_projections,
+                # The packed projection covers every row; a row share cannot
+                # take it.
+                input_projections=(
+                    None
+                    if self.execution_plan.petit_tp_attention
+                    else self._latent_input_projections
+                ),
+                split_replicated_rows=self.execution_plan.petit_tp_attention,
             )
-            if self.execution_plan.use_native and mapping.moe.tp_size == 1
+            if (
+                self.execution_plan.use_native
+                or self.execution_plan.petit_tp_attention
+            )
+            and mapping.moe.tp_size == 1
             else None
         )
+        if self.execution_plan.petit_tp_attention and layer_index == (
+            config.first_k_dense_replace
+        ):
+            logger.info(
+                "K3 routed MoE: %s SiTU MegaMoE under attention TP%d "
+                "(EP=%d, each rank routes ceil(rows/EP))",
+                moe_backend.value,
+                mapping.attn.tp_size,
+                mapping.moe.ep_size,
+            )
         # Dry-run exact registry selection for the fused decode pipeline.
         self._use_fused_decode_pipeline = (
             self.execution_plan.joint_moe_reduce
+            and not self.execution_plan.petit_tp_attention
             and latent_moe_decode_pipeline_available(
                 self.gate.weight,
                 self.routed_expert_down_proj.weight,
@@ -2960,7 +2992,7 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        if self.execution_plan.use_native:
+        if self.execution_plan.use_native or self.execution_plan.petit_tp_attention:
             return
 
         self.comm = K3MoeTailComm(
@@ -3163,6 +3195,7 @@ class KimiLinearMoE(nn.Module):
         plan = self.execution_plan
         if not (
             plan.owns_ep_communication
+            or plan.petit_tp_attention
             or plan.use_native
             or plan.use_trtllm
             or plan.use_cutedsl
@@ -3945,7 +3978,7 @@ class KimiLinearMoE(nn.Module):
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
             return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
 
-        if self.execution_plan.use_native:
+        if self.execution_plan.use_native or self.execution_plan.petit_tp_attention:
             return self._forward_amd(
                 hidden_states,
                 prefix_sum,

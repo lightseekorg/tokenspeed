@@ -1227,3 +1227,111 @@ def test_forward_add3_on_a_narrowed_column_projection_returns_full_width(
     got = proj.forward_add3(x, a, c)
     assert got.shape == (m, out)
     torch.testing.assert_close(got, a + x @ full.T + c)
+
+
+def _petit_tp_attention_mapping(attn_dp_size: int = 1):
+    group = tuple(range(8))
+    return SimpleNamespace(
+        attn=SimpleNamespace(dp_size=attn_dp_size, tp_size=8 // attn_dp_size),
+        dense=SimpleNamespace(tp_size=8 // attn_dp_size),
+        moe=SimpleNamespace(
+            tp_size=1,
+            ep_size=8,
+            ep_group=group,
+            tp_ep_size=8,
+            tp_ep_group=group,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "attn_dp_size,petit_tp_attention", [(1, True), (8, False)], ids=["tp8", "dp8"]
+)
+def test_kimi3_moe_execution_policy_petit_under_attention_tp(
+    attn_dp_size, petit_tp_attention
+) -> None:
+    """Attention TP8 over Petit's EP8 group: the layer splits the replicated
+    rows and the joint all-reduce completes them; attention DP8 keeps Petit
+    owning EP communication."""
+    with mock.patch.object(
+        latent_module, "native_latent_moe_available", return_value=True
+    ):
+        plan = Kimi3MoEExecutionPlan.build(
+            _petit_tp_attention_mapping(attn_dp_size),
+            MoeBackend.GLUON_PETIT,
+            alt_stream=None,
+        )
+    assert plan.petit_tp_attention == petit_tp_attention
+    assert plan.owns_ep_communication == (not petit_tp_attention)
+    assert plan.joint_moe_reduce == petit_tp_attention
+    assert not plan.use_native
+    assert not plan.use_mega_moe
+
+
+class _RowShareExperts(_EpExperts):
+    """Stands in for Petit: returns each routed row's latent complete."""
+
+    def __init__(self, ep_size: int, ep_rank: int) -> None:
+        super().__init__(ep_size, num_experts=8)
+        self.ep_rank = ep_rank
+        self.calls: list[tuple[int, int, int]] = []
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: StandardTopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        assert topk_output.topk_ids.shape == (hidden_states.shape[0], 1)
+        self.calls.append(
+            (hidden_states.shape[0], num_global_tokens, max_num_tokens_per_gpu)
+        )
+        return hidden_states + 1
+
+
+@pytest.mark.parametrize("ep_size", [4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 13, 96])
+def test_latent_moe_split_replicated_rows_sums_to_every_row(
+    ep_size: int, num_tokens: int
+) -> None:
+    """Each rank routes rows [r * ceil(T / EP), ...) only (none when T < EP)
+    and leaves the others zero, so the EP sum of the routed latents equals
+    routing every row once, before the norm and the up-projection."""
+    hidden_states = torch.arange(num_tokens * 4, dtype=torch.float32).view(
+        num_tokens, 4
+    )
+    share = -(-num_tokens // ep_size)
+    latents: list[torch.Tensor] = []
+    for rank in range(ep_size):
+        experts = _RowShareExperts(ep_size, rank)
+        captured: list[torch.Tensor] = []
+
+        def reduce(value: torch.Tensor, captured=captured) -> torch.Tensor:
+            captured.append(value.clone())
+            return value
+
+        layer = _layer(experts, latent_reduce=reduce, split_replicated_rows=True)
+        layer(hidden_states)
+        start = min(num_tokens, rank * share)
+        rows = min(num_tokens, start + share) - start
+        # Every rank calls the experts, with its share sized from all T rows.
+        assert experts.calls == [(rows, num_tokens, share)]
+        (latent,) = captured
+        assert latent.shape == (num_tokens, 2)
+        outside = torch.ones(num_tokens, dtype=torch.bool)
+        outside[start : start + rows] = False
+        assert torch.count_nonzero(latent[outside]) == 0
+        latents.append(latent)
+    torch.testing.assert_close(sum(latents), hidden_states[:, :2] + 1)
+
+
+def test_latent_moe_split_replicated_rows_refuses_packed_projections() -> None:
+    with pytest.raises(ValueError, match="split_replicated_rows"):
+        _layer(
+            _RowShareExperts(2, 0),
+            latent_reduce=lambda x: x,
+            shared_experts=_Shared(),
+            input_projections=lambda hidden_states, shared_out: None,
+            split_replicated_rows=True,
+        )

@@ -121,7 +121,7 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         mapping=SimpleNamespace(
             attn=SimpleNamespace(dp_size=1), moe=SimpleNamespace(tp_ep_size=8)
         ),
-        execution_plan=SimpleNamespace(use_native=False),
+        execution_plan=SimpleNamespace(use_native=False, petit_tp_attention=False),
         native_latent_moe=None,
         decode_moe=None,
         iris_state=None,
@@ -283,7 +283,7 @@ def test_nvfp4_projection_setup_uses_processed_expert_scale(
 def _make_amd_moe(fork, *, routed, shared, projection, norm, mapping):
     moe = _make_moe(fork, num_tokens=routed.shape[0])
     moe.mapping = mapping
-    moe.execution_plan = SimpleNamespace(use_native=True)
+    moe.execution_plan = SimpleNamespace(use_native=True, petit_tp_attention=False)
     moe.comm = None
     moe.routed_hidden = routed.shape[1]
     moe.routed_expert_norm = norm

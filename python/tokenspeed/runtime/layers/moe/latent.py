@@ -145,6 +145,11 @@ class Kimi3MoEExecutionPlan:
     # FlashInfer's CuTe DSL NVFP4 SiTU experts on precomputed top-k.
     use_cutedsl: bool
     use_marlin: bool = False
+    # Gluon Petit under attention TP = EP size (attention DP1, MoE TP1): every
+    # rank holds the same rows and hands Petit its ceil(T / EP) share; the
+    # joint all-reduce over the EP group completes routed + shared, as the
+    # native EP path's partials do. Petit then owns dispatch/combine only.
+    petit_tp_attention: bool = False
 
     @classmethod
     def build(
@@ -156,11 +161,23 @@ class Kimi3MoEExecutionPlan:
         """Select orchestration from the backend, streams, and parallel layout."""
 
         use_mega_moe = moe_backend == MoeBackend.MEGA_MOE
-        owns_ep_communication = moe_backend in (
-            MoeBackend.MEGA_MOE,
-            MoeBackend.GLUON_PETIT,
+        petit_tp_attention = False
+        if moe_backend == MoeBackend.GLUON_PETIT and getattr(mapping, "attn", None):
+            from tokenspeed.runtime.utils.server_args import (
+                gluon_petit_tp_attention_mapping,
+            )
+
+            petit_tp_attention = gluon_petit_tp_attention_mapping(mapping)
+        owns_ep_communication = use_mega_moe or (
+            moe_backend == MoeBackend.GLUON_PETIT and not petit_tp_attention
         )
-        use_native = not owns_ep_communication and native_latent_moe_available()
+        # Under attention TP Petit runs the routed experts inside the native
+        # latent layer, but the experts are Petit's, not the native kernel's.
+        use_native = (
+            not owns_ep_communication
+            and not petit_tp_attention
+            and native_latent_moe_available()
+        )
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
         # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
@@ -193,11 +210,12 @@ class Kimi3MoEExecutionPlan:
             owns_ep_communication=owns_ep_communication,
             use_marlin=use_marlin,
             use_cutedsl=use_cutedsl,
+            petit_tp_attention=petit_tp_attention,
             overlap_shared_experts=(
                 use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),
             joint_moe_reduce=(
-                use_native
+                (use_native or petit_tp_attention)
                 and mapping.moe.tp_size == 1
                 and mapping.moe.ep_size > 1
                 and mapping.moe.ep_group == mapping.moe.tp_ep_group
@@ -568,8 +586,17 @@ class LatentMoELayer(nn.Module):
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
         input_projections: InputProjector | None = None,
+        # Gluon Petit under attention TP: route only this rank's
+        # ceil(T / EP) share of the replicated rows and leave the other rows'
+        # routed latent zero, so the EP all-reduce assembles every row.
+        split_replicated_rows: bool = False,
     ) -> None:
         super().__init__()
+        if split_replicated_rows and input_projections is not None:
+            raise ValueError(
+                "split_replicated_rows routes a row share; it cannot "
+                "take the packed all-row input projections"
+            )
         if input_projections is not None and shared_experts is None:
             raise ValueError("input_projections requires shared_experts")
         if shared_reduce is not None and shared_experts is None:
@@ -621,6 +648,61 @@ class LatentMoELayer(nn.Module):
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
+        self.split_replicated_rows = split_replicated_rows
+
+    def _route_row_share(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_target: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """This rank's routed latent over replicated rows, zero outside its share.
+
+        Rank r routes rows [r * ceil(T / EP), min(T, (r + 1) * ceil(T / EP)))
+        through the experts (Gluon Petit dispatches and combines them across
+        the EP group, so they come back complete); every rank calls the experts,
+        with zero rows when T < EP, so the shapes stay graph-stable. The other
+        rows stay zero for the EP all-reduce, which then holds every row's
+        routed latent, as the native EP path's summed partials do.
+        """
+        from tokenspeed.runtime.utils.server_args import (
+            gluon_petit_tp_attention_rows,
+        )
+
+        num_tokens = hidden_states.shape[0]
+        ep_size = int(self.experts.ep_size)
+        start, end = gluon_petit_tp_attention_rows(
+            num_tokens, ep_size, int(self.experts.ep_rank)
+        )
+        local = hidden_states[start:end]
+        local_logits = router_logits[start:end]
+        if end > start:
+            topk_output = self.topk(local, local_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=local,
+                router_logits=local_logits,
+            )
+        routed_input = _module_tensor_output(self.routed_down_proj, local)
+        if routed_input.ndim != 2 or routed_input.shape[0] != end - start:
+            raise ValueError("routed_down_proj must return [T, L]")
+        routed_share = self.experts(
+            hidden_states=routed_input,
+            topk_output=topk_output,
+            num_global_tokens=num_tokens,
+            # Rank 0 holds the largest share.
+            max_num_tokens_per_gpu=-(-num_tokens // ep_size),
+        )
+        _check_shape(routed_share, tuple(routed_input.shape), "routed experts")
+        latent = (
+            routed_target
+            if routed_target is not None
+            else routed_share.new_empty((num_tokens, routed_share.shape[1]))
+        )
+        latent.zero_()
+        latent[start:end].copy_(routed_share)
+        return latent
 
     def finalize_output(
         self,
@@ -760,37 +842,43 @@ class LatentMoELayer(nn.Module):
             )
             if router_logits.ndim != 2 or router_logits.shape[0] != num_tokens:
                 raise ValueError("router must return logits shaped [T, E]")
-            if num_tokens > 0:
-                topk_output = self.topk(hidden_states, router_logits)
+            if self.split_replicated_rows:
+                routed_latent = self._route_row_share(
+                    hidden_states, router_logits, routed_target
+                )
+                latent_shape = tuple(routed_latent.shape)
             else:
-                topk_output = self.topk.empty_topk_output(
-                    hidden_states.device,
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                )
+                if num_tokens > 0:
+                    topk_output = self.topk(hidden_states, router_logits)
+                else:
+                    topk_output = self.topk.empty_topk_output(
+                        hidden_states.device,
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                    )
 
-            routed_input = (
-                packed_routed
-                if packed_routed is not None
-                else _module_tensor_output(self.routed_down_proj, hidden_states)
-            )
-            if routed_input.ndim != 2 or routed_input.shape[0] != num_tokens:
-                raise ValueError("routed_down_proj must return [T, L]")
-            latent_shape = tuple(routed_input.shape)
-            previous_output = getattr(self.experts, "_situ_output_buffer", None)
-            if routed_target is not None:
-                self.experts._situ_output_buffer = routed_target
-            try:
-                routed_latent = self.experts(
-                    hidden_states=routed_input,
-                    topk_output=topk_output,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                routed_input = (
+                    packed_routed
+                    if packed_routed is not None
+                    else _module_tensor_output(self.routed_down_proj, hidden_states)
                 )
-            finally:
+                if routed_input.ndim != 2 or routed_input.shape[0] != num_tokens:
+                    raise ValueError("routed_down_proj must return [T, L]")
+                latent_shape = tuple(routed_input.shape)
+                previous_output = getattr(self.experts, "_situ_output_buffer", None)
                 if routed_target is not None:
-                    self.experts._situ_output_buffer = previous_output
-            _check_shape(routed_latent, latent_shape, "routed experts")
+                    self.experts._situ_output_buffer = routed_target
+                try:
+                    routed_latent = self.experts(
+                        hidden_states=routed_input,
+                        topk_output=topk_output,
+                        num_global_tokens=num_global_tokens,
+                        max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                    )
+                finally:
+                    if routed_target is not None:
+                        self.experts._situ_output_buffer = previous_output
+                _check_shape(routed_latent, latent_shape, "routed experts")
 
         # Spin-wait collectives cannot safely overlap an all-device GEMM.
         # Join both compute branches first. Individual reducers retain
