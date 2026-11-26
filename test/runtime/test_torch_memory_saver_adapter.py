@@ -104,11 +104,9 @@ class CpuMemorySaver:
 @pytest.fixture(params=["cuda", "hip"])
 def memory(monkeypatch, request):
     monkeypatch.setattr(
-        torch.version, "cuda", "test" if request.param == "cuda" else None
+        torch.version, "cuda", "13.0" if request.param == "cuda" else None
     )
-    monkeypatch.setattr(
-        torch.version, "hip", "test" if request.param == "hip" else None
-    )
+    monkeypatch.setattr(torch.version, "hip", "7.0" if request.param == "hip" else None)
     monkeypatch.setattr(adapter, "_non_expandable_allocation", nullcontext)
     allocations = []
     saver = CpuMemorySaver(allocations)

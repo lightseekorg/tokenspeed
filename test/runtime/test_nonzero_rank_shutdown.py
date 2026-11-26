@@ -61,7 +61,7 @@ from types import SimpleNamespace as NS
 
 
 def emit(**fields):
-    print(json.dumps(fields), flush=True)
+    print("NODE_REPORT", json.dumps(fields), flush=True)
 
 
 if __name__ == "__main__":
@@ -143,7 +143,7 @@ if os.environ["STAND_IN"] == "stuck":
 else:
     signal.signal(signal.SIGTERM, stopped_gracefully)
 subprocess.Popen(["sleep", "300"])
-print(json.dumps({"scheduler": os.getpid(), "pdeathsig": pdeathsig.value}), flush=True)
+print("NODE_REPORT", json.dumps({"scheduler": os.getpid(), "pdeathsig": pdeathsig.value}), flush=True)
 connection.send({"status": "ready"})
 time.sleep(300)
 """
@@ -172,7 +172,10 @@ def node_rank_1(tmp_path, stand_in, **env):
     try:
         reports = []
         for line in node.stdout:
-            reports.append(json.loads(line))
+            # Device runtimes may also log to the child's stdout at startup.
+            if not line.startswith("NODE_REPORT "):
+                continue
+            reports.append(json.loads(line.removeprefix("NODE_REPORT ")))
             if "scheduler" not in reports[-1]:
                 break
         *schedulers, report = reports
