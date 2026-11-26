@@ -606,6 +606,7 @@ impl TransferPeer for FakePeer {
                         events.push(match role {
                             Role::Prefill => PdEvent::Succeeded(rid.clone()),
                             _ => PdEvent::RemotePrefillDone(RemotePrefill {
+                                bootstrap_topk_row: None,
                                 rid: rid.clone(),
                                 bootstrap_token: room.sent.expect("sent with the KV"),
                                 kv_ready_at: (
@@ -628,7 +629,7 @@ impl TransferPeer for FakePeer {
         Ok(events)
     }
 
-    fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>) {}
+    fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>, _bootstrap_topk_row: Option<Vec<u8>>) {}
 
     fn has_in_flight(&self) -> bool {
         !self.tracked.is_empty()
@@ -1752,6 +1753,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             reasoning: None,
             reasoning_usage: None,
             logprobs: LogprobServability {
+                full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
                 pipeline_parallel: pipeline,

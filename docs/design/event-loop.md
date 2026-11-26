@@ -91,6 +91,28 @@ interpret an LCM block as a fixed-size token page.
 EPD encode-mode metric ownership and units are documented in
 [encoder-metrics.md](encoder-metrics.md).
 
+## Binary full-vocabulary outputs
+
+A request may set `return_full_vocab_topk` and select the server's fixed
+`--full-vocab-top-k` width through `top_logprobs_num`. Ingress requires
+non-streaming sampled logprobs, a blockwise normalizer and the unmodified
+full-vocabulary temperature-one distribution; pipeline parallelism is refused.
+This does not change the semantics of ordinary requests in the same batch.
+
+The forward reports one `(sampled_logprob, packed_row)` per output-token slot,
+including verification padding. The existing commit loop selects accepted
+positions, validates rows and appends only emitted tokens, stopping at the
+same condition as token output. The request owns the packed bytes, which the
+transport sends as `output_full_vocab_topk` (MessagePack binary). Public
+frontends decide how to consume these bytes; the event loop performs no
+external storage or publication I/O.
+
+P/D completion carries the first token's packed row beside its sampled
+logprob. Decode validates and owns it before appending later decode rows.
+Missing or invalid rows abort the requesting sequence rather than producing
+misaligned output; older peers can omit the frame only for ordinary requests.
+
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new

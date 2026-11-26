@@ -160,6 +160,7 @@ fn generate_text() {
     check_add(
         "generate_text",
         TokenizedGenerateReqInput {
+            return_full_vocab_topk: false,
             rid: Some(StrOrList::One(s("r-text"))),
             http_worker_ipc: Some(s("ipc:///tmp/worker")),
             input_text: Some(s("héllo wörld")),
@@ -523,6 +524,7 @@ fn output_from_an_older_producer_defaults_the_load_tail() {
 /// A batch whose required columns are empty and whose tail is the default.
 fn no_tail() -> BatchTokenIDOutSlim {
     BatchTokenIDOutSlim {
+        output_full_vocab_topk: Vec::new(),
         rids: None,
         output_ids: vec![],
         finished_reasons: vec![],

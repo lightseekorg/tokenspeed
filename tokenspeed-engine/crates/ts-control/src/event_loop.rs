@@ -3308,6 +3308,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             done.bootstrap_token,
                             done.cached_tokens,
                             done.bootstrap_logprob,
+                            done.bootstrap_topk_row,
                             done.kv_ready_at,
                         );
                     }
@@ -3373,6 +3374,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             rid,
                             state.cached_tokens,
                             state.output_logprobs.first().copied(),
+                            (state.full_vocab_top_k > 0).then(|| state.output_full_vocab_topk.clone()),
                         );
                     }
                 }

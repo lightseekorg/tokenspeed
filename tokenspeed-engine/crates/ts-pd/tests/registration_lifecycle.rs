@@ -250,6 +250,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
     assert_eq!(
         event,
         PdEvent::RemotePrefillDone(RemotePrefill {
+            bootstrap_topk_row: None,
             rid: "original".to_owned(),
             bootstrap_token: 777,
             cached_tokens: 128,
@@ -314,6 +315,7 @@ fn abort_room_ignores_a_room_owned_by_an_active_prefill_request() {
     assert_eq!(
         event,
         PdEvent::RemotePrefillDone(RemotePrefill {
+            bootstrap_topk_row: None,
             rid: "original".to_owned(),
             bootstrap_token: 555,
             cached_tokens: 0,

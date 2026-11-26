@@ -206,6 +206,7 @@ pub fn limits(config: &Config) -> IngressLimits {
         reasoning: None,
         reasoning_usage: None,
         logprobs: LogprobServability {
+            full_vocab_top_k: 0,
             supports_prompt_logprobs: true,
             logprob_order: "torch".into(),
             pipeline_parallel: false,

@@ -114,7 +114,12 @@ def _generate_minimal() -> list[bytes]:
     # Unnormalized defaults: the decoder must not invent normalized values.
     return _add(
         TokenizedGenerateReqInput(
-            rid="r-min", input_ids=[1, 2, 3], sampling_params=SamplingParams()
+            cache_group_id=None,
+            shared_prefix_tokens=[],
+            return_full_vocab_topk=False,
+            rid="r-min",
+            input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
         )
     )
 
@@ -155,6 +160,9 @@ def _generate_text() -> list[bytes]:
     sampling_params.normalize(tokenizer=None)
     return _add(
         TokenizedGenerateReqInput(
+            cache_group_id=None,
+            shared_prefix_tokens=[],
+            return_full_vocab_topk=False,
             rid="r-text",
             http_worker_ipc="ipc:///tmp/worker",
             input_text="héllo wörld",
@@ -236,6 +244,9 @@ def _generate_multimodal() -> list[bytes]:
     sampling_params.normalize(tokenizer=None)
     return _add(
         TokenizedGenerateReqInput(
+            cache_group_id=None,
+            shared_prefix_tokens=[],
+            return_full_vocab_topk=False,
             rid="r-mm",
             input_ids=list(range(60)),
             sampling_params=sampling_params,
@@ -392,6 +403,7 @@ def _control_output_internal_state() -> list[bytes]:
 
 def _output_slim() -> list[bytes]:
     batch = BatchTokenIDOutSlim(
+        output_full_vocab_topk=[],
         rids=["a", "b", "c"],
         output_ids=[[1, 2], [], [300000]],
         finished_reasons=["", "stop", "abort"],
@@ -416,6 +428,7 @@ def _output_slim_tail() -> list[bytes]:
     # The columns a frontend renders beyond the tokens: finish details,
     # speculation, prompt logprobs and top-k alternatives.
     batch = BatchTokenIDOutSlim(
+        output_full_vocab_topk=[],
         rids=["a", "b"],
         output_ids=[[7], [8]],
         finished_reasons=["stop", "abort"],

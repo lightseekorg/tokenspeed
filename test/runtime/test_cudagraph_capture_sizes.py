@@ -70,6 +70,8 @@ def _config(
         model_is_mrope=False,
         autotune_cache_key=None,
         prefill_only=False,
+        full_vocab_top_k=0,
+        full_vocab_top_k_solution=None,
         input_logprob_chunk_tokens=1024,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,

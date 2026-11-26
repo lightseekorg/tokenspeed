@@ -68,11 +68,27 @@ def completed_result(
         results.input_token_logprobs is not None
         or results.input_top_logprobs_val is not None
         or results.output_top_logprobs_val is not None
+        or results.full_vocab_topk is not None
     ):
         logprobs = (
             result_buffer(results.input_token_logprobs),
             top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
             top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
+            (
+                list(
+                    zip(
+                        results.full_vocab_logprobs.tolist(),
+                        (
+                            row.tobytes()
+                            for row in result_buffer(results.full_vocab_topk).astype(
+                                "<i4", copy=False
+                            )
+                        ),
+                    )
+                )
+                if results.full_vocab_topk is not None
+                else None
+            ),
         )
     return (
         results.output_tokens.tolist(),

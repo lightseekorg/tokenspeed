@@ -93,6 +93,7 @@ class Completion:
     # Prompt tokens served from the prefix cache.
     cached_tokens: int = 0
     output_token_logprobs: list[float] = dataclasses.field(default_factory=list)
+    output_full_vocab_topk: bytes = b""
     # Selected-token cumulative probability diagnostics, parallel to logprobs.
     output_token_cumulative_probs: list[float] = dataclasses.field(default_factory=list)
     # The prompt logprobs (None for the first position) and their tokens.
@@ -114,6 +115,7 @@ class Completion:
             )
         self.output_ids.extend(chunk["output_ids"])
         self.output_token_logprobs.extend(chunk["output_token_logprobs"])
+        self.output_full_vocab_topk += chunk["output_full_vocab_topk"]
         self.output_token_cumulative_probs.extend(cumulative_probs)
         self.finish_reason = chunk["finish_reason"]
         self.finish_details = chunk["finish_details"]

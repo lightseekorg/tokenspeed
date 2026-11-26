@@ -476,6 +476,10 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
     dict.set_item("reasoning_tokens", chunk.reasoning_tokens)?;
     dict.set_item("output_token_logprobs", chunk.output_token_logprobs)?;
     dict.set_item(
+        "output_full_vocab_topk",
+        PyBytes::new(py, &chunk.output_full_vocab_topk),
+    )?;
+    dict.set_item(
         "output_token_cumulative_probs",
         chunk.output_token_cumulative_probs,
     )?;

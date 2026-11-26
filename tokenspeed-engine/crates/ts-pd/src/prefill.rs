@@ -302,6 +302,7 @@ struct State {
     failed_sessions: HashMap<String, Instant>,
     cached_tokens: HashMap<u64, i64>,
     bootstrap_logprobs: HashMap<u64, f64>,
+    bootstrap_topk_rows: HashMap<u64, Vec<u8>>,
     /// Rooms whose KV streams layerwise.
     layerwise_rooms: HashSet<u64>,
     /// Layerwise rooms' bootstrap payloads, from their remote decode.
@@ -432,6 +433,7 @@ impl State {
         self.destinations.remove(&room);
         self.cached_tokens.remove(&room);
         self.bootstrap_logprobs.remove(&room);
+        self.bootstrap_topk_rows.remove(&room);
         self.layerwise_rooms.remove(&room);
         self.prefill_metadata.remove(&room);
         self.announced.remove(&room);
@@ -1226,7 +1228,7 @@ impl Shared {
         bootstrap_token: i64,
         spec_candidate_ids: &Option<Vec<i32>>,
     ) {
-        let (cached_tokens, bootstrap_logprob) = {
+        let (cached_tokens, bootstrap_logprob, bootstrap_topk_row) = {
             let state = self.state();
             if state.ended(room) {
                 return;
@@ -1234,6 +1236,7 @@ impl Shared {
             (
                 state.cached_tokens.get(&room).copied().unwrap_or(0),
                 state.bootstrap_logprobs.get(&room).copied(),
+                state.bootstrap_topk_rows.get(&room).cloned(),
             )
         };
         let message = StatusMessage {
@@ -1244,6 +1247,7 @@ impl Shared {
             spec_candidate_ids: spec_candidate_ids.clone(),
             cached_tokens,
             bootstrap_logprob,
+            bootstrap_topk_row,
         };
         for registration in registrations {
             self.notify((registration.endpoint.clone(), registration.port), &message);
@@ -2103,6 +2107,7 @@ impl TransferPeer for PrefillPeer {
             let mut state = self.shared.state();
             state.cached_tokens.remove(&room);
             state.bootstrap_logprobs.remove(&room);
+            state.bootstrap_topk_rows.remove(&room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
             if state.cancelled.contains_key(&room) {
                 state.rooms.update(room, TransferPoll::Failed);
@@ -2366,7 +2371,13 @@ impl TransferPeer for PrefillPeer {
         );
     }
 
-    fn record_usage(&mut self, rid: &str, cached_tokens: i64, bootstrap_logprob: Option<f64>) {
+    fn record_usage(
+        &mut self,
+        rid: &str,
+        cached_tokens: i64,
+        bootstrap_logprob: Option<f64>,
+        bootstrap_topk_row: Option<Vec<u8>>,
+    ) {
         let Some(sender) = self.senders.get(rid) else {
             return;
         };
@@ -2377,6 +2388,9 @@ impl TransferPeer for PrefillPeer {
         state.cached_tokens.insert(sender.room, cached_tokens);
         if let Some(logprob) = bootstrap_logprob {
             state.bootstrap_logprobs.insert(sender.room, logprob);
+        }
+        if let Some(row) = bootstrap_topk_row {
+            state.bootstrap_topk_rows.insert(sender.room, row);
         }
     }
 }

@@ -109,6 +109,8 @@ wire_struct! {
         pub peer_holder: Option<String> = None,
         /// Router estimate of additional usable peer tokens beyond the local prefix.
         pub peer_expected_tokens: Option<u64> = None,
+        /// Request binary full-vocabulary head/tail rows, with top_logprobs_num K.
+        pub return_full_vocab_topk: bool = false,
     }
 }
 
@@ -145,6 +147,7 @@ impl TokenizedGenerateReqInput {
             shared_prefix_tokens: Vec::new(),
             peer_holder: None,
             peer_expected_tokens: None,
+            return_full_vocab_topk: false,
         }
     }
 }

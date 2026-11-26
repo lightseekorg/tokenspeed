@@ -111,6 +111,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     assert exported[7][1][1].tolist() == [[70000, 1], [70001, 2]]
     assert exported[7][2][0].tolist() == [[-0.5, -2.0]]
     assert exported[7][2][1].tolist() == [[7, 8]]
+    assert exported[7][3] is None
     del result
     gc.collect()
     assert exported[8].tolist() == [0.875]

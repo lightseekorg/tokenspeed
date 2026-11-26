@@ -40,6 +40,7 @@ pub mod handshake;
 pub mod msgpack;
 pub mod multimodal;
 pub mod output;
+pub mod topk;
 pub mod request;
 pub mod request_timing;
 pub mod sampling;

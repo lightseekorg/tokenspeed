@@ -839,6 +839,9 @@ class ServerArgs:
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Fixed graph width for opt-in full-vocabulary binary output; 0 disables it.
+    full_vocab_top_k: int = 0
+    full_vocab_top_k_solution: str | None = None
     # Optional diagnostics over the same distribution as output logprobs.
     enable_output_cumulative_probs: bool = False
     # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
@@ -1029,6 +1032,7 @@ class ServerArgs:
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
+        self.validate_full_vocab_topk()
         self.validate_output_cumulative_probs()
         self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
@@ -1141,6 +1145,39 @@ class ServerArgs:
             raise ValueError(
                 "V4.1 adaptive verification requires chain sampling "
                 "and TP synchronization"
+            )
+
+    def validate_full_vocab_topk(self):
+        from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
+        from tokenspeed.runtime.utils.env import envs
+
+        if self.full_vocab_top_k == 0:
+            return
+        if not 1 <= self.full_vocab_top_k <= 128:
+            raise ValueError("--full-vocab-top-k must be 0 (off) or between 1 and 128")
+        if not self.full_vocab_top_k_solution:
+            raise ValueError(
+                "--full-vocab-top-k requires an explicit --full-vocab-top-k-solution"
+            )
+        if (
+            not self.enable_output_logprobs
+            or self.logprob_order not in BLOCKWISE_LOGPROB_ORDERS
+        ):
+            raise ValueError(
+                "--full-vocab-top-k requires output logprobs and blockwise logprob order"
+            )
+        if self.mapping.has_pp or self.dp_sampling:
+            raise ValueError(
+                "--full-vocab-top-k requires full logits on each sampler and no pipeline"
+            )
+        if (
+            self.synthetic_acceptance_length is not None
+            or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
+        ):
+            raise ValueError("--full-vocab-top-k does not support synthetic acceptance")
+        if self.eagle_harness and self.speculative_exec_mode == 2:
+            raise ValueError(
+                "--full-vocab-top-k does not support synthetic harness output tokens"
             )
 
     def validate_output_cumulative_probs(self):
@@ -5128,6 +5165,18 @@ class ServerArgs:
             dest="enable_replay_ssm",
             action="store_true",
             help="Deprecated: ReplaySSM is on by default.",
+        )
+        parser.add_argument(
+            "--full-vocab-top-k",
+            type=int,
+            default=ServerArgs.full_vocab_top_k,
+            help="Fixed K (1..128) for opt-in binary full-vocabulary head/tail output; 0 disables it.",
+        )
+        parser.add_argument(
+            "--full-vocab-top-k-solution",
+            type=str,
+            default=ServerArgs.full_vocab_top_k_solution,
+            help="Explicit block-sum-exp solution for full-vocabulary binary scores.",
         )
         parser.add_argument(
             "--enable-output-logprobs",

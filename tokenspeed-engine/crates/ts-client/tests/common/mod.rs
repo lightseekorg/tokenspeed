@@ -352,6 +352,7 @@ fn step(
 ) -> Vec<Bytes> {
     let token = 1000 * i32::from(index) + k as i32;
     EngineOutput::Batch(Box::new(BatchTokenIDOutSlim {
+        output_full_vocab_topk: Vec::new(),
         rids: Some(vec![rid.to_owned()]),
         output_ids: vec![if finish == Some("abort") {
             vec![]

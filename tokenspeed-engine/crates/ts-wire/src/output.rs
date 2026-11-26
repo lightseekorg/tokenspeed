@@ -20,6 +20,8 @@
 
 //! Per-step outputs from the engine to a frontend (`engine/io_struct.py`).
 
+use bytes::Bytes;
+
 use crate::{
     codec::Dict,
     error::{Error, Result},
@@ -105,6 +107,8 @@ wire_struct! {
         pub num_waiting_uncached_tokens: Option<i64> = None,
         /// Request timing metadata only on terminal rows; absent on older producers.
         pub request_timing: Vec<Option<RequestTiming>> = Vec::new(),
+        /// Packed little-endian full-vocabulary rows for each request.
+        pub output_full_vocab_topk: Vec<Bytes> = Vec::new(),
     }
 }
 
@@ -165,6 +169,8 @@ pub struct RequestOutput<'a> {
     pub output_top_logprobs: Option<TopLogprobRows<'a>>,
     /// The terminal request boundaries, when the producer reports them.
     pub request_timing: Option<&'a RequestTiming>,
+    /// Packed rows for this chunk, empty unless requested.
+    pub output_full_vocab_topk: &'a [u8],
 }
 
 impl BatchTokenIDOutSlim {
@@ -222,6 +228,7 @@ impl BatchTokenIDOutSlim {
             ),
             ("reasoning_tokens", self.reasoning_tokens.len()),
             ("request_timing", self.request_timing.len()),
+            ("output_full_vocab_topk", self.output_full_vocab_topk.len()),
         ];
         if let Some((name, found)) = optional
             .iter()
@@ -255,6 +262,7 @@ impl BatchTokenIDOutSlim {
         Ok((0..len).map(move |i| RequestOutput {
             request_timing: self.request_timing.get(i).and_then(Option::as_ref),
             rid: &rids[i],
+            output_full_vocab_topk: self.output_full_vocab_topk.get(i).map_or(&[], Bytes::as_ref),
             output_ids: &self.output_ids[i],
             finish_reason: Some(self.finished_reasons[i].as_str()).filter(|r| !r.is_empty()),
             prompt_tokens: self.prompt_tokens[i],

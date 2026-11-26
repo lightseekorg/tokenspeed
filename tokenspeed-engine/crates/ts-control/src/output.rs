@@ -93,6 +93,8 @@ pub struct ForwardResult {
     /// The top-k alternatives of each prefill row's sampled token, in
     /// prefill output order, when the forward asked for them.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Binary rows and their shared-normalizer sampled logprobs, including verify padding.
+    pub full_vocab_topk: Option<Vec<(f64, Vec<u8>)>>,
 }
 
 pub use ts_wire::output::TopLogprobs;
@@ -176,6 +178,7 @@ impl ForwardResult {
             // A pipeline computes no alternatives: the ingress refuses them.
             input_top_logprobs: None,
             output_top_logprobs: None,
+            full_vocab_topk: None,
         })
     }
 }
@@ -323,6 +326,8 @@ pub struct StreamedOutput {
     pub output_top_logprobs: Option<TopLogprobs>,
     /// Terminal request timing metadata; absent from intermediate outputs.
     pub request_timing: Option<ts_wire::RequestTiming>,
+    /// Validated rows for exactly output_ids.
+    pub output_full_vocab_topk: Vec<u8>,
 }
 
 /// What committing a forward produced.
@@ -1080,6 +1085,7 @@ impl OutputProcessor {
         bootstrap_token: i32,
         cached_tokens: i64,
         bootstrap_logprob: Option<f64>,
+        bootstrap_topk_row: Option<Vec<u8>>,
         kv_ready_at: (SystemTime, Instant),
     ) {
         let Some(state) = self.states.get_mut(rid) else {
@@ -1092,6 +1098,19 @@ impl OutputProcessor {
             trace.transfer_done_ms = Some(trace.ms());
         }
         state.cached_tokens = cached_tokens;
+        if state.full_vocab_top_k > 0 {
+            let packed = bootstrap_topk_row.zip(bootstrap_logprob).and_then(|(mut row, logprob)| {
+                ts_wire::topk::validate_row(&mut row, bootstrap_token, logprob, state.full_vocab_top_k, state.full_vocab_topk_vocab_size)
+                    .is_ok().then_some(row)
+            });
+            match packed {
+                Some(row) => state.output_full_vocab_topk.extend(row),
+                None => {
+                    state.finished_reason = Some(FinishReason::abort("remote prefill omitted or corrupted its full-vocabulary row"));
+                    return;
+                }
+            }
+        }
         state.output_ids.push(bootstrap_token);
         state.request_timing.kv_ready(
             EventStamp::at(kv_ready_at.0, kv_ready_at.1),
@@ -1386,7 +1405,7 @@ impl OutputProcessor {
             let chunk_len = i64::from(batch.input_lengths[i]);
             let mut row = (0, 0, 0);
             if let Some(state) = state {
-                if state.return_logprob {
+                if state.return_logprob && state.full_vocab_top_k == 0 {
                     plan.sampled_top_k = plan.sampled_top_k.max(state.top_logprobs_num);
                 }
                 let lo = chunk_start.max(state.logprob_start_len);
@@ -1546,6 +1565,16 @@ impl OutputProcessor {
             }
         }
 
+        if let Some(packed) = &result.full_vocab_topk {
+            if packed.len() != result.output_tokens.len() {
+                return Err(CommitError::TokenColumn {
+                    tokens: result.output_tokens.len(),
+                    column: "full_vocab_topk",
+                    found: packed.len(),
+                });
+            }
+        }
+
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
         let (stats_now, step, prefilling_others) =
@@ -1606,6 +1635,7 @@ impl OutputProcessor {
                 .output_token_cumulative_probs
                 .as_ref()
                 .map(|probs| window(probs, pt, output_length));
+            let model_full_vocab = result.full_vocab_topk.as_ref().map(|rows| window_ref(rows, pt, output_length));
             let is_decode = i >= batch.num_extends;
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
@@ -1742,7 +1772,29 @@ impl OutputProcessor {
                 _ => -1,
             };
             let before = state.output_ids.len();
+            let mut invalid_full_vocab = false;
             for (j, &token) in model_ids.iter().enumerate() {
+                let full_logprob = if state.full_vocab_top_k > 0 {
+                    match model_full_vocab.and_then(|rows| rows.get(j)) {
+                        Some((logprob, packed)) => {
+                            let mut packed = packed.clone();
+                            if let Err(error) = ts_wire::topk::validate_row(&mut packed, token, *logprob, state.full_vocab_top_k, state.full_vocab_topk_vocab_size) {
+                                state.finished_reason = Some(FinishReason::abort(error.to_string()));
+                                invalid_full_vocab = true;
+                                break;
+                            }
+                            state.output_full_vocab_topk.extend(packed);
+                            Some(*logprob)
+                        }
+                        _ => {
+                            state.finished_reason = Some(FinishReason::abort("full-vocabulary export is missing or invalid for an accepted token"));
+                            invalid_full_vocab = true;
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
                 state.output_ids.push(token);
                 if let Some(tokens) = &mut state.reasoning_tokens {
                     tokens.push([token]);
@@ -1759,8 +1811,8 @@ impl OutputProcessor {
                     }
                 }
                 if state.return_logprob {
-                    if let Some(lp) = model_logprobs.as_ref().and_then(|lps| lps.get(j)) {
-                        state.output_logprobs.push(*lp);
+                    if let Some(lp) = full_logprob.or_else(|| model_logprobs.as_ref().and_then(|lps| lps.get(j)).copied()) {
+                        state.output_logprobs.push(lp);
                     }
                     if let Some(prob) = model_cumulative_probs
                         .as_ref()
@@ -1844,7 +1896,7 @@ impl OutputProcessor {
             // P role: the final chunk's drafter candidates ride its result,
             // so the remote decode the scheduler emits is self-contained.
             let mut spec_candidate_ids = Vec::new();
-            if self.role == Role::Prefill && !model_ids.is_empty() && !nan_detected {
+            if self.role == Role::Prefill && !model_ids.is_empty() && !nan_detected && !invalid_full_vocab {
                 if let Some(candidates) =
                     result.next_input_ids.as_ref().and_then(|rows| rows.get(i))
                 {
@@ -1867,7 +1919,7 @@ impl OutputProcessor {
             extend.spec_candidate_ids = spec_candidate_ids;
             committed.events.push(extend);
 
-            if self.role == Role::Prefill && !nan_detected {
+            if self.role == Role::Prefill && !nan_detected && !invalid_full_vocab {
                 // A numerically corrupted prompt's KV must never transfer:
                 // it falls through to emit its terminal abort (unless the
                 // client already cancelled) and send Abort to stop the remote
@@ -2037,6 +2089,7 @@ impl OutputProcessor {
             spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
             input_logprobs,
             output_top_logprobs,
+            output_full_vocab_topk: state.output_full_vocab_topk.get(sent * (2 + 2 * state.full_vocab_top_k) * 4..).unwrap_or(&[]).to_vec(),
         })
     }
 
@@ -2298,6 +2351,7 @@ mod tests {
             input_token_logprobs: None,
             input_top_logprobs: None,
             output_top_logprobs: None,
+            full_vocab_topk: None,
         }
     }
 
@@ -2563,7 +2617,7 @@ mod tests {
                             10,
                             1,
                             None,
-                            (SystemTime::now(), Instant::now()),
+                            None, (SystemTime::now(), Instant::now()),
                         );
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -2688,7 +2742,7 @@ mod tests {
             let remote_admitted = trace.remote_admitted_ms.unwrap();
             assert!(trace.planned_ms.is_none());
 
-            processor.remote_prefill_done("r", 10, 0, None, (SystemTime::now(), Instant::now()));
+            processor.remote_prefill_done("r", 10, 0, None, None, (SystemTime::now(), Instant::now()));
             processor.mark_planned(&["r".into()], false);
             processor.mark_scheduled(&["r".into()]);
             let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
@@ -2815,7 +2869,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 4, 8, &[]);
-        p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert!(p.state("r").unwrap().stream_output_timing.is_none());
         assert_eq!(stream_at(&mut p, "r", 100.0).unwrap().output_ids, [7]);
         p.states.get_mut("r").unwrap().output_ids.extend([8, 9]);
@@ -2850,7 +2904,7 @@ mod tests {
             );
             register(&mut p, "r", 4, 3, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds() - 1.0;
-            p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
+            p.remote_prefill_done("r", 7, 0, None, None, (SystemTime::now(), Instant::now()));
             stream_at(&mut p, "r", wall_seconds()).unwrap();
             let second = p
                 .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
@@ -2979,11 +3033,11 @@ mod tests {
             None,
         );
         register(&mut p, "one", 4, 1, &[]);
-        p.remote_prefill_done("one", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("one", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.finish_remote_prefill_only("one").released, ["one"]);
 
         register(&mut p, "two", 4, 2, &[]);
-        p.remote_prefill_done("two", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("two", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let committed = p
             .commit(&batch(&[("two", 1, 0, 4)], 0), None, &result(&[8], &[1]))
             .unwrap();
@@ -3018,19 +3072,19 @@ mod tests {
         register(&mut p, "a", 4, 8, &[]);
         assert!(p.take_decode_ready_at("a").is_none());
         let before = Instant::now();
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let after = Instant::now();
         let ready = p.take_decode_ready_at("a").unwrap();
         assert!(before <= ready && ready <= after);
         assert!(p.take_decode_ready_at("a").is_none());
 
         register(&mut p, "cancelled", 4, 8, &[]);
-        p.remote_prefill_done("cancelled", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("cancelled", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         p.states.get_mut("cancelled").unwrap().to_abort = true;
         assert!(p.take_decode_ready_at("cancelled").is_none());
 
         register(&mut p, "finished", 4, 1, &[]);
-        p.remote_prefill_done("finished", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("finished", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         p.finish_remote_prefill_only("finished");
         assert!(p.take_decode_ready_at("finished").is_none());
     }
@@ -3048,7 +3102,7 @@ mod tests {
             None,
         );
         register(&mut p, "a", 4, 8, &[]);
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert!(p.take_decode_ready_at("a").is_none());
     }
 
@@ -3078,7 +3132,7 @@ mod tests {
             &grammar,
             &state.prompt_ids,
         ));
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let state = p.state("a").expect("still registered");
         assert_eq!(state.first_token_time, 0.0);
         assert_eq!(state.output_ids, vec![7]);
@@ -3102,7 +3156,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 3, 8, &[]);
-        p.remote_prefill_done("r", 9, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 9, 0, None, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.state("r").unwrap().first_token_time, 0.0);
         p.commit(&batch(&[("r", 1, 0, 3)], 0), None, &result(&[10], &[1]))
             .unwrap();
@@ -3553,7 +3607,7 @@ mod tests {
         );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 9, 0, Some(-0.25), None, (SystemTime::now(), Instant::now()));
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             ..result(&[10], &[1])
@@ -3583,7 +3637,7 @@ mod tests {
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 9, 0, Some(-0.25), None, (SystemTime::now(), Instant::now()));
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             output_token_cumulative_probs: Some(vec![0.375]),
@@ -3986,7 +4040,7 @@ mod tests {
             );
             register(&mut p, "r", 4, max_new, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds();
-            p.remote_prefill_done("r", 7, 2, None, (SystemTime::now(), Instant::now()));
+            p.remote_prefill_done("r", 7, 2, None, None, (SystemTime::now(), Instant::now()));
             let (_, prefill_done, first_token, _, _) = p
                 .state("r")
                 .unwrap()

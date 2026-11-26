@@ -405,6 +405,7 @@ pub fn output_batch(
         input_top_logprobs_idx: Vec::with_capacity(n),
         output_top_logprobs_val: Vec::with_capacity(n),
         output_top_logprobs_idx: Vec::with_capacity(n),
+        output_full_vocab_topk: Vec::with_capacity(n),
     };
     for output in outputs {
         batch.request_timing.push(output.request_timing);
@@ -445,6 +446,7 @@ pub fn output_batch(
         let (top_values, top_ids) = output.output_top_logprobs.unwrap_or_default();
         batch.output_top_logprobs_val.push(top_values);
         batch.output_top_logprobs_idx.push(top_ids);
+        batch.output_full_vocab_topk.push(output.output_full_vocab_topk.into());
     }
     // Each optional column is per request only in a frame where some
     // request has an entry.
@@ -462,6 +464,9 @@ pub fn output_batch(
     frame_column(&mut batch.input_top_logprobs_idx);
     frame_column(&mut batch.output_top_logprobs_val);
     frame_column(&mut batch.output_top_logprobs_idx);
+    if batch.output_full_vocab_topk.iter().all(|rows| rows.is_empty()) {
+        batch.output_full_vocab_topk.clear();
+    }
     frame_column(&mut batch.output_token_cumulative_probs_val);
     batch
 }
@@ -507,8 +512,14 @@ impl Frontend for EngineTransport {
     }
 
     fn reply(&mut self, mut output: ControlOutput) {
-        if let ControlOutput::GetAdmission(snapshot) = &mut output {
-            snapshot.dp_rank = i64::from(self.engine_index);
+        match &mut output {
+            ControlOutput::GetAdmission(snapshot) => {
+                snapshot.dp_rank = i64::from(self.engine_index);
+            }
+            ControlOutput::GetSharedPrefixPublication(snapshot) => {
+                snapshot.dp_rank = i64::from(self.engine_index);
+            }
+            _ => {}
         }
         if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
             publication.dp_rank = i64::from(self.engine_index);
@@ -811,6 +822,7 @@ mod tests {
     fn a_round_s_outputs_go_out_with_the_engine_index_and_load() {
         let (mut transport, _requests, mut outputs) = transport(2);
         let output = StreamedOutput {
+            output_full_vocab_topk: Vec::new(),
             rid: "r0".to_owned(),
             request_timing: None,
             output_ids: vec![7, 8],

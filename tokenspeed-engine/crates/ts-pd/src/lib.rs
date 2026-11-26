@@ -33,6 +33,12 @@
 //! rendezvous through is here too ([`bootstrap`]). Cache registrations carry
 //! an independent cache identity as well as a transport address; both P/D
 //! nodes must use this protocol version.
+//!
+//! Completion metadata carries the prefill's first-token logprob and optional
+//! packed full-vocabulary Top-K row beside the token and draft candidates. The
+//! row is owned CPU bytes, retained for the room's lifetime and copied into the
+//! completion frame. Decode moves it into the request's output; the transfer
+//! peer does not normalize scores or publish application-owned blobs.
 
 mod batch;
 pub mod bootstrap;

@@ -94,6 +94,8 @@ pub struct RemotePrefill {
     pub cached_tokens: i64,
     /// The first token's logprob, if the prefill node sent one.
     pub bootstrap_logprob: Option<f64>,
+    /// Owned packed full-vocabulary Top-K row for the first output token.
+    pub bootstrap_topk_row: Option<Vec<u8>>,
     /// The prefill node's drafter candidates, if any.
     pub spec_candidate_ids: Option<Vec<i32>>,
     /// The request's slot here.
@@ -162,8 +164,14 @@ pub trait TransferPeer {
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError>;
 
     /// P role: a committed prompt's usage, sent with its completion: the
-    /// prompt tokens served from the cache and the first token's logprob.
-    fn record_usage(&mut self, rid: &str, cached_tokens: i64, bootstrap_logprob: Option<f64>);
+    /// prompt tokens served from the cache and the first token's scores.
+    fn record_usage(
+        &mut self,
+        rid: &str,
+        cached_tokens: i64,
+        bootstrap_logprob: Option<f64>,
+        bootstrap_topk_row: Option<Vec<u8>>,
+    );
 
     /// The scheduling loop ended `rid` while its transfer may still run:
     /// stop it. Unless it succeeds first, [`PdEvent::Stopped`] reports it

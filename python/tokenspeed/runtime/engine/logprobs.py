@@ -50,6 +50,7 @@ class LogprobServability:
     pipeline_parallel: bool
     disaggregated: bool
     vocab_size: int
+    full_vocab_top_k: int
 
     @classmethod
     def of(
@@ -65,4 +66,5 @@ class LogprobServability:
             ),
             disaggregated=server_args.disaggregation_mode != "null",
             vocab_size=vocab_size,
+            full_vocab_top_k=server_args.full_vocab_top_k,
         )

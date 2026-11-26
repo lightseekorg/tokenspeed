@@ -37,6 +37,7 @@ def _chunk(ids, logprobs, cumulative_probs, reason, reasoning_tokens=0):
     return {
         "output_ids": ids,
         "output_token_logprobs": logprobs,
+        "output_full_vocab_topk": b"",
         "output_token_cumulative_probs": cumulative_probs,
         "finish_reason": reason,
         "finish_details": None if reason is None else {"type": reason},
@@ -75,6 +76,20 @@ def test_completion_without_diagnostics_keeps_the_column_empty():
     completion = Completion()
     completion.add(_chunk([4], [-0.2], [], "length"))
     assert completion.output_token_cumulative_probs == []
+
+
+def test_completion_preserves_packed_score_bits_across_chunks():
+    import struct
+
+    completion = Completion()
+    rows = [struct.pack("<iIif", token, 0x80000000, token, -0.0) for token in (4, 9)]
+    for token, row in zip((4, 9), rows):
+        chunk = _chunk([token], [-0.0], [], None)
+        chunk["output_full_vocab_topk"] = row
+        completion.add(chunk)
+    completion.add(_chunk([], [], [], "length"))
+    assert completion.output_ids == [4, 9]
+    assert completion.output_full_vocab_topk == b"".join(rows)
 
 
 @pytest.mark.parametrize("logprobs,probs", [([-0.2], [0.8, 0.9]), ([], [0.8])])

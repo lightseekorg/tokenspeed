@@ -85,6 +85,8 @@ pub struct LogprobServability {
     pub supports_prompt_logprobs: bool,
     /// `--logprob-order`; the top-k alternatives need `torch`.
     pub logprob_order: String,
+    /// Fixed graph width of the optional binary full-vocabulary output.
+    pub full_vocab_top_k: usize,
     /// The engine runs pipeline stages.
     pub pipeline_parallel: bool,
     /// The engine is one role of a disaggregated deployment.
@@ -341,6 +343,11 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
             top_logprobs_num: view.top_logprobs_num.max(0) as usize,
             computes_prompt_logprobs: limits.logprobs.computes_prompt_logprobs,
         });
+        if view.full_vocab_topk {
+            state.full_vocab_top_k = limits.logprobs.full_vocab_top_k;
+            state.full_vocab_topk_vocab_size = limits.vocab_size;
+            state.output_top_logprobs = None;
+        }
     }
     let refusal = invalid
         .map(|reason| format!("Invalid request: {reason}"))
@@ -466,6 +473,8 @@ struct RequestView {
     has_multimodal_inputs: bool,
     return_logprob: bool,
     top_logprobs_num: i64,
+    full_vocab_topk: bool,
+    stream: bool,
     has_token_ids_logprob: bool,
     logprob_start_len: i64,
     /// The budget the request asked for, before it is clamped.
@@ -490,6 +499,8 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         has_multimodal_inputs: request.multimodal_inputs.is_some(),
         return_logprob: request.return_logprob,
         top_logprobs_num: request.top_logprobs_num,
+        full_vocab_topk: request.return_full_vocab_topk,
+        stream: request.stream,
         has_token_ids_logprob: request
             .token_ids_logprob
             .as_ref()
@@ -525,6 +536,30 @@ fn refusal(
             limits.max_req_input_len
         ));
     }
+    if request.full_vocab_topk {
+        let k = limits.logprobs.full_vocab_top_k;
+        if !request.return_logprob || request.stream || !(1..=128).contains(&k)
+            || !matches!(limits.logprobs.logprob_order.as_str(), "blockwise" | "blockwise-direct" | "blockwise-16384" | "blockwise-direct-16384")
+            || request.top_logprobs_num != k as i64 || k as i64 > limits.vocab_size
+            || limits.logprobs.pipeline_parallel
+        {
+            return Some("binary full-vocabulary top-k requires non-streaming output logprobs, no pipeline, and top_logprobs_num equal to --full-vocab-top-k".to_owned());
+        }
+        if request.logprob_start_len >= 0 && request.logprob_start_len < input_len as i64 - 1 {
+            return Some("binary full-vocabulary top-k reports output positions only".to_owned());
+        }
+        if params.temperature != 1.0 || params.top_p != 1.0 || params.min_p != 0.0
+            || (params.top_k != -1 && params.top_k < limits.vocab_size)
+            || params.frequency_penalty != 0.0 || params.presence_penalty != 0.0
+            || params.repetition_penalty != 1.0 || params.min_new_tokens != 0
+            || params.json_schema.is_some() || params.regex.is_some() || params.ebnf.is_some()
+            || params.structural_tag.is_some() || params.thinking_budget.is_some()
+            || params.logit_bias.as_ref().is_some_and(|v| !v.0.is_empty())
+            || params.custom_params.as_ref().is_some_and(|v| !v.0.is_empty())
+        {
+            return Some("binary full-vocabulary top-k requires the original temperature-1 model distribution without truncation, penalties, constraints or processors".to_owned());
+        }
+    }
     if request.return_logprob {
         if !limits.enable_output_logprobs {
             return Some(
@@ -533,7 +568,7 @@ fn refusal(
                     .to_owned(),
             );
         }
-        if request.top_logprobs_num != 0 {
+        if request.top_logprobs_num != 0 && !request.full_vocab_topk {
             if let Some(reason) = limits
                 .logprobs
                 .top_logprobs_refusal(request.top_logprobs_num, request.max_new_tokens)
@@ -634,6 +669,7 @@ mod tests {
             reasoning: None,
             reasoning_usage: None,
             logprobs: LogprobServability {
+                full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
                 pipeline_parallel: false,

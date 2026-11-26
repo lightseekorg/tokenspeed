@@ -561,6 +561,7 @@ impl HostConfig {
                             .getattr("supports_prompt_logprobs")?
                             .extract()?,
                         logprob_order: servability.getattr("logprob_order")?.extract()?,
+                        full_vocab_top_k: servability.getattr("full_vocab_top_k")?.extract()?,
                         pipeline_parallel: servability.getattr("pipeline_parallel")?.extract()?,
                         disaggregated: servability.getattr("disaggregated")?.extract()?,
                         lm_head_tp_under_dp: config.getattr("lm_head_tp_under_dp")?.extract()?,

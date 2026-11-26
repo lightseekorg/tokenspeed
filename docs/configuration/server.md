@@ -206,6 +206,8 @@ policy applies in eager execution, graph replay and chain verification.
 | Parameter | Purpose |
 | --- | --- |
 | `--enable-output-logprobs` | Gate for every logprob request. Off by default; the sampler gathers logprobs only when on, and a request asking for them on a server without the flag is rejected. |
+| `--full-vocab-top-k K` | Enable fixed-width binary head/tail scoring for requests with `return_full_vocab_topk=true`; 0 disables it. Requires output logprobs, a blockwise logprob order, and request `top_logprobs_num=K` (1–128). See [binary output](../design/full-vocabulary-output.md). |
+| `--full-vocab-top-k-solution SOLUTION` | Explicit block-sum-exp provider for binary full-vocabulary scoring; required when K is nonzero. Choose the provider matching the deployment's numerical contract. |
 | `--input-logprob-chunk-tokens` | Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs. Defaults to `256`. A sizing knob only: the transient per-chunk cost is about `chunk × vocab × (2 + 2 + 4)` bytes (the bf16 logits shard, the bf16 TP-gathered logits, the fp32 log-softmax), so the default costs about 256 MiB at a 128K vocabulary, and the value never changes a result (log-softmax is row-local). |
 
 A request asks for logprobs with `return_logprob`. Its output frames carry

@@ -675,7 +675,8 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2
     )
     assert sampled_top_k == 1
-    input_logprobs, input_top, output_top = logprobs
+    input_logprobs, input_top, output_top, full_vocab_topk = logprobs
+    assert full_vocab_topk is None
     assert input_logprobs.tolist() == pytest.approx([0.0, -0.1])
     assert input_top[1].tolist() == [[0, 1], [1, 2]]
     assert tuple(column.tolist() for column in output_top) == ([[-10.0]], [[100]])

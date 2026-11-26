@@ -308,13 +308,33 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     output_lengths, output_logprobs, output_cumulative_probs,
     forward_logprobs)`` for the padded batch. The sampled-token columns keep
     ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
-    never gathers prompt logprobs or top-k alternatives, so its last output is
-    None.
+    never gathers prompt logprobs or JSON top-k alternatives. Its optional binary
+    full-vocabulary rows use the same live-token slice as sampled logprobs.
     """
     tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
     if forward_logprobs is not None:
         raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
     rows = bs * max_tokens_per_req
+    if forward_logprobs is not None:
+        from tokenspeed.runtime.execution.types import ForwardLogprobs
+
+        if any(
+            value is not None
+            for value in (
+                forward_logprobs.input_token_logprobs,
+                forward_logprobs.input_top_logprobs_val,
+                forward_logprobs.input_top_logprobs_idx,
+                forward_logprobs.output_top_logprobs_val,
+                forward_logprobs.output_top_logprobs_idx,
+            )
+        ):
+            raise RuntimeError(
+                "a decode graph returned eager-only prompt or top-k logprobs"
+            )
+        forward_logprobs = ForwardLogprobs(
+            full_vocab_topk=forward_logprobs.full_vocab_topk[:rows],
+            full_vocab_logprobs=forward_logprobs.full_vocab_logprobs[:rows],
+        )
     return (
         tokens[:rows],
         lengths[:bs],
