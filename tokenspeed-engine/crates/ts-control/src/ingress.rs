@@ -85,6 +85,8 @@ pub struct LogprobServability {
     pub supports_prompt_logprobs: bool,
     /// `--logprob-order`; the top-k alternatives need `torch`.
     pub logprob_order: String,
+    /// Python's numerical configuration identifies the selected normalizer.
+    pub blockwise_logprob_order: bool,
     /// Fixed graph width of the optional binary full-vocabulary output.
     pub full_vocab_top_k: usize,
     /// The engine runs pipeline stages.
@@ -539,7 +541,7 @@ fn refusal(
     if request.full_vocab_topk {
         let k = limits.logprobs.full_vocab_top_k;
         if !request.return_logprob || request.stream || !(1..=128).contains(&k)
-            || !matches!(limits.logprobs.logprob_order.as_str(), "blockwise" | "blockwise-direct" | "blockwise-16384" | "blockwise-direct-16384")
+            || !limits.logprobs.blockwise_logprob_order
             || request.top_logprobs_num != k as i64 || k as i64 > limits.vocab_size
             || limits.logprobs.pipeline_parallel
         {
@@ -672,6 +674,7 @@ mod tests {
                 full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
+                blockwise_logprob_order: false,
                 pipeline_parallel: false,
                 disaggregated: false,
                 lm_head_tp_under_dp: false,
@@ -1203,6 +1206,31 @@ mod tests {
                     assert!(refused_message(admit(scored, &limits).unwrap())
                         .contains("inside the vocabulary"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_topk_admission_uses_the_normalizer_capability() {
+        for blockwise in [false, true] {
+            let mut limits = limits();
+            limits.enable_output_logprobs = true;
+            limits.logprobs.full_vocab_top_k = 2;
+            // Python owns the supported order names; ingress uses its verdict.
+            limits.logprobs.logprob_order = "configured-blockwise-order".to_owned();
+            limits.logprobs.blockwise_logprob_order = blockwise;
+            let request = TokenizedGenerateReqInput {
+                return_full_vocab_topk: true,
+                return_logprob: true,
+                top_logprobs_num: 2,
+                stream: false,
+                ..request("binary", vec![1, 2], SamplingParams::default())
+            };
+            let admitted = admit(request, &limits).unwrap();
+            if blockwise {
+                assert!(matches!(admitted, Admitted::Run(_)));
+            } else {
+                assert!(refused_message(admitted).contains("binary full-vocabulary top-k"));
             }
         }
     }

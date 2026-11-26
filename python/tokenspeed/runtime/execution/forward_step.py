@@ -312,8 +312,6 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     full-vocabulary rows use the same live-token slice as sampled logprobs.
     """
     tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
-    if forward_logprobs is not None:
-        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
     rows = bs * max_tokens_per_req
     if forward_logprobs is not None:
         from tokenspeed.runtime.execution.types import ForwardLogprobs
@@ -340,7 +338,7 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
         lengths[:bs],
         None if logprobs is None else logprobs[:rows],
         None if cumulative_probs is None else cumulative_probs[:rows],
-        None,
+        forward_logprobs,
     )
 
 

@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_step import live_graph_outputs
+from tokenspeed.runtime.execution.types import ForwardLogprobs
 
 
 @pytest.mark.parametrize("live_bs", [0, 1, 3])
@@ -65,10 +66,47 @@ def test_graph_replay_without_the_diagnostic_returns_none_for_it():
     assert live[2] is None and live[3] is None and live[4] is None
 
 
-def test_a_captured_decode_with_prompt_or_top_k_logprobs_is_refused():
-    from tokenspeed.runtime.execution.types import ForwardLogprobs
+@pytest.mark.parametrize("live_bs", [0, 1, 3])
+@pytest.mark.parametrize("width", [1, 4])
+def test_graph_replay_preserves_full_vocab_rows_in_live_token_order(live_bs, width):
+    padded_bs, k = 4, 2
+    rows = padded_bs * width
+    tokens = torch.arange(rows, dtype=torch.int32)
+    lengths = torch.full((padded_bs,), width, dtype=torch.int32)
+    packed = torch.arange(rows * (2 + 2 * k), dtype=torch.int32).reshape(rows, -1)
+    sampled = -torch.arange(rows, dtype=torch.float32)
+    metadata = ForwardLogprobs(full_vocab_topk=packed, full_vocab_logprobs=sampled)
 
-    metadata = ForwardLogprobs(output_top_logprobs_val=torch.tensor([[-0.5]]))
+    live = live_graph_outputs(
+        (tokens, lengths, sampled, None, metadata), live_bs, width
+    )
+    live_rows = live_bs * width
+    assert torch.equal(live[0], tokens[:live_rows])
+    assert torch.equal(live[1], lengths[:live_bs])
+    assert torch.equal(live[2], sampled[:live_rows])
+    assert live[3] is None
+    assert isinstance(live[4], ForwardLogprobs)
+    assert torch.equal(live[4].full_vocab_topk, packed[:live_rows])
+    assert torch.equal(live[4].full_vocab_logprobs, sampled[:live_rows])
+
+    # Graph replay refreshes the captured buffers in place.
+    packed.add_(100)
+    sampled.sub_(1)
+    assert torch.equal(live[4].full_vocab_topk, packed[:live_rows])
+    assert torch.equal(live[4].full_vocab_logprobs, sampled[:live_rows])
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        ForwardLogprobs(input_token_logprobs=torch.tensor([-0.5])),
+        ForwardLogprobs(input_top_logprobs_val=torch.tensor([[-0.5]])),
+        ForwardLogprobs(input_top_logprobs_idx=torch.tensor([[1]])),
+        ForwardLogprobs(output_top_logprobs_val=torch.tensor([[-0.5]])),
+        ForwardLogprobs(output_top_logprobs_idx=torch.tensor([[1]])),
+    ],
+)
+def test_a_captured_decode_with_prompt_or_top_k_logprobs_is_refused(metadata):
     with pytest.raises(RuntimeError, match="prompt or top-k"):
         live_graph_outputs((torch.zeros(1), torch.ones(1), None, None, metadata), 1, 1)
 
@@ -84,6 +122,19 @@ def _args(**overrides):
     )
     options.update(overrides)
     return ServerArgs(**options)
+
+
+def test_logprob_servability_derives_blockwise_support_from_numerical_config():
+    from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
+    from tokenspeed.runtime.engine.logprobs import LogprobServability
+
+    for order in ("torch", *BLOCKWISE_LOGPROB_ORDERS):
+        servability = LogprobServability.of(
+            _args(logprob_order=order), supports_prompt_logprobs=True, vocab_size=32768
+        )
+        assert servability.blockwise_logprob_order == (
+            order in BLOCKWISE_LOGPROB_ORDERS
+        )
 
 
 @pytest.mark.parametrize(

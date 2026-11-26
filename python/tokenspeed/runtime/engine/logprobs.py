@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
+
 
 @dataclass(frozen=True)
 class LogprobServability:
@@ -39,6 +41,8 @@ class LogprobServability:
             prompt row's activations.
         logprob_order: ``--logprob-order``; the top-k alternatives need
             ``torch``.
+        blockwise_logprob_order: Whether the selected order uses the shared
+            blockwise normalizer required for binary full-vocabulary output.
         pipeline_parallel: The engine runs pipeline stages.
         disaggregated: The engine is one role of a disaggregated deployment.
         vocab_size: The model's vocabulary size.
@@ -47,6 +51,7 @@ class LogprobServability:
     enable_output_logprobs: bool
     supports_prompt_logprobs: bool
     logprob_order: str
+    blockwise_logprob_order: bool
     pipeline_parallel: bool
     disaggregated: bool
     vocab_size: int
@@ -61,6 +66,8 @@ class LogprobServability:
             enable_output_logprobs=server_args.enable_output_logprobs,
             supports_prompt_logprobs=supports_prompt_logprobs,
             logprob_order=server_args.logprob_order,
+            blockwise_logprob_order=server_args.logprob_order
+            in BLOCKWISE_LOGPROB_ORDERS,
             pipeline_parallel=(
                 server_args.mapping is not None and server_args.mapping.has_pp
             ),

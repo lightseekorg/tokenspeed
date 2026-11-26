@@ -430,6 +430,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
                 full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
+                blockwise_logprob_order: false,
                 pipeline_parallel: false,
                 disaggregated: false,
                 lm_head_tp_under_dp: false,

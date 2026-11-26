@@ -47,6 +47,5 @@ check that the final byte count matches the emitted token count before returning
 their response. Wire producers and consumers using this feature must be updated
 together, including the P/D workers.
 
-The implementation has not been tested or numerically validated in this change.
 Selecting a batch-invariant provider does not prove trainer alignment or
 cross-topology invariance; those require separate numerical acceptance checks.

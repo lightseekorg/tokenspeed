@@ -512,14 +512,8 @@ impl Frontend for EngineTransport {
     }
 
     fn reply(&mut self, mut output: ControlOutput) {
-        match &mut output {
-            ControlOutput::GetAdmission(snapshot) => {
-                snapshot.dp_rank = i64::from(self.engine_index);
-            }
-            ControlOutput::GetSharedPrefixPublication(snapshot) => {
-                snapshot.dp_rank = i64::from(self.engine_index);
-            }
-            _ => {}
+        if let ControlOutput::GetAdmission(snapshot) = &mut output {
+            snapshot.dp_rank = i64::from(self.engine_index);
         }
         if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
             publication.dp_rank = i64::from(self.engine_index);

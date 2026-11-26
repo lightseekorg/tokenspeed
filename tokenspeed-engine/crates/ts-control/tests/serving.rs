@@ -1756,6 +1756,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
                 full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
+                blockwise_logprob_order: false,
                 pipeline_parallel: pipeline,
                 disaggregated: pd.is_some(),
                 lm_head_tp_under_dp: false,
