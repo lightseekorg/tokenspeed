@@ -1151,7 +1151,7 @@ TEST(BlockPoolRequestAwareTest, AcquireBlocksInBucketsWithAffinityClustersAndByp
 TEST(BlockPoolRequestAwareTest, WidePackingAndWideShardsWithAffinityMaintainIntrusiveListInvariants) {
     constexpr std::int32_t kParents = 8;
     constexpr std::int32_t kWidePacking = 130;  // > 64 inline occupancy mask
-    constexpr std::int32_t kWideShards = 5;     // > 4 inline intrusive links
+    constexpr std::int32_t kWideShards = 5;     // multi-shard bucket_links_ stride
     BlockPool pool(kParents, {kWidePacking, 1});
     pool.RegisterGroup(/*group_id=*/0, kWidePacking, kWideShards);
     pool.RegisterGroup(/*group_id=*/1, /*packing=*/1, /*shard_count=*/1);
@@ -1249,6 +1249,47 @@ TEST(BlockPoolRequestAwareTest, WidePackingAndWideShardsWithAffinityMaintainIntr
         }
         check_invariants();
     }
+}
+
+TEST(BlockPoolRequestAwareTest, LateWiderShardRegistrationPreservesLiveIntrusiveLinks) {
+    // Group 0 registers with 1 bucket and populates multiple partial parents at
+    // the same occupancy level before group 1 registers with 4 buckets, forcing
+    // the flat bucket_links_ table to widen while group 0's lists are live.
+    BlockPool pool(/*num_lcm_blocks=*/6, {8, 12, 1});
+    pool.RegisterGroup(/*group_id=*/2, /*packing=*/1, /*shard_count=*/1);
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/8, /*shard_count=*/1);
+
+    // Put parents 1, 2, 3 into group 0's occupancy-1 list (order: 3 -> 2 -> 1).
+    auto p1 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    auto p2 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    auto p3 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    ASSERT_EQ(p1[0]->Location().lcm_block_id, 1);
+    ASSERT_EQ(p2[0]->Location().lcm_block_id, 2);
+    ASSERT_EQ(p3[0]->Location().lcm_block_id, 3);
+    ASSERT_EQ(pool.MinimumParentOccupancy(0), 1);
+
+    // Late registration widens link_stride_ from 1 to 4 while 3 -> 2 -> 1 is live.
+    pool.RegisterGroup(/*group_id=*/1, /*packing=*/12, /*shard_count=*/4);
+    const std::array<std::int32_t, 4> loads{0, 0, 0, 0};
+    auto g1 = pool.AcquireBlocksWithAffinity(1, 5, loads, ParentAffinity{.preferred_parent = std::nullopt});
+    ASSERT_EQ(g1.size(), 5u);
+    EXPECT_EQ(g1[0]->Location().lcm_block_id, 4);
+
+    // Unlink middle element (parent 2), then advance head (parent 3) and tail
+    // (parent 1) via hole-first acquisition to prove migrated prev/next pointers.
+    p2.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+    CacheBlockRef next_hole = pool.AcquireBlock(0);
+    ASSERT_TRUE(next_hole);
+    EXPECT_EQ(next_hole->Location().lcm_block_id, 3) << "head of group 0's occupancy-1 list survived stride widening";
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 1) << "parent 1 remains reachable behind parent 3";
+
+    p3.clear();
+    next_hole.reset();
+    p1.clear();
+    g1.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 6);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 0);
 }
 
 }  // namespace

@@ -94,6 +94,7 @@ PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const Group
 std::int64_t reservedEmptyParentsForLaterGroups(const BlockPool& pool, std::span<const CacheGroup> groups,
                                                 std::span<const BlockPlacementDemand> block_demands,
                                                 std::size_t group_index) {
+    _assert(block_demands.size() == groups.size(), "every group of the admission carries its planned block demand");
     std::int64_t reserved = 0;
     for (std::size_t j = group_index + 1; j < groups.size(); ++j) {
         const std::uint32_t gid = groups[j].Id();
@@ -472,7 +473,7 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
         // A privatized Device tail already sits in this request's own parent;
         // an unprivatized prefix hit ends on a shared prefix block, so private
         // growth opens a fresh parent instead of appending beside the prefix.
-        const bool allow_tail_parent = (!had_device_hit && !had_host_hit) || (privatized_tail && !had_host_hit);
+        const bool allow_tail_parent = !had_host_hit && (!had_device_hit || privatized_tail);
         // The copy-in blocks this admission reserves, each with the block it
         // serves (acquireCopyIns), the paired ones placed by the growth.
         PairedBlocks paired{.first_slot = demand.table->NumBlocks()};

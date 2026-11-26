@@ -88,8 +88,13 @@ A fourth quantity lives outside the logical world entirely:
 the free child-slot count **per bucket** for each cache group, and per-bucket
 occupancy-indexed intrusive lists of partially filled LCM blocks (each
 occupancy level in `[1, packing - 1]` is an O(1) LIFO doubly-linked list paired
-with a bitmask for O(1) densest/sparsest lookup; intrusive links live inline on
-each parent for up to four shard buckets and grow lazily for wider sharding).
+with a bitmask for O(1) densest/sparsest lookup; intrusive links live in a
+pool-level flat table indexed by `(lcm_block_id - 1) * link_stride + bucket`
+that is allocated lazily only when a `packing > 1` group registers, leaving
+`packing == 1`-only pools with zero link-storage overhead). LIFO per-occupancy
+ordering is deterministic across mirrored ranks replaying the same operation
+sequence, though placement depends on operation history rather than
+instantaneous pool occupancy alone.
 C++ group ids are dense scheduler indices, so the scheduler supplies the
 complete packing vector when it constructs each pool. The per-group placement
 records form a vector indexed by group id, and each `GroupAvailability` stores

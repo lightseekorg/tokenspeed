@@ -904,60 +904,118 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
         }
         return plan;
     };
-    // FragmentThePool's prompts, and their pages written to the pool.
+    // MovesPublishedPagesByCopyAndKeepsTheirKeys's prompts (11 one-page
+    // prompts), and their pages written to the pool.
     std::vector<RequestSpec> prompts;
-    for (std::int32_t k = 0; k < 8; ++k) {
+    for (std::int32_t k = 0; k < 11; ++k) {
         prompts.push_back(RequestSpec{
             .request_id = "a" + std::to_string(k), .tokens = MakeTokens(kP, 100 + 50 * k), .max_new_tokens = 1});
     }
     Submit(prompts);
     miss();
-    for (int plan = 0; plan < 4 && scheduler_->RequestTokenSize("a7") != -1; ++plan) {
+    for (int plan = 0; plan < 6 && scheduler_->RequestTokenSize("a10") != -1; ++plan) {
         Land(next_plan());
     }
-    ASSERT_EQ(scheduler_->RequestTokenSize("a7"), -1);
-    for (int plan = 0; plan < 16 && (coordinator.Host().HasPendingStores() || !writing.empty()); ++plan) {
+    ASSERT_EQ(scheduler_->RequestTokenSize("a10"), -1);
+    for (int plan = 0; plan < 32 && (coordinator.Host().HasPendingStores() || !writing.empty()); ++plan) {
         next_plan();
     }
     ASSERT_FALSE(coordinator.Host().HasPendingStores());
-    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 12);
-    std::vector<CacheBlockRef> held;
-    for (std::int32_t k = 0; k < 8; ++k) {
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 6);
+    std::vector<CacheBlockRef> history;
+    std::vector<CacheBlockRef> sliding;
+    for (std::int32_t k = 0; k < 11; ++k) {
         for (const CacheKey& key :
              scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(MakeTokens(kP + 1, 100 + 50 * k)))) {
-            if (key.group_id == 0 || k > 0) {
-                held.push_back(coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Find(pool, key));
+            if (key.group_id == 0) {
+                history.push_back(coordinator.GroupPrefixIndex(0).Find(pool, key));
+            } else if (k >= 2) {
+                sliding.push_back(coordinator.GroupPrefixIndex(1).Find(pool, key));
             }
         }
     }
-    ASSERT_EQ(held.size(), 15u);
-    Submit(RequestSpec{.request_id = "R", .tokens = MakeTokens(126, 3000), .max_new_tokens = 1});
+    ASSERT_EQ(history.size(), 11u);
+    ASSERT_EQ(sliding.size(), 9u);
+    const std::vector<std::int32_t> prompt = MakeTokens(78, 3000);
+    Submit(RequestSpec{.request_id = "R", .tokens = prompt, .max_new_tokens = 1});
     miss();
-    Land(next_plan());
+    const ExecutionPlan first = next_plan();
+    const std::vector<std::int32_t> before_rows =
+        FindForwardBatch(first)->block_tables.at("full_attention").AbsoluteRows();
+    Land(first);
     // The first chunk's sixteen published blocks: four in the one write, the
     // rest queued.
     const ExecutionPlan publishes = next_plan();
     EXPECT_TRUE(FindForwardBatch(publishes)->request_ids.empty());
     ASSERT_EQ(writing.size(), 1u);
     ASSERT_TRUE(coordinator.Host().HasPendingStores());
-    held.erase(held.begin() + 1, held.end());
+
+    const std::vector<CacheKey> keys = scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(prompt));
+    std::vector<std::pair<std::int32_t, std::optional<std::size_t>>> bound_parents;
+    std::set<std::int32_t> seen_parents;
+    for (std::size_t slot = 0; slot < 8; ++slot) {
+        const std::optional<CacheBlockLocation> at =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, keys[slot]);
+        ASSERT_TRUE(at) << slot;
+        bound_parents.emplace_back(at->lcm_block_id, slot);
+        seen_parents.insert(at->lcm_block_id);
+    }
+    const std::int32_t prompt_end_parent = (before_rows.back() - 1) / 2 + 1;
+    bound_parents.emplace_back(prompt_end_parent, std::nullopt);
+    seen_parents.insert(prompt_end_parent);
+    seen_parents.insert((before_rows[8] - 1) / 2 + 1);
+    for (const CacheBlockRef& ref : history) {
+        const std::int32_t parent = ref->Location().lcm_block_id;
+        if (!seen_parents.contains(parent)) {
+            bound_parents.emplace_back(parent, std::nullopt);
+        }
+    }
+    ASSERT_EQ(bound_parents.size(), 10u);
+    std::ranges::sort(bound_parents, [](const auto& a, const auto& b) { return a.first < b.first; });
+    const std::int32_t kept_parent = bound_parents[0].first;
+    std::optional<std::size_t> moved_slot;
+    for (std::size_t idx = bound_parents.size(); idx-- > 6;) {
+        if (bound_parents[idx].second.has_value()) {
+            moved_slot = bound_parents[idx].second;
+            break;
+        }
+    }
+    ASSERT_TRUE(moved_slot);
+    const CacheBlockLocation published_at =
+        *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, keys[*moved_slot]);
+    const std::int32_t published_page = pool.ResolveCacheBlockId(0, published_at);
+    sliding.erase(sliding.begin(), sliding.begin() + 2);
+    std::int32_t kept_cached_page = 0;
+    for (CacheBlockRef& ref : history) {
+        const std::int32_t parent = ref->Location().lcm_block_id;
+        if (parent == kept_parent) {
+            kept_cached_page = pool.ResolveCacheBlockId(0, ref->Location());
+            ref = CacheBlockRef{};
+        } else if (parent == published_at.lcm_block_id) {
+            ref = CacheBlockRef{};
+        }
+    }
+    ASSERT_NE(kept_cached_page, 0);
     // The second chunk needs the compaction, which moves a published page by
     // a copy: it runs once nothing is queued.
     std::optional<ExecutionPlan> second;
+    int waited_plans = 0;
     for (int plan = 0; plan < 8 && !second; ++plan) {
         ExecutionPlan next = next_plan();
         if (FindForwardBatch(next)->request_ids.empty()) {
+            ++waited_plans;
             EXPECT_TRUE(next.pages_to_copy.at("full_attention").empty());
             EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
         } else {
             second = std::move(next);
         }
     }
+    EXPECT_GT(waited_plans, 0);
     ASSERT_TRUE(second);
     EXPECT_EQ(FindForwardBatch(*second)->request_ids, std::vector<std::string>{"R"});
     EXPECT_EQ(FindForwardBatch(*second)->extend_prefix_lens, std::vector<std::int32_t>{64});
     EXPECT_EQ(second->pages_to_copy.at("full_attention"),
-              (std::vector<std::pair<std::int32_t, std::int32_t>>{{44, 13}}));
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{published_page, kept_cached_page}}));
     EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 1u);
 }
 
@@ -967,9 +1025,9 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
 // wrote them. The layout of FirstAdmissionCompactionMovesTheProbesTailBlock
 // without a Host tier, with one pool write that takes all the blocks a
 // request queues: X finishes on its first token, and R, X's prompt and one
-// token more, cannot be admitted until X's tail block moves (24 -> 1). The
-// compaction waits for the plan that writes X's pages where they are, and no
-// plan's write names a block the plan copies into.
+// token more, cannot be admitted until X's tail block moves into a kept
+// parent. The compaction waits for the plan that writes X's pages where they
+// are, and no plan's write names a block the plan copies into.
 TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPoolWritesOfTheHitPages) {
     config_ = MakeConfig();
     config_.device_allocator.total_pages = 11;
@@ -983,6 +1041,7 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
     config_ = WithHostPackingFromDevice(config_);
     scheduler_ = std::make_unique<Scheduler>(config_);
     CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
     // The pool holds nothing: every lookup is a miss.
     const auto miss = [&] {
         std::vector<SharedL2Answer> answers;
@@ -1016,29 +1075,62 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
         }
         return plan;
     };
-    // LeaveATailBesideCache's prompts, and their pages written to the pool.
-    Submit(std::vector<RequestSpec>{
-        RequestSpec{.request_id = "a0", .tokens = MakeTokens(kP, 100), .max_new_tokens = 1},
-        RequestSpec{.request_id = "a1", .tokens = MakeTokens(kP, 150), .max_new_tokens = 1},
-        RequestSpec{.request_id = "b", .tokens = MakeTokens(3 * kP, 200), .max_new_tokens = 1}});
-    miss();
-    for (int plan = 0; plan < 4 && scheduler_->RequestTokenSize("b") != -1; ++plan) {
-        Land(next_plan());
+    // FirstAdmissionCompactionMovesTheProbesTailBlock's prompts, and their
+    // pages written to the pool.
+    const std::vector<std::int32_t> a0_tokens = MakeTokens(2 * kP, 100);
+    const std::vector<std::int32_t> a1_tokens = MakeTokens(kP, 150);
+    const std::vector<std::int32_t> b_tokens = MakeTokens(2 * kP, 200);
+    for (const auto& [id, seq] : {std::pair{"a0", a0_tokens}, std::pair{"a1", a1_tokens}, std::pair{"b", b_tokens}}) {
+        Submit(RequestSpec{.request_id = id, .tokens = seq, .max_new_tokens = 1});
+        miss();
+        for (int plan = 0; plan < 4 && scheduler_->RequestTokenSize(id) != -1; ++plan) {
+            Land(next_plan());
+        }
+        ASSERT_EQ(scheduler_->RequestTokenSize(id), -1);
     }
-    ASSERT_EQ(scheduler_->RequestTokenSize("b"), -1);
     for (int plan = 0; plan < 16 && (coordinator.Host().HasPendingStores() || !writing.empty()); ++plan) {
         next_plan();
     }
     ASSERT_FALSE(coordinator.Host().HasPendingStores());
     // X's five pages and its tail are queued at its finish, and no write is
-    // in flight.
-    Submit(RequestSpec{.request_id = "X", .tokens = MakeTokens(43, 20000), .max_new_tokens = 1});
-    miss();
-    Land(next_plan());
+    // in flight; pin one KV block per cached parent while X runs so X's tail
+    // sits alone in b's parent.
+    {
+        std::vector<CacheBlockRef> pins;
+        for (const std::vector<std::int32_t>& seq : {a0_tokens, a1_tokens, b_tokens}) {
+            std::vector<std::int32_t> probe_seq = seq;
+            probe_seq.push_back(0);
+            for (const CacheKey& key : scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(probe_seq))) {
+                if (key.group_id == 0) {
+                    CacheBlockRef ref = coordinator.GroupPrefixIndex(0).Find(pool, key);
+                    ASSERT_TRUE(ref);
+                    pins.push_back(std::move(ref));
+                    break;
+                }
+            }
+        }
+        ASSERT_EQ(pins.size(), 3u);
+        Submit(RequestSpec{.request_id = "X", .tokens = MakeTokens(43, 20000), .max_new_tokens = 1});
+        miss();
+        Land(next_plan());
+    }
     ASSERT_TRUE(coordinator.Host().HasPendingStores());
     ASSERT_TRUE(writing.empty());
     ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 1);
-    Submit(RequestSpec{.request_id = "R", .tokens = MakeTokens(44, 20000), .max_new_tokens = 1});
+    const PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
+    const std::vector<std::int32_t> prompt = MakeTokens(44, 20000);
+    const PrefixProbe probe = coordinator.Prober().ProbePromptPrefix(PromptPrefix{
+        .prefix_hashes = scheduler_->PrefixHashesForTokens(prompt),
+        .tokens = prompt,
+        .max_tokens = static_cast<std::int32_t>(prompt.size()) - 1,
+    });
+    ASSERT_EQ(probe.device.num_common_tokens, 43);
+    ASSERT_TRUE(probe.device.tail);
+    const std::vector<CacheBlockLocation> tail_at = index.MatchedLocations(
+        pool, probe.device.tail->group_keys[0], /*begin_block=*/0, probe.device.tail->per_group[0]);
+    ASSERT_EQ(tail_at.size(), 1u);
+    const std::int32_t tail_page = pool.ResolveCacheBlockId(0, tail_at.front());
+    Submit(RequestSpec{.request_id = "R", .tokens = prompt, .max_new_tokens = 1});
     miss();
     // R's first chunk needs the compaction, which moves the tail block by a
     // copy: the plan writes the queued pages instead, and it runs in the
@@ -1052,8 +1144,11 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionWaitsForTheQueuedPool
     const ExecutionPlan moves = next_plan();
     EXPECT_EQ(FindForwardBatch(moves)->request_ids, std::vector<std::string>{"R"});
     EXPECT_EQ(FindForwardBatch(moves)->extend_prefix_lens, std::vector<std::int32_t>{43});
-    EXPECT_EQ(moves.pages_to_copy.at("full_attention"),
-              (std::vector<std::pair<std::int32_t, std::int32_t>>{{24, 1}, {24, 2}}));
+    const auto& kv_copies = moves.pages_to_copy.at("full_attention");
+    ASSERT_EQ(kv_copies.size(), 2u);
+    EXPECT_EQ(kv_copies[0].first, tail_page);
+    EXPECT_EQ(kv_copies[1].first, tail_page);
+    EXPECT_NE(kv_copies[0].second, kv_copies[1].second);
     EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 1u);
 }
 

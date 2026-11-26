@@ -225,14 +225,14 @@ public:
         _assert(group.packing == packing, "cache group packing changed after construction");
         const auto buckets = static_cast<std::size_t>(shard_count);
         if (group.parents_by_bucket.empty()) {
+            if (packing > 1) {
+                ensureLinkStride(buckets);
+            }
             group.parents_by_bucket.resize(buckets);
             for (OccupancyBuckets& bucket_index : group.parents_by_bucket) {
                 bucket_index.Init(packing);
             }
             group.free_slots_by_bucket.assign(buckets, 0);
-            if (packing > 1 && buckets > kInlineLinkBuckets) {
-                wide_link_buckets_ = std::max(wide_link_buckets_, buckets);
-            }
         } else {
             _assert(group.packing == packing && group.parents_by_bucket.size() == buckets,
                     "cache group geometry changed after registration");
@@ -362,10 +362,15 @@ public:
     }
 
     // A hint for a later Release(location): prefetches its LCM parent's
-    // record, found by its ID alone. Parent records live as long as the pool.
+    // record (and its intrusive link slot when the pool carries packed groups),
+    // found by its ID alone. Parent records live as long as the pool.
     void PrefetchRelease(CacheBlockLocation location) const noexcept {
         if (location.lcm_block_id <= 0 || static_cast<std::size_t>(location.lcm_block_id) > lcm_blocks_.size()) return;
-        PrefetchObject(lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)]);
+        const std::size_t idx = static_cast<std::size_t>(location.lcm_block_id - 1);
+        PrefetchObject(lcm_blocks_[idx]);
+        if (link_stride_ > 0) {
+            PrefetchObject(bucket_links_[idx * link_stride_]);
+        }
     }
 
     void Release(CacheBlockLocation location) noexcept {
@@ -405,12 +410,12 @@ public:
 
 private:
     static constexpr std::int32_t kInlineOccupancySlots = 64;
-    static constexpr std::size_t kInlineLinkBuckets = 4;
     static constexpr std::size_t kInlineLoadBuckets = 8;
 
-    // Intrusive doubly-linked list node stored directly on each LcmBlock per
-    // shard bucket, using 1-based parent IDs (0 = null) so all index updates
-    // are O(1) with zero heap allocation.
+    // Intrusive doubly-linked list node stored in the pool-level flat table
+    // `bucket_links_` indexed by `(lcm_block_id - 1) * link_stride_ + bucket`,
+    // using 1-based parent IDs (0 = null) so all index updates are O(1) with
+    // zero per-parent heap allocation and zero memory on packing == 1 pools.
     struct BucketLink {
         std::int32_t prev{0};
         std::int32_t next{0};
@@ -529,11 +534,6 @@ private:
         // Only the lowest free slot per bucket is needed, not a list of all holes.
         // The packing is the sentinel for a bucket with no free slot.
         std::vector<std::int32_t> first_free_slots;
-        // Intrusive doubly-linked list links for OccupancyBuckets (up to 4
-        // shards inline; wider sharding allocates wide_links on first bind).
-        std::array<BucketLink, kInlineLinkBuckets> inline_links{};
-        std::unique_ptr<BucketLink[]> wide_links;
-        std::size_t wide_links_capacity{0};
 
         bool SlotOccupied(std::size_t slot) const noexcept {
             const std::uint64_t word =
@@ -546,10 +546,35 @@ private:
             const std::uint64_t bit = std::uint64_t{1} << (slot % kInlineOccupancySlots);
             word = occupied ? (word | bit) : (word & ~bit);
         }
-        BucketLink& Link(std::size_t bucket, std::size_t num_buckets) noexcept {
-            return num_buckets <= kInlineLinkBuckets ? inline_links[bucket] : wide_links[bucket];
-        }
     };
+
+    BucketLink& bucketLink(std::int32_t id, std::size_t bucket) noexcept {
+        _assert(id > 0 && static_cast<std::size_t>(id) <= lcm_blocks_.size(), "LCM block id out of range");
+        _assert(bucket < link_stride_, "bucket index exceeds link stride");
+        return bucket_links_[static_cast<std::size_t>(id - 1) * link_stride_ + bucket];
+    }
+
+    // Lazily allocates or widens the flat per-parent link table when a packed
+    // group (packing > 1) registers with more buckets than `link_stride_`.
+    // Preserves links already live in buckets [0, link_stride_).
+    void ensureLinkStride(std::size_t buckets) {
+        if (buckets <= link_stride_) {
+            return;
+        }
+        const std::size_t num_parents = lcm_blocks_.size();
+        if (num_parents > 0) {
+            FatalCheck(buckets <= std::numeric_limits<std::size_t>::max() / num_parents,
+                       "intrusive link table size exceeds address space");
+            std::vector<BucketLink> grown(num_parents * buckets);
+            if (link_stride_ > 0) {
+                for (std::size_t p = 0; p < num_parents; ++p) {
+                    std::copy_n(bucket_links_.data() + p * link_stride_, link_stride_, grown.data() + p * buckets);
+                }
+            }
+            bucket_links_ = std::move(grown);
+        }
+        link_stride_ = buckets;
+    }
 
     const GroupAvailability& placement(std::uint32_t group_id) const noexcept {
         FatalCheck(group_id < group_availability_.size(), "group id has no placement in this pool");
@@ -566,7 +591,7 @@ private:
         return group.FreeSlots() + free_parent_ids_.size() * static_cast<std::size_t>(packing);
     }
 
-    void removeAvailability(GroupAvailability& group, LcmBlock& parent, std::int32_t id) noexcept {
+    void removeAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) noexcept {
         if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
@@ -575,11 +600,11 @@ private:
         for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
                 OccupancyBuckets& index = group.parents_by_bucket[bucket];
-                BucketLink& link = parent.Link(bucket, buckets);
+                BucketLink& link = bucketLink(id, bucket);
                 const std::int32_t prev = link.prev;
                 const std::int32_t next = link.next;
                 if (prev != 0) {
-                    lcm_blocks_[static_cast<std::size_t>(prev - 1)].Link(bucket, buckets).next = next;
+                    bucketLink(prev, bucket).next = next;
                 } else {
                     FatalCheck(index.heads[idx] == id, "partial LCM parent missing from its bucket index");
                     index.heads[idx] = next;
@@ -588,14 +613,14 @@ private:
                     }
                 }
                 if (next != 0) {
-                    lcm_blocks_[static_cast<std::size_t>(next - 1)].Link(bucket, buckets).prev = prev;
+                    bucketLink(next, bucket).prev = prev;
                 }
                 link = {};
             }
         }
     }
 
-    void addAvailability(GroupAvailability& group, LcmBlock& parent, std::int32_t id) noexcept {
+    void addAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) noexcept {
         if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
@@ -604,14 +629,14 @@ private:
         for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
                 OccupancyBuckets& index = group.parents_by_bucket[bucket];
-                BucketLink& link = parent.Link(bucket, buckets);
+                BucketLink& link = bucketLink(id, bucket);
                 const std::int32_t old_head = index.heads[idx];
                 FatalCheck(link.prev == 0 && link.next == 0 && old_head != id,
                            "partial LCM parent already present in its bucket index");
                 link.prev = 0;
                 link.next = old_head;
                 if (old_head != 0) {
-                    lcm_blocks_[static_cast<std::size_t>(old_head - 1)].Link(bucket, buckets).prev = id;
+                    bucketLink(old_head, bucket).prev = id;
                 } else {
                     index.SetNonEmpty(idx);
                 }
@@ -822,24 +847,17 @@ private:
 
     CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
         using Control = internal_cache_block_ref::CacheBlockControl;
-        const std::size_t buckets = placement(group_id).parents_by_bucket.size();
         if (slots_per_parent > kInlineOccupancySlots) [[unlikely]] {
             LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
             if (parent.wide_occupancy == nullptr) {
                 allocateWideOccupancy(parent, wide_occupancy_words_);
             }
         }
-        if (slots_per_parent > 1 && buckets > kInlineLinkBuckets) [[unlikely]] {
-            LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-            if (parent.wide_links_capacity < buckets) {
-                allocateWideLinks(parent, std::max(buckets, wide_link_buckets_));
-            }
-        }
         void* storage = control_memory_.allocate(sizeof(Control), alignof(Control));
         auto* control = new (storage) Control(*this, location);
-        // Allocate a wide parent's occupancy words, wide links and the control
-        // before mutating the pool, then commit the location before publishing
-        // its RAII owner: CacheBlock destruction releases this location and
+        // Allocate a wide parent's occupancy words and the control before
+        // mutating the pool, then commit the location before publishing its
+        // RAII owner: CacheBlock destruction releases this location and
         // therefore requires it to be occupied.
         occupy(group_id, slots_per_parent, location);
         return CacheBlockRef{*control};
@@ -848,12 +866,6 @@ private:
     // Out of line so the allocation stays out of the inlined acquire loops.
     [[gnu::cold, gnu::noinline]] static void allocateWideOccupancy(LcmBlock& parent, std::size_t words) {
         parent.wide_occupancy = std::make_unique<std::uint64_t[]>(words);
-    }
-
-    [[gnu::cold, gnu::noinline]] static void allocateWideLinks(LcmBlock& parent, std::size_t buckets) {
-        FatalCheck(parent.occupied_count == 0, "cannot reallocate wide links while parent is occupied");
-        parent.wide_links = std::make_unique<BucketLink[]>(buckets);
-        parent.wide_links_capacity = buckets;
     }
 
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
@@ -866,8 +878,9 @@ private:
             FatalCheck(parent.slots == 0 && parent.occupancy == 0, "empty LCM parent must not retain child slots");
             FatalCheck(slots_per_parent <= kInlineOccupancySlots || parent.wide_occupancy != nullptr,
                        "a wide LCM parent binds without its occupancy words");
-            FatalCheck(slots_per_parent == 1 || buckets <= kInlineLinkBuckets || parent.wide_links_capacity >= buckets,
-                       "a wide-bucket LCM parent binds without its link storage");
+            FatalCheck(slots_per_parent == 1 ||
+                           (buckets <= link_stride_ && bucket_links_.size() == lcm_blocks_.size() * link_stride_),
+                       "a packed LCM parent binds without its link storage");
             parent.slots = slots_per_parent;
             if (slots_per_parent > 1) {
                 parent.first_free_slots.resize(buckets);
@@ -932,8 +945,10 @@ private:
     std::vector<GroupAvailability> group_availability_;
     // Words of a wide parent's occupancy bits; 0 when every packing fits inline.
     std::size_t wide_occupancy_words_{0};
-    // Bucket count of a wide-sharded parent's intrusive links; 0 when all fit inline.
-    std::size_t wide_link_buckets_{0};
+    // Flat intrusive links indexed by (lcm_block_id - 1) * link_stride_ + bucket.
+    // Remains empty (link_stride_ == 0) on pools with only packing == 1 groups.
+    std::vector<BucketLink> bucket_links_;
+    std::size_t link_stride_{0};
 };
 
 }  // namespace tokenspeed
