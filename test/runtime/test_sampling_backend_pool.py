@@ -529,7 +529,7 @@ class TestTritonRouteSelection:
         with (
             patch.object(
                 triton_backend_module,
-                "gumbel_sample_top_p_parallel_from_pools",
+                "gumbel_sample_from_pools_in_nucleus",
                 return_value=target_sampled,
             ) as top_p_sampler,
             patch.object(
@@ -552,8 +552,11 @@ class TestTritonRouteSelection:
 
         top_p_sampler.assert_called_once()
         args, kwargs = top_p_sampler.call_args
-        assert (args[6].shape[0]) == (n)
-        assert (args[17].shape[0]) == (n)
+        # Scratch and output rows, and the nucleus of every verify row.
+        assert (args[5].shape[0]) == (n)
+        assert (args[7].shape[0]) == (n)
+        threshold, limit = args[8]
+        assert (threshold.shape[0], limit.shape[0]) == (n, n)
         assert (kwargs["num_tokens_per_req"]) == (n)
 
     def test_verify_large_finite_top_k_top_p_uses_qrita_sampler(self):

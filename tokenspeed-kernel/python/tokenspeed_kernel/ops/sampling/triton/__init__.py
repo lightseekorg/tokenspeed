@@ -50,6 +50,7 @@ from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
+    gumbel_sample_from_pools_in_nucleus,
     gumbel_scratch_shape,
 )
 from .logprobs import selected_token_logprobs
@@ -68,17 +69,24 @@ from .topk_topp import (
     verify_rows_top_k_top_p_from_pools,
 )
 from .topp import gumbel_sample_top_p_parallel_from_pools
+from .topp_threshold import (
+    top_p_threshold_scratch_shapes,
+    top_p_thresholds_from_pools,
+)
 
 __all__ = [
     "_QRITA_PERCENTILE_TO_STD_TABLE",
     "gather_and_expand_scalars",
     "gumbel_sample_from_pools",
+    "gumbel_sample_from_pools_in_nucleus",
     "gumbel_sample_from_pools_compact",
     "gumbel_scratch_shape",
     "gumbel_sample_min_p_from_pools",
     "gumbel_sample_min_p_from_pools_parallel",
     "gumbel_sample_from_pools_generic",
     "gumbel_sample_top_p_parallel_from_pools",
+    "top_p_threshold_scratch_shapes",
+    "top_p_thresholds_from_pools",
     "gumbel_sample_top_k_top_p_from_candidates",
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",

@@ -32,6 +32,39 @@ the output capacity in the same way as an undercount. `test/nvidia/ops/test_samp
 a producer that signals launch completion before it stores the probabilities,
 and checks the renormalized rows and the Top-P input pointers in both modes.
 
+## Exact top-p sampling (`triton/topp_threshold.py`, `triton/gumbel.py`)
+
+`top_p_thresholds_from_pools` finds each row's top-p nucleus: tokens ranked by
+`logits / T` descending, ties by lower id, kept while the mass before them is
+below `top_p` of the row. It returns the last kept token's scaled logit and id,
+and `gumbel_sample_from_pools_in_nucleus` then draws the plain Gumbel-Max over
+the kept tokens only, so the draw follows the nucleus distribution exactly,
+whatever the top-p. (A sampler that retries a bounded number of draws from the
+whole row and then takes the argmax over-draws the argmax when the nucleus
+holds little mass.)
+
+1. Per 1024-token block: the block's max, its sum of `exp(s - max)` and its 32
+   best tokens as rank keys (scaled-logit bits above the inverted id).
+2. Per row: the total mass, then each block's first 4 candidates and, if their
+   mass can reach the target, all 32. Every token above the highest
+   last-candidate key of any block is a candidate, so the candidates above
+   that key are the row's exact top ranks. A candidate set whose mass cannot
+   reach the target is not sorted.
+3. Rare path, for rows whose nucleus reaches past the candidates (very flat
+   rows, about 0.25% of rows of a 27B chat model at T = 1): a fixed grid
+   builds radix histograms of the row, one level per launch. Three levels walk
+   the scaled logit's order-preserving bits (12 + 12 + 8) down to the
+   boundary's value; two count the ids holding that value, so ties resolve by
+   lowest id. Masses are 2**-40 fixed point added with integer atomics, so the
+   result does not depend on the order programs add in; the first level sorts
+   each block by bin and adds once per bin, since a flat row puts most of a
+   block in one bin. Rows past the 64 histogram slots take a single-program
+   search over the row.
+
+The candidate path sums masses in fp32 and the rare path in fixed point, so a
+token whose mass before it is within rounding of the target may fall on either
+side of the boundary.
+
 ## Packed probability sampling (`packed_verify.py`)
 
 `sample_probs` draws from already filtered and normalized FP32 rows.

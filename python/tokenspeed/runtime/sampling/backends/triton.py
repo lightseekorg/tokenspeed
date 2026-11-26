@@ -46,12 +46,14 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
+    gumbel_sample_from_pools_in_nucleus,
     gumbel_sample_top_k_top_p_from_candidates,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
-    gumbel_sample_top_p_parallel_from_pools,
     gumbel_scratch_shape,
     selected_token_logprobs,
+    top_p_threshold_scratch_shapes,
+    top_p_thresholds_from_pools,
     verify_chain_row_decisions,
     verify_chain_target_sampled,
     verify_rows_no_filter_from_pools,
@@ -98,12 +100,6 @@ _TOP_K_TOP_P_TUNED_VOCAB_MAX = 32768
 _TOP_K_TOP_P_PAD = 128
 # The candidate count of a batch whose finite top_k all fit in it.
 _TOP_K_TOP_P_SMALL_PAD = 64
-_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE = 1024
-_TOP_P_PARALLEL_SAMPLE_ATTEMPTS = 3
-_TOP_P_PARALLEL_VERIFY_ATTEMPTS = 4
-_TOP_P_PARALLEL_MAX_ATTEMPTS = max(
-    _TOP_P_PARALLEL_SAMPLE_ATTEMPTS, _TOP_P_PARALLEL_VERIFY_ATTEMPTS
-)
 _QRITA_VERIFY_MIN_ROWS = 128
 
 _SAMPLE_ROUTE_GUMBEL_GENERIC = 0
@@ -535,54 +531,22 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
 
-        top_p_blocks = (vocab_size + _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE - 1) // (
-            _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE
-        )
+        # Top-p-only rows sample from their exact nucleus: its threshold per
+        # row, then a Gumbel-Max over the tokens it keeps.
         top_p_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
-        self._top_p_local_max = torch.empty(
-            (top_p_rows, top_p_blocks), dtype=torch.float32, device=config.device
-        )
-        self._top_p_local_sum = torch.empty(
-            (top_p_rows, top_p_blocks), dtype=torch.float32, device=config.device
-        )
-        self._top_p_local_argmax = torch.empty(
-            (top_p_rows, top_p_blocks), dtype=torch.int32, device=config.device
-        )
-        self._top_p_local_scores = torch.empty(
-            (top_p_rows, top_p_blocks, _TOP_P_PARALLEL_MAX_ATTEMPTS),
-            dtype=torch.float32,
-            device=config.device,
-        )
-        self._top_p_local_logits = torch.empty(
-            (top_p_rows, top_p_blocks, _TOP_P_PARALLEL_MAX_ATTEMPTS),
-            dtype=torch.float32,
-            device=config.device,
-        )
-        self._top_p_local_ids = torch.empty(
-            (top_p_rows, top_p_blocks, _TOP_P_PARALLEL_MAX_ATTEMPTS),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._top_p_row_max = torch.empty(
+        self._top_p_scratch = {
+            name: torch.empty(shape, dtype=dtype, device=config.device)
+            for name, (shape, dtype) in top_p_threshold_scratch_shapes(
+                top_p_rows, vocab_size
+            ).items()
+        }
+        self._top_p_threshold = torch.empty(
             (top_p_rows,), dtype=torch.float32, device=config.device
         )
-        self._top_p_row_total = torch.empty(
-            (top_p_rows,), dtype=torch.float32, device=config.device
-        )
-        self._top_p_row_argmax = torch.empty(
+        self._top_p_limit = torch.empty(
             (top_p_rows,), dtype=torch.int32, device=config.device
         )
-        self._top_p_row_candidate_logits = torch.empty(
-            (top_p_rows, _TOP_P_PARALLEL_MAX_ATTEMPTS),
-            dtype=torch.float32,
-            device=config.device,
-        )
-        self._top_p_row_candidate_ids = torch.empty(
-            (top_p_rows, _TOP_P_PARALLEL_MAX_ATTEMPTS),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._top_p_accepted = torch.empty(
+        self._top_p_rare = torch.empty(
             (top_p_rows,), dtype=torch.int32, device=config.device
         )
         self._selected_logprob_out = torch.empty(
@@ -882,28 +846,15 @@ class TritonSamplingBackend(SamplingBackend):
                 top_k_pad=self._top_k_top_p_pad,
             )
         elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
-            batch_next_token_ids = gumbel_sample_top_p_parallel_from_pools(
+            batch_next_token_ids = self._sample_top_p_exact(
                 logits,
                 req_pool_indices,
-                self._temperature_pool,
-                self._top_p_pool,
-                self._seed_pool,
+                (self._temperature_pool, self._top_p_pool, self._seed_pool),
                 offsets_pool,
-                self._top_p_local_max[:bs],
-                self._top_p_local_sum[:bs],
-                self._top_p_local_argmax[:bs],
-                self._top_p_local_scores[:bs],
-                self._top_p_local_logits[:bs],
-                self._top_p_local_ids[:bs],
-                self._top_p_row_max[:bs],
-                self._top_p_row_total[:bs],
-                self._top_p_row_argmax[:bs],
-                self._top_p_row_candidate_logits[:bs],
-                self._top_p_row_candidate_ids[:bs],
-                self._top_p_accepted[:bs],
+                self._gumbel_local_ids[:bs],
+                self._gumbel_local_scores[:bs],
                 self._gumbel_out[:bs],
-                block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
-                num_attempts=_TOP_P_PARALLEL_SAMPLE_ATTEMPTS,
+                num_tokens_per_req=1,
             )
         else:
             batch_next_token_ids = gumbel_sample_from_pools_generic(
@@ -958,6 +909,47 @@ class TritonSamplingBackend(SamplingBackend):
             logits_output, values, logprob_values, None, sampled
         )
         return sampled, self._ones_buf[:bs]
+
+    def _sample_top_p_exact(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        pools: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        offsets_pool: torch.Tensor,
+        local_ids: torch.Tensor,
+        local_scores: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """An exact top-p sample per row: the Gumbel-Max over the row's nucleus
+        (``top_p_thresholds_from_pools``). ``pools`` are the temperature,
+        top-p and seed pools ``req_pool_indices`` reads."""
+        temperature, top_p, seed = pools
+        rows = logits.shape[0]
+        nucleus = top_p_thresholds_from_pools(
+            logits,
+            req_pool_indices,
+            temperature,
+            top_p,
+            self._top_p_scratch,
+            self._top_p_threshold[:rows],
+            self._top_p_limit[:rows],
+            self._top_p_rare[:rows],
+            num_tokens_per_req=num_tokens_per_req,
+        )
+        return gumbel_sample_from_pools_in_nucleus(
+            logits,
+            req_pool_indices,
+            temperature,
+            seed,
+            offsets_pool,
+            local_ids,
+            local_scores,
+            out,
+            nucleus,
+            num_tokens_per_req=num_tokens_per_req,
+        )
 
     def _sample_verify_targets(
         self,
@@ -1051,28 +1043,14 @@ class TritonSamplingBackend(SamplingBackend):
                     num_tokens_per_req=num_tokens_per_req,
                 )
         elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
-            target_sampled = gumbel_sample_top_p_parallel_from_pools(
+            target_sampled = self._sample_top_p_exact(
                 logits,
                 req_pool_indices,
-                temperature,
-                top_p,
-                seed,
+                (temperature, top_p, seed),
                 offsets_pool,
-                self._top_p_local_max[:rows],
-                self._top_p_local_sum[:rows],
-                self._top_p_local_argmax[:rows],
-                self._top_p_local_scores[:rows],
-                self._top_p_local_logits[:rows],
-                self._top_p_local_ids[:rows],
-                self._top_p_row_max[:rows],
-                self._top_p_row_total[:rows],
-                self._top_p_row_argmax[:rows],
-                self._top_p_row_candidate_logits[:rows],
-                self._top_p_row_candidate_ids[:rows],
-                self._top_p_accepted[:rows],
+                self._gumbel_verify_local_ids[:rows],
+                self._gumbel_verify_local_scores[:rows],
                 self._gumbel_verify_out[:rows],
-                block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
-                num_attempts=_TOP_P_PARALLEL_VERIFY_ATTEMPTS,
                 num_tokens_per_req=num_tokens_per_req,
             )
         else:
