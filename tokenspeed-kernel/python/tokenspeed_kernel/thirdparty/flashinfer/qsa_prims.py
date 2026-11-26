@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cache
 from weakref import WeakValueDictionary
 
@@ -361,15 +361,13 @@ class _PrimTSQSARunner:
         )
         if new_plan:
             if group_size == 1:
-                # FlashInfer 0.7.5 keeps the first inputs as defaults. Its
-                # outer plan tests the tuple and always passes live tensors.
-                prepared = plan.wrapper._prepared_plan
-                attention = prepared._attention_plan
-                plan.wrapper._prepared_plan = replace(
-                    prepared,
-                    _attention_plan=replace(
-                        attention, _direct_q1_inputs=(None, None, None, None)
-                    ),
+                # Clear the frozen plan's tensor defaults in place. The outer
+                # plan checks the tuple to route the live single-query inputs.
+                attention = plan.wrapper._prepared_plan._attention_plan
+                object.__setattr__(
+                    attention,
+                    "_direct_q1_inputs",
+                    (None,) * len(attention._direct_q1_inputs),
                 )
             # Bound eager geometries per layer. Captures own their plans
             # outside this LRU.

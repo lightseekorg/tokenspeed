@@ -526,6 +526,23 @@ def test_prims_qsa_decode_matches_reference_and_refreshes_live_metadata(
         graph = torch.cuda.CUDAGraph()
         with capture_session(graph), torch.cuda.graph(graph, stream=stream):
             actual = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    else:
+        first_inputs = (
+            weakref.ref(metadata.selected_blocks),
+            weakref.ref(metadata.block_table),
+            weakref.ref(metadata.token_to_request),
+            weakref.ref(metadata.query_positions),
+        )
+        with torch.cuda.stream(stream):
+            metadata = replace(
+                metadata,
+                selected_blocks=metadata.selected_blocks.clone(),
+                block_table=metadata.block_table.clone(),
+                token_to_request=metadata.token_to_request.clone(),
+                query_positions=metadata.query_positions.clone(),
+            )
+        kwargs["sparse_metadata"] = metadata
+        assert all(ref() is None for ref in first_inputs)
     with torch.cuda.stream(stream):
         metadata.selected_blocks[:query_width].copy_(
             torch.arange(512, 1024, dtype=torch.int32, device=device).expand(

@@ -1748,9 +1748,10 @@ Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
 Plan offsets and shared scratch use the CPU-backed named workspace region on
-a plan miss. Their addresses survive memory release and resume. PrimTS reads
-the current logical candidates and row layout on each run. The adapter drops
-the initial metadata inputs retained by FlashInfer's single-query plan.
+a plan miss. Their addresses survive memory release and resume. The adapter
+clears the initial metadata tensor defaults in FlashInfer's single-query plan
+in place. Each launch passes the current logical candidates and row layout to
+the initialized plan.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
 CuTe kernel read invalid candidates from the zero-initialized slot 1 of the
