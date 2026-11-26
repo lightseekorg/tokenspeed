@@ -73,6 +73,11 @@ jobs:
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
 
+      # The matrix collects every unit-test task whose runner label is the NPU
+      # runner: the operator accuracy/performance suite (npu-operators.yaml),
+      # the install smoke (npu-install-smoke.yaml), and the runtime unit tests
+      # (npu-runtime.yaml). Adding a task YAML under test/ci/ut/ is the only
+      # registration step; no per-task wiring is needed here.
       - name: Scan shared CI tasks
         id: scan
         if: steps.changes.outputs.should_run == 'true'

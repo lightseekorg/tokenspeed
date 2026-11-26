@@ -1,0 +1,15 @@
+api_version: ci.tokenspeed.io/v1
+name: npu-runtime
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - tokenspeed-npu-arm64
+ut:
+  commands:
+    - bash test/ci_system/npu/run_npu_tests.sh runtime "$NPU_CI_WORK"
+report:
+  github_step_summary: true

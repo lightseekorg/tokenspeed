@@ -10,7 +10,13 @@
     ".github/workflows/run-ci-task-matrix.yml",
     "test/ci_system/*ascend*",
     "test/ci/ut/npu-operators.yaml",
-    "test/ci_system/pipeline.py"
+    "test/ci_system/pipeline.py",
+    "test/ci/ut/npu-install-smoke.yaml",
+    "test/ci/ut/npu-runtime.yaml",
+    "python/tokenspeed/env.py",
+    "python/tokenspeed/cli/**",
+    "test/runtime/*npu*",
+    "test/runtime/**/*npu*"
   ],
   "expected_plans": "test/ci/npu/expected-plans.json",
   "execution": {
