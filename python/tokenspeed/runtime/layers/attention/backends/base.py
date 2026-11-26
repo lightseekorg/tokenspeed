@@ -202,6 +202,34 @@ class CachePoolBinding:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
 
+    def prepare_pending_recurrent_state(
+        self, slots: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        """Order pending recurrent reads before this forward's state consumers."""
+        for backend in self.child_backends():
+            backend.prepare_pending_recurrent_state(
+                slots, frontier, allow_defer=allow_defer
+            )
+
+    def prepare_recurrent_state_acceptance(
+        self, stopped: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        """Bind stop-truncated completion facts before accepted-state commit."""
+        for backend in self.child_backends():
+            backend.prepare_recurrent_state_acceptance(
+                stopped, frontier, allow_defer=allow_defer
+            )
+
+    def materialize_recurrent_state(self, slots: torch.Tensor | None) -> None:
+        """Replay unique device slots, or all rows when slots is None."""
+        for backend in self.child_backends():
+            backend.materialize_recurrent_state(slots)
+
+    def discard_recurrent_state(self, slots: torch.Tensor) -> None:
+        """Retire pending replay for unique device slots without writing state."""
+        for backend in self.child_backends():
+            backend.discard_recurrent_state(slots)
+
     def fixed_workspace_bytes(self) -> int:
         """Return recipe-reserved workspace bytes, excluding the shared arena.
 

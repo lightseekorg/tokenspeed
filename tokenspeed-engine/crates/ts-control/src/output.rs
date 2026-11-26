@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
@@ -35,6 +35,7 @@ use crate::{
     codec::{Reader, Writer},
     request::{AbortCode, FinishReason, InputLogprobs, RequestState},
     request_stats::{self, wall_seconds, RequestTimings},
+    request_timing::EventStamp,
 };
 
 const NUMERICAL_ERROR: &str = "Request terminated: numerical corruption (NaN logits or \
@@ -320,6 +321,8 @@ pub struct StreamedOutput {
     /// The top-k alternatives of `output_ids`, when the request asked for
     /// them.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Terminal request timing metadata; absent from intermediate outputs.
+    pub request_timing: Option<ts_wire::RequestTiming>,
 }
 
 /// What committing a forward produced.
@@ -549,6 +552,8 @@ pub struct OutputProcessor {
     /// which publishes nothing; a state the device could not complete stops
     /// the engine.
     defers_decode_state: bool,
+    /// Actual DP and attention-TP identity; unknown until supplied by the host.
+    timing_ranks: Option<(i64, i64)>,
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
@@ -599,6 +604,7 @@ impl OutputProcessor {
             physical_context_len,
             role,
             defers_decode_state,
+            timing_ranks: None,
             finish_log,
             last_commit_at: 0.0,
             admissions: 0,
@@ -619,6 +625,12 @@ impl OutputProcessor {
             completion_token_samples: Vec::new(),
             spec_decode_accept_length_samples: Vec::new(),
         }
+    }
+
+    /// Attach the actual DP and attention-TP ranks to terminal request metadata.
+    pub fn with_timing_ranks(mut self, dp_rank: i64, tp_rank: i64) -> Self {
+        self.timing_ranks = Some((dp_rank, tp_rank));
+        self
     }
 
     /// Per-request latency samples and token totals since the last drain.
@@ -682,10 +694,14 @@ impl OutputProcessor {
         }
     }
 
-    /// Log a request's stats line as it leaves the processor.
-    fn log_end(&mut self, rid: &str, state: &RequestState) {
-        self.collect_stream_end(state, wall_seconds());
-        self.log_finished(rid, state);
+    /// Complete terminal response metadata and collect existing request stats.
+    fn complete_request(
+        &mut self,
+        rid: &str,
+        state: &RequestState,
+        outputs: &mut [StreamedOutput],
+    ) {
+        self.complete_response(rid, state, outputs);
         if self.metrics_enabled {
             if let Some(usage) = &state.peer_usage {
                 if usage.lookup_at.is_some() || usage.admission_at.is_some() {
@@ -727,12 +743,42 @@ impl OutputProcessor {
         }
     }
 
-    fn log_finished(&self, rid: &str, state: &RequestState) {
+    /// Sample completion once and attach timing to the terminal response, when emitted.
+    fn complete_response(
+        &mut self,
+        rid: &str,
+        state: &RequestState,
+        outputs: &mut [StreamedOutput],
+    ) {
+        self.collect_stream_end(state, wall_seconds());
         if let Some(trace) = &state.ttft {
             trace.finish(rid, state);
         }
+        // Keep the existing backend completion boundary even with logging disabled.
+        let finished = EventStamp::now();
+        let finished_at = finished.wall_seconds();
+        if let Some(output) = outputs
+            .last_mut()
+            .filter(|output| output.rid == rid && output.finish_reason.is_some())
+        {
+            let role = match self.role {
+                Role::Plain => "plain",
+                Role::Prefill => "prefill",
+                Role::Decode => "decode",
+            };
+            output.request_timing = Some(state.request_timing.finish(
+                role,
+                self.timing_ranks,
+                state.created_time,
+                &finished,
+            ));
+        }
+        self.log_finished(rid, state, finished_at);
+    }
+
+    /// Log the completion boundary already sampled by the response lifecycle.
+    fn log_finished(&self, rid: &str, state: &RequestState, finished_at: f64) {
         if self.finish_log.enabled && tracing::enabled!(tracing::Level::INFO) {
-            let finished_at = wall_seconds();
             let stats = state
                 .timings
                 .as_ref()
@@ -965,6 +1011,7 @@ impl OutputProcessor {
     /// An abort that arrived before it applies now.
     pub fn register(&mut self, rid: String, mut state: RequestState) {
         assert_ne!(state.admission, 0, "assign an identity before registration");
+        state.request_timing.accepted = Some(EventStamp::now());
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -1016,7 +1063,7 @@ impl OutputProcessor {
             .into_iter()
             .collect();
         }
-        self.log_end(rid, &state);
+        self.complete_request(rid, &state, &mut committed.outputs);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1033,6 +1080,7 @@ impl OutputProcessor {
         bootstrap_token: i32,
         cached_tokens: i64,
         bootstrap_logprob: Option<f64>,
+        kv_ready_at: (SystemTime, Instant),
     ) {
         let Some(state) = self.states.get_mut(rid) else {
             return;
@@ -1045,6 +1093,10 @@ impl OutputProcessor {
         }
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
+        state.request_timing.kv_ready(
+            EventStamp::at(kv_ready_at.0, kv_ready_at.1),
+            state.output_ids.len(),
+        );
         if let Some(tokens) = &mut state.reasoning_tokens {
             tokens.push([bootstrap_token]);
         }
@@ -1114,7 +1166,7 @@ impl OutputProcessor {
             ForwardEventKind::Finish
         };
         committed.events.push(event(kind, rid, Vec::new(), 0));
-        self.log_end(rid, &state);
+        self.complete_request(rid, &state, &mut committed.outputs);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1143,7 +1195,7 @@ impl OutputProcessor {
             .into_iter()
             .collect();
         }
-        self.log_end(rid, &state);
+        self.complete_request(rid, &state, &mut committed.outputs);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1192,17 +1244,18 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
-        let output = Self::stream_state(
+        let mut outputs: Vec<_> = Self::stream_state(
             rid,
             &mut state,
             self.stream_interval,
             self.spec_num_tokens,
             self.metrics_enabled,
             Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
-        );
-        self.collect_stream_end(&state, wall_seconds());
-        self.log_finished(rid, &state);
-        output.into_iter().collect()
+        )
+        .into_iter()
+        .collect();
+        self.complete_response(rid, &state, &mut outputs);
+        outputs
     }
 
     /// The ids of the requests registered and not ended.
@@ -1231,8 +1284,7 @@ impl OutputProcessor {
             .into_iter()
             .collect();
         }
-        self.collect_stream_end(&state, wall_seconds());
-        self.log_finished(rid, &state);
+        self.complete_response(rid, &state, &mut committed.outputs);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -1266,7 +1318,7 @@ impl OutputProcessor {
             .into_iter()
             .collect();
         }
-        self.log_end(rid, &state);
+        self.complete_request(rid, &state, &mut committed.outputs);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1304,7 +1356,7 @@ impl OutputProcessor {
                     Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
                 ));
             }
-            self.log_end(&abort.request_id, &state);
+            self.complete_request(&abort.request_id, &state, &mut committed.outputs);
             self.trace_end(&abort.request_id, &state);
             committed.released.push(abort.request_id.clone());
         }
@@ -1764,6 +1816,11 @@ impl OutputProcessor {
                     break;
                 }
             }
+            if self.role == Role::Plain && !is_decode && !state.output_ids.is_empty() {
+                state
+                    .request_timing
+                    .kv_ready(EventStamp::now(), state.output_ids.len());
+            }
             if is_decode && self.metrics_enabled {
                 self.generated_tokens += (state.output_ids.len() - before) as u64;
             }
@@ -1852,7 +1909,7 @@ impl OutputProcessor {
 
     fn release(&mut self, rid: &str, committed: &mut Committed) {
         if let Some(state) = self.states.remove(rid) {
-            self.log_end(rid, &state);
+            self.complete_request(rid, &state, &mut committed.outputs);
             self.trace_end(rid, &state);
             committed.released.push(rid.to_owned());
         }
@@ -1966,6 +2023,7 @@ impl OutputProcessor {
             )
         });
         Some(StreamedOutput {
+            request_timing: None,
             rid: rid.to_owned(),
             output_ids,
             finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
@@ -2006,7 +2064,7 @@ impl OutputProcessor {
             }
             if state.finished() {
                 let (_, state) = self.states.remove_entry(rid).expect("present above");
-                self.log_end(rid, &state);
+                self.complete_request(rid, &state, &mut outputs);
                 self.trace_end(rid, &state);
                 released.push(rid.to_owned());
             }
@@ -2020,6 +2078,197 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn request_timing_returns_actual_prefill_output_count_once_without_logs() {
+        for stream in [true, false] {
+            for replay_prefill in [true, false] {
+                let mut p = processor(None).with_timing_ranks(2, 0);
+                let mut state =
+                    RequestState::new(vec![1, 2, 3], 4, BTreeSet::new(), stream, None, false);
+                state.created_time = wall_seconds() - 5.0;
+                let created = state.created_time;
+                register_state(&mut p, "timing".to_owned(), state);
+                let first = p
+                    .commit(
+                        &batch(&[("timing", 3, 0, 3)], 1),
+                        None,
+                        &result(&[4, 5, 6], &[3]),
+                    )
+                    .unwrap();
+                assert!(first
+                    .outputs
+                    .iter()
+                    .all(|output| output.request_timing.is_none()));
+                let first_boundary = p
+                    .state("timing")
+                    .unwrap()
+                    .request_timing
+                    .finish("plain", Some((2, 0)), created, &EventStamp::now())
+                    .events
+                    .kv_ready
+                    .unwrap();
+                // A resumed prefill must preserve the original readiness boundary.
+                let next = if replay_prefill {
+                    batch(&[("timing", 1, 3, 4)], 1)
+                } else {
+                    batch(&[("timing", 1, 0, 3)], 0)
+                };
+                let final_output = p.commit(&next, None, &result(&[7], &[1])).unwrap();
+                let output = &final_output.outputs[0];
+                let timing = output.request_timing.as_ref().unwrap();
+                assert_eq!(timing.kv_output_tokens, Some(3));
+                assert_eq!(output.completion_tokens, 4);
+                assert_eq!(output.rid, "timing");
+                assert_eq!(output.finish_reason, Some("length"));
+                assert_eq!(timing.role, "plain");
+                assert_eq!((timing.dp_rank, timing.tp_rank), (Some(2), Some(0)));
+                let accepted = timing.events.accepted.as_ref().unwrap();
+                let kv_ready = timing.events.kv_ready.as_ref().unwrap();
+                let finished = &timing.events.finished;
+                assert_eq!(kv_ready, &first_boundary);
+                let mono_ns = |stamp: &ts_wire::RequestTimestamp| {
+                    stamp.ts_mono_ns.as_ref().unwrap().parse::<u128>().unwrap()
+                };
+                assert!(mono_ns(accepted) <= mono_ns(kv_ready));
+                assert!(mono_ns(kv_ready) <= mono_ns(finished));
+                let finished_s = finished.ts_unix_ns.parse::<u128>().unwrap() as f64 / 1e9;
+                assert!((timing.e2e_latency_s.unwrap() - (finished_s - created)).abs() < 1e-6);
+                assert_eq!(timing.clock.clock_sync, "unknown");
+                assert_eq!(timing.clock.clock_uncertainty_ns, None);
+                assert!(!timing.clock.process_instance_id.is_empty());
+                assert_eq!(p.num_running(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn request_timing_preserves_pd_landing_time_for_one_token_request() {
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            false,
+            None,
+        );
+        register(&mut p, "one", 3, 1, &[]);
+        let observed = (SystemTime::now(), Instant::now());
+        p.remote_prefill_done("one", 9, 0, None, observed);
+        let c = p.finish_remote_prefill_only("one");
+        let timing = c.outputs[0].request_timing.as_ref().unwrap();
+        assert_eq!(timing.kv_output_tokens, Some(1));
+        assert_eq!(c.outputs[0].completion_tokens, 1);
+        assert_eq!(timing.role, "decode");
+        assert_eq!((timing.dp_rank, timing.tp_rank), (None, None));
+        assert_eq!(
+            timing.events.kv_ready.as_ref().unwrap().ts_unix_ns,
+            observed
+                .0
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string(),
+        );
+        assert!(p.finish_remote_prefill_only("one").outputs.is_empty());
+    }
+
+    #[test]
+    fn request_timing_transfer_failure_keeps_missing_kv_boundary() {
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
+        register(&mut p, "failed", 3, 8, &[]);
+        let c = p.fail_transfer("failed");
+        let timing = c.outputs[0].request_timing.as_ref().unwrap();
+        assert!(timing.events.accepted.is_some());
+        assert_eq!(timing.kv_output_tokens, None);
+        assert_eq!(timing.events.kv_ready, None);
+        assert_eq!(c.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(timing.e2e_latency_s, None);
+        let metrics = p.take_request_metrics();
+        assert_eq!(metrics.completion_token_samples, vec![0]);
+        assert_eq!(p.take_request_tokens(), (3, 0));
+        assert!(p.fail_transfer("failed").outputs.is_empty());
+        assert!(p.take_request_metrics().completion_token_samples.is_empty());
+    }
+
+    #[test]
+    fn request_timing_rejection_has_no_registration_or_readiness() {
+        let mut p = processor(None);
+        let mut state = RequestState::new(vec![1], 1, BTreeSet::new(), true, None, false);
+        state.abort("invalid request", true, None);
+        let outputs = p.publish_finished_at_admission("invalid", state);
+        let timing = outputs[0].request_timing.as_ref().unwrap();
+        assert_eq!(timing.events.accepted, None);
+        assert_eq!(timing.events.kv_ready, None);
+        assert_eq!(timing.kv_output_tokens, None);
+        assert_eq!(outputs[0].finish_reason, Some("abort"));
+    }
+
+    #[test]
+    fn request_timing_prefill_reports_its_local_completion() {
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Prefill,
+            false,
+            NO_FINISH_LOG,
+            false,
+            None,
+        );
+        register(&mut p, "prefill", 3, 8, &[]);
+        let c = p
+            .commit(
+                &batch(&[("prefill", 3, 0, 3)], 1),
+                None,
+                &result(&[7], &[1]),
+            )
+            .unwrap();
+        assert!(c.outputs.is_empty());
+        let c = p.finish_prefill("prefill");
+        let timing = c.outputs[0].request_timing.as_ref().unwrap();
+        assert_eq!(timing.role, "prefill");
+        assert!(timing.events.accepted.is_some());
+        assert_eq!(timing.events.kv_ready, None);
+        assert_eq!(timing.kv_output_tokens, None);
+        assert_eq!(c.outputs[0].completion_tokens, 1);
+        assert!(p.finish_prefill("prefill").outputs.is_empty());
+    }
+
+    #[test]
+    fn request_timing_attaches_to_each_terminal_row_and_cancellation_stays_silent() {
+        let mut p = processor(None);
+        for rid in ["a", "b", "cancelled"] {
+            register(&mut p, rid, 3, 1, &[]);
+        }
+        p.mark_abort("cancelled", false);
+        let cancelled = p.reap_unscheduled("cancelled");
+        assert!(cancelled.outputs.is_empty());
+        let c = p
+            .commit(
+                &batch(&[("a", 3, 0, 3), ("b", 3, 0, 3)], 2),
+                None,
+                &result(&[7, 8], &[1, 1]),
+            )
+            .unwrap();
+        assert_eq!(c.outputs.len(), 2);
+        for output in &c.outputs {
+            assert!(output.request_timing.is_some());
+            assert_eq!(output.completion_tokens, 1);
+        }
+        assert_eq!(p.num_running(), 0);
+    }
 
     fn batch(rows: &[(&str, i32, i32, i32)], num_extends: usize) -> ForwardBatchView {
         // (rid, input_length, extend_prefix_len, prefill_length)
@@ -2309,7 +2558,13 @@ mod tests {
                         processor.finish_prefill(rid);
                     } else {
                         processor.mark_planned(&[rid.into()], true);
-                        processor.remote_prefill_done(rid, 10, 1, None);
+                        processor.remote_prefill_done(
+                            rid,
+                            10,
+                            1,
+                            None,
+                            (SystemTime::now(), Instant::now()),
+                        );
                         processor.finish_remote_prefill_only(rid);
                     }
                 }
@@ -2433,7 +2688,7 @@ mod tests {
             let remote_admitted = trace.remote_admitted_ms.unwrap();
             assert!(trace.planned_ms.is_none());
 
-            processor.remote_prefill_done("r", 10, 0, None);
+            processor.remote_prefill_done("r", 10, 0, None, (SystemTime::now(), Instant::now()));
             processor.mark_planned(&["r".into()], false);
             processor.mark_scheduled(&["r".into()]);
             let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
@@ -2472,7 +2727,7 @@ mod tests {
         state.created_time = 100.0;
         state.first_token_time = 100.25;
         state.output_ids = vec![7];
-        p.log_end("a", &state);
+        p.complete_request("a", &state, &mut []);
         let metrics = p.take_request_metrics();
         assert_eq!(metrics.ttft_seconds, vec![0.25]);
         assert_eq!(metrics.request_seconds.len(), 1);
@@ -2560,7 +2815,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 4, 8, &[]);
-        p.remote_prefill_done("r", 7, 0, None);
+        p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
         assert!(p.state("r").unwrap().stream_output_timing.is_none());
         assert_eq!(stream_at(&mut p, "r", 100.0).unwrap().output_ids, [7]);
         p.states.get_mut("r").unwrap().output_ids.extend([8, 9]);
@@ -2595,7 +2850,7 @@ mod tests {
             );
             register(&mut p, "r", 4, 3, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds() - 1.0;
-            p.remote_prefill_done("r", 7, 0, None);
+            p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
             stream_at(&mut p, "r", wall_seconds()).unwrap();
             let second = p
                 .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
@@ -2724,11 +2979,11 @@ mod tests {
             None,
         );
         register(&mut p, "one", 4, 1, &[]);
-        p.remote_prefill_done("one", 7, 0, None);
+        p.remote_prefill_done("one", 7, 0, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.finish_remote_prefill_only("one").released, ["one"]);
 
         register(&mut p, "two", 4, 2, &[]);
-        p.remote_prefill_done("two", 7, 0, None);
+        p.remote_prefill_done("two", 7, 0, None, (SystemTime::now(), Instant::now()));
         let committed = p
             .commit(&batch(&[("two", 1, 0, 4)], 0), None, &result(&[8], &[1]))
             .unwrap();
@@ -2763,19 +3018,19 @@ mod tests {
         register(&mut p, "a", 4, 8, &[]);
         assert!(p.take_decode_ready_at("a").is_none());
         let before = Instant::now();
-        p.remote_prefill_done("a", 7, 0, None);
+        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
         let after = Instant::now();
         let ready = p.take_decode_ready_at("a").unwrap();
         assert!(before <= ready && ready <= after);
         assert!(p.take_decode_ready_at("a").is_none());
 
         register(&mut p, "cancelled", 4, 8, &[]);
-        p.remote_prefill_done("cancelled", 7, 0, None);
+        p.remote_prefill_done("cancelled", 7, 0, None, (SystemTime::now(), Instant::now()));
         p.states.get_mut("cancelled").unwrap().to_abort = true;
         assert!(p.take_decode_ready_at("cancelled").is_none());
 
         register(&mut p, "finished", 4, 1, &[]);
-        p.remote_prefill_done("finished", 7, 0, None);
+        p.remote_prefill_done("finished", 7, 0, None, (SystemTime::now(), Instant::now()));
         p.finish_remote_prefill_only("finished");
         assert!(p.take_decode_ready_at("finished").is_none());
     }
@@ -2793,7 +3048,7 @@ mod tests {
             None,
         );
         register(&mut p, "a", 4, 8, &[]);
-        p.remote_prefill_done("a", 7, 0, None);
+        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
         assert!(p.take_decode_ready_at("a").is_none());
     }
 
@@ -2823,7 +3078,7 @@ mod tests {
             &grammar,
             &state.prompt_ids,
         ));
-        p.remote_prefill_done("a", 7, 0, None);
+        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
         let state = p.state("a").expect("still registered");
         assert_eq!(state.first_token_time, 0.0);
         assert_eq!(state.output_ids, vec![7]);
@@ -2847,7 +3102,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 3, 8, &[]);
-        p.remote_prefill_done("r", 9, 0, None);
+        p.remote_prefill_done("r", 9, 0, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.state("r").unwrap().first_token_time, 0.0);
         p.commit(&batch(&[("r", 1, 0, 3)], 0), None, &result(&[10], &[1]))
             .unwrap();
@@ -2883,7 +3138,7 @@ mod tests {
         state.created_time = 100.0;
         state.first_token_time = 101.0;
         state.output_ids = vec![2, 3];
-        p.log_end("done", &state);
+        p.complete_request("done", &state, &mut []);
         let samples = p.take_request_metrics();
         assert!(samples.ttft_seconds.is_empty());
         assert!(samples.request_seconds.is_empty());
@@ -2931,7 +3186,7 @@ mod tests {
                 local_reason: reason.map(str::to_owned),
                 ..Default::default()
             });
-            p.log_end("r", &state);
+            p.complete_request("r", &state, &mut []);
             assert_eq!(
                 p.take_request_metrics().peer_local_reasons,
                 expected.into_iter().collect::<Vec<_>>()
@@ -2946,7 +3201,7 @@ mod tests {
         register(&mut p, "a", 12, 4, &[]);
         let mut state = p.states.remove("a").expect("registered above");
         state.cached_tokens = 3;
-        p.log_end("a", &state);
+        p.complete_request("a", &state, &mut []);
         assert_eq!(p.take_request_tokens(), (12, 3));
         // Draining is destructive: the next round must not report it again.
         assert_eq!(p.take_request_tokens(), (0, 0));
@@ -3298,7 +3553,7 @@ mod tests {
         );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
-        p.remote_prefill_done("r", 9, 0, Some(-0.25));
+        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             ..result(&[10], &[1])
@@ -3328,7 +3583,7 @@ mod tests {
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
-        p.remote_prefill_done("r", 9, 0, Some(-0.25));
+        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             output_token_cumulative_probs: Some(vec![0.375]),
@@ -3731,7 +3986,7 @@ mod tests {
             );
             register(&mut p, "r", 4, max_new, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds();
-            p.remote_prefill_done("r", 7, 2, None);
+            p.remote_prefill_done("r", 7, 2, None, (SystemTime::now(), Instant::now()));
             let (_, prefill_done, first_token, _, _) = p
                 .state("r")
                 .unwrap()

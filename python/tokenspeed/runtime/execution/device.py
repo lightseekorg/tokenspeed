@@ -138,6 +138,7 @@ import contextlib
 import enum
 import json
 import os
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -434,9 +435,11 @@ class DeviceHandle:
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
-        # with the write-backs and restores with the load-backs; all four
-        # ACK kinds ride the cache poll.
+        # with the write-backs and restores with the load-backs; their ACKs
+        # ride the cache poll.
         self._l2 = host_cache_executor
+        self._replay_retirements: deque[tuple[Any, int, torch.Tensor | None]] = deque()
+        self._completed_replay_retirement = 0
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -464,12 +467,30 @@ class DeviceHandle:
     # Per-round work
     # ------------------------------------------------------------------
 
+    def retire_replay(self, retirement_id: int, slots: Sequence[int]) -> None:
+        """Materialize old slots after settling drafting, ahead of their reuse."""
+        event = None
+        staged_slots = None
+        if slots:
+            executor = self._executor
+            # Keep the pinned upload alive until the execution stream uses it.
+            staged_slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True)
+            with executor.device_module.stream(executor.execution_stream):
+                device_slots = staged_slots.to(executor.device, non_blocking=True)
+                executor.attn_backend.materialize_recurrent_state(device_slots)
+                event = executor.device_module.Event()
+                event.record(executor.execution_stream)
+            executor.default_stream.wait_event(event)
+        self._replay_retirements.append((event, retirement_id, staged_slots))
+
     def execute(
         self,
         execution_plan,
         planned: "PlannedForward | None",
         *,
         cache_ops: Sequence,
+        retirement_slots: Sequence[int] = (),
+        retirement_id: int | None = None,
     ) -> ModelExecutionResult | None:
         """Execute one scheduler plan; never waits for the device on the
         per-round path.
@@ -532,12 +553,17 @@ class DeviceHandle:
 
             cache_ops: The plan's Device-copy operations, the ones the control
                 plane counts; its storage operations go to the L3 executor.
+            retirement_slots: Slots of old owners to materialize before this
+                plan touches their pages.
+            retirement_id: Host fence covering the retirements, if issued.
 
         Returns:
             The launched forward's result, its host copies landing behind its
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if retirement_slots and retirement_id is None:
+            raise ValueError("Replay retirement slots require a host fence")
         if planned is not None and self._weight_memory is not None:
             self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
@@ -546,6 +572,8 @@ class DeviceHandle:
                 raise TypeError(
                     f"unsupported Device cache op: {type(operation).__name__}"
                 )
+        if cache_ops and self._l2 is None:
+            raise RuntimeError("Device cache operations require a Host cache executor")
 
         executor = self._executor
         copies = {
@@ -579,6 +607,7 @@ class DeviceHandle:
             or folds
             or fence is not None
             or peer_fetches
+            or retirement_slots
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -586,6 +615,8 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
+        if retirement_id is not None:
+            self.retire_replay(retirement_id, retirement_slots)
         l2 = self._l2
         if folds:
             # The victims' last forwards ran on the execution stream, and the
@@ -791,6 +822,16 @@ class DeviceHandle:
         if self._l2 is not None:
             results.extend(self._l2.poll_results())
         return results
+
+    def poll_replay_retirement(self) -> int:
+        """Return the latest completed host fence without waiting for CUDA."""
+        while self._replay_retirements:
+            event, retirement_id, _staged_slots = self._replay_retirements[0]
+            if event is not None and not event.query():
+                break
+            self._replay_retirements.popleft()
+            self._completed_replay_retirement = retirement_id
+        return self._completed_replay_retirement
 
     def poll_cache_observations(self) -> tuple[list[dict], int]:
         """Drain completed CPU diagnostics only; no event query or device work."""

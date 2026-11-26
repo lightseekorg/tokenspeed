@@ -315,6 +315,10 @@ struct State {
     /// agree on them, and deferred allocation requires single-member
     /// replicas today.
     pages_held: HashMap<u64, Instant>,
+    /// Start of the final handoff (layerwise writes may already be in flight).
+    handoff_started: HashMap<u64, Instant>,
+    /// Explicit bootstrap rejection or bootstrap timeout on this rank.
+    handshake_failures: HashSet<u64>,
 }
 
 impl State {
@@ -432,6 +436,8 @@ impl State {
         self.prefill_metadata.remove(&room);
         self.announced.remove(&room);
         self.pages_held.remove(&room);
+        self.handoff_started.remove(&room);
+        self.handshake_failures.remove(&room);
     }
 
     /// One complete, unique Decode-rank set.
@@ -464,6 +470,11 @@ impl State {
         }
         Ok(())
     }
+}
+
+enum FailureStage {
+    Handshake,
+    Transfer,
 }
 
 struct Shared {
@@ -505,22 +516,27 @@ impl Shared {
     /// Fail a room and tell every destination that pre-allocated for it or
     /// announced it.
     fn abort_room(&self, room: u64, reason: &str) {
-        self.end_room(room, reason, true);
+        self.end_room(room, reason, Some(FailureStage::Transfer));
     }
 
     /// Cancellation uses the same retirement fence, without reporting a transfer error.
     fn cancel_room(&self, room: u64, reason: &str) {
-        self.end_room(room, reason, false);
+        self.end_room(room, reason, None);
     }
 
-    fn end_room(&self, room: u64, reason: &str, failed: bool) {
+    fn end_room(&self, room: u64, reason: &str, failure: Option<FailureStage>) {
         let routes: Vec<_> = {
             let mut state = self.state();
             // Once per room: a room's later chunks fail here again.
             let counted = state.rooms.get(room) == Some(TransferPoll::Failed)
                 || state.rooms.has_failure(room);
-            if let (true, false, Some(metrics)) = (failed, counted, &self.metrics) {
-                metrics.record_failure();
+            if let (Some(stage), false) = (failure, counted) {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failure();
+                }
+                if matches!(stage, FailureStage::Handshake) {
+                    state.handshake_failures.insert(room);
+                }
             }
             // Timeout/failure must reject manifests arriving after this
             // request is forgotten, just like an explicit cancellation.
@@ -880,9 +896,10 @@ impl Shared {
             .map(|(&room, _)| room)
             .collect();
         for room in affected.into_iter().chain(announced) {
-            self.abort_room(
+            self.end_room(
                 room,
                 &format!("Decode session {cache_id} registration rejected: {reason}"),
+                Some(FailureStage::Handshake),
             );
         }
         let mut state = self.state();
@@ -923,7 +940,11 @@ impl Shared {
         }
         if let Err(reason) = self.accept_preallocation(room, &cache_id, frames) {
             tracing::error!(room, reason, "rejecting CachePD pre-allocation metadata");
-            self.abort_room(room, &format!("invalid pre-allocation metadata: {reason}"));
+            self.end_room(
+                room,
+                &format!("invalid pre-allocation metadata: {reason}"),
+                Some(FailureStage::Handshake),
+            );
             match self.state().route_of(&cache_id) {
                 Some(route) => self.notify_failed(route, room),
                 None => tracing::error!(room, "cannot notify a malformed Decode peer"),
@@ -1561,7 +1582,13 @@ impl PrefillOutbox {
                 .filter(|ids| !ids.is_empty())
                 .cloned();
             let source = {
-                let state = self.shared.state();
+                let mut state = self.shared.state();
+                if self.shared.metrics.is_some() && state.rooms_by_rid.get(rid) == Some(&room) {
+                    state
+                        .handoff_started
+                        .entry(room)
+                        .or_insert_with(Instant::now);
+                }
                 let destinations = state.destinations.get(&room).map_or(&[][..], Vec::as_slice);
                 if destinations.is_empty() {
                     drop(state);
@@ -2149,6 +2176,7 @@ impl TransferPeer for PrefillPeer {
                             if let Some(metrics) = &self.shared.metrics {
                                 metrics.record_timeout("bootstrapping");
                             }
+                            state.handshake_failures.insert(sender.room);
                             sender.concluded = Some(TransferPoll::Failed);
                             TransferPoll::Failed
                         }
@@ -2181,31 +2209,43 @@ impl TransferPeer for PrefillPeer {
                 }
             }
         }
-        let retired: Vec<i64> = {
-            let state = self.shared.state();
-            self.order
-                .iter()
-                .map(|rid| {
-                    let room = self.senders[rid].room;
-                    i64::from(!state.pending_chunks.contains_key(&room))
-                })
-                .collect()
-        };
         let has_terminal = agreed.iter().any(|&poll| {
             matches!(
                 TransferPoll::from_wire(poll),
                 Some(TransferPoll::Success | TransferPoll::Failed)
             )
         });
-        let retired = if replica.size() > 1 && has_terminal {
-            mesh.all_reduce(replica, &retired, Reduce::Min)?
-        } else {
-            retired
+        let agreement = {
+            let state = self.shared.state();
+            let mut fields: Vec<i64> = self
+                .order
+                .iter()
+                .map(|rid| i64::from(!state.pending_chunks.contains_key(&self.senders[rid].room)))
+                .collect();
+            // A follower can be the only rank to see a handshake rejection.
+            // The agreed status determines which rooms carry a cause on the
+            // retirement collective, even while their writes are draining.
+            if has_terminal {
+                for (rid, poll) in self.order.iter().zip(&agreed) {
+                    let sender = &self.senders[rid];
+                    if *poll == TransferPoll::Failed as i64 {
+                        fields.push(i64::from(!state.handshake_failures.contains(&sender.room)));
+                    }
+                }
+            }
+            fields
         };
+        let agreement = if replica.size() > 1 && has_terminal {
+            mesh.all_reduce(replica, &agreement, Reduce::Min)?
+        } else {
+            agreement
+        };
+        let (retired, causes) = agreement.split_at(self.order.len());
+        let mut causes = causes.iter();
 
         let mut events = Vec::new();
         let mut ended = Vec::new();
-        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
+        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(retired) {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
@@ -2216,7 +2256,18 @@ impl TransferPeer for PrefillPeer {
                     PdEvent::Bootstrapped(rid.clone())
                 });
             } else if poll == TransferPoll::Failed {
+                let handshake_failed = *causes.next().expect("one cause per agreed failure") == 0;
                 if sender.local != TransferPoll::Failed {
+                    if replica.index() == 0 {
+                        if let Some(metrics) = &self.shared.metrics {
+                            let outcome = if handshake_failed {
+                                "handshake_failed"
+                            } else {
+                                "failed"
+                            };
+                            metrics.record_handoff(outcome);
+                        }
+                    }
                     sender.local = TransferPoll::Failed;
                     sender.draining = Some(Draining {
                         rid: rid.clone(),
@@ -2240,6 +2291,20 @@ impl TransferPeer for PrefillPeer {
                 && poll == TransferPoll::Success
                 && retired != 0
             {
+                if replica.index() == 0 {
+                    if let Some(metrics) = &self.shared.metrics {
+                        metrics.record_handoff("success");
+                        let started = self
+                            .shared
+                            .state()
+                            .handoff_started
+                            .get(&sender.room)
+                            .copied();
+                        if let Some(started) = started {
+                            metrics.observe_prefill_handoff(started.elapsed().as_secs_f64());
+                        }
+                    }
+                }
                 sender.local = TransferPoll::Success;
                 events.push(PdEvent::Succeeded(rid.clone()));
                 ended.push(rid.clone());
