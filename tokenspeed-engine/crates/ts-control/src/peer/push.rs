@@ -547,6 +547,10 @@ struct FencedJobs {
     /// unknown retirements that could not fit in `unknown`.
     unknown_hwm: HashMap<String, HashMap<u32, u64>>,
     unknown_hwm_entries: usize,
+    /// Reader endpoints known to speak v2 (`PUSH_V2`, understanding `UNKNOWN`).
+    /// Keeps `hwm_overflowed` from sending unrecognized `u` frames in reply to
+    /// stray `CANCEL` frames from legacy `p`-only peers.
+    v2_peers: HashSet<String>,
     unknown_overflowed: bool,
     hwm_overflowed: bool,
 }
@@ -562,6 +566,12 @@ impl FencedJobs {
         self.unknown_overflowed
     }
 
+    fn note_v2_peer(&mut self, reply_to: &str) {
+        if !self.v2_peers.contains(reply_to) && self.v2_peers.len() < MAX_UNKNOWN_FENCED_JOBS {
+            self.v2_peers.insert(reply_to.to_owned());
+        }
+    }
+
     /// Whether `key` is known or conservatively suspected to have retired with
     /// unknown RDMA write state.
     fn may_be_unknown(&self, key: &JobKey) -> bool {
@@ -571,14 +581,16 @@ impl FencedJobs {
         if !self.unknown_overflowed || self.clean.contains_key(key) {
             return false;
         }
-        if self.hwm_overflowed {
-            return true;
-        }
         let incarnation = (key.job >> 32) as u32;
-        self.unknown_hwm
+        if self
+            .unknown_hwm
             .get(key.reply_to.as_str())
             .and_then(|incarnations| incarnations.get(&incarnation))
             .is_some_and(|&max_job| key.job <= max_job)
+        {
+            return true;
+        }
+        self.hwm_overflowed && self.v2_peers.contains(key.reply_to.as_str())
     }
 
     fn alloc_seq(&mut self) -> u64 {
@@ -588,6 +600,7 @@ impl FencedJobs {
     }
 
     fn record_unknown_overflow(&mut self, key: JobKey) {
+        self.note_v2_peer(&key.reply_to);
         if !self.unknown_overflowed {
             self.unknown_overflowed = true;
             tracing::error!(
@@ -647,6 +660,7 @@ impl FencedJobs {
 
     fn insert(&mut self, key: JobKey, unknown: bool) {
         if unknown {
+            self.note_v2_peer(&key.reply_to);
             self.clean.remove(&key);
             self.overflow_cancelled.remove(&key);
             if self.unknown.contains(&key) {
@@ -1028,6 +1042,9 @@ impl Holder {
                 Some(Reject::InFlightDuplicate)
             } else {
                 let mut fenced = self.state.fenced.lock();
+                if supports_unknown {
+                    fenced.note_v2_peer(&key.reply_to);
+                }
                 if fenced.may_be_unknown(&key) {
                     if supports_unknown {
                         Some(Reject::FencedUnknown)
@@ -3768,5 +3785,43 @@ mod tests {
         assert!(!fenced.may_be_unknown(&key(base)));
         assert!(fenced.contains(&key(base + MAX_FENCED_JOBS as u64 - 1)));
         assert!(fenced.order.len() <= MAX_FENCED_JOBS * 2);
+    }
+
+    #[test]
+    fn legacy_p_peer_cancel_stays_cancelled_even_after_hwm_overflow() {
+        let mut fenced = FencedJobs::default();
+        // Fill unknown set and overflow both `unknown` and `unknown_hwm` with v2 peers.
+        for j in 0..(MAX_UNKNOWN_FENCED_JOBS as u64) {
+            fenced.insert(
+                JobKey {
+                    reply_to: "10.0.0.1:7200".into(),
+                    job: j,
+                },
+                true,
+            );
+        }
+        for inc in 1..=(MAX_UNKNOWN_HWM_PEERS as u32 + 1) {
+            fenced.insert(
+                JobKey {
+                    reply_to: "10.0.0.1:7200".into(),
+                    job: (u64::from(inc) << 32) | 5,
+                },
+                true,
+            );
+        }
+        assert!(fenced.is_unknown_overflowed());
+        assert!(fenced.hwm_overflowed);
+
+        // Known v2 peer whose new incarnation overflowed `unknown_hwm` stays conservatively Unknown.
+        assert!(fenced.may_be_unknown(&JobKey {
+            reply_to: "10.0.0.1:7200".into(),
+            job: (u64::from(MAX_UNKNOWN_HWM_PEERS as u32 + 10) << 32) | 1,
+        }));
+        // Legacy `p`-only peer that never sent `PUSH_V2` is NOT in `v2_peers`, so stray
+        // `CANCEL` frames never trigger an unrecognized `u` (`Unknown`) reply.
+        assert!(!fenced.may_be_unknown(&JobKey {
+            reply_to: "10.0.0.99:7200".into(),
+            job: (9u64 << 32) | 1,
+        }));
     }
 }
