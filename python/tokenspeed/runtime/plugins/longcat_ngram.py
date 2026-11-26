@@ -120,11 +120,14 @@ class _HostEmbedding(nn.Embedding):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            row = torch.arange(
-                self.num_embeddings,
-                dtype=torch.float32,
-                device="cpu",
-            ) % 1000
+            row = (
+                torch.arange(
+                    self.num_embeddings,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                % 1000
+            )
             self.weight.data.copy_(row.unsqueeze(1))
 
 
@@ -441,9 +444,7 @@ class NgramEmbedding(nn.Module):
         self._ensure_staging()
         with torch.no_grad():
             for index in range(num_embedders):
-                new_ids = self._compute_new_ids(
-                    input_ids, predecessor_window, index
-                )
+                new_ids = self._compute_new_ids(input_ids, predecessor_window, index)
                 host_weight = self._host_embedders[index]
                 rows = F.embedding(
                     new_ids.to("cpu"),
@@ -500,9 +501,7 @@ class NgramEmbedding(nn.Module):
         # reorders the bf16 additions, which drifts the forward output by up
         # to ~1e-1 away from the reference (V5 numeric criterion regression).
         if self.tp_size > 1:
-            local_partial = self._ngram_local_partial(
-                input_ids, predecessor_window
-            )
+            local_partial = self._ngram_local_partial(input_ids, predecessor_window)
             # TP feature-column sharding: the local table slice contributes
             # only this rank's feature columns; all-reduce sums the full
             # contribution.
@@ -510,9 +509,7 @@ class NgramEmbedding(nn.Module):
             local_partial = all_reduce(local_partial, self.tp_group)
             x = x + local_partial
         else:
-            x = self._ngram_local_partial(
-                input_ids, predecessor_window, out=x
-            )
+            x = self._ngram_local_partial(input_ids, predecessor_window, out=x)
         x = x / (1 + self.k * (self.n - 1))
         return x
 
@@ -578,9 +575,7 @@ class NgramEmbedding(nn.Module):
                 if input_ids.dim() > 1:
                     x_ngram = x_ngram.reshape(*input_ids.shape, -1)
             x_proj = self.post_projs[index](x_ngram)
-            local_partial = (
-                x_proj if local_partial is None else local_partial + x_proj
-            )
+            local_partial = x_proj if local_partial is None else local_partial + x_proj
         return local_partial
 
     def forward(
@@ -605,16 +600,12 @@ class NgramEmbedding(nn.Module):
         """
         if ngram_context is not None:
             committed = self.n - 1
-            context = torch.cat(
-                [ngram_context[..., -committed:], input_ids], dim=-1
-            )
+            context = torch.cat([ngram_context[..., -committed:], input_ids], dim=-1)
         else:
             committed = 0
             context = input_ids
         window = self._window_from_context(context, committed)
-        return self.forward_from_window(
-            input_ids, window, query_shard=query_shard
-        )
+        return self.forward_from_window(input_ids, window, query_shard=query_shard)
 
 
 class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
@@ -672,9 +663,7 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
         n_1 = self.ngram_embeddings.n - 1
         bs = view.req_pool_indices.shape[0]
         if bs == 0:
-            return torch.zeros(
-                (0, n_1), dtype=input_ids.dtype, device=input_ids.device
-            )
+            return torch.zeros((0, n_1), dtype=input_ids.dtype, device=input_ids.device)
         history = view.history_token_ids  # [pool, max_committed]
         committed = view.committed_lengths
         slots = view.req_pool_indices
@@ -687,9 +676,9 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
             + hl[:, None]
         )
         valid = (idx >= 0) & (idx < hl[:, None])
-        flat = slots.to(input_ids.device).unsqueeze(-1) * history.size(-1) + idx.clamp_min(
-            0
-        )
+        flat = slots.to(input_ids.device).unsqueeze(-1) * history.size(
+            -1
+        ) + idx.clamp_min(0)
         gathered = history.reshape(-1)[flat]  # [bs, n-1]
         hist = gathered.masked_fill(~valid, 0).to(
             device=input_ids.device, dtype=input_ids.dtype
@@ -719,9 +708,7 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
             rows, ngram_context=hist, query_shard=ctx.query_shard
         )
         if not lengths:
-            return torch.empty(
-                (0, out.size(-1)), dtype=out.dtype, device=out.device
-            )
+            return torch.empty((0, out.size(-1)), dtype=out.dtype, device=out.device)
         out_rows = [out[r, : lengths[r]] for r in range(bs)]
         return torch.cat(out_rows, dim=0)
 
@@ -876,6 +863,9 @@ class LongcatFlashNgramForCausalLM(LongcatFlashForCausalLM):
 
         return ModelProfile(
             configure_attention=configure_mla_attention,
+            # None keeps the architecture's attention-config generator; LongCat's
+            # MLA geometry comes from that generator, so behavior is unchanged.
+            create_attention_config=None,
             cache_family="mla",
             linear_attention=None,
             default_attention_backend=None,
