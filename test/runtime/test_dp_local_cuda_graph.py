@@ -203,3 +203,16 @@ def test_independent_dp_retains_exact_bucket_requirement_without_padding():
     ctx.global_num_tokens = None
     assert not runner.can_run(2, ctx)
     assert runner.can_run(4, ctx)
+
+
+@pytest.mark.parametrize("verify_width", [1, 6])
+def test_independent_dp_ignores_control_plane_peer_counts(verify_width):
+    runner = _runner(local=False, capture_bs=[1, 2, 4, 8], verify_width=verify_width)
+    runner.requires_forward_coordination = False
+    # Control-plane cache coordination may publish counts even though this
+    # layout has no forward collective. Oversized and mixed peers are irrelevant.
+    ctx = _context(
+        3, [16, 1, 0, 8], all_decode_or_idle=False, verify_width=verify_width
+    )
+    assert runner.can_run(3, ctx)
+    assert runner.padded_bs(3, ctx) == 4

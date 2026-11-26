@@ -166,6 +166,7 @@ def _runner(
     wrapper._mega_moe_live_requests = None
     wrapper._graph_debug = False
     wrapper._reported_query_graphs = set()
+    wrapper._reported_independent_graphs = set()
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
         torch.arange(16, dtype=torch.int32),
@@ -472,6 +473,24 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
     # staging reads; otherwise it writes none and MegaMoE routes every row.
     expected = mega_moe_live_requests(config.device) if armed else None
     assert runner._mega_moe_live_requests is expected
+
+
+def test_independent_replay_report_is_not_suppressed_by_drafter_report(caplog):
+    wrapper, events, _ = _runner(
+        use_graph=True,
+        has_drafter=True,
+        consumers=(),
+        fail_forward=False,
+    )
+    wrapper.requires_forward_coordination = False
+    wrapper.dp_local_graph = True
+    wrapper.global_rank = 0
+    with caplog.at_level("INFO", logger="tokenspeed.runtime.execution.forward_step"):
+        _run(wrapper, ForwardMode.DECODE)
+    text = caplog.text
+    assert "Local DP decode graph replay:" in text
+    assert "Independent DP decode graph replayed:" in text
+    assert "execute" in events
 
 
 if __name__ == "__main__":
