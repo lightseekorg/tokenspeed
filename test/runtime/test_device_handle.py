@@ -255,6 +255,10 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         enforce_eager=False,
         enable_memory_saver=False,
         enable_kvstore=False,
+        # Read where the Host cache executor is built: no Host tier and no
+        # shared L2 pool here.
+        has_host_tier=False,
+        shared_l2_config=None,
         spec_context_pad=0,
         device="cuda",
         speculative_algorithm=algorithm,
@@ -280,6 +284,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
     assert events.count(("plan-check",)) == int(declares_padded_replay)

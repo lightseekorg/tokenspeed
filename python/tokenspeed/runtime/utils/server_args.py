@@ -660,6 +660,9 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # A paged L2 pool shared by every prefill rank, in place of their Host L2
+    # (--shared-l2-config, a JSON object).
+    shared_l2_config: str | None = None
     # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
     # the node's replica leaders share for external control messages;
     # None turns it off.
@@ -1821,6 +1824,12 @@ class ServerArgs:
         return self.disaggregation_mode not in ("prefill", "encode")
 
     @property
+    def has_host_tier(self) -> bool:
+        """Whether this engine's scheduler has a Host tier: the local Host L2,
+        or a shared L2 pool in its place."""
+        return self.enable_kvstore or self.shared_l2_config is not None
+
+    @property
     def writes_state_checkpoints_in_forward(self) -> bool:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
@@ -1923,6 +1932,22 @@ class ServerArgs:
                 )
             # Reuse the scheduler's no-pool capacity abort path. Host history
             # and fixed hot partitions follow the ordinary request ownership.
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
+        if self.shared_l2_config is not None and self.retracting_role:
+            # A retraction image's Host part would go to the pool's proxy
+            # tier, which holds no bytes.
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio not in (None, 0) or max_requests > 0 or forced:
+                raise ValueError(
+                    "a rank with --shared-l2-config does not retract; remove the "
+                    "--retraction-snapshot-host-gb, --retraction-snapshot-ratio, "
+                    "--retraction-snapshot-max-requests and "
+                    "--debug-force-retraction-interval overrides (a ratio of 0 is "
+                    "allowed)."
+                )
             self.retraction_snapshot_host_gb = 0.0
             self.retraction_snapshot_ratio = 0.0
             self.retraction_snapshot_max_requests = 0
@@ -2753,8 +2778,9 @@ class ServerArgs:
     def validate_startup_requests(self):
         if not self.enable_startup_requests:
             return
-        # A disaggregated node's requests need a peer node, and dropping the
-        # startup prefixes would delete an L3 store's shared namespace.
+        # A disaggregated node's requests need a peer node, dropping the
+        # startup prefixes would delete an L3 store's shared namespace, and it
+        # would leave them in a shared L2 pool.
         if self.disaggregation_mode != "null":
             raise ValueError(
                 "--enable-startup-requests is not supported with --disaggregation-mode"
@@ -2763,6 +2789,10 @@ class ServerArgs:
             raise ValueError(
                 "--enable-startup-requests is not supported with "
                 "--kvstore-storage-backend"
+            )
+        if self.shared_l2_config is not None:
+            raise ValueError(
+                "--enable-startup-requests is not supported with --shared-l2-config"
             )
 
     def validate_peer_prefix_options(self):
@@ -2888,6 +2918,45 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        if self.shared_l2_config is not None:
+            from tokenspeed.runtime.cache.shared_l2.client import SharedL2ClientConfig
+
+            SharedL2ClientConfig.from_json(self.shared_l2_config)
+            # The pool takes the Host L2's place on prefill and fused ranks
+            # of attention TP 1 (docs/configuration/server.md, "Shared L2
+            # pool"). Any other sharded cache group is refused when the cache
+            # is built.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("the local Host L2 (pass --disable-kvstore)", self.enable_kvstore),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    ("--kv-offload-config", self.kv_offload_config is not None),
+                    (
+                        "--disaggregation-mode decode or encode",
+                        self.disaggregation_mode in ("decode", "encode"),
+                    ),
+                    ("attention TP > 1", self.mapping.attn.tp_size != 1),
+                    (
+                        "--kv-parallel-size > 1 (the first version of the pool "
+                        "holds replicated KV only)",
+                        self.kv_parallel_size > 1,
+                    ),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                    ("disabled prefix caching", not self.enable_prefix_caching),
+                    # A sleep unmaps the Device cache, which the pool's client
+                    # registered for RDMA once, and a wake maps other memory.
+                    ("--enable-memory-saver", self.enable_memory_saver),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"--shared-l2-config does not support {', '.join(unsupported)}"
+                )
         _require_choice(
             "--kvstore-write-policy",
             self.kvstore_write_policy,
@@ -2904,6 +2973,8 @@ class ServerArgs:
             unsupported = [
                 setting
                 for setting, refused in (
+                    # A pool is written when a page is published.
+                    ("--shared-l2-config", self.shared_l2_config is not None),
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                     (
                         "--kvstore-storage-backend",
@@ -3891,6 +3962,19 @@ class ServerArgs:
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--shared-l2-config",
+            type=str,
+            default=ServerArgs.shared_l2_config,
+            help="JSON object joining a shared L2 pool, which takes the place of "
+            "this rank's Host L2 (requires --disable-kvstore; prefill and fused "
+            "instances of attention TP 1; not with L3 storage, KV offloading, "
+            "retraction, --enable-memory-saver or --kvstore-write-policy "
+            "write_back). Fields: owner_address, device_names, "
+            "request_timeout_ms, join_timeout_s, read_workers, write_workers, "
+            "scheduler {max_writes_in_flight, max_keys_per_write}; see "
             "docs/configuration/server.md.",
         )
         parser.add_argument(
@@ -5205,7 +5289,8 @@ class ServerArgs:
             "the engine's own (one short, one of a full prefill chunk, then a "
             "full batch) through the ordinary serving path, so the first client "
             "requests do not compile what that path reaches. Not supported with "
-            "--disaggregation-mode or --kvstore-storage-backend.",
+            "--disaggregation-mode, --kvstore-storage-backend or "
+            "--shared-l2-config.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

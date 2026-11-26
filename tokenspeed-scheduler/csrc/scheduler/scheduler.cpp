@@ -112,12 +112,16 @@ Scheduler::Scheduler(SchedulerConfig config)
                              : nullptr},
       disk_transfers_{config_.HasDiskCache() ? std::make_unique<DiskTransferManager>(coordinator_, *config_.disk_config)
                                              : nullptr},
+      shared_l2_proxy_{config_.shared_l2_config ? std::make_unique<SharedL2Proxy>(coordinator_) : nullptr},
       peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr},
       peer_host_landings_{
           config_.peer_config && config_.peer_config->landing_tier == PeerLandingTier::kHost
               ? std::make_unique<PeerHostLandings>(coordinator_, config_.peer_config->max_host_landing_blocks)
               : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
+    if (shared_l2_proxy_) {
+        coordinator_.SetDeviceHitCollection(true);
+    }
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
@@ -783,6 +787,13 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
             local_candidates.emplace_back(request.get(), std::move(looking->host_grant));
             request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
         }
+        // With a shared L2 pool a waiting prompt waits for its lookup to be
+        // settled, so a prefix the pool holds is not recomputed.
+        if (const auto* waiting = request->GetIf<fsm::Submitted>();
+            waiting != nullptr && shared_l2_proxy_ &&
+            waiting->admission.shared_l2_lookup_state != fsm::SharedL2LookupState::kSettled) {
+            continue;
+        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());
@@ -843,7 +854,21 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         disk_operations = disk_transfers_->TakeCommands();
     }
 
-    if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
+    std::vector<SharedL2Operation> shared_l2_operations;
+    if (shared_l2_proxy_) {
+        // What the build's Device hits used, and what its admissions no
+        // longer hold: the lookups they consumed, and the load-backs that
+        // landed since the last plan.
+        shared_l2_operations = shared_l2_proxy_->NextOperations(coordinator_.TakeDeviceHits());
+        if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
+            // The Host tier is the pool's proxy: the queued publications,
+            // finishes included, are written to the pool, a bounded number at
+            // a time.
+            for (SharedL2WriteOperation& write : tier_transfers_.StartSharedL2Writes(*config_.shared_l2_config)) {
+                shared_l2_operations.emplace_back(std::move(write));
+            }
+        }
+    } else if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
@@ -880,16 +905,20 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         plan.peer_fetches.push_back(std::move(fetch));
     }
     const bool has_storage_work = !storage_operations.empty() || !disk_operations.empty();
+    const bool has_shared_l2_work = !shared_l2_operations.empty();
     for (auto& operation : storage_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
     for (auto& operation : disk_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
+    for (auto& operation : shared_l2_operations) {
+        plan.With(CacheOperation{std::move(operation)});
+    }
     trackStalledRounds(num_live_requests,
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
-                           built.snapshot_restores.empty() && plan.aborts.empty());
+                           built.snapshot_restores.empty() && plan.aborts.empty() && !has_shared_l2_work);
     // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
     // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
     // stalled plan, unless lone-request compaction moved or published

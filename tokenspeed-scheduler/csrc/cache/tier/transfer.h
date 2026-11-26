@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "cache/tier/disk.h"
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include "utils.h"
 
@@ -350,6 +351,6 @@ struct SnapshotRestoreBatch {
 };
 
 using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch, SnapshotStoreBatch, SnapshotRestoreBatch,
-                                    StorageOperation, DiskOperation>;
+                                    StorageOperation, DiskOperation, SharedL2Operation>;
 
 }  // namespace tokenspeed
