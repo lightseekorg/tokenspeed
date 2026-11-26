@@ -85,49 +85,37 @@ A fourth quantity lives outside the logical world entirely:
   (as a state slot). The view is defined by the consumer, not by the block.
 
 `BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
-the free child-slot count **per bucket** for each cache group, and per-bucket
-occupancy-indexed intrusive lists of partially filled LCM blocks (each
-occupancy level in `[1, packing - 1]` is an O(1) LIFO doubly-linked list paired
-with a bitmask for O(1) densest/sparsest lookup; intrusive links live in a
-pool-level flat table indexed by `(lcm_block_id - 1) * link_stride + bucket`
-that is allocated lazily only when a `packing > 1` group registers, leaving
-`packing == 1`-only pools with zero link-storage overhead). LIFO per-occupancy
-ordering is deterministic across mirrored ranks replaying the same operation
-sequence, though placement depends on operation history rather than
-instantaneous pool occupancy alone.
-C++ group ids are dense scheduler indices, so the scheduler supplies the
-complete packing vector when it constructs each pool. The per-group placement
-records form a vector indexed by group id, and each `GroupAvailability` stores
-immutable slots-per-parent geometry. The coordinator registers each group's
-shard count in every pool it owns — Device, Host L2, and the snapshot pool
-alike — before allocation, so a block's bucket means the same owner on every
-tier; an ordinary standalone pool fixes a single bucket on first use.
-Registration cannot change the geometry after it is fixed, including after all
-blocks are freed. The pool updates its per-bucket free-slot counts and bucket
-indexes together on every occupancy transition. A parent with zero occupants is
-unbound, so its capacity belongs to the global empty-parent FIFO rather than
-any group.
+the free child-slot count **per bucket** for each cache group, and
+deterministic O(1) per-bucket occupancy indexes of partially filled LCM blocks.
+Per-occupancy ordering is deterministic across mirrored ranks replaying the
+same operation sequence, though placement depends on operation history rather
+than instantaneous occupancy alone.
 
-For packed Device groups (`packing > 1`, non-State), admission and restore
-apply **request-aware placement** (`ParentAffinity`) so concurrent requests do
-not interleave their pages across the same LCM parents and block whole-parent
-reclamation when one request finishes. `GroupAllocator::PreferredParent`
-derives the affinity parent directly from the request's live `BlockTable` tail
-without storing extra per-request or per-parent state (rejecting shared blocks
-with `use_count > 2`, while admission and restore also disable tail-parent
-reuse on unprivatized prefix hits and claimed Device prefix tails even when
-`use_count == 2` so private growth never packs into cached prefix parents). Each
-allocation step tries: (1) a free slot in `preferred_parent` (respecting
-KV-parallel `min_load` bucket balance); (2) the next empty FIFO parent while
-`NumEmptyLcmBlocks() > reserved_empty_parents`, switching `preferred_parent`
-to that newly opened parent for subsequent blocks of the same request; and
-(3) fallback to the densest partial parent (hole-first) once empty parents
-reach the reserve floor. `reserved_empty_parents` reserves the exact empty
-parents later groups in the same admission step require (computed from the
-planner's `BlockPlacementDemand` and current per-bucket holes), so an earlier
-packed KV group never consumes empty parents needed by a later `packing = 1`
-group (such as State checkpoints). `State` groups, `packing == 1` groups, and
-compact Host/snapshot tiers bypass affinity and remain hole-first.
+C++ group ids are dense scheduler indices, so the scheduler supplies the
+complete packing vector when constructing each pool, and the coordinator
+registers every group's shard count across Device, Host L2, and snapshot pools
+before allocation (an ordinary standalone pool fixes a single bucket on first
+use; geometry is immutable once fixed). Free-slot counts and bucket indexes
+update together on every occupancy transition, and a parent with zero occupants
+is unbound and returned to the global empty-parent FIFO.
+
+For packed non-State Device groups (`packing > 1`), admission and restore apply
+**request-aware placement** (`ParentAffinity`) so concurrent requests do not
+interleave private pages across the same LCM parents and block whole-parent
+reclamation when a request finishes. Affinity is derived from the request's
+private tail without extra per-request state, and never reuses shared or cached
+prefix parents. Each allocation step tries:
+
+* **Preferred parent** — a free slot in the request's current private parent,
+  preserving KV-parallel bucket balance.
+* **Fresh empty parent** — the next empty FIFO parent while empty parents
+  remain above the reserve held for later groups in the same admission step,
+  becoming the new preferred parent.
+* **Hole-first fallback** — the densest partial parent once empty parents reach
+  that reserve floor.
+
+`State` groups, `packing == 1` groups, and compact Host/snapshot tiers bypass
+affinity and stay hole-first.
 
 An allocated block never moves, with one exception: a lone request's compaction
 (`LoneRequestAdmission::Compact`, `scheduler.md` §1.4) gathers the
