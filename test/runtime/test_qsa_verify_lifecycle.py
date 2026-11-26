@@ -155,6 +155,7 @@ def _runner(
     wrapper.token_to_kv_pool = SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=())
     )
+    wrapper.requires_forward_coordination = True
     wrapper._can_use_graph = lambda bs, ctx: use_graph
     wrapper._padded_bs = lambda bs, ctx: 4
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")

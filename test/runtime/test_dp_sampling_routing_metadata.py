@@ -37,6 +37,7 @@ def _graph_route(
     wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
     wrapper.disable = disable
     wrapper.dp_size = dp_size
+    wrapper.requires_forward_coordination = True
     wrapper.disable_padding = disable_padding
     wrapper.max_capture_bs = max_bs
     wrapper.capture_bs = capture_bs
