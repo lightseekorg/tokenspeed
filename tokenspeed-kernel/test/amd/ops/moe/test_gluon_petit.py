@@ -428,6 +428,15 @@ def test_validate_layer_preserves_kimi_k3_activation_contract(overrides, error):
         assert _validate_layer(layer) == _KIMI_K3_PROFILE
 
 
+def test_validate_layer_accepts_kimi_k3_without_bias_attributes() -> None:
+    # Kimi K3's compressed-tensors MXFP4 MoELayer registers no bias
+    # parameters (create_mxfp4_weight_pair(with_bias=False)), so the layer has
+    # no w13_weight_bias / w2_weight_bias attribute at all.
+    layer = _kimi_k3_layer()
+    del layer.w13_weight_bias, layer.w2_weight_bias
+    assert _validate_layer(layer) == _KIMI_K3_PROFILE
+
+
 def _register_parameter(
     module: torch.nn.Module,
     name: str,
