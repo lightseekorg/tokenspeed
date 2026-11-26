@@ -1484,6 +1484,10 @@ class ForwardStepRunner:
             )
             self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
             self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
+            # Execution slots take no padding pass: the fill uploads every row
+            # past the batch as execution_slot_padding (max_bs + 1, never a
+            # request-pool padding row) with the rows themselves, so the eager
+            # and graph paths read one buffer and padding costs no launch.
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
