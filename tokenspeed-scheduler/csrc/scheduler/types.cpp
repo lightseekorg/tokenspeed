@@ -151,7 +151,14 @@ void SchedulerConfig::Validate() const {
             throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching");
         }
         if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count != 1; })) {
-            throw std::invalid_argument("Scheduler: peer prefix sharing supports replicated cache groups only");
+            const bool supported = peer_config->versioned_shards && role == Role::kP &&
+                                   peer_config->landing_tier == PeerLandingTier::kDevice &&
+                                   std::ranges::all_of(cache_groups, [](const CacheGroupConfig& group) {
+                                       return (group.attn_kind == AttnKind::kFull && group.shard_count == 8) ||
+                                              (group.attn_kind == AttnKind::kState && group.shard_count == 1);
+                                   });
+            if (!supported)
+                throw std::invalid_argument("Scheduler: sharded peer sharing requires the v1 TP8/KVP8 P Device reader");
         }
         // A replayable group is never cached, so no holder exports the
         // suffix a landed prefix would have to replay.

@@ -90,6 +90,10 @@ Scheduler::PeerStats Scheduler::GetPeerStats() const {
         stats.leases = peer_exports_->NumLeases();
         stats.pinned_blocks = peer_exports_->NumPinnedBlocks();
     }
+    if (peer_offer_tickets_) {
+        stats.leases += peer_offer_tickets_->NumLeases();
+        stats.pinned_blocks += peer_offer_tickets_->NumPinnedBlocks();
+    }
     for (const auto& request : requests_) {
         stats.looking_requests += request->Is<fsm::PeerLooking>();
         stats.landing_requests += request->Is<fsm::PeerLanding>();
@@ -181,6 +185,13 @@ void Scheduler::recordPeerDispatch(Request& request) {
 }
 
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
+    if (config_.peer_config && config_.peer_config->versioned_shards) {
+        auto attempt = peer_target_attempts_.find(event.request_id);
+        if (attempt == peer_target_attempts_.end() || attempt->second != event.lease) return;
+        if (event.frozen && event.num_tokens != 0) return;
+        peer_target_attempts_.erase(attempt);
+        if (!event.frozen) RetirePeerTarget(event.lease);
+    }
     Request* request = findRequest(event.request_id);
     if (auto attempt = device_attempts_.extract(event.request_id); !attempt.empty()) {
         const auto& a = attempt.mapped();
@@ -332,6 +343,20 @@ bool Scheduler::ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now
     peer_exports_->Lookup(coordinator_, event, now_us);
     return peer_exports_->HasLease(event.lease);
 }
+
+bool Scheduler::PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us) {
+    if (!config_.peer_config || pin.pages.empty() || !peerPagesReady(pin.pages)) return false;
+    if (!peer_offer_tickets_) peer_offer_tickets_ = std::make_unique<PeerExports>(*config_.peer_config);
+    if (peer_offer_tickets_->HasLease(pin.lease)) return false;
+    peer_offer_tickets_->Pin(coordinator_, pin, now_us, &checkpoint);
+    return peer_offer_tickets_->Held(pin.lease);
+}
+
+bool Scheduler::ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us) {
+    if (!peer_offer_tickets_ || !peer_offer_tickets_->Held(lease)) return false;
+    peer_offer_tickets_->Release(coordinator_, cache::PeerRelease{.lease = lease, .demote = false}, now_us);
+    return true;
+}
 void Scheduler::ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint) {
     peer_exports_->Expire(now_us, /*retain_hard=*/true);
     if (!peerPagesReady(event.pages)) return;
@@ -465,6 +490,10 @@ void Scheduler::preparePeer(Request& request) {
         request.peer_local_reason = "lookup_below_min";
         return;
     }
+    if (static_cast<std::uint32_t>(next_peer_lease_) == std::numeric_limits<std::uint32_t>::max()) {
+        request.peer_local_reason = "lease_id_exhausted";
+        return;
+    }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
     peer_lookups_.push_back(PeerLookupRequest{.request_id = request.Id(),
                                               .deadline_us = Deadline(peer_now_us_, limits.lookup_timeout_us),
@@ -593,6 +622,14 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         build.scheduled.insert(request);
 
         const auto& landing = *request->GetIf<fsm::PeerLanding>();
+        if (config_.peer_config->versioned_shards) {
+            peer_target_attempts_.insert_or_assign(request->Id(), hit.lease);
+            auto& holds = peer_target_holds_[hit.lease];
+            for (const auto& table : landing.resources.block_tables) {
+                for (const auto& block : table.Blocks())
+                    if (block) holds.push_back(block);
+            }
+        }
         PeerFetchOperation fetch{.request_id = request->Id(),
                                  .lease = hit.lease,
                                  .holder = request->PeerHolder(),

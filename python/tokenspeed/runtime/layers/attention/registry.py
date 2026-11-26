@@ -133,6 +133,7 @@ class AttentionBuild:
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
     producer_fields_by_step: tuple[tuple[str, ...], ...]
     logical_plan: CacheMemoryPlan | None
+    peer_state_abi: dict | None = None
 
 
 def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
@@ -1727,4 +1728,9 @@ def create_attn_components(
         cache_fields_by_stage=cache_fields_by_stage,
         producer_fields_by_step=stage_schedules[server_args.mapping.pp_rank],
         logical_plan=logical_plan,
+        peer_state_abi=(
+            getattr(recipe, "peer_state_abi", None)
+            if server_args.peer_prefix_port
+            else None
+        ),
     )

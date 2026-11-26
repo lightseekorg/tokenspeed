@@ -1291,6 +1291,8 @@ def _peer_sharing_settings(
         protocol=mooncake_protocol(),
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
+        semantic_id=geometry.semantic_id,
+        source_role=server_args.disaggregation_mode,
     )
 
 
@@ -1476,6 +1478,8 @@ class HostBootstrap:
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
                     landing_tier=server_args.peer_prefix_landing_tier,
+                    versioned_shards=bool(self.peer_sharing.semantic_id)
+                    and mapping.attn.kvp_size == 8,
                     num_host_blocks=host_block_capacity(
                         device.host_cache.storage,
                         device.host_cache.ownership.shard_counts,

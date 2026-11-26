@@ -8,6 +8,13 @@ scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
 ## Two worlds: logical tokens vs. physical storage
 
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
 ### Logical world (token units, storage-agnostic)
 
 **Naming convention: every `*_granularity` quantity (`prefix_granularity`,

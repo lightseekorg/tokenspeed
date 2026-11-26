@@ -285,6 +285,20 @@ TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock
     EXPECT_TRUE(holder_.PeerLeaseHeld(pin.lease));
     holder_.ApplyPeerExport(cache::PeerRelease{.lease = pin.lease}, 4'000'004);
     EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, 0u);
+
+    pin.pages.back().block_id += 1;
+    EXPECT_FALSE(holder_.PinPeerOffer(checkpoint, pin, 4'000'005));
+    pin.pages = mapping;
+    ASSERT_TRUE(holder_.PinPeerOffer(checkpoint, pin, 4'000'006));
+    EXPECT_FALSE(holder_.PinPeerOffer(checkpoint, pin, 4'000'007));
+    const auto held = holder_.GetPeerStats().pinned_blocks;
+    ASSERT_GT(held, 0u);
+    holder_.ApplyPeerExport(cache::PeerRelease{.lease = pin.lease}, 4'000'008);
+    Send(holder_, cache::PeerTick{.now_us = 100'000'000});
+    EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, held);
+    EXPECT_TRUE(holder_.ClosePeerOffer(pin.lease, 100'000'001));
+    EXPECT_FALSE(holder_.ClosePeerOffer(pin.lease, 100'000'002));
+    EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, 0u);
 }
 
 TEST_P(PeerSchedulerTest, LookupBoundCanExcludeAPublishedTailCheckpoint) {
