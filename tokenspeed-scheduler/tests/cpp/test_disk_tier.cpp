@@ -1125,10 +1125,10 @@ TEST(DiskGdsTest, CleaningGatesTheTipAndPreservesColdAncestorDependencies) {
         const auto long_keys = cache.OnHostOnly(Prompt(4, 2));
         cache.disks.StartCleaning();
         EXPECT_TRUE(cache.disks.TakeCommands().empty());
-        // Reuse only the final history block. The ancestor blocks remain cold
-        // but are still required when this eligible branch is written to Disk.
-        const std::array tip{long_keys[3]};
-        {
+        // Reuse both tips: the short branch stays gated by length. Cold
+        // ancestors still belong to the eligible long branch's Disk closure.
+        for (const auto& key : {short_keys[1], long_keys[3]}) {
+            const std::array tip{key};
             auto& index = cache.coordinator.Store().Groups()[0].Index();
             const auto probe = FullAttnMatcher{}.Probe(index, cache.host, tip, 0, 1, /*extra_hits=*/nullptr);
             const auto reused = index.AcquireMatched(cache.host, tip, 0, probe,
@@ -1136,6 +1136,7 @@ TEST(DiskGdsTest, CleaningGatesTheTipAndPreservesColdAncestorDependencies) {
                                                      /*session=*/nullptr);
             ASSERT_EQ(reused.blocks.size(), 1u);
         }
+        const std::array tip{long_keys[3]};
         if (disk_tip) {
             CopyToDisk(cache, tip);
             cache.EvictFromHost(tip);

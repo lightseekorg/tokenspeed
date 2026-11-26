@@ -3776,6 +3776,8 @@ Both policies respect the write-operation limit and reserve foreground read
 capacity. Cleaning length and reuse gates apply to the candidate tip, never
 to its required ancestors. GDS rediscovers a gated candidate on a later pass;
 the queue-based policy keeps cold entries in its bounded reuse queue.
+A published Disk tip remains eligible when its lost ancestor copies need
+cleaning again: new Disk entries do not inherit Host's tier-local reuse bit.
 GDS does not queue write-back ACK notifications: its candidates come from
 residency, so unused notifications consume neither queue space nor the dropped
 cleaning counter. Legacy cleaning retains its bounded FIFO and drop accounting.

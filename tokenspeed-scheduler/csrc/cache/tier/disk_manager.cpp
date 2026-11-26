@@ -302,9 +302,13 @@ void DiskTransferManager::StartCleaning() {
                 };
                 const bool host_tip =
                     std::ranges::any_of(candidate.keys, [&](const CacheKey& key) { return qualifies(key, host_pool); });
-                const bool disk_tip = std::ranges::any_of(candidate.disk_dependencies, [&](const CacheKey& key) {
-                    return qualifies(key, *store.DiskPool());
-                });
+                // A published Disk tip already passed cleaning admission.
+                // Its new tier-local entry does not inherit was_acquired; it
+                // must still allow lost ancestor copies to be cleaned again.
+                const bool disk_tip = node->boundary_tokens >= config_.min_clean_tokens &&
+                                      std::ranges::any_of(candidate.disk_dependencies, [&](const CacheKey& key) {
+                                          return key.content_hash == candidate.hash;
+                                      });
                 if (!host_tip && !disk_tip) return true;
             }
             if (std::ranges::any_of(candidate.keys, [&](const CacheKey& key) { return !mayClean(key); })) return true;
