@@ -1808,7 +1808,8 @@ class MuseIrisState:
         rows: int,
         compile_only: bool,
     ) -> None:
-        """Launch iris_fused_lamport_twoshot_muse_attntail on rows producer rows.
+        """Launch ``iris_fused_lamport_twoshot_muse_attntail`` for ``rows`` rows
+        of producer output.
 
         ``branch`` is the producer view, so the kernel reads the same input as
         the unfused two-shot (``reduce_outputs``) would.
