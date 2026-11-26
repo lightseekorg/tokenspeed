@@ -75,6 +75,7 @@ def _graph_class(device: str) -> type:
         else torch.get_device_module(device).CUDAGraph
     )
 
+
 __all__ = [
     "BreakableCapture",
     "HandoffSlot",

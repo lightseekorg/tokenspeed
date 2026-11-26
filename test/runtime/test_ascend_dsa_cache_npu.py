@@ -52,6 +52,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         select_paged_dsa_attention,
         select_paged_dsa_indexer,
     )
+
     pytest.importorskip("flash_ops")
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 

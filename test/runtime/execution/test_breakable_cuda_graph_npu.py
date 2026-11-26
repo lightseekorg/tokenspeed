@@ -18,7 +18,6 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 import pytest  # noqa: E402
-
 import torch  # noqa: E402
 import torch.npu  # noqa: E402
 

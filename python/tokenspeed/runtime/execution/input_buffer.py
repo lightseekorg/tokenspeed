@@ -294,9 +294,7 @@ class InputBuffers:
             self.ngram_token_mask_buf[:refresh_tokens].zero_()
             if self.ngram_hash_ids_buf is not None:
                 assert self.ngram_padding_hash is not None
-                self.ngram_hash_ids_buf[:refresh_tokens].copy_(
-                    self.ngram_padding_hash
-                )
+                self.ngram_hash_ids_buf[:refresh_tokens].copy_(self.ngram_padding_hash)
             self._ngram_active_tokens = 0
             return
 

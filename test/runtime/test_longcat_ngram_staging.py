@@ -46,8 +46,8 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 from tokenspeed.runtime.plugins.longcat_ngram import NgramEmbedding
 
@@ -74,7 +74,9 @@ def _build_pair(cfg, device, seed=0):
     torch.manual_seed(seed)
     base = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, device=device)
     host_mod = NgramEmbedding(cfg, base).to(device)
-    staging_mod = NgramEmbedding(cfg, torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, device=device)).to(device)
+    staging_mod = NgramEmbedding(
+        cfg, torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, device=device)
+    ).to(device)
     # Share identical weights (embedder tables live on CPU either way).
     with torch.no_grad():
         staging_mod.word_embeddings.weight.data.copy_(
@@ -125,9 +127,7 @@ def test_staging_preload_matches_host_lookup():
             new_ids, host_mod._host_embedders[index]
         ).reshape(-1, 256)
         staged = staging_mod.staging[: ids.numel(), index, :]
-        assert torch.equal(staged, host_rows), (
-            f"embedder {index}: staging row mismatch"
-        )
+        assert torch.equal(staged, host_rows), f"embedder {index}: staging row mismatch"
     assert True  # 12/12 tables bit-exact
 
 
@@ -144,9 +144,9 @@ def test_staging_partial_matches_host_partial_bit_exact():
         staging_mod.preload_staging(ids, window)
         staging_out = staging_mod._ngram_local_partial(ids, window)
     assert list(staging_out.shape) == list(ids.shape) + [cfg.hidden_size]
-    assert torch.equal(staging_out, host_out), (
-        "staging path and host path must be bit-identical (maxdiff=0)"
-    )
+    assert torch.equal(
+        staging_out, host_out
+    ), "staging path and host path must be bit-identical (maxdiff=0)"
     md = (staging_out.float() - host_out.float()).abs().max().item()
     assert md == 0.0, f"maxdiff={md}"
 

@@ -157,9 +157,7 @@ def test_hccl_all_gather_reduce_scatter_roundtrip():
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
-    torch.distributed.init_process_group(
-        backend="hccl", rank=rank, world_size=world
-    )
+    torch.distributed.init_process_group(backend="hccl", rank=rank, world_size=world)
     try:
         torch.manual_seed(0)
         x = torch.full((8, 4), rank, dtype=torch.float32, device="npu")
@@ -167,12 +165,19 @@ def test_hccl_all_gather_reduce_scatter_roundtrip():
         torch.distributed.all_gather_into_tensor(gathered, x.contiguous())
         if rank == 0:
             expected = torch.cat(
-                [torch.full((8, 4), r, dtype=torch.float32, device="npu") for r in range(world)]
+                [
+                    torch.full((8, 4), r, dtype=torch.float32, device="npu")
+                    for r in range(world)
+                ]
             )
             torch.testing.assert_close(gathered, expected, msg="all_gather_into_tensor")
         out = torch.empty((8, 4), dtype=torch.float32, device="npu")
-        torch.distributed.reduce_scatter_tensor(out, gathered, torch.distributed.ReduceOp.SUM)
-        expected_scatter = torch.full((8, 4), world * rank, dtype=torch.float32, device="npu")
+        torch.distributed.reduce_scatter_tensor(
+            out, gathered, torch.distributed.ReduceOp.SUM
+        )
+        expected_scatter = torch.full(
+            (8, 4), world * rank, dtype=torch.float32, device="npu"
+        )
         torch.testing.assert_close(out, expected_scatter, msg="reduce_scatter_tensor")
     finally:
         torch.distributed.destroy_process_group()

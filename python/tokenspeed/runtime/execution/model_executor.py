@@ -2847,12 +2847,8 @@ class ModelExecutor:
                 # host 查表路径（基线可回退）。非 LongCat 模型无此钩子 → no-op。
                 if (
                     self.config.enforce_eager is False
-                    and hasattr(
-                        self.model_runner.model, "preload_ngram_staging"
-                    )
-                    and getattr(
-                        self.model_runner.model, "ngram_staging_enabled", False
-                    )
+                    and hasattr(self.model_runner.model, "preload_ngram_staging")
+                    and getattr(self.model_runner.model, "ngram_staging_enabled", False)
                 ):
                     ngram_window = self.input_buffers.ngram_model_kwargs(
                         total_tokens

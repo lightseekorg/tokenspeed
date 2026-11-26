@@ -46,8 +46,8 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 from tokenspeed.runtime.plugins.longcat_ngram import NgramEmbedding
 
@@ -142,9 +142,9 @@ def test_decode_graph_staging_replays_match_host_reference():
         g.replay()
         torch.npu.synchronize()
         got = out_buf.float()
-        assert torch.equal(got, ref), (
-            f"round {round_}: graph replay vs eager host reference mismatch"
-        )
+        assert torch.equal(
+            got, ref
+        ), f"round {round_}: graph replay vs eager host reference mismatch"
         md = (got - ref).abs().max().item()
         assert md == 0.0, f"round {round_}: maxdiff={md}"
 
@@ -194,9 +194,9 @@ def test_probe_forward_2d_staging_replays_match_host_reference():
         g.replay()
         torch.npu.synchronize()
         got = out_buf.float()
-        assert torch.equal(got, ref), (
-            f"round {round_}: probe 2-D graph replay vs eager host reference mismatch"
-        )
+        assert torch.equal(
+            got, ref
+        ), f"round {round_}: probe 2-D graph replay vs eager host reference mismatch"
         md = (got - ref).abs().max().item()
         assert md == 0.0, f"round {round_}: maxdiff={md}"
 

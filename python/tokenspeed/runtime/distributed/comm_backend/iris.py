@@ -217,9 +217,7 @@ class IrisBackend(CommBackend):
             producer_direct_max_numel=producer_direct_max_numel,
             dtype=dtype,
             heap_size=None,
-            device=torch.device(
-                f"{device_type}:{device_module.current_device()}"
-            ),
+            device=torch.device(f"{device_type}:{device_module.current_device()}"),
         )
         self.install(group, state)
         return state
