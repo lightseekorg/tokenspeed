@@ -20,7 +20,20 @@
 
 """Distributed runtime public exports."""
 
-from tokenspeed.runtime.distributed.comm_manager import CommManager
+from typing import TYPE_CHECKING
+
 from tokenspeed.runtime.distributed.mapping import Mapping
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.comm_manager import CommManager
+
 __all__ = ["CommManager", "Mapping"]
+
+
+def __getattr__(name: str) -> "type[CommManager]":
+    """Resolve the communication manager only when a caller requests it."""
+    if name == "CommManager":
+        from tokenspeed.runtime.distributed.comm_manager import CommManager
+
+        return CommManager
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
