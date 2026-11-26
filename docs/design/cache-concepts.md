@@ -161,6 +161,19 @@ Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
 
+A shared L2 pool (`--shared-l2-config`) uses the compact Host geometry too. A
+pool page holds one block exactly as a Host block does, and a rank reports the
+pool's `host_group_packing` for its Host tier, which is then a proxy: its
+blocks hold no bytes and stand for pinned pool pages. Only the parents are
+spread over the provider processes' memory, in the order the providers
+joined: a page lies in its parent as a Host block does, on the provider that
+holds the parent (`shared_l2/geometry.rs` of `ts-control`, from the sizes
+`runtime/cache/shared_l2/layout.py` reads off the Host layout); the bytes
+move between a rank's Device blocks and pool pages by RDMA and never pass
+through the rank's host memory. The pool's capacity follows from the same
+geometry: a State checkpoint costs one parent for each State group, and KV
+pages share parents by their group's packing.
+
 Host allocations follow PyTorch's existing allocator configuration, including
 `PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
 never overrides the registration method or thread count. Without an explicit

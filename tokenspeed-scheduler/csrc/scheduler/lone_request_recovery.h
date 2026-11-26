@@ -107,6 +107,7 @@ public:
 
 private:
     bool alone(const Request& request) const;
+    bool hasPendingSharedL2Stores() const;
     // Records an admission's pages on the plan; returns it.
     std::optional<AdmissionResult> record(ExecutionPlan& plan, std::optional<AdmissionResult> admission);
     // The compaction for the admission `retry` repeats: gathers the request's

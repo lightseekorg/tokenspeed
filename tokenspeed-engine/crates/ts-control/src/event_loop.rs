@@ -89,6 +89,7 @@ use crate::{
     peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
+    shared_l2::{Pool, PoolClient, PoolError},
 };
 
 /// Fold what an output-processor call produced into the round's results.
@@ -501,6 +502,9 @@ pub enum LoopError {
     /// agree on its reports.
     #[error(transparent)]
     Disk(#[from] DiskError),
+    /// The shared L2 pool's client or its owner failed.
+    #[error(transparent)]
+    SharedL2(#[from] PoolError),
     /// The replica could not agree on its peer sharing reports.
     #[error(transparent)]
     Peer(#[from] PeerError),
@@ -616,23 +620,13 @@ pub struct Subsystems {
     pub disk: Option<DiskTier>,
     /// The Disk tier's metrics, on a rank that reports them.
     pub disk_metrics: Option<DiskMetrics>,
+    /// With a shared L2 pool as the Host tier, this rank's client of the
+    /// pool's owner. `None` without one.
+    pub shared_l2: Option<Box<dyn PoolClient + Send>>,
     /// With peer prefix sharing, this rank's part of it: started over the
     /// loop's scheduler, which its endpoint serves between rounds. `None`
     /// without.
     pub peer: Option<Peer>,
-}
-
-// Only independent peers can use the scheduler during a device or collective wait.
-fn during_peer_wait<T>(
-    peer: Option<&Peer>,
-    scheduler: &mut ArcMutexGuard<RawMutex, Scheduler>,
-    wait: impl FnOnce() -> T,
-) -> T {
-    if peer.is_some_and(Peer::autonomous) {
-        ArcMutexGuard::unlocked(scheduler, wait)
-    } else {
-        wait()
-    }
 }
 
 /// Fences issued through the forward queue, and the prefix every replica
@@ -648,7 +642,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Held for the whole round. A peer holder's endpoint answers from the
     /// scheduler between rounds, so the loop lets go of it only where it
     /// waits on something else: a forward's result, an idle frontend, a
-    /// paused round's sleep.
+    /// paused round's sleep (when no device copies were just queued), or an
+    /// attention-DP collective / idle forward when no forward or device copy
+    /// batch is still queued on the device.
     scheduler: ArcMutexGuard<RawMutex, Scheduler>,
     data_plane: D,
     frontend: F,
@@ -667,6 +663,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The Disk tier: this rank's executor and the replica's agreement.
     disk: Option<DiskTier>,
     disk_metrics: Option<DiskMetrics>,
+    /// The shared L2 pool: this rank's client and the writes in flight there.
+    shared_l2: Option<Pool>,
     peer: Option<Peer>,
     /// The peer clock the replica agreed on this round.
     peer_now_us: i64,
@@ -679,6 +677,13 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     history: Option<HistoryRows>,
     /// Dispatched forwards, oldest first, with the prompt rows each gathers.
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
+    /// Forwards queued on the device and forwards whose results came back.
+    forwards_dispatched: u64,
+    forwards_completed: u64,
+    /// Set while a dispatched plan's `pages_to_copy` may still be queued on the
+    /// device: the `forwards_dispatched` count whose completion proves, by
+    /// device order, that the copies ran. A later plan never clears it.
+    copies_confirmed_at: Option<u64>,
     cache_ops: CacheOps,
     replay_retirements: Option<ReplayRetirements>,
     controls: Controls,
@@ -769,6 +774,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             l3_metrics: subsystems.l3_metrics,
             disk: subsystems.disk,
             disk_metrics: subsystems.disk_metrics,
+            shared_l2: subsystems.shared_l2.map(Pool::new),
             peer: subsystems.peer,
             peer_now_us: 0,
             scheduler: scheduler.lock_arc(),
@@ -787,6 +793,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             grammar_queue: Vec::new(),
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
+            forwards_dispatched: 0,
+            forwards_completed: 0,
+            copies_confirmed_at: None,
             cache_ops: CacheOps::new(),
             cache_clear_started: None,
             startup_cache_clear: false,
@@ -848,6 +857,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             self.startup_cache_clear = true;
             loop {
+                self.sync_peer_holder_changes()?;
                 if self.clear_cache()? == Some(true) {
                     break;
                 }
@@ -893,6 +903,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             || self.cache_ops.open() != 0
             || self.replay_retirements_pending()
             || self.outputs.num_running() != 0
+            || self
+                .shared_l2
+                .as_ref()
+                .is_some_and(|shared_l2| shared_l2.open_writes() != 0)
         {
             return false;
         }
@@ -969,8 +983,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
-        // Hand off to a waiting servicer even in rounds with no device,
-        // transfer or frontend wait. With no waiter this is one atomic read.
+        // Hand off to a waiting peer servicer even in rounds with no device,
+        // transfer, collective, or frontend wait. With no waiter this costs
+        // one atomic read.
         ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
@@ -1044,13 +1059,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
         let storage = self.storage_round(&storage_reports, forward_allowed)?;
-        let ready = if self.cache_ops.open() > 0 {
+        let mut ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
                 .acknowledged(polled, &mut self.ranks.mesh, &self.ranks.replica)?
         } else {
             Vec::new()
         };
+        // A shared L2 pool's finished writes are acknowledgments too: polled
+        // in every round, frozen or not.
+        if let Some(shared_l2) = self.shared_l2.as_mut() {
+            ready.extend(shared_l2.poll_writes()?);
+        }
         if storage.tick.is_some() || !ready.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
@@ -1082,6 +1102,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if let Some(disk) = &self.disk {
                 busy |= disk.submit(&plan)?;
             }
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                busy |= shared_l2.dispatch(&plan, self.in_flight.len())?;
+            }
             let cache_ops = plan.cache_ops();
             self.cache_ops.dispatched(&cache_ops);
             let retirement_id = if self.replay_retirements.is_some()
@@ -1097,6 +1120,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // The storage tick disabled forward planning: scheduler aborts arise
             // only in that build, and frozen rounds reset the no-progress streak.
             self.record_scheduler_metrics(None, &cache_ops, 0);
+            let frozen_has_copies = plan.has_pages_to_copy();
             let device_work = plan.needs_device() || retirement_id.is_some();
             busy |= device_work;
             if device_work {
@@ -1108,21 +1132,36 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     },
                 )?;
             }
+            if device_work && frozen_has_copies {
+                // No forward of its own: the next one dispatched is behind it.
+                self.copies_confirmed_at = Some(self.forwards_dispatched + 1);
+            }
+            let copies_clear = self.copies_confirmed_at.is_none();
             let mut forwarded = false;
-            if let Some(dp) = self.dp_round(None, &mut stop)? {
+            if let Some(dp) = self.dp_round(None, &mut stop, copies_clear)? {
                 if dp.idle_forward && memory_resident {
-                    during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
-                        self.data_plane.idle_forward(&dp)
-                    })?;
+                    if !copies_clear {
+                        self.data_plane.idle_forward(&dp)?;
+                    } else {
+                        let data_plane = &mut self.data_plane;
+                        ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                            data_plane.idle_forward(&dp)
+                        })?;
+                    }
                     forwarded = true;
                 }
             }
             busy |= forwarded;
             self.note_forward(forwarded);
-            ArcMutexGuard::unlocked(&mut self.scheduler, || {
+            if !copies_clear {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
-            });
+            } else {
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    std::thread::sleep(PAUSED_IDLE_SLEEP);
+                });
+            }
         } else {
+            busy |= self.shared_l2_round()?;
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
                 &mut stop,
@@ -1207,8 +1246,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed. Returns whether the data plane or the L3
-    /// executor got work.
+    /// in-flight depth committed. Returns whether the data plane, the L3
+    /// executor or a shared L2 pool's client got work.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
@@ -1221,6 +1260,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
+        let has_device_copies = plan.has_pages_to_copy();
         let sample_ttft = self.outputs.ttft_sampling_enabled();
         let debug = tracing::enabled!(tracing::Level::DEBUG);
         // Reading the batch crosses FFI and copies its arrays.
@@ -1245,6 +1285,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             (Some(l3), _) => l3.submit(&plan)?,
             (None, Some(disk)) => disk.submit(&plan)?,
             (None, None) => false,
+        };
+        // So do a plan's shared L2 ops, on the pool's client; its writes once
+        // the forwards in flight landed.
+        let shared_l2_work = match self.shared_l2.as_mut() {
+            Some(shared_l2) => shared_l2.dispatch(&plan, self.in_flight.len())?,
+            None => false,
         };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
@@ -1274,7 +1320,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        let dp = self.dp_round(forward.as_ref(), stop)?;
+        // Keep `self.scheduler` locked for coordinated peers and whenever
+        // `pages_to_copy` may still be pending on the device; an autonomous
+        // single-member peer can safely use the scheduler during the DP
+        // collective when no device copy batch is unconfirmed.
+        let dp_unlock = self.peer.as_ref().is_some_and(Peer::autonomous)
+            && !has_device_copies
+            && self.copies_confirmed_at.is_none();
+        let dp = self.dp_round(forward.as_ref(), stop, dp_unlock)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
             // Padding for a peer is not a local request batch.
             forward = None;
@@ -1342,18 +1395,34 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
+        let mut queued = false;
         let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
-            let pending = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
-                self.data_plane.execute(plan, &dispatch)
-            })?;
-            if let Some(pending) = pending {
+            let copies_clear = !has_device_copies && self.copies_confirmed_at.is_none();
+            let executed = if copies_clear
+                && (idle_forward || self.peer.as_ref().is_some_and(Peer::autonomous))
+            {
+                let data_plane = &mut self.data_plane;
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    data_plane.execute(plan, &dispatch)
+                })?
+            } else {
+                self.data_plane.execute(plan, &dispatch)?
+            };
+            if let Some(pending) = executed {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
                 self.in_flight.push_back((batch, input_logprobs, pending));
+                self.forwards_dispatched += 1;
                 forwarded = true;
+                queued = true;
             }
+        }
+        if device_work && has_device_copies {
+            // Its own forward runs behind the copies; without one, the next
+            // forward dispatched does.
+            self.copies_confirmed_at = Some(self.forwards_dispatched + u64::from(!queued));
         }
         self.note_forward(forwarded);
 
@@ -1365,7 +1434,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             0
         };
         self.commit_down_to(depth, events, outputs, released)?;
-        Ok(device_work || storage_work)
+        Ok(device_work || storage_work || shared_l2_work)
     }
 
     /// Export a round's snapshot on both serving and paused paths. The
@@ -1511,6 +1580,30 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let due = controller.note_round(forwarded);
             self.controls.enqueue_internal(due);
         }
+    }
+
+    /// With a shared L2 pool, the waiting prompts not looked up yet ask the
+    /// pool in one request, and the round waits for its answers: a prompt is
+    /// in no plan before its answer, so that a prefix the pool holds is not
+    /// recomputed. An answer is no event of the head's batch: the proxy
+    /// blocks it creates go back to the pool's client. Returns whether any
+    /// prompt was asked about.
+    fn shared_l2_round(&mut self) -> Result<bool, LoopError> {
+        let Some(shared_l2) = self.shared_l2.as_mut() else {
+            return Ok(false);
+        };
+        let lookups = self.scheduler.start_shared_l2_lookups();
+        if lookups.is_empty() {
+            return Ok(false);
+        }
+        let _span = profile::span("EventLoop::shared_l2_round");
+        let answers = shared_l2.lookup(&lookups)?;
+        let proxy_blocks = self
+            .scheduler
+            .apply_shared_l2_answers(&answers)
+            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        shared_l2.map_proxy_blocks(&proxy_blocks);
+        Ok(true)
     }
 
     /// The round's storage input to the scheduler. With L3 or the Disk
@@ -2105,7 +2198,28 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -key,
                 if reload_ready { -1 } else { 0 },
             ];
-            let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
+            let reduced = if self.ranks.replica.size() == 1
+                && self.in_flight.is_empty()
+                && self.copies_confirmed_at.is_none()
+            {
+                let reduced = {
+                    let mesh = &mut self.ranks.mesh;
+                    ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                        mesh.all_reduce(world, &row, Reduce::Max)
+                    })?
+                };
+                // Any peer Lookup/Pin/Release answered while waiting on sibling DP
+                // ranks in `all_reduce` must be applied to `self.scheduler` before
+                // `clear_cache` or `next_execution_plan` runs in this round.
+                // Limited to single-member replicas so TP/PP adds no per-round broadcast,
+                // and only when no forward is in flight and every dispatched copy batch
+                // is behind a forward that completed. The round-head `bump`, the idle
+                // receive and `complete()` hand the scheduler over regardless, as on main.
+                self.sync_peer_holder_changes()?;
+                reduced
+            } else {
+                self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?
+            };
             // A resume reaches DP engines independently. None may forward
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
@@ -2739,6 +2853,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     && self.transfers_idle()
                     && self.cache_ops.open() == 0,
             )?;
+        // Sync any peer Lookup/Pin/Release answered while `self.scheduler` was
+        // unlocked earlier in this round before `storage_non_storage_clearable`
+        // or `clear_l1_cache` inspects hard pins. Only runs when a Reload or
+        // Release drain is actually active, adding zero per-round collectives.
+        if self.controls.reload_pending() && self.peer.is_some() && self.replica_any(drained)? {
+            self.sync_peer_holder_changes()?;
+        }
         let Some(drain) = self.controls.drain() else {
             return Ok(());
         };
@@ -2755,8 +2876,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            if tags.iter().any(|tag| tag == "kv_cache") && !self.scheduler.clear_l1_cache() {
-                return Ok(());
+            if tags.iter().any(|tag| tag == "kv_cache") {
+                self.sync_peer_holder_changes()?;
+                if !self.scheduler.clear_l1_cache() {
+                    return Ok(());
+                }
             }
         }
         match self.controls.take_drain().expect("checked above") {
@@ -2777,6 +2901,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
     /// Act on a control operation as it arrives.
     fn control(&mut self, request: ControlRequest) -> Result<(), LoopError> {
+        // A shared L2 pool has no weight version: its pages would be read
+        // back under weights or a forward that did not compute them. Such an
+        // operation is refused here, before it drains or flushes anything.
+        if self.shared_l2.is_some()
+            && (control::is_weight_load(&request)
+                || matches!(request, ControlRequest::ReloadForward(_)))
+        {
+            let refusal = "a shared L2 pool holds KV of the weights and forward the server \
+                           started with; restart the ranks and clear the pool instead"
+                .to_owned();
+            tracing::info!(
+                op = request.tag(),
+                message = refusal,
+                "refused with a shared L2 pool"
+            );
+            self.controls
+                .reply(control::gated_reply(&request, false, refusal));
+            return Ok(());
+        }
         // A disaggregated release cannot drain while a pause withholds
         // requests that would still need their transfers, nor a release run
         // while a rebalance's steps would land on unmapped weights.
@@ -3081,12 +3224,41 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
+    /// Drain any holder changes answered on `ts-peer-servicer` while
+    /// `self.scheduler` was unlocked, share them across the replica so every
+    /// TP/PP member applies the exact same sequence, and advance `self.scheduler`.
+    fn sync_peer_holder_changes(&mut self) -> Result<(), LoopError> {
+        let Some(peer) = &self.peer else {
+            return Ok(());
+        };
+        let changes = if self.ranks.replica.size() == 1 {
+            peer.take_holder_changes()
+        } else {
+            let payload = if self.owns_frontend() {
+                Peer::encode_changes(&peer.take_holder_changes())
+            } else {
+                Vec::new()
+            };
+            let shared = self.ranks.mesh.broadcast(&self.ranks.replica, 0, payload)?;
+            Peer::decode_changes(&shared)?
+        };
+        if !changes.is_empty() {
+            self.scheduler
+                .advance_peer(self.peer_now_us, &changes)
+                .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        }
+        Ok(())
+    }
+
     /// With attention DP, every rank's batch this round, and whether any
-    /// rank is stopping.
+    /// rank is stopping. When `allow_unlock` is true and no forward is in
+    /// flight, releases `self.scheduler` across the DP `all_gather` so
+    /// `ts-peer-servicer` can answer while waiting on sibling DP ranks.
     fn dp_round(
         &mut self,
         forward: Option<&ForwardBatchView>,
         stop: &mut bool,
+        allow_unlock: bool,
     ) -> Result<Option<DpRound>, LoopError> {
         let (num_tokens, batch_size, num_extends) = match forward {
             Some(batch) => {
@@ -3129,9 +3301,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
-            self.ranks.mesh.all_gather_i64(world, &row)
-        })?;
+        let rows = if allow_unlock
+            && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::autonomous))
+        {
+            let mesh = &mut self.ranks.mesh;
+            ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
+        } else {
+            self.ranks.mesh.all_gather_i64(world, &row)?
+        };
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;
@@ -3351,6 +3528,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let data_plane = &mut self.data_plane;
             let result =
                 ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
+            self.forwards_completed += 1;
+            if self
+                .copies_confirmed_at
+                .is_some_and(|at| self.forwards_completed >= at)
+            {
+                self.copies_confirmed_at = None;
+            }
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                shared_l2.forward_landed()?;
+            }
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;
             let Committed {

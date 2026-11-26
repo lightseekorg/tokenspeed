@@ -251,6 +251,11 @@ impl Pieces {
         self.pieces.iter().copied()
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(pieces: Vec<(usize, usize)>) -> Self {
+        Self { pieces }
+    }
+
     /// The piece holding `address`: its index and end.
     fn find(&self, address: usize) -> Option<(usize, usize)> {
         let index = self
@@ -370,8 +375,9 @@ impl Executor {
         };
         match config.backend {
             Backend::IoUring => {
-                let ring = uring::Ring::new(&file, &pieces, config.queue_depth)
-                    .map_err(StartError::Ring)?;
+                let ring =
+                    uring::Ring::new(&file, &pieces, config.queue_depth, config.max_io_bytes)
+                        .map_err(StartError::Ring)?;
                 let (shared, file) = (shared.clone(), file.clone());
                 executor.lifecycle.lock().threads.push(spawn(
                     "ts-disk-uring".to_owned(),
@@ -383,11 +389,12 @@ impl Executor {
                 )?);
             }
             Backend::Psync => {
+                let max_io_bytes = config.max_io_bytes;
                 for index in 0..config.queue_depth {
                     let (shared, file) = (shared.clone(), file.clone());
                     executor.lifecycle.lock().threads.push(spawn(
                         format!("ts-disk-io-{index}"),
-                        Box::new(move || psync::run(&shared, &file)),
+                        Box::new(move || psync::run(&shared, &file, max_io_bytes)),
                     )?);
                 }
             }
@@ -427,11 +434,11 @@ impl Executor {
             {
                 return Err(SubmitError::PastFile(io));
             }
-            chunks.extend(
-                self.pieces
-                    .split(io, job.direction, self.max_io_bytes)
-                    .ok_or(SubmitError::Unregistered(io))?,
-            );
+            let split = self
+                .pieces
+                .split(io, job.direction, self.max_io_bytes)
+                .ok_or(SubmitError::Unregistered(io))?;
+            chunks.extend(split);
         }
         let mut queues = self.shared.queues.lock();
         if queues.closing() {

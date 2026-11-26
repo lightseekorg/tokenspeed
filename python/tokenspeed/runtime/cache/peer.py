@@ -59,8 +59,7 @@ SOFT_PIN_S = 2.0
 # their deadline, long before.
 HARD_PIN_S = 30.0
 # A reader whose read failed holds the landing's blocks this long before
-# reusing them, so a READ still in flight cannot land in another request's
-# block.
+# reusing them, so an in-flight READ cannot land in another request's block.
 QUARANTINE_S = 5.0
 # A holder forgets a lease's record this long after its last request.
 RECORD_LIFETIME_S = HARD_PIN_S + 30.0
@@ -125,11 +124,21 @@ def peer_scheduler_config(
     host = landing_tier == "host"
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
+    if answer_timeout_ms <= 0:
+        raise ValueError(
+            f"peer answer_timeout_ms must be positive, got {answer_timeout_ms}"
+        )
+    answer_timeout_s = answer_timeout_ms / 1000.0
+    soft_pin_s = min(
+        HARD_PIN_S,
+        max(SOFT_PIN_S, (2.0 if host else 4.0) * answer_timeout_s + 2.0),
+    )
+    host_ready_s = max(HOST_READY_S, answer_timeout_s + 5.0)
     return PeerConfig(
         name=name,
         incarnation=incarnation,
         max_leases=MAX_LEASES,
-        soft_pin_us=int(SOFT_PIN_S * 1e6),
+        soft_pin_us=int(soft_pin_s * 1e6),
         hard_pin_us=int(HARD_PIN_S * 1e6),
         lookup_timeout_us=answer_timeout_ms * 1000,
         min_fetch_tokens=min_fetch_tokens,
@@ -137,7 +146,7 @@ def peer_scheduler_config(
         max_host_landing_blocks=(
             max(1, int(num_host_blocks * HOST_LANDING_BLOCKS_FRACTION)) if host else 0
         ),
-        host_ready_timeout_us=int(HOST_READY_S * 1e6) if host else 0,
+        host_ready_timeout_us=int(host_ready_s * 1e6) if host else 0,
         versioned_shards=versioned_shards,
     )
 

@@ -223,18 +223,11 @@ pub fn start(
         settings.peer.incarnation,
     )
     .map_err(|error| error.to_string())?;
-    if let Some((executor, disk_layout, ring, slot_bytes)) = disk.and_then(DiskTier::push_source) {
+    let push_source = disk.and_then(DiskTier::push_source);
+    if let Some((_, _, ref ring, _)) = push_source {
         engine
             .register(ring.address(), ring.size())
             .map_err(|error| error.to_string())?;
-        push.serve(PushSource {
-            executor,
-            disk_layout,
-            ring,
-            slot_bytes,
-            writer: Arc::new(EngineWriter(engine.clone())),
-        })
-        .map_err(|error| error.to_string())?;
     }
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
@@ -301,6 +294,16 @@ pub fn start(
             "TP8/KVP8 peer reader requires a pinned weight identity and a common registered layout"
                 .into(),
         );
+    }
+    if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
+        push.serve(PushSource {
+            executor,
+            disk_layout,
+            ring,
+            slot_bytes,
+            writer: Arc::new(EngineWriter(engine.clone())),
+        })
+        .map_err(|error| error.to_string())?;
     }
     tracing::debug!(
         regions = ?settings

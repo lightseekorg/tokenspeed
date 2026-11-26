@@ -151,6 +151,25 @@ impl Peer {
         matches!(&self.driver, Driver::Background(_))
     }
 
+    /// Drain queued holder changes on the endpoint owner (empty on other
+    /// members and autonomous peers, which apply exports directly).
+    pub fn take_holder_changes(&self) -> Vec<PeerEventView> {
+        match &self.driver {
+            Driver::Rounds(p) => p.take_holder_changes(),
+            Driver::Background(_) => Vec::new(),
+        }
+    }
+
+    /// Encode holder changes for intra-replica broadcast.
+    pub fn encode_changes(changes: &[PeerEventView]) -> Vec<u8> {
+        Protocol::encode_changes(changes)
+    }
+
+    /// Decode holder changes from intra-replica broadcast.
+    pub fn decode_changes(bytes: &[u8]) -> Result<Vec<PeerEventView>, PeerError> {
+        Protocol::decode_changes(bytes)
+    }
+
     /// Report to the normal replica collective (empty for the independent owner).
     pub fn report(&mut self) -> Vec<u8> {
         let legacy = match &mut self.driver {
@@ -620,6 +639,11 @@ fn drive(
             match commands.try_recv() {
                 Ok(Command::Lookup(lookups, scheduler_tick)) => {
                     for mut l in lookups {
+                        l.holder = normalize_peer_holder(&l.holder).to_owned();
+                        if l.holder == p.settings.name {
+                            p.self_lookup_answers.push(fallback(l.lease));
+                            continue;
+                        }
                         let budget = l.deadline_us.saturating_sub(scheduler_tick).max(0);
                         let sent = p.origin.elapsed().as_micros() as i64;
                         l.deadline_us = sent.saturating_add(budget);
@@ -702,7 +726,9 @@ fn drive(
                     let Some(attempt) = pending.get(&answer.lease.id) else {
                         continue;
                     };
-                    if attempt.lease != answer.lease || stamp.name != attempt.holder {
+                    if attempt.lease != answer.lease
+                        || normalize_peer_holder(&stamp.name) != attempt.holder
+                    {
                         continue;
                     }
                     let attempt = pending.remove(&answer.lease.id).unwrap();
@@ -745,9 +771,10 @@ fn drive(
             }
             p.take_reply(&reply, arrival, &mut out.events, &mut actions);
             if let Reply::Layout { stamp, .. } = &reply {
-                if p.layouts.contains_key(&stamp.name) {
+                let holder_name = normalize_peer_holder(&stamp.name);
+                if p.layouts.contains_key(holder_name) {
                     for (rid, landing) in &mut p.landings {
-                        if landing.fetch().holder == stamp.name {
+                        if landing.fetch().holder == holder_name {
                             landing.tick(arrival);
                             if let Some(action) = landing.layout_known(arrival) {
                                 actions.push((rid.clone(), action));

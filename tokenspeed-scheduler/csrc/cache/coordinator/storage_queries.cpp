@@ -288,6 +288,18 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
     return {};
 }
 
+std::int32_t StorageQueries::ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const {
+    if (hits.empty() || prompt.max_tokens <= 0) return 0;
+    const std::unordered_set<CacheKey, CacheKeyHash> remote(hits.begin(), hits.end());
+    const PreparedPrefixKeys keys = prober_.ResolvePreparedPrefixKeys(prompt);
+    const auto& group_keys = *keys;
+    const PrefixProbe::Tier device_only =
+        prober_.ProbeTier(prompt, group_keys, store_.MatchOrder(), /*claim_partial=*/true);
+    const auto suffix = prober_.ProbeHostSuffix(prompt, group_keys, store_.MatchOrder(), device_only.num_common_tokens,
+                                                &remote, device_only);
+    return std::max(device_only.num_common_tokens, suffix.host.num_common_tokens);
+}
+
 PrefixProber::PrefixListing StorageQueries::ListWithDisk(const PromptPrefix& prompt,
                                                          std::span<const CacheKey> disk_hits) const {
     const BlockPool* disk_pool = store_.DiskPool();

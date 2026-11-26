@@ -165,8 +165,12 @@ def test_a_prefill_rank_refuses_deferred_allocation_for_a_multimodal_model(
             match="deferred does not support a multimodal model; serve it "
             "with --language-model-only",
         ):
-            rust_host.HostBootstrap(server_args, None, None, None, None, None, None)
+            rust_host.HostBootstrap(
+                server_args, None, None, None, None, None, None, None
+            )
     else:
         # Past the refusal, the rank reads what the stand-in config lacks.
         with pytest.raises(AttributeError):
-            rust_host.HostBootstrap(server_args, None, None, None, None, None, None)
+            rust_host.HostBootstrap(
+                server_args, None, None, None, None, None, None, None
+            )

@@ -55,11 +55,22 @@ public:
 
     const DiskConfig& Config() const { return config_; }
 
+    struct ReadStartResult {
+        StorageLease lease;
+        // True when Disk had hits (or credits were exhausted before probing)
+        // and the read could not start only because operation or Host-block
+        // credits were temporarily insufficient.
+        bool retryable{false};
+    };
+
+    // Whether a read can start now within the operation and Host-block bounds.
+    bool HasReadCredits() const;
     // Reads the keys of the prompt's prefix that only the Disk holds -- for
     // the longest boundary Disk extends the local hit to under the
     // Host-suffix rule -- into Host blocks it allocates, holding the Disk
-    // sources. Returns an empty lease when Disk adds nothing, the credits are
-    // spent, or no boundary's blocks fit the Host.
+    // sources. Distinguishes a permanent miss from transient credit exhaustion.
+    ReadStartResult TryStartRead(const PromptPrefix& prompt, std::int32_t local_tokens);
+    // Convenience wrapper returning only the lease.
     StorageLease StartRead(const PromptPrefix& prompt);
     // Whether the operation finished; an unknown operation counts as finished.
     bool Completed(std::uint64_t id) const;
@@ -89,6 +100,7 @@ public:
     // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
     std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
     std::size_t NumQueuedCleanings() const { return cleaning_.size(); }
+    std::size_t NumAwaitingReuse() const { return awaiting_reuse_.size(); }
     std::uint64_t WrittenBlocks() const { return written_blocks_; }
     std::uint64_t ReadBlocks() const { return read_blocks_; }
     std::uint64_t FailedReads() const { return failed_reads_; }
@@ -113,13 +125,20 @@ private:
 
     std::uint64_t nextId();
     void detach(std::uint64_t id) noexcept override;
+    std::size_t numOperations(DiskOpKind kind) const;
     std::size_t heldHostBlocks(DiskOpKind kind) const;
     DiskOperation command(std::uint64_t id, const Ticket& ticket) const;
+    // Moves the entries acquired since the reuse gate turned them away back
+    // into the cleaning queue, a bounded number per call.
+    void requeueReused();
 
     CacheCoordinator& coordinator_;
     const DiskConfig config_;
     std::map<std::uint64_t, Ticket> operations_;
     std::deque<CacheKey> cleaning_;
+    // Dirty Host entries the reuse gate turned away: cleaned once a later
+    // admission acquires them, forgotten when the Host drops them.
+    std::deque<CacheKey> awaiting_reuse_;
     std::vector<DiskOperation> commands_;
     std::uint64_t next_id_{1};
     std::uint64_t written_blocks_{0};

@@ -139,7 +139,7 @@ switch an envelope folds is also available individually under `auto`.
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order selection`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
 | `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
-| `--enable-startup-requests` | Before reporting ready, the engine serves a few requests of its own through the ordinary serving path: one one-token request, one each of a thirty-second of a prefill chunk, a sixteenth, one token more, and three sixteenths, one of a full chunk, then a full batch, sized from the server's limits. The first client requests then compile nothing that path reaches. Not supported with `--disaggregation-mode` or `--kvstore-storage-backend`. See [Startup requests](../design/event-loop.md#startup-requests). |
+| `--enable-startup-requests` | Before reporting ready, the engine serves a few requests of its own through the ordinary serving path: one one-token request, one each of a thirty-second of a prefill chunk, a sixteenth, one token more, and three sixteenths, one of a full chunk, then a full batch, sized from the server's limits. The first client requests then compile nothing that path reaches. Not supported with `--disaggregation-mode`, `--kvstore-storage-backend` or `--shared-l2-config`. See [Startup requests](../design/event-loop.md#startup-requests). |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
@@ -1638,6 +1638,7 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--retraction-snapshot-*`
+- `--shared-l2-config`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
@@ -2075,6 +2076,201 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
 
+### Shared L2 pool
+
+`--shared-l2-config` joins a rank to one paged pool that every rank of a
+deployment's prefill and fused instances uses in place of its Host L2: one cache index and one eviction
+policy (the Host L2's), with the bytes spread over the nodes' host memory. A
+prefix one rank computed is loaded by any rank on any node, straight from the
+pool into its GPU cache by RDMA.
+
+**Scope of the first version.** Prefill and fused instances with attention TP 1
+(attention DP is fine), replicated cache groups (no KV sharding:
+`--kv-parallel-size` above 1 is refused) and `--pipeline-parallel-size 1`. A
+rank passes `--disable-kvstore`: the pool takes
+the Host L2's place and the rank allocates no Host memory for it. The pool is
+written when a page is published, so `--kvstore-write-policy` stays at its
+default (`write_back` is refused). It cannot be combined with
+`--kvstore-storage-backend` or KV offloading, and `--enable-memory-saver` is
+refused: the pool's client registers the Device cache memory for RDMA once,
+and nothing registers it again after a memory release and resume. Peer
+prefix sharing (`--peer-prefix-port`) is refused: it needs the local Host L2
+(`--enable-kvstore`), and the scheduler's configuration check refuses the
+pair as well. A `DSPARK` draft that needs captured-context replay is refused,
+as it is with the local Host L2: the Host tier cannot restore a
+drafter-private context. Pool ranks never retract: a fused instance runs
+without a retraction snapshot pool and refuses the
+`--retraction-snapshot-*` and `--debug-force-retraction-interval` overrides.
+`--enable-startup-requests` is refused: the flush after the startup requests
+clears the rank's own caches, so their prefixes would stay in the pool.
+Weight loads (`update_weights_from_distributed`, `update_weights_from_disk`,
+`update_weights_from_mooncake`) and forward reloads (`reload_forward`) are
+refused on a rank with a pool, with the message "a shared L2 pool holds KV of
+the weights and forward the server started with; restart the ranks and clear
+the pool instead": a rank is admitted by the checkpoint it loaded at start,
+and the pool would go on serving KV of the old weights or the old forward.
+
+Two services run beside the engines (`python -m
+tokenspeed.runtime.cache.shared_l2`); nothing starts them for you. Start the
+owner, then the providers, then the engines.
+
+* `owner`: one per deployment. It serves the cache index and holds no bytes.
+  Every flag is required. Its service runs in the engine's host extension and
+  logs as a rank's host does, to stderr (`TS_HOST_LOG` sets the level).
+
+  | Flag | Meaning |
+  |---|---|
+  | `--address tcp://HOST:PORT` | Where the ranks and providers reach it. There is no authentication: bind it to a cluster-internal address. |
+  | `--num-providers K` | Provider processes to wait for (a node may run several). The pool is built when all `K` have joined and the first rank reports its cache geometry: the owner takes that rank's LCM block size and cuts each provider's bytes into whole blocks (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name and both byte counts). The pool's size is fixed from then on. |
+  | `--headroom-lcm-blocks H` | When fewer than `H/2` LCM blocks are empty, a write evicts back up to `H` in one pass. |
+  | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations, and the owner answers its next request with an error, which stops the rank's engine. A rank pings the owner whenever it has had no release or touch to send for 5 seconds; a ping fails after at most the rank's `request_timeout_ms`, and the engine's loop reads the failure at the head of its next round (an idle rank runs a round about every 10 ms). A running rank that cannot reach the owner therefore stops about 5 seconds plus its `request_timeout_ms` after the owner last heard it: keep `S` well above that, so that it stops before the owner drops its pins, and well above any pause a rank process can take (the frozen rank under *Known limits*). |
+  | `--checkpoint-retention-requests R` | `--checkpoint-retention-requests` of the scheduler, counted over the lookups of every rank together, hit or miss. A rank sends one lookup for each new prompt its own GPU cache does not cover already; a prompt it covers sends none and is not counted. A rank's own default is 16 x its batch size; for the pool use about 16 x the sum of the ranks' batch sizes. `0` ranks every entry by its own last use. |
+  | `--checkpoint-retention-leaf-distance D` | As the scheduler's option of that name. |
+
+* `provider --owner-address ADDRESS --hostname HOST --device-name NICS --bytes B`: one
+  or more per node, each a process hosting `B` bytes of pool memory registered
+  for RDMA on the NICs it names. A provider
+  announces its memory once, at start, and the owner counts every
+  announcement as one provider: a provider that is started again counts as one
+  more until `--num-providers` have joined, and is refused after that. The owner
+  cannot tell that the earlier one's memory is gone, so restart the owner
+  together with a provider.
+
+  A provider does not bind its CPUs or memory to a NUMA node. On a node with
+  several NUMA domains, run one provider per domain under `numactl` and give
+  it the NICs of that domain (`cat /sys/class/infiniband/NIC/device/numa_node`),
+  so that a provider's memory and the NICs that read and write it are in one
+  domain. `--num-providers` counts each of these processes:
+
+  ```bash
+  numactl --cpunodebind=0 --membind=0 python -m tokenspeed.runtime.cache.shared_l2 provider \
+      --owner-address tcp://HOST:PORT --hostname NODE --device-name mlx5_0,mlx5_1 --bytes B
+  numactl --cpunodebind=1 --membind=1 python -m tokenspeed.runtime.cache.shared_l2 provider \
+      --owner-address tcp://HOST:PORT --hostname NODE --device-name mlx5_2,mlx5_3 --bytes B
+  ```
+
+The owner keeps everything in memory, and a provider announces its memory
+only when it starts: a restarted owner waits for new providers and knows none
+of the ranks that joined the owner before it. **A restart of the owner is
+therefore a restart of the providers and of the ranks too:** stop the ranks,
+the owner and the providers, then start the owner, the providers and the
+ranks again. A rank that is still running when its owner goes away stops by
+itself, at its first request the owner does not answer.
+
+A provider that is stopped or killed stops the ranks that use it: a load whose
+RDMA read fails and a write whose RDMA copy fails each stop the rank's engine
+and, under attention DP, its whole instance.
+
+A rank that is stopped or restarted does not release what it holds at the
+owner. The owner drops that client's pins and reservations once it has been
+silent for `--client-timeout-s`, which it checks every quarter of that time.
+Until then the pages they cover are not evicted. A restarted rank joins the
+pool as a new client.
+
+**Flushing.** The engine's cache flush clears a rank's Device cache and leaves
+the pool as it is. To empty the pool, send the owner `clear`:
+
+```bash
+python -c "from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection as C; print(C('tcp://HOST:PORT', timeout_ms=5000).request('clear'))"
+```
+
+It answers `cleared: False` and changes nothing while a rank holds pins or
+reservations. Those of a rank that is gone count until the owner has dropped
+them: after stopping the ranks, `clear` succeeds within 1.25 x
+`--client-timeout-s`. `request('stats')` shows the pool's counters, its
+providers and how many ranks have joined.
+
+**Sizing.** The pool is laid out as a rank's compact Host L2: one LCM block is
+as large as the largest block of any cache group, a KV group packs as many
+pages into a block as fit, and a State checkpoint takes one LCM block for each
+State group. A pool therefore holds about `pool bytes / (State groups x LCM
+block bytes)` checkpoints, less the blocks its KV pages take. A rank logs the
+block size when it joins (`shared L2 client ... joined: ... LCM blocks of N
+bytes`). Measured on K3 with attention DP: an LCM block of about 143 MiB and
+about three LCM blocks (about 429 MiB) a checkpoint, so about 150 checkpoints
+in a 64 GiB pool.
+
+The rank's JSON names every field:
+
+```json
+{"owner_address": "tcp://HOST:PORT",
+ "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1"],
+ "request_timeout_ms": 2000, "join_timeout_s": 600,
+ "read_workers": 4, "write_workers": 4,
+ "scheduler": {"max_writes_in_flight": 4, "max_keys_per_write": 512}}
+```
+
+| Field | Meaning |
+|---|---|
+| `owner_address` | The owner's address. |
+| `device_names` | A list: the RDMA devices of each local GPU index, as Mooncake names them. Name the fastest GPU-side NICs. |
+| `request_timeout_ms` | How long a request may wait for the owner's answer, from the moment the rank sends it. A request that passes it has failed, which stops the rank's engine: set it above the longest pause the owner can have. A lookup holds the rank's scheduling until it is answered or has failed, for up to this long. |
+| `join_timeout_s` | How long a starting rank waits for the pool to be ready; the rank fails to start after it. |
+| `read_workers` | Threads reading one load's providers in parallel. A layer is read with one request for each provider that holds its pages, so more threads than providers are never busy. |
+| `write_workers` | Threads writing newly published blocks to the pool. |
+| `scheduler.max_writes_in_flight`, `scheduler.max_keys_per_write` | Writes in flight at once, and blocks in one write; Device blocks stay pinned only while their write is in flight. |
+
+Before it plans a round, the engine's loop sends the owner one request with
+the lookup of each waiting prompt that has none yet, and waits for the answer.
+A prompt the pool holds no prefix of is a miss and is computed.
+
+A write reserves pool pages for newly published blocks, copies the blocks by
+RDMA and commits them. A block the owner gives no page (the pool holds it,
+another rank is writing it, or the pool has no room) is skipped. A rank tells
+the owner when it is done with a hit (a release) and when it reuses blocks of
+its own GPU cache that the pool holds too (a touch), and pings it whenever it
+has had neither to send for 5 seconds.
+
+With `--kv-events-config`, a pool rank reports the Host entries that stand
+for the pages of a hit with the Host medium (`CPU_PINNED`) for as long as it
+holds the hit, although the bytes are in the pool.
+
+A starting rank repeats its hello until the pool is ready; after the join no
+request is sent twice, and a rank does not serve without its pool. Each of
+these failures stops the rank's engine, as a failed forward does; under
+attention DP the other ranks of the instance stop with it (they report that a
+rank left the mesh):
+
+| What fails | How |
+|---|---|
+| A lookup | The owner does not answer within `request_timeout_ms` (after a restart of the owner too: the rank's next request leaves on the connection to the earlier owner and is lost), answers with an error (an owner that does not know the rank answers so: it dropped the rank after `--client-timeout-s` of silence), or answers with anything but one well-formed hit for each prompt. A failed lookup is never taken for a miss. |
+| A write | Its reservation or its commit is not answered within `request_timeout_ms` or is answered with an error, or its RDMA copy fails (a dead provider included). |
+| A release, a touch or a ping | It is not answered within `request_timeout_ms` or is answered with an error. |
+| A load of an admitted prompt | A provider died or an RDMA read failed (reported after the RDMA retries, some seconds), or a hit named a page the pool does not have (refused before any read). The forward already depends on the pages; none of its results is returned. |
+
+The engine's loop reads a failed write, release, touch or ping at the head of
+its next round, before that round plans, on an idle rank as on a serving one.
+
+Known limits:
+
+* An owner that is paused or unreachable for longer than `request_timeout_ms`
+  stops every rank that uses the pool.
+* After a restart of the owner every rank has to be restarted.
+* A rank process that is frozen for longer than the owner's
+  `--client-timeout-s` loses its pins and reservations at the owner. After it
+  resumes, and until its next poll or request to the owner fails and stops it,
+  a load may read pool pages that now hold another rank's blocks, and a write
+  that was in progress may finish into pages the owner has since given to
+  another rank. That rank's entry then serves wrong KV to every rank that hits
+  it, until it is evicted. Nothing in the engine guards against this: keep
+  `--client-timeout-s` well above any pause a rank process can take, and send
+  the owner `clear` after a rank was frozen for that long.
+
+The owner admits a rank by two checks: its cache geometry (prefix page, group
+kinds and packing, LCM block bytes) and its deployment identity, the one L3
+names its objects under (checkpoint, cache layout and quantization, attention
+backends, runtime compatibility). The first rank sets both; a rank that
+differs is refused at start.
+
+A load reads the pool pages layer by layer, `read_workers` providers at a
+time, and the forward waits per layer as for a Host L2 load. It needs GPUDirect
+RDMA writes ordered for the GPU that owns the memory and CUDA stream memory
+operations; a rank refuses to start on a device without either.
+
+Not in this version: a pool that survives its owner, providers joining a
+running pool, a quota per rank, one pool for several models, KV sharding and
+attention TP above 1.
+
 ### Peer prefix sharing
 
 `--peer-prefix-port PORT` lets replicas reuse each other's cached prefixes
@@ -2101,8 +2297,9 @@ than computing it; it never reads itself, since its prefill server sends what
 it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
 `--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
 Peer sharing is refused with
-`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
-`--query-context-parallel-size > 1`; the
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1`,
+`--query-context-parallel-size > 1` and `--enable-memory-saver` (releasing
+Device KV memory invalidates registered Mooncake MRs); the
 scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
 groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
@@ -2137,7 +2334,7 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `queue_depth` | 32 | Requests in flight on the drive; with `psync`, threads. |
 | `write_queue_depth` | 8 | Of those, at most this many writes. |
 | `max_io_bytes` | 4194304 | Longer ranges are issued as several requests; a multiple of 4096. |
-| `max_operations` | 16 | Disk operations in flight, reads and writes. |
+| `max_operations` | 16 | Disk operations in flight, reads and writes. Cleaning writes are capped at `max(1, max_operations / 4)` concurrent operations, and one operation is reserved for reads when `max_operations > 1`. |
 | `max_blocks_per_operation` | 4096 | Blocks one operation moves. |
 | `host_blocks_fraction` | 0.25 | The share of Host L2 blocks Disk operations may hold at once. |
 | `write_host_blocks_fraction` | 0.5 | Of those, the share writes may hold. |
@@ -2146,6 +2343,8 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
 | `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
 | `push_ring_mb` | 512 | With `--peer-prefix-port`, the staging memory a peer push reads Disk blocks into, rounded up to whole blocks. |
+| `min_clean_tokens` | 0 | Minimum prefix branch length (in tokens) required to clean a Host tip to Disk when the branch length is known; `0` disables the length filter. |
+| `require_reuse_for_cleaning` | false | When `true`, skip cleaning Host tips that were never reused after initial publication. |
 
 The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
 and is refused with `--kvstore-storage-backend` and

@@ -212,53 +212,75 @@ impl Reads {
                         Err(_) => return,
                     };
                     let started = std::time::Instant::now();
+                    let ReadJob {
+                        request_id,
+                        session,
+                        spans,
+                        push,
+                    } = *job;
+                    let total_spans = spans.lengths.len();
+                    let host_bytes = spans.host_bytes;
                     tracing::debug!(
-                        request = job.request_id,
-                        spans = job.spans.lengths.len(),
+                        request = request_id,
+                        spans = total_spans,
                         "peer read started"
                     );
-                    let mut outcome = if job.spans.is_empty() {
-                        Ok(())
-                    } else {
-                        reader.read(&job.session, &job.spans)
+                    // Overlap `PushJob` concurrently with one-sided `READ`,
+                    // joining both before reporting the landing outcome so no
+                    // transfer trails behind settlement.
+                    let (outcome, disk_bytes) = match (push, !spans.is_empty()) {
+                        (Some(push), true) => {
+                            let bytes = push.bytes();
+                            let PushJob {
+                                endpoint,
+                                session: push_session,
+                                budget,
+                                items,
+                            } = push;
+                            let (read_res, push_res) = std::thread::scope(|scope| {
+                                let push_handle = scope
+                                    .spawn(|| pusher.push(&endpoint, &push_session, budget, items));
+                                let read_res = reader.read(&session, &spans);
+                                let push_res = push_handle.join().unwrap_or_else(|_| {
+                                    Err("peer push worker panicked".to_owned())
+                                });
+                                (read_res, push_res)
+                            });
+                            (read_res.and(push_res), bytes)
+                        }
+                        (Some(push), false) => {
+                            let bytes = push.bytes();
+                            let res =
+                                pusher.push(&push.endpoint, &push.session, push.budget, push.items);
+                            (res, bytes)
+                        }
+                        (None, true) => (reader.read(&session, &spans), 0),
+                        (None, false) => (Ok(()), 0),
                     };
-                    // The push holds the landing too: a failed read still
-                    // waits for it, so no write trails the outcome.
-                    let mut disk_bytes = 0;
-                    if let Some(push) = job.push {
-                        disk_bytes = push.bytes();
-                        let pushed =
-                            pusher.push(&push.endpoint, &push.session, push.budget, push.items);
-                        outcome = outcome.and(pushed);
-                    }
+                    let ok = outcome.is_ok();
                     if let Some(observation) = observation {
-                        observation.finish(
-                            started,
-                            started.elapsed(),
-                            job.spans.host_bytes,
-                            disk_bytes,
-                            outcome.is_ok(),
-                        );
+                        observation.finish(started, started.elapsed(), host_bytes, disk_bytes, ok);
                     }
                     tracing::debug!(
-                        request = job.request_id,
-                        ok = outcome.is_ok(),
+                        request = request_id,
+                        ok,
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "peer read ended"
                     );
-                    if let Err(error) = &outcome {
-                        let spans = &job.spans;
+                    if let Err(error) = outcome {
                         tracing::warn!(
-                            request = job.request_id,
+                            request = request_id,
                             %error,
-                            spans = spans.lengths.len(),
+                            spans = total_spans,
                             first_source = spans.sources.first().map(|a| format!("{a:#x}")),
-                            first_destination = spans.destinations.first().map(|a| format!("{a:#x}")),
-                            last_destination = spans.destinations.last().map(|a| format!("{a:#x}")),
+                            first_destination =
+                                spans.destinations.first().map(|a| format!("{a:#x}")),
+                            last_destination =
+                                spans.destinations.last().map(|a| format!("{a:#x}")),
                             "peer read failed"
                         );
                     }
-                    if done.send((job.request_id, outcome.is_ok())).is_err() {
+                    if done.send((request_id, ok)).is_err() {
                         return;
                     }
                 })?;
@@ -512,6 +534,79 @@ mod tests {
             push: Some(push()),
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
+    }
+
+    #[test]
+    fn push_and_read_overlap_concurrently() {
+        use std::sync::Barrier;
+        struct BReader {
+            arena: Arena,
+            barrier: Arc<Barrier>,
+            calls: std::sync::Mutex<Vec<usize>>,
+        }
+        impl PageReader for BReader {
+            fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+                self.calls.lock().unwrap().push(spans.lengths.len());
+                self.barrier.wait();
+                self.arena.read(session, spans)
+            }
+        }
+        struct BPusher {
+            barrier: Arc<Barrier>,
+            fail: bool,
+        }
+        impl PagePusher for BPusher {
+            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+                self.barrier.wait();
+                if self.fail {
+                    Err("push failed".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let arena = Arena::new(64);
+        arena.write(0, &[9; 8]);
+        arena.write(8, &[4; 8]);
+        let push = || PushJob {
+            endpoint: "holder:7200".into(),
+            session: "r".into(),
+            budget: Duration::from_secs(1),
+            items: vec![PushItem {
+                group: 0,
+                block: 1,
+                spans: Vec::new(),
+            }],
+        };
+        for (fail, want) in [(false, true), (true, false)] {
+            let barrier = Arc::new(Barrier::new(2));
+            let reader = Arc::new(BReader {
+                arena: arena.clone(),
+                barrier: barrier.clone(),
+                calls: Default::default(),
+            });
+            let reads = Reads::start(
+                reader.clone(),
+                Arc::new(BPusher { barrier, fail }),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap();
+            reads.submit(ReadJob {
+                request_id: "j".into(),
+                session: "s".into(),
+                spans: Spans {
+                    sources: vec![0, 8],
+                    destinations: vec![24, 32],
+                    lengths: vec![8, 8],
+                    host_bytes: 0,
+                },
+                push: Some(push()),
+            });
+            assert_eq!(wait_for(&reads), vec![("j".into(), want)]);
+            assert_eq!(*reader.calls.lock().unwrap(), vec![2]);
+        }
+        assert_eq!(arena.read_bytes(24, 8), vec![9; 8]);
+        assert_eq!(arena.read_bytes(32, 8), vec![4; 8]);
     }
 
     #[test]

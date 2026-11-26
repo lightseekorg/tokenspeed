@@ -869,5 +869,204 @@ TEST(DiskTierConfigTest, ADiskTierNeedsHostWriteBackAndItsLimits) {
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "disk_config without a Disk tier";
 }
 
+TEST(DiskTierTest, CleaningAdmissionAndReadSlotReservation) {
+    // 1. Cleaning reserves foreground read slots (`max_write_ops = max(1, 4/4) = 1`).
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 1;
+    DiskTierCache c1(FullOnly(), 16, limits);
+    c1.disks.QueueCleaning(c1.OnHostOnly(Prompt(2, 1)));
+    c1.disks.QueueCleaning(c1.OnHostOnly(Prompt(2, 2)));
+    c1.disks.StartCleaning();
+    ASSERT_EQ(c1.disks.TakeCommands().size(), 1u);
+    c1.disks.StartCleaning();
+    EXPECT_TRUE(c1.disks.TakeCommands().empty());
+    EXPECT_TRUE(c1.disks.HasReadCredits());
+
+    // 2. min_clean_tokens and require_reuse_for_cleaning drop unready branches.
+    DiskConfig gated = Limits();
+    gated.min_clean_tokens = 12;
+    DiskTierCache c2(FullOnly(), 16, gated);
+    c2.disks.QueueCleaning(c2.OnHostOnly(Prompt(2, 1)));  // 8 < 12
+    c2.disks.StartCleaning();
+    EXPECT_EQ(c2.disks.DroppedCleanings(), 2u);
+    const auto long_keys = c2.OnHostOnly(Prompt(4, 2));  // 16 >= 12
+    EXPECT_EQ(c2.Clean(std::span{long_keys}.last(1)).group_ids.size(), 4u);
+
+    DiskConfig reuse = Limits();
+    reuse.require_reuse_for_cleaning = true;
+    DiskTierCache c3(FullOnly(), 16, reuse);
+    const auto cold = c3.OnHostOnly(Prompt(2, 1));
+    c3.disks.QueueCleaning(cold);
+    c3.disks.StartCleaning();
+    // Not reused yet: nothing is written, and nothing is given up either.
+    EXPECT_TRUE(c3.disks.TakeCommands().empty());
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 2u);
+    // A later admission acquires the Host entries: the next plan cleans them.
+    {
+        auto& index = c3.coordinator.Store().Groups()[0].Index();
+        const auto probe = FullAttnMatcher{}.Probe(index, c3.host, cold, 0, 2, /*extra_hits=*/nullptr);
+        const PrefixMatch reused =
+            index.AcquireMatched(c3.host, cold, 0, probe, CacheCoordinatorTestAccess::NextAccessEpoch(c3.coordinator),
+                                 /*session=*/nullptr);
+        EXPECT_EQ(reused.blocks.size(), 2u);
+    }
+    c3.disks.StartCleaning();
+    const auto writes = c3.disks.TakeCommands();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].group_ids.size(), 2u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+
+    // An entry the Host drops while it waits is forgotten.
+    DiskTierCache c4(FullOnly(), 16, reuse);
+    const auto gone = c4.OnHostOnly(Prompt(2, 3));
+    c4.disks.QueueCleaning(gone);
+    c4.disks.StartCleaning();
+    c4.EvictFromHost(std::span{gone}.last(1));
+    c4.EvictFromHost(std::span{gone}.first(1));
+    c4.disks.StartCleaning();
+    EXPECT_EQ(c4.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c4.disks.DroppedCleanings(), 2u);
+}
+
+TEST(DiskTierTest, PartialHostCreditExhaustionRetryableAndInt32BlockBound) {
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 8;
+    limits.max_host_blocks = 5;
+    limits.max_write_host_blocks = 5;
+    DiskTierCache cache(FullAndState(), 16, limits);
+    const Prompt p1(3, 1), p2(3, 2);
+    const auto k1 = cache.OnHostOnly(p1), k2 = cache.OnHostOnly(p2);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(k1).op_id, .success = true});
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(k2).op_id, .success = true});
+    cache.EvictFromHost(k1);
+    cache.EvictFromHost(k2);
+    const auto r1 = cache.disks.TryStartRead(p1.Prefix(), /*local_tokens=*/0);
+    ASSERT_TRUE(r1.lease);
+    const auto r2 = cache.disks.TryStartRead(p2.Prefix(), /*local_tokens=*/0);
+    EXPECT_FALSE(r2.lease);
+    EXPECT_TRUE(r2.retryable);
+
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.device_allocator.total_pages = 9;
+    cfg.host_allocator.total_pages = 9;
+    cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    cfg.max_scheduled_tokens = 64;
+    cfg.max_batch_size = 4;
+    cfg.max_resident_requests = 4;
+    cfg.cache_groups.push_back(
+        CacheGroupConfig{.group_id = "full", .block_granularity = 4, .total_pages = 9, .attn_kind = AttnKind::kFull});
+    cfg.host_group_packing = {4};
+    SetTestSnapshotPool(cfg);
+    cfg.disk_allocator.total_pages = (std::numeric_limits<std::int32_t>::max() / 4) + 2;
+    cfg.disk_config = Limits();
+    EXPECT_THROW(cfg.Validate(), std::invalid_argument);
+}
+
+TEST_F(DiskTierKvEventsTest, FailedReadDropsDiskEntryAndUnblocksWithoutPermanentLockout) {
+    Tick(1);
+    SeedOnHost();
+    scheduler_->DrainKvEvents();
+    const auto writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    ASSERT_FALSE(scheduler_->DrainKvEvents().empty());
+    DropSeedFromHost();
+
+    Submit(RequestSpec{.request_id = "hit", .tokens = MakeTokens(9), .max_new_tokens = 1});
+    const ExecutionPlan prefetch = PlanOnce();
+    ASSERT_TRUE(Idle(prefetch));
+    const auto reads = DiskOps(prefetch);
+    ASSERT_EQ(reads.size(), 1u);
+
+    // Failed Disk read drops the unreadable Disk entry and lets the request admit locally.
+    AckDisk(reads[0], /*success=*/false);
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+    EXPECT_EQ(scheduler_->GetDiskStats().failed_reads, 1u);
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admitted);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{4});
+}
+
+TEST_F(DiskTierKvEventsTest, SaturatedDiskCreditsDeferRetryUntilInFlightOperationFinishes) {
+    Tick(1);
+    SeedOnHost();
+    const auto writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    DropSeedFromHost();
+
+    // First request consumes the sole Disk read operation slot (`max_operations = 1`?
+    // Fill remaining slots or saturate read credits by submitting multiple hits).
+    const std::vector<std::int32_t> tokens = MakeTokens(9);
+    for (int i = 0; i < 4; ++i) {
+        Submit(RequestSpec{.request_id = "r" + std::to_string(i), .tokens = tokens, .max_new_tokens = 1});
+    }
+    // Plan with forward disallowed so waiting requests stay queued while read credits saturate.
+    const ExecutionPlan first = scheduler_->NextExecutionPlan({.allow_prefill = false});
+    const auto first_reads = DiskOps(first);
+    ASSERT_FALSE(first_reads.empty());
+    // While in-flight operations occupy all credits, another round emits no duplicate reads
+    // and leaves waiting requests ready to retry once credits free up.
+    const ExecutionPlan second = scheduler_->NextExecutionPlan({.allow_prefill = false});
+    EXPECT_TRUE(DiskOps(second).empty());
+    for (const auto& op : first_reads) {
+        AckDisk(op, /*success=*/true);
+    }
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admitted);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_FALSE(batch->request_ids.empty());
+}
+
+TEST(DiskTierTest, HybridStateDiskOnlyResidencyAndHotDescendantVisibility) {
+    DiskTierCache cache(FullAndState(), 16);
+    std::vector<ContentHash> observed;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation m) {
+        if (m == CacheMutation::kLowerTierResidency) observed.push_back(key.content_hash);
+    });
+
+    const Prompt turn1(2, 41), turn2(4, 41);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn1)).op_id, .success = true});
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn2)).op_id, .success = true});
+
+    // Evicting P1 State while descendant P3 State stays on Host keeps RAM visibility.
+    const ContentHash p1{turn1.hashes[1]}, p3{turn2.hashes[3]};
+    cache.EvictFromHost(std::vector<CacheKey>{CacheKey{.group_id = 1, .content_hash = p1}});
+    for (const auto& h : turn2.hashes) {
+        EXPECT_TRUE(
+            cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{h}}, 0).host_publishable);
+    }
+
+    // Evicting P3 State too makes all pages Disk-only and notifies every ancestor with kLowerTierResidency.
+    observed.clear();
+    cache.EvictFromHost(std::vector<CacheKey>{CacheKey{.group_id = 1, .content_hash = p3}});
+    for (const auto& h : turn2.hashes) {
+        const ContentHash ch{h};
+        EXPECT_NE(std::ranges::find(observed, ch), observed.end());
+        const auto st = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ch}, 0);
+        EXPECT_FALSE(st.host_publishable);
+        EXPECT_TRUE(st.disk_publishable);
+    }
+
+    // Prefetching P3 State back to Host restores host_publishable and notifies P1.
+    observed.clear();
+    StorageLease read = cache.disks.StartRead(turn2.Prefix());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(cache.disks.TakeCommands().size(), 1u);
+    cache.disks.Complete(cache::DiskDone{.op_id = read.OperationId(), .success = true});
+    EXPECT_NE(std::ranges::find(observed, p1), observed.end());
+    for (const auto& h : turn2.hashes) {
+        EXPECT_TRUE(
+            cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{h}}, 0).host_publishable);
+    }
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

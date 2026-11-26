@@ -182,7 +182,8 @@ impl Offers {
             id: key.lease,
         };
         let mut event = p.lookup_event(&lease);
-        let answer = scheduler.answer_peer_lookup(&event);
+        // Soft offers reserve no source pages. PIN rechecks capacity and the exact manifest.
+        let answer = scheduler.answer_peer_lookup_bounded(&event, 0);
         let end = answer.num_tokens;
         if end <= 0
             || end > p.max_tokens

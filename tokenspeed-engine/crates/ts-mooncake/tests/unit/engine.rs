@@ -244,3 +244,38 @@ fn protocol_with_a_nul_is_rejected_before_native_initialization() {
         Err(Error::Nul("protocol"))
     ));
 }
+
+#[test]
+fn negative_rpc_port_destroys_native_handle_and_returns_create_error() {
+    static DESTROYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn bad_port(_: *mut c_void) -> c_int {
+        -1
+    }
+    unsafe extern "C" fn tracked_destroy(raw: *mut c_void) {
+        DESTROYED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        destroy(raw);
+    }
+    DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+    let bad_lib = Arc::new(Library {
+        path: PathBuf::from("test-process"),
+        create,
+        destroy: tracked_destroy,
+        rpc_port: bad_port,
+        register,
+        unregister,
+        write,
+        write_pages,
+        read: None,
+        read_pages: None,
+        _library: libloading::os::unix::Library::this().into(),
+    });
+    assert!(matches!(
+        Engine::start(bad_lib, "127.0.0.1", "rdma", ""),
+        Err(Error::Create(host)) if host == "127.0.0.1"
+    ));
+    assert_eq!(
+        DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "failed rpc_port startup must destroy the native handle once without leaking"
+    );
+}
