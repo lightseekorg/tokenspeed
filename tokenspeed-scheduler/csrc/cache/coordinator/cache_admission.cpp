@@ -377,7 +377,8 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             held.clear();  // the unused ones go back
         }
         const std::int64_t reserved_for_later =
-            GroupIsState(i)
+            (GroupIsState(i) || i + 1 == store_.Groups().size() ||
+             store_.DevicePool().Packing(store_.Groups()[i].Id()) == 1)
                 ? 0
                 : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), plan.block_demands, i);
         // A first admission's table ends in the tail's blocks: shared full
@@ -667,7 +668,8 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
         BlockTable& table = *demands[i].table;
         const ImageTable& shape = image.tables[i];
         const std::int64_t reserved_for_later =
-            GroupIsState(i)
+            (GroupIsState(i) || i + 1 == store_.Groups().size() ||
+             store_.DevicePool().Packing(store_.Groups()[i].Id()) == 1)
                 ? 0
                 : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), candidate->block_demands, i);
         const std::optional<ParentAffinity> shape_affinity =

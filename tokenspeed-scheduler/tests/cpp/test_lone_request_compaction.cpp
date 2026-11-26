@@ -1975,7 +1975,11 @@ TEST_F(LoneRequestCompactionSuite, MovesOneProbeTailBlockPerCompaction) {
         setup_holes.push_back(std::move(four[3]));
     }
     std::vector<CacheBlockRef> temp_pad = pool.AcquireBlocks(1, pool.NumEmptyLcmBlocks() - 2);
-    setup_holes.clear();
+    // Release in explicit reverse order so LIFO occupancy-bucket order is
+    // identical across libc++ and libstdc++.
+    while (!setup_holes.empty()) {
+        setup_holes.pop_back();
+    }
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 2);
 
     Submit(RequestSpec{.request_id = "X", .tokens = MakeTokens(14, 20000), .max_new_tokens = 1});

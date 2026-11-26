@@ -205,15 +205,19 @@ public:
                     ++loads[static_cast<std::size_t>(block->Location().slot_index % shard_count_)];
                 }
             }
-            std::optional<std::int32_t> preferred = allow_tail_parent ? PreferredParent(table) : std::nullopt;
-            if (!preferred && !placed.empty() && placed.back()) {
-                preferred = placed.back()->Location().lcm_block_id;
+            if (pool.Packing(group_id_) == 1) {
+                block_refs = pool.AcquireBlocks(group_id_, num_others, loads);
+            } else {
+                std::optional<std::int32_t> preferred = allow_tail_parent ? PreferredParent(table) : std::nullopt;
+                if (!preferred && !placed.empty() && placed.back()) {
+                    preferred = placed.back()->Location().lcm_block_id;
+                }
+                const ParentAffinity affinity{
+                    .preferred_parent = preferred,
+                    .reserved_empty_parents = reserved_empty_parents,
+                };
+                block_refs = pool.AcquireBlocksWithAffinity(group_id_, num_others, loads, affinity);
             }
-            const ParentAffinity affinity{
-                .preferred_parent = preferred,
-                .reserved_empty_parents = reserved_empty_parents,
-            };
-            block_refs = pool.AcquireBlocksWithAffinity(group_id_, num_others, loads, affinity);
             if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;
             }

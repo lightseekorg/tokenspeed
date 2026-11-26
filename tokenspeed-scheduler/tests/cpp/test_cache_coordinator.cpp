@@ -6921,7 +6921,12 @@ TEST(RetractionImageTest, ALoneRestoreDropsClaimsThatBindTooManyParents) {
                                                      /*newly_cached=*/nullptr, /*session=*/nullptr);
             holes.push_back(std::move(pair[1]));
         }
-        holes.clear();
+        // Release in explicit reverse order so LIFO occupancy-bucket order does
+        // not depend on std::vector::clear() element destruction order across
+        // C++ standard libraries.
+        while (!holes.empty()) {
+            holes.pop_back();
+        }
         std::vector<BlockTable> later(2);
         ASSERT_TRUE(AdmitForTest(coordinator, later, /*num_tokens=*/12));
         EXPECT_EQ(paged.BlockTablePageIds(later[0]), (std::vector<std::int32_t>{24, 8, 22, 2, 4, 6}));

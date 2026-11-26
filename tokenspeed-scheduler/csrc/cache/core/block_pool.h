@@ -725,10 +725,11 @@ private:
         }
         GroupAvailability& group = prepareAvailability(group_id, packing);
         const std::size_t num_buckets = group.parents_by_bucket.size();
-        std::array<std::int64_t, kInlineLoadBuckets> inline_counts{};
+        std::array<std::int64_t, kInlineLoadBuckets> inline_counts;
         std::vector<std::int64_t> wide_counts;
         std::span<std::int64_t> blocks_by_bucket;
         if (num_buckets <= kInlineLoadBuckets) {
+            std::fill_n(inline_counts.data(), num_buckets, 0);
             blocks_by_bucket = std::span<std::int64_t>{inline_counts.data(), num_buckets};
         } else {
             wide_counts.assign(num_buckets, 0);
@@ -772,9 +773,22 @@ private:
     std::vector<CacheBlockRef> acquireAvailableBlocks(std::uint32_t group_id, std::int32_t packing, std::int32_t count,
                                                       std::span<const std::int32_t> bucket_loads,
                                                       std::optional<ParentAffinity> affinity) {
-        const bool balanced = bucket_loads.size() > 1;
         GroupAvailability& group = prepareAvailability(group_id, packing);
-        std::array<std::int64_t, kInlineLoadBuckets> inline_loads{};
+        // Exact capacity checking precedes all mutations, so a second,
+        // pool-sized shadow allocator is unnecessary.
+        std::vector<CacheBlockRef> out;
+        out.reserve(static_cast<std::size_t>(count));
+        if (packing == 1) {
+            // Single-slot parents have no partial parents, one bucket, and no
+            // affinity; pull directly from the empty-parent FIFO.
+            for (std::int32_t i = 0; i < count; ++i) {
+                FatalCheck(!free_parent_ids_.empty(), "prechecked block capacity was exhausted");
+                out.push_back(createBlockRef(group_id, 1, CacheBlockLocation{free_parent_ids_.front(), 0}));
+            }
+            return out;
+        }
+        const bool balanced = bucket_loads.size() > 1;
+        std::array<std::int64_t, kInlineLoadBuckets> inline_loads;
         std::vector<std::int64_t> wide_loads;
         std::span<std::int64_t> loads;
         if (balanced) {
@@ -820,10 +834,6 @@ private:
             }
             return nextLocation(group, loads);
         };
-        // Exact capacity checking precedes all mutations, so a second,
-        // pool-sized shadow allocator is unnecessary.
-        std::vector<CacheBlockRef> out;
-        out.reserve(static_cast<std::size_t>(count));
         for (std::int32_t i = 0; i < count; ++i) {
             const CacheBlockLocation location = pick_location();
             out.push_back(createBlockRef(group_id, packing, location));
@@ -870,6 +880,19 @@ private:
 
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+        if (slots_per_parent == 1) {
+            FatalCheck(parent.occupied_count == 0, "LCM child slot already occupied");
+            FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
+                       "empty LCM placement must consume the next free parent");
+            FatalCheck(parent.slots == 0 && parent.occupancy == 0, "empty LCM parent must not retain child slots");
+            FatalCheck(location.slot_index == 0, "LCM child slot is out of range");
+            free_parent_ids_.pop_front();
+            parent.bound_group = group_id;
+            parent.slots = 1;
+            parent.occupancy = 1;
+            parent.occupied_count = 1;
+            return;
+        }
         GroupAvailability& group = placement(group_id);
         const std::size_t buckets = group.parents_by_bucket.size();
         if (parent.occupied_count == 0) {
