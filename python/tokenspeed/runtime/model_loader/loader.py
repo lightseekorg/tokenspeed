@@ -967,6 +967,7 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
         concurrency = extra_config.pop("concurrency", None)
         memory_limit = extra_config.pop("memory_limit", None)
         distributed = extra_config.pop("distributed", False)
+        distributed_scope = extra_config.pop("distributed_scope", None)
         if extra_config:
             raise ValueError(
                 f"Unexpected extra config keys for load format "
@@ -992,9 +993,22 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
             raise ValueError(
                 f"runai_streamer distributed must be a bool, got {distributed!r}"
             )
+        if distributed:
+            if distributed_scope not in ("local", "global"):
+                raise ValueError(
+                    "runai_streamer distributed=True requires explicit "
+                    "distributed_scope ('local' or 'global'), "
+                    f"got {distributed_scope!r}"
+                )
+        elif distributed_scope is not None:
+            raise ValueError(
+                "runai_streamer distributed_scope requires distributed=True, "
+                f"got {distributed_scope!r}"
+            )
         self.concurrency: int | None = concurrency
         self.memory_limit: int | None = memory_limit
         self.distributed: bool = distributed
+        self.distributed_scope: str | None = distributed_scope
 
     def _prepare_weights(
         self,
@@ -1078,31 +1092,17 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
                 prefixed_filter,
             )
 
-        if self.distributed:
-            if checkpoint_load_group is not None:
-                raise ValueError(
-                    "runai_streamer distributed=True is incompatible with "
-                    f"checkpoint_load_group={checkpoint_load_group!r}: Run:ai "
-                    "distributed streaming broadcasts across the full default "
-                    "process group rather than a rank subset."
-                )
-            if (
-                not torch.distributed.is_initialized()
-                or torch.distributed.get_world_size() <= 1
-            ):
-                logger.warning(
-                    "runai_streamer distributed=True requested without a "
-                    "multi-rank torch.distributed process group; streaming "
-                    "locally without broadcast."
-                )
-                use_distributed = False
-            else:
-                use_distributed = True
-        else:
-            use_distributed = False
+        if self.distributed and checkpoint_load_group is not None:
+            raise ValueError(
+                "runai_streamer distributed=True is incompatible with "
+                f"checkpoint_load_group={checkpoint_load_group!r}: Run:ai "
+                "distributed streaming broadcasts across the full default "
+                "process group rather than a rank subset."
+            )
         weights_iterator = runai_streamer_weights_iterator(
             hf_weights_files,
-            distributed=use_distributed,
+            distributed=self.distributed,
+            distributed_scope=self.distributed_scope,
             weight_name_filter=prefixed_filter,
             index_weight_map=index_weight_map,
             concurrency=self.concurrency,

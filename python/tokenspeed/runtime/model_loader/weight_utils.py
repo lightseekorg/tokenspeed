@@ -25,6 +25,7 @@ import ctypes
 import fnmatch
 import glob
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import mmap
@@ -45,6 +46,7 @@ import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from packaging.version import InvalidVersion, Version
 from safetensors import safe_open
 from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
@@ -986,10 +988,55 @@ def _instanttensor_tensors(
         )
 
 
+_MIN_RUNAI_STREAMER_VERSION = "0.16.1"
+
+
+def _cuda_distributed_backend(backend: str) -> str:
+    """Return the backend serving CUDA from a torch.distributed backend string.
+
+    Handles both single-backend strings (``"nccl"``) and composite strings
+    such as ``"cpu:gloo,cuda:nccl"``.
+    """
+    if ":" not in backend:
+        return backend.strip().lower()
+    for entry in backend.split(","):
+        device, sep, name = entry.partition(":")
+        if sep and device.strip().lower() == "cuda":
+            return name.strip().lower()
+    return ""
+
+
+def _require_runai_streamer_version(runai_mod: Any) -> None:
+    """Verify the installed ``runai-model-streamer`` meets the minimum version."""
+    version_str = getattr(runai_mod, "__version__", None)
+    if version_str is None:
+        try:
+            version_str = importlib.metadata.version("runai-model-streamer")
+        except importlib.metadata.PackageNotFoundError as e:
+            raise ImportError(
+                f"runai_streamer requires runai-model-streamer>="
+                f"{_MIN_RUNAI_STREAMER_VERSION} with package version metadata."
+            ) from e
+    try:
+        parsed = Version(str(version_str))
+    except InvalidVersion as e:
+        raise ImportError(
+            f"runai_streamer requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}; unable to parse installed version "
+            f"{version_str!r}."
+        ) from e
+    if parsed < Version(_MIN_RUNAI_STREAMER_VERSION):
+        raise ImportError(
+            f"runai_streamer requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}, found {version_str!r}."
+        )
+
+
 def runai_streamer_weights_iterator(
     hf_weights_files: list[str],
     *,
     distributed: bool,
+    distributed_scope: str | None,
     weight_name_filter: Callable[[str], bool] | None,
     index_weight_map: dict[str, str] | None,
     concurrency: int | None = None,
@@ -998,20 +1045,49 @@ def runai_streamer_weights_iterator(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream safetensors weights via ``runai_model_streamer.SafetensorsStreamer``.
 
-    Supports local file paths as well as ``gs://`` and ``s3://`` object-store URIs.
-    When ``weight_name_filter`` rejects some tensors in a remote shard (for example,
+    Requires ``runai-model-streamer>=0.16.1`` (for explicit ``device`` and
+    ``is_distributed`` support on ``stream_files``). Supports local file paths
+    as well as ``gs://`` and ``s3://`` object-store URIs. When
+    ``weight_name_filter`` rejects some tensors in a remote shard (for example,
     a large host-resident embedding table sharing a shard with small projection
     weights), accepted tensors from that mixed shard are fetched directly via
     byte-range reads so rejected tables are never streamed into memory.
+
+    When ``distributed`` is True, ``distributed_scope`` must be ``"local"``
+    (``RUNAI_STREAMER_DIST_GLOBAL=0``, intra-node broadcast) or ``"global"``
+    (``RUNAI_STREAMER_DIST_GLOBAL=1``, cross-host broadcast across the default
+    NCCL process group). Distributed streaming requires CUDA and a multi-rank
+    process group with NCCL serving CUDA, and passes
+    ``device="cuda:<current_device>"`` so Run:ai does not silently downgrade to
+    non-distributed streaming. In both distributed and non-distributed modes,
+    every yielded tensor is copied out of Run:ai's reusable staging buffers to
+    standalone CPU storage so callers that stash tensors across iterations
+    never alias overwritten memory or pin streamer buffers.
     """
+    if distributed:
+        if distributed_scope not in ("local", "global"):
+            raise ValueError(
+                "runai_streamer distributed=True requires explicit "
+                "distributed_scope ('local' or 'global'), "
+                f"got {distributed_scope!r}"
+            )
+    elif distributed_scope is not None:
+        raise ValueError(
+            "runai_streamer distributed_scope requires distributed=True, "
+            f"got {distributed_scope!r}"
+        )
+
     try:
+        import runai_model_streamer
         from runai_model_streamer import SafetensorsStreamer
     except ImportError as e:
         raise ImportError(
-            "runai_streamer load format requires runai-model-streamer; "
-            "install runai-model-streamer (and runai-model-streamer-gcs or "
-            "runai-model-streamer-s3 for object-store URIs)."
+            f"runai_streamer load format requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}; install runai-model-streamer "
+            "(and runai-model-streamer-gcs or runai-model-streamer-s3 for "
+            "object-store URIs)."
         ) from e
+    _require_runai_streamer_version(runai_model_streamer)
 
     from tokenspeed.runtime.model_loader.object_store import (
         RemoteSafetensorsFile,
@@ -1045,28 +1121,74 @@ def runai_streamer_weights_iterator(
     if memory_limit is not None:
         env_overrides["RUNAI_STREAMER_MEMORY_LIMIT"] = str(memory_limit)
 
+    stream_device = "cpu"
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "runai_streamer distributed=True requires CUDA; refusing to "
+                "silently downgrade to non-distributed streaming."
+            )
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() <= 1
+        ):
+            raise RuntimeError(
+                "runai_streamer distributed=True requires an initialized "
+                "multi-rank torch.distributed process group; refusing to "
+                "silently downgrade to non-distributed streaming."
+            )
+        backend = torch.distributed.get_backend()
+        if _cuda_distributed_backend(backend) != "nccl":
+            raise RuntimeError(
+                "runai_streamer distributed=True requires an NCCL CUDA backend "
+                f"in torch.distributed, got {backend!r}."
+            )
+        stream_device = f"cuda:{torch.cuda.current_device()}"
+        env_overrides["RUNAI_STREAMER_DIST_GLOBAL"] = (
+            "1" if distributed_scope == "global" else "0"
+        )
+
     if stream_files:
-        with ExitStack() as stack:
-            # Run:ai reads these env vars when opening the streamer and
-            # scheduling files; restore process-wide os.environ before the
-            # first yield so concurrent threads do not observe mutations.
-            saved_env: dict[str, str | None] = {
-                k: os.environ.get(k) for k in env_overrides
-            }
-            try:
-                os.environ.update(env_overrides)
-                streamer = stack.enter_context(SafetensorsStreamer())
-                streamer.stream_files(stream_files, is_distributed=distributed)
-            finally:
-                for k, prev in saved_env.items():
-                    if prev is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = prev
-            for name, tensor in streamer.get_tensors():
-                if weight_name_filter is not None and not weight_name_filter(name):
-                    continue
-                yield name, tensor
+        try:
+            with ExitStack() as stack:
+                # Run:ai reads these env vars when opening the streamer and
+                # scheduling files; restore process-wide os.environ before the
+                # first yield so concurrent threads do not observe mutations.
+                saved_env: dict[str, str | None] = {
+                    k: os.environ.get(k) for k in env_overrides
+                }
+                try:
+                    os.environ.update(env_overrides)
+                    streamer = stack.enter_context(SafetensorsStreamer())
+                    streamer.stream_files(
+                        stream_files,
+                        device=stream_device,
+                        is_distributed=distributed,
+                    )
+                finally:
+                    for k, prev in saved_env.items():
+                        if prev is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = prev
+                for name, tensor in streamer.get_tensors():
+                    if weight_name_filter is not None and not weight_name_filter(name):
+                        continue
+                    # Run:ai yields views into reusable staging buffers (bounded
+                    # CPU chunks under memory_limit, or CUDA receive buffers
+                    # under distributed broadcast) that are overwritten as
+                    # iteration advances. Copy out to standalone CPU storage so
+                    # callers that stash tensors across iterations never alias
+                    # overwritten memory and no CUDA staging buffer stays pinned.
+                    tensor = (
+                        tensor.detach().cpu()
+                        if tensor.is_cuda
+                        else tensor.detach().clone()
+                    )
+                    yield name, tensor
+        finally:
+            if distributed and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     open_remote_file = (
         RemoteSafetensorsFile if remote_file_factory is None else remote_file_factory

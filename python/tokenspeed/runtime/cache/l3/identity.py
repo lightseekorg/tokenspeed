@@ -73,7 +73,9 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "extensible": (("*.safetensors",), ("*.bin",), ("*.pt",)),
 }
 # Run:ai streamer tuning knobs affect only I/O scheduling, never weight bytes.
-_RUNAI_STREAMER_TUNING_KEYS = frozenset({"concurrency", "memory_limit", "distributed"})
+_RUNAI_STREAMER_TUNING_KEYS = frozenset(
+    {"concurrency", "memory_limit", "distributed", "distributed_scope"}
+)
 # Keep in lockstep with ShardedStateLoader.DEFAULT_PATTERN.
 _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")

@@ -68,7 +68,12 @@ class TestRunaiStreamerConfig:
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         extra = json.dumps(
-            {"concurrency": 8, "memory_limit": 4 * 1024**3, "distributed": True}
+            {
+                "concurrency": 8,
+                "memory_limit": 4 * 1024**3,
+                "distributed": True,
+                "distributed_scope": "global",
+            }
         )
         args = parser.parse_args(
             [
@@ -91,12 +96,19 @@ class TestRunaiStreamerConfig:
         assert loader.concurrency == 8
         assert loader.memory_limit == 4 * 1024**3
         assert loader.distributed is True
+        assert loader.distributed_scope == "global"
 
     def test_server_args_parses_extra_config_once(self) -> None:
         args = object.__new__(ServerArgs)
-        args.model_loader_extra_config = '{"concurrency": 4, "distributed": true}'
+        args.model_loader_extra_config = (
+            '{"concurrency": 4, "distributed": true, "distributed_scope": "local"}'
+        )
         args._parse_model_loader_extra_config()
-        assert args.model_loader_extra_config == {"concurrency": 4, "distributed": True}
+        assert args.model_loader_extra_config == {
+            "concurrency": 4,
+            "distributed": True,
+            "distributed_scope": "local",
+        }
 
         args.model_loader_extra_config = None
         args._parse_model_loader_extra_config()
@@ -116,6 +128,10 @@ class TestRunaiStreamerConfig:
             {"memory_limit": -1},
             {"memory_limit": False},
             {"distributed": "yes"},
+            {"distributed": True},
+            {"distributed": True, "distributed_scope": "cluster"},
+            {"distributed": False, "distributed_scope": "local"},
+            {"distributed_scope": "global"},
         ],
     )
     def test_invalid_extra_config_is_rejected(self, bad_config: dict) -> None:
@@ -135,7 +151,10 @@ class TestRunaiStreamerConfig:
         loader = RunaiModelStreamerLoader(
             LoadConfig(
                 load_format="runai_streamer",
-                model_loader_extra_config={"distributed": True},
+                model_loader_extra_config={
+                    "distributed": True,
+                    "distributed_scope": "global",
+                },
             )
         )
         source = DefaultModelLoader.Source(
@@ -175,7 +194,11 @@ class TestL3Identity:
             hf_config=None,
             revision="",
             load_format="runai_streamer",
-            model_loader_extra_config={"concurrency": 8, "distributed": True},
+            model_loader_extra_config={
+                "concurrency": 8,
+                "distributed": True,
+                "distributed_scope": "global",
+            },
             ext_yaml="",
         )
         id_runai_decode = l3_checkpoint_id(
@@ -503,8 +526,12 @@ class TestRunaiStreamerMixedShardIterator:
                 return None
 
             def stream_files(
-                self, files: list[str], is_distributed: bool = False
+                self,
+                files: list[str],
+                device: str = "cpu",
+                is_distributed: bool = False,
             ) -> None:
+                assert device == "cpu"
                 assert is_distributed is False
                 self._files = list(files)
                 streamed_files.extend(files)
@@ -515,6 +542,7 @@ class TestRunaiStreamerMixedShardIterator:
                         yield k, v
 
         fake_mod = types.ModuleType("runai_model_streamer")
+        fake_mod.__version__ = "0.16.1"  # type: ignore[attr-defined]
         fake_mod.SafetensorsStreamer = _FakeStreamer  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "runai_model_streamer", fake_mod)
         monkeypatch.delenv("RUNAI_STREAMER_CONCURRENCY", raising=False)
@@ -537,6 +565,7 @@ class TestRunaiStreamerMixedShardIterator:
         it = runai_streamer_weights_iterator(
             uris,
             distributed=False,
+            distributed_scope=None,
             weight_name_filter=lambda name: "engram.embed" not in name,
             index_weight_map=index_weight_map,
             concurrency=6,
@@ -934,6 +963,222 @@ class TestObjectStoreMetadataResolution:
         sharded_loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
         with pytest.raises(ValueError, match="runai_streamer"):
             sharded_loader._prepare_weights(uri, None)
+
+
+class TestRunaiStreamerDistributedContract:
+    """Streamer device/version contract, scope env handling, and buffer isolation."""
+
+    @pytest.mark.parametrize(
+        ("distributed", "scope", "backend", "expected_device", "expected_dist_global"),
+        [
+            (False, None, None, "cpu", "preexisting"),
+            (True, "local", "nccl", "cuda:3", "0"),
+            (True, "global", "cpu:gloo,cuda:nccl", "cuda:3", "1"),
+        ],
+    )
+    def test_streams_with_device_contract_scope_and_copies_out_of_reused_buffer(
+        self,
+        monkeypatch,
+        distributed: bool,
+        scope: str | None,
+        backend: str | None,
+        expected_device: str,
+        expected_dist_global: str,
+    ) -> None:
+        stream_calls: list[tuple[list[str], str | None, bool]] = []
+        env_during_stream: list[str | None] = []
+        empty_cache_calls: list[bool] = []
+
+        # Single reusable staging buffer mimicking runai_model_streamer's
+        # bounded CPU chunk buffer (memory_limit) or CUDA broadcast receive
+        # buffer, overwritten on every subsequent yield.
+        reusable_buf = torch.zeros((2, 4), dtype=torch.float32)
+        expected = {
+            "layer0.weight": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            "layer1.weight": torch.arange(10, 18, dtype=torch.float32).reshape(2, 4),
+        }
+
+        class _ContractEnforcingStreamer:
+            def __enter__(self):
+                env_during_stream.append(os.environ.get("RUNAI_STREAMER_DIST_GLOBAL"))
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def stream_files(
+                self,
+                files: list[str],
+                device: str | None = None,
+                is_distributed: bool = False,
+            ) -> None:
+                if is_distributed and (
+                    not isinstance(device, str) or not device.startswith("cuda:")
+                ):
+                    raise RuntimeError(
+                        "distributed streaming requires a cuda:<idx> device"
+                    )
+                stream_calls.append((list(files), device, is_distributed))
+
+            def get_tensors(self):
+                for name, values in expected.items():
+                    reusable_buf.copy_(values)
+                    yield name, reusable_buf
+                    # Overwrite staging buffer immediately after consumer resumes.
+                    reusable_buf.fill_(999.0)
+
+        fake_mod = types.ModuleType("runai_model_streamer")
+        fake_mod.__version__ = "0.16.1"  # type: ignore[attr-defined]
+        fake_mod.SafetensorsStreamer = _ContractEnforcingStreamer  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "runai_model_streamer", fake_mod)
+        monkeypatch.setenv("RUNAI_STREAMER_DIST_GLOBAL", "preexisting")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: distributed)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+        monkeypatch.setattr(
+            torch.cuda, "empty_cache", lambda: empty_cache_calls.append(True)
+        )
+        if backend is not None:
+            monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+            monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+            monkeypatch.setattr(torch.distributed, "get_backend", lambda: backend)
+
+        stashed: dict[str, torch.Tensor] = {}
+        it = runai_streamer_weights_iterator(
+            ["gs://example-bucket/model/model-00001-of-00001.safetensors"],
+            distributed=distributed,
+            distributed_scope=scope,
+            weight_name_filter=None,
+            index_weight_map=None,
+        )
+        for name, tensor in it:
+            assert os.environ.get("RUNAI_STREAMER_DIST_GLOBAL") == "preexisting"
+            stashed[name] = tensor
+
+        assert env_during_stream == [expected_dist_global]
+        assert stream_calls == [
+            (
+                ["gs://example-bucket/model/model-00001-of-00001.safetensors"],
+                expected_device,
+                distributed,
+            )
+        ]
+        assert empty_cache_calls == ([True] if distributed else [])
+        assert set(stashed.keys()) == set(expected.keys())
+        for name, ref in expected.items():
+            assert torch.equal(stashed[name], ref)
+            assert stashed[name].data_ptr() != reusable_buf.data_ptr()
+
+    def test_distributed_fails_fast_without_prerequisites_or_minimum_version(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        class _ModernStreamer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def stream_files(
+                self,
+                files: list[str],
+                device: str | None = None,
+                is_distributed: bool = False,
+            ) -> None:
+                return None
+
+            def get_tensors(self):
+                return iter(())
+
+        fake_mod = types.ModuleType("runai_model_streamer")
+        fake_mod.__version__ = "0.16.0"  # type: ignore[attr-defined]
+        fake_mod.SafetensorsStreamer = _ModernStreamer  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "runai_model_streamer", fake_mod)
+
+        # 0. Versions below 0.16.1 must fail fast with ImportError naming the minimum.
+        with pytest.raises(ImportError, match="0.16.1"):
+            list(
+                runai_streamer_weights_iterator(
+                    ["/tmp/a.safetensors"],
+                    distributed=False,
+                    distributed_scope=None,
+                    weight_name_filter=None,
+                    index_weight_map=None,
+                )
+            )
+
+        fake_mod.__version__ = "0.16.1"  # type: ignore[attr-defined]
+
+        # 1. Missing CUDA must raise rather than falling back to non-distributed.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(RuntimeError, match="requires CUDA"):
+            list(
+                runai_streamer_weights_iterator(
+                    ["/tmp/a.safetensors"],
+                    distributed=True,
+                    distributed_scope="global",
+                    weight_name_filter=None,
+                    index_weight_map=None,
+                )
+            )
+
+        # 2. Uninitialized or single-rank process group must raise (including via loader).
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        with pytest.raises(RuntimeError, match="multi-rank"):
+            list(
+                runai_streamer_weights_iterator(
+                    ["/tmp/a.safetensors"],
+                    distributed=True,
+                    distributed_scope="local",
+                    weight_name_filter=None,
+                    index_weight_map=None,
+                )
+            )
+
+        safetensors.torch.save_file(
+            {"w": torch.zeros((2, 2), dtype=torch.bfloat16)},
+            str(tmp_path / "model.safetensors"),
+        )
+        loader = RunaiModelStreamerLoader(
+            LoadConfig(
+                load_format="runai_streamer",
+                model_loader_extra_config={
+                    "distributed": True,
+                    "distributed_scope": "global",
+                },
+            )
+        )
+        source = DefaultModelLoader.Source(
+            model_or_path=str(tmp_path),
+            revision=None,
+            weight_files=None,
+            prefix="",
+            fall_back_to_pt=False,
+        )
+        with pytest.raises(RuntimeError, match="multi-rank"):
+            list(
+                loader._get_weights_iterator(
+                    source, None, None, Mapping(world_size=1, rank=0)
+                )
+            )
+
+        # 3. Non-NCCL CUDA backends (single or composite) must raise.
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+        for bad_backend in ("gloo", "cpu:gloo", "cpu:gloo,cuda:gloo"):
+            monkeypatch.setattr(
+                torch.distributed, "get_backend", lambda b=bad_backend: b
+            )
+            with pytest.raises(RuntimeError, match="NCCL CUDA backend"):
+                list(
+                    runai_streamer_weights_iterator(
+                        ["/tmp/a.safetensors"],
+                        distributed=True,
+                        distributed_scope="global",
+                        weight_name_filter=None,
+                        index_weight_map=None,
+                    )
+                )
 
 
 if __name__ == "__main__":
