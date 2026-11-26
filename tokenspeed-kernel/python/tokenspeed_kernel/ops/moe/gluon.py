@@ -3127,6 +3127,8 @@ _KIMI_K3_PROFILE = _Profile(
     inter_dim=3072,
     has_bias=False,
     activation="situ",
+    # Attention TP8 hands Petit ceil(chunk / 8) rows per rank.
+    raised_capacity_world_sizes=frozenset({8}),
 )
 _DSV41_FLASH_PROFILE = _Profile(
     name="dsv41_flash",
@@ -3276,11 +3278,12 @@ def gluon_petit_largest_max_tokens_per_rank(world_size: int) -> int:
     limits; the result is the largest such limit over the profiles whose
     capacity rises at ``world_size`` (``_Profile.raised_capacity_world_sizes``):
     7808 rows at EP4 and 2624 at EP8, both set by the DSv4.1 Flash target
-    (Muse Spark's 2368 at EP8 is smaller). A world size at which no profile
-    raises (and any world size Petit does not serve, which MoELayer refuses)
-    keeps the default 1024 rows. A model whose own limit is lower (Muse Spark
-    above 2368 rows at EP8, or a profile that keeps the default) is refused
-    when its workspace is built (``gluon_petit_max_tokens_per_rank`` with the
+    (Muse Spark's 2368, GLM-5.3 Flash's 2464 and Kimi K3's 1344 at EP8 are
+    smaller). A world size at which no profile raises (and any world size
+    Petit does not serve, which MoELayer refuses) keeps the default 1024
+    rows. A model whose own limit is lower (Muse Spark above 2368 rows at
+    EP8, or a profile that keeps the default) is refused when its workspace
+    is built (``gluon_petit_max_tokens_per_rank`` with the
     profile).
     """
     world_size = int(world_size)

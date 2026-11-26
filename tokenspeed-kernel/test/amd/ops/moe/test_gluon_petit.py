@@ -746,10 +746,11 @@ def test_largest_capacity_per_world_size() -> None:
         # GLM-5.3 Flash's heap reaches 2**32 above 2464 rows at EP8
         # (reserved 4,253,855,744 B there).
         (_GLM53_FLASH_PROFILE, 8, 2464),
+        # Kimi K3's (896 experts, top-16) heap reaches 2**32 above 1344 rows.
+        (_KIMI_K3_PROFILE, 8, 1344),
         # Profiles that do not raise their capacity at EP8 keep 1024 rows.
         (_GPT_OSS_120B_PROFILE, 8, 1024),
         (_DSV4_PROFILE, 8, 1024),
-        (_KIMI_K3_PROFILE, 8, 1024),
         # Profiles not served at EP4 keep 1024 rows there.
         (_GPT_OSS_120B_PROFILE, 4, 1024),
         (_DSV4_PROFILE, 4, 1024),
@@ -778,9 +779,7 @@ def test_largest_capacity_per_profile(profile, world_size, largest) -> None:
             _megamoe_config(petit_kernel, profile, world_size, largest + 32)
 
 
-@pytest.mark.parametrize(
-    "profile", [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE]
-)
+@pytest.mark.parametrize("profile", [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE])
 def test_profile_without_raised_capacity_refuses_above_1024_at_ep8(profile) -> None:
     # The server admits EP8 chunks up to 2624 rows for DSv4.1 Flash; a model
     # whose profile keeps the default refuses them when its workspace is built.
@@ -817,7 +816,8 @@ def largest(experts, top_k, hidden, inter, function):
         activation=p.MegaMoeActivation.mxfp4, activation_function=function,
         stages=p.MegaMoeStages.two_stage, inter_dim=inter, has_bias=False)
 print(largest(256, 8, 4096, 4096, F.silu), largest(384, 6, 5120, 2560,
-      F.silu_clamped), largest(288, 8, 4096, 2048, F.silu_clamped))
+      F.silu_clamped), largest(288, 8, 4096, 2048, F.silu_clamped),
+      largest(896, 16, 3584, 3072, F.kimi_situ))
 fds = []
 for fd in os.listdir("/proc/self/fd"):
     try:
@@ -830,9 +830,9 @@ print([f for f in fds if f.startswith(("/dev/kfd", "/dev/dri"))])
 
 def test_largest_capacity_needs_no_extension_or_gpu() -> None:
     """Petit's capacity search sizes the heap in pure Python: Muse Spark 2368,
-    DSv4.1 Flash 2624 and GLM-5.3 Flash 2464 rows at EP8 (the values the
-    profiles above serve), without loading the compiled extension or opening
-    a GPU device."""
+    DSv4.1 Flash 2624, GLM-5.3 Flash 2464 and Kimi K3 1344 rows at EP8 (the
+    values the profiles above serve), without loading the compiled extension
+    or opening a GPU device."""
     import os
     import subprocess
     import sys
@@ -860,13 +860,18 @@ def test_largest_capacity_needs_no_extension_or_gpu() -> None:
         check=True,
     )
     capacities, gpu_files = result.stdout.splitlines()[-2:]
-    assert capacities == "2368 2624 2464"
+    assert capacities == "2368 2624 2464 1344"
     assert gpu_files == "[]"
     # The same search through the profiles.
     assert [
         _profile_largest_max_tokens_per_rank(profile, 8)
-        for profile in (_MUSE_SPARK_PROFILE, _DSV41_FLASH_PROFILE, _GLM53_FLASH_PROFILE)
-    ] == [2368, 2624, 2464]
+        for profile in (
+            _MUSE_SPARK_PROFILE,
+            _DSV41_FLASH_PROFILE,
+            _GLM53_FLASH_PROFILE,
+            _KIMI_K3_PROFILE,
+        )
+    ] == [2368, 2624, 2464, 1344]
 
 
 def test_muse_spark_capacity_at_ep8() -> None:
@@ -908,6 +913,33 @@ def test_muse_spark_capacity_at_ep8() -> None:
     assert _megamoe_config(
         petit_kernel, _MUSE_SPARK_PROFILE, 8, 2304
     ).variant_token_counts() == (0, 1, 2, 12, 16, 128, 129, 1024, 1025)
+
+
+def test_kimi_k3_capacity_at_ep8() -> None:
+    # Under attention TP8 a rank hands Petit ceil(chunk / 8) rows: the TP8
+    # recipe's 8192-token chunk needs 1024 rows, a 10752-token chunk 1344,
+    # Kimi K3's limit; the next 32-row block is refused.
+    assert _profile_largest_max_tokens_per_rank(_KIMI_K3_PROFILE, 8) == 1344
+    assert gluon_petit_max_tokens_per_rank(8, 1024, _KIMI_K3_PROFILE) == 1024
+    assert gluon_petit_max_tokens_per_rank(8, 1344, _KIMI_K3_PROFILE) == 1344
+    for rows in (1345, 1376, 2048):
+        with pytest.raises(
+            ValueError,
+            match=f"at most 1344 tokens per rank at world size 8 for kimi_k3; "
+            rf"got {rows} \(a larger capacity would exceed",
+        ):
+            gluon_petit_max_tokens_per_rank(8, rows, _KIMI_K3_PROFILE)
+    # One rank's VMM heap (reserved, physical) bytes at the plain 1024 rows
+    # and the tuned 1344 (reserved stays below 2**32 = 4,294,967,296).
+    petit_kernel = _import_petit_kernel()
+    assert _megamoe_config(petit_kernel, _KIMI_K3_PROFILE, 8, 1024).heap_bytes() == (
+        3230609408,
+        602763264,
+    )
+    assert _megamoe_config(petit_kernel, _KIMI_K3_PROFILE, 8, 1344).heap_bytes() == (
+        4219908096,
+        785575936,
+    )
 
 
 @pytest.mark.parametrize(

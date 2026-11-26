@@ -407,8 +407,9 @@ _REQUIRES_EP8 = pytest.mark.skipif(
 _RAISED_CAPACITY = {4: 4096, 8: 2560}.get(_WORLD_SIZE, 4096)
 # A profile whose own limit is below that serves its own raised capacity in
 # the raised-capacity cases: Muse Spark's EP8 2304-token chunks (a 256-multiple
-# below its 2368-row limit) and GLM-5.3 Flash's (below its 2464-row limit).
-_PROFILE_RAISED_CAPACITY = {"muse_spark": 2304, "glm53_flash": 2304}
+# below its 2368-row limit), GLM-5.3 Flash's (below its 2464-row limit) and
+# Kimi K3's 1344 rows (its limit; 8 x 1344 = 10752-token attention-TP8 chunks).
+_PROFILE_RAISED_CAPACITY = {"muse_spark": 2304, "glm53_flash": 2304, "kimi_k3": 1344}
 
 
 def _profile_capacity(profile_name: str, capacity: int) -> int:
@@ -487,7 +488,8 @@ def test_distributed_petit_reference(profile_name, capacity):
             # A raised capacity still serves small and uneven calls.
             ("uneven", ([0, 1, 12, 24] * 2)[:ws]),
             # Every rank above the old 1024-row cap at once (2048-row chunks).
-            ("above_1024", [2048] * ws),
+            # (Kimi K3's 1344-row limit caps it at its capacity.)
+            ("above_1024", [min(2048, capacity)] * ws),
             # Every rank at the raised capacity fills each destination's pool.
             ("full", [capacity] * ws),
         )
@@ -570,22 +572,32 @@ def test_distributed_petit_reference(profile_name, capacity):
             dist.barrier()
 
 
-@pytest.mark.skipif(
-    _WORLD_SIZE != 4 or not is_cdna4(),
-    reason="requires torchrun with four gfx950 GPUs",
+@_REQUIRES_EP4_OR_EP8
+@pytest.mark.parametrize(
+    "profile_name,world_size,chunk",
+    (
+        ("dsv41_flash", 4, 8192),
+        ("dsv41_flash_dspark", 4, 8192),
+        # Kimi K3 under attention TP8: the 8192-token TP8 chunk and the
+        # 10752-token chunk at Kimi's 1344-row EP8 limit.
+        ("kimi_k3", 8, 8192),
+        ("kimi_k3", 8, 10752),
+    ),
 )
-@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
-def test_distributed_petit_replicated_rows_split(profile_name):
-    """Attention TP over Petit's EP group (TokenSpeed DeepseekV4MoE, TP4/EP4).
+def test_distributed_petit_replicated_rows_split(profile_name, world_size, chunk):
+    """Attention TP over Petit's EP group (DeepseekV4MoE TP4/EP4, Kimi K3's
+    LatentMoELayer TP8/EP8).
 
     Every rank holds the same T rows and sends Petit only its contiguous rows
-    [r * ceil(T / 4), min(T, (r + 1) * ceil(T / 4))) (none when T < 4), writes
-    the routed share into its rows of a full-size buffer holding its
+    [r * ceil(T / EP), min(T, (r + 1) * ceil(T / EP))) (none when T < EP),
+    writes the routed share into its rows of a full-size buffer holding its
     shared-expert partial, and one all-reduce gives every rank all T routed
-    rows plus the summed partials. Petit's capacity is ceil(8192 / 4) = 2048.
+    rows plus the summed partials. Petit's capacity is ceil(chunk / EP).
     """
+    if _WORLD_SIZE != world_size:
+        pytest.skip(f"{profile_name} runs this layout at EP{world_size}")
     profile = _PROFILES[profile_name]
-    capacity = 2048
+    capacity = -(-chunk // world_size)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
@@ -598,8 +610,10 @@ def test_distributed_petit_replicated_rows_split(profile_name):
     plan = _make_plan(profile, ws)
     plan["gluon_petit_max_tokens_per_rank"] = capacity
     kernel_moe_process_weights(plan, layer)
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
-    for num_rows in (1, 2, 3, 4, 5, 13, 96, 8192):
+    input_scale = (
+        4.0 if profile.activation == "situ" or profile.clamp is not None else 1.0 / 32
+    )
+    for num_rows in (1, 2, 3, 4, 5, 7, 8, 9, 13, 96, 128, chunk):
         share = -(-num_rows // ws)
         start = min(num_rows, rank * share)
         end = min(num_rows, start + share)
@@ -1157,7 +1171,8 @@ _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
 @_REQUIRES_EP4_OR_EP8
 @pytest.mark.parametrize("capacity", (1024, _RAISED_CAPACITY))
 @pytest.mark.parametrize(
-    "profile_name", ("dsv41_flash", "dsv41_flash_dspark", "muse_spark", "glm53_flash")
+    "profile_name",
+    ("dsv41_flash", "dsv41_flash_dspark", "muse_spark", "glm53_flash", "kimi_k3"),
 )
 def test_distributed_petit_startup_warmup_compiles_every_variant(
     profile_name, capacity
@@ -1242,6 +1257,9 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
             # below 12 rows, cta64 below 24, then cta56) and the 8-warp 64-row
             # tile from 256 rows; nothing changes above 1024.
             "glm53_flash": (0, 1, 2, 12, 16, 24, 32, 256, 257),
+            # Kimi K3 (SiTU): always the cta56 producer, the 8-warp 64-row
+            # tile from 256 rows; nothing changes above 1024 (its 1344 rows).
+            "kimi_k3": (0, 1, 2, 256, 257),
         },
     }
     expected = expected[ws][profile_name]
