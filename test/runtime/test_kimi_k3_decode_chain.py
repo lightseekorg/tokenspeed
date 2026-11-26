@@ -68,7 +68,7 @@ def _moe(batches=(1, 8)):
             moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
         ),
         native_latent_moe=None,
-        execution_plan=SimpleNamespace(use_native=False),
+        execution_plan=SimpleNamespace(use_native=False, owns_ep_communication=False),
         decode_moe=SimpleNamespace(
             owner=SimpleNamespace(batches=batches),
             run=mock.Mock(return_value="chain"),

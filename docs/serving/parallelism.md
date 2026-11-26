@@ -296,7 +296,12 @@ Select the transport with `--all2all-backend`:
 
 For NVIDIA NVFP4 and MXFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
-`--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+`--all2all-backend none`, MoE TP=1/DP=1, and `MoE EP == attention TP * attention DP`
+within each pipeline stage (covering TP/EP, DEP, and pure DP/EP layouts), keeps
+routing weights after FC2, and returns BF16 outputs. When `attention TP > 1`,
+each rank scatters its slice of the TP group's rows into MegaMoE, gathers the
+combined latent rows across the attention TP group, column-shards the routed
+up-projection, and folds its reduction into the shared-expert all-reduce.
 MXFP4 experts run FlashInfer's Kimi K3 MegaMoE, which quantizes the BF16 routed
 rows to MXFP8.
 

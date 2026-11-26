@@ -37,6 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardMode
 from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
@@ -44,7 +45,7 @@ from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
 
-@pytest.mark.parametrize("dp,ep,world", [(4, 2, 4), (2, 4, 4), (4, 4, 8)])
+@pytest.mark.parametrize("dp,ep,world", [(4, 2, 4), (4, 4, 8)])
 def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     monkeypatch, dp: int, ep: int, world: int
 ) -> None:
@@ -64,6 +65,26 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
             alt_stream=None,
         )
     backend.assert_not_called()
+
+
+def test_non_mega_moe_rejects_hybrid_attn_dp_tp_layout(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kimi_k3, "get_moe_backend", lambda: MoeBackend("flashinfer_trtllm")
+    )
+    monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend("none"))
+    with pytest.raises(ValueError, match="attention DP == MoE EP == world size"):
+        KimiLinearMoE(
+            config=SimpleNamespace(),
+            mapping=Mapping(
+                rank=0, world_size=4, attn_dp_size=2, moe_tp_size=1, moe_ep_size=4
+            ),
+            layer_index=0,
+            model_scope="test",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="moe",
+            alt_stream=None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -134,22 +155,8 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     monkeypatch.setitem(
         kimi_k3.global_server_args_dict, "speculative_num_draft_tokens", 4
     )
-    mapping = SimpleNamespace(
-        world_size=2,
-        rank=1,
-        attn=SimpleNamespace(dp_size=2, dp_rank=1, tp_size=1),
-        moe=SimpleNamespace(
-            ep_size=2,
-            ep_rank=1,
-            ep_group=(0, 1),
-            tp_size=1,
-            tp_rank=0,
-            tp_group=(1,),
-            tp_ep_size=2,
-            tp_ep_rank=1,
-            tp_ep_group=(0, 1),
-            dp_size=1,
-        ),
+    mapping = Mapping(
+        rank=1, world_size=2, attn_dp_size=2, moe_tp_size=1, moe_ep_size=2
     )
     expected_error = (mega_moe and backend != expected_a2a) or (
         not mega_moe and backend == "flashinfer" and not fabric_available
@@ -409,10 +416,8 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         topk_weights_dtype=weights_dtype, topk_indices_dtype=torch.int32
     )
     layer = SimpleNamespace(
-        mapping=SimpleNamespace(
-            world_size=2,
-            attn=SimpleNamespace(dp_rank=rank),
-            moe=SimpleNamespace(ep_group=group),
+        mapping=Mapping(
+            rank=rank, world_size=2, attn_dp_size=2, moe_tp_size=1, moe_ep_size=2
         ),
         execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=False),
         moe_alltoall=(
@@ -446,7 +451,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         kimi_k3, "all_reduce", mock.Mock(side_effect=AssertionError("all-reduce"))
     )
     ctx = SimpleNamespace(
-        collective_global_num_tokens=list(counts), global_num_tokens=[99, 99]
+        collective_global_num_tokens=list(counts),
+        global_num_tokens=[99, 99],
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=None,
     )
     result = KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
 
@@ -521,9 +529,16 @@ def test_attn_dp_all_idle_skips_collectives(monkeypatch) -> None:
     monkeypatch.setattr(kimi_k3, "reduce_scatter", forbidden)
     hidden = torch.empty(0, 4)
     layer = SimpleNamespace(
-        mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0))
+        mapping=Mapping(
+            rank=0, world_size=2, attn_dp_size=2, moe_tp_size=1, moe_ep_size=2
+        )
     )
-    ctx = SimpleNamespace(collective_global_num_tokens=None, global_num_tokens=[0, 0])
+    ctx = SimpleNamespace(
+        collective_global_num_tokens=None,
+        global_num_tokens=[0, 0],
+        forward_mode=ForwardMode.IDLE,
+        attn_backend=None,
+    )
     result = KimiLinearMoE._forward_attn_dp(layer, hidden, hidden, ctx)
     assert result is hidden
     forbidden.assert_not_called()
@@ -564,9 +579,16 @@ def test_attn_dp_rejects_invalid_token_metadata_before_collectives(
     monkeypatch.setattr(kimi_k3, "all_gather", forbidden)
     monkeypatch.setattr(kimi_k3, "reduce_scatter", forbidden)
     layer = SimpleNamespace(
-        mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0))
+        mapping=Mapping(
+            rank=0, world_size=2, attn_dp_size=2, moe_tp_size=1, moe_ep_size=2
+        )
     )
-    ctx = SimpleNamespace(collective_global_num_tokens=counts, global_num_tokens=None)
+    ctx = SimpleNamespace(
+        collective_global_num_tokens=counts,
+        global_num_tokens=None,
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=None,
+    )
     with pytest.raises(ValueError, match="matching collective token counts"):
         KimiLinearMoE._forward_attn_dp(
             layer, torch.ones(1, 4), torch.ones(1, prefix_width), ctx
@@ -632,7 +654,9 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
         execution_plan=SimpleNamespace(use_mega_moe=True, owns_ep_communication=True),
-        mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
+        mapping=Mapping(
+            rank=0, world_size=2, attn_dp_size=2, moe_tp_size=1, moe_ep_size=2
+        ),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
         expert_dispatch_info=None,
@@ -664,7 +688,10 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         topk_weights_dtype=torch.bfloat16, topk_indices_dtype=torch.int32
     )
     ctx = SimpleNamespace(
-        collective_global_num_tokens=[rows, 3], global_num_tokens=None
+        collective_global_num_tokens=[rows, 3],
+        global_num_tokens=None,
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=None,
     )
     result = KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
     if shared_tp:
@@ -693,6 +720,465 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         torch.testing.assert_close(result, up.forward_add3(latent, prefix, hidden))
     else:
         assert result is prefix
+
+
+@pytest.mark.parametrize(
+    "tp,dp,pp",
+    [(8, 1, 1), (16, 1, 1), (8, 2, 1), (4, 4, 1), (8, 1, 2)],
+)
+def test_mega_moe_accepts_tp_ep_and_dep_layouts_and_shards_tail(
+    monkeypatch, tp: int, dp: int, pp: int
+) -> None:
+    ep = tp * dp
+    world = ep * pp
+
+    class Experts(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+            self.supports_precomputed_topk = True
+            self.topk_output_format = TopKOutputFormat.STANDARD
+            self.plan = {"a2a_backend": "none", "weight_dtype": "mxfp4"}
+            self.topk_weights_dtype = torch.float32
+            self.sorted_route_rows = frozenset()
+
+    monkeypatch.setattr(kimi_k3, "get_moe_backend", lambda: MoeBackend("mega_moe"))
+    monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend("none"))
+    monkeypatch.setattr(kimi_k3, "MoELayer", Experts)
+    forbidden = mock.Mock(side_effect=AssertionError("TP-only setup reached"))
+    monkeypatch.setattr(kimi_k3.KimiK3LatentDownOp, "initialize", forbidden)
+    monkeypatch.setattr(kimi_k3, "K3MoeTailComm", forbidden)
+    monkeypatch.setattr(kimi_k3, "LatentMoELayer", forbidden)
+
+    mapping = Mapping(
+        rank=min(3, world - 1),
+        world_size=world,
+        attn_tp_size=tp,
+        attn_dp_size=dp,
+        pp_size=pp,
+        moe_tp_size=1,
+        moe_ep_size=ep,
+    )
+    layer = KimiLinearMoE(
+        config=KimiLinearConfig(
+            hidden_size=64,
+            routed_expert_hidden_size=32,
+            moe_intermediate_size=32,
+            num_experts=64,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+        ),
+        mapping=mapping,
+        layer_index=1,
+        model_scope="test",
+        moe_block_count=1,
+        quant_config=None,
+        prefix="moe",
+        alt_stream=None,
+    )
+    forbidden.assert_not_called()
+    assert layer.comm is None
+    assert layer.native_latent_moe is None
+    assert not layer._shard_latent_projections
+    assert layer._shard_up_projection is True
+    assert not layer.routed_expert_down_proj.narrowed
+    assert layer.routed_expert_down_proj.weight.shape == (32, 64)
+    assert layer.routed_expert_up_proj.narrowed
+    assert layer.routed_expert_up_proj.shard_group == mapping.attn.tp_group
+    assert layer.routed_expert_up_proj.weight.shape == (64 // tp, 32)
+    assert layer.shared_experts.down_proj.tp_size == tp
+    assert layer.shared_experts.down_proj.tp_group == mapping.attn.tp_group
+    assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
+    assert layer.experts.kwargs["token_scatter_size"] == tp
+    layer.pack_input_projection_weights()
+    assert layer.packed_input_projection_weight is None
+
+
+def test_mega_moe_rejects_invalid_ep_layout(monkeypatch) -> None:
+    monkeypatch.setattr(kimi_k3, "get_moe_backend", lambda: MoeBackend("mega_moe"))
+    monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend("none"))
+    with pytest.raises(ValueError, match="EP > 1"):
+        KimiLinearMoE(
+            config=SimpleNamespace(),
+            mapping=Mapping(
+                rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8, moe_ep_size=1
+            ),
+            layer_index=0,
+            model_scope="test",
+            moe_block_count=1,
+            quant_config=None,
+            prefix="moe",
+            alt_stream=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "tp,dp,dp_token_counts",
+    [
+        (4, 1, [0]),
+        (4, 1, [2]),
+        (4, 1, [7]),
+        (4, 1, [8]),
+        (4, 2, [6, 2]),
+        (4, 2, [0, 3]),
+    ],
+)
+def test_mega_moe_tp_ep_and_dep_forward_matches_dense_reference(
+    monkeypatch, tp: int, dp: int, dp_token_counts: list[int]
+) -> None:
+    """Simulate every rank of TP/EP and DEP MegaMoE and verify exact equivalence."""
+    ep = tp * dp
+    hidden_size = 16
+    routed_hidden = 8
+    top_k = 2
+    torch.manual_seed(17)
+    down_w = torch.randn(routed_hidden, hidden_size, dtype=torch.bfloat16) * 0.2
+    up_w = torch.randn(hidden_size, routed_hidden, dtype=torch.bfloat16) * 0.2
+    shared_w = torch.randn(hidden_size, hidden_size, dtype=torch.bfloat16) * 0.2
+    norm_w = torch.ones(routed_hidden, dtype=torch.bfloat16)
+
+    dp_hiddens = [
+        torch.randn(n, hidden_size, dtype=torch.bfloat16) for n in dp_token_counts
+    ]
+    dp_prefixes = [
+        torch.randn(n, hidden_size, dtype=torch.bfloat16) for n in dp_token_counts
+    ]
+    global_counts = [
+        dp_token_counts[dp_rank] for dp_rank in range(dp) for _ in range(tp)
+    ]
+
+    def expert_transform(x: torch.Tensor) -> torch.Tensor:
+        return x * 1.5
+
+    expected_max_slice = max((n + tp - 1) // tp for n in dp_token_counts)
+
+    # Precompute full routed output per DP group for simulated token_all_gather.
+    dp_expected_routed = [expert_transform(h @ down_w.T) for h in dp_hiddens]
+    # Split shared_w by columns across TP ranks so sum(partial) == h @ shared_w.T.
+    shard_cols = hidden_size // tp
+
+    for rank in range(ep):
+        mapping = Mapping(
+            rank=rank,
+            world_size=ep,
+            attn_tp_size=tp,
+            attn_dp_size=dp,
+            moe_tp_size=1,
+            moe_ep_size=ep,
+        )
+        dp_rank = mapping.attn.dp_rank
+        tp_rank = mapping.attn.tp_rank
+        hidden = dp_hiddens[dp_rank]
+        prefix = dp_prefixes[dp_rank]
+        n_tok = dp_token_counts[dp_rank]
+        expected_tp_counts = [
+            n_tok // tp + (1 if r < n_tok % tp else 0) for r in range(tp)
+        ]
+        local_n = expected_tp_counts[tp_rank]
+        start = sum(expected_tp_counts[:tp_rank])
+
+        events: list[str] = []
+
+        @contextmanager
+        def scope(**kwargs):
+            yield SimpleNamespace(
+                branch=nullcontext,
+                branch_after_main=nullcontext,
+                record_checkpoint=lambda: events.append("record"),
+                join_checkpoint=lambda: events.append("join_ckpt"),
+                join=lambda: events.append("join"),
+            )
+
+        up_proj = Kimi3LatentProjection(
+            routed_hidden,
+            hidden_size,
+            params_dtype=torch.bfloat16,
+            solution="torch",
+            shard_group=mapping.attn.tp_group,
+            shard_rank=tp_rank,
+            shard_size=tp,
+        )
+        up_proj.weight.data.copy_(
+            up_w[tp_rank * shard_cols : (tp_rank + 1) * shard_cols]
+        )
+
+        def norm(value: torch.Tensor) -> torch.Tensor:
+            return torch.nn.functional.rms_norm(
+                value.float(), (routed_hidden,), weight=norm_w.float(), eps=1e-6
+            ).to(value.dtype)
+
+        buf_calls: list[tuple[int, int]] = []
+
+        def input_buffers(tok: int, max_tok: int):
+            buf_calls.append((tok, max_tok))
+            return (
+                torch.empty((tok, routed_hidden // 2), dtype=torch.uint8),
+                torch.empty((tok, max(1, routed_hidden // 16)), dtype=torch.uint8),
+                torch.full((tok, top_k), -1, dtype=torch.int32),
+                torch.zeros((tok, top_k), dtype=torch.float32),
+            )
+
+        expert_calls: list[tuple[int, int, int]] = []
+
+        def run_experts(
+            routed_in,
+            routing,
+            *,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            do_finalize,
+        ):
+            events.append("experts")
+            expert_calls.append(
+                (routed_in.shape[0], max_num_tokens_per_gpu, num_global_tokens)
+            )
+            assert do_finalize
+            return expert_transform(routed_in)
+
+        def fake_token_all_gather(tensor, *, group, scattered_num_tokens):
+            events.append("token_all_gather")
+            assert group == mapping.attn.tp_group
+            assert scattered_num_tokens == expected_tp_counts
+            torch.testing.assert_close(
+                tensor, dp_expected_routed[dp_rank][start : start + local_n]
+            )
+            return dp_expected_routed[dp_rank]
+
+        def fake_all_reduce(tensor, group):
+            events.append("all_reduce")
+            assert group == mapping.attn.tp_group
+            # Reconstruct exact sum across all TP ranks in this DP group:
+            # sum_r (shared_partial_r + column_shard_r(up_proj(norm(routed)))).
+            routed_normed = norm(dp_expected_routed[dp_rank])
+            expected_local = (
+                hidden[:, tp_rank * shard_cols : (tp_rank + 1) * shard_cols]
+                @ shared_w[:, tp_rank * shard_cols : (tp_rank + 1) * shard_cols].T
+            )
+            expected_local[:, tp_rank * shard_cols : (tp_rank + 1) * shard_cols] += (
+                routed_normed
+                @ up_w[tp_rank * shard_cols : (tp_rank + 1) * shard_cols].T
+            )
+            torch.testing.assert_close(tensor, expected_local)
+            return hidden @ shared_w.T + routed_normed @ up_w.T
+
+        def run_shared(x, *, down_out):
+            return (
+                x[:, tp_rank * shard_cols : (tp_rank + 1) * shard_cols]
+                @ shared_w[:, tp_rank * shard_cols : (tp_rank + 1) * shard_cols].T
+            )
+
+        def run_topk(
+            src,
+            logits,
+            *,
+            output_format,
+            num_token_non_padded,
+            expert_location_dispatch_info,
+            out,
+        ):
+            w_out, ids_out = out
+            ids_out.fill_(1)
+            w_out.fill_(0.5)
+            return StandardTopKOutput(w_out, ids_out, None)
+
+        monkeypatch.setattr(kimi_k3, "token_all_gather", fake_token_all_gather)
+        monkeypatch.setattr(kimi_k3, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(
+            kimi_k3, "all_gather", mock.Mock(side_effect=AssertionError("all_gather"))
+        )
+        monkeypatch.setattr(
+            kimi_k3,
+            "reduce_scatter",
+            mock.Mock(side_effect=AssertionError("reduce_scatter")),
+        )
+
+        shared_mod = mock.Mock(side_effect=run_shared)
+        shared_mod.shared_parallel = None
+        shared_mod.shared_communication = None
+
+        layer = SimpleNamespace(
+            execution_plan=SimpleNamespace(
+                use_mega_moe=True, owns_ep_communication=True
+            ),
+            mapping=mapping,
+            stream_fork=SimpleNamespace(scope=scope),
+            gate=lambda src: torch.zeros((src.shape[0], 8), dtype=torch.bfloat16),
+            topk=run_topk,
+            expert_dispatch_info=None,
+            routed_expert_down_proj=lambda src: (src @ down_w.T, None),
+            experts=SimpleNamespace(
+                plan={"weight_dtype": "mxfp4"},
+                input_buffers=input_buffers,
+            ),
+            moe_alltoall=None,
+            _routed_experts=run_experts,
+            routed_expert_norm=norm,
+            routed_expert_up_proj=up_proj,
+            _shard_up_projection=True,
+            shared_experts=shared_mod,
+            routed_hidden=routed_hidden,
+            top_k=top_k,
+        )
+        layer._forward_attn_dp = lambda h, p, c: KimiLinearMoE._forward_attn_dp(
+            layer, h, p, c
+        )
+
+        ctx = SimpleNamespace(
+            collective_global_num_tokens=global_counts if dp > 1 else None,
+            global_num_tokens=None,
+            forward_mode=ForwardMode.EXTEND,
+            attn_backend=None,
+        )
+        out = KimiLinearMoE.forward(
+            layer,
+            hidden,
+            prefix,
+            num_global_tokens=sum(dp_token_counts),
+            max_num_tokens_per_gpu=expected_max_slice,
+            ctx=ctx,
+            prefix_is_sharded=False,
+        )
+
+        if expected_max_slice == 0:
+            assert out is prefix
+            assert expert_calls == []
+            assert events == []
+        else:
+            assert buf_calls == [(local_n, expected_max_slice)]
+            assert expert_calls == [
+                (local_n, expected_max_slice, ep * expected_max_slice)
+            ]
+            if n_tok == 0:
+                assert out is prefix
+                assert events == ["join", "experts"]
+            else:
+                assert events == ["join", "experts", "token_all_gather", "all_reduce"]
+                expected = prefix + (
+                    hidden @ shared_w.T + norm(dp_expected_routed[dp_rank]) @ up_w.T
+                )
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_mega_moe_tp_ep_masks_cuda_graph_decode_padding_rows(monkeypatch) -> None:
+    """Padded decode rows (decode_window_locations == 0) must be masked to id=-1, weight=0."""
+    tp = 4
+    num_tokens = 7  # ragged counts: [2, 2, 2, 1]
+    locations = torch.tensor([11, 12, 13, 0, 0, 0, 0], dtype=torch.int32)
+    hidden = torch.randn(num_tokens, 8, dtype=torch.bfloat16)
+    prefix = torch.zeros_like(hidden)
+
+    for rank in range(tp):
+        mapping = Mapping(
+            rank=rank, world_size=tp, attn_tp_size=tp, moe_tp_size=1, moe_ep_size=tp
+        )
+        counts = [2, 2, 2, 1]
+        start = sum(counts[:rank])
+        local_n = counts[rank]
+        expected_live = locations[start : start + local_n] > 0
+
+        @contextmanager
+        def scope(**kwargs):
+            yield SimpleNamespace(
+                branch=nullcontext,
+                branch_after_main=nullcontext,
+                join=lambda: None,
+            )
+
+        captured_routing: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def run_experts(
+            routed_in,
+            routing,
+            *,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            do_finalize,
+        ):
+            captured_routing.append(
+                (routing.topk_ids.clone(), routing.topk_weights.clone())
+            )
+            return routed_in
+
+        def run_topk(
+            src,
+            logits,
+            *,
+            output_format,
+            num_token_non_padded,
+            expert_location_dispatch_info,
+            out,
+        ):
+            w_out, ids_out = out
+            ids_out.fill_(5)
+            w_out.fill_(0.75)
+            return StandardTopKOutput(w_out, ids_out, None)
+
+        monkeypatch.setattr(
+            kimi_k3,
+            "token_all_gather",
+            lambda t, *, group, scattered_num_tokens: torch.zeros(
+                (num_tokens, 4), dtype=t.dtype
+            ),
+        )
+        monkeypatch.setattr(kimi_k3, "all_reduce", lambda t, group: t)
+
+        up_proj = Kimi3LatentProjection(
+            4,
+            8,
+            params_dtype=torch.bfloat16,
+            solution="torch",
+            shard_group=mapping.attn.tp_group,
+            shard_rank=rank,
+            shard_size=tp,
+        )
+        shared_mod = mock.Mock(return_value=torch.zeros_like(hidden))
+        shared_mod.shared_parallel = None
+        shared_mod.shared_communication = None
+
+        layer = SimpleNamespace(
+            execution_plan=SimpleNamespace(
+                use_mega_moe=True, owns_ep_communication=True
+            ),
+            mapping=mapping,
+            stream_fork=SimpleNamespace(scope=scope),
+            gate=lambda src: torch.zeros((src.shape[0], 8), dtype=torch.bfloat16),
+            topk=run_topk,
+            expert_dispatch_info=None,
+            routed_expert_down_proj=lambda src: (src[:, :4].contiguous(), None),
+            experts=SimpleNamespace(
+                plan={"weight_dtype": "mxfp4"},
+                input_buffers=lambda tok, max_tok: (
+                    torch.empty((tok, 2), dtype=torch.uint8),
+                    torch.empty((tok, 1), dtype=torch.uint8),
+                    torch.empty((tok, 2), dtype=torch.int32),
+                    torch.empty((tok, 2), dtype=torch.float32),
+                ),
+            ),
+            moe_alltoall=None,
+            _routed_experts=run_experts,
+            routed_expert_norm=None,
+            routed_expert_up_proj=up_proj,
+            _shard_up_projection=True,
+            shared_experts=shared_mod,
+            routed_hidden=4,
+            top_k=2,
+        )
+        ctx = SimpleNamespace(
+            collective_global_num_tokens=None,
+            global_num_tokens=None,
+            forward_mode=ForwardMode.DECODE,
+            attn_backend=SimpleNamespace(decode_window_locations=lambda: locations),
+        )
+        KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
+        assert len(captured_routing) == 1
+        ids, weights = captured_routing[0]
+        for row in range(local_n):
+            if expected_live[row]:
+                assert torch.equal(ids[row], torch.tensor([5, 5], dtype=torch.int32))
+                assert torch.equal(weights[row], torch.tensor([0.75, 0.75]))
+            else:
+                assert torch.equal(ids[row], torch.tensor([-1, -1], dtype=torch.int32))
+                assert torch.equal(weights[row], torch.tensor([0.0, 0.0]))
 
 
 if __name__ == "__main__":

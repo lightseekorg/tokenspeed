@@ -424,7 +424,13 @@ def get_kimi_mega_moe_runner(plan: dict, w: torch.nn.Module) -> KimiMegaMoERunne
     top_k = w.top_k
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
-    max_tokens = _token_capacity(get_autotune_max_num_tokens())
+    scatter_size = int(plan.get("token_scatter_size", 1))
+    if scatter_size < 1:
+        raise ValueError(f"token_scatter_size must be >= 1, got {scatter_size}")
+    per_rank_ceiling = (
+        get_autotune_max_num_tokens() + scatter_size - 1
+    ) // scatter_size
+    max_tokens = _token_capacity(per_rank_ceiling)
     key = (
         id(group),
         torch.cuda.current_device(),

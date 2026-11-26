@@ -129,6 +129,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     can_acquire_all_reduce_outputs,
     reduce_scatter,
+    token_all_gather,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
@@ -138,6 +139,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
+from tokenspeed.runtime.execution.query_shard import scatter_count
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -2533,12 +2535,13 @@ def _check_k3_expert_placement(
         )
     if not (
         mapping.attn.dp_size > 1
+        and mapping.attn.tp_size == 1
         and mapping.moe.tp_size == 1
         and mapping.moe.ep_size > 1
     ):
         raise ValueError(
-            "Kimi-K3 expert placement requires attention DP with MoE EP only "
-            "(moe tp_size 1)"
+            "Kimi-K3 expert placement requires attention DP with attention TP=1 "
+            "and MoE EP only (moe tp_size 1)"
         )
     if peer_weights is not None:
         raise ValueError(
@@ -2599,9 +2602,14 @@ class KimiLinearMoE(nn.Module):
         # Decoder layers inspect this even when attention DP skips native setup.
         self.native_latent_moe: LatentMoELayer | None = None
         if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
-            if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
+            if (
+                mapping.moe.tp_size != 1
+                or mapping.moe.dp_size != 1
+                or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
+            ):
                 raise ValueError(
-                    "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
+                    "Kimi-K3 attention DP requires attention DP == MoE EP == world size "
+                    "(or MoE TP=1/DP=1 with EP == attention TP * DP for MegaMoE)."
                 )
         elif mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
@@ -2624,14 +2632,43 @@ class KimiLinearMoE(nn.Module):
             if moe_backend.is_gluon_petit()
             else All2AllBackend.NONE
         )
-        if self.execution_plan.owns_ep_communication and (
-            mapping.attn.dp_size <= 1 or all2all_backend is not fused_all2all_backend
-        ):
-            raise ValueError(
-                "K3 MegaMoE requires attention DP > 1 and "
-                f"--all2all-backend {fused_all2all_backend.value}; "
-                "the fused kernel owns dispatch/combine."
-            )
+        if self.execution_plan.use_mega_moe:
+            if all2all_backend is not fused_all2all_backend:
+                raise ValueError(
+                    "K3 MegaMoE requires "
+                    f"--all2all-backend {fused_all2all_backend.value}; "
+                    "the fused kernel owns dispatch/combine."
+                )
+            if (
+                mapping.moe.tp_size != 1
+                or mapping.moe.dp_size != 1
+                or mapping.moe.ep_size <= 1
+                or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
+            ):
+                raise ValueError(
+                    "K3 MegaMoE requires MoE TP=1/DP=1, EP > 1, and "
+                    "EP == attention TP * DP inside each pipeline stage."
+                )
+        else:
+            if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
+                if not (
+                    mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size
+                ):
+                    raise ValueError(
+                        "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
+                    )
+            if self.execution_plan.owns_ep_communication and (
+                mapping.attn.dp_size <= 1
+                or all2all_backend is not fused_all2all_backend
+            ):
+                raise ValueError(
+                    "K3 MegaMoE requires attention DP > 1 and "
+                    f"--all2all-backend {fused_all2all_backend.value}; "
+                    "the fused kernel owns dispatch/combine."
+                )
+        uses_ep_dispatch = (
+            mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1
+        ) or self.execution_plan.use_mega_moe
         # The target's expert placement (None for drafts and plain serving):
         # the routed experts hold P = E + R slots and the router emits slot ids.
         self.expert_placement: ExpertLocationMetadata | None = (
@@ -2714,7 +2751,10 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode=("precomputed_topk" if mapping.attn.dp_size > 1 else None),
+            routing_mode=("precomputed_topk" if uses_ep_dispatch else None),
+            token_scatter_size=(
+                mapping.attn.tp_size if self.execution_plan.use_mega_moe else 1
+            ),
             # Native gfx950 accepts bf16 model activations; the selected kernel
             # may quantize them internally. Hopper Marlin runs A16W4.
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
@@ -2738,10 +2778,10 @@ class KimiLinearMoE(nn.Module):
             expert_layout=expert_layout,
         )
 
-        if mapping.attn.dp_size > 1:
+        if uses_ep_dispatch:
             if not self.experts.supports_precomputed_topk:
                 raise ValueError(
-                    "Kimi-K3 attention DP requires precomputed TopK support."
+                    "Kimi-K3 EP dispatch requires precomputed TopK support."
                 )
             expected_a2a = (
                 fused_all2all_backend.value
@@ -2750,7 +2790,7 @@ class KimiLinearMoE(nn.Module):
             )
             if self.experts.plan.get("a2a_backend") not in (None, expected_a2a):
                 raise ValueError(
-                    "Kimi-K3 attention DP requires expert all-to-all backend "
+                    "Kimi-K3 EP dispatch requires expert all-to-all backend "
                     f"{expected_a2a!r}."
                 )
 
@@ -2785,8 +2825,18 @@ class KimiLinearMoE(nn.Module):
             )
 
         # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
-        self._shard_latent_projections = _shard_k3_latent_projection(
-            mapping, config.hidden_size
+        # MegaMoE slices rows across attention TP before down_proj, so down_proj stays
+        # replicated while up_proj shards columns across attention TP and folds its
+        # gather into the shared-expert all-reduce.
+        self._shard_up_projection: bool = (
+            self.execution_plan.use_mega_moe
+            and mapping.attn.tp_size > 1
+            and config.hidden_size % mapping.attn.tp_size == 0
+        )
+        self._shard_latent_projections = (
+            False
+            if self.execution_plan.use_mega_moe
+            else _shard_k3_latent_projection(mapping, config.hidden_size)
         )
         # Every captured decode width takes the column shard when the fabric has one.
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -2824,18 +2874,28 @@ class KimiLinearMoE(nn.Module):
             prefix=add_prefix("routed_expert_down_proj", prefix),
             multicast_down=multicast_down,
             column_group=(mapping.moe.tp_ep_group if column_down else None),
-            shard_rank=mapping.moe.tp_ep_rank,
-            shard_size=mapping.moe.tp_ep_size,
+            shard_rank=mapping.moe.tp_ep_rank if column_down else 0,
+            shard_size=mapping.moe.tp_ep_size if column_down else 1,
         )
+        if self._shard_up_projection:
+            up_shard_group = mapping.attn.tp_group
+            up_shard_rank = mapping.attn.tp_rank
+            up_shard_size = mapping.attn.tp_size
+        elif self._shard_latent_projections:
+            up_shard_group = mapping.moe.tp_ep_group
+            up_shard_rank = mapping.moe.tp_ep_rank
+            up_shard_size = mapping.moe.tp_ep_size
+        else:
+            up_shard_group = None
+            up_shard_rank = 0
+            up_shard_size = 1
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
-            shard_group=(
-                mapping.moe.tp_ep_group if self._shard_latent_projections else None
-            ),
-            shard_rank=mapping.moe.tp_ep_rank,
-            shard_size=mapping.moe.tp_ep_size,
+            shard_group=up_shard_group,
+            shard_rank=up_shard_rank,
+            shard_size=up_shard_size,
         )
         self.routed_expert_norm = (
             RMSNorm(self.routed_hidden, eps=config.rms_norm_eps)
@@ -2844,7 +2904,7 @@ class KimiLinearMoE(nn.Module):
         )
         self._topk_ready = (
             torch.cuda.Event()
-            if (mapping.attn.dp_size == 1 or mapping.moe.tp_ep_size == 1)
+            if not uses_ep_dispatch
             and alt_stream is not None
             and self.experts.supports_precomputed_topk
             else None
@@ -2865,24 +2925,26 @@ class KimiLinearMoE(nn.Module):
         shared_parallel = shared_expert_mapping(
             mapping, envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
         )
+        if shared_parallel is not None:
+            shared_tp_rank = shared_parallel.tp_rank
+            shared_tp_size = shared_parallel.tp_size
+            shared_tp_group = shared_parallel.tp_group
+        elif uses_ep_dispatch:
+            shared_tp_rank = mapping.attn.tp_rank
+            shared_tp_size = mapping.attn.tp_size
+            shared_tp_group = (
+                mapping.attn.tp_group if mapping.attn.tp_size > 1 else None
+            )
+        else:
+            shared_tp_rank = mapping.moe.tp_ep_rank
+            shared_tp_size = mapping.moe.tp_ep_size
+            shared_tp_group = mapping.moe.tp_ep_group
         self.shared_experts = KimiLinearMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
-            tp_rank=(
-                shared_parallel.tp_rank
-                if shared_parallel is not None
-                else (0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank)
-            ),
-            tp_size=(
-                shared_parallel.tp_size
-                if shared_parallel is not None
-                else (1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size)
-            ),
-            tp_group=(
-                shared_parallel.tp_group
-                if shared_parallel is not None
-                else (None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group)
-            ),
+            tp_rank=shared_tp_rank,
+            tp_size=shared_tp_size,
+            tp_group=shared_tp_group,
             shared_parallel=shared_parallel,
             quant_config=_dense_mlp_quant_config(quant_config),
             prefix=add_prefix("shared_experts", prefix),
@@ -2896,12 +2958,14 @@ class KimiLinearMoE(nn.Module):
         # TP8 decode chain over Lamport mailboxes; bound by prepare_communication_runtime.
         self.decode_moe: KimiK3DecodeMoELayer | None = None
 
-        if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
+        if uses_ep_dispatch:
             self.moe_alltoall = None
             if self.execution_plan.owns_ep_communication:
                 if layer_index == config.first_k_dense_replace:
                     logger.info(
-                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE (EP={mapping.moe.ep_size})",
+                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE "
+                        f"(EP={mapping.moe.ep_size}, attn_tp={mapping.attn.tp_size}, "
+                        f"attn_dp={mapping.attn.dp_size})",
                     )
                 return
             if all2all_backend is not All2AllBackend.AGRS:
@@ -2994,6 +3058,10 @@ class KimiLinearMoE(nn.Module):
         view of that tensor, so the rebinding adds no steady-state memory and
         leaves the separate composition working unchanged.
         """
+        if self.execution_plan.use_mega_moe and self.mapping.attn.tp_size > 1:
+            # Routed projections consume this rank's TP token slice while
+            # shared experts consume the full attention-TP batch.
+            return
         modules = (
             self.gate,
             self.routed_expert_down_proj,
@@ -3660,33 +3728,68 @@ class KimiLinearMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prefix_sum: torch.Tensor,
-        ctx: ForwardContext,
+        ctx: ForwardContext | None,
     ) -> torch.Tensor:
-        """Keep dense work local and dispatch/combine only routed expert activations."""
-        counts = (
-            ctx.collective_global_num_tokens
-            if ctx.collective_global_num_tokens is not None
-            else ctx.global_num_tokens
-        )
+        """Dispatch/combine routed experts across EP ranks while keeping dense work in attention TP.
+
+        Covers ``attn_dp >= 1, attn_tp >= 1`` where ``moe_ep == attn_dp * attn_tp``:
+        when ``attn_tp > 1``, each rank slices its disjoint subset of replicated
+        rows (``scatter_count``) for routing, latent down-projection, and MegaMoE
+        dispatch/combine, gathers the routed latent back across ``attn.tp_group``,
+        and folds the column-sharded up-projection into the shared-expert all-reduce.
+        """
+        tp = self.mapping.attn
+        moe = self.mapping.moe
+        tp_size = tp.tp_size
+        tp_rank = tp.tp_rank
+        dp_size = tp.dp_size
         num_tokens = hidden_states.shape[0]
-        if (
-            counts is None
-            or len(counts) != self.mapping.world_size
-            or num_tokens != counts[self.mapping.attn.dp_rank]
-            or prefix_sum.shape != hidden_states.shape
-        ):
+        if prefix_sum.shape != hidden_states.shape:
             raise ValueError(
                 "Kimi-K3 attention DP requires matching collective token counts."
             )
-        max_tokens = max(counts)
+        if dp_size > 1:
+            if ctx is None:
+                raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
+            counts = (
+                ctx.collective_global_num_tokens
+                if ctx.collective_global_num_tokens is not None
+                else ctx.global_num_tokens
+            )
+            if (
+                counts is None
+                or len(counts) != self.mapping.world_size
+                or num_tokens != counts[self.mapping.rank]
+                or (
+                    tp_size > 1
+                    and any(counts[peer] != num_tokens for peer in tp.tp_group)
+                )
+            ):
+                raise ValueError(
+                    "Kimi-K3 attention DP requires matching collective token counts."
+                )
+            max_dp_tokens = max(counts[peer] for peer in moe.ep_group)
+            max_tokens = ceil_div(max_dp_tokens, tp_size)
+        else:
+            counts = None
+            max_tokens = ceil_div(num_tokens, tp_size)
         if max_tokens == 0:
             return prefix_sum
+
+        tp_counts = scatter_count(num_tokens, tp_size)
+        start = sum(tp_counts[:tp_rank])
+        local_tokens = tp_counts[tp_rank]
+        source = (
+            hidden_states
+            if tp_size == 1
+            else hidden_states.narrow(0, start, local_tokens)
+        )
 
         quant_out = None
         routing_out = None
         if self.execution_plan.use_mega_moe:
             activation, scales, ids, weights = self.experts.input_buffers(
-                num_tokens, max_tokens
+                local_tokens, max_tokens
             )
             quant_out = (activation, scales)
             routing_out = (weights, ids)
@@ -3705,7 +3808,8 @@ class KimiLinearMoE(nn.Module):
         # the branch below reads the front's shared_activated.
         fused_inputs = None
         if (
-            num_tokens > 0
+            tp_size == 1
+            and local_tokens > 0
             and shared_communication is None
             and hidden_states.is_cuda
             and self.shared_experts.gate_up_proj.weight.dtype == hidden_states.dtype
@@ -3735,13 +3839,13 @@ class KimiLinearMoE(nn.Module):
                     shared_output = self.shared_experts(shared_input, down_out=None)
 
             shared_activated = None
-            if num_tokens > 0:
+            if local_tokens > 0:
                 if fused_inputs is None:
-                    router_logits = self.gate(hidden_states)
+                    router_logits = self.gate(source)
                 else:
                     router_logits, routed_input, shared_activated = fused_inputs
                 topk = self.topk(
-                    hidden_states,
+                    source,
                     router_logits,
                     output_format=TopKOutputFormat.STANDARD,
                     num_token_non_padded=None,
@@ -3749,9 +3853,26 @@ class KimiLinearMoE(nn.Module):
                     out=routing_out,
                 )
                 if fused_inputs is None:
-                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                    routed_input, _ = self.routed_expert_down_proj(source)
                 topk_ids = topk.topk_ids
                 topk_weights = topk.topk_weights
+                # Mask CUDA-graph padding rows in place (expert id -1, weight 0)
+                # so filler decode rows never route to experts or pollute load.
+                if (
+                    self.execution_plan.use_mega_moe
+                    and ctx is not None
+                    and ctx.forward_mode is not None
+                    and ctx.forward_mode.is_decode_or_idle()
+                    and ctx.attn_backend is not None
+                ):
+                    live = (
+                        ctx.attn_backend.decode_window_locations().narrow(
+                            0, start, local_tokens
+                        )
+                        > 0
+                    )
+                    topk_ids.masked_fill_(~live[:, None], -1)
+                    topk_weights.masked_fill_(~live[:, None], 0)
             else:
                 routed_input = hidden_states.new_empty((0, self.routed_hidden))
                 if routing_out is not None:
@@ -3769,7 +3890,7 @@ class KimiLinearMoE(nn.Module):
                     )
 
             if self.experts.plan["weight_dtype"] == "nvfp4":
-                if num_tokens > 0:
+                if local_tokens > 0:
                     routed_input = fp4_quantize(
                         routed_input,
                         self.experts.w13_input_scale_quant,
@@ -3809,14 +3930,14 @@ class KimiLinearMoE(nn.Module):
                     if prequantized
                     else [routed_input, topk_ids, topk_weights]
                 )
-                if num_tokens < max_tokens:
-                    padding = (0, 0, 0, max_tokens - num_tokens)
+                if local_tokens < max_tokens:
+                    padding = (0, 0, 0, max_tokens - local_tokens)
                     payloads = [
                         F.pad(tensor, padding, mode="constant", value=0)
                         for tensor in payloads
                     ]
                 payloads = [
-                    all_gather(tensor.contiguous(), self.mapping.moe.ep_group, dim=0)
+                    all_gather(tensor.contiguous(), moe.ep_group, dim=0)
                     for tensor in payloads
                 ]
                 routed_input = (
@@ -3851,7 +3972,7 @@ class KimiLinearMoE(nn.Module):
                 topk_ids=topk_ids,
                 router_logits=None,
             )
-            total_tokens = self.mapping.world_size * max_tokens
+            total_tokens = moe.ep_size * max_tokens
             if self.execution_plan.use_mega_moe:
                 fork.join()
             routed_output = self._routed_experts(
@@ -3880,23 +4001,43 @@ class KimiLinearMoE(nn.Module):
                 routed_output = self.moe_alltoall.combine(routed_output)
             else:
                 routed_output = reduce_scatter(
-                    routed_output.contiguous(), group=self.mapping.moe.ep_group
-                )[:num_tokens]
-
-            if num_tokens > 0 and self.routed_expert_norm is not None:
-                routed_output = self.routed_expert_norm(routed_output)
+                    routed_output.contiguous(), group=moe.ep_group
+                )[:local_tokens]
 
             projected = None
-            if (
-                shared_communication is not None
-                and self.execution_plan.owns_ep_communication
-                and num_tokens > 0
-                and not self.routed_expert_up_proj.narrowed
-            ):
-                projected, _ = self.routed_expert_up_proj(routed_output)
+            if tp_size == 1:
+                if num_tokens > 0 and self.routed_expert_norm is not None:
+                    routed_output = self.routed_expert_norm(routed_output)
+                if (
+                    shared_communication is not None
+                    and self.execution_plan.owns_ep_communication
+                    and num_tokens > 0
+                    and not self.routed_expert_up_proj.narrowed
+                ):
+                    projected, _ = self.routed_expert_up_proj(routed_output)
 
         if num_tokens == 0:
             return prefix_sum
+        if tp_size > 1:
+            routed_output = token_all_gather(
+                routed_output.contiguous(),
+                group=tp.tp_group,
+                scattered_num_tokens=tp_counts,
+            )
+            if self.routed_expert_norm is not None:
+                routed_output = self.routed_expert_norm(routed_output)
+            if self._shard_up_projection:
+                projected_shard = self.routed_expert_up_proj.project_shard(
+                    routed_output
+                )
+                column, width = self.routed_expert_up_proj.shard_slice
+                shared_output[:, column : column + width].add_(projected_shard)
+            else:
+                projected_full, _ = self.routed_expert_up_proj(routed_output)
+                if tp_rank == 0:
+                    shared_output.add_(projected_full)
+            shared_output = all_reduce(shared_output, tp.tp_group)
+            return prefix_sum + shared_output
         if projected is not None:
             return add3(prefix_sum, projected, shared_output)
         return self.routed_expert_up_proj.forward_add3(
@@ -3949,8 +4090,10 @@ class KimiLinearMoE(nn.Module):
             raise ValueError(
                 "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
             )
-        if self.mapping.attn.dp_size > 1 and self.mapping.moe.tp_ep_size > 1:
-            if ctx is None:
+        if (
+            self.mapping.attn.dp_size > 1 and self.mapping.moe.tp_ep_size > 1
+        ) or self.execution_plan.owns_ep_communication:
+            if ctx is None and self.mapping.attn.dp_size > 1:
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
             return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
 
@@ -4581,6 +4724,7 @@ class KimiLinearDecoderLayer(nn.Module):
             and self.is_moe_layer
             and isinstance(self.block_sparse_moe, KimiLinearMoE)
             and self.block_sparse_moe.native_latent_moe is None
+            and not self.block_sparse_moe.execution_plan.owns_ep_communication
             and self.mapping.attn.dp_size == 1
         ):
             mixed = self.k3_comm.mix_for_moe(
