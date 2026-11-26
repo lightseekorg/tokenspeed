@@ -122,6 +122,13 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
 def _structural_tag_for_longcat(
     content_format: Any, *, prompt_opens_reasoning: bool
 ) -> str:
+    """Constrain LongCat's answer after its free-form reasoning block.
+
+    Continue the block when the prompt opened it; otherwise allow an optional
+    ``<longcat_think>...</longcat_think>`` block before the answer. Standard
+    tag primitives avoid requiring the native LongCat tool-protocol extension;
+    this wrapper does not implement that tool protocol.
+    """
     from xgrammar.structural_tag import (
         AnyTextFormat,
         OptionalFormat,
@@ -130,8 +137,6 @@ def _structural_tag_for_longcat(
         TagFormat,
     )
 
-    # Use the standard tag primitives: usage accounting must not depend on
-    # the native LongCat tool-protocol extension being installed.
     reasoning = TagFormat(
         begin="" if prompt_opens_reasoning else "<longcat_think>",
         content=AnyTextFormat(),
@@ -358,7 +363,15 @@ def _reasoning_implicit_closer_id(reasoning_parser: str, tokenizer) -> int | Non
 def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | None:
     """The engine's ``ReasoningGrammar`` for ``reasoning_parser``, or None
     when xgrammar has no template for it: a JSON schema then constrains the
-    whole reply."""
+    whole reply.
+
+    The engine's ``--reasoning-parser`` enables this configuration; setting a
+    frontend parser alone does not enable the engine counter. Single-token
+    markers also enable host-side usage accounting, independently of schema
+    constraints, including with ``--grammar-backend none``. The host excludes
+    prompt tokens and delimiters, continues a prompt-opened reasoning block,
+    and counts committed reasoning tokens even without a generated closer.
+    """
     from xgrammar.structural_tag import JSONSchemaFormat
 
     tags = [
