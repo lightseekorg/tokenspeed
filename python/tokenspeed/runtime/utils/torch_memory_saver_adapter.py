@@ -72,6 +72,7 @@ def _non_expandable_allocation():
 
 
 _NAMED_REGION_POOLS = {
+    "cache_transfer": "persistent_buffers",
     "executor_inputs": "persistent_buffers",
     "runtime_states": "persistent_buffers",
     "attention_state": "persistent_buffers",
@@ -150,7 +151,7 @@ class TorchMemorySaverAdapter(ABC):
         return _TorchMemorySaverAdapterReal
 
     @staticmethod
-    def create(enable: bool, *, device: str = "cuda") -> "TorchMemorySaverAdapter":
+    def create(enable: bool, *, device: str) -> "TorchMemorySaverAdapter":
         adapter = TorchMemorySaverAdapter.adapter_class(enable, device=device)
         if (
             adapter is _TorchMemorySaverAdapterReal
@@ -221,28 +222,16 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
+    @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
-        # tag defaults to "default" in the library; pass it through explicitly so
-        # weights vs kv_cache regions can be paused/resumed independently.
-        # enable_cpu_backup=True offloads (and restores) contents to CPU on
-        # pause (weights); False discards them (kv_cache).
-        @contextmanager
-        def active_region():
-            pending: list[Callable[[], None]] = []
-            token = _communication_initializers.set(pending)
-            try:
-                with _non_expandable_allocation(), _primary_memory_saver.region(
-                    tag=tag or "default", enable_cpu_backup=enable_cpu_backup
-                ):
-                    yield
-            finally:
-                _communication_initializers.reset(token)
-            # A failed model load never initializes communication. The original
-            # allocator region has fully exited before these callbacks run.
-            for operation in pending:
-                operation()
-
-        return active_region()
+        with (
+            _defer_communication_initializers(),
+            _non_expandable_allocation(),
+            _primary_memory_saver.region(
+                tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+            ),
+        ):
+            yield
 
     @contextmanager
     def cuda_graph(self, graph, *, pool, stream, tag: str):

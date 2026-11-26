@@ -84,17 +84,13 @@ does not add a complete-stream requirement to partial SDK updates.
 
 ## Replay and host boundaries
 
-Ascend MHA target replay updates FIA host sequence lengths from the paged
-attention router's live decode metadata, including verify-width padding. Hybrid
-models use this same router for their full-attention layers. Speculative attention
-is causal and aligned to the cache end. Captured native draft decode uses device lengths,
-including the accepted frontier computed inside the graph; eager decode uses
-normal kernel selection. Replay writes Q, workspace and outputs.
-FIA descriptors use live host lengths while tasks consume device data in graph
-order. Shared masks, sampler inputs and attention metadata stay resident.
+Memory Saver retains the captured executable and restores allocations at their
+original addresses. Attention kernel selection and replay metadata follow the
+serving backend. Shared masks must be initialized during warmup so a discardable
+capture pool cannot own constants reused across graphs.
 
-The launcher passes the rank device in the child environment so older hosts
-can use the same command line. On NPU the matching host restores the original
+The launcher passes the rank device in the child environment before Python starts.
+On NPU the matching host restores the original
 main thread-state after Python log cleanup and before native exit handlers
 run, including when Memory Saver is disabled.
 Before native exit, NPU workers explicitly close process groups: the host skips
@@ -107,7 +103,10 @@ Build and ABI details belong to the [native README](https://github.com/yanlonghu
 The runtime and native host in this change provide the complete protocol 3
 transition interface. Ascend uses `acl_graph`; its communicator-owned HCCL
 allocations remain resident.
-CUDA and ROCm continue to use protocol 2.
+CUDA and ROCm continue to use protocol 2. Ascend ranks compare protocol versions on the world Gloo group
+before initializing the Saver HCCL group. A mixed-version replica fails at startup.
+Protocol 3 matches release and resume calls by direction, tags and optional
+`transition_id`. Each ingress can assign its own request ID.
 
 Future HCCL work must investigate releasing communicator-owned buffer backing
 while retaining the captured graph, then restoring the buffers at the captured

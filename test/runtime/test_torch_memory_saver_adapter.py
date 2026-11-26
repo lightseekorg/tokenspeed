@@ -241,7 +241,7 @@ def test_graph_rng_storage_survives_sleep_before_graph_replay(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "default_generators", (object(),))
     monkeypatch.setattr(memory, "cuda_graph", capture, raising=False)
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     graph = CudaGraph()
     with saver.cuda_graph(graph, pool=None, stream=None, tag="cuda_graph"):
         temporary = memory.allocate(41)
@@ -389,7 +389,7 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
         "device_module",
         SimpleNamespace(stream=lambda stream: nullcontext(), Event=Event),
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled, device="cuda")
     lane = lanes.HostTransferLane(saver)
     for count in (1, 257):
         assert (
@@ -668,7 +668,7 @@ def _check_megamoe_buffers_on_cuda():
         enable_memory_saver=True,
         mapping=Mapping(rank=0, world_size=1),
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     with tempfile.TemporaryDirectory() as tmp:
         dist.init_process_group(
             "nccl",
@@ -776,7 +776,7 @@ def _check_checkpoint_metadata_on_cuda():
         in_forward_state_checkpoints,
     )
 
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     retained = []
     consumers = []
     scans = []
@@ -896,7 +896,7 @@ def test_capture_metadata_survives_sleep_for_target_and_draft(
 
     target = CpuAttentionMetadata()
     draft = CpuAttentionMetadata() if with_draft else None
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     prepare_capture_metadata(
         target,
         draft,
@@ -955,7 +955,7 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
         transfer_policy="full_suffix",
         replayable=False,
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled, device="cuda")
     contract = CacheRuntimeContract(
         prefix_granularity=1,
         num_lcm_blocks=4,
@@ -1016,7 +1016,7 @@ def _check_sampled_drafting_on_cuda(sparse: bool):
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
     vocab, pool, width, max_bs, top_k = 64, 6, 4, 4, 3
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.memory_saver_adapter = saver
 

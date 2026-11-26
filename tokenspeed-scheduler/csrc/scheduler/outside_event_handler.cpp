@@ -216,6 +216,11 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         store_hashes.push_back(completed.completed_pages->tail->hash.ToString());
     }
     coordinator_.Host().QueueCachedBlocksForStore(store_hashes);
+    if (shared_l2_proxy_) {
+        // A shared L2 pool takes them with the next plan's writes; queued,
+        // they pin nothing.
+        return std::nullopt;
+    }
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);

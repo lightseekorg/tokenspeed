@@ -53,9 +53,8 @@ def apply_rope(
         native_positions = torch.arange(
             positions.numel(), device=positions.device, dtype=positions.dtype
         ).reshape_as(positions)
-    # CANN requires INT64 positions, including later draft steps.
     q_out, k_out = torch_npu.npu_mrope(
-        native_positions.to(torch.int64),
+        native_positions,
         native_q,
         k,
         cache,

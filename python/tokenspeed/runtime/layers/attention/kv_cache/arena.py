@@ -153,7 +153,7 @@ class CacheArena:
             enable=enable_memory_saver, device=device
         )
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
-        with self.memory_saver_adapter.named_region("attention_state"):
+        with self.memory_saver_adapter.named_region("cache_transfer"):
             for group in plan.groups:
                 page_count, fields = plan.page_field_layout(group.group_id)
                 for base, stride, size in fields:
@@ -662,6 +662,20 @@ class CacheArena:
         """
         if self.offload is not None:
             self.offload.synchronize()
+
+    def release_probe_storage(self) -> None:
+        """Discard a quiesced startup probe arena before allocating its replacement.
+
+        The startup caller has synchronized the device and dropped the captured
+        graphs. Cache views can still hold the arena until rebinding, so release
+        the shared storage in place. The retired arena is only a source of
+        geometry until the replacement binds; its fields must not be read or
+        written.
+        """
+        if self.offload is not None:
+            self.offload.release_probe_storage()
+        for buffer in self.regions.values():
+            buffer.untyped_storage().resize_(0)
 
     @torch.no_grad()
     def clear(self) -> None:

@@ -2776,7 +2776,7 @@ def test_dense_fp8_copy_is_allocated_in_the_weights_region(
         torch.randn(4608, 8192, device="cuda", generator=generator).bfloat16() * 0.02
     )
     # As weight_loader.py loads the model: inside the weights region.
-    saver = saver_module.TorchMemorySaverAdapter.create(enable=True)
+    saver = saver_module.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     with saver.region(tag="weights", enable_cpu_backup=True):
         fp8.prepare(weight)
     assert fp8.weight is not None and fp8.scale is not None

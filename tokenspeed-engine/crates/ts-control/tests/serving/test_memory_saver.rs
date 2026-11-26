@@ -184,24 +184,15 @@ async fn the_client_releases_and_resumes_all_memory_sharing_replicas() {
         },
     )
     .await;
+    // Each ingress may assign its own request ID. Only the transition ID is shared.
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: Some(StrOrList::Many(vec!["park".to_owned()])),
+        rid: Some(StrOrList::Many(vec!["local-request".to_owned()])),
         http_worker_ipc: None,
         tags: None,
+        transition_id: Some("park".to_owned()),
     });
     assert_eq!(
         control(&engine, release).await,
-        [("ReleaseMemoryOccupationReqOutput", false); 2]
-    );
-    for rank in &engine.ranks {
-        assert!(rank.device_ops.lock().unwrap().is_empty());
-    }
-    for rid in ["after-refusal-first", "after-refusal-second"] {
-        let chunks = run(&engine.client, request(rid, 4, budget(2))).await;
-        assert_eq!(tokens(&chunks), [1000, 1001]);
-    }
-    assert_eq!(
-        control(&engine, memory_request(true, None, Some("park"))).await,
         [("ReleaseMemoryOccupationReqOutput", true); 2]
     );
     assert_eq!(
@@ -415,13 +406,26 @@ fn peer_device_failure_preserves_v2_replies_and_prevents_v3_domain_success() {
 #[test]
 fn dp_memory_release_and_resume_wait_for_delayed_replicas() {
     let mut scripts = vec![vec![Vec::new(); 65]; 2];
-    scripts[0][2].push(memory_transition(true, None));
+    let release = |rid: &str, tags| {
+        EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+            ReleaseMemoryOccupationReqInput {
+                rid: Some(StrOrList::One(rid.to_owned())),
+                http_worker_ipc: None,
+                tags,
+                transition_id: Some("training-step".to_owned()),
+            },
+        )))
+    };
+    scripts[0][2].push(release("ingress-a", None));
     scripts[1][6].push(EngineRequest::Add(Box::new(request(
         "drain",
         4,
         budget(24),
     ))));
-    scripts[1][12].push(memory_transition(true, Some(&["weights", "kv_cache"])));
+    scripts[1][12].push(release(
+        "ingress-b",
+        Some(vec!["weights".into(), "kv_cache".into()]),
+    ));
     scripts[0][42].push(memory_transition(false, None));
     scripts[1][50].push(memory_transition(false, Some(&["kv_cache", "weights"])));
     scripts[0][56].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));

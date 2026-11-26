@@ -65,7 +65,7 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
-from tokenspeed_engine.scheduler import Scheduler
+from tokenspeed_engine.scheduler import Scheduler, SharedL2Config
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
@@ -355,7 +355,7 @@ def start_rust_host(
                 "notset": "trace",
             }.get(level, level),
         )
-        # Older hosts ignore the device hint and accept the same command line.
+        # The native host needs the device before Python startup to select its exit path.
         host_env["TS_HOST_DEVICE"] = server_args.device
         popen = subprocess.Popen(
             [
@@ -721,7 +721,7 @@ class HostDataPlane:
         record_cache_observations: bool = False,
         *,
         defer_recurrent_state: bool,
-        replica_memory_transitions: bool = False,
+        replica_memory_transitions: bool,
     ) -> None:
         self._device = handle
         self._defer_recurrent_state = defer_recurrent_state
@@ -1325,7 +1325,7 @@ def _peer_sharing_settings(
     host_cache,
     geometry,
 ) -> PeerSharingSettings:
-    """Build the live cache namespace and agree on the TP replica's incarnation."""
+    """Build the live cache namespace and agree on the TP replica's settings."""
     mapping = server_args.mapping
     deployment_id = cache_deployment_id(
         server_args,
@@ -1335,6 +1335,7 @@ def _peer_sharing_settings(
         world_cpu_group=None,
         for_peer=True,
     )
+    protocol = mooncake_protocol()
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
         dist.broadcast_object_list(
@@ -1371,7 +1372,7 @@ def _peer_sharing_settings(
         library=mooncake_library(),
         local_ip=local_ip,
         push_host=host,
-        protocol=mooncake_protocol(),
+        protocol=protocol,
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
     )
@@ -1394,12 +1395,12 @@ class HostBootstrap:
         host_spans,
         metrics_relay_endpoint: str | None,
         peer_outbox,
+        shared_l2_handle,
         *,
-        replica_memory_transitions: bool = False,
+        replica_memory_transitions: bool,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
-        self._replica_memory_transitions = replica_memory_transitions
         mapping = server_args.mapping
         gpu_id = mapping.gpu_id
         self._gpu_id = gpu_id
@@ -1456,19 +1457,26 @@ class HostBootstrap:
                 )
 
             before_memory_profile = None
-            if server_args.device == "npu" and server_args.enable_memory_saver:
-                from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
-                    AscendMemorySaverAdapter,
-                )
+            if server_args.device == "npu":
 
-                def configure_saver_hccl() -> None:
-                    self._hccl_saver = AscendMemorySaverAdapter.configure_node_hccl(
-                        mapping,
-                        emulate_rank_zero=server_args.emulate_rank_zero,
-                        on_startup_failure=on_startup_failure,
+                def prepare_npu_memory() -> None:
+                    # Every NPU rank must agree before saver-only HCCL collectives.
+                    memory_protocol.check_memory_protocol(
+                        pg_manager.get_process_group("gloo", mapping.world_group),
+                        replica_memory_transitions=replica_memory_transitions,
                     )
+                    if replica_memory_transitions:
+                        from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
+                            AscendMemorySaverAdapter,
+                        )
 
-                before_memory_profile = configure_saver_hccl
+                        self._hccl_saver = AscendMemorySaverAdapter.configure_node_hccl(
+                            mapping,
+                            emulate_rank_zero=server_args.emulate_rank_zero,
+                            on_startup_failure=on_startup_failure,
+                        )
+
+                before_memory_profile = prepare_npu_memory
             min_per_gpu_mem = init_distributed(
                 server_args,
                 port_args,
@@ -1519,6 +1527,7 @@ class HostBootstrap:
                 peer_outbox=(
                     peer_outbox if server_args.peer_prefix_port is not None else None
                 ),
+                shared_l2_handle=shared_l2_handle,
             )
             # The L3 tier the host runs over the shared Host pool; None
             # without a storage backend.
@@ -1585,10 +1594,21 @@ class HostBootstrap:
                 )
             specs = device.specs
             geometry = specs.cache_geometry
+            # With --shared-l2-config, the config of the pool the device
+            # build joined; else None.
+            shared_l2_client_config = device.shared_l2_client_config
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
                 storage_config=storage_config,
+                shared_l2_config=(
+                    SharedL2Config(
+                        max_writes_in_flight=shared_l2_client_config.max_writes_in_flight,
+                        max_keys_per_write=shared_l2_client_config.max_keys_per_write,
+                    )
+                    if shared_l2_client_config is not None
+                    else None
+                ),
                 num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
                 disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -1601,7 +1621,7 @@ class HostBootstrap:
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
-                    enable_kvstore=server_args.enable_kvstore,
+                    has_host_tier=server_args.has_host_tier,
                     disaggregation_mode=server_args.disaggregation_mode,
                     draft_model_path_use_base=server_args.draft_model_path_use_base,
                     draft_model_config=draft_model_config,
@@ -1898,12 +1918,16 @@ class HostBootstrap:
             on_startup_failure.pop_all()
 
     def collective_addresses(self, port: int) -> list[str]:
-        """Agree on the memory protocol and exchange the rank mesh addresses."""
-        return memory_protocol.gather_collective_addresses(
-            self._world_cpu_group,
+        """Every rank's collective address, in rank order, given this rank's
+        port; a collective of the whole world, through the rendezvous the
+        data plane already has."""
+        gathered: list = [None] * self._world_cpu_group.size()
+        dist.all_gather_object(
+            gathered,
             join_host_port(self._collective_host, port),
-            replica_memory_transitions=self._replica_memory_transitions,
+            group=self._world_cpu_group,
         )
+        return gathered
 
     def report_ready(self) -> None:
         """Tell the launcher the rank is serving, once the frontend
@@ -1985,7 +2009,7 @@ class HostBootstrap:
 
 
 def prepare_bootstrap(
-    control_fd: int, *, validate_memory_protocol: bool
+    control_fd: int,
 ) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
     """Read the launch pipe once so the host can select a protocol before building the rank."""
     connection = Connection(control_fd)
@@ -2003,9 +2027,8 @@ def prepare_bootstrap(
         if requires_v3
         else memory_protocol.WEIGHT_UPDATE_PROTOCOL
     )
-    enabled = validate_memory_protocol and requires_v3
-    return enabled, functools.partial(
-        _build_rank, connection, launch_args, minimum_protocol, enabled
+    return requires_v3, functools.partial(
+        _build_rank, connection, launch_args, minimum_protocol, requires_v3
     )
 
 
@@ -2017,7 +2040,8 @@ def _build_rank(
     pd_outbox,
     protocol: int,
     host_spans,
-    peer_outbox=None,
+    peer_outbox,
+    shared_l2_handle,
 ) -> HostBootstrap | EncodeBootstrap:
     server_args, port_args, metrics_relay_endpoint = launch_args
     if server_args.enable_memory_saver and protocol < minimum_protocol:
@@ -2029,6 +2053,11 @@ def _build_rank(
         raise RuntimeError(
             "--peer-prefix-port requires a ts-host binary with peer prefix "
             "sharing; rebuild tokenspeed-engine together with this runtime"
+        )
+    if server_args.shared_l2_config is not None and shared_l2_handle is None:
+        raise RuntimeError(
+            "--shared-l2-config requires a ts-host binary with the shared L2 "
+            "pool client; rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(
@@ -2042,23 +2071,9 @@ def _build_rank(
         host_spans,
         metrics_relay_endpoint,
         peer_outbox,
+        shared_l2_handle,
         replica_memory_transitions=replica_memory_transitions,
     )
-
-
-def bootstrap(
-    control_fd: int,
-    pd_outbox,
-    weight_update_commit_protocol: int = 0,
-    host_spans=None,
-    peer_outbox=None,
-) -> HostBootstrap | EncodeBootstrap:
-    """Build the rank for hosts that call the original bootstrap entry point.
-
-    The host may pass span recording and the outbox for peer prefix sharing.
-    """
-    _, start = prepare_bootstrap(control_fd, validate_memory_protocol=False)
-    return start(pd_outbox, weight_update_commit_protocol, host_spans, peer_outbox)
 
 
 def notify_launcher_of_failure() -> None:

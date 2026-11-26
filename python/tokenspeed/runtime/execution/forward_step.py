@@ -83,7 +83,6 @@ logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
 _is_cuda_graph_phase = False
-_is_acl_graph_forward = False
 
 
 def get_is_capture_mode() -> bool:
@@ -92,11 +91,6 @@ def get_is_capture_mode() -> bool:
 
 def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
-
-
-def is_acl_graph_forward() -> bool:
-    """Whether this forward is recording or warming up an ACL decode graph."""
-    return _is_acl_graph_forward
 
 
 @contextmanager
@@ -974,14 +968,7 @@ class ForwardStepRunner:
             self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
-            # Only this graph's capture and warmups need the graph-safe draft kernel.
-            global _is_acl_graph_forward
-            previous = _is_acl_graph_forward
-            _is_acl_graph_forward = self.device == "npu"
-            try:
-                return self._capture_forward(bs, ctx, sampling_info)
-            finally:
-                _is_acl_graph_forward = previous
+            return self._capture_forward(bs, ctx, sampling_info)
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
@@ -1362,43 +1349,6 @@ class ForwardStepRunner:
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
-    def _update_npu_graph(self, graph, seq_lens: torch.Tensor) -> None:
-        """Update host task arguments after metadata refresh and before replay.
-
-        Captured FIA tasks start with the query width as their placeholder KV
-        length. Replay supplies one KV length per captured row. Native target
-        MHA uses its published lengths, including the verify floor for short
-        live requests and padding. Other backends receive the padded input
-        lengths in ``seq_lens``.
-        """
-        from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-            HybridLinearAttnBackend,
-        )
-        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
-            MHAAttnBackend,
-        )
-        from tokenspeed.runtime.layers.attention.backends.paged.router import (
-            CacheGroupRouter,
-        )
-
-        backend = self.attn_backend
-        if isinstance(backend, HybridLinearAttnBackend):
-            backend = backend.full_attn_backend
-        if type(backend) is CacheGroupRouter:
-            leaves = backend.child_backends()
-            if leaves and all(type(leaf) is MHAAttnBackend for leaf in leaves):
-                # All native MHA groups use the same target verify width.
-                seq_lens = leaves[0].forward_decode_metadata.seq_lens
-
-        # The tasks read their device inputs when replay reaches them, after
-        # their in-graph producers.
-        with torch.inference_mode():
-            graph.update(
-                cpu_update_input=[
-                    {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                ]
-            )
-
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
@@ -1642,7 +1592,13 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                self._update_npu_graph(graph, seq_lens)
+                # Update callbacks write the inference tensors created at capture.
+                with torch.inference_mode():
+                    graph.update(
+                        cpu_update_input=[
+                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                        ]
+                    )
             query_tokens = (
                 self._decode_query_tokens or padded_bs * self.max_tokens_per_req
             )

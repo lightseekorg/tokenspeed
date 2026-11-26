@@ -87,7 +87,14 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
     @contextmanager
     def named_region(self, name: str):
         """Back up persistent owners while reusing their active allocator scope."""
-        key = PoolKey("weights", AllocationPolicy.CPU_BACKUP, _NAMED_REGION_POOLS[name])
+        if name == "cache_transfer":
+            # Frozen rounds may copy KV with weights asleep. ACL graph sleep also
+            # sleeps KV; its backup allocator preserves these tables across wake.
+            key = PoolKey("acl_graph", AllocationPolicy.CPU_BACKUP, "cache_transfer")
+        else:
+            key = PoolKey(
+                "weights", AllocationPolicy.CPU_BACKUP, _NAMED_REGION_POOLS[name]
+            )
         scope = (torch.npu.current_device(), key)
         previous = _named_region.active
         if previous == scope:
@@ -100,6 +107,13 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
                 yield
             finally:
                 _named_region.active = previous
+
+    def assert_cache_active(self) -> None:
+        """Permit KV copies during weights-only sleep and reject uncertain mappings."""
+        state = self._state().state  # Also checks native allocator callback failures.
+        with state.lock:
+            if state.failed or state.paused.intersection(("kv_cache", "acl_graph")):
+                state.assert_active()
 
     @contextmanager
     def allocation_region(self, key: PoolKey):

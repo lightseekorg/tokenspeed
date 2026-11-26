@@ -152,6 +152,7 @@ class _Loop:
         mixed: bool,
         inject_aborts: bool,
         shuffle_groups: bool,
+        configure=None,
     ):
         self.rng = random.Random(seed)
         # Mid-run aborts draw from their own stream.
@@ -188,6 +189,10 @@ class _Loop:
             cfg.host_group_packing = [
                 group.cache_blocks_per_lcm_block for group in cfg.cache_groups
             ]
+        if configure is not None:
+            # What a scenario adds to the drawn configuration (a shared L2
+            # rank its pool's settings); it draws nothing from this loop.
+            configure(cfg)
         self.history_group = [group.group_id for group in cfg.cache_groups].index(
             HISTORY
         )
@@ -382,48 +387,50 @@ class _Loop:
     def run(self, rounds: int) -> None:
         self.submit(self.rng.randrange(2, 6))
         for self.round in range(rounds):
-            if self.rng.random() < 0.3:
-                self.submit(self.rng.randrange(1, 4))
-            if self.remote or self.prefill_only:
-                self.peer(None)
-            plan = self.scheduler.next_execution_plan()
-            assert (
-                self.scheduler.host_cache_stats().retraction_stores.image_refused == 0
-            )
-            self.queue_acks(plan)
-            self.pending.append(plan)
-            if self.remote or self.prefill_only:
-                self.peer(plan)
-            if self.abort_rng is not None:
-                # One in twenty rounds, and from mid-run on until one is aborted.
-                abortable = sorted(r for r, s in self.live.items() if not s["finished"])
-                if abortable and (
-                    self.abort_rng.random() < 0.05
-                    or (self.aborts == 0 and self.round >= rounds // 2)
-                ):
-                    request_id = self.abort_rng.choice(abortable)
-                    events = ts.ExecutionEvent()
-                    events.add_event(_event("Abort", request_id))
-                    self.scheduler.advance(events)
-                    del self.live[request_id]
-                    if self.role != ts.SchedulerConfig.Role.Fused:
-                        self.stopping.add(request_id)
-                    self.aborts += 1
-            if len(self.pending) > 1:
+            self.step(rounds)
+
+    def step(self, rounds: int) -> None:
+        """Round self.round of a run of `rounds`."""
+        if self.rng.random() < 0.3:
+            self.submit(self.rng.randrange(1, 4))
+        if self.remote or self.prefill_only:
+            self.peer(None)
+        plan = self.scheduler.next_execution_plan()
+        assert self.scheduler.host_cache_stats().retraction_stores.image_refused == 0
+        self.queue_acks(plan)
+        self.pending.append(plan)
+        if self.remote or self.prefill_only:
+            self.peer(plan)
+        if self.abort_rng is not None:
+            # One in twenty rounds, and from mid-run on until one is aborted.
+            abortable = sorted(r for r, s in self.live.items() if not s["finished"])
+            if abortable and (
+                self.abort_rng.random() < 0.05
+                or (self.aborts == 0 and self.round >= rounds // 2)
+            ):
+                request_id = self.abort_rng.choice(abortable)
+                events = ts.ExecutionEvent()
+                events.add_event(_event("Abort", request_id))
+                self.scheduler.advance(events)
+                del self.live[request_id]
+                if self.role != ts.SchedulerConfig.Role.Fused:
+                    self.stopping.add(request_id)
+                self.aborts += 1
+        if len(self.pending) > 1:
+            self.land(self.pending.pop(0))
+        if self.rng.random() < 0.1:
+            while self.pending:
                 self.land(self.pending.pop(0))
-            if self.rng.random() < 0.1:
-                while self.pending:
-                    self.land(self.pending.pop(0))
-            for request_id in [r for r, s in self.live.items() if s["finished"]]:
-                if self.scheduler.request_token_size(request_id) == -1:
-                    state = self.live.pop(request_id)
-                    # Every landed token but the last was consumed.
-                    sequence = state["prompt"] + state["out"][:-1]
-                    if len(self.done) < 20:
-                        self.done.append(sequence)
-                    else:
-                        self.done[self.rng.randrange(20)] = sequence
-            self.acknowledge(everything=False)
+        for request_id in [r for r, s in self.live.items() if s["finished"]]:
+            if self.scheduler.request_token_size(request_id) == -1:
+                state = self.live.pop(request_id)
+                # Every landed token but the last was consumed.
+                sequence = state["prompt"] + state["out"][:-1]
+                if len(self.done) < 20:
+                    self.done.append(sequence)
+                else:
+                    self.done[self.rng.randrange(20)] = sequence
+        self.acknowledge(everything=False)
 
 
 # Seed 42 on the D role reaches the sliding-window tail hit inside a prompt's

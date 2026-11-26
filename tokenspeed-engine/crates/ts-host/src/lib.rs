@@ -23,6 +23,9 @@
 //! The launching Python interpreter imports this extension and enters the
 //! scheduling loop on its main thread with the GIL released. The forward
 //! thread runs the Python data plane; completion queries acquire the GIL.
+//!
+//! The extension also serves a shared L2 pool's owner, which is no rank
+//! (`shared_l2_owner`).
 
 mod cache_events;
 mod data_plane;
@@ -31,6 +34,8 @@ mod host_spans;
 mod logging;
 mod pd;
 mod peer;
+mod shared_l2;
+mod shared_l2_owner;
 
 use std::{
     collections::HashSet,
@@ -42,10 +47,7 @@ use std::{
     time::Duration,
 };
 
-use pyo3::{
-    prelude::*,
-    types::{PyBytes, PyDict},
-};
+use pyo3::{prelude::*, types::PyBytes};
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
@@ -740,54 +742,22 @@ fn bootstrap_worker<'py>(
     outbox: &Bound<'py, PyAny>,
     host_spans: &Bound<'py, PyAny>,
     peer_outbox: &Bound<'py, PyAny>,
+    shared_l2_handle: &Bound<'py, PyAny>,
 ) -> PyResult<(Bound<'py, PyAny>, bool)> {
-    let py = runtime.py();
-    // Choose the supported arguments before the launch pipe is consumed.
-    let parameters = |function: &Bound<'py, PyAny>| {
-        py.import("inspect")?
-            .call_method1("signature", (function,))?
-            .getattr("parameters")
-    };
-    let prepare = match runtime.getattr("prepare_bootstrap") {
-        Ok(prepare) => prepare,
-        // Old Python still owns the launch pipe and understands weight protocol 2.
-        Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
-            let bootstrap = runtime.getattr("bootstrap")?;
-            let parameters = parameters(&bootstrap)?;
-            let worker = if parameters.contains("peer_outbox")? {
-                bootstrap.call1((
-                    control_fd,
-                    outbox,
-                    WEIGHT_UPDATE_PROTOCOL,
-                    host_spans,
-                    peer_outbox,
-                ))?
-            } else if parameters.contains("host_spans")? {
-                bootstrap.call1((control_fd, outbox, WEIGHT_UPDATE_PROTOCOL, host_spans))?
-            } else {
-                bootstrap.call1((control_fd, outbox, WEIGHT_UPDATE_PROTOCOL))?
-            };
-            return Ok((worker, false));
-        }
-        Err(error) => return Err(error),
-    };
-    // This entry point requires checked startup. Do not retry a failed call:
-    // it may already have consumed the launch pipe.
-    let options = PyDict::new(py);
-    options.set_item("validate_memory_protocol", true)?;
-    let prepared = prepare.call((control_fd,), Some(&options))?;
+    let prepared = runtime.call_method1("prepare_bootstrap", (control_fd,))?;
     let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
     let protocol = if replica_memory_transitions {
         WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
     } else {
         WEIGHT_UPDATE_PROTOCOL
     };
-    let start = start.bind(py);
-    let bootstrap = if parameters(start)?.contains("peer_outbox")? {
-        start.call1((outbox, protocol, host_spans, peer_outbox))?
-    } else {
-        start.call1((outbox, protocol, host_spans))?
-    };
+    let bootstrap = start.bind(runtime.py()).call1((
+        outbox,
+        protocol,
+        host_spans,
+        peer_outbox,
+        shared_l2_handle,
+    ))?;
     Ok((bootstrap, replica_memory_transitions))
 }
 
@@ -806,11 +776,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, peer_outbox, mode, replica_memory_transitions) =
+    let (bootstrap, outbox, peer_outbox, shared_l2_handle, mode, replica_memory_transitions) =
         Python::attach(|py| {
             let built = (|| {
                 let outbox = Bound::new(py, pd::Outbox::new())?;
                 let peer_outbox = Bound::new(py, peer::Outbox::new())?;
+                let shared_l2_handle = Bound::new(py, shared_l2::Handle::new())?;
                 let host_spans = Bound::new(py, host_spans::HostSpans)?;
                 let runtime = py.import("tokenspeed.runtime.engine.rust_host")?;
                 let (bootstrap, replica_memory_transitions) = bootstrap_worker(
@@ -819,12 +790,14 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                     outbox.as_any(),
                     host_spans.as_any(),
                     peer_outbox.as_any(),
+                    shared_l2_handle.as_any(),
                 )?;
                 let mode: String = bootstrap.getattr("mode")?.extract()?;
                 Ok((
                     bootstrap.unbind(),
                     outbox.unbind(),
                     peer_outbox.unbind(),
+                    shared_l2_handle.unbind(),
                     mode,
                     replica_memory_transitions,
                 ))
@@ -851,15 +824,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 let bootstrap = bootstrap.into_bound(py);
                 let outbox = outbox.into_bound(py);
                 let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
-                let peer_sharing = match bootstrap.getattr("peer_sharing") {
-                    Ok(settings) => peer::Settings::from_python(&settings)?,
-                    Err(error)
-                        if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) =>
-                    {
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
+                let peer_sharing =
+                    peer::Settings::from_python(&bootstrap.getattr("peer_sharing")?)?;
                 let python_config = bootstrap.getattr("config")?;
                 let metrics = Metrics::from_python(&python_config)?;
                 let exporter = metrics.exporter().map_err(|error| {
@@ -986,9 +952,18 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             .extract::<bool>(py)
     })
     .map_err(|error| Python::attach(|py| python_error(py, error)))?;
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams, cache_events, replay_retirement)
-            .map_err(HostError::DataPlane)?;
+    // With a shared L2 pool as the Host tier, the client the rank started
+    // when it joined the pool at device build is the loop's; the data plane
+    // keeps the handle, for the acknowledgments of the rank's loads.
+    let shared_l2_client = shared_l2_handle.get().take_client();
+    let data_plane = PythonDataPlane::start(
+        data_plane,
+        peers.streams,
+        cache_events,
+        replay_retirement,
+        shared_l2_handle,
+    )
+    .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -1129,6 +1104,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
+            shared_l2: shared_l2_client,
             disk_metrics,
             disk,
             peer,
@@ -1264,6 +1240,10 @@ fn cache_event_protocol() -> String {
 fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
     module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        shared_l2_owner::run_shared_l2_owner,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(cache_event_protocol, module)?)?;
     Ok(())
 }

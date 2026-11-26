@@ -22,6 +22,7 @@
 
 from collections.abc import Sequence
 
+from tokenspeed.runtime.cache.transfer.ops import RestoreOp, SnapshotOp
 from tokenspeed.runtime.engine.io_struct import UpdateWeightFromDiskReqInput
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.types import (
@@ -55,8 +56,18 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
         retirement_slots: Sequence[int] = (),
         retirement_id: int | None = None,
     ) -> ModelExecutionResult | None:
-        # A round can still touch KV storage when it has no model forward.
-        self._require_active_pools()
+        # Snapshots, PD slot setup and recurrent-state work also use model-owned
+        # state. Ordinary KV copies and page maintenance only need the cache pools.
+        if (
+            planned is not None
+            or retirement_slots
+            or execution_plan.remote_prefill is not None
+            or any(isinstance(op, (SnapshotOp, RestoreOp)) for op in cache_ops)
+            or any(len(pairs) for pairs in execution_plan.state_folds_arrays().values())
+        ):
+            self._require_active_pools()
+        else:
+            self._executor.model_runner.memory_saver_adapter.assert_cache_active()
         return super().execute(
             execution_plan,
             planned,

@@ -109,9 +109,9 @@ tokenspeed serve "$CHECKPOINT_A" \
 
 | Tag | Policy |
 | --- | --- |
-| `weights` | Parameters follow the explicit weight policy. Persistent executor inputs, runtime state, attention metadata and shared workspaces always use a separate CPU-backed pool under this same tag, including with parameter discard. |
-| `kv_cache` | Discard shared target/draft device KV; clear and synchronize on wake. |
-| `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also discards resident device KV. Graph-only wake keeps KV asleep. |
+| `weights` | Parameters follow the explicit weight policy. Forward inputs, model runtime state and model workspaces use a separate CPU-backed pool under this tag. |
+| `kv_cache` | Discard shared target/draft KV and clear it on wake. |
+| `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also discards resident device KV. Cache transfer tables and workspaces use a separate CPU-backed pool under this tag, including in eager mode. KV copies can continue when only weights sleep. If both KV and this tag sleep, wake this tag before or together with KV. |
 
 Persistent backup consumes pinned host memory and adds transfer time. HCCL
 communicators and their workspaces stay resident. On Atlas A3, the saver uses
@@ -173,23 +173,20 @@ failure after a weight transaction begins requires worker restart.
 
 The native host and Python runtime negotiate these control guarantees:
 
-| Protocol | Meaning | Startup address payload |
-| --- | --- | --- |
-| `WEIGHT_UPDATE_PROTOCOL` (v2) | Existing weight-load preflight, result agreement and commit; memory operations retain mainline drain and synchronization. | Address string |
-| `WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL` (v3) | v2 plus memory-domain agreement on release/resume requests, direction and tags, readiness/drain checks, and device-completion acknowledgements from every participating rank. | `(version, address)` tuple |
+| Protocol | Meaning |
+| --- | --- |
+| `WEIGHT_UPDATE_PROTOCOL` (v2) | Weight-load preflight, result agreement and commit. Memory operations use the usual drain and synchronization. |
+| `WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL` (v3) | Adds agreement on release/resume direction, tags and transition ID, readiness and drain checks, and device-completion acknowledgements from all participating ranks. |
 
-V3 extends v2's guarantees, but their startup formats cannot be mixed within
-one model instance. A partial device failure keeps the replica unavailable;
-v3 does not promise automatic rollback of every rank.
-
-This change includes v3 in the runtime and native host. Checked startup reads
-the Ascend adapter's protocol-integration capability
-without creating an allocator or initializing a device. CUDA, ROCm and disabled
-savers retain protocol 2. The Gloo address rendezvous rejects mixed protocols
-before the Rust mesh or READY; model and graph startup options must also agree.
+The Ascend saver selects v3. CUDA, ROCm and disabled savers use v2. Within an
+Ascend serving instance, ranks agree on the selected version over Gloo before
+saver-specific HCCL setup. Both versions exchange ordinary address strings
+when the native mesh starts. A partial transition failure keeps the replica
+unavailable.
 
 Send each participating ingress the same direction, canonical tags and optional
-single-string `transition_id` (`rid` on the direct wire). Use a fresh ID for each
+single-string `transition_id`. Direct-wire clients use the same field and may
+assign `rid` independently for each request. Use a fresh ID for each
 operation, or omit it for ordered calls. Success waits for every TP rank's device
 completion. A pre-device refusal changes no mappings. HCCL stays resident;
 communication release tags are rejected before any memory is released.
@@ -238,6 +235,8 @@ each model's inventory before all-rank commit.
 
 ## Validation coverage and limitations
 
+- The shared L2 pool registers device KV once for RDMA. TokenSpeed rejects
+  `--shared-l2-config` with `--enable-memory-saver` for either weight policy.
 - Memory Saver adds no model, attention, sampling or speculative-algorithm
   allowlist. Actual execution support remains with the existing runtime and
   kernels. Weight discard requires the existing complete-replacement and
@@ -246,11 +245,10 @@ each model's inventory before all-rank commit.
   Qwen3 and selected speculative configurations are test coverage, not startup
   eligibility. Other configurations, especially cross-host layouts, require
   their own qualification; removing a Saver gate does not implement a kernel.
-- Captured narrowed draft attention uses Triton lengths computed on device and
-  keeps overlap enabled. Do not force
-  `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_MHA_DECODE_WITH_KVCACHE=torch_npu_mha_decode_with_kvcache`
-  for this path: a narrowed query needs its causal KV frontier or absolute mask,
-  not the full verification KV length.
+- For fixed-width speculative verification, check the installed attention
+  backend's query-width support. The upstream native Ascend paged MHA decode
+  supports one query per request. Earlier multi-token MTP graph results used
+  separate attention and RoPE changes.
 - Complete target/draft SDK refresh used a synthetic Qwen3 MTP draft and test
   provider. Real TCP with CPU staging covered local TP2 and remote publisher/TP1;
   production providers, RDMA and native draft refresh require qualification.

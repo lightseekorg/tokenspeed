@@ -501,73 +501,36 @@ fn bootstrap_selects_the_memory_protocol_for_the_rank() {
                 let outbox = PyString::new(py, "outbox");
                 let spans = PyString::new(py, "host spans");
                 let peer = PyString::new(py, "peer");
-                // Exercise both startup paths before and after peer prefix sharing.
-                let legacy = c"def bootstrap(fd, outbox, protocol): return (fd, outbox, protocol)";
-                let legacy_profiled = c"def bootstrap(fd, outbox, protocol, host_spans=None): return (fd, outbox, protocol, host_spans)";
-                let prepared = c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)";
-                let legacy_peer = c"def bootstrap(fd, outbox, protocol, host_spans, peer_outbox): return (fd, outbox, protocol, host_spans, peer_outbox)";
-                let prepared_peer = c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans, peer_outbox: (fd, outbox, protocol, host_spans, peer_outbox)";
-                for (source, capability, profiled, has_peer) in [
-                    (legacy, false, false, false),
-                    (legacy_profiled, false, true, false),
-                    (legacy_peer, false, true, true),
-                    (prepared, false, true, false),
-                    (prepared, true, true, false),
-                    (prepared_peer, false, true, true),
-                    (prepared_peer, true, true, true),
-                ] {
-                    let module =
-                        PyModule::from_code(py, source, c"bootstrap_test.py", c"bootstrap_test")
-                            .unwrap();
-                    module
-                        .setattr("replica_memory_transitions", capability)
+                let shared = PyString::new(py, "shared L2");
+                let source = c"def prepare_bootstrap(fd):\n    return capability, lambda outbox, protocol, spans, peer, shared: (fd, outbox, protocol, spans, peer, shared)";
+                let module =
+                    PyModule::from_code(py, source, c"bootstrap_test.py", c"bootstrap_test")
                         .unwrap();
+                for capability in [false, true] {
+                    module.setattr("capability", capability).unwrap();
                     let (worker, enabled) = super::bootstrap_worker(
                         &module,
                         7,
                         outbox.as_any(),
                         spans.as_any(),
                         peer.as_any(),
+                        shared.as_any(),
                     )
                     .unwrap();
                     assert_eq!(enabled, capability);
-                    let protocol = if capability { 3 } else { 2 };
-                    if has_peer {
-                        assert_eq!(
-                            worker
-                                .extract::<(i32, String, u32, String, String)>()
-                                .unwrap(),
-                            (
-                                7,
-                                "outbox".to_owned(),
-                                protocol,
-                                "host spans".to_owned(),
-                                "peer".to_owned()
-                            ),
-                        );
-                    } else if profiled {
-                        assert_eq!(
-                            worker.extract::<(i32, String, u32, String)>().unwrap(),
-                            (7, "outbox".to_owned(), protocol, "host spans".to_owned()),
-                        );
-                    } else {
-                        assert_eq!(
-                            worker.extract::<(i32, String, u32)>().unwrap(),
-                            (7, "outbox".to_owned(), protocol),
-                        );
-                    }
-                }
-                for source in [
-                    c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    raise TypeError('prepare consumed the pipe')\ndef bootstrap(*args):\n    raise AssertionError('must not retry the consumed pipe')",
-                    c"def prepare_bootstrap(fd):\n    raise AssertionError('unchecked entry must not run')\ndef bootstrap(*args):\n    raise AssertionError('must not downgrade an incompatible prepare')",
-                ] {
-                    let module = PyModule::from_code(
-                        py, source, c"broken_bootstrap.py", c"broken_bootstrap",
-                    ).unwrap();
-                    let error = super::bootstrap_worker(
-                        &module, 7, outbox.as_any(), spans.as_any(), peer.as_any(),
-                    ).unwrap_err();
-                    assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+                    assert_eq!(
+                        worker
+                            .extract::<(i32, String, u32, String, String, String)>()
+                            .unwrap(),
+                        (
+                            7,
+                            "outbox".to_owned(),
+                            if capability { 3 } else { 2 },
+                            "host spans".to_owned(),
+                            "peer".to_owned(),
+                            "shared L2".to_owned()
+                        )
+                    );
                 }
             });
         },

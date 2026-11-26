@@ -92,12 +92,6 @@ CPU scheduler lengths are passed directly, without a device length readback.
 MLA decode partial packing reuses its compiled kernel across changing batch
 sizes and preserves empty-shard masks during Graph replay.
 
-Ascend paged MHA supports up to five query tokens per request for speculative
-verification. The fused attention and Triton decode registrations cover
-64- and 128-token pages.
-Qwen3 with fixed-width chain MTP and the default paged MHA route checks the
-registered verify widths before initializing the distributed process group.
-
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

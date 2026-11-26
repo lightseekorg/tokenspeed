@@ -1034,6 +1034,13 @@ impl Controls {
         if !not_released.is_empty() {
             return Err(format!("tags not released: {not_released:?}"));
         }
+        // On Ascend, the graph tag backs up the tables used to copy resident KV.
+        if self.released.iter().any(|tag| tag == "acl_graph")
+            && tags.iter().any(|tag| tag == "kv_cache")
+            && !tags.iter().any(|tag| tag == "acl_graph")
+        {
+            return Err("resume acl_graph before or together with kv_cache".to_owned());
+        }
         Ok(tags)
     }
 
@@ -1073,6 +1080,7 @@ mod tests {
 
     fn release(tags: Option<Vec<&str>>) -> ControlRequest {
         ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            transition_id: None,
             rid: None,
             http_worker_ipc: None,
             tags: tags.map(|tags| tags.into_iter().map(str::to_owned).collect()),
@@ -1508,6 +1516,7 @@ mod tests {
 
         let resume_memory = ControlRequest::ResumeMemoryOccupation(
             ts_wire::control::ResumeMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: None,

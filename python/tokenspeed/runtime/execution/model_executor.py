@@ -419,6 +419,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    acl_graph_memory_policy: str
     enable_dp_local_cuda_graph: bool
     prefix_granularity: int
     max_num_seqs: int
@@ -521,7 +522,6 @@ class ModelExecutorConfig:
     # The scheduler may give extend rows in-forward State checkpoints
     # (--enable-state-checkpoint-in-forward).
     state_checkpoint_in_forward: bool = False
-    acl_graph_memory_policy: str = ServerArgs.acl_graph_memory_policy
 
     @property
     def spec_draft_tree(self) -> bool:

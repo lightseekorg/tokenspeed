@@ -28,14 +28,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.engine.memory_protocol import (
-    gather_collective_addresses,
+    check_memory_protocol,
 )
 
 # CPU regressions use the runtime job's complete dependency environment.
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 
-def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
+def _rendezvous(rank, rendezvous, protocols):
     dist.init_process_group(
         "gloo",
         init_method=rendezvous,
@@ -44,32 +44,21 @@ def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
         timeout=timedelta(seconds=15),
     )
     try:
-        if rank in legacy_ranks:
-            # The old Python code passes the gathered objects to Rust as-is.
-            # The old host can only extract Vec<String> from that result.
-            gathered = [None] * len(protocols)
-            dist.all_gather_object(gathered, addresses[rank], group=dist.group.WORLD)
-            if 3 in protocols:
-                assert (3, addresses[protocols.index(3)]) in gathered
-            else:
-                assert gathered == list(addresses)
-        elif len(set(protocols)) > 1:
+        if len(set(protocols)) > 1:
             with pytest.raises(
                 RuntimeError,
                 match="Memory protocol mismatch before serving",
             ) as refused:
-                gather_collective_addresses(
+                check_memory_protocol(
                     dist.group.WORLD,
-                    addresses[rank],
                     replica_memory_transitions=protocols[rank] == 3,
                 )
             assert str(list(protocols)) in str(refused.value)
         else:
-            assert gather_collective_addresses(
+            check_memory_protocol(
                 dist.group.WORLD,
-                addresses[rank],
                 replica_memory_transitions=protocols[rank] == 3,
-            ) == list(addresses)
+            )
     finally:
         dist.destroy_process_group()
 
@@ -77,25 +66,11 @@ def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo"
 )
-@pytest.mark.parametrize(
-    ("protocols", "hosts", "legacy_ranks"),
-    [
-        pytest.param((2, 3), (1, 2), (), id="pp2-mixed-v2-ingress"),
-        pytest.param((3, 2), (1, 2), (), id="pp2-mixed-v3-ingress"),
-        pytest.param((2, 3), (1, 2), (0,), id="pp2-mixed-legacy-ingress"),
-        pytest.param((2, 2), (1, 2), (0,), id="pp2-legacy-compatible-v2"),
-        pytest.param((3, 3), (1, 2), (), id="pp2-all-v3"),
-    ],
-)
-def test_memory_protocol_startup_rendezvous(tmp_path, protocols, hosts, legacy_ranks):
-    # Distinct advertised hosts model one PP stage or one EP ingress per
-    # machine; only the existing Gloo rendezvous is needed for these tests.
-    addresses = tuple(
-        f"192.0.2.{host}:{7800 + rank}" for rank, host in enumerate(hosts)
-    )
+@pytest.mark.parametrize("protocols", [(2, 3), (3, 2), (2, 2), (3, 3)])
+def test_memory_protocol_startup_rendezvous(tmp_path, protocols):
     mp.spawn(
         _rendezvous,
-        args=((tmp_path / "rendezvous").as_uri(), protocols, addresses, legacy_ranks),
+        args=((tmp_path / "rendezvous").as_uri(), protocols),
         nprocs=len(protocols),
         join=True,
     )

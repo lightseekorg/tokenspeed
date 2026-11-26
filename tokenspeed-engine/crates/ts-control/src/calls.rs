@@ -71,7 +71,7 @@ use ts_wire::{
         PROFILE_STOP,
     },
     msgpack::Integer,
-    ControlRequest, StrOrList, Value,
+    ControlRequest, Value,
 };
 
 use crate::request::MAX_CACHE_SESSION_ID_BYTES;
@@ -312,14 +312,16 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
         }
         "release_memory_occupation" => {
             ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                rid: body.str_opt("transition_id")?.map(StrOrList::One),
+                rid: None,
+                transition_id: body.str_opt("transition_id")?,
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })
         }
         "resume_memory_occupation" => {
             ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: body.str_opt("transition_id")?.map(StrOrList::One),
+                rid: None,
+                transition_id: body.str_opt("transition_id")?,
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })

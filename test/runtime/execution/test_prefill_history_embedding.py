@@ -216,6 +216,7 @@ def _config():
         prefill_graph_max_tokens=32,
         prefill_graph_capture_sizes=[16, 32],
         disable_autotune=True,
+        acl_graph_memory_policy="discard",
     )
 
 

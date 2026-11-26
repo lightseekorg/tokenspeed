@@ -30,15 +30,20 @@ fn memory_operations_preserve_transition_ids_and_allow_legacy_calls() {
             } else {
                 Vec::new()
             };
-            let (tags, rid) = match rl(method, args).unwrap() {
-                ControlRequest::ReleaseMemoryOccupation(request) => (request.tags, request.rid),
-                ControlRequest::ResumeMemoryOccupation(request) => (request.tags, request.rid),
+            let (tags, rid, transition_id) = match rl(method, args).unwrap() {
+                ControlRequest::ReleaseMemoryOccupation(request) => {
+                    (request.tags, request.rid, request.transition_id)
+                }
+                ControlRequest::ResumeMemoryOccupation(request) => {
+                    (request.tags, request.rid, request.transition_id)
+                }
                 _ => panic!("a memory operation"),
             };
             assert_eq!(tags, supplied.then(|| vec!["kv_cache".to_owned()]));
+            assert!(rid.is_none());
             assert_eq!(
-                rid,
-                supplied.then(|| StrOrList::One("training-step-42".to_owned()))
+                transition_id.as_deref(),
+                supplied.then_some("training-step-42")
             );
         }
     }

@@ -174,6 +174,41 @@ public:
         return it != nodes_.end() && !leafWithin(it->second, leaf_distance_, static_cast<std::size_t>(tier), removed);
     }
 
+    // What another coordinator needs to observe a checkpoint this tree knows
+    // (a shared L2 pool's owner, which is sent it with the checkpoint's State
+    // block): its tokens, the chain hashes of its full pages, its tail and
+    // its publishing request's access epoch.
+    struct Checkpoint {
+        std::vector<std::int32_t> tokens;
+        std::vector<std::string> prefix_hashes;
+        std::optional<TailPublication> tail;
+        std::uint64_t access_epoch{0};
+
+        bool operator==(const Checkpoint&) const = default;
+    };
+    std::optional<Checkpoint> CheckpointOf(const ContentHash& hash) const {
+        const auto it = nodes_.find(hash);
+        if (it == nodes_.end()) {
+            return std::nullopt;
+        }
+        const Node& node = it->second;
+        const auto page = static_cast<std::size_t>(prefix_granularity_);
+        const std::size_t pages = node.full_prefix == nullptr ? 0 : static_cast<std::size_t>(node.full_prefix->depth);
+        Checkpoint checkpoint{.access_epoch = node.access_epoch};
+        checkpoint.tokens.resize(static_cast<std::size_t>(node.num_tokens));
+        checkpoint.prefix_hashes.resize(pages);
+        for (const PrefixSegment* segment = node.full_prefix; segment != nullptr; segment = segment->parent) {
+            const auto index = static_cast<std::size_t>(segment->depth - 1);
+            checkpoint.prefix_hashes[index] = segment->hash.ToString();
+            std::ranges::copy(segment->tokens, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(index * page));
+        }
+        std::ranges::copy(node.tail, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(pages * page));
+        if (!node.tail.empty()) {
+            checkpoint.tail = TailPublication{.tail_tokens = static_cast<std::int32_t>(node.tail.size()), .hash = hash};
+        }
+        return checkpoint;
+    }
+
     void Clear() {
         nodes_.clear();
         roots_.clear();

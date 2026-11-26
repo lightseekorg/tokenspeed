@@ -126,3 +126,55 @@ def test_runtime_owners_survive_memory_release(graph_policy):
         saver.resume()
         graph.reset()
         torch.npu.synchronize()
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_NPU_MEMORY_SAVER_TESTS") != "1",
+    reason="requires RUN_NPU_MEMORY_SAVER_TESTS=1 and an exclusively assigned NPU",
+)
+def test_moe_workspace_uses_ascend_pool(monkeypatch):
+    import torch
+
+    pytest.importorskip("torch_npu")
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    torch.npu.set_device(0)
+    monkeypatch.setitem(global_server_args_dict, "enable_memory_saver", True)
+    monkeypatch.setitem(global_server_args_dict, "device", "npu")
+    saver = TorchMemorySaverAdapter.create(enable=True, device="npu")
+
+    def prepare_input_buffers(plan, layer):
+        # Supply a minimal kernel plan with the same four-view factory as MegaMoE.
+        storage = torch.arange(32, dtype=torch.float32, device="npu").view(4, 8)
+        return lambda rows, capacity: tuple(row[:rows] for row in storage)
+
+    experts = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(experts)
+    experts.plan = {"prepare_input_buffers": prepare_input_buffers}
+    experts._input_buffer_factory = None
+    views = experts.input_buffers(4, 8)
+    ptr = views[0].untyped_storage().data_ptr()
+
+    def backing():
+        return next(
+            b
+            for b in saver.stats()["blocks"]
+            if 0 <= ptr - int(b["ptr"], 16) < b["aligned_bytes"]
+        )
+
+    expected = torch.stack([v.cpu() for v in views])
+    assert backing()["policy"] == "backup"
+    assert backing()["tag"] == "weights"
+    try:
+        saver.pause("weights")
+        assert not backing()["mapped"] and backing()["backup_valid"]
+        saver.resume("weights")
+        result = experts.input_buffers(4, 8)
+        assert result[0].untyped_storage().data_ptr() == ptr
+        torch.testing.assert_close(torch.stack([v.cpu() for v in result]), expected)
+    finally:
+        saver.resume("weights")

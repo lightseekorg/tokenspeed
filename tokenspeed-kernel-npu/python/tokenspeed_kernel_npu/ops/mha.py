@@ -179,31 +179,26 @@ def mha_decode_with_kvcache(
         sinks=sinks,
         return_lse=return_lse,
     )
+    if max_seqlen_q != 1:
+        raise NotImplementedError("Ascend MHA decode supports one query per request")
     if q_scale is not None or k_scale is not None or v_scale is not None:
         raise NotImplementedError("Ascend MHA does not support scaled FP8 cache")
 
     del max_seqlen_k, enable_pdl
     batch_size = cache_seqlens.shape[0]
-    # A verify query is a suffix of the KV cache. Align the causal mask to
-    # the end of that cache so each query only reads through its own token.
-    causal = max_seqlen_q > 1
     actual_seq_lengths_kv = (
-        [max_seqlen_q] * batch_size
-        if torch.npu.is_current_stream_capturing()
-        else cache_seqlens
+        [1] * batch_size if torch.npu.is_current_stream_capturing() else cache_seqlens
     )
     output, _ = torch_npu.npu_fused_infer_attention_score(
-        q.reshape(batch_size, max_seqlen_q, -1),
+        q.reshape(batch_size, 1, -1),
         k_cache.flatten(2),
         v_cache.flatten(2),
-        atten_mask=_causal_mask(q.device) if causal else None,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
         block_table=page_table,
         num_heads=q.shape[1],
         num_key_value_heads=k_cache.shape[2],
         scale=_scale(q, softmax_scale),
         input_layout="BSH",
-        sparse_mode=3 if causal else 0,
         block_size=k_cache.shape[1],
     )
     return output.reshape_as(q)

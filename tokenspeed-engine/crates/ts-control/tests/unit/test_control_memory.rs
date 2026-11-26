@@ -20,6 +20,7 @@
 
 fn wake_regions(tags: Option<Vec<String>>) -> ControlRequest {
     ControlRequest::ResumeMemoryOccupation(ts_wire::control::ResumeMemoryOccupationReqInput {
+        transition_id: None,
         rid: None,
         http_worker_ipc: None,
         tags,
@@ -204,6 +205,10 @@ fn graph_wake_preserves_the_backend_kv_sleeping_state() {
             successes(&controls.take_replies()),
             [("ReleaseMemoryOccupationReqOutput", true)]
         );
+        if graph == "acl_graph" {
+            assert!(controls.resume_tags(Some(&["kv_cache".into()])).is_err());
+            assert_eq!(controls.resume_tags(None).unwrap(), ["acl_graph", "kv_cache"]);
+        }
         for tag in if graph == "acl_graph" {
             vec![graph, "kv_cache"]
         } else {

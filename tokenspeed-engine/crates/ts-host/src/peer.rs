@@ -39,7 +39,7 @@ use ts_control::{
         landing::Timeouts,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        Peer, PeerFence, PeerListener, PeerSettings,
+        Peer, PeerFence, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_scheduler::Scheduler;
@@ -214,18 +214,11 @@ pub fn start(
         settings.peer.incarnation,
     )
     .map_err(|error| error.to_string())?;
-    if let Some((executor, disk_layout, ring, slot_bytes)) = disk.and_then(DiskTier::push_source) {
+    let push_source = disk.and_then(DiskTier::push_source);
+    if let Some((_, _, ref ring, _)) = push_source {
         engine
             .register(ring.address(), ring.size())
             .map_err(|error| error.to_string())?;
-        push.serve(PushSource {
-            executor,
-            disk_layout,
-            ring,
-            slot_bytes,
-            writer: Arc::new(EngineWriter(engine.clone())),
-        })
-        .map_err(|error| error.to_string())?;
     }
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
@@ -241,6 +234,16 @@ pub fn start(
         .map(|bytes| RankGeometry::decode(bytes))
         .collect::<Option<Vec<_>>>()
         .ok_or("a replica member's peer geometry does not decode")?;
+    if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
+        push.serve(PushSource {
+            executor,
+            disk_layout,
+            ring,
+            slot_bytes,
+            writer: Arc::new(EngineWriter(engine.clone())),
+        })
+        .map_err(|error| error.to_string())?;
+    }
     tracing::debug!(
         regions = ?settings
             .regions
@@ -254,9 +257,13 @@ pub fn start(
             .collect::<Vec<_>>(),
         "peer geometry"
     );
+    let progress = PeerProgress::for_replica(geometries.len(), &mut scheduler.lock())
+        .map_err(|error| error.to_string())?;
     // Replicas read only holders of the same namespace; a mismatch answers
     // as a miss, so the namespace is worth seeing in the log.
     tracing::info!(
+        ?progress,
+        members = geometries.len(),
         name = settings.peer.name,
         session = engine.session_id(),
         incarnation = settings.peer.incarnation,
@@ -280,12 +287,15 @@ pub fn start(
     };
     let peer = Peer::start(
         settings.peer,
+        progress,
         replica.index(),
         geometries,
         listener,
         scheduler,
-        Arc::new(EngineReader(engine)),
-        Arc::new(push),
+        PeerTransfers {
+            reader: Arc::new(EngineReader(engine)),
+            pusher: Arc::new(push),
+        },
     )
     .map_err(|error| error.to_string())?;
     // A second start would be a second peer; there is one per process.

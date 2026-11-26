@@ -868,7 +868,6 @@ def _bootstrap_args(*, device: str, memory_saver: bool, role: str) -> ServerArgs
     return args
 
 
-@pytest.mark.parametrize("checked_startup", [False, True])
 @pytest.mark.parametrize(
     "device,role,memory_saver,protocol,required",
     [
@@ -888,7 +887,7 @@ def _bootstrap_args(*, device: str, memory_saver: bool, role: str) -> ServerArgs
     ],
 )
 def test_host_protocol_and_capability_agree_before_device_build(
-    monkeypatch, checked_startup, device, role, memory_saver, protocol, required
+    monkeypatch, device, role, memory_saver, protocol, required
 ):
     from tokenspeed.runtime.engine import rust_host
     from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
@@ -906,7 +905,7 @@ def test_host_protocol_and_capability_agree_before_device_build(
         module.AscendMemorySaverAdapter = NpuSaver
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
-    expected = checked_startup and memory_saver and device == "npu" and role != "encode"
+    expected = memory_saver and device == "npu" and role != "encode"
     assert TorchMemorySaverAdapter.adapter_class(
         memory_saver, device=device
     ).supports_replica_memory_transitions is (device == "npu" and memory_saver)
@@ -925,16 +924,15 @@ def test_host_protocol_and_capability_agree_before_device_build(
             )
         )
         fd = os.dup(receiver.fileno())
-        if checked_startup:
-            capability, start = rust_host.prepare_bootstrap(
-                fd, validate_memory_protocol=True
+        capability, start = rust_host.prepare_bootstrap(fd)
+        assert capability is expected
+        build.assert_not_called()
+
+        def invoke():
+            return start(
+                None, protocol if protocol is not None else 0, None, None, None
             )
-            assert capability is expected
-            build.assert_not_called()
-            invoke = lambda: start(None, protocol if protocol is not None else 0, None)
-        else:
-            arguments = (fd, None) if protocol is None else (fd, None, protocol)
-            invoke = lambda: rust_host.bootstrap(*arguments)
+
         if required is not None:
             with pytest.raises(RuntimeError, match=f"protocol {required}"):
                 invoke()
@@ -945,10 +943,9 @@ def test_host_protocol_and_capability_agree_before_device_build(
                 assert build.call_args.kwargs["replica_memory_transitions"] is expected
 
 
-@pytest.mark.parametrize("checked_startup", [False, True])
 @pytest.mark.parametrize("has_peer_outbox", [False, True])
 def test_host_bootstrap_requires_peer_outbox_for_peer_prefix_sharing(
-    monkeypatch, checked_startup, has_peer_outbox
+    monkeypatch, has_peer_outbox
 ):
     from tokenspeed.runtime.engine import rust_host
 
@@ -962,22 +959,21 @@ def test_host_bootstrap_requires_peer_outbox_for_peer_prefix_sharing(
         peer_prefix_landing_tier="device",
     )
     peer_outbox = object() if has_peer_outbox else None
+    shared_l2_handle = object()
     receiver, sender = Pipe(duplex=True)
     with receiver, sender:
         sender.send((args, None, None))
         fd = os.dup(receiver.fileno())
-        if checked_startup:
-            capability, start = rust_host.prepare_bootstrap(
-                fd, validate_memory_protocol=True
-            )
-            assert not capability
-            build.assert_not_called()
-            invoke = lambda: start(None, 2, None, peer_outbox=peer_outbox)
-        else:
-            invoke = lambda: rust_host.bootstrap(fd, None, 2, peer_outbox=peer_outbox)
+        capability, start = rust_host.prepare_bootstrap(fd)
+        assert not capability
+        build.assert_not_called()
+
+        def invoke():
+            return start(None, 2, None, peer_outbox, shared_l2_handle)
+
         if has_peer_outbox:
             assert invoke() is built
-            assert build.call_args.args[-1] is peer_outbox
+            assert build.call_args.args[-2:] == (peer_outbox, shared_l2_handle)
         else:
             with pytest.raises(RuntimeError, match="--peer-prefix-port requires"):
                 invoke()

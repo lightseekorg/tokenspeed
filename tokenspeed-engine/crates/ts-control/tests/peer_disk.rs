@@ -42,7 +42,7 @@ use ts_control::{
         landing::Timeouts,
         push::{PageWriter, PushEndpoint, PushSource},
         read::Arena,
-        Peer, PeerListener, PeerSettings,
+        Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_disk::{Backend, ExecutorConfig, Memory};
@@ -90,7 +90,7 @@ fn interpreter() {
 /// A fused scheduler with peer sharing: the holder's with eight usable
 /// Device blocks over a write-back Host tier and a Disk tier, the reader's
 /// with a Device cache alone.
-fn scheduler(name: &str, holder: bool) -> Scheduler {
+fn scheduler(name: &str, incarnation: u64, holder: bool) -> Scheduler {
     interpreter();
     let tiers = if holder {
         format!(
@@ -105,7 +105,8 @@ fn scheduler(name: &str, holder: bool) -> Scheduler {
              cfg.disk_config = ts.DiskConfig(max_operations=4, max_blocks_per_operation=64,\n\
                                              max_host_blocks=4, max_write_host_blocks=2,\n\
                                              max_queued_cleanings=64, min_prefetch_tokens=1,\n\
-                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000)\n\
+                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000,\n\
+                                             min_clean_tokens=0, require_reuse_for_cleaning=False)\n\
              device_pages = {DEVICE_PAGES}",
             host_pages = HOST_BLOCKS + 1,
             disk_pages = DISK_BLOCKS + 1,
@@ -131,7 +132,7 @@ cfg.max_resident_requests = 8
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full", block_granularity={PAGE},
                                         total_pages=device_pages, attn_kind=ts.AttnKind.Full,
                                         transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
-cfg.peer_config = ts.PeerConfig(name="{name}", incarnation=1, max_leases=8,
+cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_leases=8,
                                 soft_pin_us=1_000_000, hard_pin_us=1_000_000,
                                 lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE},
                                 landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0,
@@ -217,10 +218,10 @@ impl Drop for ScratchFile {
     }
 }
 
-fn settings(name: &str) -> PeerSettings {
+fn settings(name: &str, incarnation: u64) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
-        incarnation: 1,
+        incarnation,
         deployment_id: "deployment".into(),
         weight_version: "v1".into(),
         timeouts: Timeouts {
@@ -250,9 +251,10 @@ struct Replica {
 
 impl Replica {
     fn start(holder: bool, arena: &Arena) -> Self {
+        let incarnation = if holder { 1 } else { 2 };
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let name = format!("127.0.0.1:{}", listener.port());
-        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 1).unwrap();
+        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", incarnation).unwrap();
         let disk = holder.then(|| {
             let dir = std::env::var_os("TS_DISK_TEST_DIR")
                 .map(PathBuf::from)
@@ -296,17 +298,20 @@ impl Replica {
             .unwrap();
             (tier, host, file)
         });
-        let scheduler = Arc::new(Mutex::new(scheduler(&name, holder)));
+        let scheduler = Arc::new(Mutex::new(scheduler(&name, incarnation, holder)));
         // The holder's Device pages are never read: its prefix is on Disk.
         let base = if holder { 1 << 30 } else { READER_BASE };
         let peer = Peer::start(
-            settings(&name),
+            settings(&name, incarnation),
+            PeerProgress::Coordinated,
             0,
             vec![geometry(base, push.name())],
             Some(listener),
             scheduler.clone(),
-            Arc::new(arena.clone()),
-            Arc::new(push),
+            PeerTransfers {
+                reader: Arc::new(arena.clone()),
+                pusher: Arc::new(push),
+            },
         )
         .unwrap();
         Self {

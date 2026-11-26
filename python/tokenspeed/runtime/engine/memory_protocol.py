@@ -22,7 +22,7 @@
 
 Protocol 2 agrees on weight-load prerequisites and commits. Protocol 3 keeps
 those guarantees and also coordinates memory transitions across the replica.
-Their address-gather envelopes differ, so ranks must select the same version.
+Ascend ranks must agree before starting saver-specific HCCL collectives.
 """
 
 import torch.distributed as dist
@@ -35,45 +35,24 @@ WEIGHT_UPDATE_PROTOCOL = 2
 WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL = 3
 
 
-def gather_collective_addresses(
+def check_memory_protocol(
     group: dist.ProcessGroup,
-    address: str,
     *,
     replica_memory_transitions: bool,
-) -> list[str]:
-    """Return the mesh addresses once every serving rank agrees on the protocol."""
+) -> None:
+    """Reject a mixed Ascend replica before a rank starts saver-specific work."""
+    if group.size() == 1:
+        return
     protocol = (
         WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
         if replica_memory_transitions
         else WEIGHT_UPDATE_PROTOCOL
     )
-    # Keep v2's address string. A legacy runtime also joins this Gloo gather,
-    # and its host rejects a v3 tuple when extracting the address string list.
-    local = (protocol, address) if replica_memory_transitions else address
-    gathered: list[object] = [None] * group.size()
-    dist.all_gather_object(gathered, local, group=group)
-
-    addresses = []
-    versions = []
-    for rank, entry in enumerate(gathered):
-        if isinstance(entry, str):
-            versions.append(WEIGHT_UPDATE_PROTOCOL)
-            addresses.append(entry)
-        elif (
-            isinstance(entry, tuple)
-            and len(entry) == 2
-            and isinstance(entry[0], int)
-            and isinstance(entry[1], str)
-        ):
-            version, peer_address = entry
-            versions.append(version)
-            addresses.append(peer_address)
-        else:
-            raise RuntimeError(f"Invalid mesh address from rank {rank}: {entry!r}")
+    versions = [None] * group.size()
+    dist.all_gather_object(versions, protocol, group=group)
     if any(version != protocol for version in versions):
         raise RuntimeError(
             "Memory protocol mismatch before serving. "
             f"Versions in rank order: {versions}. "
             "Use the same memory protocol on every serving rank."
         )
-    return addresses

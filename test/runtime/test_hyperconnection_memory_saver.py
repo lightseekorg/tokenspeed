@@ -76,7 +76,7 @@ def _check_mix_workspaces_survive_release(
     )
 
     global_server_args_dict["enable_memory_saver"] = True
-    saver = TorchMemorySaverAdapter.create(enable=True)
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
     # The executor registers the process's workspace region through the same call.
     register_workspace_region(saver)
     config = HyperConnectionConfig(

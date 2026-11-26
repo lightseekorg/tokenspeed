@@ -40,12 +40,8 @@ from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-    HybridLinearAttnBackend,
-)
 from tokenspeed.runtime.layers.attention.backends.paged import mha
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
-from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
@@ -60,16 +56,10 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def _backend(
-    *,
-    width=1,
-    is_draft=False,
-    block_decode=False,
-    page_size=16,
-    heads=(12, 2, 1),
-    backend_name="mha",
+    *, width=1, is_draft=False, block_decode=False, page_size=16, heads=(12, 2, 1)
 ):
     spec = MHAConfig(
-        backend_name=backend_name,
+        backend_name="mha",
         num_attention_heads=heads[0],
         num_kv_heads=heads[1],
         head_dim=128,
@@ -89,95 +79,6 @@ def _backend(
         components=(spec,),
     )
     return mha.MHAAttnBackend(config, spec, kernel_page_size=page_size)
-
-
-@pytest.mark.parametrize("width", [4, 5])
-def test_ascend_fia_update_reads_target_verify_metadata_for_partial_batch(width):
-    leaf = _backend(width=width)
-    runner = ForwardStepRunner.__new__(ForwardStepRunner)
-    runner.attn_backend = CacheGroupRouter(
-        lambda gid, grain: leaf,
-        is_draft=False,
-        spec_num_tokens=width,
-        device="cpu",
-        consumed_group_ids=None,
-    )
-    runner.attn_backend.set_cache_pool(
-        make_mha_pool_for_groups(
-            (
-                CacheGroupSpec(
-                    "full_attention", "full_history", 16, 1, replayable=False
-                ),
-            ),
-            device="cpu",
-        )
-    )
-    runner.attn_backend.init_cuda_graph_state(4, max_extend_tokens=0)
-    runner.draft_attn_backend = None
-    runner.max_tokens_per_req = width
-    hybrid_runner = ForwardStepRunner.__new__(ForwardStepRunner)
-    hybrid_runner.attn_backend = HybridLinearAttnBackend(
-        runner.attn_backend, MambaAttnBackend.__new__(MambaAttnBackend), [0]
-    )
-    slot_ids = torch.tensor([2, 5, 7, 0], dtype=torch.int32)
-    block_tables = {
-        "full_attention": torch.arange(1, 13, dtype=torch.int32).reshape(3, 4)
-    }
-
-    class Graph:
-        def update(self, *, cpu_update_input):
-            assert torch.is_inference_mode_enabled()
-            self.lengths = cpu_update_input
-
-    graph = Graph()
-    for active_lengths in ([width - 1, 17, width], [32, width, width - 2]):
-        # Batch three replays the batch-four graph with the raw sentinel of 1.
-        raw = [*active_lengths, 1]
-        seq_lens = torch.tensor(raw, dtype=torch.int32)
-        runner._prepare_decode_metadata(
-            4,
-            3,
-            slot_ids,
-            seq_lens,
-            ForwardMode.DECODE,
-            use_graph=True,
-            settle=lambda: None,
-            block_tables=block_tables,
-        )
-        expected = [max(length, width) for length in raw]
-        for replay in (runner, hybrid_runner):
-            replay._update_npu_graph(graph, seq_lens)
-            assert graph.lengths == [{"actual_seq_lengths_kv": expected}]
-        assert leaf.forward_decode_metadata.seq_lens.tolist() == expected
-        assert seq_lens.tolist() == raw
-
-
-@pytest.mark.parametrize(
-    "device,is_draft,backend_name,eager_solution,graph_solution",
-    [
-        ("npu", True, "mha", None, "triton"),
-        ("npu", True, "triton", "triton", "triton"),
-        ("npu", True, "fa3", "fa3", "fa3"),
-        ("npu", False, "mha", None, None),
-        ("cuda", True, "mha", None, None),
-        ("cuda", True, "fa3", "fa3", "fa3"),
-    ],
-)
-def test_native_mha_draft_decode_selects_triton_only_for_automatic_acl_graphs(
-    monkeypatch, device, is_draft, backend_name, eager_solution, graph_solution
-):
-    from tokenspeed.runtime.execution import forward_step
-
-    leaf = _backend(is_draft=is_draft, backend_name=backend_name)
-    leaf.device = device
-    assert leaf._decode_kernel_solution() == eager_solution
-
-    # Enforced eager startup can enable this flag to warm up collectives.
-    monkeypatch.setattr(forward_step, "_is_cuda_graph_phase", True)
-    assert leaf._decode_kernel_solution() == eager_solution
-
-    monkeypatch.setattr(forward_step, "_is_acl_graph_forward", True)
-    assert leaf._decode_kernel_solution() == graph_solution
 
 
 def _init(backend, *, lengths, queries, prefixes, mode, tables=None):
@@ -504,7 +405,9 @@ def _block_runtime():
     # wire_target's choice for a one-rank layout: the lookup is the input.
     drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
-    runner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    runner.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     runner.dp_local_graph = False
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
@@ -742,7 +645,7 @@ def _cached_attention_cpu(
     page_table,
     cache_seqlens,
     window_left,
-    **kwargs,
+    **kwargs
 ):
     """CPU stand-in for the unavailable GPU operation, using its public ABI.
 

@@ -113,6 +113,56 @@ The D role probes Device and Host history and receives missing data from
 its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+**A shared L2 pool is asked before admission, never by it.** With
+`shared_l2_config` the rank's Host tier is the proxy of one Host L2 pool that
+every rank of the prefill and fused instances shares (the decode role does
+not use one): an owner process keeps the pool's index
+(`SharedL2Pool`, the Host L2 code over pages it holds no bytes of) and
+provider processes its bytes. The main rule is three sentences:
+
+1. At the head of each scheduling round a rank sends the prefixes of
+   its newly arrived prompts to the pool's owner in one blocking call, and
+   applies the answers before it plans.
+2. A hit is admitted like a local Host L2 hit: Device pages are allocated,
+   the pages are read from the pool by RDMA behind the forward, and the
+   prompt computes only the tokens after the hit.
+3. Pages a forward completes are written to the pool once that forward has
+   landed; the owner registers them under the Host L2's retention rules, and
+   every rank's later lookups can hit them.
+
+The scheduler's part of each sentence follows. The loop's part, and the one
+list of the special cases with where each is handled, is the *Shared L2
+pool* entry of `event-loop.md`.
+
+- *Lookups.* `StartSharedL2Lookups()` hands the runtime each waiting prompt's
+  lookup once, and none for a prompt whose Device prefix already covers what
+  it may reuse. Before a plan the runtime asks the owner about all of them
+  in one request, waits for the reply and applies the answers
+  (`ApplySharedL2Answers`), each of which names its prompt by its request
+  id; a `Submitted` prompt is absent from forward candidates until its
+  lookup is settled, that is answered or turned out not to be needed
+  (`AdmissionResources::shared_l2_lookup_state`). A miss is an answer that
+  names no page, and its prompt computes.
+- *Hits.* An answer becomes proxy Host entries, each standing for a pool
+  page the owner pinned under the answer's ticket; from there admission,
+  junction cuts and load-back are the Host L2 code. The prompt's
+  pre-admission state holds the entries
+  (`AdmissionResources::shared_l2_hit_blocks`): dropping it lets them go,
+  while a load-back the admission started holds its sources until its ACK.
+  Each plan drops a ticket's proxy entries from its answer's last one back,
+  up to the first one a waiting prompt or a load-back still holds, and
+  releases the tickets left without an entry: an entry nothing
+  holds stays while a later one of its ticket is held, and the owner keeps
+  the ticket's pages pinned meanwhile.
+- *Writes.* Publications are written to the pool from the write-through
+  store queue (`TierTransferManager::StartSharedL2Writes`): at most
+  `max_writes_in_flight` writes of `max_keys_per_write` blocks are in
+  flight, and only those pin their Device sources, until the runtime reports
+  each one done; the rest wait as keys. A write carries each State
+  checkpoint among its blocks (its tokens, page hashes and tail), which the
+  owner's checkpoint retention ranks by. The runtime relays the plan's shared L2 ops (write, release,
+  touch) to its pool client and none blocks it.
+
 A first admission with no free request-pool row skips prefix matching; with
 prefix caching, the prompt was hashed when it was submitted. This is a slot
 constraint, not a KV capacity failure: it does not trigger retraction.
@@ -943,7 +993,9 @@ parents they leave return to the empty FIFO, and the admission is retried once
 in the same plan build. It runs only when all of these hold: the admission
 failed in its last variant, no other request holds pages, no forward result or
 PD transfer of the request is out, no load-back or pinned store is in flight
-(a retraction's two global gates, §2), and a dense layout of the blocks plus
+(a retraction's two global gates, §2), with a shared L2 pool no publication
+waits in the store queue for its write (the special cases of the *Shared L2
+pool* entry in `event-loop.md` say why), and a dense layout of the blocks plus
 the demand fits the pool bucket by bucket (`DenseLayoutParents`:
 `ParentsNeededForBucketsAndPairs`, the demand's copy-in pairs counted) —
 otherwise the shortfall is the bound's own and compacting would only churn.
