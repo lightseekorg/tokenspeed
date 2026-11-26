@@ -308,13 +308,15 @@ def _decode_kernel(
     WINDOW_LEFT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    MERGE_CHUNK: tl.constexpr,
     PPI: tl.constexpr,
     HAS_GATE: tl.constexpr,
     GATE_EPS: tl.constexpr,
 ):
     """Rows are (query position, head of the KV group) of one sequence and
     KV head; each split attends a run of pages and stores its normalized
-    partial and log-sum-exp. The split whose ticket arrives last merges them,
+    partial and log-sum-exp. A sequence uses at most ``num_splits`` splits of
+    at least PPI pages each; the split whose ticket arrives last merges them,
     applies the output gate, stores the output and re-arms the counter."""
     b = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -340,119 +342,178 @@ def _decode_kernel(
         row_lo = row_end * 0
     first_page = kv_lo // PAGE
     end_page = tl.cdiv(seq_len, PAGE)
-    per_split = tl.cdiv(end_page - first_page, num_splits)
-    p0 = first_page + split * per_split
-    p1 = tl.minimum(p0 + per_split, end_page)
+    # At least PPI pages a split: the launch sizes for the widest page table,
+    # and splits past this sequence's keys exit without arriving.
+    splits = tl.maximum(tl.minimum(num_splits, tl.cdiv(end_page - first_page, PPI)), 1)
+    if split < splits:
+        per_split = tl.cdiv(end_page - first_page, splits)
+        p0 = first_page + split * per_split
+        p1 = tl.minimum(p0 + per_split, end_page)
 
-    q = tl.load(
-        q_ptr + token[:, None] * (HQ * D) + head[:, None] * D + offs_d[None, :],
-        mask=row_ok[:, None],
-        other=0.0,
-    )
-    m_i = tl.zeros([BLOCK_M], tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, D], tl.float32)
-    offs_n = tl.arange(0, BLOCK_N)
-    row_end_split = tl.minimum(row_end, p1 * PAGE)
-    for pg in range(p0, p1, PPI):
-        pages = pg + offs_n // PAGE
-        phys = tl.load(page_table + b * pt_stride + pages, mask=pages < p1, other=0).to(
-            tl.int64
+        q = tl.load(
+            q_ptr + token[:, None] * (HQ * D) + head[:, None] * D + offs_d[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
         )
-        m_i, l_i, acc = _attend_tile(
-            q,
-            m_i,
-            l_i,
-            acc,
-            kd_ptr,
-            ks_ptr,
-            vd_ptr,
-            vs_ptr,
-            phys,
-            pg * PAGE + offs_n,
-            row_lo,
-            row_end_split,
-            sm_scale_log2,
-            PAGE_STRIDE,
-            kvh,
-            H,
-            D,
-            PAGE,
-            BLOCK_N,
-        )
-    has = l_i > 0
-    o = tl.where(has[:, None], acc / tl.where(has, l_i, 1.0)[:, None], 0.0)
-    lse = tl.where(has, m_i + tl.log2(tl.where(has, l_i, 1.0)), float("-inf"))
-    base = (token * HQ + head) * MAX_SPLITS
-    tl.store(
-        mid_o + (base + split)[:, None] * D + offs_d[None, :], o, mask=row_ok[:, None]
-    )
-    tl.store(mid_lse + base + split, lse, mask=row_ok)
-    counter = counters + b * H + kvh
-    tl.debug_barrier()
-    ticket = tl.atomic_add(counter, 1, sem="acq_rel", scope="gpu")
-    # The barrier orders partial reads after the acquire, however the atomic lowers.
-    tl.debug_barrier()
-    if ticket == num_splits - 1:
-        m_run = lse
-        weight = tl.where(has, 1.0, 0.0)
-        merged = o
-        for s in range(num_splits):
-            other = row_ok & (s != split)
-            lse_s = tl.load(
-                mid_lse + base + s,
-                mask=other,
-                other=float("-inf"),
-                cache_modifier=".cg",
+        m_i = tl.zeros([BLOCK_M], tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        acc = tl.zeros([BLOCK_M, D], tl.float32)
+        offs_n = tl.arange(0, BLOCK_N)
+        row_end_split = tl.minimum(row_end, p1 * PAGE)
+        for pg in range(p0, p1, PPI):
+            pages = pg + offs_n // PAGE
+            phys = tl.load(
+                page_table + b * pt_stride + pages, mask=pages < p1, other=0
+            ).to(tl.int64)
+            m_i, l_i, acc = _attend_tile(
+                q,
+                m_i,
+                l_i,
+                acc,
+                kd_ptr,
+                ks_ptr,
+                vd_ptr,
+                vs_ptr,
+                phys,
+                pg * PAGE + offs_n,
+                row_lo,
+                row_end_split,
+                sm_scale_log2,
+                PAGE_STRIDE,
+                kvh,
+                H,
+                D,
+                PAGE,
+                BLOCK_N,
             )
-            o_s = tl.load(
-                mid_o + (base + s)[:, None] * D + offs_d[None, :],
-                mask=other[:, None],
-                other=0.0,
-                cache_modifier=".cg",
-            )
-            m_new = tl.maximum(m_run, lse_s)
-            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-            alpha = tl.exp2(m_run - m_safe)
-            beta = tl.exp2(lse_s - m_safe)
-            merged = merged * alpha[:, None] + o_s * beta[:, None]
-            weight = weight * alpha + beta
-            m_run = m_new
-        merged = merged / tl.where(weight > 0, weight, 1.0)[:, None]
-        dtype = out_ptr.dtype.element_ty
-        if HAS_GATE:
-            # store_rmsnorm_gated: weightless RMSNorm of the rounded output
-            # head, times the sigmoid of the gate.
-            merged = merged.to(dtype).to(tl.float32)
-            gate = tl.load(
-                gate_ptr
-                + token[:, None] * gate_stride
-                + head[:, None] * D
-                + offs_d[None, :],
-                mask=row_ok[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            variance = tl.sum(merged * merged, axis=1) / D
-            merged = (
-                merged
-                * tl.rsqrt(variance[:, None] + GATE_EPS)
-                * (1 / (1 + tl.exp(-gate)))
-            )
+        has = l_i > 0
+        o = tl.where(has[:, None], acc / tl.where(has, l_i, 1.0)[:, None], 0.0)
+        lse = tl.where(has, m_i + tl.log2(tl.where(has, l_i, 1.0)), float("-inf"))
+        base = (token * HQ + head) * MAX_SPLITS
         tl.store(
-            out_ptr + token[:, None] * (HQ * D) + head[:, None] * D + offs_d[None, :],
-            merged.to(dtype),
+            mid_o + (base + split)[:, None] * D + offs_d[None, :],
+            o,
             mask=row_ok[:, None],
         )
-        tl.atomic_xchg(counter, 0, sem="release", scope="gpu")
+        tl.store(mid_lse + base + split, lse, mask=row_ok)
+        counter = counters + b * H + kvh
+        tl.debug_barrier()
+        ticket = tl.atomic_add(counter, 1, sem="acq_rel", scope="gpu")
+        # The barrier orders partial reads after the acquire, however the
+        # atomic lowers.
+        tl.debug_barrier()
+        if ticket == splits - 1:
+            _merge_splits(
+                mid_o,
+                mid_lse,
+                out_ptr,
+                gate_ptr,
+                gate_stride,
+                base,
+                token,
+                head,
+                row_ok,
+                splits,
+                HQ,
+                D,
+                BLOCK_M,
+                MAX_SPLITS,
+                MERGE_CHUNK,
+                HAS_GATE,
+                GATE_EPS,
+            )
+            tl.atomic_xchg(counter, 0, sem="release", scope="gpu")
 
 
-# Pages per inner iteration, software pipeline stages, target programs per
-# CU and the smallest row block; tuned on MI355X at 16/2 heads, head_dim 64.
-_DECODE_PAGES_PER_ITER = 4
+@triton.jit
+def _merge_splits(
+    mid_o,
+    mid_lse,
+    out_ptr,
+    gate_ptr,
+    gate_stride,
+    base,
+    token,
+    head,
+    row_ok,
+    splits,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    MAX_SPLITS: tl.constexpr,
+    MERGE_CHUNK: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    GATE_EPS: tl.constexpr,
+):
+    """Online log-sum-exp merge of the split partials, MERGE_CHUNK splits a
+    step, then the optional output gate and the store."""
+    offs_d = tl.arange(0, D)
+    m_run = tl.zeros([BLOCK_M], tl.float32) - float("inf")
+    weight = tl.zeros([BLOCK_M], tl.float32)
+    merged = tl.zeros([BLOCK_M, D], tl.float32)
+    for c in range(0, splits, MERGE_CHUNK):
+        offs_c = c + tl.arange(0, MERGE_CHUNK)
+        live = row_ok[:, None] & (offs_c < splits)[None, :]
+        lse_c = tl.load(
+            mid_lse + base[:, None] + offs_c[None, :],
+            mask=live,
+            other=float("-inf"),
+            cache_modifier=".cg",
+        )
+        o_c = tl.load(
+            mid_o
+            + ((base[:, None] + offs_c[None, :]) * D)[:, :, None]
+            + offs_d[None, None, :],
+            mask=live[:, :, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        m_new = tl.maximum(m_run, tl.max(lse_c, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_run - m_safe)
+        w_c = tl.exp2(lse_c - m_safe[:, None])
+        weight = weight * alpha + tl.sum(w_c, 1)
+        merged = merged * alpha[:, None] + tl.sum(o_c * w_c[:, :, None], 1)
+        m_run = m_new
+    merged = merged / tl.where(weight > 0, weight, 1.0)[:, None]
+    dtype = out_ptr.dtype.element_ty
+    if HAS_GATE:
+        # store_rmsnorm_gated: weightless RMSNorm of the rounded output head,
+        # times the sigmoid of the gate.
+        merged = merged.to(dtype).to(tl.float32)
+        gate = tl.load(
+            gate_ptr
+            + token[:, None] * gate_stride
+            + head[:, None] * D
+            + offs_d[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        variance = tl.sum(merged * merged, axis=1) / D
+        merged = (
+            merged * tl.rsqrt(variance[:, None] + GATE_EPS) * (1 / (1 + tl.exp(-gate)))
+        )
+    tl.store(
+        out_ptr + token[:, None] * (HQ * D) + head[:, None] * D + offs_d[None, :],
+        merged.to(dtype),
+        mask=row_ok[:, None],
+    )
+
+
+# Pages per inner iteration (fewer while there are fewer than
+# _DECODE_WIDE_PROGRAMS (sequence, KV head) programs), software pipeline
+# stages, warps, target programs per CU, the smallest row block, the split cap
+# and the splits the merge reads a step; tuned on MI355X at 16/2 heads,
+# head_dim 64.
+_DECODE_PAGES_PER_ITER = 8
+_DECODE_PAGES_PER_ITER_NARROW = 4
+_DECODE_WIDE_PROGRAMS = 16
 _DECODE_STAGES = 2
-_DECODE_SPLIT_MULT = 4
+_DECODE_WARPS = 8
+_DECODE_SPLIT_MULT = 1
 _DECODE_MIN_BLOCK_M = 16
-_DECODE_MAX_SPLITS = 64
+_DECODE_MAX_SPLITS = 32
+_DECODE_MERGE_CHUNK = 4
 
 # Split partials and the arrival counters, per (device, geometry); the
 # counters start at zero and the last split of each (sequence, KV head)
@@ -539,9 +600,12 @@ def mxfp4_decode(
     max_pages = page_table.shape[1]
     if window_left >= 0:
         max_pages = min(max_pages, triton.cdiv(window_left + 1, page_size) + 1)
-    num_splits = _decode_splits(
-        batch * kv_heads, triton.cdiv(max_pages, _DECODE_PAGES_PER_ITER), q.device
+    ppi = (
+        _DECODE_PAGES_PER_ITER
+        if batch * kv_heads >= _DECODE_WIDE_PROGRAMS
+        else _DECODE_PAGES_PER_ITER_NARROW
     )
+    num_splits = _decode_splits(batch * kv_heads, triton.cdiv(max_pages, ppi), q.device)
     max_splits = triton.next_power_of_2(num_splits)
     mid_o, mid_lse, counters = _decode_workspace(
         tokens, q_heads, head_dim, max_splits, batch * kv_heads, q.device
@@ -573,10 +637,11 @@ def mxfp4_decode(
         WINDOW_LEFT=window_left,
         BLOCK_M=max(_DECODE_MIN_BLOCK_M, triton.next_power_of_2(rows)),
         MAX_SPLITS=max_splits,
-        PPI=_DECODE_PAGES_PER_ITER,
+        MERGE_CHUNK=min(_DECODE_MERGE_CHUNK, max_splits),
+        PPI=ppi,
         HAS_GATE=gate is not None,
         GATE_EPS=gate_eps,
-        num_warps=4,
+        num_warps=_DECODE_WARPS,
         num_stages=_DECODE_STAGES,
         waves_per_eu=2,
     )

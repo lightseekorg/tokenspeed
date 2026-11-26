@@ -142,6 +142,35 @@ def test_decode(bs, ctx, qlen, window_left, gated):
         assert _rel(out, ref) < 1e-2, f"call {call}"
 
 
+@pytest.mark.parametrize(
+    "bs,ctx,window_left",
+    [(2, 70, -1), (2, 700, -1), (2, 5000, 2047), (16, 3000, -1), (16, 5000, 2047)],
+)
+def test_decode_over_a_wide_page_table(bs, ctx, window_left):
+    """A CUDA-graph page table is as wide as the longest sequence; a short
+    sequence uses fewer splits than the launch."""
+    qlen = 2
+    cache = _Cache(bs, ctx, seed=ctx)
+    page_table = torch.zeros(bs, 2080, dtype=torch.int32, device="cuda")
+    page_table[:, : cache.page_table.shape[1]] = cache.page_table
+    seqlens = torch.linspace(ctx // 2 + 1, ctx, bs, device="cuda").to(torch.int32)
+    for _ in range(2):
+        q = torch.randn(bs * qlen, HQ, D, device="cuda", dtype=BF16)
+        out = mxfp4_decode(
+            q,
+            *cache.planes,
+            page_table,
+            seqlens,
+            window_left=window_left,
+            qlen=qlen,
+            softmax_scale=D**-0.5,
+            gate=None,
+            gate_eps=1e-6,
+        )
+        ref = _attend(q, cache, seqlens, [qlen] * bs, window_left, D**-0.5)
+        assert _rel(out, ref) < 1e-2
+
+
 def test_long_decode_splits_the_keys():
     assert _decode_splits(2 * H, 32, torch.device("cuda")) > 1
 
