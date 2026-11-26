@@ -138,6 +138,7 @@ def _case(
     retain_input=True,
     stamp_capacity=None,
     arena_step=2,
+    ended_rows=None,
     gate_error=None,
     state_dtype=torch.float32,
     output_norm=False,
@@ -437,6 +438,28 @@ def _case(
         commit = resolve_kda_batched_retained_commit(
             original.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
         )
+        # Each row's request slot follows the record slots. With
+        # ``ended_rows`` the request slots lie past the record slots and every
+        # flag at a record slot's index is set. The listed rows' requests end
+        # in the final round. Any other row reads an unset flag, or (the last
+        # row) lies outside the flags: its request did not end.
+        request_slots = slots.to(torch.int32)
+        request_stopped = torch.zeros(slot_count, device="cuda", dtype=torch.bool)
+        ended = set()
+        if ended_rows is not None:
+            if round_idx == len(accepted_rounds) - 1:
+                ended = set(ended_rows)
+            request_slots = slot_count + torch.arange(
+                batch, device="cuda", dtype=torch.int32
+            )
+            if batch - 1 not in ended_rows:
+                request_slots[-1:] = slot_count + batch
+            request_stopped = torch.zeros(
+                slot_count + batch, device="cuda", dtype=torch.bool
+            )
+            request_stopped[:slot_count] = True
+            for r in ended:
+                request_stopped[slot_count + r] = True
         commit_kwargs = dict(
             descriptors=torch.tensor(
                 [
@@ -469,10 +492,8 @@ def _case(
             retained_key=history.key[:, None],
             retained_decay=history.decay[:, None],
             replay_length=history.length,
-            # No request ends in these rounds.
-            request_stopped=torch.zeros(
-                history.length.shape[0], device="cuda", dtype=torch.bool
-            ),
+            request_slots=request_slots,
+            request_stopped=request_stopped,
             request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
             draft_token_num=width,
             history_capacity=capacity,
@@ -509,7 +530,12 @@ def _case(
             take = max(0, min(accepted, lengths[0]))
             assert int(length[int(slots[0]), 0]) == old + take
             return history
-        torch.testing.assert_close(state, dense_before, atol=0, rtol=0)
+        # Only an ended request's live page gains a dense state.
+        unchanged = torch.ones(state.shape[0], device="cuda", dtype=torch.bool)
+        unchanged[[int(live[r]) for r in ended]] = False
+        torch.testing.assert_close(
+            state[unchanged], dense_before[unchanged], atol=0, rtol=0
+        )
         for actual, before_record in zip((u, key, decay), records_before):
             torch.testing.assert_close(actual, before_record, atol=0, rtol=0)
         for r, n in enumerate(lengths):
@@ -524,7 +550,6 @@ def _case(
             dst = int(live[r])
             # The prepare folded a row shorter than the window as a full one.
             old = 0 if old_lengths[r] > capacity - width else old_lengths[r]
-            assert int(length[int(slots[r]), 0]) == old + take
             if take:
                 expected[r] = references[r][1][take - 1]
             if take:
@@ -533,6 +558,15 @@ def _case(
                     (expected_conv[r], mixed[begin : begin + take].T), -1
                 )[:, -3:]
             torch.testing.assert_close(conv[dst], expected_conv[r], atol=0, rtol=0)
+            if r in ended:
+                # The records through this round's acceptance fold into the
+                # live page, and the record slot's count clears.
+                assert int(length[int(slots[r]), 0]) == 0
+                torch.testing.assert_close(
+                    state[dst].float(), expected[r], atol=4e-6, rtol=4e-5
+                )
+                continue
+            assert int(length[int(slots[r]), 0]) == old + take
             torch.testing.assert_close(
                 _reconstruct(state[dst], history, int(slots[r]), old + take),
                 expected[r],
@@ -547,7 +581,11 @@ def _case(
 
 
 def test_retained_smoke_gfx1250():
-    """One head, one row, T1 and two rounds; bounded simulator coverage."""
+    """One head, one row, T1 and two rounds; bounded simulator coverage.
+
+    The row's request ends in the second round. Its stop flag is read at a
+    request slot other than its record slot, whose flag is set throughout.
+    """
     _case(
         8,
         1,
@@ -557,6 +595,7 @@ def test_retained_smoke_gfx1250():
         strided=False,
         projected=False,
         lower_bound=-5.0,
+        ended_rows=(0,),
     )
 
 
@@ -599,6 +638,29 @@ def test_retained_rounds(
         strided=strided,
         projected=projected,
         lower_bound=lower_bound,
+    )
+
+
+@pytest.mark.parametrize("width", [1, 4])
+def test_retained_commit_reads_stop_flags_by_request_slot(width):
+    """Stop flags are read at request slots, never at record slots.
+
+    Every flag at a record slot's index is set. In the final round row 1's
+    request ends: its records fold into its live page and its count clears.
+    Rows 0 and 2 read an unset flag or lie outside the flags, so they advance
+    their counts and fold nothing.
+    """
+    _case(
+        8,
+        width,
+        2,
+        (1, width),
+        cross_page=False,
+        strided=True,
+        projected=False,
+        lower_bound=None,
+        lengths=[width, 1, width],
+        ended_rows=(1,),
     )
 
 

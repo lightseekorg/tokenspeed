@@ -741,6 +741,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         req_pool_indices: torch.Tensor,
     ) -> None:
+        # The workspace copy keeps the live rows' request rows for the
+        # round's prepare, verify and commit. A padded graph replay passes a
+        # step-runner temporary here, so nothing keeps a view of it.
         self._record_slots[:bs].copy_(req_pool_indices[:bs])
         if self._replay_record_metadata is not None and seq_lens.is_cuda:
             from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
@@ -773,22 +776,29 @@ class KdaAttnBackend(CapacityPrefillBackend):
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
-        super().refresh_decode_metadata(
-            bs,
-            actual_bs,
-            req_pool_indices,
-            seq_lens,
-            forward_mode=forward_mode,
-            block_tables=block_tables,
-            num_extends=num_extends,
-            for_graph_replay=for_graph_replay,
-            **kwargs,
-        )
-        # The refresh arms the commit exactly when it prepared a verify round
-        # over live rows: an eager or graph decode, or a mixed forward's
-        # decode rows. Each reaches its verify only after this point.
-        if self._verify_commit_ctx is not None:
-            self._prepare_retained_history(bs, actual_bs)
+        try:
+            super().refresh_decode_metadata(
+                bs,
+                actual_bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode=forward_mode,
+                block_tables=block_tables,
+                num_extends=num_extends,
+                for_graph_replay=for_graph_replay,
+                **kwargs,
+            )
+            # The refresh arms the commit exactly when it prepared a verify
+            # round over live rows: an eager or graph decode, or a mixed
+            # forward's decode rows. Each reaches its verify only after this
+            # point.
+            if self._verify_commit_ctx is not None:
+                self._prepare_retained_history(bs, actual_bs)
+        except BaseException:
+            # A refresh that fails after arming leaves no commit armed over a
+            # partly prepared round.
+            self._verify_commit_ctx = None
+            raise
 
     def _prepare_retained_history(self, bs: int, actual_bs: int) -> None:
         """Ready every layer's retained history for this round's verify.
@@ -1067,7 +1077,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
+        try:
+            self._commit_verified_round(ctx, accepted_length)
+        finally:
+            # Disarm even when the page resolve, a check or a launch raises.
+            self._verify_commit_ctx = None
 
+    def _commit_verified_round(self, ctx: tuple, accepted_length: torch.Tensor) -> None:
         _, draft_token_num, _ = ctx
         bs = accepted_length.shape[0]
         group_ids = list(self._replay_group_ids or self._state_groups())
@@ -1093,6 +1109,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 "(bind_request_stop_flags)"
             )
         correction, key, decay = self._retained_records.unbind(2)
+        # Until records move to execution slots, a row's record slot is its
+        # request row, so one workspace view feeds both: the stop flags read
+        # no step-runner temporary, at no copy or launch.
+        record_slots = self._record_slots[:bs]
         # The planner clamps each active interval to at least one accepted
         # token. Every layer of a request shares its count, which the second
         # launch writes once from the round's acceptance. A request that
@@ -1108,7 +1128,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             write_indices=write_stack,
             accepted_length=steps,
             query_start_loc=metadata.query_start_loc[: bs + 1],
-            record_slots=self._record_slots[:bs],
+            record_slots=record_slots,
             record_slot_count=self._record_slot_count,
             record_metadata=self._replay_record_metadata[:bs],
             record_stamps=self._replay_record_stamps,
@@ -1116,6 +1136,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_key=key,
             retained_decay=decay,
             replay_length=self._replay_length,
+            request_slots=record_slots,
             request_stopped=self._request_stopped,
             request_ends=self._request_ends[first_row : first_row + bs],
             draft_token_num=draft_token_num,
@@ -1127,8 +1148,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             conv_state_dtype=conv.dtype,
             recurrent_state_dtype=state.dtype,
         )
-        self._verify_commit_ctx = None
-        return
 
     @override
     def _prefill_scan(

@@ -887,6 +887,8 @@ def prepare_kda_retained_commit(
         field[:, None].expand(-1, layers, -1, -1, -1)
         for field in (first.correction, first.key, first.decay)
     ]
+    # Serving passes the rows' request-pool rows, a contiguous INT32 vector.
+    request_slots = torch.arange(batch, device="cuda", dtype=torch.int32)
     request_stopped = torch.zeros(batch, device="cuda", dtype=torch.bool)
     # No request ends in the measured rounds, so no row's report changes.
     request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
@@ -914,6 +916,7 @@ def prepare_kda_retained_commit(
             retained_key=records[1],
             retained_decay=records[2],
             replay_length=replay_length,
+            request_slots=request_slots,
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,

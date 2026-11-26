@@ -760,9 +760,12 @@ def resolve_kda_batched_retained_commit(
     every layer shares. The first launch reads it in every layer; a second,
     one-dimensional launch then writes each carried request's count once: the
     records its verify read (the count, or 0 when it lies outside
-    [0, history_capacity - draft_token_num]) plus its acceptance. A request
-    whose slot is set in request_stopped ended in this forward: its accepted
-    records are folded into its live page and its count is cleared. One
+    [0, history_capacity - draft_token_num]) plus its acceptance.
+    request_slots gives each row's request slot, which may differ from its
+    record slot: a row whose request slot is set in request_stopped ended in
+    this forward, and its accepted records are folded into its live page and
+    its record slot's count is cleared. A request slot outside
+    [0, request_stopped.numel()) reads as not ended. One
     whose commit a layer that carried it rejects instead is reported as
     ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's per-row
     ``apply_stop_conditions`` report. Metadata and all pointers remain stable

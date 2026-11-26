@@ -58,12 +58,17 @@ count once, to `eff` plus the acceptance, with no scratch and no cross-program
 reduction. A row is carried when its source and live pages lie in the pool in
 a State group a launched layer lists, its record slot is resident and its
 window is non-empty; a row no layer carries (graph padding, a masked overlap
-row, a row paged only in groups no launched layer lists) keeps its count. A
-request whose slot is set in `request_stopped` ended in this forward: the
-convolution launch also folds its records, through this round's acceptance,
-into its live page (each program of a row takes some heads), and the count
-launch clears its count instead of advancing it. Other commits read no record
-and write no dense state. Stamp-ring capacity is independent of
+row, a row paged only in groups no launched layer lists) keeps its count.
+Stop flags are per request row while records and counts are per record slot,
+so the commit takes both vectors: `request_slots` (INT32 or INT64
+`[requests]`, any stride) gives each row's request slot in `request_stopped`,
+and `record_slots` its records and count. A request slot outside
+`[0, request_stopped.numel())` reads as not ended. A request whose request
+slot is set in `request_stopped` ended in this forward: the convolution launch
+also folds its records, through this round's acceptance, into its live page
+(each program of a row takes some heads), and the count launch clears its
+record slot's count instead of advancing it. Other commits read no record and
+write no dense state. Stamp-ring capacity is independent of
 retained-history capacity.
 Padding rows (a page at or below 0, or one past the checkpoint pool) leave all
 pages and counts untouched.

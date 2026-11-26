@@ -370,6 +370,7 @@ _BATCHED_RUNTIME_ARGUMENTS = [
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
+    "request_slot_stride",
     "length_stride",
     "stamp_slots",
     "stamp_capacity",
@@ -377,11 +378,12 @@ _BATCHED_RUNTIME_ARGUMENTS = [
 ]
 
 
-# A mixed forward's decode rows follow its extend rows in the stop report, so
-# request_ends may start at any INT32 element.
+# A mixed forward's decode rows follow its extend rows in the stop report and
+# in the request rows, so request_ends and request_slots may start at any
+# element.
 @triton.jit(
     do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS,
-    do_not_specialize_on_alignment=["request_ends"],
+    do_not_specialize_on_alignment=["request_slots", "request_ends"],
 )
 def retained_batched_conv_kernel(
     descriptors,
@@ -393,6 +395,7 @@ def retained_batched_conv_kernel(
     record_slots,
     metadata,
     stamps,
+    request_slots,
     request_stopped,
     replay_length,
     request_ends,
@@ -405,6 +408,7 @@ def retained_batched_conv_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
+    request_slot_stride,
     length_stride,
     stamp_strides,
     stamp_slots,
@@ -460,6 +464,9 @@ def retained_batched_conv_kernel(
             WINDOW,
         )
     )
+    # Stop flags are per request row, records and counts per record slot.
+    # Issued ahead of the window so its latency overlaps the window's loads.
+    request_slot = tl.load(request_slots + row * request_slot_stride).to(tl.int64)
     if not valid:
         # A request that ended in this forward keeps records outside its live
         # page; its finish must not publish that page. The stop conditions
@@ -496,9 +503,12 @@ def retained_batched_conv_kernel(
     tl.store(ptr + 2 * tap_stride, h2, mask=mask)
     # The request ended in this forward: its live page becomes a dense
     # checkpoint others may read. The publish launch clears the count after
-    # every program of this one has folded its heads.
+    # every program of this one has folded its heads. A request row outside
+    # the stop flags reads as not ended.
     if tl.load(
-        request_stopped + record_slot, mask=record_slot < stopped_count, other=0
+        request_stopped + request_slot,
+        mask=(request_slot >= 0) & (request_slot < stopped_count),
+        other=0,
     ):
         retained_fold_ended_request(
             descriptors,
@@ -532,9 +542,12 @@ def retained_batched_conv_kernel(
         "query_stride",
         "record_slot_stride",
         "record_slot_count",
+        "request_slot_stride",
         "length_stride",
         "stopped_count",
-    ]
+    ],
+    # A mixed forward's decode rows follow its extend rows in the request rows.
+    do_not_specialize_on_alignment=["request_slots"],
 )
 def retained_batched_publish_kernel(
     descriptors,
@@ -544,6 +557,7 @@ def retained_batched_publish_kernel(
     accepted,
     starts,
     record_slots,
+    request_slots,
     request_stopped,
     replay_length,
     batch,
@@ -557,6 +571,7 @@ def retained_batched_publish_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
+    request_slot_stride,
     length_stride,
     stopped_count,
     CAPACITY: tl.constexpr,
@@ -567,12 +582,14 @@ def retained_batched_publish_kernel(
 
     A row the commit carries -- its source and live pages lie in the pool in
     a state group one of the ``layers`` launched layers lists, its record
-    slot is resident and its window is non-empty -- sets its slot's count to
-    the records its verify read plus the round's acceptance, or to 0 when its
-    request ended in this forward (the commit folded its records into its
-    live page). Other rows (graph padding, masked overlap rows, rows paged
-    only in groups no launched layer lists) leave every count alone. Real
-    rows have distinct slots, so no two programs write the same count.
+    slot is resident and its window is non-empty -- sets its record slot's
+    count to the records its verify read plus the round's acceptance, or to 0
+    when its request ended in this forward (the commit folded its records
+    into its live page). The stop flag is read at the row's request slot; one
+    outside the flags reads as not ended. Other rows (graph padding, masked
+    overlap rows, rows paged only in groups no launched layer lists) leave
+    every count alone. Real rows have distinct record slots, so no two
+    programs write the same count.
     """
     lanes = tl.arange(0, BLOCK)
     row = tl.program_id(0).to(tl.int64) * BLOCK + lanes
@@ -587,6 +604,9 @@ def retained_batched_publish_kernel(
     )
     record_slot = tl.load(
         record_slots + row * record_slot_stride, mask=in_batch, other=-1
+    ).to(tl.int64)
+    request_slot = tl.load(
+        request_slots + row * request_slot_stride, mask=in_batch, other=-1
     ).to(tl.int64)
     paged = tl.zeros([BLOCK], dtype=tl.int32)
     for group in range(group_count):
@@ -631,8 +651,8 @@ def retained_batched_publish_kernel(
     old = tl.load(replay_length + record_slot * length_stride, mask=carried, other=0)
     old = tl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
     stopped = tl.load(
-        request_stopped + record_slot,
-        mask=carried & (record_slot < stopped_count),
+        request_stopped + request_slot,
+        mask=carried & (request_slot >= 0) & (request_slot < stopped_count),
         other=0,
     )
     tl.store(

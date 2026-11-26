@@ -182,13 +182,24 @@ def _fold(base, records, slot, layer, count):
     return state
 
 
-def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.float32):
+def _commit_case(
+    window,
+    *,
+    stale=False,
+    stopped_slots=(),
+    state_dtype=torch.float32,
+    request_slots=(1, 3, 0, -1),
+    request_slot_dtype=torch.int32,
+):
     """Three layers in two State groups commit four rows; row 3 is padding.
 
-    Every layer of a request shares its count: the rows' slots hold 2, the
-    records their verify read, and slot 2, which has no row, holds 7. The
+    Every layer of a request shares its count: the rows' record slots hold 2,
+    the records their verify read, and slot 2, which has no row, holds 7. The
     commit writes each row's count once, from that and its acceptance. With
     ``stale``, layer 1 rejects row 1's commit and leaves its window alone.
+    ``stopped_slots`` are the request slots set in the five stop flags, and
+    ``request_slots`` the rows' request slots (by default their record
+    slots); a request slot outside the flags reads as not ended.
     """
     heads, dim, channels, layers, capacity = 2, 128, 768, 3, 8
     reads = torch.tensor(
@@ -237,12 +248,14 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
             torch.rand(shape, device="cuda") * 0.2 + 0.7,
         )
     )
-    # One more flag than request slots; slot 2 ends without a row here.
+    # One more flag than record slots; slot 2 ends without a row here.
     request_stopped = torch.zeros(5, device="cuda", dtype=torch.bool)
     request_stopped[list(stopped_slots)] = True
+    # A row's request ended when its request slot's flag is set.
+    ended = [0 <= slot < 5 and slot in stopped_slots for slot in request_slots]
     # Each row's report as the stop conditions leave it.
     request_ends = torch.tensor(
-        [REQUEST_ENDED if slot in stopped_slots else 0 for slot in (1, 3, 0, -1)],
+        [REQUEST_ENDED if end else 0 for end in ended],
         device="cuda",
         dtype=torch.int32,
     )
@@ -252,7 +265,7 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
     expected_length = length.clone()
     for row in range(3):
         slot = int(record_slots[row])
-        expected_length[slot] = 0 if slot in stopped_slots else 2 + int(accepted[row])
+        expected_length[slot] = 0 if ended[row] else 2 + int(accepted[row])
     originals, convs, states, descriptors = [], [], [], []
     expected_convs, expected_states = [], []
     for layer in range(layers):
@@ -277,10 +290,9 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
             expected_conv[target] = torch.cat(
                 (conv[source], qkv[start : start + take].float().T), dim=-1
             )[:, -3:]
-            slot = int(record_slots[row])
-            if slot in stopped_slots:
+            if ended[row]:
                 expected_state[target] = _fold(
-                    state[target], records, slot, layer, 2 + take
+                    state[target], records, int(record_slots[row]), layer, 2 + take
                 )
         descriptors.append(
             [
@@ -315,6 +327,10 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         retained_key=records[1],
         retained_decay=records[2],
         replay_length=length,
+        # Serving passes the rows' request-pool rows, a contiguous INT32 vector.
+        request_slots=torch.tensor(
+            request_slots, device="cuda", dtype=request_slot_dtype
+        ),
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=window,
@@ -391,6 +407,73 @@ def test_batched_retained_commit_folds_ended_requests(window, stale, state_dtype
     )
     for state, expected_state in zip(states, expected_states):
         torch.testing.assert_close(state, expected_state, **tolerance)
+
+
+@pytest.mark.parametrize("window", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_batched_retained_commit_reads_stop_flags_by_request_slot(window, dtype):
+    """Stop flags follow request slots; records and counts follow record slots.
+
+    Rows 0-2 hold record slots 1, 3 and 0 and request slots 4, 1 and one
+    outside the five flags; request slots 0, 1 and 3 ended. Row 1's request
+    ended: its record slot 3's records fold into its live page and that count
+    clears. Row 0's request did not end, though its record slot 1 is row 1's
+    ended request slot, and row 2's out-of-range request slot reads as not
+    ended, though its record slot 0 is an ended request slot: both advance
+    their counts and fold nothing. Padding row 3's request slot 3 ended, but
+    no layer carries the row. The request slots are a strided view.
+    """
+    far = 2**32 if dtype == torch.int64 else 2**31 - 1
+    tolerance = dict(atol=2e-6, rtol=2e-6)
+    for outside in (-1, 5, far):
+        args, keepalive, actual, expected = _commit_case(
+            window,
+            stopped_slots=(0, 1, 3),
+            request_slots=(4, 1, outside, 3),
+            request_slot_dtype=dtype,
+        )
+        slots = args["request_slots"]
+        args["request_slots"] = torch.stack((slots, slots), 1)[:, 0]
+        assert args["request_slots"].stride(0) == 2
+        states_before = [state.clone() for state in actual[2]]
+        _resolve_commit()(**args)
+        assert args["request_ends"].tolist() == [0, REQUEST_ENDED, 0, REQUEST_ENDED]
+        convs, length, states = actual
+        expected_convs, expected_length, expected_states = expected
+        for conv, expected_conv in zip(convs, expected_convs):
+            torch.testing.assert_close(conv, expected_conv, atol=0, rtol=0)
+        torch.testing.assert_close(length, expected_length, atol=0, rtol=0)
+        assert length[:, 0].tolist() == [2 + window, 2, 7, 0]
+        for layer, (state, expected_state) in enumerate(zip(states, expected_states)):
+            torch.testing.assert_close(state, expected_state, **tolerance)
+            group = int(args["group_indices"][layer])
+            # Only row 1's live page changed.
+            for row in (0, 2):
+                target = int(args["write_indices"][group, row])
+                torch.testing.assert_close(
+                    state[target], states_before[layer][target], atol=0, rtol=0
+                )
+            target = int(args["write_indices"][group, 1])
+            assert not torch.equal(state[target], states_before[layer][target])
+
+
+def test_batched_retained_commit_validates_request_slots():
+    """A request slot vector of the wrong shape, dtype or device launches
+    nothing; one per row of any stride is accepted."""
+    args, keepalive, actual, _ = _commit_case(4)
+    commit = _resolve_commit()
+    length_before = actual[1].clone()
+    slots = args["request_slots"]
+    for bad, match in (
+        (slots[:3], "one record and request slot per request"),
+        (slots[None], "one record and request slot per request"),
+        (slots.float(), "must be integer tensors"),
+        (slots.bool(), "must be integer tensors"),
+        (slots.cpu(), "must share a device"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            commit(**dict(args, request_slots=bad))
+    torch.testing.assert_close(actual[1], length_before, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("count", [-1, 8 - 4 + 1, 8, 9])
@@ -827,7 +910,13 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
     # report: their contiguous view starts one INT32 past a 16-byte boundary.
     ends = torch.zeros(5, device="cuda", dtype=torch.int32)[1:]
     assert ends.is_contiguous() and ends.data_ptr() % 16 != 0
-    offset = dict(args, request_ends=ends)
+    # So do their request rows.
+    rows = torch.zeros(5, device="cuda", dtype=torch.int32)[1:]
+    rows.copy_(args["request_slots"])
+    assert rows.data_ptr() % 16 != 0
+    offset = dict(args, request_ends=ends, request_slots=rows)
+    slots = args["request_slots"]
+    strided = dict(args, request_slots=torch.stack((slots, slots), 1)[:, 0])
     shorter = dict(
         args,
         read_indices=args["read_indices"][:, :2],
@@ -837,12 +926,14 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
         record_slots=args["record_slots"][:2],
         record_metadata=args["record_metadata"][:2],
         record_stamps=torch.full((3, 5, 11, 2), -1, device="cuda", dtype=torch.int64),
+        request_slots=args["request_slots"][:2],
         request_ends=args["request_ends"][:2],
     )
     with assert_no_triton_compile(
         kernels.retained_batched_conv_kernel, kernels.retained_batched_publish_kernel
     ):
         commit(**offset)
+        commit(**strided)
         commit(**shorter)
         # Serving packs each [groups, batch] page table contiguously at the
         # start of its buffer, so its row stride is the batch size: 1,
@@ -867,6 +958,7 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
                     record_metadata=torch.full(
                         (batch, 3), -1, device="cuda", dtype=torch.int64
                     ),
+                    request_slots=torch.zeros(batch, device="cuda", dtype=torch.int32),
                     request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
                 )
             )
