@@ -20,6 +20,7 @@
 
 //! Per-member exact pin and close votes for versioned source offers.
 use super::{
+    push::PagePusher,
     registered::Replica,
     v1::{put_pages, Closure, Digest, Disposition, Generation, Key, Message, Offer},
 };
@@ -128,7 +129,13 @@ impl Offers {
     pub fn has(&self, key: &Key) -> bool {
         self.records.contains_key(key)
     }
-    pub fn expire(&mut self, now: i64, retirement_bound_ms: u32, s: &mut Scheduler) -> Vec<Vote> {
+    pub fn expire(
+        &mut self,
+        now: i64,
+        retirement_bound_ms: u32,
+        s: &mut Scheduler,
+        pusher: &dyn PagePusher,
+    ) -> Vec<Vote> {
         let due: Vec<_> = self
             .records
             .iter()
@@ -141,7 +148,7 @@ impl Offers {
             .collect();
         let mut votes = Vec::new();
         for (key, id, d) in due {
-            let (_, vote) = self.close(&key, id, d, s, now);
+            let (_, vote) = self.close(&key, id, d, s, pusher, now);
             votes.extend(vote);
         }
         self.records
@@ -301,6 +308,7 @@ impl Offers {
         k: &Key,
         o: &Offer,
         s: &mut Scheduler,
+        pusher: &dyn PagePusher,
         now: i64,
     ) -> (Option<Message>, Option<Vote>) {
         let no = || {
@@ -326,6 +334,12 @@ impl Offers {
                 r.until = now.saturating_add(2_000_000);
                 r.held = self.device_pin_gate.allows(&r.checkpoint.pages)
                     && s.pin_peer_offer(&r.checkpoint, now).unwrap_or(false);
+                if r.held {
+                    // Authorize this offer on the holder's push endpoint before
+                    // voting PINNED so every member is ready before Grant leaves
+                    // rank 0. Refused or closed offers revoke it before unpinning.
+                    pusher.activate_offer(k.holder.incarnation, r.offer.id);
+                }
                 (
                     None,
                     Some(Vote {
@@ -347,6 +361,7 @@ impl Offers {
         id: u64,
         d: Disposition,
         s: &mut Scheduler,
+        pusher: &dyn PagePusher,
         now: i64,
     ) -> (Option<Message>, Option<Vote>) {
         let ack = |c| (Some(Message::Ack(k.clone(), id, d, c)), None);
@@ -379,11 +394,18 @@ impl Offers {
             _ => (),
         }
         r.phase = Phase::Closing(d);
-        r.until = now.saturating_add(1_000_000);
         r.votes.fill(None);
-        let ok = !r.held
-            || s.close_peer_offer(&r.checkpoint.lease, now)
-                .unwrap_or(false);
+        // Fence new Disk pushes and cancel any in-flight pushes for this offer
+        // BEFORE releasing scheduler pins. Keep Disk blocks pinned (vote 0)
+        // until every in-flight NVMe read and RDMA write for this offer has
+        // truly drained. Keep `r.until` identical across all ranks; when any
+        // rank votes 0, `vote()` shortens `r.until` uniformly for a fast retry.
+        let drained = pusher.cancel_offer(k.holder.incarnation, id);
+        r.until = now.saturating_add(1_000_000);
+        let ok = drained
+            && (!r.held
+                || s.close_peer_offer(&r.checkpoint.lease, now)
+                    .unwrap_or(false));
         if ok {
             r.held = false;
         }
@@ -430,6 +452,13 @@ impl Offers {
                 r.phase = Phase::Closed(d);
                 r.until = now.saturating_add(60_000_000);
                 Some(Message::Ack(v.key.clone(), v.offer, d, Closure::Closed))
+            }
+            Phase::Closing(_) => {
+                // At least one member is still draining Disk pushes or retrying
+                // scheduler unpin; pull the collective retry deadline in uniformly
+                // on every member using shared round time `now`.
+                r.until = r.until.min(now.saturating_add(50_000));
+                None
             }
             _ => None,
         }

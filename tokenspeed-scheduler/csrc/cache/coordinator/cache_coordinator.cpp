@@ -488,9 +488,10 @@ CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& prob
     if (out.num_tokens == 0) {
         return out;
     }
-    // The Device's hits are claimed only when it resumes at all, as Admit
-    // claims them; the Host suffix's follow them in the table.
-    const bool device_claims = probe.device.num_common_tokens > 0;
+    // Claim every Device hit populated by the probe, including a Device-resident
+    // State checkpoint or tail paired with a Host KV suffix (split_tokens == 0);
+    // the Host suffix's hits follow them in the table.
+    const bool device_claims = !probe.device.per_group.empty();
     out.access_epoch = history_.IssueAccessEpoch();
     AcquiredPrefix acquired = acquirePrefix(std::move(probe), out.access_epoch);
     const auto exported = [&](std::size_t i, std::int32_t slot, CacheTier tier, CacheBlockRef block) {

@@ -886,10 +886,12 @@ PrefixProber::PrefixListing PrefixProber::ListPrefix(const PrefixProbe& probe) c
         return out;
     }
     // The same blocks at the same slots as CacheCoordinator::ExportPrefix:
-    // the Device's full pages then its tail, from slot 0, when it resumes at
-    // all; the Host suffix's full pages from its floor, then its tail, after
-    // them; a State group's one checkpoint, the Device's first.
-    const bool device_claims = probe.device.num_common_tokens > 0;
+    // the Device's full pages then its tail, from slot 0, whenever Device
+    // claims anything (including a Device-resident State checkpoint or tail
+    // paired with a Host KV suffix when split_tokens == 0); the Host suffix's
+    // full pages from its floor, then its tail, after them; a State group's
+    // one checkpoint, the Device's first.
+    const bool device_claims = !probe.device.per_group.empty();
     const bool host_claims = store_.HostPool() != nullptr && !probe.host.per_group.empty();
     const std::span<const std::vector<CacheKey>> group_keys = *probe.group_keys;
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {

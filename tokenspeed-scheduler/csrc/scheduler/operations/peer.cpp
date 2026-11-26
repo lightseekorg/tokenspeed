@@ -199,6 +199,10 @@ void Scheduler::recordPeerDispatch(Request& request) {
     request.peer_dispatch_sample.reset();
 }
 
+void Scheduler::handleEvent(const cache::PeerTargetRetired& event) {
+    RetirePeerTarget(event.lease);
+}
+
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     if (config_.peer_config && config_.peer_config->versioned_shards) {
         auto attempt = peer_target_attempts_.find(event.request_id);

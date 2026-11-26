@@ -29,18 +29,23 @@ endpoint. A holder that cannot push Disk truncates lookups to its Device/Host
 prefix instead of returning a full miss; a holder that can push Disk answers
 lookups with any mix of Device, Host, and Disk pages, pinning every listed block
 across all tiers under its offer ticket. Each reader member plans one-sided
-READs for Device/Host pages and holder-pushed spans (tagged with the offer id)
-for Disk pages through `PeerReadPlan::plan`, running both concurrently without
-occupying local read-worker threads while waiting on Disk pushes. When a Disk
-push is cancelled and the holder does not confirm within a short grace window,
-the reader coordinates an early `FetchFrozen` fallback while retrying `Cancel`
-in the background on its push dispatcher; a late `Cancelled`/`Done` reply cleanly
-unfreezes the landing via `TargetRetired` and sends `RELEASE(Abort)`, whereas an
-RDMA write error or push worker panic reports `Unknown` retirement and leaves
-both endpoints frozen (`frozen_targets`, `frozen_blocks`, and `frozen_landings`
-metrics expose frozen landings). Closing or expiring an offer on the holder also
-cancels in-flight pushes and fences late pushes tagged with that offer id. Every
-reader's local 30-second monotonic submission window starts before it votes
+READs for Device/Host pages and holder-pushed spans (tagged with the holder's
+`(incarnation, offer_id)` via wire frame `P`) for Disk pages through
+`PeerReadPlan::plan`, running both concurrently without occupying local
+read-worker threads while waiting on Disk pushes. Each holder member authorizes
+an offer's id on its push endpoint once pinned and rejects pushes for inactive
+or mismatched-incarnation offers before touching NVMe. When a Disk push is
+cancelled and the holder does not confirm within a short grace window, the
+reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
+the background on its push dispatcher for a bounded retry budget; a late
+`Cancelled`/`Done` reply cleanly unfreezes the landing via `TargetRetired` and
+sends `RELEASE(Abort)`, whereas retry-budget expiry, an RDMA write error, or a
+push worker panic reports `Unknown` retirement and leaves both endpoints frozen
+(`frozen_targets`, `frozen_blocks`, and `frozen_landings` metrics expose frozen
+landings). Closing or expiring an offer on the holder revokes its push
+authorization, cancels in-flight pushes, and waits for them to drain before
+releasing Disk block pins. Every reader's local 30-second monotonic submission
+window starts before it votes
 READY; workers check the same deadline at each READ batch and clamp Disk push
 budgets to the remaining window. The holder starts its own 30-second interval at
 GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.

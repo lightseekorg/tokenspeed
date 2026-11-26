@@ -1021,6 +1021,7 @@ mod tests {
             vec![PushTarget {
                 endpoint: "holder:7200".into(),
                 session: "reader".into(),
+                holder_incarnation: 1,
                 offer_id: 1,
                 items: vec![PushItem {
                     group: 0,
@@ -1186,6 +1187,7 @@ mod tests {
                 vec![PushTarget {
                     endpoint: "holder:7200".into(),
                     session: "reader".into(),
+                    holder_incarnation: 1,
                     offer_id: 1,
                     items: vec![PushItem {
                         group: 0,

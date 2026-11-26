@@ -83,6 +83,7 @@ pub(super) struct Attempt {
     retire_wait: bool,
     invalid: bool,
     frozen: bool,
+    granted: bool,
 }
 
 fn event(kind: PeerEventKind, f: &PeerFetchView, end: i32) -> PeerEventView {
@@ -118,6 +119,7 @@ impl Attempt {
             retire_wait: false,
             invalid: false,
             frozen: false,
+            granted: false,
         }
     }
     /// Once all DMA is retired and the business deadline has passed, only the
@@ -264,6 +266,7 @@ impl Attempt {
                                 Some(PushTarget {
                                     endpoint: src.members[i].geometry.push.clone()?,
                                     session: local_member.geometry.session.clone(),
+                                    holder_incarnation: k.holder.incarnation,
                                     offer_id: o.id,
                                     items,
                                 })
@@ -424,6 +427,7 @@ impl Attempt {
             self.seal();
             return None;
         }
+        self.granted = true;
         self.phase = Phase::Reading;
         self.deadline = now.saturating_add(30_000_000);
         None
@@ -462,7 +466,7 @@ impl Attempt {
             self.seal();
         }
         if self.phase == Phase::Reading {
-            if now >= self.deadline || self.invalid {
+            if self.granted && (now >= self.deadline || self.invalid) {
                 self.seal();
                 self.freeze(round);
             }
@@ -756,5 +760,43 @@ mod verification {
             release,
             Some(Message::Release(key, offer.id, Disposition::Abort))
         );
+    }
+
+    #[test]
+    fn planning_or_pin_timeout_and_invalidate_do_not_freeze_before_grant() {
+        for pre_grant_phase in [Phase::Planning, Phase::Pin] {
+            let (mut a, _, _) = granted_candidate();
+            a.phase = pre_grant_phase;
+            a.granted = false;
+            a.deadline = 100;
+            let mut round = PeerRound::default();
+            // Simulate timeout before Grant ever arrived -> must abort cleanly, not freeze.
+            a.tick(None, None, Duration::from_secs(1), 200, &mut round);
+            assert!(!a.frozen, "pre-grant timeout must not mark attempt frozen");
+            assert!(
+                !round
+                    .events
+                    .iter()
+                    .any(|e| e.kind == PeerEventKind::FetchFrozen),
+                "pre-grant timeout must not emit FetchFrozen"
+            );
+
+            // Simulate invalidate() before Grant -> must also not freeze.
+            let (mut b, _, _) = granted_candidate();
+            b.phase = pre_grant_phase;
+            b.granted = false;
+            b.deadline = 10_000;
+            b.invalidate();
+            let mut round2 = PeerRound::default();
+            b.tick(None, None, Duration::from_secs(1), 200, &mut round2);
+            assert!(!b.frozen, "pre-grant invalidate must not freeze");
+            assert!(
+                !round2
+                    .events
+                    .iter()
+                    .any(|e| e.kind == PeerEventKind::FetchFrozen),
+                "pre-grant invalidate must not emit FetchFrozen"
+            );
+        }
     }
 }

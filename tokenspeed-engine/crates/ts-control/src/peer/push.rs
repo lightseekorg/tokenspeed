@@ -57,6 +57,9 @@ use crate::{
 };
 
 const PUSH: &[u8] = b"p";
+/// Offer-bound v2 push frame carrying `(holder_incarnation, offer_id)` for v1
+/// readers; legacy readers continue speaking `PUSH` without wire breakage.
+const PUSH_V2: &[u8] = b"P";
 const CANCEL: &[u8] = b"c";
 const DONE: &[u8] = b"d";
 const CANCELLED: &[u8] = b"x";
@@ -72,6 +75,11 @@ const CANCEL_FREEZE_WAIT: Duration = Duration::from_secs(1);
 /// Initial retry interval for unacknowledged cancels, doubling up to `CANCEL_RETRY_MAX`.
 const CANCEL_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const CANCEL_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Upper bound on background cancel retries before concluding the holder is
+/// permanently gone (e.g. crashed/restarted onto a new ephemeral port) and
+/// resolving as `PushOutcome::Unknown` so the landing stays safely frozen
+/// without leaking reader state or spinning forever.
+const CANCEL_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
 /// holder's Disk block, to the reader's `address`.
@@ -124,6 +132,8 @@ pub struct PushTarget {
     pub endpoint: String,
     /// This member's transfer session, which the holder writes into.
     pub session: String,
+    /// Expected holder incarnation authorizing `offer_id` (ignored when `offer_id == 0`).
+    pub holder_incarnation: u64,
     /// The v1 offer id authorizing this push on the holder (`0` when untagged).
     pub offer_id: u64,
     /// The Disk blocks and destination spans to push.
@@ -200,9 +210,17 @@ pub trait PagePusher: Send + Sync {
         }
     }
 
-    /// Cancel any active or queued holder-side Disk pushes tagged with
-    /// `offer_id` and fence late arrivals for that offer.
-    fn cancel_offer(&self, _offer_id: u64) {}
+    /// Authorize holder-side Disk pushes tagged with `(incarnation, offer_id)`
+    /// once the offer's blocks are pinned on this member.
+    fn activate_offer(&self, _incarnation: u64, _offer_id: u64) {}
+
+    /// Revoke authorization for `(incarnation, offer_id)` and signal any
+    /// queued/in-flight holder-side Disk pushes tagged with it to stop. Returns
+    /// `true` only once zero pushes for that offer remain in flight (so
+    /// scheduler Disk pins may be safely released).
+    fn cancel_offer(&self, _incarnation: u64, _offer_id: u64) -> bool {
+        true
+    }
 
     /// Start one or more Disk pushes without blocking the caller thread.
     /// Sets `cancelling` to `true` once an unacknowledged cancel exceeds its
@@ -243,7 +261,9 @@ pub struct PushSource {
 enum Message {
     Push {
         job: u64,
-        offer_id: u64,
+        /// `Some((holder_incarnation, offer_id))` encodes as `PUSH_V2`; `None`
+        /// encodes as legacy `PUSH` for wire compatibility.
+        offer: Option<(u64, u64)>,
         reply_to: String,
         session: String,
         budget_us: u64,
@@ -271,14 +291,20 @@ impl Message {
         let kind = match self {
             Message::Push {
                 job,
-                offer_id,
+                offer,
                 reply_to,
                 session,
                 budget_us,
                 items,
             } => {
                 out.u64(*job);
-                out.u64(*offer_id);
+                let tag = if let Some((incarnation, offer_id)) = offer {
+                    out.u64(*incarnation);
+                    out.u64(*offer_id);
+                    PUSH_V2
+                } else {
+                    PUSH
+                };
                 out.bytes(reply_to.as_bytes());
                 out.bytes(session.as_bytes());
                 out.u64(*budget_us);
@@ -293,7 +319,7 @@ impl Message {
                         out.u64(span.length);
                     }
                 }
-                PUSH
+                tag
             }
             Message::Cancel { job, reply_to } => {
                 out.u64(*job);
@@ -324,9 +350,13 @@ impl Message {
         let mut reader = Reader::new(payload);
         let text = |reader: &mut Reader<'_>| String::from_utf8(reader.bytes()?.to_vec()).ok();
         let message = match kind.as_ref() {
-            PUSH => {
+            PUSH | PUSH_V2 => {
                 let job = reader.u64()?;
-                let offer_id = reader.u64()?;
+                let offer = if kind.as_ref() == PUSH_V2 {
+                    Some((reader.u64()?, reader.u64()?))
+                } else {
+                    None
+                };
                 let reply_to = text(&mut reader)?;
                 let session = text(&mut reader)?;
                 let budget_us = reader.u64()?;
@@ -352,7 +382,7 @@ impl Message {
                 }
                 Message::Push {
                     job,
-                    offer_id,
+                    offer,
                     reply_to,
                     session,
                     budget_us,
@@ -459,9 +489,13 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
-/// Maximum completed or cancelled push job keys retained to fence duplicate or
-/// late-arriving Push messages after a Cancel.
+/// Maximum completed or cancelled clean push job keys retained to fence
+/// duplicate or late-arriving Push messages after a Cancel.
 const MAX_FENCED_JOBS: usize = 16_384;
+/// Maximum `UnknownRetirement` job keys stored explicitly; if exceeded, the
+/// holder conservatively answers `Unknown` for any unrecognized Cancel so an
+/// unknown RDMA write retirement is never downgraded to `Cancelled`.
+const MAX_UNKNOWN_FENCED_JOBS: usize = 65_536;
 /// Upper bound on concurrent push worker threads per holder.
 const MAX_PUSH_WORKERS: usize = 16;
 /// Upper bound on queued pushes waiting for a worker before fast-failing.
@@ -478,58 +512,49 @@ struct JobKey {
     job: u64,
 }
 
-/// Bounded FIFO set of `(reply_to, job)` keys that may never start again,
-/// remembering whether the completed job left RDMA write retirement unknown.
+/// Set of `(reply_to, job)` keys that may never start again.
+///
+/// Clean completions/cancellations use a bounded FIFO (`MAX_FENCED_JOBS`).
+/// `UnknownRetirement` entries are NEVER FIFO-evicted by normal push traffic so
+/// a late `Cancel` retry can never misclassify an RDMA write fault as cleanly
+/// cancelled (`Cancelled`), which would cause premature reader unfreeze.
 #[derive(Default)]
 struct FencedJobs {
-    map: HashMap<JobKey, bool>,
+    clean: HashSet<JobKey>,
     order: VecDeque<JobKey>,
+    unknown: HashSet<JobKey>,
+    unknown_overflowed: bool,
 }
 
 impl FencedJobs {
     fn contains(&self, key: &JobKey) -> bool {
-        self.map.contains_key(key)
+        self.unknown.contains(key) || self.clean.contains(key)
     }
 
     fn unknown(&self, key: &JobKey) -> bool {
-        self.map.get(key).copied().unwrap_or(false)
+        self.unknown.contains(key) || (self.unknown_overflowed && !self.clean.contains(key))
     }
 
     fn insert(&mut self, key: JobKey, unknown: bool) {
-        if let Some(entry) = self.map.get_mut(&key) {
-            *entry |= unknown;
+        if unknown {
+            self.clean.remove(&key);
+            if self.unknown.contains(&key) {
+                return;
+            }
+            if self.unknown.len() < MAX_UNKNOWN_FENCED_JOBS {
+                self.unknown.insert(key);
+            } else {
+                self.unknown_overflowed = true;
+            }
             return;
         }
-        self.map.insert(key.clone(), unknown);
+        if self.unknown.contains(&key) || !self.clean.insert(key.clone()) {
+            return;
+        }
         self.order.push_back(key);
         while self.order.len() > MAX_FENCED_JOBS {
             if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
-        }
-    }
-}
-
-/// Bounded FIFO set of closed/expired v1 offer ids whose late pushes are rejected.
-#[derive(Default)]
-struct FencedOffers {
-    set: HashSet<u64>,
-    order: VecDeque<u64>,
-}
-
-impl FencedOffers {
-    fn contains(&self, offer_id: u64) -> bool {
-        self.set.contains(&offer_id)
-    }
-
-    fn insert(&mut self, offer_id: u64) {
-        if offer_id == 0 || !self.set.insert(offer_id) {
-            return;
-        }
-        self.order.push_back(offer_id);
-        while self.order.len() > MAX_FENCED_JOBS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.set.remove(&oldest);
+                self.clean.remove(&oldest);
             }
         }
     }
@@ -562,16 +587,16 @@ enum CancelAck {
 
 /// A push the holder runs, and whether the reader cancelled it.
 struct Running {
-    offer_id: u64,
+    offer: Option<(u64, u64)>,
     cancelled: AtomicBool,
     /// State machine preventing lost `Cancelled`/`Unknown` ACKs when Cancel races finish.
     ack: Mutex<CancelAck>,
 }
 
 impl Running {
-    fn new(offer_id: u64) -> Self {
+    fn new(offer: Option<(u64, u64)>) -> Self {
         Self {
-            offer_id,
+            offer,
             cancelled: AtomicBool::new(false),
             ack: Mutex::new(CancelAck::Pending(None)),
         }
@@ -659,7 +684,7 @@ struct HolderState {
     slots: Slots,
     running: Mutex<HashMap<JobKey, Arc<Running>>>,
     fenced: Mutex<FencedJobs>,
-    fenced_offers: Mutex<FencedOffers>,
+    active_offers: Mutex<HashSet<(u64, u64)>>,
 }
 
 /// The holder's half: a bounded worker pool serving Disk pushes.
@@ -694,7 +719,7 @@ impl Holder {
             },
             running: Mutex::new(HashMap::new()),
             fenced: Mutex::new(FencedJobs::default()),
-            fenced_offers: Mutex::new(FencedOffers::default()),
+            active_offers: Mutex::new(HashSet::new()),
         });
         let worker_count = slots.clamp(1, MAX_PUSH_WORKERS);
         let (tx, rx) = mpsc::sync_channel::<QueuedPush>(MAX_QUEUED_PUSHES);
@@ -759,7 +784,7 @@ impl Holder {
         &self,
         sockets: Weak<Sockets>,
         key: JobKey,
-        offer_id: u64,
+        offer: Option<(u64, u64)>,
         session: String,
         budget: Duration,
         items: Vec<PushItem>,
@@ -783,18 +808,22 @@ impl Holder {
             }
             return;
         }
-        let running = Arc::new(Running::new(offer_id));
+        let running = Arc::new(Running::new(offer));
         {
             let mut running_map = self.state.running.lock();
-            if (offer_id != 0 && self.state.fenced_offers.lock().contains(offer_id))
+            let offer_unauthorized = match offer {
+                Some(pair) => !self.state.active_offers.lock().contains(&pair),
+                None => false,
+            };
+            if offer_unauthorized
                 || running_map.contains_key(&key)
                 || self.state.fenced.lock().contains(&key)
             {
                 tracing::warn!(
                     job = key.job,
-                    offer_id,
+                    ?offer,
                     reader = key.reply_to,
-                    "rejecting duplicate, fenced, or closed-offer peer push"
+                    "rejecting duplicate, fenced, or unauthorized-offer peer push"
                 );
                 if let Some(sockets) = sockets.upgrade() {
                     send(
@@ -878,22 +907,39 @@ impl Holder {
         }
     }
 
-    /// Cancels all active/queued jobs tagged with `offer_id` and fences late
-    /// pushes for that offer so closed/expired holder offers stop Disk pushes.
-    fn cancel_offer(&self, offer_id: u64) {
+    /// Authorizes `(incarnation, offer_id)` to serve Disk pushes once pinned.
+    fn activate_offer(&self, incarnation: u64, offer_id: u64) {
         if offer_id == 0 {
             return;
         }
-        {
+        self.state
+            .active_offers
+            .lock()
+            .insert((incarnation, offer_id));
+    }
+
+    /// Revokes authorization for `(incarnation, offer_id)` and signals all
+    /// queued/active jobs tagged with it to stop. Returns `true` only once zero
+    /// jobs for that offer remain in `running` (so Disk block pins may be released).
+    fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
+        if offer_id == 0 {
+            return true;
+        }
+        let pair = (incarnation, offer_id);
+        let drained = {
             let running_map = self.state.running.lock();
-            self.state.fenced_offers.lock().insert(offer_id);
+            self.state.active_offers.lock().remove(&pair);
+            let mut active = false;
             for running in running_map.values() {
-                if running.offer_id == offer_id {
+                if running.offer == Some(pair) {
                     running.cancelled.store(true, Ordering::Release);
+                    active = true;
                 }
             }
-        }
+            !active
+        };
         self.state.slots.wake_all();
+        drained
     }
 
     /// Cancels all active jobs, closes the queue, and joins every worker.
@@ -1125,6 +1171,7 @@ struct CancelTiming {
     freeze_wait: Duration,
     retry_initial: Duration,
     retry_max: Duration,
+    retry_budget: Duration,
 }
 
 impl Default for CancelTiming {
@@ -1133,6 +1180,7 @@ impl Default for CancelTiming {
             freeze_wait: CANCEL_FREEZE_WAIT,
             retry_initial: CANCEL_RETRY_INITIAL,
             retry_max: CANCEL_RETRY_MAX,
+            retry_budget: CANCEL_RETRY_BUDGET,
         }
     }
 }
@@ -1154,6 +1202,7 @@ enum GroupPhase {
         freeze_at: Instant,
         next_retry: Instant,
         retry_interval: Duration,
+        give_up_at: Instant,
         freeze_signaled: bool,
     },
 }
@@ -1194,6 +1243,7 @@ impl PushGroup {
             freeze_at: now + timing.freeze_wait,
             next_retry: now + timing.retry_initial,
             retry_interval: timing.retry_initial,
+            give_up_at: now + timing.retry_budget,
             freeze_signaled,
         };
     }
@@ -1296,11 +1346,24 @@ fn step_groups(
                 freeze_at,
                 next_retry,
                 retry_interval,
+                give_up_at,
                 freeze_signaled,
             } => {
                 if !*freeze_signaled && now >= *freeze_at {
                     group.cancelling.store(true, Ordering::Release);
                     *freeze_signaled = true;
+                }
+                if now >= *give_up_at {
+                    // Holder never acknowledged cancellation within the retry
+                    // budget (e.g. crashed or restarted onto a new ephemeral
+                    // port). Resolve as Unknown so the landing stays safely
+                    // frozen while reclaiming reader dispatcher resources.
+                    group.unknown_reason.get_or_insert_with(|| {
+                        "peer push cancellation went unacknowledged; remote write retirement unknown"
+                            .to_owned()
+                    });
+                    done_ids.push(group_id);
+                    continue;
                 }
                 if now >= *next_retry {
                     for (&job, (host, port)) in &group.pending {
@@ -1412,7 +1475,7 @@ impl PushEndpoint {
                             Ok(frames) if !frames.is_empty() => match Message::decode(&frames) {
                                 Some(Message::Push {
                                     job,
-                                    offer_id,
+                                    offer,
                                     reply_to,
                                     session,
                                     budget_us,
@@ -1423,7 +1486,7 @@ impl PushEndpoint {
                                         Some(h) => h.enqueue(
                                             sockets_weak.clone(),
                                             JobKey { reply_to, job },
-                                            offer_id,
+                                            offer,
                                             session,
                                             Duration::from_micros(budget_us),
                                             items,
@@ -1559,11 +1622,20 @@ impl PushEndpoint {
         Ok(())
     }
 
-    /// Cancel active/queued pushes tagged with `offer_id` and fence late arrivals.
-    pub fn cancel_offer(&self, offer_id: u64) {
+    /// Authorize pushes tagged with `(incarnation, offer_id)` once pinned.
+    pub fn activate_offer(&self, incarnation: u64, offer_id: u64) {
         if let Some(holder) = self.holder.lock().as_ref() {
-            holder.cancel_offer(offer_id);
+            holder.activate_offer(incarnation, offer_id);
         }
+    }
+
+    /// Revoke authorization for `(incarnation, offer_id)` and cancel queued/in-flight
+    /// pushes. Returns `true` once zero jobs for that offer remain in flight.
+    pub fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
+        self.holder
+            .lock()
+            .as_ref()
+            .is_none_or(|holder| holder.cancel_offer(incarnation, offer_id))
     }
 
     /// Override cancel freeze/retry timings in unit and integration tests.
@@ -1573,11 +1645,13 @@ impl PushEndpoint {
         freeze_wait: Duration,
         retry_initial: Duration,
         retry_max: Duration,
+        retry_budget: Duration,
     ) {
         *self.cancel_timing.lock() = CancelTiming {
             freeze_wait,
             retry_initial,
             retry_max,
+            retry_budget,
         };
     }
 
@@ -1614,8 +1688,12 @@ impl Drop for PushEndpoint {
 }
 
 impl PagePusher for PushEndpoint {
-    fn cancel_offer(&self, offer_id: u64) {
-        PushEndpoint::cancel_offer(self, offer_id);
+    fn activate_offer(&self, incarnation: u64, offer_id: u64) {
+        PushEndpoint::activate_offer(self, incarnation, offer_id);
+    }
+
+    fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
+        PushEndpoint::cancel_offer(self, incarnation, offer_id)
     }
 
     fn push(
@@ -1639,7 +1717,7 @@ impl PagePusher for PushEndpoint {
         };
         let request = Message::Push {
             job,
-            offer_id: 0,
+            offer: None,
             reply_to: self.name.clone(),
             session: session.to_owned(),
             budget_us: u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
@@ -1724,11 +1802,11 @@ impl PagePusher for PushEndpoint {
             return;
         };
         let effective_budget = budget.min(remaining).min(MAX_PUSH_BUDGET);
-        if effective_budget.is_zero() {
+        let budget_us = u64::try_from(effective_budget.as_micros()).unwrap_or(u64::MAX);
+        if budget_us == 0 {
             finish(PushOutcome::Aborted("peer push budget is zero".to_owned()));
             return;
         }
-        let budget_us = u64::try_from(effective_budget.as_micros()).unwrap_or(u64::MAX);
         let mut requests = Vec::with_capacity(targets.len());
         for target in targets {
             let (host, port) = match split_endpoint(&target.endpoint) {
@@ -1745,7 +1823,8 @@ impl PagePusher for PushEndpoint {
                 port,
                 Message::Push {
                     job,
-                    offer_id: target.offer_id,
+                    offer: (target.offer_id != 0)
+                        .then_some((target.holder_incarnation, target.offer_id)),
                     reply_to: self.name.clone(),
                     session: target.session,
                     budget_us,
@@ -1838,23 +1917,43 @@ mod tests {
 
     #[test]
     fn wire_codec_validation_fencing_and_cancel_race() {
-        for msg in [
-            Message::Push {
-                job: (7 << 32) + 1,
-                offer_id: 42,
-                reply_to: "10.0.0.3:7200".into(),
-                session: "10.0.0.3:12345".into(),
-                budget_us: 2_000_000,
-                items: vec![PushItem {
-                    group: 1,
-                    block: 42,
-                    spans: vec![PushSpan {
-                        offset: 0,
-                        address: 1 << 40,
-                        length: 4096,
-                    }],
+        let legacy_push = Message::Push {
+            job: (7 << 32) + 1,
+            offer: None,
+            reply_to: "10.0.0.3:7200".into(),
+            session: "10.0.0.3:12345".into(),
+            budget_us: 2_000_000,
+            items: vec![PushItem {
+                group: 1,
+                block: 42,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 1 << 40,
+                    length: 4096,
                 }],
-            },
+            }],
+        };
+        assert_eq!(legacy_push.frames()[0].as_ref(), PUSH);
+        let v2_push = Message::Push {
+            job: (7 << 32) + 2,
+            offer: Some((99, 42)),
+            reply_to: "10.0.0.3:7200".into(),
+            session: "10.0.0.3:12345".into(),
+            budget_us: 2_000_000,
+            items: vec![PushItem {
+                group: 1,
+                block: 42,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 1 << 40,
+                    length: 4096,
+                }],
+            }],
+        };
+        assert_eq!(v2_push.frames()[0].as_ref(), PUSH_V2);
+        for msg in [
+            legacy_push,
+            v2_push,
             Message::Cancel {
                 job: 3,
                 reply_to: "[::1]:7200".into(),
@@ -1925,7 +2024,7 @@ mod tests {
         assert!(fenced.contains(&a) && !fenced.unknown(&a) && !fenced.contains(&b));
         fenced.insert(b.clone(), true);
         assert!(fenced.contains(&b) && fenced.unknown(&b));
-        for job in 0..(MAX_FENCED_JOBS as u64 + 2) {
+        for job in 0..(MAX_FENCED_JOBS as u64 + 100) {
             fenced.insert(
                 JobKey {
                     reply_to: "10.0.0.3:7200".into(),
@@ -1935,18 +2034,20 @@ mod tests {
             );
         }
         assert!(!fenced.contains(&a));
+        // Unknown-retirement entries must never be evicted by clean FIFO traffic.
+        assert!(fenced.contains(&b) && fenced.unknown(&b));
         assert!(fenced.contains(&JobKey {
             reply_to: "10.0.0.3:7200".into(),
-            job: MAX_FENCED_JOBS as u64 + 1
+            job: MAX_FENCED_JOBS as u64 + 99
         }));
 
-        let r1 = Running::new(0);
+        let r1 = Running::new(None);
         assert_eq!(r1.cancel("r1".into()), None);
         assert_eq!(r1.finish(false), Some("r1".into()));
-        let r2 = Running::new(0);
+        let r2 = Running::new(None);
         assert_eq!(r2.finish(false), None);
         assert_eq!(r2.cancel("r2".into()), Some(("r2".into(), false)));
-        let r3 = Running::new(0);
+        let r3 = Running::new(None);
         assert_eq!(r3.finish(true), None);
         assert_eq!(r3.cancel("r3".into()), Some(("r3".into(), true)));
     }
@@ -2581,6 +2682,7 @@ mod tests {
         let target = |ep: &PushEndpoint, block: i32, dst: u64| PushTarget {
             endpoint: ep.name().to_owned(),
             session: "reader-sess".into(),
+            holder_incarnation: 0,
             offer_id: 0,
             items: vec![PushItem {
                 group: 0,
@@ -2663,12 +2765,44 @@ mod tests {
         assert!(matches!(out, PushOutcome::Unknown(_)), "got {out:?}");
         assert_eq!(h2.push_ring_slot_counts(), Some((3, 4)));
 
-        // 6. Holder cancel_offer stops an in-flight push tagged with that offer
-        //    and fences late arrivals for the same offer without touching NVMe.
+        // 6. Holder active-offer whitelist & drain-aware cancel_offer:
+        //    - Unauthorized (never activated) or wrong-incarnation offer pushes
+        //      are rejected before touching NVMe.
+        //    - Active offer push is cancelled by `cancel_offer`, which reports
+        //      `false` (not drained) until the worker exits and `true` once clear.
+        let mut offer_target = target(&h1, 1, 7000);
+        offer_target.holder_incarnation = 101;
+        offer_target.offer_id = 77;
+        let entered_before_unauth = w1.entered.load(Ordering::Acquire);
+        let unauth_res = reader.push_many(
+            vec![offer_target.clone()],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(
+            matches!(unauth_res, PushOutcome::Aborted(_)),
+            "got {unauth_res:?}"
+        );
+        assert_eq!(w1.entered.load(Ordering::Acquire), entered_before_unauth);
+
+        h1.activate_offer(101, 77);
+        let mut wrong_inc_target = offer_target.clone();
+        wrong_inc_target.holder_incarnation = 999;
+        let wrong_inc_res = reader.push_many(
+            vec![wrong_inc_target],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(
+            matches!(wrong_inc_res, PushOutcome::Aborted(_)),
+            "got {wrong_inc_res:?}"
+        );
+        assert_eq!(w1.entered.load(Ordering::Acquire), entered_before_unauth);
+
         *w1.hold.0.lock().unwrap() = true;
         w1.entered.store(0, Ordering::SeqCst);
-        let mut offer_target = target(&h1, 1, 7000);
-        offer_target.offer_id = 77;
         std::thread::scope(|scope| {
             let t = offer_target.clone();
             let handle = scope.spawn(|| {
@@ -2684,12 +2818,14 @@ mod tests {
                 assert!(wait.elapsed() < Duration::from_secs(5));
                 thread::sleep(Duration::from_millis(2));
             }
-            h1.cancel_offer(77);
+            // In-flight worker still holds the block -> not drained yet.
+            assert!(!h1.cancel_offer(101, 77));
             *w1.hold.0.lock().unwrap() = false;
             w1.hold.1.notify_all();
             let res = handle.join().unwrap();
             assert!(matches!(res, PushOutcome::Aborted(_)), "got {res:?}");
         });
+        assert!(h1.cancel_offer(101, 77));
         let entered_before_late = w1.entered.load(Ordering::Acquire);
         let late_res = reader.push_many(
             vec![offer_target],
@@ -2715,6 +2851,7 @@ mod tests {
                 Duration::from_millis(40),
                 Duration::from_millis(25),
                 Duration::from_millis(50),
+                Duration::from_secs(10),
             );
             let sealed = Arc::new(AtomicBool::new(false));
             let cancelling = Arc::new(AtomicBool::new(false));
@@ -2723,6 +2860,7 @@ mod tests {
                 vec![PushTarget {
                     endpoint: fake_ep,
                     session: "s".into(),
+                    holder_incarnation: 99,
                     offer_id: 9,
                     items: vec![PushItem {
                         group: 0,
@@ -2746,14 +2884,14 @@ mod tests {
             let frames = in_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let Some(Message::Push {
                 job,
-                offer_id,
+                offer,
                 reply_to,
                 ..
             }) = Message::decode(&frames)
             else {
                 panic!("expected Push");
             };
-            assert_eq!(offer_id, 9);
+            assert_eq!(offer, Some((99, 9)));
 
             // Seal the reader push -> reader sends Cancel, waits freeze_wait,
             // signals `cancelling`, and keeps retrying Cancel until answered.
@@ -2796,5 +2934,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn background_cancel_retry_gives_up_as_unknown_after_budget() {
+        let (in_tx, in_rx) = mpsc::channel::<Vec<Bytes>>();
+        let fake_holder = Sockets::start_at("127.0.0.1", 0, in_tx).unwrap();
+        let fake_ep = format!("127.0.0.1:{}", fake_holder.port());
+        let reader = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 201).unwrap();
+        reader.set_cancel_timing_for_test(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(120),
+        );
+        let sealed = Arc::new(AtomicBool::new(false));
+        let cancelling = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+        reader.start_push_many(
+            vec![PushTarget {
+                endpoint: fake_ep,
+                session: "s".into(),
+                holder_incarnation: 55,
+                offer_id: 11,
+                items: vec![PushItem {
+                    group: 0,
+                    block: 1,
+                    spans: vec![PushSpan {
+                        offset: 0,
+                        address: 1024,
+                        length: 64,
+                    }],
+                }],
+            }],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            sealed.clone(),
+            cancelling.clone(),
+            Box::new(move |outcome| {
+                let _ = done_tx.send(outcome);
+            }),
+        );
+        let _push_frames = in_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        sealed.store(true, Ordering::SeqCst);
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(outcome, PushOutcome::Unknown(_)),
+            "expected Unknown once cancel retry budget expires, got {outcome:?}"
+        );
+        assert!(cancelling.load(Ordering::Acquire));
+
+        // Sub-microsecond push budget must abort cleanly rather than send budget_us=0.
+        let (zero_tx, zero_rx) = mpsc::channel();
+        reader.start_push_many(
+            vec![PushTarget {
+                endpoint: format!("127.0.0.1:{}", fake_holder.port()),
+                session: "s".into(),
+                holder_incarnation: 55,
+                offer_id: 12,
+                items: vec![PushItem {
+                    group: 0,
+                    block: 1,
+                    spans: vec![PushSpan {
+                        offset: 0,
+                        address: 1024,
+                        length: 64,
+                    }],
+                }],
+            }],
+            Duration::from_nanos(500),
+            Instant::now() + Duration::from_secs(10),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(move |outcome| {
+                let _ = zero_tx.send(outcome);
+            }),
+        );
+        let zero_out = zero_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(zero_out, PushOutcome::Aborted(_)),
+            "sub-microsecond budget must abort, got {zero_out:?}"
+        );
     }
 }

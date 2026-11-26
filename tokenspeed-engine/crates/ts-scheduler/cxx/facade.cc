@@ -281,6 +281,8 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                 break;
             case PeerEventKind::LookupAnswered:
             case PeerEventKind::FetchDone:
+            case PeerEventKind::FetchFrozen:
+            case PeerEventKind::TargetRetired:
                 break;
         }
     }
@@ -304,7 +306,7 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                 break;
             }
             case PeerEventKind::TargetRetired:
-                scheduler.RetirePeerTarget(FromView(event.lease));
+                execution_event.With(tokenspeed::cache::PeerTargetRetired{.lease = FromView(event.lease)});
                 break;
             case PeerEventKind::FetchFrozen:
             case PeerEventKind::FetchDone:

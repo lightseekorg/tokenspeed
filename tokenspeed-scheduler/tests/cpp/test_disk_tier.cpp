@@ -1138,5 +1138,57 @@ TEST(DiskTierTest, HybridPeerListAndPinKeepsDeviceStateWhenKvIsOnDisk) {
     EXPECT_TRUE(cache.coordinator.ClearCache());
 }
 
+TEST(DiskTierTest, HybridPeerListWithoutDiskKeepsDeviceStateWhenKvIsOnHost) {
+    // Regression test for P2-1: when Device KV is evicted (split_tokens == 0)
+    // while Host KV and a Device State checkpoint are both present, both
+    // `AnswerLookupWithoutDisk` (`ListPrefix`) and `ExportPrefix` must report
+    // the Device State checkpoint (`kDevice`) alongside Host KV (`kHost`).
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 83);
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    // Copy KV pages to Host and evict KV from Device while retaining Device State.
+    for (const auto& h : prompt.hashes) {
+        const CacheKey key{.group_id = 0, .content_hash = ContentHash{h}};
+        CacheBlockRef host_blk = cache.coordinator.Host().AcquireHostBlock(0, 0);
+        ASSERT_TRUE(host_blk);
+        cache.coordinator.Host().CacheHostBlock(host_blk, key, std::nullopt);
+        const auto dev_loc = cache.coordinator.Store().LocationOf(cache.device, 0, key);
+        ASSERT_TRUE(dev_loc);
+        ASSERT_TRUE(cache.coordinator.Evictor().EvictCachedBlockAlone(
+            0, *dev_loc, &CacheEvictor::DeviceEvictionStats::admission, /*write_back_segment=*/nullptr));
+    }
+
+    const cache::PeerLookup lookup{.lease = {.reader = "no-disk-reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/false);
+    ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.tokens.size()));
+    ASSERT_EQ(answer.pages.size(), 3u);
+    auto find_page = [&](std::uint32_t group, std::int32_t slot) {
+        const auto it = std::ranges::find_if(answer.pages,
+                                             [&](const PeerPage& p) { return p.group_id == group && p.slot == slot; });
+        EXPECT_NE(it, answer.pages.end());
+        return it != answer.pages.end() ? *it : PeerPage{};
+    };
+    EXPECT_EQ(find_page(0u, 0).tier, CacheTier::kHost);
+    EXPECT_EQ(find_page(0u, 1).tier, CacheTier::kHost);
+    EXPECT_EQ(find_page(1u, kPeerStateSlot).tier, CacheTier::kDevice);
+
+    const auto exported =
+        cache.coordinator.ExportPrefix(cache.coordinator.Prober().ProbePromptPrefix(prompt.Prefix()));
+    EXPECT_EQ(exported.num_tokens, answer.num_tokens);
+    ASSERT_EQ(exported.blocks.size(), 3u);
+    EXPECT_EQ(exported.blocks[2].tier, CacheTier::kDevice);
+}
+
+
 }  // namespace
 }  // namespace tokenspeed::test

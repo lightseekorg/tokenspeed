@@ -407,7 +407,7 @@ impl Control {
                     self.send(Message::Grant(k.clone(), o.clone(), false));
                     return;
                 }
-                let (reply, v) = self.offers.pin(k, o, s, now);
+                let (reply, v) = self.offers.pin(k, o, s, self.pusher.as_ref(), now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -432,9 +432,8 @@ impl Control {
                     self.send(Message::Ack(k.clone(), *id, *d, Closure::Stale));
                     return;
                 }
-                let (reply, v) = self.offers.close(k, *id, *d, s, now);
+                let (reply, v) = self.offers.close(k, *id, *d, s, self.pusher.as_ref(), now);
                 if let Some(v) = v {
-                    self.pusher.cancel_offer(*id);
                     self.votes.push(v);
                 }
                 if let Some(r) = reply {
@@ -502,11 +501,14 @@ impl Control {
                         // Consensus refused this offer. No reader could have
                         // obtained GO, so each holder can roll back its own ticket
                         // even if the reader disappeared before sending RELEASE.
-                        let (_, vote) =
-                            self.offers.close(key, offer.id, Disposition::Abort, s, now);
-                        if vote.is_some() {
-                            self.pusher.cancel_offer(offer.id);
-                        }
+                        let (_, vote) = self.offers.close(
+                            key,
+                            offer.id,
+                            Disposition::Abort,
+                            s,
+                            self.pusher.as_ref(),
+                            now,
+                        );
                         self.votes.extend(vote);
                     }
                     self.send(m);
@@ -546,10 +548,9 @@ impl Control {
         for m in outgoing {
             self.send(m);
         }
-        let expired = self.offers.expire(now, retirement_bound_ms, s);
-        for v in &expired {
-            self.pusher.cancel_offer(v.offer);
-        }
+        let expired = self
+            .offers
+            .expire(now, retirement_bound_ms, s, self.pusher.as_ref());
         self.votes.extend(expired);
         round.events.append(&mut self.missing);
         Ok(())

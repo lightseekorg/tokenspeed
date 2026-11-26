@@ -708,6 +708,7 @@ private:
     void handleEvent(const cache::PeerRelease& event);
     void handleEvent(const cache::PeerLookupAnswered& event);
     void handleEvent(const cache::PeerFetchDone& event);
+    void handleEvent(const cache::PeerTargetRetired& event);
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
     void handleEvent(const cache::DiskDone& event);
