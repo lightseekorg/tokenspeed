@@ -30,6 +30,7 @@ import setproctitle
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--control-fd", type=int, required=True)
+    parser.add_argument("--npu-device", type=int)
     parser.add_argument(
         "--enable-async-logging", choices=("true", "false"), required=True
     )
@@ -39,6 +40,13 @@ def main() -> None:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     setproctitle.setproctitle(args.process_title)
+    if args.npu_device is not None:
+        import torch
+        import torch_npu  # noqa: F401 -- register the NPU backend with PyTorch
+
+        # Runtime imports can initialize the current device. Bind this rank
+        # before the native host imports tokenspeed.runtime.engine.rust_host.
+        torch.npu.set_device(args.npu_device)
     if "tokenspeed_scheduler" in sys.modules:
         raise RuntimeError("the scheduler must be imported after host initialization")
     from tokenspeed_engine._host import run_host, scheduler

@@ -363,6 +363,11 @@ def start_rust_host(
                 ),
                 "--python",
                 sys.executable,
+                *(
+                    ["--npu-device", str(server_args.mapping.gpu_id)]
+                    if server_args.device == "npu"
+                    else []
+                ),
                 "--control-fd",
                 str(child.fileno()),
                 "--enable-async-logging",
