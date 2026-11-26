@@ -124,7 +124,7 @@ fn allocate_bounce_mode(
             Err(error)
                 if matches!(
                     error.raw_os_error(),
-                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL | libc::E2BIG | libc::EPERM)
+                    Some(libc::ENOMEM | libc::EINVAL | libc::E2BIG | libc::EPERM)
                 ) =>
             {
                 tracing::warn!(
@@ -191,8 +191,11 @@ impl Ring {
         // `EFAULT` signals VM_PFNMAP/VM_IO device-pinned memory (e.g. Ascend
         // `torch_npu` `/dev/davinci_manager`), which Linux `O_DIRECT` also
         // rejects on non-fixed Read/Write -> stage through an anonymous mmap
-        // bounce pool (RFC 0006). Other registration errors (such as ENOMEM
-        // from a low RLIMIT_MEMLOCK) propagate explicitly.
+        // bounce pool (RFC 0006). Other registration errors on the caller's
+        // buffers (such as ENOMEM from a low RLIMIT_MEMLOCK) propagate
+        // explicitly; on the anonymous bounce pool, memlock/limit errors
+        // degrade to non-fixed O_DIRECT while unexpected errors like EFAULT
+        // propagate.
         let mode = match unsafe { ring.submitter().register_buffers(&buffers) } {
             Ok(()) => BufferMode::FixedCaller,
             Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {

@@ -61,10 +61,12 @@ impl Memory {
         }
         #[cfg(target_os = "linux")]
         // SAFETY: `base..base+size` is the private mapping just created above
-        // (without MAP_POPULATE, so no pages are faulted in yet). Disable THP
-        // so `io_uring_register_buffers` (FOLL_LONGTERM) does not fail on
-        // transparent huge pages, and mark `MADV_DONTFORK` so a child process
-        // cannot trigger COW on DMA-pinned pages.
+        // (without MAP_POPULATE, so no pages are faulted in yet). Applied to
+        // every `ts_disk::Memory` allocation (io_uring/psync bounce pools and
+        // peer-push staging rings): disable THP so `io_uring_register_buffers`
+        // (`FOLL_LONGTERM`) does not fail on transparent huge pages, and mark
+        // `MADV_DONTFORK` so a child process cannot trigger COW on DMA-pinned
+        // pages.
         unsafe {
             let _ = libc::madvise(base, size, libc::MADV_NOHUGEPAGE);
             if libc::madvise(base, size, libc::MADV_DONTFORK) != 0 {

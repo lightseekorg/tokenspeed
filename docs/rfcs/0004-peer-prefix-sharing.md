@@ -548,7 +548,12 @@ namespace, prefix length and full source-page mapping against the lookup
 and its writable grant before issuing DMA. Eviction or a changed mapping
 falls back to local prefill without a second lookup. While the holder has
 unretired replay work, both ordinary and checkpoint PINs reject any mapping
-containing Device pages. Host-only mappings remain eligible.
+containing Device pages. Host-only mappings remain eligible. In coordinated
+mode, the control loop's idle/DP-round/`gate()` lock-release windows also wait
+until pending device `pages_to_copy` batches have retired behind a completed
+forward before handing `scheduler.lock()` to `ts-peer-servicer`; the
+pre-existing round-head `bump` and `complete()` lock windows remain unchanged
+and can still hand the scheduler over while an in-flight copy batch is pending.
 
 Coordinated replicas keep their existing namespace. Independent Host and Device
 replicas use `async-host-v2:` and `async-device-v3:` respectively. During a

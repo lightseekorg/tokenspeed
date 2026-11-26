@@ -152,8 +152,8 @@ void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {
         if (looking == nullptr || looking->lease != event.lease) {
             continue;
         }
-        if (async_host_peer_ && event.num_tokens > 0) {
-            if (looking->host_grant) looking->host_grant->lookup_answered = true;
+        if (async_host_peer_ && looking->host_grant && event.num_tokens > 0) {
+            looking->host_grant->lookup_answered = true;
             return;
         }
         request->Apply(fsm::FinishPeerLookupEvent{event.num_tokens > 0
@@ -217,16 +217,23 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         const auto* prefetch = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
         const bool waiting = prefetch != nullptr && prefetch->lease.IssuedBy(*peer_host_landings_);
         auto* active = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
+        std::optional<fsm::StorageReadyHold> saved_base;
         if (active && active->host_grant && active->host_grant->landing) {
-            active->admission.storage_hold =
-                fsm::StorageReadyHold{.lease = std::move(active->host_grant->landing), .deadline_us = peer_now_us_};
+            // Preserve any prior Disk/L3 Ready hold so the peer landing's Ready
+            // hold does not clobber it: on success it steps aside into
+            // `storage_base_hold`; on failure it is restored to `storage_hold`.
+            saved_base = std::exchange(
+                active->admission.storage_hold,
+                fsm::StorageReadyHold{.lease = std::move(active->host_grant->landing), .deadline_us = peer_now_us_});
         }
         if (const std::optional<std::int32_t> landed =
                 peer_host_landings_->Finish(event.request_id, event.num_tokens)) {
             const auto* owner = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
+            const bool owns_landing = owner && owner->admission.storage_hold &&
+                                      owner->admission.storage_hold->lease.IssuedBy(*peer_host_landings_);
             if (*landed == 0) {
                 ++peer_failed_landings_;
-            } else if (async_host_peer_ && !(owner && owner->admission.storage_hold)) {
+            } else if (async_host_peer_ && !owns_landing) {
                 ++peer_unused_host_landings_;
             } else {
                 peer_landed_tokens_ += static_cast<std::uint64_t>(*landed);
@@ -238,8 +245,11 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
                 if (*landed > 0) {
                     looking->admission.storage_hold->deadline_us =
                         Deadline(peer_now_us_, config_.peer_config->host_ready_timeout_us);
+                    if (saved_base) {
+                        looking->admission.storage_base_hold = std::move(saved_base);
+                    }
                 } else {
-                    looking->admission.storage_hold.reset();
+                    looking->admission.storage_hold = std::move(saved_base);
                 }
                 request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
             } else if (waiting) {
@@ -255,6 +265,9 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
                 if (base) request->AdmissionResourcesPtr()->storage_base_hold = std::move(base);
             }
             return;
+        }
+        if (active && saved_base) {
+            active->admission.storage_hold = std::move(saved_base);
         }
     }
     if (request == nullptr) {
@@ -506,7 +519,7 @@ void Scheduler::preparePeer(Request& request) {
                                               .max_tokens = max_tokens});
     spdlog::debug("[Peer] rid={} lookup {} to {} local_tokens={} bound_tokens={}", request.Id(), lease.id, holder,
                   local, max_tokens);
-    const bool grant_host = async_host_peer_ && !submitted->admission.storage_hold;
+    const bool grant_host = async_host_peer_;
     request.Apply(fsm::StartPeerLookupEvent{lease, Deadline(peer_now_us_, limits.lookup_timeout_us)});
     if (grant_host) {
         const auto shared = request.SharedPrefixTokens();

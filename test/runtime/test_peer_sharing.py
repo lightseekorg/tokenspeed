@@ -306,8 +306,8 @@ def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeou
     assert high.host_ready_timeout_us == 10_000_000
     assert high.lookup_timeout_us == 5_000_000
 
-    # Device landing scales soft_pin without raising the 50 ms floor or
-    # exceeding HARD_PIN_S, while leaving host_ready_timeout_us == 0.
+    # Device landing scales soft_pin without dropping below the 2 s SOFT_PIN_S
+    # floor or exceeding HARD_PIN_S, while leaving host_ready_timeout_us == 0.
     dev_low = peer_scheduler_config(landing_tier="device", answer_timeout_ms=50, **base)
     assert dev_low.soft_pin_us == 2_200_000
     assert dev_low.host_ready_timeout_us == 0

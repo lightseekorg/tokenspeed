@@ -70,6 +70,11 @@ class DiskTierTuning:
         ready_timeout_ms: How long a finished prefetch is held for it.
         push_ring_mb: With peer sharing, the staging ring a peer push reads
             Disk blocks into, in MB, rounded up to whole blocks.
+        min_clean_tokens: Minimum prefix branch length (in tokens) required to
+            clean a Host tip to Disk when the branch length is known; 0 disables
+            the length filter.
+        require_reuse_for_cleaning: When True, skip cleaning Host tips that were
+            never reused after initial publication.
     """
 
     queue_depth: int = 32

@@ -310,7 +310,9 @@ impl Slots {
 
     fn give_back(&self, slot: usize) {
         self.free.lock().push(slot);
-        self.returned.notify_one();
+        // Wake every blocked waiter: a single wakeup could land on a waiter
+        // that just saw `cancelled` and returns `None` without popping.
+        self.returned.notify_all();
     }
 
     fn free_count(&self) -> usize {
@@ -1691,5 +1693,58 @@ mod tests {
         );
         assert_eq!(writer.ok_writes.load(Ordering::SeqCst), 1);
         assert_eq!(holder.push_ring_slot_counts(), Some((1, TOTAL_SLOTS)));
+    }
+
+    #[test]
+    fn slots_give_back_wakes_live_waiter_when_sibling_cancelled() {
+        let slots = Arc::new(Slots {
+            total: 1,
+            max_per_job: 1,
+            free: Mutex::new(vec![0]),
+            returned: Condvar::new(),
+        });
+        let held = slots.try_take().expect("initial single slot");
+
+        // Park multiple cancelled waiters alongside one live waiter so a single
+        // `notify_one` could land on a cancelled waiter and leave the live one
+        // asleep until its long deadline.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let live_cancel = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let mut cancelled_handles = Vec::new();
+        for _ in 0..8 {
+            let s = slots.clone();
+            let c = cancelled.clone();
+            cancelled_handles.push(thread::spawn(move || s.take(deadline, &c).is_some()));
+        }
+        let s_live = slots.clone();
+        let c_live = live_cancel.clone();
+        let live_handle = thread::spawn(move || {
+            let start = Instant::now();
+            let got = s_live.take(deadline, &c_live);
+            (got.is_some(), start.elapsed())
+        });
+
+        // Give all waiters time to enter `wait_until`.
+        thread::sleep(Duration::from_millis(40));
+        // Mark the sibling waiters cancelled without calling `wake_all`, then
+        // return the single slot via `give_back` (`notify_all`).
+        cancelled.store(true, Ordering::Release);
+        drop(held);
+
+        let (live_got, elapsed) = live_handle.join().unwrap();
+        assert!(
+            live_got,
+            "live waiter must acquire the returned slot despite cancelled siblings"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "live waiter should wake immediately on give_back, took {elapsed:?}"
+        );
+        for h in cancelled_handles {
+            assert!(!h.join().unwrap());
+        }
+        assert_eq!(slots.free_count(), 1);
     }
 }

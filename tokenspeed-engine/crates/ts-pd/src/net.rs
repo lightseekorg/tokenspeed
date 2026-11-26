@@ -242,9 +242,11 @@ impl Sockets {
         })?;
         runtime.spawn(async move {
             let mut pull = pull;
+            let mut consecutive_errors: u32 = 0;
             loop {
                 match pull.recv().await {
                     Ok(message) => {
+                        consecutive_errors = 0;
                         if incoming.send(message.into_vec()).is_err() {
                             return;
                         }
@@ -256,8 +258,20 @@ impl Sockets {
                     Err(error) => {
                         // `PullSocket::recv` already disconnects only the failing
                         // peer (e.g. a peer whose PUSH timed out and closed mid-frame);
-                        // keep serving the remaining and reconnecting peers.
-                        tracing::warn!(%error, "PD control peer disconnected with error");
+                        // keep serving the remaining and reconnecting peers. Back off
+                        // briefly on repeated errors so an unexpected non-consuming
+                        // failure cannot spin hot or flood logs.
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        tracing::warn!(
+                            %error,
+                            consecutive_errors,
+                            "PD control peer disconnected with error"
+                        );
+                        if consecutive_errors >= 2 {
+                            let delay_ms =
+                                5u64.saturating_mul(1u64 << (consecutive_errors - 2).min(5));
+                            tokio::time::sleep(Duration::from_millis(delay_ms.min(100))).await;
+                        }
                     }
                 }
             }

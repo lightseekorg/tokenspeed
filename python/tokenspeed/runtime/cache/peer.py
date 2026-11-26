@@ -121,7 +121,11 @@ def peer_scheduler_config(
     host = landing_tier == "host"
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
-    answer_timeout_s = max(0.0, answer_timeout_ms / 1000.0)
+    if answer_timeout_ms <= 0:
+        raise ValueError(
+            f"peer answer_timeout_ms must be positive, got {answer_timeout_ms}"
+        )
+    answer_timeout_s = answer_timeout_ms / 1000.0
     soft_pin_s = min(
         HARD_PIN_S,
         max(SOFT_PIN_S, (2.0 if host else 4.0) * answer_timeout_s + 2.0),

@@ -41,8 +41,25 @@ const MAX_TRANSIENT_RETRIES: u8 = 16;
 
 static LOGGED_BOUNCE_FALLBACK: AtomicBool = AtomicBool::new(false);
 
+/// Per-piece O_DIRECT capability discovered on the first I/O against each
+/// registered piece (`Chunk::buffer`):
+/// - `Unknown`: not yet probed on this worker.
+/// - `Direct`: raw `pread`/`pwrite` succeeded; any later `EFAULT` propagates as
+///   `IoError::Os(EFAULT)` without touching the caller address.
+/// - `Bounce`: the piece's first raw `O_DIRECT` I/O returned `EFAULT` (e.g.
+///   device-pinned `VM_PFNMAP`/`VM_IO` host memory registered via
+///   `Executor::start`); stage subsequent chunks for this piece through the
+///   worker's anonymous mmap bounce buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PieceIoState {
+    Unknown,
+    Direct,
+    Bounce,
+}
+
 pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize) {
     let mut bounce: Option<Memory> = None;
+    let mut piece_states: Vec<PieceIoState> = Vec::new();
     loop {
         let chunk = {
             let mut queues = shared.queues.lock();
@@ -56,7 +73,13 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize) {
                 shared.work.wait(&mut queues);
             }
         };
-        let result = transfer(file.raw_fd(), chunk, &mut bounce, max_io_bytes);
+        let result = transfer(
+            file.raw_fd(),
+            chunk,
+            &mut bounce,
+            &mut piece_states,
+            max_io_bytes,
+        );
         let finished = shared.queues.lock().finish(chunk, result);
         shared.work.notify_all();
         if let Some((done, report)) = finished {
@@ -69,38 +92,60 @@ fn transfer(
     fd: RawFd,
     chunk: Chunk,
     bounce: &mut Option<Memory>,
+    piece_states: &mut Vec<PieceIoState>,
     max_io_bytes: usize,
 ) -> Result<(), IoError> {
-    match bounce.as_ref() {
-        Some(buf) => transfer_bounced(fd, chunk, buf),
-        None => match transfer_raw(fd, chunk) {
+    let piece_idx = usize::from(chunk.buffer);
+    if piece_idx >= piece_states.len() {
+        piece_states.resize(piece_idx + 1, PieceIoState::Unknown);
+    }
+    match piece_states[piece_idx] {
+        PieceIoState::Direct => transfer_raw(fd, chunk),
+        PieceIoState::Bounce => {
+            let buf = ensure_bounce(bounce, max_io_bytes.max(chunk.len))?;
+            transfer_bounced(fd, chunk, buf)
+        }
+        PieceIoState::Unknown => match transfer_raw(fd, chunk) {
+            Ok(()) => {
+                piece_states[piece_idx] = PieceIoState::Direct;
+                Ok(())
+            }
             Err(IoError::Os(libc::EFAULT)) => {
+                // Only pieces that fail their very first raw O_DIRECT I/O with
+                // EFAULT switch to bounce staging; callers of `Executor::start`
+                // guarantee every registered piece is CPU-mapped until `close`.
                 let buf_size = max_io_bytes.max(chunk.len);
-                match Memory::map(buf_size) {
-                    Ok(buf) => {
-                        if !LOGGED_BOUNCE_FALLBACK.swap(true, Ordering::Relaxed) {
-                            tracing::warn!(
-                                bounce_bytes = buf_size,
-                                "psync O_DIRECT hit EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
-                                 staging through per-worker anonymous mmap bounce buffer"
-                            );
-                        }
-                        let res = transfer_bounced(fd, chunk, &buf);
-                        *bounce = Some(buf);
-                        res
-                    }
-                    Err(err) => Err(IoError::Os(err.raw_os_error().unwrap_or(libc::ENOMEM))),
+                let buf = ensure_bounce(bounce, buf_size)?;
+                if !LOGGED_BOUNCE_FALLBACK.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        bounce_bytes = buf_size,
+                        piece = piece_idx,
+                        "psync O_DIRECT hit EFAULT on first access (device-pinned VM_PFNMAP/VM_IO memory); \
+                         staging piece through per-worker anonymous mmap bounce buffer"
+                    );
                 }
+                piece_states[piece_idx] = PieceIoState::Bounce;
+                transfer_bounced(fd, chunk, buf)
             }
             other => other,
         },
     }
 }
 
+fn ensure_bounce(bounce: &mut Option<Memory>, min_bytes: usize) -> Result<&Memory, IoError> {
+    if bounce.as_ref().is_none_or(|b| b.size() < min_bytes) {
+        let mapped = Memory::map(min_bytes)
+            .map_err(|err| IoError::Os(err.raw_os_error().unwrap_or(libc::ENOMEM)))?;
+        *bounce = Some(mapped);
+    }
+    Ok(bounce.as_ref().expect("just initialized"))
+}
+
 fn transfer_bounced(fd: RawFd, chunk: Chunk, bounce: &Memory) -> Result<(), IoError> {
     debug_assert!(chunk.len <= bounce.size());
     if chunk.direction == Direction::Write {
-        // SAFETY: source is caller's mapped memory; dest is worker-owned bounce buffer.
+        // SAFETY: `Executor::start` requires every registered piece to stay
+        // CPU-readable until `Executor::close` returns; `bounce` is worker-owned.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 chunk.address as *const u8,
@@ -115,7 +160,8 @@ fn transfer_bounced(fd: RawFd, chunk: Chunk, bounce: &Memory) -> Result<(), IoEr
     };
     transfer_raw(fd, bounce_chunk)?;
     if chunk.direction == Direction::Read {
-        // SAFETY: bounce holds the bytes read from disk; dest is caller's mapped memory.
+        // SAFETY: `bounce` holds the bytes read from disk; `Executor::start`
+        // requires every registered piece to stay CPU-writable until `close`.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bounce.address() as *const u8,
@@ -186,4 +232,103 @@ fn transfer_raw(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct ScratchFile(PathBuf);
+    impl ScratchFile {
+        fn new(name: &str) -> Self {
+            let dir = std::env::var_os("TS_DISK_TEST_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            Self(dir.join(format!("ts-disk-psync-{}-{name}", std::process::id())))
+        }
+    }
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn transfer_bounced_roundtrips_aligned_write_and_read() {
+        let scratch = ScratchFile::new("bounce-rt");
+        let len = ALIGNMENT * 4;
+        let file = DiskFile::create(&scratch.0, len as u64).unwrap();
+        let mut src = Memory::map(len).unwrap();
+        let dst = Memory::map(len).unwrap();
+        let pattern: Vec<u8> = (0..len)
+            .map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8)
+            .collect();
+        src.write_at(0, &pattern);
+
+        let mut bounce = None;
+        let mut states = vec![PieceIoState::Bounce];
+        let write_chunk = Chunk {
+            job: 1,
+            direction: Direction::Write,
+            file_offset: 0,
+            address: src.address(),
+            len,
+            buffer: 0,
+        };
+        transfer(file.raw_fd(), write_chunk, &mut bounce, &mut states, len).unwrap();
+        assert!(bounce.is_some());
+
+        let read_chunk = Chunk {
+            job: 2,
+            direction: Direction::Read,
+            file_offset: 0,
+            address: dst.address(),
+            len,
+            buffer: 0,
+        };
+        transfer(file.raw_fd(), read_chunk, &mut bounce, &mut states, len).unwrap();
+        let mut out = vec![0u8; len];
+        dst.read_at(0, &mut out);
+        assert_eq!(out, pattern);
+    }
+
+    #[test]
+    fn direct_piece_propagates_efault_without_bouncing() {
+        let scratch = ScratchFile::new("direct-efault");
+        let len = ALIGNMENT;
+        let file = DiskFile::create(&scratch.0, len as u64).unwrap();
+        let mut valid = Memory::map(len).unwrap();
+        valid.write_at(0, &vec![0xabu8; len]);
+
+        let mut bounce = None;
+        let mut states = Vec::new();
+        // First I/O on piece 0 succeeds and marks piece 0 Direct.
+        let ok_chunk = Chunk {
+            job: 1,
+            direction: Direction::Write,
+            file_offset: 0,
+            address: valid.address(),
+            len,
+            buffer: 0,
+        };
+        transfer(file.raw_fd(), ok_chunk, &mut bounce, &mut states, len).unwrap();
+        assert_eq!(states, vec![PieceIoState::Direct]);
+        assert!(bounce.is_none());
+
+        // A later EFAULT on a Direct piece (e.g. invalid address) must return
+        // Os(EFAULT) cleanly without trying to copy into a bounce buffer.
+        let bad_chunk = Chunk {
+            job: 2,
+            direction: Direction::Write,
+            file_offset: 0,
+            address: ALIGNMENT, // unmapped low address
+            len,
+            buffer: 0,
+        };
+        let err = transfer(file.raw_fd(), bad_chunk, &mut bounce, &mut states, len).unwrap_err();
+        assert_eq!(err, IoError::Os(libc::EFAULT));
+        assert!(bounce.is_none());
+    }
 }
