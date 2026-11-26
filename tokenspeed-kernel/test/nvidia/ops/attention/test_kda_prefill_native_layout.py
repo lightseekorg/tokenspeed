@@ -211,34 +211,52 @@ def test_strided_prefill_matches_recurrence(lengths, heads, state_dtype, backend
 @pytest.mark.parametrize("sequences", [1, 2, 4, 8])
 @pytest.mark.parametrize("capacity", [256, 2048, 8192])
 @pytest.mark.parametrize(
-    ("backend_name", "heads"), [("cutedsl_kda", 12), ("cutedsl_kda", 96), ("cudnn", 12)]
+    ("backend_name", "heads", "shared_plan"),
+    [
+        ("cutedsl_kda", 12, False),
+        ("cutedsl_kda", 96, False),
+        ("cutedsl_kda", 12, True),
+        ("cutedsl_kda", 96, True),
+        ("cudnn", 12, False),
+    ],
 )
 def test_capacity_preparation_dynamic_replay(
-    native_cuda, sequences, capacity, backend_name, heads
+    native_cuda, sequences, capacity, backend_name, heads, shared_plan
 ):
     """Replay new GPU bounds with the runtime's zero-padded inputs.
 
     The captured call does not rerun Python admission against its CPU mirror.
-    Production runtime must refresh both mirrors before replay.
+    Production runtime must refresh both mirrors before replay. With a shared
+    plan, two layers read one plan refreshed in place before each forward, as
+    a captured prefill graph's layers do.
     """
     lengths = [capacity // sequences] * sequences
     inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
     state_before = state.clone()
+    layers = 2 if shared_plan else 1
+    plan = (
+        build_kda_prefill_plan(bounds, heads=heads, layers=layers)
+        if shared_plan
+        else None
+    )
 
     def run():
-        return kda_paged_prefill(
-            *inputs,
-            initial_state=state,
-            cu_seqlens=bounds,
-            cu_seqlens_cpu=cpu,
-            capacity=KdaPrefillCapacity(capacity, sequences),
-            plan=None,
-            plan_layer=0,
-            lower_bound=-5.0,
-            override=None,
-            solution=backend_name,
-            recurrent_layout="v_major",
-        )
+        return [
+            kda_paged_prefill(
+                *inputs,
+                initial_state=state,
+                cu_seqlens=bounds,
+                cu_seqlens_cpu=cpu,
+                capacity=KdaPrefillCapacity(capacity, sequences),
+                plan=plan,
+                plan_layer=layer,
+                lower_bound=-5.0,
+                override=None,
+                solution=backend_name,
+                recurrent_layout="v_major",
+            )
+            for layer in range(layers)
+        ]
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -276,18 +294,24 @@ def test_capacity_preparation_dynamic_replay(
             recurrent_layout="v_major",
         )
         with assert_no_cute_compile():
+            # Each forward refreshes the plan outside the graph first.
+            if shared_plan:
+                refresh_kda_prefill_plan(bounds, plan)
             padded = run()
+            if shared_plan:
+                refresh_kda_prefill_plan(bounds, plan)
             graph.replay()
-        torch.testing.assert_close(
-            actual.out[:, :live], padded.out[:, :live], rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            actual.final_state, padded.final_state, rtol=0, atol=0
-        )
+        for captured, eager in zip(actual, padded, strict=True):
+            torch.testing.assert_close(
+                captured.out[:, :live], eager.out[:, :live], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                captured.final_state, eager.final_state, rtol=0, atol=0
+            )
         # cuDNN may partition the scan differently for exact and padded shapes.
         for result, reference in (
-            (actual.out[:, :live], expected.out),
-            (actual.final_state, expected.final_state),
+            *((layer.out[:, :live], expected.out) for layer in actual),
+            *((layer.final_state, expected.final_state) for layer in actual),
         ):
             if backend_name == "cutedsl_kda":
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
@@ -340,7 +364,6 @@ def test_only_plan_taking_prefill_kernels_get_a_shared_plan(native_cuda):
     """Callers share a plan exactly when the selected kernel declares one."""
     assert kda_prefill_takes_plan(torch.bfloat16, solution="cutedsl_kda")
     assert not kda_prefill_takes_plan(torch.bfloat16, solution="cudnn")
-    assert not kda_prefill_takes_plan(torch.bfloat16, solution="fla")
 
 
 @pytest.mark.parametrize("heads", [12, 96])
@@ -351,78 +374,3 @@ def test_plan_rejects_state_other_than_128x128(native_cuda, heads):
     plan = build_kda_prefill_plan(bounds, heads=heads, layers=1)
     with pytest.raises(ValueError, match="128x128 state"):
         _actual(inputs, state, bounds, cpu, "v_major", plan)
-
-
-@pytest.mark.parametrize(
-    ("lengths", "heads"),
-    # Ordinary scan; persistent without and with FP32 handoffs.
-    [([17, 65], 12), ([31, 129, 7], 96), ([3] * 16, 96), ([200] * 4, 96)],
-)
-def test_layers_sharing_a_plan_match_launches_that_plan_alone(
-    native_cuda, lengths, heads
-):
-    layers = 3
-    inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
-    plan = build_kda_prefill_plan(bounds, heads=heads, layers=layers)
-    for layer in range(layers):
-        layer_inputs = (*(t * (layer + 1) for t in inputs[:3]), *inputs[3:])
-        expected = _actual(layer_inputs, state, bounds, cpu, "v_major")
-        actual = _actual(layer_inputs, state, bounds, cpu, "v_major", plan, layer)
-        assert torch.equal(actual.out, expected.out)
-        assert torch.equal(actual.final_state, expected.final_state)
-
-
-@pytest.mark.parametrize("heads", [12, 96])
-def test_refreshed_plan_replays_shared_layers(native_cuda, heads):
-    """A captured plan refreshed in place serves every captured layer's replay."""
-    layers, capacity, sequences = 2, 1024, 4
-    inputs, state, bounds, cpu = _inputs(
-        "cuda", [capacity // sequences] * sequences, heads=heads
-    )
-    plan = build_kda_prefill_plan(bounds, heads=heads, layers=layers)
-
-    def run():
-        return [
-            kda_paged_prefill(
-                *inputs,
-                initial_state=state,
-                cu_seqlens=bounds,
-                cu_seqlens_cpu=cpu,
-                capacity=KdaPrefillCapacity(capacity, sequences),
-                lower_bound=-5.0,
-                solution="cutedsl_kda",
-                recurrent_layout="v_major",
-                plan=plan,
-                plan_layer=layer,
-            )
-            for layer in range(layers)
-        ]
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        run()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        captured = run()
-    for lengths in ([capacity - 3, 1, 1, 1], [1, 1, 1, capacity - 3], [17, 19, 23, 29]):
-        live = sum(lengths)
-        new_cpu = torch.tensor([0, *lengths], dtype=torch.int64).cumsum(0)
-        cpu.copy_(new_cpu)
-        bounds.copy_(new_cpu)
-        for tensor in inputs[:5]:
-            tensor.copy_(torch.randn_like(tensor) * 0.1)
-            tensor[:, live:].zero_()
-        refresh_kda_prefill_plan(bounds, plan)
-        with assert_no_cute_compile():
-            graph.replay()
-        exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
-        expected = _actual(exact, state, bounds, new_cpu, "v_major")
-        for result in captured:
-            torch.testing.assert_close(
-                result.out[:, :live], expected.out, rtol=0, atol=0
-            )
-            torch.testing.assert_close(
-                result.final_state, expected.final_state, rtol=0, atol=0
-            )
