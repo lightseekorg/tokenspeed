@@ -879,7 +879,8 @@ class LongcatFlashNgramForCausalLM(LongcatFlashForCausalLM):
             cache_family="mla",
             linear_attention=None,
             default_attention_backend=None,
-            default_prefix_granularity=None,
+            # upstream 73ab3056 (#2830) removed default_prefix_granularity:
+            # the cache recipe now owns the prefix grain (MLA ordinary = 64).
             request_token_history=True,
             is_multimodal=False,
             tokenizer_kwargs={},
