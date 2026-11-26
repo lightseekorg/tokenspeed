@@ -103,6 +103,19 @@ impl Attempt {
             frozen: false,
         }
     }
+    /// Once all DMA is retired and the business deadline has passed, only the
+    /// exact RELEASE needs to survive. Never detach a Reading/frozen attempt.
+    pub fn take_pending_release(&mut self, now: i64) -> Option<Message> {
+        let Phase::Closing(disposition) = self.phase else {
+            return None;
+        };
+        if !self.published || now < self.deadline {
+            return None;
+        }
+        let release = Message::Release(self.key.take()?, self.offer.take()?.id, disposition);
+        self.phase = Phase::Finished;
+        Some(release)
+    }
     pub fn finished(&self) -> bool {
         self.phase == Phase::Finished
     }
@@ -611,6 +624,23 @@ mod verification {
             assert_eq!(round.events.len(), 1);
             assert_eq!(round.events[0].num_tokens, 0);
         }
+    }
+
+    #[test]
+    fn only_a_retired_business_fallback_can_detach_an_exact_release() {
+        let (mut a, _, _) = granted_candidate();
+        let mut round = PeerRound::default();
+        a.freeze(&mut round);
+        assert!(a.take_pending_release(i64::MAX).is_none());
+
+        let (mut a, _, _) = granted_candidate();
+        let release = a.close(Disposition::Abort, 10);
+        assert!(a.take_pending_release(i64::MAX).is_none());
+        a.tick(None, None, 2_000_010, &mut round);
+        assert!(a.take_pending_release(2_000_009).is_none());
+        assert_eq!(a.take_pending_release(2_000_010), Some(release));
+        assert!(a.finished());
+        assert!(a.take_pending_release(i64::MAX).is_none());
     }
 
     #[test]

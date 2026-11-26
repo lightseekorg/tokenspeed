@@ -196,6 +196,7 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     if (config_.peer_config && config_.peer_config->versioned_shards) {
         auto attempt = peer_target_attempts_.find(event.request_id);
         if (attempt == peer_target_attempts_.end() || attempt->second != event.lease) return;
+        // A frozen landing can publish only a fallback, never readable tokens.
         if (event.frozen && event.num_tokens != 0) return;
         peer_target_attempts_.erase(attempt);
         if (!event.frozen) RetirePeerTarget(event.lease);
@@ -582,6 +583,11 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         if (!prefillAllowed(*request, build)) {
             return;
         }
+        // A reused request id must not displace an older landing awaiting retirement.
+        if (peer_target_attempts_.contains(request->Id())) {
+            submitted->admission.peer_hit.reset();
+            continue;
+        }
         fsm::PeerHit hit = *submitted->admission.peer_hit;
         std::size_t path = 0;
         double nominal_us = 0;
@@ -668,7 +674,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
 
         const auto& landing = *request->GetIf<fsm::PeerLanding>();
         if (config_.peer_config->versioned_shards) {
-            peer_target_attempts_.insert_or_assign(request->Id(), hit.lease);
+            peer_target_attempts_.emplace(request->Id(), hit.lease);
             auto& holds = peer_target_holds_[hit.lease];
             for (const auto& table : landing.resources.block_tables) {
                 for (const auto& block : table.Blocks())

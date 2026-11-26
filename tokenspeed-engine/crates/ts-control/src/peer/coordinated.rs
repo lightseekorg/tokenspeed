@@ -105,6 +105,69 @@ impl Report {
     }
 }
 
+/// Timed-out closes retain only the message, never a lookup, layout or landing.
+#[derive(Default)]
+struct PendingReleases {
+    holders: HashMap<String, HolderReleases>,
+}
+struct HolderReleases {
+    messages: BTreeMap<u64, Message>,
+    retry_us: i64,
+    last_sent: u64,
+}
+
+impl PendingReleases {
+    fn insert(&mut self, release: Message, now: i64) {
+        let Message::Release(key, _, _) = &release else {
+            unreachable!()
+        };
+        let holder = self.holders.entry(key.holder.name.clone()).or_insert_with(|| {
+            tracing::warn!(holder = %key.holder.name, "peer close unconfirmed; pausing new lookups to holder");
+            HolderReleases { messages: BTreeMap::new(), last_sent: 0, retry_us: now.saturating_add(1_000_000) }
+        });
+        holder.messages.insert(key.lease, release);
+    }
+    fn retry(&mut self, now: i64, outgoing: &mut Vec<Message>) {
+        for holder in self.holders.values_mut() {
+            if now >= holder.retry_us {
+                // Rotate so an unreachable lease cannot monopolize this endpoint.
+                use std::ops::Bound::{Excluded, Unbounded};
+                let next = holder
+                    .messages
+                    .range((Excluded(holder.last_sent), Unbounded))
+                    .next()
+                    .or_else(|| holder.messages.first_key_value());
+                if let Some((&id, release)) = next {
+                    outgoing.push(release.clone());
+                    holder.last_sent = id;
+                }
+                holder.retry_us = now.saturating_add(if holder.messages.len() == 1 {
+                    5_000_000
+                } else {
+                    100_000
+                });
+            }
+        }
+    }
+    fn ack(&mut self, key: &Key, offer: u64, disposition: Disposition, closure: Closure) -> bool {
+        if closure == Closure::Unknown {
+            return false;
+        }
+        let Some(holder) = self.holders.get_mut(&key.holder.name) else {
+            return false;
+        };
+        if !matches!(holder.messages.get(&key.lease), Some(Message::Release(k, id, d)) if k == key && *id == offer && *d == disposition)
+        {
+            return false;
+        }
+        holder.messages.remove(&key.lease);
+        if holder.messages.is_empty() {
+            self.holders.remove(&key.holder.name);
+        }
+        true
+    }
+}
+
 pub(super) struct Control {
     pub layout: Arc<Replica>,
     rank: usize,
@@ -113,6 +176,8 @@ pub(super) struct Control {
     known: HashMap<String, (Generation, Arc<Replica>)>,
     attempts: BTreeMap<u64, Attempt>,
     offers: Offers,
+    pending_releases: PendingReleases,
+    cap_warn_after_us: i64,
     votes: Vec<Vote>,
     proposals: Vec<(i64, Message, Message)>,
     fences: VecDeque<Vec<u64>>,
@@ -146,6 +211,8 @@ impl Control {
                 known: HashMap::new(),
                 attempts: BTreeMap::new(),
                 offers: Offers::new(device_pin_gate),
+                pending_releases: PendingReleases::default(),
+                cap_warn_after_us: 0,
                 votes: Vec::new(),
                 proposals: Vec::new(),
                 fences: VecDeque::new(),
@@ -220,7 +287,14 @@ impl Control {
         }
         for q in lookups {
             let id = q.lease.id;
-            if !self.admission || self.attempts.len() >= 4096 {
+            if !self.admission || self.pending_releases.holders.contains_key(&q.holder) {
+                continue;
+            }
+            if self.attempts.len() >= 4096 {
+                if self.rank == 0 && now >= self.cap_warn_after_us {
+                    tracing::warn!("peer attempt limit reached; falling back to local prefill");
+                    self.cap_warn_after_us = now.saturating_add(60_000_000);
+                }
                 continue;
             }
             let target = q.holder.clone();
@@ -361,6 +435,14 @@ impl Control {
             Message::Ack(k, id, d, c) => {
                 if let Some(a) = self.attempts.get_mut(&k.lease) {
                     a.ack(k, *id, *d, *c, round);
+                } else if self.pending_releases.ack(k, *id, *d, *c)
+                    && *c == Closure::Stale
+                    && self
+                        .known
+                        .get(&k.holder.name)
+                        .is_some_and(|(g, _)| g == &k.holder)
+                {
+                    self.known.remove(&k.holder.name);
                 }
             }
             _ => (),
@@ -378,6 +460,8 @@ impl Control {
         }
         let first = &mut reports[0];
         let retirement_bound_ms = first.retirement_bound_ms;
+        // Coordinated rounds share rank zero's reported clock. Use it for both
+        // proposal timestamps and expiry, even if member process origins differ.
         let now = round.now_us;
         for (issued_at, q, a) in first.proposals.drain(..) {
             if self.rank == 0 {
@@ -439,13 +523,67 @@ impl Control {
                 outgoing.push(m);
             }
         }
+        self.attempts.retain(|_, attempt| {
+            if let Some(release) = attempt.take_pending_release(now) {
+                self.pending_releases.insert(release, now);
+            }
+            !attempt.finished()
+        });
+        self.pending_releases.retry(now, &mut outgoing);
         for m in outgoing {
             self.send(m);
         }
-        self.attempts.retain(|_, a| !a.finished());
         self.votes
             .extend(self.offers.expire(now, retirement_bound_ms, s));
         round.events.append(&mut self.missing);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_releases_retry_fairly_and_only_matching_terminal_acks_unblock_a_holder() {
+        let generation = |name: &str| Generation {
+            name: name.into(),
+            incarnation: 1,
+            epoch: 1,
+        };
+        let key = Key {
+            reader: generation("reader"),
+            holder: generation("offline"),
+            lease: 1,
+        };
+        let second = Key {
+            lease: 2,
+            ..key.clone()
+        };
+        let disposition = Disposition::Abort;
+        let first_release = Message::Release(key.clone(), 11, disposition);
+        let second_release = Message::Release(second.clone(), 12, disposition);
+        let mut pending = PendingReleases::default();
+        pending.insert(first_release.clone(), 0);
+        pending.insert(second_release.clone(), 0);
+        assert!(!pending.holders.contains_key("healthy"));
+        let mut out = Vec::new();
+        for now in [0, 1_000_000, 1_000_001, 1_100_000, 1_200_000] {
+            pending.retry(now, &mut out);
+        }
+        assert_eq!(
+            out,
+            vec![first_release.clone(), second_release, first_release]
+        );
+        assert!(!pending.ack(&key, 12, disposition, Closure::Closed));
+        assert!(!pending.ack(&key, 11, disposition, Closure::Unknown));
+        assert!(!pending.ack(&key, 11, Disposition::Complete, Closure::Closed));
+        let mut stale_key = key.clone();
+        stale_key.holder.epoch += 1;
+        assert!(!pending.ack(&stale_key, 11, disposition, Closure::Closed));
+        assert!(pending.ack(&second, 12, disposition, Closure::Stale));
+        assert!(pending.holders.contains_key("offline"));
+        assert!(pending.ack(&key, 11, disposition, Closure::Closed));
+        assert!(pending.holders.is_empty());
     }
 }

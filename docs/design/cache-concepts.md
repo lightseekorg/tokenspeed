@@ -40,6 +40,14 @@ If the backend has no verified bound, leave the setting unset: a granted
 source remains pinned pending explicit closure. A timeout for polling one
 Mooncake batch alone does not establish the bound. No heartbeats extend it.
 
+After all reader members have retired their reads, a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement keeps the original landing frozen and cannot enter this retry path.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)

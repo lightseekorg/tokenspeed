@@ -343,3 +343,165 @@ impl<'a> PeerReadPlan<'a> {
         Ok(batches)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::geometry::DeviceField;
+    use serde_json::json;
+
+    fn contract(width: usize) -> Contract {
+        let heads = 8 / width;
+        let wire = json!({
+            "plan": {"prefix_granularity": 4, "num_lcm_blocks": 16, "lcm_block_bytes": 4 + heads,
+                "groups": [
+                    {"group_id":"kv","cache_blocks_per_lcm_block":1,"page_count":17},
+                    {"group_id":"state","cache_blocks_per_lcm_block":1,"page_count":17}],
+                "planes": [
+                    {"plane_id":"kv","bytes_per_lcm_block":4,"arena_offset_bytes":0},
+                    {"plane_id":"state","bytes_per_lcm_block":heads,"arena_offset_bytes":1024}],
+                "fields": [
+                    {"group_id":"kv","field_id":"layer.0.kv","plane_id":"kv","shape":[4,1],
+                     "dtype":"uint8","field_offset_bytes":0,"page_stride_bytes":4},
+                    {"group_id":"state","field_id":"layer.1.recurrent_state","plane_id":"state","shape":[heads,1],
+                     "dtype":"uint8","field_offset_bytes":0,"page_stride_bytes":heads}],
+                "resident_block_bytes":null},
+            "group_specs":[
+                {"group_id":"kv","attn_kind":"full_history","rows_per_page":4,"entry_stride_tokens":1,
+                 "sliding_window_tokens":null,"replayable":false,"transfer_policy":"full_suffix","shard_count":width},
+                {"group_id":"state","attn_kind":"state","rows_per_page":null,"entry_stride_tokens":null,
+                 "sliding_window_tokens":null,"replayable":false,"transfer_policy":"latest_snapshot","shard_count":1}],
+            "transfer_schema":{"fields":[{"field_id":"layer.1.recurrent_state",
+                "partition":{"axis":0,"global_extent":8,"global_parts":[]}}]},"field_addresses":null
+        });
+        Contract::from_wire(wire.to_string().as_bytes()).unwrap()
+    }
+
+    fn page(group_id: u32, slot: i32, block_id: i32) -> PeerPageView {
+        PeerPageView {
+            group_id,
+            slot,
+            block_id,
+            tier: PeerTier::Device,
+        }
+    }
+
+    fn geometry(width: u64) -> RankGeometry {
+        let field = |group_id, id: &str, address, bytes| DeviceField {
+            group_id,
+            field_id: id.into(),
+            address,
+            bytes,
+            page_stride: bytes,
+        };
+        RankGeometry {
+            session: "test".into(),
+            host: None,
+            push: None,
+            device: vec![
+                field(0, "layer.0.kv", 100, 4),
+                field(1, "layer.1.recurrent_state", 200, 8 / width),
+            ],
+        }
+    }
+
+    #[test]
+    fn interval_requires_each_history_slot_and_one_state_snapshot() {
+        let layout = contract(8);
+        let pages = [page(0, 1, 1), page(0, 2, 2), page(1, 1, 1)];
+        assert!(covers_interval(&layout, 5, 10, &pages));
+        assert!(!covers_interval(&layout, 5, 10, &pages[..2]));
+        assert!(!covers_interval(&layout, 5, 10, &[pages[0], pages[2]]));
+        assert!(!covers_interval(
+            &layout,
+            5,
+            10,
+            &[pages[0], pages[0], pages[2]]
+        ));
+    }
+
+    #[test]
+    fn cross_layout_reads_cover_owned_pages_and_the_exact_state_head() {
+        let (src, dst) = (contract(1), contract(8));
+        let (sg, dg) = (geometry(1), geometry(8));
+        let endpoint = |geometry| ReadEndpoint {
+            geometry,
+            host_virtual_bounds: &[],
+            regions: &[(100, 150)],
+        };
+        let pages = [
+            (page(0, 0, 3), page(0, 0, 6)),
+            (page(1, 1, 1), page(1, 1, 1)),
+        ];
+        for reader in 0..8 {
+            let plan = PeerReadPlan::new(&src, &dst, 1, 8, reader).unwrap();
+            let spans = &plan
+                .reads(&[endpoint(&sg)], &endpoint(&dg), &pages)
+                .unwrap()[&0];
+            let mut actual: Vec<_> = spans
+                .sources
+                .iter()
+                .copied()
+                .zip(spans.destinations.iter().copied())
+                .zip(spans.lengths.iter().copied())
+                .collect();
+            actual.sort_unstable();
+            let mut expected = vec![((208 + reader as u64, 201), 1)];
+            if reader == 5 {
+                expected.insert(0, ((112, 104), 4));
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_coverage_registration_and_alias_are_rejected_before_read() {
+        let (src, dst) = (contract(1), contract(8));
+        let (sg, mut dg) = (geometry(1), geometry(8));
+        let source = ReadEndpoint {
+            geometry: &sg,
+            host_virtual_bounds: &[],
+            regions: &[(100, 150)],
+        };
+        let pages = [
+            (page(0, 0, 1), page(0, 0, 1)),
+            (page(1, 1, 1), page(1, 1, 1)),
+        ];
+        let mut plan = PeerReadPlan::new(&src, &dst, 1, 8, 0).unwrap();
+        let end = |g, regions| ReadEndpoint {
+            geometry: g,
+            host_virtual_bounds: &[],
+            regions,
+        };
+        // The KV field fits, but the registered state range ends one byte early.
+        assert!(plan
+            .reads(
+                std::slice::from_ref(&source),
+                &end(&dg, &[(100, 101)]),
+                &pages
+            )
+            .is_err());
+        let short = ReadEndpoint {
+            geometry: &sg,
+            host_virtual_bounds: &[],
+            regions: &[(100, 108)],
+        };
+        assert!(plan
+            .reads(&[short], &end(&dg, &[(100, 150)]), &pages)
+            .is_err());
+        dg.device[1].address = 103;
+        let alias = ReadEndpoint {
+            geometry: &dg,
+            host_virtual_bounds: &[],
+            regions: &[(100, 150)],
+        };
+        assert!(plan
+            .reads(std::slice::from_ref(&source), &alias, &pages)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        // Shorten a planned fragment, leaving the last byte of the owned KV page uncovered.
+        plan.groups[0][0].1.bytes_per_row = 0;
+        assert!(plan.reads(&[source], &alias, &pages[..1]).is_err());
+    }
+}
