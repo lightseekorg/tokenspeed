@@ -1323,9 +1323,11 @@ impl Holder {
 
 impl HolderState {
     /// Runs one push to its end: every block read into a slot and written to
-    /// the reader, unless the arrival-anchored `deadline` passes, the reader
-    /// cancels or an I/O fails. Reports whether every block landed, or whether
-    /// an RDMA write error left remote write retirement unknown.
+    /// the reader, unless `deadline` passes (arrival-anchored `arrived + budget`
+    /// for legacy pushes, and clamped to `activated_at + offer_push_deadline`
+    /// for offer-bound `PUSH_V2` pushes), the reader cancels, or an I/O fails.
+    /// Reports whether every block landed, or whether an RDMA write error left
+    /// remote write retirement unknown.
     fn run(
         &self,
         session: &str,
@@ -3965,26 +3967,27 @@ mod tests {
             calls: AtomicUsize::new(0),
             delay: Duration::from_millis(60),
         });
+        let make_source = || PushSource {
+            executor: executor.clone(),
+            disk_layout: HostLayout {
+                groups: vec![ts_l3::GroupLayout {
+                    packing: 1,
+                    block_bytes: BLOCK,
+                    shard_count: 1,
+                }],
+                lcm_block_bytes: BLOCK,
+                num_lcm_blocks: 2,
+                owner_rank: 0,
+                tp_rank: 0,
+            },
+            writer: writer.clone(),
+            ring: ring.clone(),
+            slot_bytes: BLOCK,
+        };
         let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 302).unwrap();
         holder
             .serve_with_offer_windows(
-                PushSource {
-                    executor,
-                    disk_layout: HostLayout {
-                        groups: vec![ts_l3::GroupLayout {
-                            packing: 1,
-                            block_bytes: BLOCK,
-                            shard_count: 1,
-                        }],
-                        lcm_block_bytes: BLOCK,
-                        num_lcm_blocks: 2,
-                        owner_rank: 0,
-                        tp_rank: 0,
-                    },
-                    writer: writer.clone(),
-                    ring,
-                    slot_bytes: BLOCK,
-                },
+                make_source(),
                 Duration::from_millis(80),
                 Duration::from_millis(120),
             )
@@ -4031,9 +4034,18 @@ mod tests {
             "stalled-TCP Push arriving past offer accept window must not execute any RDMA write"
         );
 
-        // 2. Activate offer 11 and submit a multi-block push with a huge 10s
-        //    budget; execution must be capped by `offer_push_deadline` (120ms)
-        //    so it aborts long before the 10s wire budget elapses.
+        // 2. Re-serve with a generous accept window (10s) and tight
+        //    `offer_push_deadline` (120ms), activate offer 11, and submit a
+        //    multi-block push with a huge 10s wire budget; the push must be
+        //    accepted (writing >= 1 block) and then aborted by the activation-
+        //    anchored execution cap long before the 10s wire budget elapses.
+        holder
+            .serve_with_offer_windows(
+                make_source(),
+                Duration::from_secs(10),
+                Duration::from_millis(120),
+            )
+            .unwrap();
         holder.activate_offer(600, 11);
         let started = Instant::now();
         let capped_push = Message::Push {
@@ -4054,9 +4066,10 @@ mod tests {
             "offer_push_deadline must cap execution well below the 10s wire budget (elapsed {:?})",
             started.elapsed()
         );
+        let calls = writer.calls.load(Ordering::SeqCst);
         assert!(
-            writer.calls.load(Ordering::SeqCst) < 20,
-            "capped push must stop submitting RDMA writes once offer_push_deadline elapses"
+            (1..20).contains(&calls),
+            "capped push must start writing (>= 1) then stop before all 20 blocks once offer_push_deadline elapses (got {calls})"
         );
     }
 }
