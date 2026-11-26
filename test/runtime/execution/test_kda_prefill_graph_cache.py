@@ -389,6 +389,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
     )
+    from tokenspeed_kernel.ops.attention.kda import kda_prefill_takes_plan
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     from tokenspeed.runtime.execution.forward_batch_info import (
@@ -429,6 +430,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         cache_pool=object(),
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
+        # As _publish_cache_pool: only a plan-taking kernel gets a shared plan.
+        _prefill_takes_plan=kda_prefill_takes_plan(
+            torch.bfloat16, solution=backend_name
+        ),
     )
     backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
