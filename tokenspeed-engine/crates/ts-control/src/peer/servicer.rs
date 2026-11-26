@@ -25,12 +25,16 @@
 
 use std::{
     collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use ts_scheduler::{
     PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView,
-    Scheduler,
+    PeerTier, Scheduler,
 };
 
 use crate::peer::{
@@ -101,9 +105,25 @@ struct Record {
     expires: Instant,
 }
 
+/// Shared with the control thread, which closes this gate while holding the
+/// scheduler lock, before its new Device publications become visible.
+#[derive(Default)]
+pub(super) struct DevicePinGate(AtomicBool);
+
+impl DevicePinGate {
+    pub(super) fn block(&self, blocked: bool) {
+        self.0.store(blocked, Ordering::Release);
+    }
+
+    pub(super) fn allows(&self, pages: &[PeerPageView]) -> bool {
+        !self.0.load(Ordering::Acquire) || pages.iter().all(|page| page.tier != PeerTier::Device)
+    }
+}
+
 /// The holder's half: answers, the leases' records and the queued changes.
 pub struct Holder {
     pub(super) metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    pub(super) device_pin_gate: Arc<DevicePinGate>,
     stamp: Stamp,
     ranks: Vec<RankGeometry>,
     records: HashMap<PeerLeaseView, Record>,
@@ -118,6 +138,7 @@ impl Holder {
     pub fn new(stamp: Stamp, ranks: Vec<RankGeometry>, record_lifetime: Duration) -> Self {
         Self {
             metrics: None,
+            device_pin_gate: Arc::default(),
             stamp,
             ranks,
             records: HashMap::new(),
@@ -181,6 +202,7 @@ impl Holder {
                     answer.num_tokens = looked_up.num_tokens;
                     answer.pages = looked_up.pages.clone();
                     answer.held = looked_up.num_tokens > 0
+                        && self.device_pin_gate.allows(&looked_up.pages)
                         && cache.pages_match(
                             &record.lookup,
                             looked_up.num_tokens,

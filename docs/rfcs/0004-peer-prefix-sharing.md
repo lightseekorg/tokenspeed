@@ -527,7 +527,9 @@ soft lease has expired, the holder resolves the same checkpoint and acquires
 references in the same exchange. The reader checks the holder incarnation,
 namespace, prefix length and full source-page mapping against the lookup
 and its writable grant before issuing DMA. Eviction or a changed mapping
-falls back to local prefill without a second lookup.
+falls back to local prefill without a second lookup. While the holder has
+unretired replay work, both ordinary and checkpoint PINs reject any mapping
+containing Device pages. Host-only mappings remain eligible.
 
 Coordinated replicas keep their existing namespace. Independent Host and Device
 replicas use `async-host-v2:` and `async-device-v3:` respectively. During a

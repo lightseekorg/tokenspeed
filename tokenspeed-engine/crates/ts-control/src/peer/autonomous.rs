@@ -66,6 +66,7 @@ enum Driver {
 /// The protocol owner and its control-loop handoff.
 pub struct Peer {
     driver: Driver,
+    device_pin_gate: Option<Arc<servicer::DevicePinGate>>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
@@ -101,6 +102,10 @@ impl Peer {
             transfers,
         )?;
         let (port, fence, origin) = (protocol.port(), protocol.fence(), protocol.origin);
+        let device_pin_gate = protocol
+            .endpoint
+            .as_ref()
+            .map(|e| e.holder.lock().device_pin_gate.clone());
         let driver = if background {
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
@@ -128,6 +133,7 @@ impl Peer {
         };
         Ok(Self {
             driver,
+            device_pin_gate,
             port,
             fence,
             origin,
@@ -242,6 +248,12 @@ impl Peer {
     /// The port of this replica member.
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+    /// Gate new Device pins immediately, including when the protocol runs in the background.
+    pub fn block_device_pins(&self, blocked: bool) {
+        if let Some(gate) = &self.device_pin_gate {
+            gate.block(blocked);
+        }
     }
     /// The data-plane fence endpoint.
     pub fn fence(&self) -> PeerFence {
@@ -452,6 +464,7 @@ impl Exports {
                 let mut answer = holder.answer(lease, PeerAnswerKind::Pin);
                 if p.progress == PeerProgress::Device
                     && holder.matches_stamp(&stamp)
+                    && holder.device_pin_gate.allows(&checkpoint.pages)
                     && cache
                         .apply_peer_export(&checkpoint, micros)
                         .map_err(|e| PeerError::Worker(e.to_string()))?

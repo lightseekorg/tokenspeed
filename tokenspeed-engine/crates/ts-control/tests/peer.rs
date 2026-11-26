@@ -1533,7 +1533,15 @@ fn held_host_read(shutdown: bool) {
     assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
 }
 
-fn delayed_checkpoint_pin(evict: bool) {
+#[derive(Clone, Copy, Debug)]
+enum CheckpointState {
+    Ready,
+    Evicted,
+    Replaying,
+    Retired,
+}
+
+fn delayed_checkpoint_pin(state: CheckpointState) {
     let arena = Arena::new(200_000);
     let replica = |base| {
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
@@ -1570,12 +1578,17 @@ fn delayed_checkpoint_pin(evict: bool) {
         ])
         .unwrap();
     assert_eq!(reader.round().0, vec![("forward".into(), 0)]);
+    if matches!(state, CheckpointState::Replaying | CheckpointState::Retired) {
+        holder.peer.block_device_pins(true);
+    }
     std::thread::sleep(Duration::from_secs(4));
     // Retire the soft lease explicitly before the late grant.
     holder.round();
     assert_eq!(holder.scheduler.lock().peer_stats().leases, 0);
-    if evict {
-        assert!(holder.scheduler.lock().clear_cache());
+    match state {
+        CheckpointState::Ready | CheckpointState::Replaying => {}
+        CheckpointState::Evicted => assert!(holder.scheduler.lock().clear_cache()),
+        CheckpointState::Retired => holder.peer.block_device_pins(false),
     }
     reader.advance(&[
         event(ForwardEventKind::ExtendResult, "forward", vec![7]),
@@ -1589,7 +1602,7 @@ fn delayed_checkpoint_pin(evict: bool) {
     );
     let fetch = &fetches[0];
     let addr = READER_BASE + fetch.destinations[0].block_id as u64 * PAGE_BYTES;
-    if !evict {
+    if matches!(state, CheckpointState::Ready | CheckpointState::Retired) {
         assert_eq!(prefix, 2048);
         assert_eq!(arena.read_bytes(addr, 1), vec![29]);
     } else {
@@ -1598,17 +1611,27 @@ fn delayed_checkpoint_pin(evict: bool) {
     }
     assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
     println!(
-        "delayed PIN evict={evict} forward_ms=4000 fetches={} consumed={prefix}",
+        "delayed PIN state={state:?} forward_ms=4000 fetches={} consumed={prefix}",
         fetches.len()
     );
 }
 #[test]
 fn expired_checkpoint_pin_keeps_an_unchanged_prefix() {
-    delayed_checkpoint_pin(false);
+    delayed_checkpoint_pin(CheckpointState::Ready);
 }
 #[test]
 fn expired_checkpoint_pin_rejects_an_evicted_prefix() {
-    delayed_checkpoint_pin(true);
+    delayed_checkpoint_pin(CheckpointState::Evicted);
+}
+
+#[test]
+fn expired_checkpoint_pin_rejects_device_pages_during_replay() {
+    delayed_checkpoint_pin(CheckpointState::Replaying);
+}
+
+#[test]
+fn expired_checkpoint_pin_accepts_device_pages_after_replay_retires() {
+    delayed_checkpoint_pin(CheckpointState::Retired);
 }
 
 #[test]
