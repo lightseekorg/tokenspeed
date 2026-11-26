@@ -21,6 +21,39 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn only_a_backed_up_arena_keeps_its_prefix_after_independent_kv_wake() {
+    for backup_device_kv in [false, true] {
+        let engine = start_ranks_with(
+            Layout::Tp(2),
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                replica_memory_transitions: true,
+                ascend_graph: true,
+                backup_device_kv,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let warm = run(&engine.client, request("warm", 65, budget(2))).await;
+        assert_eq!(warm.last().unwrap().cached_tokens, 0);
+        for (release, tag) in [
+            (true, "acl_graph"),
+            (false, "kv_cache"),
+            (false, "acl_graph"),
+        ] {
+            let result = control(&engine, memory_request(release, Some(&[tag]), None)).await;
+            assert!(result.iter().all(|(_, ok)| *ok), "{result:?}");
+        }
+        let next = run(&engine.client, request("reuse", 65, budget(2))).await;
+        assert_eq!(
+            next.last().unwrap().cached_tokens,
+            if backup_device_kv { 64 } else { 0 }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() {
     async fn publication(engine: &Engine, wait: bool) -> GetSharedPrefixPublicationReqOutput {
         let request =

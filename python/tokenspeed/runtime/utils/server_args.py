@@ -3050,6 +3050,15 @@ class ServerArgs:
                 "one request"
             )
 
+    @property
+    def backup_device_kv(self) -> bool:
+        """An Ascend CPU-backed target can reuse its prefixes across sleep."""
+        return (
+            self.device == "npu"
+            and self.enable_memory_saver
+            and self.weight_memory_policy == "cpu_backup"
+        )
+
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
         if self.weight_memory_policy not in (None, "cpu_backup", "discard"):

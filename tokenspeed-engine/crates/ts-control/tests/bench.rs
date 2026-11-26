@@ -448,6 +448,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
         request_token_history: false,
         request_token_history_lookback: None,
         controls: ControlConfig {
+            backup_device_kv: false,
             memory_saver: false,
             replica_memory_transitions: false,
             memory_regions: Vec::new(),

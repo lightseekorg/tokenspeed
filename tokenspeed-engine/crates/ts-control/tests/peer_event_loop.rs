@@ -190,6 +190,7 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
         request_token_history: false,
         request_token_history_lookback: None,
         controls: ControlConfig {
+            backup_device_kv: false,
             memory_saver: true,
             replica_memory_transitions: false,
             memory_regions: vec!["kv_cache".into(), "weights".into()],

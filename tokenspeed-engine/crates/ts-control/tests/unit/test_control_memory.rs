@@ -206,8 +206,14 @@ fn graph_wake_preserves_the_backend_kv_sleeping_state() {
             [("ReleaseMemoryOccupationReqOutput", true)]
         );
         if graph == "acl_graph" {
-            assert!(controls.resume_tags(Some(&["kv_cache".into()])).is_err());
-            assert_eq!(controls.resume_tags(None).unwrap(), ["acl_graph", "kv_cache"]);
+            assert_eq!(
+                controls.resume_tags(Some(&["kv_cache".into()])).unwrap(),
+                ["kv_cache"]
+            );
+            assert_eq!(
+                controls.resume_tags(None).unwrap(),
+                ["acl_graph", "kv_cache"]
+            );
         }
         for tag in if graph == "acl_graph" {
             vec![graph, "kv_cache"]

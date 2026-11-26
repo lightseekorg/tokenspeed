@@ -134,6 +134,7 @@ class CacheArena:
         cache_group_specs: tuple[CacheGroupSpec, ...],
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
+        backup_device_kv: bool | None = None,
         storage_plan: CacheStoragePlan | None = None,
     ):
         if not cache_group_specs:
@@ -142,6 +143,15 @@ class CacheArena:
             )
         self.plan = plan
         self.device = device
+        if (
+            enable_memory_saver
+            and str(device).split(":", 1)[0] == "npu"
+            and backup_device_kv is None
+        ):
+            raise ValueError(
+                "An enabled Ascend saver requires the target KV backup policy"
+            )
+        self.backup_device_kv = bool(backup_device_kv)
         # Materialize immutable byte geometry at setup, not on first hand-out.
         # zero_blocks and copy_blocks ship only page ids per call; each group's
         # field table (page-0 offset, page stride, payload bytes) lives on the
@@ -153,7 +163,7 @@ class CacheArena:
             enable=enable_memory_saver, device=device
         )
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
-        with self.memory_saver_adapter.named_region("cache_transfer"):
+        with self.memory_saver_adapter.named_region("cache_layout"):
             for group in plan.groups:
                 page_count, fields = plan.page_field_layout(group.group_id)
                 for base, stride, size in fields:
@@ -173,9 +183,7 @@ class CacheArena:
             spec.group_id: spec for spec in cache_group_specs
         }
         # The payload and geometry share an adapter but have distinct lifetimes.
-        # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
-        # sleep and rebuilt after wake (paging overwrites; clear() zeros the
-        # remapped pages).
+        # Preserve bytes only when the target can resume its original weights.
         self.storage_plan = storage_plan or plan_cache_storage(
             plan,
             cache_group_specs,
@@ -193,8 +201,10 @@ class CacheArena:
         self.regions: dict[str, torch.Tensor] = {}
         # Only device regions live in the memory saver's pool; pinned Host
         # regions (sparse offload history) are ordinary Host allocations and
-        # stay mapped across sleep. Wake zeroes both (clear()).
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+        # stay mapped across sleep. An invalidated image clears both on wake.
+        with self.memory_saver_adapter.region(
+            tag="kv_cache", enable_cpu_backup=self.backup_device_kv
+        ):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
                 self.regions[region.region_id] = torch.zeros(

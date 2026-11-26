@@ -220,7 +220,7 @@ def test_npu_install_requires_use_ascend_provider(monkeypatch) -> None:
     requirements = _requirements_by_name(install_requires)
     assert {"torch", "triton-ascend", "apache-tvm-ffi"} <= requirements.keys()
     assert str(requirements["triton-ascend"].specifier) == "==3.2.1"
-    assert str(requirements["torch-npu-memory-saver"].specifier) == "==0.1.5"
+    assert str(requirements["torch-npu-memory-saver"].specifier) == "==0.1.6"
     assert not any(
         name.startswith("nvidia-")
         or name

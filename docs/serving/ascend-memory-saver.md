@@ -69,12 +69,10 @@ export TORCH_HCCL_ZERO_COPY=0
 export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-The NPU kernel backend installs [torch-npu-memory-saver 0.1.5](https://pypi.org/project/torch-npu-memory-saver/0.1.5/)
-from PyPI and builds its ABI 4 allocator against the active CANN toolkit.
-To add it to an existing NPU installation, run `python -m pip install torch-npu-memory-saver==0.1.5`.
-For CPython 3.12 on Linux AArch64 with CANN 9.0.0, you can skip the saver build:
-download the [A2-tested wheel](https://github.com/yanlonghu/torch_npu_memory_saver/releases/download/v0.1.5/torch_npu_memory_saver-0.1.5-cp312-cp312-linux_aarch64.whl)
-and run `python -m pip install ./torch_npu_memory_saver-0.1.5-cp312-cp312-linux_aarch64.whl` before installing TokenSpeed.
+This revision requires `torch-npu-memory-saver==0.1.6` (allocator ABI 5).
+The NPU installation builds the PyPI source package against the active CANN
+toolkit. CPython 3.12 / Linux AArch64 workers on the tested A2 CANN 9.0.0
+stack can also install the [prebuilt wheel](https://github.com/yanlonghu/torch_npu_memory_saver/releases/tag/v0.1.6) first.
 
 Ascend requires protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
@@ -110,8 +108,8 @@ tokenspeed serve "$CHECKPOINT_A" \
 | Tag | Policy |
 | --- | --- |
 | `weights` | Parameters follow the explicit weight policy. Forward inputs, model runtime state and model workspaces use a separate CPU-backed pool under this tag. |
-| `kv_cache` | Discard shared target/draft KV and clear it on wake. |
-| `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also discards resident device KV. Cache transfer tables and workspaces use a separate CPU-backed pool under this tag, including in eager mode. KV copies can continue when only weights sleep. If both KV and this tag sleep, wake this tag before or together with KV. |
+| `kv_cache` | With target weights on `cpu_backup`, back up shared target/draft KV and keep the prefix index. A weight update invalidates the old prefix even when its version string is reused. With target weights on `discard`, drop KV and clear it on wake. |
+| `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also suspends KV. KV can wake and service page operations while the graph is still asleep. The immutable cache layout stays in the runtime allocator. |
 
 Persistent backup consumes pinned host memory and adds transfer time. HCCL
 communicators and their workspaces stay resident. On Atlas A3, the saver uses

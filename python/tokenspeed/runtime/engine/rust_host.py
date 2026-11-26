@@ -525,6 +525,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        backup_device_kv: The device preserves prefix pages across KV sleep.
         allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
@@ -618,6 +619,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    backup_device_kv: bool
     allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
@@ -1780,6 +1782,7 @@ class HostBootstrap:
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                backup_device_kv=server_args.backup_device_kv,
                 allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]

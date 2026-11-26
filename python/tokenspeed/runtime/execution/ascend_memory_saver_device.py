@@ -36,6 +36,19 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
     """Additional launch and weight-update checks for managed Ascend pools."""
 
     _additional_discard_reload_types = (UpdateWeightFromDiskReqInput,)
+    _stale_kv_backup = False
+
+    def commit_weight_update(self, success: bool) -> None:
+        super().commit_weight_update(success)
+        # A partial load or a repeated version string can change the target too.
+        # The host flushed its prefix index before loading. Never expose these
+        # backed-up bytes through a new transfer registration.
+        self._stale_kv_backup = self._weight_memory.kv_released
+
+    def _restore_kv_contents(self) -> None:
+        if self._weight_memory.policy == "discard" or self._stale_kv_backup:
+            super()._restore_kv_contents()
+        self._stale_kv_backup = False
 
     _TRAINER_WEIGHT_UPDATE_UNSUPPORTED = (
         "This trainer weight-update path uses CUDA tensors and is not implemented "

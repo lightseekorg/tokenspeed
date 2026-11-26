@@ -35,7 +35,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "torch_npu_memory_saver":
         raise
     raise ModuleNotFoundError(
-        "Install Ascend Memory Saver with 'python -m pip install torch-npu-memory-saver==0.1.5'.",
+        "Install Ascend Memory Saver with 'python -m pip install torch-npu-memory-saver==0.1.6'.",
         name=exc.name,
     ) from exc
 
@@ -87,10 +87,14 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
     @contextmanager
     def named_region(self, name: str):
         """Back up persistent owners while reusing their active allocator scope."""
-        if name == "cache_transfer":
-            # Frozen rounds may copy KV with weights asleep. ACL graph sleep also
-            # sleeps KV; its backup allocator preserves these tables across wake.
-            key = PoolKey("acl_graph", AllocationPolicy.CPU_BACKUP, "cache_transfer")
+        if name == "cache_layout":
+            # Immutable geometry lives in PTA's ordinary runtime allocator. REMAIN
+            # creates no MemPool and the table stays usable while other tags sleep.
+            key = PoolKey("kv_cache", AllocationPolicy.REMAIN, name)
+        elif name == "cache_transfer":
+            # Transfer scratch follows KV availability. Share the backup allocator
+            # with backed-up KV; its tables must survive even when payload is discarded.
+            key = PoolKey("kv_cache", AllocationPolicy.CPU_BACKUP, "kv_cache")
         else:
             key = PoolKey(
                 "weights", AllocationPolicy.CPU_BACKUP, _NAMED_REGION_POOLS[name]
@@ -112,7 +116,7 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
         """Permit KV copies during weights-only sleep and reject uncertain mappings."""
         state = self._state().state  # Also checks native allocator callback failures.
         with state.lock:
-            if state.failed or state.paused.intersection(("kv_cache", "acl_graph")):
+            if state.failed or "kv_cache" in state.paused:
                 state.assert_active()
 
     @contextmanager

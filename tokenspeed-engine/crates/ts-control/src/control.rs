@@ -88,6 +88,7 @@ pub struct ControlConfig {
     /// The regions this engine can release (`nccl` needs an NCCL that can
     /// suspend its communicators).
     pub memory_regions: Vec<String>,
+    pub backup_device_kv: bool,
     /// With a cache shared beyond this engine -- the L3 storage tier or
     /// peer prefix sharing -- the checkpoint identity its pages are named
     /// under (`--weight-version`); `None` without one.
@@ -1034,13 +1035,6 @@ impl Controls {
         if !not_released.is_empty() {
             return Err(format!("tags not released: {not_released:?}"));
         }
-        // On Ascend, the graph tag backs up the tables used to copy resident KV.
-        if self.released.iter().any(|tag| tag == "acl_graph")
-            && tags.iter().any(|tag| tag == "kv_cache")
-            && !tags.iter().any(|tag| tag == "acl_graph")
-        {
-            return Err("resume acl_graph before or together with kv_cache".to_owned());
-        }
         Ok(tags)
     }
 
@@ -1172,6 +1166,7 @@ mod tests {
         Controls::new(ControlConfig {
             memory_saver,
             replica_memory_transitions: false,
+            backup_device_kv: false,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             shared_weight_version: None,
             allow_reload_forward: true,
@@ -1311,6 +1306,7 @@ mod tests {
         let mut off = Controls::new(ControlConfig {
             memory_saver: false,
             replica_memory_transitions: false,
+            backup_device_kv: false,
             memory_regions: Vec::new(),
             shared_weight_version: None,
             allow_reload_forward: false,
@@ -1355,6 +1351,7 @@ mod tests {
         let mut l3 = Controls::new(ControlConfig {
             memory_saver: false,
             replica_memory_transitions: false,
+            backup_device_kv: false,
             memory_regions: Vec::new(),
             shared_weight_version: Some("v1".to_owned()),
             allow_reload_forward: false,
@@ -1392,6 +1389,7 @@ mod tests {
         let mut controls = Controls::new(ControlConfig {
             memory_saver: false,
             replica_memory_transitions: false,
+            backup_device_kv: false,
             memory_regions: Vec::new(),
             shared_weight_version: Some("B".to_owned()),
             allow_reload_forward: false,

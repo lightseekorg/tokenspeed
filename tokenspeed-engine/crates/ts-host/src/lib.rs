@@ -614,6 +614,7 @@ impl HostConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
                 replica_memory_transitions,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
+                backup_device_kv: config.getattr("backup_device_kv")?.extract()?,
                 // With L3, its namespace's weight version; peer sharing,
                 // which excludes L3, sets its own in `serve`.
                 shared_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),

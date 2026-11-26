@@ -2049,7 +2049,11 @@ def test_ascend_weights_only_sleep_keeps_cache_pages_usable():
     field = CacheFieldSpec("data", "kv.0", (16, 8), "float16")
     layout = pack([(group, (field,))], prefix_granularity=16)
     arena = CacheArena(
-        layout.bind(4), "npu", cache_group_specs=(group,), enable_memory_saver=True
+        layout.bind(4),
+        "npu",
+        cache_group_specs=(group,),
+        enable_memory_saver=True,
+        backup_device_kv=True,
     )
     saver = arena.memory_saver_adapter
     with saver.region(tag="weights", enable_cpu_backup=True):
@@ -2085,10 +2089,16 @@ def test_ascend_weights_only_sleep_keeps_cache_pages_usable():
         with pytest.raises(RuntimeError, match="kv_cache"):
             handle.execute(plan, None, cache_ops=())
         saver.pause("acl_graph")
-        # Direct device calls can bypass the host's graph-before-KV wake check.
         saver.resume("kv_cache")
-        with pytest.raises(RuntimeError, match="acl_graph"):
-            handle.execute(plan, None, cache_ops=())
+        # The copy uses resident geometry and restored KV even with the graph asleep.
+        torch.testing.assert_close(
+            pages[2].cpu(), torch.full((16, 8), 5, dtype=pages.dtype)
+        )
+        pages[1].fill_(9)
+        handle.execute(plan, None, cache_ops=())
+        torch.testing.assert_close(
+            pages[2].cpu(), torch.full((16, 8), 9, dtype=pages.dtype)
+        )
         handle.resume_weights(saver)
     finally:
         saver.resume()

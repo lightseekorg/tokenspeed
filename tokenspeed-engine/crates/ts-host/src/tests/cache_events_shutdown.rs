@@ -138,6 +138,7 @@ class CpuConfig:
     startup_requests: bool = False
     memory_saver: bool = False
     memory_regions: tuple = ()
+    backup_device_kv: bool = False
     allow_reload_forward: bool = False
     l3: object = None
     disk: object = None

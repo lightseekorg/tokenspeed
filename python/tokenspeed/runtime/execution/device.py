@@ -993,17 +993,17 @@ class DeviceHandle:
         else:
             self._weight_memory.resume(operation)
 
+    def _restore_kv_contents(self) -> None:
+        self._executor.token_to_kv_pool.clear_kv_buffers()
+
     def finish_kv_resume(self, *, synchronize_before_registration: bool) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
 
-        Re-mapped memory holds garbage, so the arena is zeroed first. The
-        draft pool names the same arena, so clearing the target's clears both.
-        FP8 KV scales ride with the weights region and need no reset. The
-        arena then goes back to the PD transfer engine, which registers the
-        new physical pages.
+        The target and draft share an arena. Restore its contents before
+        registering the new physical pages with the PD transfer engine.
         """
         self.settle()
-        self._executor.token_to_kv_pool.clear_kv_buffers()
+        self._restore_kv_contents()
         if self._kv_transfer is not None:
             if synchronize_before_registration:
                 # NPU transfer registration can expose pages without ordering

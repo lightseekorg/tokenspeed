@@ -29,7 +29,7 @@ cache:
 
 - ``weights``: model parameters (CPU backup, or discard until a complete
   replica-committed update; frozen draft allocations retain CPU backup);
-- ``kv_cache``: the cache arena (discarded; zeroed on resume);
+- ``kv_cache``: the cache arena (Ascend can back up an unchanged target's KV);
 - ``cuda_graph``: the decode CUDA graph memory pool (discarded; every replay
   rewrites it before reading);
 - ``acl_graph``: the Ascend decode graph pool (discarded or backed up to
@@ -89,8 +89,7 @@ def memory_regions(
     def resume_kv_cache() -> None:
         device.before_kv_resume()
         adapter.resume(tag="kv_cache")
-        # Re-mapped memory holds garbage: zero it, then register it with
-        # the PD transfer engine again.
+        # Finish restoring or clearing the arena before exposing it to PD.
         device.finish_kv_resume(
             synchronize_before_registration=synchronize_kv_before_registration
         )

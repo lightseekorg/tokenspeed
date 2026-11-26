@@ -257,7 +257,15 @@ def test_graph_rng_storage_survives_sleep_before_graph_replay(
 
 
 @pytest.mark.parametrize(
-    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+    "name",
+    [
+        "executor_inputs",
+        "runtime_states",
+        "attention_state",
+        "cache_layout",
+        "cache_transfer",
+        "workspace",
+    ],
 )
 def test_named_buffers_preserve_contents_and_addresses_across_discard(
     memory, buffers, name
@@ -301,7 +309,15 @@ def test_named_buffer_scope_is_restored_after_failure(memory, buffers):
 
 
 @pytest.mark.parametrize(
-    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+    "name",
+    [
+        "executor_inputs",
+        "runtime_states",
+        "attention_state",
+        "cache_layout",
+        "cache_transfer",
+        "workspace",
+    ],
 )
 def test_disabled_named_region_leaves_allocations_resident(memory, buffers, name):
     saver = adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda")

@@ -72,6 +72,7 @@ def _non_expandable_allocation():
 
 
 _NAMED_REGION_POOLS = {
+    "cache_layout": "persistent_buffers",
     "cache_transfer": "persistent_buffers",
     "executor_inputs": "persistent_buffers",
     "runtime_states": "persistent_buffers",

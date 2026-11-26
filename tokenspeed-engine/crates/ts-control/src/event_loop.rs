@@ -2414,8 +2414,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // An invalid request has no descriptor. Share readiness and exact
         // matching in one exchange, before any rank changes its pause state.
         let descriptor = match &prepared {
-            Ok(tags) => serde_json::to_vec(&(call.release, &call.id, tags))
-                .expect("memory call descriptor contains only strings and a boolean"),
+            Ok(tags) => serde_json::to_vec(&(
+                call.release,
+                &call.id,
+                tags,
+                self.config.controls.backup_device_kv,
+            ))
+            .expect("memory call descriptor contains only strings and a boolean"),
             Err(_) => Vec::new(),
         };
         let (mesh, domain) = self.ranks.memory_domain();
@@ -3013,7 +3018,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            let clears_kv = tags.iter().any(|tag| tag == "kv_cache");
+            // Backed-up pages still own their L1 prefix entries. Weight loads
+            // flush those entries before the first parameter write, even if KV sleeps.
+            let clears_kv =
+                !self.config.controls.backup_device_kv && tags.iter().any(|tag| tag == "kv_cache");
             if self.config.controls.replica_memory_transitions {
                 // Weight and cache prerequisites may have changed while draining.
                 let tags = tags.clone();

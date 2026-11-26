@@ -1791,6 +1791,7 @@ struct Setup {
     replica_memory_transitions: bool,
     /// Advertise the Ascend graph region beside the shared KV arena.
     ascend_graph: bool,
+    backup_device_kv: bool,
     /// A rank that fails after memory release begins.
     memory_release_failure_rank: Option<usize>,
     /// A rank that fails after memory resume begins.
@@ -1862,6 +1863,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         request_token_history: setup.request_token_history,
         request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
+            backup_device_kv: setup.backup_device_kv,
             memory_saver: true,
             replica_memory_transitions: setup.replica_memory_transitions,
             memory_regions,
