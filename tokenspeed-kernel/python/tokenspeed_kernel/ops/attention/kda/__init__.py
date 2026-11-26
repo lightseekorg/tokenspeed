@@ -317,7 +317,6 @@ def kda_paged_prefill(
     solution: str | None = None,
     recurrent_layout: str | None = None,
     plan: KdaPrefillPlan | None,
-    plan_layer: int,
 ) -> KdaPrefillResult:
     """Run packed KDA prefill through capability-based kernel selection.
 
@@ -341,11 +340,9 @@ def kda_paged_prefill(
         solution: Optional registered solution name.
         recurrent_layout: Layout of the backend-owned recurrent state; the
             platform default when omitted.
-        plan: Launch schedules built once from ``cu_seqlens`` and shared by
-            the batch's layers, for kernels with the ``prefill_plan`` trait,
-            or None for a call that plans alone.
-        plan_layer: This launch's row in ``plan``; distinct per launch, 0
-            without a plan.
+        plan: Ordinary-scan metadata built once from ``cu_seqlens``
+            (``build_kda_prefill_plan``) and shared by the batch's layers, for
+            kernels with the ``prefill_plan`` trait; None plans in the launch.
 
     Returns:
         Packed output and FP32 final state, in the caller's
@@ -396,9 +393,8 @@ def kda_paged_prefill(
         raise ValueError("Selected KDA kernel does not support planning capacity")
     if supports_capacity:
         kernel_kwargs["capacity"] = capacity
-    if spec is not None and True in spec.traits.get("prefill_plan", ()):
+    if _takes_plan(spec):
         kernel_kwargs["plan"] = plan
-        kernel_kwargs["plan_layer"] = plan_layer
     elif plan is not None:
         raise ValueError("Selected KDA kernel does not take a prefill plan")
     supported = None if spec is None else spec.traits.get("recurrent_layout")
@@ -432,7 +428,7 @@ def kda_prefill_takes_plan(dtype: torch.dtype, *, solution: str | None) -> bool:
     This initialization-time probe selects as ``kda_paged_prefill`` does for
     ``dtype`` activations, without allocating or launching. When it holds, a
     caller that scans one batch in several layers builds the plan once
-    (``build_kda_prefill_plan``) and passes each launch its own ``plan_layer``.
+    (``build_kda_prefill_plan``) and passes it to each launch.
     """
     if solution == "fla":
         solution = "triton"
@@ -446,7 +442,10 @@ def kda_prefill_takes_plan(dtype: torch.dtype, *, solution: str | None) -> bool:
         )
     except NoKernelFoundError:
         return False
-    spec = KernelRegistry.get().get_by_name(kernel.name)
+    return _takes_plan(KernelRegistry.get().get_by_name(kernel.name))
+
+
+def _takes_plan(spec) -> bool:
     return spec is not None and True in spec.traits.get("prefill_plan", ())
 
 

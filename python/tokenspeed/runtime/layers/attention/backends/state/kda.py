@@ -228,12 +228,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # by the executor (bind_request_stop_flags).
         self._request_stopped: torch.Tensor | None = None
         self._request_ends: torch.Tensor | None = None
-        # Whether the prefill kernel reads a forward's shared plan, each
-        # recurrent layer's row in it, and the local heads it schedules; set
-        # when a cache pool is bound.
+        # Whether the prefill kernel reads a forward's shared plan; set when a
+        # cache pool is bound.
         self._prefill_takes_plan = False
-        self._prefill_plan_rows: dict[int, int] = {}
-        self._prefill_plan_heads = 0
         self._reset_replay_state()
         self.kda_backend = kda_backend.strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
@@ -365,11 +362,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         super()._publish_cache_pool(cache_pool)
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
-        self._prefill_plan_rows = {
-            layer_id: row
-            for row, layer_id in enumerate(sorted(cache_pool.state_group_by_layer))
-        }
-        self._prefill_plan_heads = shape["num_heads"]
         self._prefill_takes_plan = kda_prefill_takes_plan(
             self.dtype,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
@@ -1141,7 +1133,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         recurrent_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         *,
-        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,
@@ -1233,7 +1224,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             solution=None if self.kda_backend == "auto" else self.kda_backend,
             recurrent_layout=self.kda_recurrent_layout,
             plan=self.forward_metadata.prefill_scan_plan,
-            plan_layer=self._prefill_plan_rows[layer_id],
         )
 
         out = kda_result.out.squeeze(0)
@@ -1289,7 +1279,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             cu_seqlens_cpu=prefix_cu_seqlens_cpu,
             capacity=None,
             plan=None,
-            plan_layer=0,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
             recurrent_layout=self.kda_recurrent_layout,
@@ -1307,14 +1296,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _build_prefill_scan_plan(
         self, scan_query_start_loc: torch.Tensor
     ) -> KdaPrefillPlan | None:
-        """Schedule every layer's prefill scan once per forward."""
+        """Plan every layer's prefill scan once per forward."""
         if not self._prefill_takes_plan:
             return None
-        return build_kda_prefill_plan(
-            scan_query_start_loc,
-            heads=self._prefill_plan_heads,
-            layers=len(self._prefill_plan_rows),
-        )
+        return build_kda_prefill_plan(scan_query_start_loc)
 
     @override
     def _refresh_prefill_scan_plan(

@@ -84,7 +84,6 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
     backend._kda_gate = lambda g_raw, *_args: g_raw
-    backend._prefill_plan_rows = {7: 0, 9: 1}
     # Prepare boundaries once; repeated preparation must preserve their identity.
     boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
     scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
@@ -123,7 +122,6 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         value,
         stored,
         scan_boundaries,
-        layer_id=9,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
         D=None,

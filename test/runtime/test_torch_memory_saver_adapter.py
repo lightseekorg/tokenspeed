@@ -478,14 +478,12 @@ def _check_managed_metadata_on_cuda():
     from tokenspeed_kernel.ops.attention.kda import (
         build_kda_prefill_plan,
         kda_paged_prefill,
-        refresh_kda_prefill_plan,
     )
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     if cutedsl_kda_supported():
-        # Exercise lazy compilation, both CuTe routes and handoffs, including
-        # growth, with two layers sharing a retained plan as captured
-        # prefill graphs hold it.
+        # Exercise lazy compilation and both workspace routes, including growth,
+        # with a retained shared plan as captured prefill graphs hold it.
         for tokens, heads, sequences in (
             (32, 12, 1),
             (257, 96, 1),
@@ -509,34 +507,29 @@ def _check_managed_metadata_on_cuda():
                 bias = torch.zeros(heads, 128, device="cuda")
                 state = torch.zeros(sequences, heads, 128, 128, device="cuda")
                 bounds = host_bounds.to("cuda")
-            with saver.named_region("attention_state"):
-                plan = build_kda_prefill_plan(bounds, heads=heads, layers=2)
+                plan = build_kda_prefill_plan(bounds)
 
-            def forward():
-                refresh_kda_prefill_plan(bounds, plan)
-                results = [
-                    kda_paged_prefill(
-                        *packed.unbind(2),
-                        gate,
-                        beta,
-                        decay,
-                        bias,
-                        initial_state=state,
-                        cu_seqlens=bounds,
-                        cu_seqlens_cpu=host_bounds,
-                        capacity=None,
-                        plan=plan,
-                        plan_layer=layer,
-                        lower_bound=-5.0,
-                        solution="cutedsl_kda",
-                        recurrent_layout="v_major",
-                    )
-                    for layer in range(2)
-                ]
-                return [(r.out.cpu(), r.final_state.cpu()) for r in results]
+            def scan():
+                return kda_paged_prefill(
+                    *packed.unbind(2),
+                    gate,
+                    beta,
+                    decay,
+                    bias,
+                    initial_state=state,
+                    cu_seqlens=bounds,
+                    cu_seqlens_cpu=host_bounds,
+                    capacity=None,
+                    plan=plan,
+                    lower_bound=-5.0,
+                    solution="cutedsl_kda",
+                    recurrent_layout="v_major",
+                )
 
-            expected = forward()
-            pointers = [packed.data_ptr(), plan.flags.data_ptr()]
+            result = scan()
+            expected_out, expected_state = result.out.cpu(), result.final_state.cpu()
+            del result
+            pointer = packed.data_ptr(), plan.sequence_order.data_ptr()
             for _ in range(2):
                 torch.cuda.synchronize()
                 saver.pause(tag="weights")
@@ -549,10 +542,15 @@ def _check_managed_metadata_on_cuda():
                 )
                 assert ordinary_bytes == 0, ordinary_bytes
                 saver.resume(tag="weights")
-                assert [packed.data_ptr(), plan.flags.data_ptr()] == pointers
-                for (out, final), (ref_out, ref_final) in zip(forward(), expected):
-                    torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
-                    torch.testing.assert_close(final, ref_final, rtol=0, atol=0)
+                assert (packed.data_ptr(), plan.sequence_order.data_ptr()) == pointer
+                result = scan()
+                torch.testing.assert_close(
+                    result.out.cpu(), expected_out, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    result.final_state.cpu(), expected_state, rtol=0, atol=0
+                )
+                del result
 
 
 @pytest.mark.skipif(

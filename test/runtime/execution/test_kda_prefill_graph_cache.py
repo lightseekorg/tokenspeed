@@ -62,15 +62,18 @@ def metadata(device, page):
     )
 
 
-def configure_prefill(backend, heads=8):
+def configure_prefill(backend):
+    from tokenspeed_kernel.ops.attention.kda import kda_prefill_takes_plan
+
     backend._retained_records = None
     backend._prefill_graph_enabled = True
     backend.kda_backend = "cutedsl_kda"
     backend._prefill_metadata = {}
     backend._prefill_metadata_pool = None
-    backend._prefill_takes_plan = True
-    backend._prefill_plan_rows = {0: 0}
-    backend._prefill_plan_heads = heads
+    # As _publish_cache_pool: only a plan-taking kernel gets a shared plan.
+    backend._prefill_takes_plan = kda_prefill_takes_plan(
+        torch.bfloat16, solution=backend.kda_backend
+    )
 
 
 def test_metadata_snapshot_does_not_alias():
@@ -416,7 +419,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
     )
     backend = object.__new__(KdaAttnBackend)
-    configure_prefill(backend, heads)
+    configure_prefill(backend)
     backend._descriptor_row_by_layer = {0: 0}
     backend._retained_records = torch.empty(10, 1, 3, heads, 16, dim, device="cuda")
     correction, key, decay = backend._retained_records[:, 0].unbind(1)
@@ -430,7 +433,6 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         cache_pool=object(),
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
-        # As _publish_cache_pool: only a plan-taking kernel gets a shared plan.
         _prefill_takes_plan=kda_prefill_takes_plan(
             torch.bfloat16, solution=backend_name
         ),
@@ -626,7 +628,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     if backend_name == "cutedsl_kda":
         # The captured layers read the retained plan, refreshed in place.
         retained["plan_order"] = fixed.prefill_scan_plan.sequence_order
-        retained["plan_flags"] = fixed.prefill_scan_plan.flags
+        retained["plan_chunks"] = fixed.prefill_scan_plan.cu_chunks
     addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
@@ -725,11 +727,6 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
-        # Each forward prepares its own metadata, refreshing the retained plan.
-        backend.forward_metadata = source
-        backend.prepare_prefill_metadata(
-            bucket, batch_size, ctx.forward_mode, capture=False
-        )
         reset(source)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {

@@ -222,9 +222,9 @@ class MambaForwardMetadata:
     scan_checkpoint_rows: torch.Tensor | None = None
     # Request slots for families with off-page replay records.
     req_pool_indices: torch.Tensor | None = None
-    # Launch schedules every layer's prefill scan reads, built once per forward
-    # from scan_query_start_loc (``_build_prefill_scan_plan``); None for scans
-    # that plan inside each launch.
+    # Scan metadata every layer's prefill reads, built once per forward from
+    # scan_query_start_loc (``_build_prefill_scan_plan``); None for scans that
+    # plan inside each launch.
     prefill_scan_plan: Any = None
 
     @property
@@ -2309,7 +2309,6 @@ class MambaAttnBackend(AttentionBackend):
                 value,
                 recurrent_state,
                 scan_query_start_loc,
-                layer_id=layer_id,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 D=D,
@@ -2562,7 +2561,6 @@ class MambaAttnBackend(AttentionBackend):
         recurrent_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         *,
-        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,

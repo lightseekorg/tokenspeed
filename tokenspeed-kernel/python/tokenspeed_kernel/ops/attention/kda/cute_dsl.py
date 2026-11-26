@@ -51,10 +51,7 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.flashinfer.kda import cutedsl_kda_prefill
-from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import (
-    KdaPrefillPlan,
-    build_kda_prefill_plan,
-)
+from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import KdaPrefillPlan
 
 _SUPPORTED_ARCHES = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
 
@@ -91,16 +88,10 @@ __all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
     },
 )
 def cutedsl_kda_nvidia_paged_prefill(
-    *,
-    capacity: KdaPrefillCapacity | None,
-    plan: KdaPrefillPlan | None,
-    plan_layer: int,
-    **kwargs,
+    *, capacity: KdaPrefillCapacity | None, plan: KdaPrefillPlan | None, **kwargs
 ) -> KdaPrefillResult:
     """Use tensor extent and live boundaries after the facade admits capacity."""
-    return _nvidia_kda_prefill(
-        cutedsl_kda_chunk_prefill, plan=plan, plan_layer=plan_layer, **kwargs
-    )
+    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, plan=plan, **kwargs)
 
 
 def cutedsl_kda_chunk_prefill(
@@ -118,7 +109,6 @@ def cutedsl_kda_chunk_prefill(
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
     plan: KdaPrefillPlan | None,
-    plan_layer: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Scan BF16 Q/K/V views with FlashInfer's CuTe kernels.
 
@@ -126,9 +116,8 @@ def cutedsl_kda_chunk_prefill(
     logits. State uses FP32 [sequences, H, V, K]. Packed inputs have B=1
     and device sequence boundaries; fixed batches flatten without copying.
     The CPU boundary mirror is retained for the shared facade contract;
-    this backend plans from device boundaries without a D2H. ``plan`` is a
-    ``build_kda_prefill_plan`` shared by the batch's layers, ``plan_layer``
-    this launch's row in it; without one, this call builds its own.
+    this backend plans from device boundaries without a D2H. ``plan`` is
+    ordinary-scan metadata the batch's layers share, or None to plan here.
     Returns BF16 output and a separate FP32 final state.
     """
     if not beta_is_logit:
@@ -153,9 +142,6 @@ def cutedsl_kda_chunk_prefill(
         initial_state = torch.zeros(
             sequences, heads, dim, dim, dtype=torch.float32, device=q.device
         )
-    cu_seqlens = cu_seqlens.to(torch.int64)
-    if plan is None:
-        plan = build_kda_prefill_plan(cu_seqlens, heads=heads, layers=1)
     out, final_state = cutedsl_kda_prefill(
         q,
         k,
@@ -165,10 +151,9 @@ def cutedsl_kda_chunk_prefill(
         A_log,
         dt_bias,
         initial_state=initial_state.float().contiguous(),
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=cu_seqlens.to(torch.int64),
         lower_bound=lower_bound,
         plan=plan,
-        plan_layer=plan_layer,
     )
     return out.view(batch, tokens, heads, dim), final_state
 

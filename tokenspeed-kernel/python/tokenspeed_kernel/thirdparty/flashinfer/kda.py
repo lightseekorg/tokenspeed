@@ -46,6 +46,7 @@ def _compile_cutedsl_kda(device: int, gate_dtype: torch.dtype, lower_bound: floa
     # The public wrapper updates state in place and retains GPU scratch globally.
     # Use its compiled kernel with separate state output and invocation-owned scratch.
     with torch.cuda.device(device):
+        warm_kda_prefill_plan()
         return cute.compile(
             kda.host_unified,
             *fakes,
@@ -71,9 +72,12 @@ def _compile_cutedsl_kda(device: int, gate_dtype: torch.dtype, lower_bound: floa
 @lru_cache(maxsize=None)
 def _compile_persistent_kda(device: int, heads: int, lower_bound: float):
     from flashinfer.kda_kernels.persistent.forward import _get_compiled
+    from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import (
+        warm_persistent_kda_plan,
+    )
 
     with torch.cuda.device(device):
-        warm_kda_prefill_plan(heads)
+        warm_persistent_kda_plan(heads)
         # Lengths and handoffs change on replay; keep their handling in one
         # compiled variant instead of specializing on each batch's partition.
         return _get_compiled(
@@ -104,13 +108,23 @@ def _run_persistent_kda(
     A_log,
     dt_bias,
     initial_state,
+    cu_seqlens,
     lower_bound,
-    plan,
-    plan_layer,
+    sm_count,
 ):
     from cuda.bindings.driver import CUstream
+    from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import persistent_kda_plan
 
-    heads, dim = initial_state.shape[1:3]
+    sequences, heads, dim = initial_state.shape[:3]
+    workers = min(sequences * heads, sm_count)
+    cu32, offsets, chains, starts, lengths, sources, destinations, flags = (
+        persistent_kda_plan(cu_seqlens, heads, workers)
+    )
+    handoffs = torch.empty(
+        (workers if sequences * heads > sm_count else 1, dim, dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
     # Unused export/probe ABI views share invocation-owned dummy storage.
     dummy = torch.empty(64 * 256, dtype=torch.bfloat16, device=q.device)
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
@@ -126,17 +140,21 @@ def _run_persistent_kda(
         initial_state.view(-1, dim, dim),
         final_state.view(-1, dim, dim),
         out[0],
-        plan.cu32,
-        plan.offsets,
-        *plan.tasks,
-        plan.handoffs,
-        plan.flags[plan_layer],
+        cu32,
+        offsets,
+        chains,
+        starts,
+        lengths,
+        sources,
+        destinations,
+        handoffs,
+        flags,
         dummy.view(64, 1, 256),
         dummy.view(torch.float32)[:160].view(1, 160),
         dummy.view(torch.int64)[:64],
         0,
         1,
-        plan.workers,
+        workers,
         0,
         0,
         1,
@@ -175,6 +193,13 @@ def _run_cutedsl_kda(
         kda._decomp_ws_bytes(heads, chunks), dtype=torch.uint8, device=q.device
     )
     scratch = kda._partition_workspace(workspace, heads, chunks)
+    if plan is None:
+        # FlashInfer builds the metadata in this launch.
+        cu_chunks = torch.empty(sequences + 1, dtype=torch.int32, device=q.device)
+        order = torch.empty(sequences, dtype=torch.int32, device=q.device)
+        generate = 1
+    else:
+        order, cu_chunks, generate = plan.sequence_order, plan.cu_chunks, 0
     num_ctas, chunks_per_cta = kda._k1_grid(chunks, heads)
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     final_state = torch.empty_like(initial_state)
@@ -187,11 +212,11 @@ def _run_cutedsl_kda(
         dt_bias.reshape(heads, 128).contiguous(),
         beta_logits.contiguous(),
         cu_seqlens,
-        plan.sequence_order,
-        0,
+        order,
+        generate,
         None,
-        plan.cu_chunks,
-        0,
+        cu_chunks,
+        generate,
         scratch["kd"],
         scratch["qd"],
         scratch["w"],
@@ -226,8 +251,7 @@ def cutedsl_kda_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     lower_bound: float,
-    plan: KdaPrefillPlan,
-    plan_layer: int,
+    plan: KdaPrefillPlan | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select ordinary or persistent CuTe prefill from live packed boundaries.
 
@@ -237,16 +261,16 @@ def cutedsl_kda_prefill(
         g_raw: BF16 or FP32 raw gate with the same shape as q.
         beta_logits: BF16 [1, capacity, heads] raw beta logits.
         A_log/dt_bias: FP32 per-head decay and per-channel gate bias.
-        initial_state: FP32 [sequences, heads, 128, 128] gathered cache state.
+        initial_state: FP32 [sequences, heads, V, K] gathered cache state.
         cu_seqlens: Device int64 boundaries [sequences + 1]. Live lengths may
             change on replay and their sum may be less than token capacity;
             input rows beyond the live total must be zero, as in the runtime.
             Every sequence must be non-empty; unused capacity slots scan one
             zero-padded token each.
         lower_bound: Negative safe-gate bound, fixed for the model.
-        plan: Schedules built from ``cu_seqlens`` by ``build_kda_prefill_plan``.
-        plan_layer: This launch's handoff-flag row in ``plan``; each launch
-            between two plan refreshes takes a different row.
+        plan: Ordinary-scan metadata built from ``cu_seqlens`` once for the
+            batch's layers, or None for the launch to build its own. The
+            persistent scan plans inside its launch.
 
     Returns:
         Packed BF16 output and separate FP32 final state. Input state is
@@ -255,11 +279,9 @@ def cutedsl_kda_prefill(
     from flashinfer.kda_kernels import kda_chunked_bt16 as kda
 
     heads = q.shape[2]
-    if plan.heads != heads or plan.cu_chunks.numel() != cu_seqlens.numel():
+    sequences = cu_seqlens.numel() - 1
+    if plan is not None and plan.cu_chunks.numel() != cu_seqlens.numel():
         raise ValueError("KDA prefill plan was built for another batch shape")
-    # The launch ABI and the plan's handoff rows are sized for 128x128 state.
-    if initial_state.shape[2:] != (128, 128):
-        raise ValueError("CuTe KDA prefill requires a 128x128 state per head")
     sm_count = kda._device_sm_count(q.device)
     can_compile_persistent = (
         heads % 8 == 0 and g_raw.dtype == torch.bfloat16 and -5.0 <= lower_bound < 0
@@ -271,7 +293,7 @@ def cutedsl_kda_prefill(
             q.device.index, heads, lower_bound
         )
 
-    if can_compile_persistent and plan.persistent:
+    if can_compile_persistent and 2 * sequences * heads > sm_count:
         return _run_persistent_kda(
             compiled_persistent,
             q,
@@ -282,9 +304,9 @@ def cutedsl_kda_prefill(
             A_log,
             dt_bias,
             initial_state,
+            cu_seqlens,
             lower_bound,
-            plan,
-            plan_layer,
+            sm_count,
         )
     else:
         return _run_cutedsl_kda(
