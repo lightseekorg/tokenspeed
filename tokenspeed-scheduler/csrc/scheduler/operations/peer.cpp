@@ -31,8 +31,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include "cache/prefix/prefix_hasher.h"
 #include "core/profile_span.h"
 #include "fsm/peer_events.h"
+#include "fsm/storage_events.h"
 #include "scheduler/scheduler.h"
 
 namespace tokenspeed {
@@ -40,6 +42,15 @@ namespace tokenspeed {
 bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                                std::span<const PeerPage> pages) const {
     if (!PeerExports::Matches(coordinator_, lookup, num_tokens, pages)) {
+        return false;
+    }
+    // A decoded endpoint a retraction published holds its deferred state only
+    // after the runtime acknowledged the commit (ExecutionPlan::
+    // state_commit_fence); local forwards order behind it, a remote read
+    // does not.
+    if (std::ranges::any_of(pages, [&](const PeerPage& page) {
+            return page.tier == CacheTier::kDevice && awaitsStateCommit(page.group_id, page.block_id);
+        })) {
         return false;
     }
     if (!tier_transfers_.HasLoadBacksInFlight()) {
@@ -53,6 +64,12 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
         return page.tier == CacheTier::kDevice && loading[page.group_id].contains(page.block_id);
     });
 }
+bool Scheduler::awaitsStateCommit(std::uint32_t group, std::int32_t page) const {
+    const std::pair key{group, page};
+    return uncommitted_state_pages_.contains(key) ||
+           std::ranges::any_of(state_commit_fences_, [&](const auto& fence) { return fence.second.contains(key); });
+}
+
 namespace {
 
 std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
@@ -71,6 +88,7 @@ Scheduler::PeerStats Scheduler::GetPeerStats() const {
         stats.looking_requests += request->Is<fsm::PeerLooking>();
         stats.landing_requests += request->Is<fsm::PeerLanding>();
     }
+    if (peer_host_landings_) stats.landing_requests += peer_host_landings_->NumLandings();
     return stats;
 }
 
@@ -85,6 +103,15 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
             spdlog::debug("[Peer] rid={} lookup {} unanswered; admitted from the local hit", request->Id(),
                           looking->lease.id);
             request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
+        }
+        // A prefix landed into Host is held for the admission on the peer
+        // clock; past it the Host keeps it as any other entry.
+        auto* admission = request->AdmissionResourcesPtr();
+        if (peer_host_landings_ && admission != nullptr && admission->storage_hold &&
+            admission->storage_hold->lease.IssuedBy(*peer_host_landings_) &&
+            peer_now_us_ >= admission->storage_hold->deadline_us) {
+            spdlog::debug("[Peer] rid={} Host landing's ready hold expired before admission", request->Id());
+            admission->storage_hold.reset();
         }
     }
 }
@@ -101,7 +128,7 @@ void Scheduler::handleEvent(const cache::PeerPin& event) {
 
 void Scheduler::handleEvent(const cache::PeerRelease& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer release without configured peer sharing");
-    peer_exports_->Release(coordinator_, event);
+    peer_exports_->Release(coordinator_, event, peer_now_us_);
 }
 
 void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {
@@ -120,6 +147,25 @@ void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {
 
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     Request* request = findRequest(event.request_id);
+    if (peer_host_landings_) {
+        const auto* prefetch = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
+        const bool waiting = prefetch != nullptr && prefetch->lease.IssuedBy(*peer_host_landings_);
+        if (const std::optional<std::int32_t> landed =
+                peer_host_landings_->Finish(event.request_id, event.num_tokens)) {
+            if (*landed > 0) {
+                peer_landed_tokens_ += static_cast<std::uint64_t>(*landed);
+            } else {
+                ++peer_failed_landings_;
+            }
+            // A request that let go of the landing has nothing to step.
+            if (waiting) {
+                request->Apply(fsm::FinishPrefetchEvent{
+                    *landed > 0 ? std::optional{Deadline(peer_now_us_, config_.peer_config->host_ready_timeout_us)}
+                                : std::nullopt});
+            }
+            return;
+        }
+    }
     if (request == nullptr) {
         return;
     }
@@ -191,15 +237,69 @@ void Scheduler::excludeLandedPages(AdmissionResult& admission, std::span<const P
     }
 }
 
+void Scheduler::startPeerHostLanding(Request& request) {
+    auto& admission = request.GetIf<fsm::Submitted>()->admission;
+    const fsm::PeerHit hit = *std::exchange(admission.peer_hit, std::nullopt);
+    const std::int32_t grain = config_.prefix_granularity;
+    const auto hashes = request.PromptPrefixHashes(hit.num_tokens / grain);
+    std::optional<TailPublication> tail;
+    if (const std::int32_t tail_tokens = hit.num_tokens % grain; tail_tokens > 0) {
+        const ContentHash prior = hashes.empty() ? ContentHash{} : ContentHash{hashes.back()};
+        tail = TailPublication{
+            .tail_tokens = tail_tokens,
+            .hash = HashPrefixPage(request.TokenSlice(hit.num_tokens - tail_tokens, tail_tokens), prior)};
+    }
+    const PromptPrefix prompt{.prefix_hashes = hashes,
+                              .tokens = request.TokenSlice(0, hit.num_tokens),
+                              .max_tokens = hit.num_tokens,
+                              .tail = tail,
+                              .shared_prefix_tokens = request.SharedPrefixTokens()};
+    const PrefixProbe probe = coordinator_.Prober().ProbePromptPrefix(prompt);
+    const std::int32_t local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+    std::optional<PeerHostLandings::Started> started =
+        local < hit.num_tokens
+            ? peer_host_landings_->Start(prompt, request.Id(), hit.lease, request.PeerHolder(), local)
+            : std::nullopt;
+    if (!started) {
+        // The local hit grew to the answer, or the Host cannot take the whole
+        // answered prefix now: admitted from the local hit; the soft pin
+        // lapses at the holder.
+        spdlog::debug("[Peer] rid={} Host landing of {} tokens not started; admitted from the local hit", request.Id(),
+                      hit.num_tokens);
+        return;
+    }
+    spdlog::debug("[Peer] rid={} lands [{}, {}) from {} into Host ({} blocks)", request.Id(), local, hit.num_tokens,
+                  request.PeerHolder(), started->fetch.destinations.size());
+    peer_host_fetches_.push_back(std::move(started->fetch));
+    // The runtime always reports the landing (PeerFetchDone), after its
+    // answers' deadlines or its quarantine: no soft deadline of its own.
+    request.Apply(fsm::StartPrefetchEvent{std::move(started->lease),
+                                          std::numeric_limits<std::int64_t>::max(),
+                                          {hashes.begin(), hashes.end()},
+                                          hit.num_tokens,
+                                          std::move(tail)});
+}
+
 void Scheduler::preparePeer(Request& request) {
     auto* submitted = request.GetIf<fsm::Submitted>();
-    if (submitted == nullptr || submitted->admission.peer_prepared) {
+    if (submitted == nullptr) {
+        return;
+    }
+    // A prompt its holder answered lands into Host before its admission; not
+    // while frozen, so a flush or a weight update waits for no new landing.
+    if (peer_host_landings_ && submitted->admission.peer_hit && forward_allowed_) {
+        startPeerHostLanding(request);
+        return;
+    }
+    if (submitted->admission.peer_prepared) {
         return;
     }
     submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
-    if (holder.empty() || holder == limits.name) {
+    // The D role computes no prompt: what it lacks comes from its PD peer,
+    // so it never reads from a holder, whatever the request names.
+    if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;
@@ -216,7 +316,9 @@ void Scheduler::preparePeer(Request& request) {
         return;
     }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
-    peer_lookups_.push_back(PeerLookupRequest{.lease = lease,
+    peer_lookups_.push_back(PeerLookupRequest{.request_id = request.Id(),
+                                              .deadline_us = Deadline(peer_now_us_, limits.lookup_timeout_us),
+                                              .lease = lease,
                                               .holder = holder,
                                               .prefix_hashes = {hashes.begin(), hashes.end()},
                                               .tokens = {tokens.begin(), tokens.end()},
@@ -228,7 +330,8 @@ void Scheduler::preparePeer(Request& request) {
 
 void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build,
                                      std::span<Request* const> candidates, bool new_prompts_sealed) {
-    if (!peer_exports_ || new_prompts_sealed) {
+    // Host landings start before admission (preparePeer).
+    if (!peer_exports_ || peer_host_landings_ || new_prompts_sealed) {
         return;
     }
     ProfileSpan profile_span{"Scheduler::schedulePeerLandings"};
@@ -263,10 +366,10 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             continue;
         }
         std::vector<BlockTransfer> load_pairs = outcome.event->TakeLoadPairs();
-        if (!load_pairs.empty()) {
-            build.load_backs.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
-        }
         request->Apply(std::move(*outcome.event));
+        if (!load_pairs.empty()) {
+            build.load_backs.push_back(startPrefixLoad(*request, std::move(load_pairs)));
+        }
         build.scheduled.insert(request);
 
         const auto& landing = *request->GetIf<fsm::PeerLanding>();

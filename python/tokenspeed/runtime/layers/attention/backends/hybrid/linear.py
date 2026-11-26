@@ -81,6 +81,41 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def forward_prefill_metadata(self):
+        return self.full_attn_backend.forward_prefill_metadata
+
+    @property
+    def forward_decode_metadata(self):
+        return self.full_attn_backend.forward_decode_metadata
+
+    def prefill_request_layout(self):
+        return self.full_attn_backend.prefill_request_layout()
+
+    def model_binding(self, layer_id, binding_type):
+        return self._backend_for_layer(layer_id).model_binding(layer_id, binding_type)
+
+    def group_view(self, group_id, bs):
+        return self.full_attn_backend.group_view(group_id, bs)
+
+    def require_query_shard_metadata(self):
+        return self.full_attn_backend.require_query_shard_metadata()
+
+    def gather_history_index_k(self, layer_id, token_to_kv_pool, group):
+        return self._backend_for_layer(layer_id).gather_history_index_k(
+            layer_id, token_to_kv_pool, group
+        )
+
+    def prepare_sparse_kv_access(self, layer, selection, positions, *, forward_mode):
+        return self._backend_for_layer(layer.layer_id).prepare_sparse_kv_access(
+            layer, selection, positions, forward_mode=forward_mode
+        )
+
+    def prefetch_sparse_kv(self, layer, selection, positions):
+        return self._backend_for_layer(layer.layer_id).prefetch_sparse_kv(
+            layer, selection, positions
+        )
+
+    @property
     def supports_mla_projected_value_decode(self) -> bool:
         return self.full_attn_backend.supports_mla_projected_value_decode
 
@@ -152,6 +187,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def takes_owned_decode_topk(self, layer):
         return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
+
+    def projects_decode_values(self, layer, **sizes):
+        return self._backend_for_layer(layer.layer_id).projects_decode_values(
+            layer, **sizes
+        )
 
     def dcp_decode_query_rider(self, layer, q):
         return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)

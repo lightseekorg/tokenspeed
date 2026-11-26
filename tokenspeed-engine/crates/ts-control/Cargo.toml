@@ -20,6 +20,7 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 ts-collective = { package = "tokenspeed-collective", version = "0.1.0", path = "../ts-collective" }
+ts-disk = { package = "tokenspeed-disk", version = "0.1.0", path = "../ts-disk" }
 ts-grammar = { package = "tokenspeed-grammar", version = "0.1.0", path = "../ts-grammar" }
 ts-l3 = { package = "tokenspeed-l3", version = "0.1.0", path = "../ts-l3" }
 ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
@@ -38,7 +39,7 @@ mimalloc = { version = "0.1", default-features = false }
 pyo3 = "0.30"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-ts-client = { package = "tokenspeed-client", version = "0.1.0", path = "../ts-client" }
+ts-client = { package = "tokenspeed-client", version = "0.2.0", path = "../ts-client" }
 
 [[bench]]
 name = "engine_cpu"

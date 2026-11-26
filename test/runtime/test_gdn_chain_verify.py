@@ -140,7 +140,12 @@ def _backend(state, *, width: int, max_bs: int, cls=GdnAttnBackend):
         components=(spec, linear),
     )
     backend = (
-        GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=False)
+        GdnAttnBackend(
+            config,
+            spec,
+            writes_state_checkpoints_in_forward=False,
+            defer_recurrent_state=False,
+        )
         if cls is GdnAttnBackend
         else cls(config, spec)
     )

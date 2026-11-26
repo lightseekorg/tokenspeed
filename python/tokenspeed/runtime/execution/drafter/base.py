@@ -123,6 +123,10 @@ class BaseDrafter:
     supports_speculative_sampling = False
     supports_dp_local_graph: bool = False
 
+    # Whether the recorded q is DFlash2's sparse ``RuntimeStates.future_draft_q``
+    # instead of the dense ``RuntimeStates.draft_probs`` rows.
+    records_sparse_draft_q = False
+
     # Whether every sampled proposal comes from ``sample_draft_step`` over the
     # draft model's own head, which can then hand it this rank's vocabulary
     # shard (``keep_draft_logits_vocab_sharded``).
@@ -203,6 +207,7 @@ class BaseDrafter:
             runtime_states=self.runtime_states,
             input_buffers=self.input_buffers,
             spec_num_tokens=self.spec_num_tokens,
+            sampling_stream=sampling_backend.config.sampling_stream,
             vocab_map=self.draft_vocab_map(),
             device=self.runtime_states.draft_probs.device,
         )
@@ -235,11 +240,15 @@ class BaseDrafter:
             ``sample_draft_step`` over a head spanning the target vocabulary,
             whose shard the processor can hand over.
         """
+        # First, before the draft model is read at all: a block drafter has no
+        # per-step shard to keep, and a DFLASH draft has no ``lm_head`` of its
+        # own to inspect (it projects through the target's).
+        if not self.drafts_from_vocab_shard:
+            return False
         model = self.draft_model_runner.model
         lm_head = model.lm_head
         if (
-            not self.drafts_from_vocab_shard
-            or self.draft_vocab_map() is not None
+            self.draft_vocab_map() is not None
             or not isinstance(lm_head, VocabParallelEmbedding)
             or int(lm_head.shard_indices.org_vocab_start_index) != vocab_start
         ):
@@ -637,6 +646,10 @@ class HiddenStateDrafter(BaseDrafter):
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
+        if self.draft_sampler is not None:
+            self.draft_sampler.prepare_round(
+                accept_lengths, num_extends=base_ctx.num_extends
+            )
         draft_input = HiddenDraftInput(
             input_num_tokens=base_ctx.input_num_tokens,
             num_extends=base_ctx.num_extends,

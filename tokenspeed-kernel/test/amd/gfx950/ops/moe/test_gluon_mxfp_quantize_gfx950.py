@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, make_mxfp4_scale_ladder
 
 if not is_cdna4():
     pytest.skip(
@@ -38,12 +38,18 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (  # noqa:
     _swiglu_reduce,
     get_mfma_layout,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (  # noqa: E402
+    _quantize_mxfp4_activation,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
     _mxfp4_quantize_tile,
     _mxfp4_quantize_tile_in_layout,
     _mxfp8_quantize_tile,
     quantize_mxfp8_sorted_routes,
     scaled_downcast_layout,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
+    swizzle_cdna4_mxfp4_scale,
 )
 
 # noqa: E402
@@ -109,6 +115,28 @@ def test_sorted_route_mxfp8_quantization_matches_standard_gfx950() -> None:
         atol=0,
         rtol=0,
     )
+
+
+# Fewer than 128 rows take the one-block-per-program kernel, 128 and up the
+# tiled one.
+@pytest.mark.parametrize("rows", [32, 128])
+def test_mxfp4_activation_quantize_scale_bytes_gfx950(rows: int) -> None:
+    # Block maxima from 2**-20 to 2**10 plus an all-zero block (byte 0); most
+    # are below 4, where the scale exponent is negative before the bias.
+    # 32-row and 8-block multiples leave no padding in the swizzled scales.
+    x, expected_scale = make_mxfp4_scale_ladder(rows, 8)
+
+    packed, scale = _quantize_mxfp4_activation(x)
+    expected_packed, linear_scale = kernel_quantize_mxfp4(
+        x, scale_layout="linear", solution="triton"
+    )
+    torch.cuda.synchronize()
+
+    swizzled = swizzle_cdna4_mxfp4_scale(expected_scale)[0]
+    assert scale.shape == swizzled.shape
+    assert torch.equal(scale.cpu(), swizzled)
+    assert torch.equal(linear_scale.cpu(), expected_scale)
+    assert torch.equal(packed, expected_packed)
 
 
 @gluon.jit

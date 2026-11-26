@@ -144,6 +144,9 @@ recurrent rows to zero without reading the null page. Stores accept padded
 negative destinations and require contiguous integer destination indices.
 Model plugins use these common operations through the state backend.
 
+State scatter tiles each request independently and specializes the fixed state
+shape and inner strides; changing the request count does not recompile it.
+
 Prefill source/destination index slices are runtime metadata. Both gather and
 scatter kernels ignore their pointer alignment when choosing a specialization,
 so moving a slice within a request-index buffer does not compile another kernel.

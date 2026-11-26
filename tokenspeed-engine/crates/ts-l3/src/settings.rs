@@ -106,6 +106,9 @@ impl Settings {
             recovery_interval: Duration::from_millis(
                 runtime.getattr("recovery_interval_ms")?.extract()?,
             ),
+            clear_cache_drain_timeout: Duration::from_millis(
+                runtime.getattr("clear_cache_drain_timeout_ms")?.extract()?,
+            ),
         };
         let groups: Vec<(usize, usize, usize)> = settings.getattr("groups")?.extract()?;
         let layout = HostLayout {

@@ -434,7 +434,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-@triton.jit(do_not_specialize=["batch"])
+@triton.jit(do_not_specialize=["batch", "replay_bank_stride"])
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
@@ -450,6 +450,8 @@ def _causal_conv1d_update_kernel(
     replay_ptr,  # (batch * seqlen, replay width)
     replay_a_ptr,  # (batch * seqlen, gate heads)
     replay_b_ptr,  # (batch * seqlen, gate heads)
+    replay_bank,
+    replay_bank_stride,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -507,6 +509,8 @@ def _causal_conv1d_update_kernel(
     if idx_seq >= batch:
         return
 
+    if replay_bank is not None:
+        replay_ptr += tl.load(replay_bank).to(tl.int64) * replay_bank_stride
     if HAS_REPLAY_PAYLOAD:
         # Channel block 0 copies the gates: payload row = [REPLAY_FIRST_CHANNEL on | a | b].
         if tl.program_id(1) == 0:

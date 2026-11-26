@@ -103,6 +103,9 @@ class TestL3FlatKvRoundTripTest:
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
             CacheGroupSpec,
         )
+        from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+            TorchMemorySaverAdapter,
+        )
 
         torch = self.torch
         specs = (
@@ -139,7 +142,10 @@ class TestL3FlatKvRoundTripTest:
         class Pool:
             def __init__(self, layout):
                 self.layout = layout
-                self.arena = SimpleNamespace(runtime_contract=contract)
+                self.arena = SimpleNamespace(
+                    runtime_contract=contract,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+                )
                 self.load_tracker = None
 
             def cache_transfer_layout(self):
@@ -198,6 +204,7 @@ class TestL3FlatKvRoundTripTest:
                     kvp_rank=rank,
                     nprocs_per_node=1,
                     world_cpu_group=None,
+                    block_alignment=1,
                 )
                 stack.callback(executor.shutdown)
                 ownership = BlockOwnerTranslation.for_host_pool(
@@ -354,6 +361,7 @@ class TestL3FlatKvRoundTripTest:
             attn_tp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
 
     @staticmethod

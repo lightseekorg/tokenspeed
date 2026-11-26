@@ -37,7 +37,10 @@
 // every third plan on the oldest decode (3) or prefill (-3), into a pool too
 // small for some of the images the knob takes. One P-role test turns the
 // in-forward checkpoints on for every seed and drops short prompts' ends
-// (drop_short_prompt_end_checkpoints).
+// (drop_short_prompt_end_checkpoints). The P role also draws its decode
+// allocation policy, from a stream of its own; under deferred allocation
+// the peer allocates destinations at a rate the seed draws, whatever a
+// prompt's progress, so computed prompts wait for theirs.
 //
 // The scheduler must never raise; under write-back no copy pins its Device
 // source; every write-back row keeps its two ends in one shard's bucket;
@@ -46,7 +49,7 @@
 // admission, stranded suffix or restore) equal the sum of the drain's
 // outcomes, the dead and demoted entries it dropped included. On the P role
 // a plan leaves at most one prefill incomplete, and it runs last, after any
-// whole prompts its chunk gave way to (prefill_chunk_yield_tokens): the
+// whole prompts run beside its chunk, prefill_chunk_yield_tokens or not: the
 // completing prefills form a prefix of the batch. With KV cache events on,
 // every plan's drain removes only blocks the feed stored and stores none
 // twice, alike on mirrored ranks. Once everything is acknowledged, no Host
@@ -120,6 +123,9 @@ struct LoopKnobs {
     std::int32_t chunk_budget{0};
     // SchedulerConfig::prefill_chunk_yield_tokens (0: off; the P role only).
     std::int32_t yield_tokens{0};
+    // SchedulerConfig::enable_short_prefill_first: new prompts are admitted
+    // by rank, and so is what fills the budget a chunk leaves.
+    bool short_prefill_first{false};
     // Leave out the State groups and the sliding window: no junction cut and
     // no final-window rule then shapes a chunk.
     bool full_attention_only{false};
@@ -148,6 +154,10 @@ struct ClosedLoop {
     bool mixed{false};
     bool capacity_retraction{false};
     std::int32_t force_retraction_interval{0};
+    // The P role's draws: deferred decode allocation, and the chance a
+    // round allocates an admitted prompt's destination.
+    bool deferred{false};
+    double grant_probability{0.7};
     // Mirrored: allocated between the two schedulers' constructions, so the
     // second one's allocations are not the first one's at a fixed offset.
     std::vector<std::uint8_t> heap_perturbation;
@@ -159,6 +169,10 @@ struct ClosedLoop {
     struct Live {
         std::vector<std::int32_t> prompt;
         bool bootstrapped{false};
+        // Deferred decode allocation: the destination is allocated, and
+        // the prompt's final result landed.
+        bool granted{false};
+        bool computed{false};
         bool transferring{false};
         bool finished{false};
         // The fused role's generation: its token limit and what landed.
@@ -184,14 +198,19 @@ struct ClosedLoop {
 
     std::uint64_t aborts{0};
     std::uint64_t handoffs{0};
+    // Deferred decode allocation: plans after which a computed prompt
+    // waited for its destination, and the waiting prompts that got theirs.
+    std::uint64_t waiting_plans{0};
+    std::uint64_t waiting_grants{0};
     // Plans that only decode and write back what they evict, and the
     // eviction write-back ops so far.
     std::uint64_t decode_only_write_backs{0};
     std::uint64_t eviction_ops{0};
     // The P role's plans with an incomplete prefill that whole prompts ran
-    // beside (prefill_chunk_yield_tokens), how many of those chunks ended on
-    // a page (with restricted State groups, a segment), and the prompts they
-    // carried.
+    // beside (filling the budget its chunk left or, with
+    // prefill_chunk_yield_tokens, given way to), how many of those chunks
+    // ended on a page (with restricted State groups, a segment), and the
+    // prompts they carried.
     std::uint64_t yielding_chunks{0};
     std::uint64_t yielding_chunks_on_page{0};
     std::uint64_t carried_prompts{0};
@@ -278,6 +297,11 @@ struct ClosedLoop {
             force_retraction_interval = std::vector<std::int32_t>{0, 0, 3, -3}[retraction];
         } else {
             overlap_depth = Rand(0, 2);
+            // From a stream of its own, so the seed keeps its other draws.
+            std::mt19937 policy_rng(seed + 1);
+            deferred = role == Role::kP && std::uniform_int_distribution<int>(0, 1)(policy_rng) == 1;
+            grant_probability =
+                std::vector<double>{0.05, 0.2, 0.7}[std::uniform_int_distribution<std::size_t>(0, 2)(policy_rng)];
         }
         const std::int32_t history_block = Rand(0, 2) == 0 ? kP : kP / 2;
         // Restricted State groups require in-forward checkpoints.
@@ -289,6 +313,10 @@ struct ClosedLoop {
         const std::int32_t packing = std::max(4, kv_shards);
         SchedulerConfig cfg{};
         cfg.role = role;
+        if (role == Role::kP) {
+            cfg.decode_allocation_policy = deferred ? SchedulerConfig::DecodeAllocationPolicy::kDeferred
+                                                    : SchedulerConfig::DecodeAllocationPolicy::kEarly;
+        }
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = device_pages;
         cfg.host_allocator.total_pages = host_pages;
@@ -306,6 +334,7 @@ struct ClosedLoop {
         cfg.drop_short_prompt_end_checkpoints = knobs.drop_short_prompt_ends;
         cfg.demote_superseded_state_checkpoints = knobs.demote;
         cfg.prefill_chunk_yield_tokens = knobs.yield_tokens;
+        cfg.enable_short_prefill_first = knobs.short_prefill_first;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
                                                     .total_pages = (device_pages - 1) * packing + 1,
@@ -432,6 +461,9 @@ struct ClosedLoop {
             const std::int32_t token = ++next_token;
             results.With(forward::ExtendResult{.request_id = id, .tokens = {token}});
             const auto state = live.find(id);
+            if (state != live.end()) {
+                state->second.computed = true;
+            }
             if (role != Role::kFused || state == live.end() || state->second.finished) {
                 continue;  // a finished request's delayed row
             }
@@ -455,12 +487,17 @@ struct ClosedLoop {
     }
 
     // The transfer peer: bootstraps waiting prompts, and acknowledges (or
-    // fails) the hand-offs it was given.
+    // fails) the hand-offs it was given. Under deferred decode allocation
+    // it also allocates the admitted prompts' destinations, computed or not.
     void Peer(const ExecutionPlan* plan) {
         ExecutionEvent events;
         bool any = false;
         if (plan != nullptr && plan->remote_decode.has_value()) {
             for (const std::string& id : plan->remote_decode->request_ids) {
+                if (deferred && !live[id].granted) {
+                    throw std::logic_error("round " + std::to_string(round) + ": " + id +
+                                           " sent its KV without a destination");
+                }
                 live[id].transferring = true;
                 ++handoffs;
             }
@@ -469,6 +506,12 @@ struct ClosedLoop {
             if (!state.bootstrapped && Uniform() < 0.7) {
                 events.With(pd::BootstrappedEvent{id});
                 state.bootstrapped = true;
+                any = true;
+            }
+            if (deferred && state.bootstrapped && !state.granted && !state.finished && Uniform() < grant_probability) {
+                events.With(pd::DestinationReadyEvent{id});
+                waiting_grants += state.computed ? 1 : 0;
+                state.granted = true;
                 any = true;
             }
             if (state.transferring && Uniform() < 0.5) {
@@ -509,6 +552,31 @@ struct ClosedLoop {
             }
         }
         DrainKvEvents();
+        if (role == Role::kP) {
+            // The prompts waiting for their destination are exactly the
+            // computed live ones without one; none under early allocation.
+            const auto waiting = static_cast<std::size_t>(std::ranges::count_if(live, [this](const auto& entry) {
+                return deferred && entry.second.computed && !entry.second.granted && !entry.second.finished;
+            }));
+            for (const std::unique_ptr<Scheduler>& scheduler : schedulers) {
+                if (scheduler->AwaitingDestinationSize() != waiting) {
+                    throw std::logic_error("round " + std::to_string(round) + ": " +
+                                           std::to_string(scheduler->AwaitingDestinationSize()) +
+                                           " prompts wait for their destination, not " + std::to_string(waiting));
+                }
+            }
+            waiting_plans += waiting > 0 ? 1 : 0;
+            // Deferred: a computed prompt that has its destination goes
+            // out with this plan. Its remote decode takes no block, so it
+            // never waits for one.
+            for (const auto& [id, state] : live) {
+                if (deferred && state.computed && state.granted && !state.transferring && !state.finished &&
+                    !(plan.remote_decode.has_value() && std::ranges::count(plan.remote_decode->request_ids, id) > 0)) {
+                    throw std::logic_error("round " + std::to_string(round) + ": " + id +
+                                           " has its destination and its KV was not sent");
+                }
+            }
+        }
         std::vector<std::pair<std::uint32_t, Kind>> ops;
         bool restores = false;
         for (const Operation& operation : plan.Operations()) {
@@ -549,7 +617,7 @@ struct ClosedLoop {
         if (role == Role::kP && runs_forward) {
             // At most one prefill is left incomplete, the head of line, and
             // it runs last: the completing prefills form a prefix of the
-            // batch, whole prompts its chunk gave way to included.
+            // batch, whole prompts run beside its chunk included.
             std::optional<std::size_t> incomplete;
             for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
                 if (batch->extend_prefix_lens[i] + batch->input_lengths[i] < batch->prefill_lengths[i]) {
@@ -577,10 +645,6 @@ struct ClosedLoop {
                     carried += !prefilling.contains(id) && (resident || Serial(id) > Serial(holder)) ? 1 : 0;
                 }
                 if (carried > 0) {
-                    if (knobs.yield_tokens == 0) {
-                        throw std::logic_error("round " + std::to_string(round) +
-                                               ": a prompt was admitted behind an incomplete prefill");
-                    }
                     ++yielding_chunks;
                     carried_prompts += carried;
                     // A page, or a restricted State group's whole segment.
@@ -799,17 +863,23 @@ struct ClosedLoop {
 
 }  // namespace
 
-// 64 seeds, each of its own configuration, acknowledged op by op.
+// 64 seeds, each of its own configuration, acknowledged op by op. Without
+// prefill_chunk_yield_tokens no chunk gives way, but whole prompts still fill
+// the budget a chunk leaves.
 TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
     std::uint64_t aborts = 0;
     std::uint64_t handoffs = 0;
+    std::uint64_t filled = 0;
+    std::uint64_t waiting_plans = 0;
+    std::uint64_t waiting_grants = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
-        SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
-                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
+        SCOPED_TRACE(::testing::Message()
+                     << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " overlap "
+                     << loop.overlap_depth << " shards " << loop.kv_shards << (loop.deferred ? " deferred" : " early"));
         try {
             loop.Run();
         } catch (const std::exception& error) {
@@ -825,6 +895,9 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
         loads += stats.prefix_loads.ops;
         aborts += loop.aborts;
         handoffs += loop.handoffs;
+        filled += loop.carried_prompts;
+        waiting_plans += loop.waiting_plans;
+        waiting_grants += loop.waiting_grants;
     }
     // Write-back evicted, wrote back and loaded back at every shard count.
     for (const std::int32_t shards : {1, 2, 4, 8}) {
@@ -834,6 +907,11 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     }
     EXPECT_GT(aborts, 0u);
     EXPECT_GT(handoffs, 0u);
+    EXPECT_GT(filled, 0u) << "whole prompts filled the budget a chunk left";
+    // Under deferred allocation computed prompts waited for their
+    // destinations and got them.
+    EXPECT_GT(waiting_plans, 0u);
+    EXPECT_GT(waiting_grants, 0u);
 }
 
 // 16 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
@@ -1031,10 +1109,13 @@ TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
 // seeds per variant -- drawn configurations; in-forward checkpoints; with a
 // 24-token budget and prompts that mostly continue finished ones, State
 // groups as drawn (also with the KV event feed checked after every plan) and
-// full attention alone; drawn configurations with the KV event feed; and
-// restricted State groups of a two-page grain -- every fourth with mirrored
-// ranks. Besides draining with nothing pinned, no plan leaves two prefills
-// incomplete or runs a completing prefill after the incomplete one
+// full attention alone; drawn configurations with the KV event feed;
+// restricted State groups of a two-page grain; and, with
+// enable_short_prefill_first, drawn configurations and the 24-token budget,
+// where new prompts and the fill follow the ranking, the latter also with no
+// yield, where only the fill runs prompts beside a chunk -- every fourth with
+// mirrored ranks. Besides draining with nothing pinned, no plan leaves two
+// prefills incomplete or runs a completing prefill after the incomplete one
 // (NextPlan), so every prompt carried beside a chunk that gave way completes
 // in its round, ahead of that chunk. Such a chunk ends on a page unless a
 // junction or the final-window rule cuts it; with full attention alone
@@ -1045,6 +1126,10 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
     short_budget_kv_events.kv_events = true;
     LoopKnobs full_attention = short_budget;
     full_attention.full_attention_only = true;
+    LoopKnobs short_budget_ranked = short_budget;
+    short_budget_ranked.short_prefill_first = true;
+    LoopKnobs short_budget_ranked_fill_only = short_budget_ranked;
+    short_budget_ranked_fill_only.yield_tokens = 0;
     const struct {
         const char* name;
         LoopKnobs knobs;
@@ -1056,6 +1141,9 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
         {"full attention", full_attention},
         {"drawn, KV events", LoopKnobs{.yield_tokens = 24, .kv_events = true}},
         {"restricted State groups", LoopKnobs{.yield_tokens = 24, .state_grain = 2 * kP}},
+        {"short prefill first", LoopKnobs{.yield_tokens = 24, .short_prefill_first = true}},
+        {"24-token budget, short prefill first", short_budget_ranked},
+        {"24-token budget, short prefill first, no yield", short_budget_ranked_fill_only},
     };
     for (const auto& variant : variants) {
         std::uint64_t yielding_chunks = 0;
@@ -1083,7 +1171,7 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
             kv_stored_events += loop.kv_stored_events;
         }
         SCOPED_TRACE(variant.name);
-        EXPECT_GT(yielding_chunks, 0u) << "chunks gave way";
+        EXPECT_GT(yielding_chunks, 0u) << "whole prompts ran beside a chunk";
         EXPECT_GE(carried, yielding_chunks);
         if (variant.knobs.full_attention_only || variant.knobs.state_grain > 1) {
             EXPECT_EQ(on_page, yielding_chunks) << "every chunk that gave way ended on a page or segment";

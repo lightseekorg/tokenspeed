@@ -555,6 +555,57 @@ protected:
     }
 };
 
+// The D role with write-back (docs/rfcs/0005-runtime-pd-roles.md): what its
+// admissions evict is written back to the Host, and a later remote admission
+// loads its Host hit below the landing, so the peer sends only what lies past
+// it.
+class DecodeWriteBackTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = false;
+        cfg.device_allocator.total_pages = 5;  // the null page and four
+        cfg.host_allocator.total_pages = 9;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Lands `id`'s prompt and finishes it right after its first token.
+    ExecutionPlan LandAndFinish(const RequestSpec& spec) {
+        Submit({spec});
+        SendBootstrapped(spec.request_id);
+        ExecutionPlan admission = PlanOnce();
+        EXPECT_NE(FindRemoteAdmission(admission), nullptr) << spec.request_id;
+        SendRemotePrefillDone(spec.request_id, /*bootstrap_token=*/42);
+        SendFinish(spec.request_id);
+        PlanOnce();
+        return admission;
+    }
+};
+
+TEST_F(DecodeWriteBackTestSuite, ARemoteAdmissionLoadsItsHostHitAndLandsOnlyPastIt) {
+    LandAndFinish(MakeRequestSpec("seed", /*num_pages=*/2, /*start=*/1));
+    // Three pages and the decode room fill the Device: seed's cached pages
+    // are evicted and written back.
+    const ExecutionPlan pressure = LandAndFinish(MakeRequestSpec("pressure", /*num_pages=*/3, /*start=*/101));
+    ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(pressure).empty());
+    AckWriteBacks(pressure);
+
+    // hit continues seed's prompt by a page. The Device no longer holds
+    // seed's two pages; the Host does.
+    Submit({MakeRequestSpec("hit", /*num_pages=*/3, /*start=*/1)});
+    SendBootstrapped("hit");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* landing = FindRemoteAdmission(plan);
+    ASSERT_NE(landing, nullptr);
+    EXPECT_EQ(landing->request_ids, std::vector<std::string>{"hit"});
+    EXPECT_EQ(landing->extend_prefix_lens, std::vector<std::int32_t>{4}) << "the peer sends only the third page";
+    EXPECT_EQ(landing->input_lengths, std::vector<std::int32_t>{2});
+    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty()) << "the Host hit is loaded";
+}
+
 TEST_F(DecodeRetractionCapacityTestSuite, AdmissionDoesNotReserveFutureRetractionCapacity) {
     RequestSpec longest = MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1);
     longest.max_new_tokens = 6;  // five-parent maximum retraction state

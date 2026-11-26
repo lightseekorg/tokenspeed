@@ -30,7 +30,7 @@ use std::{
 
 use ts_scheduler::{
     PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView,
-    Scheduler,
+    PeerTier, Scheduler,
 };
 
 use crate::peer::{
@@ -87,6 +87,8 @@ pub struct Holder {
     /// scheduler holds, so a release always finds its pin's record.
     record_lifetime: Duration,
     changes: Vec<PeerEventView>,
+    /// The source execution stream still has replay to apply before remote Device reads.
+    device_pins_blocked: bool,
 }
 
 impl Holder {
@@ -98,7 +100,13 @@ impl Holder {
             records: HashMap::new(),
             record_lifetime,
             changes: Vec::new(),
+            device_pins_blocked: false,
         }
+    }
+
+    /// Gate new Device pins without affecting existing leases or other tiers.
+    pub fn block_device_pins(&mut self, blocked: bool) {
+        self.device_pins_blocked = blocked;
     }
 
     /// Answer as the namespace `identity` from now on.
@@ -144,6 +152,11 @@ impl Holder {
                     answer.num_tokens = looked_up.num_tokens;
                     answer.pages = looked_up.pages.clone();
                     answer.held = looked_up.num_tokens > 0
+                        && (!self.device_pins_blocked
+                            || looked_up
+                                .pages
+                                .iter()
+                                .all(|page| page.tier != PeerTier::Device))
                         && cache.pages_match(
                             &record.lookup,
                             looked_up.num_tokens,

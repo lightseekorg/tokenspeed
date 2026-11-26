@@ -199,6 +199,7 @@ fn generate_text() {
             cache_group_id: Some(s("cache-group")),
             shared_prefix_tokens: vec![1, 3],
             peer_holder: Some(s("10.0.0.2:7100")),
+            peer_expected_tokens: Some(128),
         },
     );
 }
@@ -534,6 +535,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         reasoning_tokens: vec![],
         num_resident_tokens: None,
         num_waiting_uncached_tokens: None,
+        request_timing: vec![],
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
@@ -793,6 +795,8 @@ fn generate_from_an_older_client_preserves_session_and_tokens() {
     let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
         panic!("generate messages must be arrays");
     };
+    assert_eq!(fields.pop(), Some(Value::from(128)));
+    expected.peer_expected_tokens = None;
     assert_eq!(fields.pop(), Some(Value::from("10.0.0.2:7100")));
     expected.peer_holder = None;
     assert_eq!(
@@ -837,4 +841,93 @@ fn shared_prefix_publication_nonce_rank_and_namespace_cross_python_wire() {
             cache_epoch: 7,
         }),
     );
+}
+
+#[test]
+fn output_without_request_timing_preserves_the_existing_load_tail() {
+    let frames = fixture("output_slim");
+    let expected: BatchTokenIDOutSlim = decode_frames(&frames).unwrap();
+    let Value::Array(mut fields) = decode_frames::<Value>(&frames).unwrap() else {
+        panic!("output messages must be arrays");
+    };
+    assert_eq!(fields.pop(), Some(Value::Array(vec![])));
+    assert_eq!(fields.last(), Some(&Value::from(3_000_000_000_i64)));
+    let legacy_frames = encode_frames(&Value::Array(fields));
+    let decoded: BatchTokenIDOutSlim = decode_frames(&legacy_frames).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(decoded.num_resident_tokens, Some(5_000_000_000));
+    assert_eq!(decoded.num_waiting_uncached_tokens, Some(3_000_000_000));
+    assert!(decoded.request_timing.is_empty());
+}
+
+#[test]
+fn request_timing_tail_roundtrips_and_rejects_ragged_columns() {
+    use ts_wire::{RequestClock, RequestTimestamp, RequestTiming, RequestTimingEvents};
+    let frames = fixture("output_slim_timing");
+    let mut batch: BatchTokenIDOutSlim = decode_frames(&frames).unwrap();
+    let timing = RequestTiming {
+        role: s("decode"),
+        dp_rank: Some(2),
+        tp_rank: Some(3),
+        clock: RequestClock {
+            host_id: s("worker-a"),
+            process_instance_id: s("process-a"),
+            clock_sync: s("unknown"),
+            clock_uncertainty_ns: Some(s("17")),
+        },
+        events: RequestTimingEvents {
+            accepted: Some(RequestTimestamp {
+                ts_unix_ns: s("1700000000000000001"),
+                ts_mono_ns: Some(s("9007199254740993")),
+            }),
+            kv_ready: Some(RequestTimestamp {
+                ts_unix_ns: s("1700000000200000002"),
+                ts_mono_ns: Some(s("9007199454740994")),
+            }),
+            finished: RequestTimestamp {
+                ts_unix_ns: s("1700000000500000003"),
+                ts_mono_ns: Some(s("9007199754740995")),
+            },
+        },
+        kv_output_tokens: Some(1),
+        e2e_latency_s: Some(0.75),
+    };
+    assert_eq!(batch.request_timing, [Some(timing.clone()), None]);
+    assert_eq!(encode_frames(&batch), frames);
+    let rows: Vec<_> = batch.requests().unwrap().collect();
+    assert_eq!(rows[0].request_timing, Some(&timing));
+    assert_eq!(rows[1].request_timing, None);
+    let mut missing = timing;
+    missing.events.accepted = None;
+    missing.events.kv_ready = None;
+    missing.events.finished.ts_mono_ns = None;
+    missing.kv_output_tokens = None;
+    missing.e2e_latency_s = None;
+    let decoded: RequestTiming = decode_frames(&encode_frames(&missing)).unwrap();
+    assert_eq!(decoded, missing);
+    batch.request_timing.pop();
+    assert!(batch
+        .requests()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("request_timing"));
+}
+
+#[test]
+fn request_timing_rejects_malformed_timestamps() {
+    let batch: BatchTokenIDOutSlim = decode_frames(&fixture("output_slim_timing")).unwrap();
+    let timing = batch.request_timing[0].as_ref().unwrap();
+    let Value::Map(mut fields) = decode_frames::<Value>(&encode_frames(timing)).unwrap() else {
+        unreachable!()
+    };
+    let (_, events) = fields
+        .iter_mut()
+        .find(|(name, _)| *name == Value::from("events"))
+        .unwrap();
+    *events = Value::Map(vec![(
+        Value::from("finished"),
+        Value::from("not a timestamp"),
+    )]);
+    assert!(decode_frames::<ts_wire::RequestTiming>(&encode_frames(&Value::Map(fields))).is_err());
 }

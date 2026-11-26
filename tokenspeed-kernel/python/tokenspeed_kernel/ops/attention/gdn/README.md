@@ -1,5 +1,13 @@
 # GDN kernels
 
+## Triton prefill KKT
+
+Accumulate `K @ K.T` before applying the row-wise beta scaling. This avoids
+the Hopper WGMMA shared-buffer lifetime bug triggered when a loaded K tile
+also feeds a separate register-side beta multiplication. Applying beta after
+the FP32 accumulation also avoids rounding beta-scaled K back to its storage
+dtype before the dot product.
+
 ## CuTe DSL WY verification
 
 `gdn_decode_mtp` selects the output-only TF32 MMA kernel for ReplaySSM through
@@ -34,7 +42,7 @@ accept `strided_state=True` within their existing execution contracts. The
 operator derives this trait from both state pools, and runtime capability
 queries include the bound input pool's layout. Decode benchmark generators
 allocate contiguous state rows and select with `strided_state=False`, matching
-the operator's dispatch for those inputs. FlashInfer 0.7.4 uses native
+the operator's dispatch for those inputs. FlashInfer 0.7.5 uses native
 4D pool indexing for padded FP32 state, including final-state writeback and
 per-token scatter; its BF16 MTP path also preserves padded pool strides.
 The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes
@@ -153,7 +161,7 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Rubin FlashInfer
 
-The audited FlashInfer Python/cubin release for these adapters is `0.7.4`.
+The audited FlashInfer Python/cubin release for these adapters is `0.7.5`.
 Registrations live in `flashinfer.py`; the explicit `flashinfer_rubin` decode
 solution requires the audited release.
 
@@ -298,3 +306,49 @@ request, and key head streams its value heads' state tiles through a
 two-stage cp.async shared-memory ring, loading the next tile while the
 current one replays. It keeps the per-tile arithmetic, so results match the
 per-tile kernel bitwise.
+
+## Deferred accepted-prefix replay
+
+On supported NVIDIA BF16 K128/V128 four-token chains, the next verify
+can replay the previous accepted prefix while it reads the recurrent
+state. The kernel writes the accepted state as BF16 and uses its FP32
+value for the current outputs. This can differ from rounding the state
+before a separate WY call.
+
+Pass `pending_replay` explicitly to `gdn_decode_mtp`. The descriptor
+references two batch payload banks, their accepted counts and page
+indices, and the previous row for each live request. Pass `None` to
+read committed state. The selected kernel must support the descriptor.
+For rows that leave the batch, pass the device request mask to
+`gdn_replay_commit`. Masked replay compacts selected rows before
+reading their state.
+
+A scheduler-requested exit looks up the requested slot records directly.
+It verifies ownership before selecting the bank rows to write back or
+invalidating replay for a discarded request. The replay kernels use the
+selected row counts on device, so an empty selection does no State I/O.
+
+The banked WY kernel uses V32 tiles and two state stages. It splits the
+value tiles across CTAs for small batches and streams the tiles within
+a CTA for larger batches. Both variants warm at startup. Batch sizes,
+page strides, accepted lengths and bank indices are runtime values. State
+rows are dense K-last and 16-byte aligned, with room for padding between rows.
+The launcher also accepts strided Q/K/V inputs through a variant with
+scalar input loads and the same replay-before-verify contract.
+
+The WY warp loads each K16 coefficient fragment once for both V16 subtiles.
+Query and retained key coefficients start in different shared-memory bank
+groups so they can be loaded together. Each replay warp packs its high and
+residual deltas into its own V16 rows and synchronizes within that warp.
+The TMA producer waits for all consumer warps before writing the state tile.
+
+`benchmarks/nvidia/bench_gdn_deferred.py` measures a continuous sequence
+at the layer count and dimensions read from a checkpoint config. It
+includes pending metadata and conv commit. The serving benchmark
+`benchmarks/nvidia/bench_gdn_deferred_serving.py` measures native
+streaming requests after running requests, queued requests and active
+KV pages from warmup drain. Pass the engine's metrics endpoint through
+`--metrics-url` and use identical prefill capture settings for both runs.
+
+See the [runtime contract](../../../../../../docs/design/unified_path.md#deferred-gdn-accepted-state)
+for state ownership and the boundaries that require materialization.

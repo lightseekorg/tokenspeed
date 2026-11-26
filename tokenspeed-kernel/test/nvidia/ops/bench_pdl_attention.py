@@ -88,6 +88,7 @@ def _gdn(batch, steps, solution):
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
                 tree_ancestors=None,
+                pending_replay=None,
             )
         return gated_rmsnorm(
             out.reshape(-1, dim),

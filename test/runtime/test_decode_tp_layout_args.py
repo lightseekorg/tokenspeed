@@ -437,6 +437,67 @@ class TestModuleRefusals:
         assert plain.forward_absorb_attn_v_proj(Q, idle, output) is output
         assert calls == []
 
+    def test_a_kvp_placed_decode_hands_the_core_its_value_projection(self):
+        """A projecting backend gets ``w_vc`` for a gate or a KVP cache.
+
+        An unplaced ungated decode, an extend, or a backend that does not
+        project keeps the latent core and projects after it.
+        """
+        attn = self._attention(Mapping(rank=0, world_size=1, attn_tp_size=1))
+        attn.w_vc = torch.zeros(8, attn.kv_lora_rank, 4)
+        calls: list[dict] = []
+
+        class Core:
+            layer_id = 0
+
+            def __call__(self, Q, **kwargs):
+                calls.append(kwargs)
+                if kwargs["value_weight"] is not None:
+                    return kwargs["projected_output"]
+                return Q.new_zeros(Q.shape[0], Q.shape[1] * attn.kv_lora_rank)
+
+        del attn.attn_mqa
+        attn.attn_mqa = Core()
+        projected: list[torch.Tensor] = []
+        attn.project_attended_heads = lambda out, ctx, output, gate: (
+            projected.append(output) or output
+        )
+
+        def ctx(*, supports, placement, num_extends=0):
+            def cache_placement(layer):
+                assert layer is attn.attn_mqa
+                return placement
+
+            backend = SimpleNamespace(
+                supports_mla_projected_value_decode=supports,
+                cache_placement=cache_placement,
+            )
+            return SimpleNamespace(
+                query_shard=None, num_extends=num_extends, attn_backend=backend
+            )
+
+        Q = torch.zeros(3, 8, attn.kv_lora_rank + 4)
+        output = torch.zeros(3, 8 * 4)
+        placed = object()
+        assert (
+            attn.forward_absorb_attn_v_proj(
+                Q, ctx(supports=True, placement=placed), output
+            )
+            is output
+        )
+        assert calls[-1]["value_weight"] is attn.w_vc
+        assert calls[-1]["projected_output"] is output
+        assert calls[-1]["output_gate"] is None and not projected
+        for unprojected in (
+            ctx(supports=True, placement=None),
+            ctx(supports=True, placement=placed, num_extends=1),
+            ctx(supports=False, placement=placed),
+        ):
+            calls.clear()
+            projected.clear()
+            assert attn.forward_absorb_attn_v_proj(Q, unprojected, output) is output
+            assert calls[-1]["value_weight"] is None and projected == [output]
+
     def test_the_expanded_prefill_keeps_refusing_under_head_tp(self):
         """``forward`` (the dense MLA path with the expanded prologue) refuses
         extend rows on every head-sharded layout: a query shard outright, and

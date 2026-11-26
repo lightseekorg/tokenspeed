@@ -58,7 +58,7 @@ Allocation sites use `named_region(name)` to describe their owner:
 | `executor_inputs` | executor inputs and ngram input buffers | `persistent_buffers` |
 | `runtime_states` | request history and runtime state | `persistent_buffers` |
 | `attention_state` | attention backend and graph metadata | `persistent_buffers` |
-| `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
+| `workspace` | shared scratch and kernel-cached workspaces, including growth | `persistent_buffers` |
 
 The adapter resolves these aliases centrally. The executor owns its adapter
 and passes it to the prefill graph; their buffers do not depend on the KV
@@ -97,6 +97,11 @@ The upstream implementation at
 [`7078bc36`](https://github.com/fzyzcjy/torch_memory_saver/commit/7078bc36ebc926ced1cd6d314b869c0a0d3d1f18)
 contains both behaviors and can be built against the deployment's CUDA toolkit.
 Record the exact source and wheel hashes when using a local build.
+
+With the native CUDA allocator, TokenSpeed temporarily disables expandable
+segments in memory-saver allocation, graph capture, pause, and resume scopes.
+Other allocations can still use expandable segments. PyTorch's setting is
+process-wide, so other CUDA allocation threads must be idle during these scopes.
 
 When CUDA graphs operate on remapped storage, set `NCCL_GRAPH_REGISTER=0` before
 launch so NCCL does not retain graph registrations across remapping. This does

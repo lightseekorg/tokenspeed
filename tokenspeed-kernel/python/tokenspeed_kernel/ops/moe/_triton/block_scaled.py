@@ -265,15 +265,43 @@ def _store_mxfp8_chunk(
 
 
 @triton.jit
+def _mxfp8_chunk_values(values, exponent, BLOCK: tl.constexpr):
+    """The FP32 values that ``_mxfp8_chunk_codes`` encode: each E4M3 value
+    times ``2^(exponent - 127)`` (at least ``2^-127``; NaN for exponent 255),
+    the decode of the block-scaled expert GEMMs. The products are exact and
+    fit BF16 at every exponent the quantizer chooses."""
+    exponent = exponent.to(tl.int32)
+    scale = tl.maximum((exponent << 23).to(tl.float32, bitcast=True), 2.0**-127)
+    scale = tl.where(exponent == 255, float("nan"), scale)
+    values = tl.reshape(values.to(tl.float32), (BLOCK // 32, 32)) * scale[:, None]
+    return tl.reshape(values, (BLOCK,))
+
+
+@triton.jit
 def _quantize_mxfp8_chunk(
-    Values, Scales, row, chunk, x, width: tl.constexpr, BLOCK: tl.constexpr, layout
+    Values,
+    Scales,
+    Dequant,
+    row,
+    chunk,
+    x,
+    width: tl.constexpr,
+    BLOCK: tl.constexpr,
+    layout,
+    STORE_DEQUANT: tl.constexpr,
 ):
     """Quantize FP32 columns ``chunk * BLOCK + [0, BLOCK)`` of one row, its
-    scales in ``layout`` (``_scale_offset``)."""
+    scales in ``layout`` (``_scale_offset``). With ``STORE_DEQUANT`` also
+    store the BF16 values the codes encode in ``Dequant`` (``[rows, width]``),
+    for a GEMM that reads its activations as BF16."""
     values, exponent = _mxfp8_chunk_codes(x, BLOCK)
     _store_mxfp8_chunk(
         Values, Scales, row, chunk, values, exponent, width, BLOCK, layout
     )
+    if STORE_DEQUANT:
+        col = chunk * BLOCK + tl.arange(0, BLOCK)
+        dequant = _mxfp8_chunk_values(values, exponent, BLOCK)
+        tl.store(Dequant + row * width + col, dequant.to(tl.bfloat16), col < width)
 
 
 @triton.jit
@@ -324,7 +352,18 @@ def _quantize_row(
                 STORE_DEQUANT,
             )
         else:
-            _quantize_mxfp8_chunk(Values, Scales, row, chunk, x, width, BLOCK, 0)
+            _quantize_mxfp8_chunk(
+                Values,
+                Scales,
+                Dequant,
+                row,
+                chunk,
+                x,
+                width,
+                BLOCK,
+                0,
+                STORE_DEQUANT,
+            )
 
 
 @triton.constexpr_function
@@ -571,7 +610,16 @@ def _swiglu_quantize(
                 )
             else:
                 _quantize_mxfp8_chunk(
-                    Values, Scales, row, chunk, x, width, BLOCK, layout
+                    Values,
+                    Scales,
+                    Dequant,
+                    row,
+                    chunk,
+                    x,
+                    width,
+                    BLOCK,
+                    layout,
+                    STORE_DEQUANT,
                 )
 
 
@@ -785,16 +833,16 @@ def _routed_quantized_input(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
 ]:
     """``_routing(ids, experts, expert_start)`` and the block quantization of
-    ``x`` to ``fmt`` in one launch. A BF16 ``dequant`` (``x``'s shape, NVFP4
-    only) also receives the values the codes encode."""
+    ``x`` to ``fmt`` in one launch. A BF16 ``dequant`` (``x``'s shape) also
+    receives the values the codes encode."""
     ids = ids.to(torch.int32).contiguous()
     rows, width = x.shape
     num_routes = ids.numel()
     routes = torch.empty((experts, num_routes), device=x.device, dtype=torch.int32)
     counts = torch.empty(experts, device=x.device, dtype=torch.int32)
     nvfp4 = fmt == "nvfp4"
-    if dequant is not None and (not nvfp4 or dequant.shape != x.shape):
-        raise ValueError("a BF16 dequant copy needs NVFP4 and the input's shape")
+    if dequant is not None and dequant.shape != x.shape:
+        raise ValueError("a BF16 dequant copy needs the input's shape")
     values, scales, amax = _quantized_buffers(rows, width, nvfp4, x.device)
     row_programs = rows > _CHUNK_PROGRAM_MAX_ROWS
     programs = rows * (1 if row_programs else triton.cdiv(width, 256))
@@ -1182,14 +1230,12 @@ def _swiglu_quantize_routes(
     and whose NVFP4 maxima become the per-row output scales of the second
     projection (weights ``w_amax`` and ``w_denominator``); None keeps route
     rows, maxima and row-major scales. A BF16 ``second_dequant`` (``second``'s
-    unpacked shape, NVFP4 only) also receives the values the codes encode.
+    unpacked shape) also receives the values the codes encode.
     """
     route_count, hidden = output.shape
     intermediate = gate_up.shape[1] // 2
     second_nvfp4 = second_format == "nvfp4"
     store_dequant = second_dequant is not None
-    if store_dequant and not second_nvfp4:
-        raise ValueError("a BF16 dequant copy needs an NVFP4 second input")
     # Unused pointer without a copy.
     second_dequant = second if second_dequant is None else second_dequant
     row_map = route_rows is not None
@@ -1447,10 +1493,10 @@ def _block_scaled_moe_routes(
 
     ``matmul`` is ``_expert_mm_scaled``, which picks its own tiles (``tiles``
     is None), or a kernel with ``_expert_mm``'s arguments run with
-    ``tiles = (BM, BN, BK)``. With ``bf16_activations`` (NVFP4 experts, a
-    kernel that takes ``BF16_X``) the quantizers also store the exact BF16
-    values of both quantized inputs, and ``matmul`` reads those instead of
-    decoding the NVFP4 codes for every output tile.
+    ``tiles = (BM, BN, BK)``. With ``bf16_activations`` (a kernel that takes
+    ``BF16_X``) the quantizers also store the exact BF16 values of both
+    quantized inputs, and ``matmul`` reads those instead of decoding the
+    codes for every output tile.
     """
     if not x.is_cuda:
         raise ValueError("Triton block-scaled experts require GPU tensors")
@@ -1460,8 +1506,6 @@ def _block_scaled_moe_routes(
     intermediate = w13.shape[1] // 2
     if not tokens:
         return x.new_empty((0, 1 if fold_slots else top_k, hidden))
-    if bf16_activations and formats != ("nvfp4", "nvfp4"):
-        raise ValueError(f"BF16 activations need NVFP4 experts, not {formats}")
     first_dequant = torch.empty_like(x) if bf16_activations else None
     (routes, counts), (first, first_scale, first_amax) = _routed_quantized_input(
         x, ids, w13.shape[0], expert_start, formats[0], first_dequant

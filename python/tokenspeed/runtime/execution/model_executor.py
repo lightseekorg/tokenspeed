@@ -126,6 +126,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
     local_pages_by_group,
 )
+from tokenspeed.runtime.layers.hyperconnection import (
+    register_workspace_region as register_hc_workspace_region,
+)
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessorOutput,
     prepare_logits_communication,
@@ -157,12 +160,18 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
+
+
+def _last_packed_token_rows(input_lengths: torch.Tensor) -> torch.Tensor:
+    """Locate each request's last row within the scheduler's int32 token budget."""
+    return torch.cumsum(input_lengths, dim=0, dtype=torch.int32).sub_(1)
 
 
 def _sampling_info_for_requests(
@@ -326,6 +335,12 @@ def select_dspark_context_producer(
 
 
 @runtime_checkable
+class MoESourceRowsModel(Protocol):
+    @property
+    def moe_source_rows(self) -> MoESourceRows | None: ...
+
+
+@runtime_checkable
 class RopeTableModel(Protocol):
     """A model that sizes its RoPE table itself (Beam's covers the
     speculative pad past the context)."""
@@ -357,11 +372,12 @@ def warn_past_rope_table(
     else:
         table_len = get_context_length(model_config.hf_text_config)
     if physical_context_len > table_len:
+        role = "draft" if model_config.is_draft_worker else "target"
         logger.warning(
             f"physical context extent {physical_context_len!s} (context_len "
             f"{context_len!s} + spec overshoot "
             f"pad {physical_context_len - context_len!s}) exceeds the "
-            f"{table_len!s} positions of the model's rope tables; "
+            f"{table_len!s} positions of the {role} model's rope tables; "
             "positions in the pad index past the precomputed rope tables. "
             "Lower --max-model-len by at least "
             f"{physical_context_len - table_len!s} to stay in bounds.",
@@ -637,6 +653,7 @@ class ModelExecutor:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=config.enable_memory_saver
         )
+        register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -660,6 +677,15 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
+        if draft_model_runner is not None and isinstance(
+            draft_model_runner.model, RopeTableModel
+        ):
+            warn_past_rope_table(
+                draft_model_runner.model,
+                draft_model_runner.model_config,
+                config.context_len,
+                config.physical_context_len,
+            )
         self._draft_final_step_counter = None
         self._pp_wire_logged = False
 
@@ -708,6 +734,12 @@ class ModelExecutor:
                 config.physical_context_len
                 if model_runner.model_config.requires_request_token_history
                 else 0
+            )
+            # Per row of a forward (sized like InputBuffers.max_bs), whether
+            # the device ended its request, and with a complete decode state:
+            # the control plane's word for publishing a request's state.
+            self.request_ends = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
             )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
@@ -782,12 +814,7 @@ class ModelExecutor:
                 f"{shard_top_k} candidates per shard instead of gathering logits"
             )
         # After the target's shard decision: a drafter sharded alike records q over its shard.
-        self._init_draft_probs(config, spec_num_tokens)
-        if self.drafter is not None:
-            # Draft-prob sampling reads the request's temperature / top-k /
-            # seed from the verifier's pool buffers: one owner of per-request
-            # sampling state.
-            self.drafter.bind_sampling_backend(self.sampling_backend)
+        self._init_sampled_drafting(config, spec_num_tokens)
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -815,6 +842,12 @@ class ModelExecutor:
             device=self.device,
         )
 
+        # A backend that defers dense state writes completes them in the
+        # decode commit of the forward that ends a request, and reports a row
+        # whose state it could not complete in request_ends.
+        self.attn_backend.bind_request_stop_flags(
+            self.runtime_states.stopped, self.request_ends
+        )
         self._configure_for_pools()
 
         # Backend-declared CUDA-graph support, AND-composed over the target
@@ -1058,6 +1091,13 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            moe_source_rows=tuple(
+                rows
+                for runner in (self.model_runner, self._draft_model_runner)
+                if runner is not None
+                and isinstance(runner.model, MoESourceRowsModel)
+                and (rows := runner.model.moe_source_rows) is not None
+            ),
         )
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; borrows the decode capture stream so all
@@ -1201,7 +1241,18 @@ class ModelExecutor:
 
         A forward reload keeps the tactics already loaded by this process.
         """
+        self._warm_kernels(keep_loaded_tactics=keep_loaded_tactics, tune=True)
 
+    def warm_kernels(self) -> None:
+        """Warm kernels on the serving stream with the loaded tactics, tuning none.
+
+        For a warm-up after the pools are rebound: it compiles the kernel
+        variants the new pools select, but profiles no tactic, since tuning
+        workspaces would land outside the memory the rebind reserved.
+        """
+        self._warm_kernels(keep_loaded_tactics=True, tune=False)
+
+    def _warm_kernels(self, *, keep_loaded_tactics: bool, tune: bool) -> None:
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
@@ -1253,8 +1304,10 @@ class ModelExecutor:
             # These dummy forwards do not perform pipeline stage transfers.
             logger.info("Kernel warmup and tuning skipped under pipeline parallelism")
             return
-        tune_mode = not self.config.disable_autotune
-        if not tune_mode:
+        tune_mode = tune and not self.config.disable_autotune
+        if not self.config.disable_autotune and not tune:
+            logger.info("Kernel warmup with the loaded tactics, profiling none")
+        elif not tune_mode:
             logger.info("Kernel tactic profiling disabled (--disable-autotune)")
 
         # One traversal discovers each operator. Its dispatch warms finite
@@ -1347,7 +1400,11 @@ class ModelExecutor:
                             ),
                             graph_phase=False,
                         )
-                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                if (
+                    tune
+                    and hipblaslt_autotune_enabled()
+                    and not self.config.prefill_only
+                ):
                     # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
                     # captured batch size tunes the dense GEMMs the tuned file
                     # does not list, so capture records the picks. Tuning ends
@@ -1381,7 +1438,7 @@ class ModelExecutor:
         num_tokens_per_req = self.config.output_length
         logits = torch.zeros(
             (num_tokens_per_req, lm_head.num_embeddings_per_partition),
-            dtype=lm_head.weight.dtype,
+            dtype=processor.sampled_shard_dtype(lm_head),
             device=self.device,
         )
         candidates = torch.zeros(
@@ -1789,6 +1846,7 @@ class ModelExecutor:
             accept_lengths,
             ib.input_lengths_buf[: ctx.bs],
             ib.extend_prompt_lens_buf[: ctx.num_extends],
+            self.request_ends[: ctx.bs],
             num_extends=ctx.num_extends,
             num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
             decode_width=ctx.output_layout.decode_width,
@@ -2003,6 +2061,16 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        self.attn_backend.prepare_pending_recurrent_state(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            self.runtime_states.valid_cache_lengths,
+            allow_defer=(
+                ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+                and ctx.output_layout.decode_width == 4
+            ),
+        )
+
         # KV offloading uses scheduler request slots to bind hot partitions;
         # ordinary backends keep their existing path through a no-op hook.
         self.attn_backend.prepare_cache_batch(
@@ -2183,17 +2251,39 @@ class ModelExecutor:
             ib.state_write_padding_pool_index,
         )
 
+    def _init_sampled_drafting(
+        self, config: ModelExecutorConfig, spec_num_tokens: int
+    ) -> None:
+        """Allocate and bind the state --enable-speculative-sampling keeps.
+
+        The recorded draft q rows and the drafter's sampling scratch live across
+        rounds and inside captured graphs, so they join the CPU-backed
+        ``runtime_states`` region: a weights release unmaps them and a resume
+        restores their addresses and contents.
+
+        Args:
+            config: The executor config.
+            spec_num_tokens: Verify chain width.
+        """
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self._init_draft_probs(config, spec_num_tokens)
+            if self.drafter is not None:
+                # Draft-prob sampling reads the request's temperature / top-k /
+                # seed from the verifier's pool buffers: one owner of per-request
+                # sampling state.
+                self.drafter.bind_sampling_backend(self.sampling_backend)
+
     def _init_draft_probs(
         self, config: ModelExecutorConfig, spec_num_tokens: int
     ) -> None:
         """Allocate the dense per-vocab draft q under --enable-speculative-sampling.
 
-        Trees keep their draft q per tree instead (bind_tree), and DFLASH
-        (DFlash2) records a sparse q over its selector's candidates
+        Trees keep their draft q per tree instead (bind_tree), and DFlash2
+        records a sparse q over its selector's candidates
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
-        The step drafters and DSpark sample from full-vocab logits and need
-        the dense rows: whole-vocabulary rows, or this rank's columns when
-        the verifier reads q per shard and the drafter can record them
+        The step drafters, DSpark and base DFLASH sample from full-vocab logits
+        and need the dense rows: whole-vocabulary rows, or this rank's columns
+        when the verifier reads q per shard and the drafter can record them
         (``_draft_probs_shard``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
@@ -2203,7 +2293,11 @@ class ModelExecutor:
                 "enable_speculative_sampling needs a speculative drafter to "
                 "record proposal distributions for"
             )
-        if config.spec_algo != "DFLASH":
+        # DFlash2 records a sparse q instead. A stage without a drafter (a
+        # pipeline stage before the last) keeps the old rule: no rows for DFLASH.
+        if config.spec_algo != "DFLASH" or (
+            self.drafter is not None and not self.drafter.records_sparse_draft_q
+        ):
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
@@ -2602,17 +2696,26 @@ class ModelExecutor:
         decode. The transferred recurrent state needs no length: it lands in
         the live slot of the request's state row, which the first decode reads
         and evolves in place.
+
+        Each landed slot also starts a new owner's history: the backends clear
+        the working state its previous owner left (``reset_request_workspace``)
+        here, since a retraction may fold the slot before its first forward.
         """
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
             return
-        self._write_valid_cache_lengths(
+        rows = self._write_valid_cache_lengths(
             forward_op.request_pool_indices[:num_extends],
             forward_op.prefill_lengths[:num_extends],
         )
+        self.attn_backend.reset_request_workspace(rows, stream=self.execution_stream)
 
-    def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
-        """Publish per-row valid cache lengths on the execution stream."""
+    def _write_valid_cache_lengths(self, pool_indices, lengths) -> torch.Tensor:
+        """Publish per-row valid cache lengths on the execution stream.
+
+        Returns:
+            The rows' request slots, an int64 device tensor.
+        """
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
@@ -2633,6 +2736,7 @@ class ModelExecutor:
             self.attn_backend.invalidate_cache_residency(
                 rows, stream=self.execution_stream
             )
+        return rows
 
     def execute_forward_op(
         self,
@@ -2688,9 +2792,15 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            self.runtime_states.bind_stop_criteria(
+            rebound_slots = self.runtime_states.bind_stop_criteria(
                 admission_ids, forward_op.request_pool_indices, stop_criteria
             )
+            if rebound_slots is not None:
+                # A slot's new owner starts without its previous owner's
+                # backend working state.
+                self.attn_backend.reset_request_workspace(
+                    rebound_slots, stream=self.execution_stream
+                )
             cache_metadata = None
             block_tables = {}
             block_tables_cpu = {}
@@ -2827,30 +2937,23 @@ class ModelExecutor:
                         num_prefill_tokens = total_tokens - num_decode_tokens
                         gather_ids = torch.empty(
                             num_extends + num_decode_tokens,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                             device=self.device,
                         )
-                        gather_ids[:num_extends] = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:num_extends],
-                                dim=0,
-                            )
-                            - 1
+                        gather_ids[:num_extends] = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:num_extends]
                         )
                         gather_ids[num_extends:] = torch.arange(
                             num_prefill_tokens,
                             total_tokens,
                             device=self.device,
-                            dtype=torch.int64,
+                            dtype=torch.int32,
                         )
                     else:
                         # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request via cumsum.
-                        gather_ids = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:bs], dim=0
-                            )
-                            - 1
+                        # per request.
+                        gather_ids = _last_packed_token_rows(
+                            self.input_buffers.input_lengths_buf[:bs]
                         )
 
                 output_layout = ForwardOutputLayout(
@@ -3062,6 +3165,10 @@ class ModelExecutor:
                     forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
+                # Every row as the stop conditions and the commit left it.
+                output_request_ends = self.request_ends[:bs].to(
+                    "cpu", non_blocking=True
+                )
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
@@ -3102,6 +3209,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            output_request_ends=output_request_ends,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a

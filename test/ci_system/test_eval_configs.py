@@ -55,7 +55,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 7,
+        "count": 8,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -351,17 +351,63 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
             assert "--disable-prefill-graph" in server_tokens
 
 
+KIMI_K31_AMD_RECIPE_CONFIGS = (
+    (EVAL_CONFIG_DIR, "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-aime26-amd.yaml"),
+    (
+        PERF_CONFIG_DIR,
+        "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-agentic-mi35x.yaml",
+    ),
+)
+# Serving flags that only the CI jobs set (the gateway tokenizer is staged on
+# the runners) and that only the doc sets (a public bind address).
+KIMI_K31_CI_ONLY_FLAGS = {
+    "--tokenizer",
+    "--host",
+    "--port",
+    "--policy",
+    "--engine-startup-timeout",
+    "--gateway-startup-timeout",
+}
+KIMI_K31_DOC_ONLY_FLAGS = {"--host", "--port"}
+
+
+def serve_flags(tokens: list[str]) -> dict[str, tuple[str, ...]]:
+    flags = {}
+    flag = None
+    for token in tokens:
+        if token.startswith("--"):
+            assert token not in flags, f"duplicate {token}"
+            flag = token
+            flags[flag] = ()
+        else:
+            assert flag is not None, f"positional {token} after the subcommand"
+            flags[flag] += (token,)
+    return flags
+
+
+def kimi_k31_amd_doc_recipe() -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    text = (REPO_ROOT / "docs" / "recipes" / "models.md").read_text(encoding="utf-8")
+    section = text.split("## Kimi K3.1 Pro {#kimi-k3-1-pro}", 1)[1]
+    section = section.split("\n## ", 1)[0].split("\n### AMD\n", 1)[1]
+    section = section.split("\n### ", 1)[0]
+    blocks = section.split("```bash\n")
+    assert len(blocks) == 2, "expected one bash block in the Kimi-K3.1 AMD recipe"
+    tokens = shlex.split(blocks[1].split("```", 1)[0].replace("\\\n", " "))
+    env = {}
+    while "=" in tokens[0] and not tokens[0].startswith("-"):
+        key, value = tokens.pop(0).split("=", 1)
+        env[key] = value
+    assert tokens[:2] == ["tokenspeed", "serve"]
+    model = tokens[2]
+    flags = serve_flags(tokens[3:])
+    flags["--model"] = (model,)
+    return env, flags
+
+
 def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
     configs = (
-        (
-            EVAL_CONFIG_DIR,
-            "kimi-k3.1-pro-eagle3.1-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
-        ),
+        *KIMI_K31_AMD_RECIPE_CONFIGS,
         (EVAL_CONFIG_DIR, "kimi-k3.1-pro-mxfp4-tp8ep1-evalscope-aime26-amd.yaml"),
-        (
-            PERF_CONFIG_DIR,
-            "kimi-k3.1-pro-eagle3.1-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml",
-        ),
         (
             PERF_CONFIG_DIR,
             "kimi-k3.1-pro-mxfp4-tp8ep1-evalscope-random-4k-1k-mi35x.yaml",
@@ -371,9 +417,9 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
     for config_dir, filename in configs:
         task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
-        is_eagle = "eagle3.1" in filename
+        is_recipe = "dspark" in filename
 
-        expected_triggers = ["per-commit", "manual"] if is_eagle else ["manual"]
+        expected_triggers = ["per-commit", "manual"] if is_recipe else ["manual"]
         assert task["triggers"] == expected_triggers
         assert (
             task["env"]["KIMI_K31_GATEWAY_TOKENIZER"]
@@ -394,39 +440,46 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             flag_value(server_tokens, "--tokenizer")
             == "${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}"
         )
-        assert flag_value(server_tokens, "--attention-backend") == "dsa"
+        if not is_recipe:
+            assert flag_value(server_tokens, "--attention-backend") == "dsa"
         if task["type"] == "eval":
-            assert flag_value(server_tokens, "--reasoning-parser") == "kimi_k3"
+            if not is_recipe:
+                assert flag_value(server_tokens, "--reasoning-parser") == "kimi_k3"
             assert task["score_threshold"] == 0.90
-        elif is_eagle:
-            assert task["perf_threshold"] == 0.9
-            assert task["perf_reference"] == {16: [85, 20]}
+        elif is_recipe:
+            assert task["perf_threshold"] == 0.95
+            assert task["perf_reference"] == {32: [24.8, 9400]}
         else:
             assert "perf_reference" not in task
             assert "perf_threshold" not in task
         tasks[filename] = task
 
-    eagle_filenames = (
-        "kimi-k3.1-pro-eagle3.1-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
-        "kimi-k3.1-pro-eagle3.1-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml",
+    eval_task, agentic_task = (
+        tasks[filename] for _, filename in KIMI_K31_AMD_RECIPE_CONFIGS
     )
-    eagle_tasks = [tasks[filename] for filename in eagle_filenames]
-    for task in eagle_tasks:
+    for task in (eval_task, agentic_task):
         server_tokens = shlex.split(task["server"]["command"])
-        assert flag_value(server_tokens, "--speculative-algorithm") == "EAGLE3"
+        assert flag_value(server_tokens, "--speculative-algorithm") == "DSPARK"
+        # A step count equal to the default leaves the checkpoint's block width.
         assert (
-            flag_value(server_tokens, "--speculative-draft-model-path")
-            == "lightseekorg/kimi-k3-eagle3.1-mla"
+            flag_value(server_tokens, "--speculative-num-steps") != "3"
+            or "--speculative-num-draft-tokens" in server_tokens
         )
-        assert flag_value(server_tokens, "--speculative-num-steps") == "3"
-        assert flag_value(server_tokens, "--speculative-num-draft-tokens") == "4"
-        assert flag_value(server_tokens, "--speculative-eagle-topk") == "1"
-        assert flag_value(server_tokens, "--eagle3-layers-to-capture") == "2,46,90"
-        assert flag_value(server_tokens, "--tp") == "8"
-        assert flag_value(server_tokens, "--ep-size") == "1"
-        assert flag_value(server_tokens, "--drafter-attention-backend") == "gluon"
+        assert flag_value(server_tokens, "--tensor-parallel-size") == "8"
+        assert flag_value(server_tokens, "--kv-parallel-size") == "8"
+        assert flag_value(server_tokens, "--decode-context-parallel-size") == "8"
+        for flag in (
+            "--max-num-seqs",
+            "--cudagraph-capture-sizes",
+            "--enable-mixed-batch",
+            "--prefill-decode-interval",
+            "--prefill-decode-min-interval",
+            "--enable-short-prefill-first",
+            "--disable-prefill-graph",
+        ):
+            assert flag not in server_tokens
 
-    eval_tokens = shlex.split(eagle_tasks[0]["eval"]["command"])
+    eval_tokens = shlex.split(eval_task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
     assert generation_config["max_tokens"] == 63488
@@ -434,38 +487,56 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
     assert "--limit" not in eval_tokens
     assert (
         flag_value(eval_tokens, "--work-dir")
-        == ".ci-artifacts/published/kimi-k3.1-pro-eagle3.1-aime26"
+        == ".ci-artifacts/published/kimi-k3.1-pro-dspark-aime26"
     )
-    perf_server_tokens = shlex.split(eagle_tasks[1]["server"]["command"])
-    # EP1 has no expert placement, so server-arg validation rejects these.
-    assert "--init-expert-location" not in perf_server_tokens
-    assert "--ep-dispatch-algorithm" not in perf_server_tokens
-    assert flag_value(perf_server_tokens, "--max-model-len") == "65536"
-    assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
-    assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
-    assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert "'evalscope[perf]==1.11.1'" in eagle_tasks[1]["perf"]["install"][0]
-    perf_tokens = shlex.split(eagle_tasks[1]["perf"]["command"])
+    assert "'evalscope[perf]==1.11.1'" in agentic_task["perf"]["install"][0]
+    assert "/tmp/agentic_dataset.json" in agentic_task["perf"]["install"][1]
     assert (
-        "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3.1-pro-eagle3.1-tp8ep1-50k-500-perf"
-        in perf_tokens
+        'revision="2779acd48a05c211f2f82eee71bdbdf688d984ca"'
+        in agentic_task["perf"]["install"][1]
     )
-    assert "trap" not in perf_tokens
+    agentic_tokens = shlex.split(agentic_task["perf"]["command"])
+    assert agentic_tokens.count("/tmp/evalscope-perf/bin/evalscope") == 1
     for flag, value in {
-        "--parallel": "16",
-        "--number": "16",
-        "--warmup-num": "0",
-        "--dataset-offset": "300160",
-        "--seed": "20260906",
-        "--min-prompt-length": "50000",
-        "--max-prompt-length": "50000",
-        "--min-tokens": "500",
+        "--dataset": "swe_smith",
         "--max-tokens": "500",
+        "--parallel": "32",
+        "--number": "64",
     }.items():
-        assert flag_value(perf_tokens, flag) == value
-    assert flag_value(perf_tokens, "--total-timeout") == "21600"
-    assert "--no-apply-chat-template" in perf_tokens
-    assert "--no-test-connection" in perf_tokens
+        assert flag_value(agentic_tokens, flag) == value
+    assert "--multi-turn" in agentic_tokens
+    assert "--dataset-offset" not in agentic_tokens
+    # collect_outputs.py reads the GPU count from the attn_tp suffix.
+    assert "$OUTPUTS_DIR/kimi-k3.1_attn_tp8;" in agentic_tokens
+    assert (
+        "$REPO_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/collect_outputs.py"
+        in agentic_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    "config", KIMI_K31_AMD_RECIPE_CONFIGS, ids=lambda config: config[1]
+)
+def test_kimi_k31_amd_ci_serves_the_documented_recipe(config):
+    config_dir, filename = config
+    task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
+    doc_env, doc_flags = kimi_k31_amd_doc_recipe()
+    tokens = shlex.split(task["server"]["command"])
+    assert tokens[:2] == ["ts", "serve"]
+    ci_flags = serve_flags(tokens[2:])
+
+    for flag in KIMI_K31_CI_ONLY_FLAGS:
+        ci_flags.pop(flag, None)
+    for flag in KIMI_K31_DOC_ONLY_FLAGS:
+        doc_flags.pop(flag, None)
+    assert ci_flags == doc_flags
+
+    ci_env = {
+        key: value
+        for key, value in task["env"].items()
+        if key not in ("CI", "KIMI_K31_GATEWAY_TOKENIZER")
+    }
+    assert ci_env == doc_env
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():

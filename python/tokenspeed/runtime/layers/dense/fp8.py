@@ -24,7 +24,11 @@
 
 
 import torch
-from tokenspeed_kernel.ops.gemm import mm, prepare_mxfp8_weight_scales
+from tokenspeed_kernel.ops.gemm import (
+    mm,
+    mm_activation_scale_layout,
+    prepare_mxfp8_weight_scales,
+)
 from tokenspeed_kernel.ops.gemm.deepgemm import prepare_deepgemm_fp8_weight
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import pdl_enabled
@@ -306,6 +310,7 @@ class Fp8LinearMethod(LinearMethodBase):
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], layer.weight.shape[0]]
         output_dtype = output_dtype or x.dtype
+        out_2d = out.view(-1, layer.weight.shape[0]) if out is not None else None
         if self.prepared_weight_scales is not None and (
             block_scale is not None or x.dtype in (torch.bfloat16, torch.float16)
         ):
@@ -324,6 +329,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
             )
             return out if out is not None else output.view(*output_shape)
+        # Prequantized scales must match the layout mm_activation_scale_layout reports.
         if block_scale is None:
             scale_encoding = (
                 "packed_ue8m0"
@@ -334,12 +340,28 @@ class Fp8LinearMethod(LinearMethodBase):
                     else "float32"
                 )
             )
+            mn_major = (
+                scale_encoding == "float32"
+                and input_2d.dtype == torch.bfloat16
+                and mm_activation_scale_layout(
+                    input_2d,
+                    layer.weight,
+                    B_scales=layer.weight_scale_inv,
+                    block_size=self.quant_config.weight_block_size,
+                    out=out_2d,
+                    out_dtype=output_dtype,
+                    solution=self._get_block_solution(),
+                )
+                == "mn_major"
+            )
+            # The GEMM reads MN-major scales, which this quantizer writes natively.
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
-                enable_pdl=pdl_enabled(),
+                enable_pdl=pdl_enabled() and not mn_major,
+                override="trtllm_quantize_fp8_mn_major" if mn_major else None,
             )
         output = mm(
             input_2d,
@@ -351,7 +373,7 @@ class Fp8LinearMethod(LinearMethodBase):
             quant="mxfp8",
             block_size=self.quant_config.weight_block_size,
             solution=self._get_block_solution(),
-            out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
+            out=out_2d,
         )
         return (
             out

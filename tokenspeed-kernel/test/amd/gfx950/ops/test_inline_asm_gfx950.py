@@ -127,9 +127,12 @@ def _mha_decode_sliding_split():
         out_ptr="*bf16",
         sink_ptr="*fp8e4nv",
         counters_ptr="*i32",
+        gate_ptr="*bf16",
+        gate_stride="i32",
     )
     constexprs = dict(
-        _ATTENTION, NUM_KV_SPLITS=8, WINDOW_LEFT=2047, HAS_SINK=False
+        _ATTENTION, NUM_KV_SPLITS=8, WINDOW_LEFT=2047, HAS_SINK=False, GATE_EPS=1e-6,
+        HAS_GATE=True, UNIFORM_ROWS=False,
     )  # fmt: skip
     return _compile_gfx950(fn, types, constexprs, 4, options=_sched_options())
 
@@ -140,7 +143,13 @@ def _mha_decode_split():
         gluon_mha_decode_gfx950 as fn,
     )
 
-    constexprs = dict(_ATTENTION, NUM_KV_SPLITS=8, IS_SLIDING=False, WINDOW_LEFT=-1)
+    constexprs = dict(
+        _ATTENTION,
+        NUM_KV_SPLITS=8,
+        IS_SLIDING=False,
+        WINDOW_LEFT=-1,
+        UNIFORM_ROWS=False,
+    )
     return _compile_gfx950(fn, _ATTENTION_POINTERS, constexprs, 4, (), _sched_options())
 
 

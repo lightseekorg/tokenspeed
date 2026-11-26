@@ -25,7 +25,10 @@ how reads spread over the sources. Whole-shard copies reach about 420 GB/s per
 GB300 at 16 ranks; one batch of small chunks, each round taking one chunk from
 every peer in a fixed per-rank random order, reaches about 700 GB/s beside
 compute. The chunk is ``SPREAD_BYTES`` divided by the number of ranks. A worker thread submits the
-batch, since the call blocks while the copy stream's queue is full; GPU-side
+chunks, since the call blocks while the copy stream's queue is full, in batches
+of ``BATCH_COPIES``: the driver may start a batch's copies only once its
+submission returns, so one batch per layer can run submission and copying back
+to back, while several let the first batches copy during the rest. GPU-side
 sequence flags order fetches against readers. Enqueue a flag wait only after
 its write is enqueued (``CopyEngineWorker.wait_submitted``): a wait ahead of its
 producer blocks the GPU, and lazy module loading on any thread then deadlocks.
@@ -40,6 +43,7 @@ from pathlib import Path
 import torch
 
 SPREAD_BYTES = 8 << 20
+BATCH_COPIES = 4096
 
 
 def build_copy_schedule(
@@ -83,7 +87,7 @@ def load_peer_copy_module():
     from tokenspeed_kernel.thirdparty.flashinfer.jit import build_cuda_module
 
     return build_cuda_module(
-        "tokenspeed_peer_copy_v2", [Path(__file__).with_name("peer_copy.cu")]
+        "tokenspeed_peer_copy_v3", [Path(__file__).with_name("peer_copy.cu")]
     )
 
 
@@ -106,10 +110,20 @@ class SequenceFlags:
 class CopyEngineWorker:
     """Background submitter of per-layer copy batches on one copy stream."""
 
-    def __init__(self, device: torch.device, stream: torch.cuda.Stream) -> None:
+    def __init__(
+        self, device: torch.device, stream: torch.cuda.Stream, batch_copies: int
+    ) -> None:
+        """Start the worker thread.
+
+        Args:
+            device: GPU the copies run on.
+            stream: Copy stream the worker submits to.
+            batch_copies: Copies per submitted batch; a layer's schedule is
+                submitted in consecutive batches of this many.
+        """
         self._module = load_peer_copy_module()
         self._handle: int | None = self._module.create_worker(
-            device.index, stream.cuda_stream
+            device.index, stream.cuda_stream, batch_copies
         )
 
     def set_layer(

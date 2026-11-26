@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -24,9 +25,15 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import kda_state_fields
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    pack,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupSpec,
 )
 
 
@@ -228,6 +235,92 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     assert not torch.count_nonzero(draft_pool.kv_buffer[0])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("recurrent_state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_checkpoint_survives_copy_and_reuse(
+    recurrent_state_dtype: torch.dtype,
+) -> None:
+    """Copy and zero a dense checkpoint without touching an adjacent MLA block."""
+    device = "cuda"
+    heads, dim = 2, 8
+    groups = (
+        (
+            CacheGroupSpec(
+                group_id=FULL_ATTENTION,
+                attn_kind="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                replayable=False,
+            ),
+            (CacheFieldSpec("layer.0.latent_kv", "slot.0", (128, 1, 576), "bfloat16"),),
+        ),
+        (
+            CacheGroupSpec(
+                group_id=LINEAR_ATTENTION, attn_kind="state", replayable=False
+            ),
+            kda_state_fields(
+                1,
+                "slot.0",
+                conv_shape=(3 * heads * dim, 3),
+                recurrent_shape=(heads, dim, dim),
+                recurrent_state_dtype=recurrent_state_dtype,
+            ),
+        ),
+    )
+    plan = pack(
+        groups,
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block={FULL_ATTENTION: 1, LINEAR_ATTENTION: 1},
+        max_padding_fraction=float("inf"),
+    ).bind(4)
+    arena = make_arena(
+        plan, device=device, cache_group_specs=tuple(spec for spec, _ in groups)
+    )
+    pool = HybridKDATokenToKVPool(
+        arena=arena,
+        model_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
+        quant_method=None,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=2,
+        rank=0,
+        layer_types=(FULL_ATTENTION, LINEAR_ATTENTION),
+    )
+    fields = {
+        name: pool.get_component(1, name) for name in ("conv_state", "recurrent_state")
+    }
+    for index, tensor in enumerate(fields.values(), 1):
+        tensor[1].fill_(index)
+        tensor[2].fill_(index + 3)
+
+    # State blocks 1..3 occupy parents 0..2. MLA block 4 owns parent 3.
+    latent = pool.get_key_buffer(0)[4]
+    latent.fill_(0.25)
+    before = {name: tensor.clone() for name, tensor in fields.items()}
+    arena.copy_blocks({LINEAR_ATTENTION: np.asarray([[1, 2], [2, 3]], dtype=np.int64)})
+    for name, tensor in fields.items():
+        for destination, source in ((1, 1), (2, 1), (3, 2)):
+            torch.testing.assert_close(
+                tensor[destination],
+                before[name][source],
+                atol=0,
+                rtol=0,
+                equal_nan=True,
+            )
+
+    pool.zero_new_blocks({LINEAR_ATTENTION: np.asarray([2], dtype=np.int64)})
+    for name, tensor in fields.items():
+        torch.testing.assert_close(
+            tensor[2], torch.zeros_like(tensor[2]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(tensor[1], before[name][1], atol=0, rtol=0)
+        torch.testing.assert_close(
+            tensor[3], before[name][2], atol=0, rtol=0, equal_nan=True
+        )
+    torch.testing.assert_close(latent, torch.full_like(latent, 0.25), atol=0, rtol=0)
+
+
 def test_kimi_k3_gqa_block_draft_kv_pages_join_the_full_attention_group() -> None:
     """A GQA block draft's K/V pages sit in the MLA group's page-id space at
     P=128, beside the target's latents, without changing the packing."""
@@ -335,8 +428,8 @@ def _pool_spec(recipe):
 
 def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> None:
     """A GQA block draft whose every layer slides keeps its K/V pages in a
-    window group of its own, in the bytes it took inside the MLA group, and
-    KVP shards the MLA group but not that window."""
+    window group of its own, inside the target's MLA planes, and KVP shards
+    the MLA group but not that window."""
     from tokenspeed.runtime.layers.attention import registry
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         DRAFT_SLIDING_ATTENTION,
@@ -344,7 +437,7 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
 
     num_target_layers = KimiLinearConfig().num_hidden_layers
     num_draft_layers = 5
-    _, _, shared = kimi_tp8_layout(draft_layers=num_draft_layers, draft_attn="mha")
+    _, _, target = kimi_tp8_layout()
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=num_draft_layers, draft_attn="mha", draft_window=2048
     )
@@ -365,13 +458,24 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
     }
     assert field_ids[DRAFT_SLIDING_ATTENTION] == draft_field_ids
     assert not field_ids[FULL_ATTENTION] & draft_field_ids
+    # The draft adds no bytes: the planes and every target group's packing are
+    # the draft-less target's, and each draft layer takes two MLA planes.
+    assert layout.plane_bytes == target.plane_bytes
+    assert layout.lcm_block_bytes == target.lcm_block_bytes
     packing = dict(layout.group_packing)
-    assert packing[DRAFT_SLIDING_ATTENTION] == packing[FULL_ATTENTION]
-    # Plane ids number each group's own layers; the bytes are the same.
-    assert sorted(size for _, size in layout.plane_bytes) == sorted(
-        size for _, size in shared.plane_bytes
+    draft_packing = packing.pop(DRAFT_SLIDING_ATTENTION)
+    assert packing == dict(target.group_packing)
+    draft_fields = next(
+        fields for spec, fields in groups if spec.group_id == DRAFT_SLIDING_ATTENTION
     )
-    assert layout.lcm_block_bytes == shared.lcm_block_bytes
+    assert [field.plane_id for field in draft_fields] == [
+        f"slot.{index}" for index in range(2 * num_draft_layers)
+    ]
+    plane_bytes = dict(layout.plane_bytes)
+    assert all(
+        draft_packing * field.payload_bytes <= plane_bytes[field.plane_id]
+        for field in draft_fields
+    )
 
     spec = _pool_spec(_kvp8(recipe))
     shard_counts = {
@@ -394,6 +498,58 @@ def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> Non
         registry._validate_unsharded_draft_storage(
             shared_spec, num_target_layers=num_target_layers
         )
+
+
+def test_kimi_k31_sliding_gqa_block_draft_pads_kv_pages_inside_mla_planes() -> None:
+    """At attention TP 1 a draft K page is narrower than its share of an MLA
+    plane: K and V are strided 4-D views of two planes with one page stride,
+    and the parent is the draft-less Kimi-K3.1 target's."""
+    from test.runtime.conftest import kimi_layout
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        DRAFT_SLIDING_ATTENTION,
+    )
+
+    num_draft_layers = 5
+    target_recipe = kimi_recipe(
+        tp_size=1, dsa_index_k_format="fp8_scaled", mamba_ssm_dtype="bfloat16"
+    )
+    _, target = kimi_layout(target_recipe)
+    recipe = kimi_recipe(
+        tp_size=1,
+        dsa_index_k_format="fp8_scaled",
+        mamba_ssm_dtype="bfloat16",
+        draft_layers=num_draft_layers,
+        draft_attn="mha",
+        draft_window=2048,
+    )
+    _, layout = kimi_layout(recipe)
+    assert layout.plane_bytes == target.plane_bytes
+    assert layout.lcm_block_bytes == target.lcm_block_bytes
+
+    assert len(layout.plane_bytes) == 48
+    assert layout.lcm_block_bytes == 100_048_896
+
+    plan = layout.bind(3)
+    draft_packing = dict(layout.group_packing)[DRAFT_SLIDING_ATTENTION]
+    assert draft_packing == 12
+    draft_fields = [
+        field for field in plan.fields if field.group_id == DRAFT_SLIDING_ATTENTION
+    ]
+    assert len(draft_fields) == 2 * num_draft_layers
+    plane_bytes = dict(layout.plane_bytes)
+    for index, field in enumerate(draft_fields):
+        assert field.plane_id == f"slot.{index}"
+        assert field.page_stride_bytes == plane_bytes[field.plane_id] // draft_packing
+        assert field.payload_bytes == 262_144
+        assert field.page_stride_bytes == 282_624
+
+    arena = make_arena(plan)
+    for field in draft_fields:
+        view = arena.field(field.field_id)
+        assert view.shape[0] >= 3 * draft_packing
+        assert view.shape[1:] == field.shape
+        assert view.stride(0) * view.element_size() == field.page_stride_bytes
 
 
 def test_drafter_keeps_fused_kv_writes_for_an_unsharded_draft_group() -> None:

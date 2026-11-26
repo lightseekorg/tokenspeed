@@ -48,7 +48,7 @@ requires_cutedsl_kda = pytest.mark.skipif(
         and find_spec("fla") is not None
         and cutedsl_kda_supported()
     ),
-    reason="requires CUDA, flash-linear-attention, and a tokenspeed-cutedsl-kda build",
+    reason="requires CUDA, flash-linear-attention, and FlashInfer CuTe KDA",
 )
 
 
@@ -143,7 +143,7 @@ def test_cutedsl_kda_repeated_token_content_stays_bounded() -> None:
     alternating-sign cancellation; a low-precision inverse blows the state
     up geometrically (we have seen 1e2-scale outputs from kernels with this
     bug on ~1k tokens of repeated words — common agentic traffic, and an
-    earlier CuteDSL KDA drop failed exactly here). Guard that the packaged build
+    earlier CuteDSL KDA drop failed exactly here). Guard that the CuTe scan
     tracks the portable scan on exactly that profile. The
     bounds are blow-up guards, not ulp bounds: on this extreme profile two
     bounded chunked implementations legitimately drift a few 1e-2 apart

@@ -46,6 +46,7 @@ from transformers import (
 from tokenspeed.runtime.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
+    Inkling2LoopMMConfig,
     Inkling2MMConfig,
     Inkling2ModelConfig,
     Inkling2MTPConfig,
@@ -103,6 +104,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingMMConfig.model_type: InklingMMConfig,
     Inkling2ModelConfig.model_type: Inkling2ModelConfig,
     Inkling2MMConfig.model_type: Inkling2MMConfig,
+    Inkling2LoopMMConfig.model_type: Inkling2LoopMMConfig,
     Inkling2MTPConfig.model_type: Inkling2MTPConfig,
     Inkling2VisionConfig.model_type: Inkling2VisionConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
@@ -223,8 +225,13 @@ def get_hf_text_config(config: PretrainedConfig):
     if text_config is None:
         return config
 
-    if hasattr(config, "quantization_config") and not hasattr(
-        text_config, "quantization_config"
+    if (
+        hasattr(config, "quantization_config")
+        and config.quantization_config is not None
+        and (
+            not hasattr(text_config, "quantization_config")
+            or text_config.quantization_config is None
+        )
     ):
         quantization_config = config.quantization_config
         for key in ["ignore", "ignored_layers", "modules_to_not_convert"]:
@@ -537,7 +544,12 @@ def get_config(
 
     # quantization config will copy to text_config
     if hasattr(text_config, "quantization_config"):
-        if "modules_to_not_convert" in text_config.quantization_config:
+        # An explicit null describes an unquantized checkpoint, just like
+        # omitted metadata. Some registered config classes declare it eagerly.
+        if (
+            text_config.quantization_config is not None
+            and "modules_to_not_convert" in text_config.quantization_config
+        ):
             text_config.quantization_config["ignored_layers"] = (
                 text_config.quantization_config["modules_to_not_convert"]
             )
@@ -627,7 +639,9 @@ def get_config(
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
         "Inkling2ForConditionalGeneration",
+        "Inkling2LoopForConditionalGeneration",
         "Inkling2MMConfig",
+        "Inkling2LoopMMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
@@ -1013,10 +1027,9 @@ def reconcile_special_tokens(tokenizer):
             if getattr(tok, "special", False) and tid not in existing_ids
         ]
         if missing:
-            tokenizer.add_special_tokens(
-                {"additional_special_tokens": missing},
-                replace_extra_special_tokens=False,
-            )
+            # The second parameter was renamed across Transformers versions.
+            # Pass it positionally to append without replacing existing tokens.
+            tokenizer.add_special_tokens({"additional_special_tokens": missing}, False)
 
     # Turn-final markers resolve by name; Muse's <|eom|> only ends a channel, not the turn.
     added_vocab = tokenizer.get_added_vocab()

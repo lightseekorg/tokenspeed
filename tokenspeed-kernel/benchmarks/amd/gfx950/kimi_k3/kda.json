@@ -68,18 +68,24 @@
       }
     },
     {
-      "id": "kimi_k3.attention.kda_fused_paged_decode/decode-bfloat16",
-      "comparison_epoch": 2,
+      "id": "kimi_k3.attention.kda_fused_paged_verify/verify-t1-bfloat16",
+      "comparison_epoch": 3,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
-        "mode": "kda_fused_paged_decode",
+        "mode": "kda_fused_paged_verify",
         "parameters": {
-          "batch": [1, 2, 4, 8, 16],
+          "batch": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place"
+          "draft_token_num": 1
         },
         "cold_cache": true,
         "seed": 4711
@@ -90,18 +96,44 @@
       }
     },
     {
-      "id": "kimi_k3.attention.kda_fused_paged_decode/decode-large-bfloat16",
-      "comparison_epoch": 2,
+      "id": "kimi_k3.attention.kda_fused_paged_verify/verify-t1-l8-bfloat16",
+      "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
-        "mode": "kda_fused_paged_decode",
+        "mode": "kda_fused_paged_verify",
         "parameters": {
-          "batch": [32, 64],
+          "batch": 4,
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place"
+          "draft_token_num": 1,
+          "history_length": 8
+        },
+        "cold_cache": true,
+        "seed": 4711
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.5
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_fused_paged_verify/verify-t1-large-bfloat16",
+      "comparison_epoch": 3,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_fused_paged_verify",
+        "parameters": {
+          "batch": [
+            32,
+            64
+          ],
+          "conv_kernel_size": 4,
+          "state_page_bytes": 884736,
+          "state_pages": 1025,
+          "draft_token_num": 1
         },
         "cold_cache": true,
         "seed": 4712
@@ -113,19 +145,23 @@
     },
     {
       "id": "kimi_k3.attention.kda_fused_paged_verify/verify-t4-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
         "mode": "kda_fused_paged_verify",
         "parameters": {
-          "batch": [1, 2, 4, 8, 16],
+          "batch": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
           "draft_token_num": 4,
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
-          "state_pages": 1025,
-          "capture_replay": true,
-          "store_states": false
+          "state_pages": 1025
         },
         "cold_cache": true,
         "seed": 4721
@@ -136,16 +172,25 @@
       }
     },
     {
-      "id": "kimi_k3.attention.kda_replay_commit/replay-t4-l69-bfloat16",
-      "comparison_epoch": 1,
+      "id": "kimi_k3.attention.kda_retained_commit/retained-t4-l69-bfloat16",
+      "comparison_epoch": 2,
       "measurement_blocks": 30,
       "definition": {
         "family": "attention",
-        "mode": "kda_replay_commit",
+        "mode": "kda_retained_commit",
         "parameters": {
-          "batch": [1, 2, 4, 8, 16],
+          "batch": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
           "draft_token_num": 4,
-          "accepted_length": [1, 4],
+          "accepted_length": [
+            1,
+            4
+          ],
           "layers": 69,
           "state_groups": 3,
           "conv_kernel_size": 4,

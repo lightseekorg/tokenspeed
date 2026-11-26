@@ -86,6 +86,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _select_direct_stage2_deferred_block_n,
     _select_grouped_moe_config,
     _select_route_tile_config,
+    _select_route_tile_stage2_single_round_jobs,
+    _stage1_wide_tile,
+    _stage2_wide_tile,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     W_LAYOUT_GDOT128,
@@ -1127,6 +1130,13 @@ def gluon_mxfp_fused_moe(
     )
 
 
+# Largest route capacity whose stage 1 groups the routes itself. Measured on
+# MI350X, EP4, served-like routing in graph replay: up to 128 rows the extra
+# grouping launch costs more than it saves; at 144-256 rows grouping once
+# ahead of stage 1 is faster.
+_STAGE1_GROUPING_MAX_ROWS = 128
+
+
 def _launch_mxfp4_route_tiles(
     q_hidden: torch.Tensor,
     q_hidden_scale: torch.Tensor,
@@ -1142,6 +1152,8 @@ def _launch_mxfp4_route_tiles(
     expert_start: int,
     top_k: int,
     config: _RouteTileConfig,
+    stage2_programs: int,
+    stage2_single_round_jobs: int,
 ) -> tuple[torch.Tensor, None, torch.Tensor]:
     """Run the route-tiled A4W4 experts and return deferred token/slot rows.
 
@@ -1155,20 +1167,22 @@ def _launch_mxfp4_route_tiles(
         expert_start: First global expert ID owned by these weights.
         top_k: Routes per token.
         config: Schedule from ``_select_route_tile_config``.
+        stage2_programs: Stage 2's persistent programs.
+        stage2_single_round_jobs: Up to this many stage-2 jobs every job gets
+            its own program (``_select_route_tile_stage2_single_round_jobs``;
+            0 keeps the persistent programs). The job count is only known on
+            the device, so stage 2 launches enough programs for both.
 
     Returns:
         Unweighted route rows, no bias, and the route map (``-1`` marks routes
         of other ranks, whose rows are left undefined).
     """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
+        gluon_mxfp4_moe_route_groups_gfx950,
         gluon_mxfp4_moe_stage1_route_tiles_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
         gluon_mxfp4_moe_stage2_route_tiles_gfx950,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
-        gluon_mxfp4_moe_route_pack_gfx950,
-        gluon_mxfp4_moe_route_tiles_gfx950,
     )
 
     n_tokens = int(topk_ids.shape[0])
@@ -1181,79 +1195,57 @@ def _launch_mxfp4_route_tiles(
             (n_tokens * top_k, out_dim), dtype=torch.bfloat16, device=device
         )
     expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
-    # Routes are grouped by expert (inside stage 1 up to 16 rows, by the
-    # descriptor kernels above 16 rows); results retain token/slot order.
     num_local_experts = int(w13_runtime.shape[0])
-    block_m = 16
-    routes_from_ids = config.route_capacity == block_m
-    if routes_from_ids:
-        if n_tokens > block_m:
-            raise ValueError(
-                "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
-                f"top-k IDs needs at most {block_m} rows, got {n_tokens}"
-            )
-        # Stage 1 groups the routes by expert from the top-k IDs, writes the
-        # route map into its descriptor argument and writes the grouping in
-        # the descriptor kernels' format for stage 2.
-        stage1_routes = topk_ids
-        stage1_descriptors = expanded_idx
-        group_count = torch.empty(1, dtype=torch.int32, device=device)
-        sorted_routes = torch.empty(
-            num_local_experts * block_m, dtype=torch.int32, device=device
+    block_m = config.block_m
+    max_rows = config.route_capacity
+    if n_tokens > max_rows:
+        raise ValueError(
+            "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
+            f"top-k IDs needs at most {max_rows} rows, got {n_tokens}"
         )
-        descriptors = torch.empty(
-            (num_local_experts, 3), dtype=torch.int32, device=device
-        )
-    else:
-        max_rows = config.route_capacity
-        if n_tokens > max_rows:
-            raise ValueError(
-                "gluon_mxfp4_moe_route_pack_gfx950: per-expert route lists hold "
-                f"at most {max_rows} rows, got {n_tokens}"
-            )
-        group_count = torch.empty(1, dtype=torch.int32, device=device)
-        sorted_routes = torch.empty(
-            num_local_experts * max_rows, dtype=torch.int32, device=device
-        )
-        descriptors = torch.empty(
-            (num_local_experts * (max_rows // block_m), 3),
-            dtype=torch.int32,
-            device=device,
-        )
-        expert_counts = torch.empty(num_local_experts, dtype=torch.int32, device=device)
-        gluon_mxfp4_moe_route_pack_gfx950[(num_local_experts,)](
+    # Stage 1 groups the routes by expert from the top-k IDs, block_m routes
+    # a group, writes the route map and writes the grouping for stage 2.
+    # Results retain token/slot order.
+    group_count = torch.empty(1, dtype=torch.int32, device=device)
+    # An expert holds at most max_rows routes, so max_rows // block_m groups.
+    plan_descriptors = torch.empty(
+        (num_local_experts * (max_rows // block_m), 3), dtype=torch.int32, device=device
+    )
+    plan_routes = torch.empty(
+        plan_descriptors.shape[0] * block_m, dtype=torch.int32, device=device
+    )
+    # Every stage 1 program groups the routes itself up to a route capacity
+    # of _STAGE1_GROUPING_MAX_ROWS; past it, that grouping (a histogram and a
+    # rank scan over capacity x top-k routes in each of its jobs) costs more
+    # than grouping once in a separate launch that stage 1 then reads.
+    pregrouped = max_rows > _STAGE1_GROUPING_MAX_ROWS
+    if pregrouped:
+        # Every grouping program ranks all routes itself, so the grid stays at
+        # one program a CU (256 on MI350X / MI355X) and strides over groups.
+        gluon_mxfp4_moe_route_groups_gfx950[(min(256, plan_descriptors.shape[0]),)](
             topk_ids,
-            sorted_routes,
-            expert_counts,
             expanded_idx,
+            group_count,
+            plan_routes,
+            plan_descriptors,
             n_tokens,
             EXPERT_START=expert_start,
             NUM_EXPERTS=num_local_experts,
             TOPK=top_k,
             MAX_ROWS=max_rows,
-            num_warps=4,
-        )
-        gluon_mxfp4_moe_route_tiles_gfx950[(1,)](
-            expert_counts,
-            descriptors,
-            group_count,
-            NUM_EXPERTS=num_local_experts,
             BLOCK_M=block_m,
-            MAX_ROWS=max_rows,
             num_warps=4,
         )
-        stage1_routes = sorted_routes
-        stage1_descriptors = descriptors
     gluon_mxfp4_moe_stage1_route_tiles_gfx950[(2048,)](
         q_hidden,
         q_hidden_scale,
         w13_runtime,
         w13_scale,
-        stage1_routes,
-        stage1_descriptors,
+        topk_ids,
+        expanded_idx,
         group_count,
-        sorted_routes,
-        descriptors,
+        plan_routes,
+        plan_descriptors,
         q_inter,
         q_inter_scale,
         n_tokens,
@@ -1273,20 +1265,23 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage1.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage1.prefetch_tiles,
-        ROUTES_FROM_IDS=routes_from_ids,
         EXPERT_START=expert_start,
         NUM_EXPERTS=num_local_experts,
+        MAX_ROWS=max_rows,
+        PREGROUPED=pregrouped,
         num_warps=config.stage1.num_warps,
     )
-    gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
+    gluon_mxfp4_moe_stage2_route_tiles_gfx950[
+        (max(stage2_programs, stage2_single_round_jobs),)
+    ](
         q_inter,
         q_inter_scale,
         w2_runtime,
         w2_scale,
-        sorted_routes,
-        descriptors,
+        plan_routes,
+        plan_descriptors,
         group_count,
-        descriptors.shape[0],
+        plan_descriptors.shape[0],
         out,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
@@ -1300,6 +1295,8 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage2.prefetch_tiles,
+        PERSISTENT_PROGRAMS=stage2_programs,
+        SINGLE_ROUND_JOBS=stage2_single_round_jobs,
         num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx
@@ -1503,6 +1500,16 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             expert_start=expert_start,
             top_k=top_k,
             config=route_tile_config,
+            # As many persistent programs as stage 1 launches.
+            stage2_programs=2048,
+            stage2_single_round_jobs=_select_route_tile_stage2_single_round_jobs(
+                n_tokens,
+                hidden_dim=hidden_dim,
+                inter_dim=inter_dim,
+                num_local_experts=local_experts,
+                num_experts=global_num_experts,
+                top_k=top_k,
+            ),
         )
 
     stage1_block_n = 64
@@ -2254,7 +2261,8 @@ class MXFP4SortedRoutes(NamedTuple):
     ``sorted_ids`` packs ``(slot << 24) | token`` per sorted row, with padding
     rows at token ``rows``; ``num_valid_ids[0]`` is the padded row extent on
     the device. ``block_m`` is the sort's per-expert padding, which both GEMMs
-    tile by.
+    tile by. ``wide_tiles`` is the grouped configuration's choice of the wide
+    prefill tiles, which the down GEMM follows too.
     """
 
     sorted_ids: torch.Tensor
@@ -2264,6 +2272,7 @@ class MXFP4SortedRoutes(NamedTuple):
     block_m: int
     rows: int
     top_k: int
+    wide_tiles: bool
 
 
 def sorted_route_capacity(rows: int, num_experts: int, top_k: int) -> int:
@@ -2404,6 +2413,15 @@ def _package_prefill_gate_up(
         a1_scale=stage1_scale,
         block_m=sort_block_m,
         num_warps=config.stage1_num_warps,
+        wide_tile=_stage1_wide_tile(
+            config.wide_tiles,
+            sort_block_m,
+            hidden_dim,
+            int(package_w13.shape[1]) // 2,
+            activation_format,
+            b_layout,
+            input_sorted,
+        ),
         b_preshuffled=True,
         b_layout=b_layout,
         swiglu_alpha=float(swiglu_alpha),
@@ -2427,6 +2445,7 @@ def _package_prefill_gate_up(
         sort_block_m,
         n_tokens,
         top_k,
+        config.wide_tiles,
     )
     return routes, intermediate, intermediate_scale, out
 
@@ -2483,6 +2502,15 @@ def _package_prefill_down(
         force_reduce=force_reduce,
         input_sorted=True,
         a_format=activation_format,
+        wide_tile=_stage2_wide_tile(
+            routes.wide_tiles,
+            routes.block_m,
+            int(package_w2.shape[1]),
+            stage2_logical_k,
+            activation_format,
+            b_layout,
+            reduces=not do_finalize or force_reduce,
+        ),
     )
 
 

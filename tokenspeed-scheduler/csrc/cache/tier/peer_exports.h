@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
@@ -65,7 +66,7 @@ public:
     // A release that asks for it, after a pin that held, demotes the pinned
     // prefix's leaf chain (CacheCoordinator::DemoteExportedChain): the
     // reader has its own copy now.
-    void Release(CacheCoordinator& coordinator, const cache::PeerRelease& release);
+    void Release(CacheCoordinator& coordinator, const cache::PeerRelease& release, std::int64_t now_us);
     // Lets every lease past its deadline go: a soft pin is forgotten, a hard
     // pin's blocks go back and its tombstone stays for one more hard-pin
     // lifetime.
@@ -73,11 +74,24 @@ public:
 
     std::size_t NumLeases() const { return leases_.size(); }
     std::size_t NumPinnedBlocks() const;
+    struct PinSample {
+        std::int64_t held_us;
+        std::int64_t remaining_us;
+        bool expired;
+    };
+    // Only the reporting owner drains these once per scheduler round.
+    std::vector<PinSample> TakePinSamples() {
+        observe_pins_ = true;
+        return std::exchange(pin_samples_, {});
+    }
 
 private:
     enum class Phase { kSoft, kHard, kExpired };
+    bool observe_pins_{false};
+    std::vector<PinSample> pin_samples_;
     struct Lease {
         Phase phase{Phase::kSoft};
+        std::int64_t pinned_us{0};
         std::int64_t deadline_us{0};
         // The prompt up to the looked-up boundary; a pin probes it again up
         // to the boundary its answer named.

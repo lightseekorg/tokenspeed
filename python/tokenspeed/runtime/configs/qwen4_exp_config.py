@@ -66,6 +66,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         rope_parameters: dict | None = None,
         num_experts: int | None = None,
         decode_monokernel: bool = False,
+        ple_table_layout: str = "global_sharded",
         **kwargs,
     ) -> None:
         if hc_count <= 1:
@@ -88,6 +89,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         # stores FP8 (half the memory of BF16), quantizing a 16-bit table per
         # row at load time.
         self.ple_embed_dtype = ple_embed_dtype
+        self.ple_table_layout = ple_table_layout
         # When enabled, keep the n-gram table in page-locked host memory and
         # let the gather kernel read it over PCIe/C2C. The table scales with
         # ngram_vocab_size_base and does not fit in device memory at production
@@ -97,6 +99,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
             if ple_offload_embedding is None
             else bool(ple_offload_embedding)
         )
+        self.enable_ple_hot_cache = False
         self.ngram_size = int(ngram_size)
         self.heads_per_ngram = int(heads_per_ngram)
         self.ngram_vocab_size_base = int(ngram_vocab_size_base)

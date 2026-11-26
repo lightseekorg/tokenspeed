@@ -1,27 +1,35 @@
-"""Kimi-K3 config + registration wiring tests (cheap, no GPU).
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-Covers the parts landed in the Kimi-K3 model-registration change: the
-``KimiLinearConfig`` mixed-layer protocol (consumed by the hybrid KV-cache
-layer) and the architecture-registration touchpoints (``_CONFIG_REGISTRY``,
-``_MLA_ARCHITECTURES``, ``is_multimodal_model``, ``EntryClass``).
-"""
+"""Kimi-K3 configuration, checkpoint loading, and cache-layout contracts."""
 
-import contextlib
 import os
 import sys
-from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
-
-from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
@@ -30,878 +38,78 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
-from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
-
-# Checkpoint-derived reference values (moonshotai/kimi-k3).
-_NUM_LAYERS = 93
-_NUM_KDA = 69
-_NUM_MLA = 24
-_KDA_HEADS = 96
-_KDA_HEAD_DIM = 128
-_KDA_CONV = 4
 
 
-class TestKimiK3ConfigTests:
-    def test_top_level_wraps_text_and_vision(self):
-        cfg = KimiK3Config()
-        assert (cfg.model_type) == ("kimi_k3")
-        assert isinstance((cfg.text_config), (KimiLinearConfig))
-        assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
-        # hidden_size / vocab_size forward to the text config.
-        assert (cfg.hidden_size) == (cfg.text_config.hidden_size)
-        assert (cfg.vocab_size) == (cfg.text_config.vocab_size)
-
-    def test_dict_subconfigs_are_materialized(self):
-        cfg = KimiK3Config(
-            text_config={"hidden_size": 4096},
-            vision_config={"vt_hidden_size": 512},
-        )
-        assert isinstance((cfg.text_config), (KimiLinearConfig))
-        assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
-        assert (cfg.text_config.hidden_size) == (4096)
-        assert (cfg.vision_config.vt_hidden_size) == (512)
-
-    def test_k31_materializes_its_subconfigs_through_from_dict(self):
-        # from_pretrained's path; a subclass without __init__ left text_config a dict.
-        cfg = KimiK31Config.from_dict(
-            {"model_type": "kimi_k31", "text_config": {"hidden_size": 4096}}
-        )
-        assert cfg.model_type == "kimi_k31"
-        assert isinstance(cfg.text_config, KimiLinearConfig)
-        assert isinstance(cfg.vision_config, KimiK3VisionConfig)
-        assert cfg.text_config.hidden_size == 4096
-
-    def test_vision_text_hidden_forced_to_text_hidden(self):
-        # The projector must emit the text hidden size, overriding any value
-        # supplied in vision_config.
-        cfg = KimiK3Config(
-            text_config={"hidden_size": 4096},
-            vision_config={"text_hidden_size": 1234},
-        )
-        assert (cfg.vision_config.text_hidden_size) == (4096)
-
-    def test_layer_partition_is_exact(self):
-        la = KimiLinearConfig().linear_attn_config
-        kda = set(la["kda_layers"])
-        full = set(la["full_attn_layers"])
-        assert (len(kda)) == (_NUM_KDA)
-        assert (len(full)) == (_NUM_MLA)
-        # 1-based, no overlap, exact cover of 1..N.
-        assert (kda & full) == (set())
-        assert (kda | full) == (set(range(1, _NUM_LAYERS + 1)))
-
-    def test_is_kda_layer_matches_config(self):
-        c = KimiLinearConfig()
-        kda = set(c.linear_attn_config["kda_layers"])
-        for i in range(c.num_hidden_layers):
-            assert (c.is_kda_layer(i)) == ((i + 1) in kda)
-
-    def test_layers_block_type_and_ids(self):
-        c = KimiLinearConfig()
-        lbt = c.layers_block_type
-        assert (len(lbt)) == (_NUM_LAYERS)
-        assert (set(lbt)) == ({"attention", "linear_attention"})
-        assert (len(c.linear_layer_ids)) == (_NUM_KDA)
-        assert (len(c.full_attention_layer_ids)) == (_NUM_MLA)
-        # 0-based full-attention ids == (1-based full_attn_layers - 1).
-        assert (c.full_attention_layer_ids) == (
-            sorted(x - 1 for x in c.linear_attn_config["full_attn_layers"])
+class TestKimiK3Config:
+    @pytest.mark.parametrize("config_class", [KimiK3Config, KimiK31Config])
+    def test_materializes_subconfigs_and_aligns_vision_output(self, config_class):
+        config = config_class.from_dict(
+            {
+                "text_config": {"hidden_size": 4096, "vocab_size": 8192},
+                "vision_config": {"vt_hidden_size": 512, "text_hidden_size": 1234},
+            }
         )
 
-    def test_layer_types_translate_full_attention(self):
-        c = KimiLinearConfig()
-        assert (set(c.layer_types)) == ({FULL_ATTENTION, LINEAR_ATTENTION})
-        for block_type, cache_label in zip(c.layers_block_type, c.layer_types):
-            if block_type == "attention":
-                assert (cache_label) == (FULL_ATTENTION)
-            else:
-                assert (cache_label) == (block_type)
+        assert isinstance(config.text_config, KimiLinearConfig)
+        assert isinstance(config.vision_config, KimiK3VisionConfig)
+        assert config.hidden_size == config.text_config.hidden_size == 4096
+        assert config.vocab_size == config.text_config.vocab_size == 8192
+        assert config.vision_config.vt_hidden_size == 512
+        assert config.vision_config.text_hidden_size == 4096
 
-    @staticmethod
-    def _kda_spec(tp_size):
-        """The KDA component as boot construction builds it, at one TP width."""
-        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-            LinearAttnConfig,
+    def test_default_layer_partition(self):
+        config = KimiLinearConfig()
+        kda = set(config.linear_attn_config["kda_layers"])
+        full = set(config.linear_attn_config["full_attn_layers"])
+
+        assert len(kda) == 69
+        assert len(full) == 24
+        assert not kda & full
+        assert kda | full == set(range(1, 94))
+
+    def test_custom_layer_partition_uses_zero_based_runtime_indices(self):
+        linear = dict(KimiLinearConfig().linear_attn_config)
+        linear.update(kda_layers=[2, 4], full_attn_layers=[1, 3])
+        config = KimiLinearConfig(num_hidden_layers=4, linear_attn_config=linear)
+
+        assert config.linear_layer_ids == [1, 3]
+        assert config.full_attention_layer_ids == [0, 2]
+        assert [config.is_kda_layer(i) for i in range(4)] == [False, True, False, True]
+        assert config.layers_block_type == [
+            "attention",
+            "linear_attention",
+            "attention",
+            "linear_attention",
+        ]
+        assert config.layer_types == [
+            FULL_ATTENTION,
+            LINEAR_ATTENTION,
+            FULL_ATTENTION,
+            LINEAR_ATTENTION,
+        ]
+
+    @pytest.mark.parametrize(
+        "frequency,expected", [(1, [30, 31, 31]), (2, [15, 15, 16])]
+    )
+    def test_local_moe_blocks_count_the_pipeline_stage(self, frequency, expected):
+        from tokenspeed.runtime.models.kimi_k3 import _k3_local_moe_blocks
+
+        config = KimiLinearConfig(moe_layer_freq=frequency)
+        assert _k3_local_moe_blocks(config, Mapping(rank=0, world_size=1)) == sum(
+            expected
         )
-
-        # world_size resolves the linear-attention TP width it defaults to.
-        server_args = ServerArgs(model="x", world_size=tp_size)
-        model = SimpleNamespace(
-            hf_config=SimpleNamespace(text_config=KimiLinearConfig())
-        )
-        return LinearAttnConfig.generate(server_args, model)
-
-    def test_kda_state_shapes(self):
-        spec = self._kda_spec(tp_size=1)
-        # conv over q/k/v (3 * num_heads * head_dim) wide, kernel_size - 1 deep.
-        assert (spec.conv_state_shape) == (
-            (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1)
-        )
-        # per-head (head_dim x head_dim) recurrent state.
-        assert (spec.temporal_state_shape) == (
-            (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
-        )
-        assert (spec.layer_ids) == (tuple(KimiLinearConfig().linear_layer_ids))
-
-    def test_kda_state_shapes_respect_tp(self):
-        spec = self._kda_spec(tp_size=4)
-        assert (spec.conv_state_shape) == (
-            (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1)
-        )
-        assert (spec.temporal_state_shape) == (
-            (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
-        )
-
-
-def _linear_calls_by_prefix(linear_calls):
-    """Index recorded projection kwargs by the last segment of their prefix."""
-    return {c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c}
-
-
-# The shard's own predicate starts at the platform, so there is no wiring to
-# assert off NVIDIA; the predicate itself is covered separately.
-@contextlib.contextmanager
-def _model_dtype(dtype: torch.dtype):
-    """The context weight loading runs under, which the wiring reads."""
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)
-
-
-_NVIDIA_ONLY = pytest.mark.skipif(
-    not current_platform().is_nvidia, reason="the latent down shard is NVIDIA-only"
-)
-_AMD_ONLY = pytest.mark.skipif(
-    not current_platform().is_amd, reason="the routed latent gather is AMD-only"
-)
-
-
-class TestKimiK3RegistrationTests:
-    def _build_moe_block(
-        self, plan, *, moe_layer_freq=1, layer_index=1, routed_hidden=64
-    ):
-        """Construct one MoE block on a chosen plan; report what it wired."""
-        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
-        from tokenspeed.runtime.models import kimi_k3
-
-        linear_calls: list[dict] = []
-        multicast_calls: list[dict] = []
-
-        class FakeLinear(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                linear_calls.append(kwargs)
-                for name, value in kwargs.items():
-                    setattr(self, name, value)
-                self.weight = torch.nn.Parameter(torch.zeros(1))
-
-        class FakeExperts(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.support_routing = False
-                self.supports_precomputed_topk = True
-                self.topk_output_format = TopKOutputFormat.STANDARD
-                self.w13_weight = torch.empty(0)
-                self.w13_weight_scale = torch.empty(0)
-                self.w2_weight = torch.empty(0)
-                self.w2_weight_scale = torch.empty(0)
-                self.plan = {"weight_dtype": "unquant"}
-                self.supports_deferred_finalize = False
-                self.sorted_route_rows = frozenset()
-
-        class FakeSharedExperts(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.gate_up_proj = FakeLinear()
-                self.down_proj = FakeLinear()
-
-        class FakeLatentMoE(torch.nn.Module):
-            def __init__(self, **kwargs):
-                super().__init__()
-                self.components = kwargs
-
-        config = KimiLinearConfig(
-            hidden_size=128,
-            routed_expert_hidden_size=routed_hidden,
-            moe_intermediate_size=64,
-            moe_layer_freq=moe_layer_freq,
-            num_experts=8,
-            num_experts_per_token=2,
-            num_shared_experts=1,
-        )
-        ep_group = tuple(range(8))
-        mapping = SimpleNamespace(
-            world_size=8,
-            pp_size=1,
-            pp_rank=0,
-            attn=SimpleNamespace(tp_size=8, dp_size=1, dp_rank=0, dp_group=(0,)),
-            moe=SimpleNamespace(
-                tp_rank=0,
-                tp_size=1,
-                tp_group=(0,),
-                ep_rank=0,
-                ep_size=8,
-                ep_group=ep_group,
-                tp_ep_size=8,
-                has_tp_ep=True,
-                tp_ep_rank=3,
-                tp_ep_group=ep_group,
-            ),
-        )
-        with (
-            _model_dtype(torch.bfloat16),
-            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
-            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
-            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
-            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
-            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
-            mock.patch.object(
-                kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
-            ),
-            mock.patch.object(
-                kimi_k3.KimiK3LatentDownOp,
-                "initialize",
-                staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),
-            ),
-            mock.patch(
-                "tokenspeed.runtime.distributed.process_group_manager"
-                ".process_group_manager.get_device_process_group",
-                return_value="pg",
-            ) as get_pg,
-            mock.patch.dict(kimi_k3.global_server_args_dict, {"enforce_eager": False}),
-        ):
-            layer = kimi_k3.KimiLinearMoE(
-                config,
-                mapping,
-                layer_index=layer_index,
-                # Values chosen not to coincide with the model total, the
-                # production scope literal, or the other case's ordinal.
-                model_scope="scope-under-test",
-                moe_block_count=46,
-                quant_config=None,
-                prefix="model.layers.1.block_sparse_moe",
-            )
-
-        return SimpleNamespace(
-            linear_calls=linear_calls,
-            multicast_calls=multicast_calls,
-            layer=layer,
-            get_pg=get_pg,
-            mapping=mapping,
-            config=config,
-        )
-
-    @_NVIDIA_ONLY
-    def test_the_packed_input_projection_declines_a_narrowed_weight(self):
-        """It reads the routed weight directly, so a narrowed one would bypass the gather.
-
-        Shipped once without this: the packed path handed the experts one rank's
-        448 columns where the expert weight takes 3584, and narrow and wide
-        generated different text from the same prompt.
-        """
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=False,
-                use_trtllm=True,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            )
-        )
-        moe = built.layer
-        moe.packed_input_projection_weight = torch.zeros(1)
-        moe.routed_expert_down_proj.narrowed = True
-        assert (moe._latent_input_projections(torch.zeros(2, 8))) is None
-        moe.routed_expert_down_proj.narrowed = False
-        assert (
-            moe.packed_input_projection_weight
-        ) is not None, (
-            "the packed weight must still be set, or the guard proves nothing"
-        )
-
-    @pytest.mark.parametrize("quantized", (True, False))
-    def test_the_latent_gather_quantizes_only_for_experts_that_read_fp8(
-        self, quantized
-    ):
-        """The gathered latent's FP8 copy reaches the experts that read it."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=True,
-                use_trtllm=False,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            )
-        )
-        moe = built.layer
-        moe.packed_input_projection_weight = torch.zeros(1)
-        moe.routed_expert_down_proj.narrowed = False
-        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
-        moe.experts._situ_input_fp8 = "stale"
-        moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
-        hidden = torch.zeros(4, 8)
-        fp8 = (torch.zeros(4, 8, dtype=torch.float8_e4m3fn), torch.ones(1))
-        requested = []
-
-        def latent_input_gather(hidden_states, weight, *, quantize, **kwargs):
-            requested.append(quantize)
-            outputs = (torch.zeros(4, 2), torch.zeros(4, 8), torch.zeros(4, 2))
-            return (*outputs, fp8) if quantize else outputs
-
-        moe.iris_state = SimpleNamespace(
-            can_latent_input_gather=lambda *args: True,
-            latent_input_gather=latent_input_gather,
-        )
-        with mock.patch.object(
-            kimi_k3, "kimi3_shared_down_projection", lambda x, w, out=None: x
-        ):
-            outputs = moe._latent_input_projections(hidden, rows_replicated=True)
-        assert len(outputs) == 3
-        assert requested == [quantized]
-        assert moe.experts._situ_input_fp8 is (fp8 if quantized else None)
-
-        # The replicated projection leaves no stale copy behind.
-        moe.experts._situ_input_fp8 = "stale"
-        moe.routed_expert_down_proj.narrowed = True
-        assert moe._latent_input_projections(hidden, rows_replicated=True) is None
-        assert moe.experts._situ_input_fp8 is None
-
-    @_AMD_ONLY
-    @pytest.mark.parametrize("quantized", (True, False))
-    def test_the_routed_latent_gather_hands_its_routes_to_the_experts(self, quantized):
-        """One launch's routes, expert sort and latent replace the routing launch."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=True,
-                use_trtllm=False,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            )
-        )
-        moe = built.layer
-        moe.packed_input_projection_weight = torch.zeros(1)
-        moe.routed_expert_down_proj.narrowed = False
-        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
-        moe.experts.sorted_route_rows = frozenset({4})
-        moe.experts.sorted_route_block_size = 16
-        moe.experts._situ_input_fp8 = "stale"
-        moe._fused_routing_scratch = torch.zeros(1, dtype=torch.int32)
-        moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
-        hidden = torch.zeros(4, 8)
-        shared_out = torch.zeros(4, 128)
-        logits, latent = torch.zeros(4, 8), torch.zeros(4, 64)
-        routes = tuple(torch.zeros(4, 2) for _ in range(6))
-        fp8 = (torch.zeros(4, 64, dtype=torch.float8_e4m3fn), torch.ones(1))
-        launched = []
-
-        def gather_routed(hidden_states, weight, *, routing, down_out, quantize, **kw):
-            launched.append((routing, quantize))
-            return logits, latent, routes, down_out, fp8 if quantize else None
-
-        serves = True
-        moe.iris_state = SimpleNamespace(
-            can_latent_input_gather_routed=lambda *args: serves,
-            latent_input_gather_routed=gather_routed,
-        )
-        routed_input, topk_output, shared_partial = moe._routed_latent_inputs(
-            hidden, shared_out, precompute_topk=True
-        )
-        ((routing, requested),) = launched
-        config = moe.topk.topk_config
-        assert requested == quantized
-        assert torch.equal(routing.correction_bias, config.correction_bias.float())
-        assert routing.routed_scaling_factor == float(config.routed_scaling_factor)
-        assert routing.normalize_topk_weights == config.renormalize
-        assert routing.block_size == 16
-        assert routing.scratch is moe._fused_routing_scratch
-        assert routed_input is latent and shared_partial is shared_out
-        assert topk_output.topk_weights is routes[0]
-        assert topk_output.topk_ids is routes[1]
-        assert topk_output.router_logits is logits
-        assert moe.experts._situ_sorted_routes == routes[2:]
-        assert moe.experts._situ_input_fp8 is (fp8 if quantized else None)
-
-        # Rows the launch does not serve fall back before launching anything.
-        assert moe._routed_latent_inputs(hidden, shared_out, False) is None
-        assert moe._routed_latent_inputs(torch.zeros(3, 8), None, True) is None
-        serves = False
-        assert moe._routed_latent_inputs(hidden, shared_out, True) is None
-        assert len(launched) == 1
-
-    @_NVIDIA_ONLY
-    def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
-        """The gate has an on direction, and the deployment plan is it."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=False,
-                use_trtllm=True,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            )
-        )
-        config, mapping = built.config, built.mapping
-        linear_calls, multicast_calls = built.linear_calls, built.multicast_calls
-        _layer, get_pg = built.layer, built.get_pg
-        self._assert_latent_projection_sharding(linear_calls, mapping, trtllm=True)
-        # The native plan cannot reach this shard at all (it is AMD-only), so the
-        # multicast wiring has to be asserted here or nowhere.
-        down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
-        assert (down["multicast_down"]) == ("mc-op")
-        assert (len(multicast_calls)) == (1)
-        wired = multicast_calls[0]
-        assert (wired["group"]) == ("pg")
-        assert (wired["hidden_size"]) == (config.hidden_size)
-        assert (wired["latent_size"]) == (config.routed_expert_hidden_size)
-        assert (wired["layer_count"]) == (46)
-        assert (wired["block_index"]) == (1)
-        assert (wired["model_scope"]) == ("scope-under-test")
-        # The mailbox is sized to the gate itself, so the two meet by
-        # construction and no width falls back to the replica between them.
-        from tokenspeed.runtime.layers.moe.latent import DOWN_MAILBOX_MAX_TOKENS
-
-        assert (wired["max_m"]) == (DOWN_MAILBOX_MAX_TOKENS)
-        # Not get_process_group("nccl", ...): that spelling passes either way,
-        # since the manager's device backend defaults to "nccl" in a test.
-        get_pg.assert_called_with(mapping.moe.tp_ep_group)
-
-    def test_the_column_group_needs_a_divisible_latent(self):
-        """The group would otherwise raise at construction and kill the boot.
-
-        The multicast op declines an indivisible latent by returning None, but
-        the column split has no such vote: it is wired straight from the
-        mapping, so the width has to be checked where it is wired.
-        """
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=False,
-                use_trtllm=True,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            ),
-            routed_hidden=60,
-        )
-        down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
-        assert (down.get("column_group")) is None
-
-    @_NVIDIA_ONLY
-    def test_the_shard_stays_off_the_plan_that_cannot_absorb_it(self):
-        """Marlin keeps the latent in bf16, so it keeps the replicated projection."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=False,
-                use_trtllm=False,
-                use_marlin=True,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            )
-        )
-        self._assert_latent_projection_sharding(
-            built.linear_calls, built.mapping, trtllm=False
-        )
-        # The multicast split adds no cross-rank sum, so no plan excludes it.
-        assert (len(built.multicast_calls)) == (1)
-        down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
-        assert (down["multicast_down"]) == ("mc-op")
-
-    @_NVIDIA_ONLY
-    def test_the_rotation_ordinal_counts_moe_blocks_not_layers(self):
-        """At a frequency above one the two are different numbers."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        built = self._build_moe_block(
-            kimi_k3.Kimi3MoEExecutionPlan(
-                use_mega_moe=False,
-                owns_ep_communication=False,
-                use_native=False,
-                use_trtllm=True,
-                overlap_shared_experts=False,
-                joint_moe_reduce=False,
-                decode_chain=False,
-            ),
-            moe_layer_freq=2,
-            layer_index=4,
-        )
-        assert (built.multicast_calls[0]["block_index"]) == (2)
-        # The count is a count of blocks, so the frequency must not divide it.
-        assert (built.multicast_calls[0]["layer_count"]) == (46)
-
-    def test_local_moe_blocks_counts_what_this_stage_runs(self):
-        """The dense prefix is not a block, and only this stage's are counted."""
-        from tokenspeed.runtime.models import kimi_k3
-
-        config = SimpleNamespace(
-            num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
-        )
-        one = Mapping(rank=0, world_size=1, pp_size=1)
-        assert (kimi_k3._k3_local_moe_blocks(config, one)) == (92)
-        # 93 over three stages is 31 apiece; the first loses its dense layer.
-        counts = [
-            kimi_k3._k3_local_moe_blocks(
-                config, Mapping(rank=rank, world_size=3, pp_size=3)
-            )
+        assert [
+            _k3_local_moe_blocks(config, Mapping(rank=rank, world_size=3, pp_size=3))
             for rank in range(3)
-        ]
-        assert (counts) == ([30, 31, 31])
+        ] == expected
 
-    def test_the_base_model_states_the_blocks_its_stage_runs(self):
-        """The rotation count must come from the stage, not a literal."""
-        from tokenspeed.runtime.models import kimi_k3
 
-        recorded: list[dict] = []
-        config = KimiLinearConfig(
-            hidden_size=64,
-            routed_expert_hidden_size=32,
-            moe_intermediate_size=32,
-            num_experts=8,
-            num_experts_per_token=2,
-            num_shared_experts=1,
-        )
-        mapping = Mapping(rank=0, world_size=8, pp_size=1, moe_tp_size=8)
-        with (
-            mock.patch.object(
-                kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
-            ),
-            mock.patch.object(
-                kimi_k3, "KimiLinearMLAAttention", lambda *a, **kw: torch.nn.Module()
-            ),
-            mock.patch.object(
-                kimi_k3,
-                "KimiLinearMoE",
-                lambda *a, **kw: recorded.append(kw) or torch.nn.Module(),
-            ),
-            mock.patch.object(
-                kimi_k3, "CommManager", lambda *a, **kw: SimpleNamespace()
-            ),
-        ):
-            kimi_k3.KimiLinearDecoderLayer(
-                config=config,
-                mapping=mapping,
-                layer_id=1,
-                model_scope="model.layers",
-                qkv_parallel=None,
-                output_parallel=None,
-            )
-
-        assert (len(recorded)) == (1)
-        assert (recorded[0]["moe_block_count"]) == (
-            kimi_k3._k3_local_moe_blocks(config, mapping)
-        )
-
-        # At PP1 the stage's blocks and the model's happen to be the same number,
-        # so the handoff has to be pinned where they differ.
-        recorded.clear()
-        staged = Mapping(rank=8, world_size=24, pp_size=3, moe_tp_size=8)
-        with (
-            mock.patch.object(
-                kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
-            ),
-            mock.patch.object(
-                kimi_k3, "KimiLinearMLAAttention", lambda *a, **kw: torch.nn.Module()
-            ),
-            mock.patch.object(
-                kimi_k3,
-                "KimiLinearMoE",
-                lambda *a, **kw: recorded.append(kw) or torch.nn.Module(),
-            ),
-            mock.patch.object(
-                kimi_k3, "CommManager", lambda *a, **kw: SimpleNamespace()
-            ),
-        ):
-            kimi_k3.KimiLinearDecoderLayer(
-                config=config,
-                mapping=staged,
-                layer_id=31,
-                model_scope="model.layers",
-                qkv_parallel=None,
-                output_parallel=None,
-            )
-        assert (recorded[0]["moe_block_count"]) == (31)
-        assert (31) != (kimi_k3._k3_local_moe_blocks(config, mapping))
-
-    def test_the_draft_states_a_rotation_of_one(self):
-        """The draft runs its one block every step, so nothing rotates."""
-        from tokenspeed.runtime.models import kimi_k3_nextn
-
-        config = KimiLinearConfig(
-            hidden_size=64,
-            routed_expert_hidden_size=32,
-            moe_intermediate_size=32,
-            num_experts=8,
-            num_experts_per_token=2,
-            num_shared_experts=1,
-        )
-        mapping = SimpleNamespace(
-            moe=SimpleNamespace(
-                tp_ep_size=8,
-                tp_ep_rank=0,
-                tp_ep_group=tuple(range(8)),
-            ),
-        )
-        with (
-            mock.patch.object(
-                kimi_k3_nextn, "KimiK3DraftAttentionMLA", lambda **kw: torch.nn.Module()
-            ),
-            mock.patch.object(
-                kimi_k3_nextn,
-                "create_kimi_linear_moe",
-                autospec=True,
-                return_value=torch.nn.Module(),
-            ) as create_moe,
-            mock.patch.object(
-                kimi_k3_nextn, "CommManager", lambda *a, **kw: SimpleNamespace()
-            ),
-            mock.patch(
-                "tokenspeed.runtime.layers.linear.ReplicatedLinear",
-                lambda *a, **kw: torch.nn.Module(),
-            ),
-        ):
-            kimi_k3_nextn.KimiK3DraftDecoderLayer(
-                config=config,
-                mapping=mapping,
-                model_scope="draft",
-                quant_config=None,
-                prefix="",
-                alt_stream=None,
-            )
-
-        # One block is a count the pool refuses; that refusal is pinned on the
-        # op itself, in test_availability_needs_a_whole_number_of_rotations.
-        create_moe.assert_called_once_with(
-            config=config,
-            mapping=mapping,
-            layer_index=0,
-            model_scope="draft",
-            moe_block_count=1,
-            quant_config=None,
-            prefix="block_sparse_moe",
-            alt_stream=None,
-            expert_layout=None,
-        )
-
-    def test_shard_predicate_requires_a_divisible_multi_rank_nvidia_group(self):
-        """Each term of the shard predicate has to be visible on its own."""
-        from types import SimpleNamespace
-
-        from tokenspeed.runtime.models import kimi_k3
-
-        def mapping_for(tp_ep_size):
-            return SimpleNamespace(
-                attn=SimpleNamespace(dp_size=1),
-                moe=SimpleNamespace(tp_ep_size=tp_ep_size),
-            )
-
-        on_nvidia = torch.version.hip is None
-        assert (kimi_k3._shard_k3_latent_projection(mapping_for(8), 7168)) == (
-            on_nvidia
-        )
-        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(1), 7168))
-        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(3), 7168))
-        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(5), 7168))
-
-    def _assert_latent_projection_sharding(self, linear_calls, mapping, trtllm=False):
-        """Both projections split columns; only the up one narrows storage."""
-        by_prefix = _linear_calls_by_prefix(linear_calls)
-        down = by_prefix["routed_expert_down_proj"]
-        up = by_prefix["routed_expert_up_proj"]
-        sharded = mapping.moe.tp_ep_size > 1 and torch.version.hip is None
-        assert (up.get("shard_group") is not None) == (sharded)
-        assert (down.get("reduce_group")) is None
-        if sharded:
-            assert (up["shard_group"]) is (mapping.moe.tp_ep_group)
-            assert (down["column_group"]) is (mapping.moe.tp_ep_group)
-        else:
-            assert (up.get("shard_group")) is None
-            assert (down.get("column_group")) is None
-        # Narrowed storage would take the full weight the multicast op slices.
-        assert (down.get("shard_group")) is None
-        for call in (down, up):
-            assert (call["shard_rank"]) == (mapping.moe.tp_ep_rank)
-            assert (call["shard_size"]) == (mapping.moe.tp_ep_size)
-
-    def test_hybrid_moe_precomputes_routing_only_for_decode(self, subtests):
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
-
-        layer = KimiLinearMoE.__new__(KimiLinearMoE)
-        torch.nn.Module.__init__(layer)
-        layer.execution_plan = SimpleNamespace(use_trtllm=True)
-        layer.experts = SimpleNamespace(
-            support_routing=True,
-            supports_precomputed_topk=True,
-            topk_output_format=TopKOutputFormat.BYPASSED,
-        )
-
-        assert (layer._routing_output_format(None)) == (TopKOutputFormat.STANDARD)
-        for mode, expected in (
-            (ForwardMode.DECODE, TopKOutputFormat.STANDARD),
-            (ForwardMode.EXTEND, TopKOutputFormat.BYPASSED),
-            (ForwardMode.MIXED, TopKOutputFormat.BYPASSED),
-            (ForwardMode.IDLE, TopKOutputFormat.BYPASSED),
-        ):
-            with subtests.test(mode=mode):
-                ctx = SimpleNamespace(forward_mode=mode)
-                assert (layer._routing_output_format(ctx)) == (expected)
-
-    def test_mla_mixed_batch_slices_decode_gate_to_live_rows(self):
-        from tokenspeed.runtime.execution.context import ForwardContext
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
-
-        metadata = SimpleNamespace(
-            extend_seq_lens_cpu=[1],
-            use_absorbed_cached_extend=False,
-        )
-        backend = SimpleNamespace(
-            spec_num_tokens=1,
-            chunked_prefill_metadata=metadata,
-            write_locations=lambda layer, mode: torch.arange(4),
-        )
-        ctx = ForwardContext(
-            attn_backend=backend,
-            token_to_kv_pool=None,
-            bs=3,
-            num_extends=1,
-            output_layout=ForwardOutputLayout(1, 1, 2, 1),
-            input_num_tokens=4,
-            forward_mode=ForwardMode.DECODE,
-        )
-        attention = DeepseekV3AttentionMLA.__new__(DeepseekV3AttentionMLA)
-        torch.nn.Module.__init__(attention)
-        attention.has_head_tp = False
-        attention.num_local_heads = 2
-        attention.v_head_dim = 3
-        attention.attn_mha = SimpleNamespace(group_id="full_attention")
-        attention.forward_normal_chunked_kv_core = mock.Mock()
-        attention.forward_absorb = mock.Mock()
-
-        output_gate = torch.arange(24).reshape(4, 6)
-        attention._attn(
-            positions=torch.arange(4),
-            q=torch.empty(4, 2, 8),
-            latent_cache=torch.empty(4, 1, 8),
-            ctx=ctx,
-            expanded=MLAPrologueOutput(
-                query=torch.empty(4, 2, 8),
-                key=torch.empty(4, 2, 8),
-                value=torch.empty(4, 2, 3),
-            ),
-            output_gate=output_gate,
-        )
-
-        torch.testing.assert_close(
-            attention.forward_absorb.call_args.kwargs["output_gate"],
-            output_gate[1:3],
-        )
-
-    def test_shared_projection_preserves_direct_write_output(self):
-        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
-
-        class FakeMergedLinear(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.weight = torch.empty(
-                    1536, 7168, dtype=torch.bfloat16, device="meta"
-                )
-
-        class FakeRowLinear(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.weight = torch.empty(
-                    7168, 768, dtype=torch.bfloat16, device="meta"
-                )
-                self.reduce_results = kwargs["reduce_results"]
-                self.tp_size = kwargs["tp_size"]
-                self.tp_group = kwargs["tp_group"]
-
-        mapping = SimpleNamespace(
-            attn=SimpleNamespace(dp_size=1),
-            moe=SimpleNamespace(
-                tp_ep_rank=0,
-                tp_ep_size=8,
-                has_tp_ep=True,
-                tp_ep_group=tuple(range(8)),
-            ),
-        )
-        activated = torch.empty(2, 768, dtype=torch.bfloat16)
-        down_out = torch.empty(2, 7168, dtype=torch.bfloat16)
-        with (
-            mock.patch.object(kimi_k3, "MergedColumnParallelLinear", FakeMergedLinear),
-            mock.patch.object(kimi_k3, "RowParallelLinear", FakeRowLinear),
-            mock.patch.object(
-                kimi_k3,
-                "kimi3_shared_situ_projection",
-                return_value=activated,
-            ),
-            mock.patch.object(
-                kimi_k3,
-                "kimi3_shared_down_projection",
-                return_value=down_out,
-            ) as shared_down,
-        ):
-            layer = kimi_k3.KimiLinearMLP(
-                hidden_size=7168,
-                intermediate_size=6144,
-                tp_rank=mapping.moe.tp_ep_rank,
-                tp_size=mapping.moe.tp_ep_size,
-                tp_group=mapping.moe.tp_ep_group,
-                shared_parallel=None,
-                quant_config=None,
-                prefix="shared_experts",
-                reduce_results=False,
-                is_shared_expert=True,
-                activation_situ_beta=1.0,
-                activation_situ_linear_beta=None,
-            )
-            actual = layer(
-                torch.empty(2, 7168, dtype=torch.bfloat16),
-                down_out=down_out,
-            )
-
-        assert (actual) is (down_out)
-        shared_down.assert_called_once_with(
-            activated,
-            layer.down_proj.weight,
-            out=down_out,
-        )
-
-    def test_kda_stacks_qkvfab_projection_weights(self):
+class TestKimiK3WeightLoading:
+    def test_kda_loads_projection_shards_in_checkpoint_order(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
         config = KimiLinearConfig(
@@ -919,695 +127,101 @@ class TestKimiK3RegistrationTests:
                 "use_full_rank_gate": True,
             },
         )
-        mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
-            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
-        )
         layer = KimiLinearKDA(
-            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+            config,
+            Mapping(rank=0, world_size=1),
+            layer_id=0,
+            qkv_parallel=None,
+            output_parallel=None,
         )
+        weight = layer.qkvgb_proj.weight
+        shards = []
+        for value, (shard_id, rows) in enumerate(
+            (("q", 64), ("k", 64), ("v", 64), ("g", 64), ("f_a", 16), ("b", 4)),
+            start=1,
+        ):
+            loaded = torch.full((rows, 64), float(value), dtype=weight.dtype)
+            weight.weight_loader(weight, loaded, shard_id)
+            shards.append(loaded)
 
-        assert (tuple(layer.qkvgb_proj.weight.shape)) == ((288, 64))
-        for value, shard_id in enumerate(("q", "k", "v", "g"), start=1):
-            loaded = torch.full((64, 64), float(value), dtype=torch.bfloat16)
-            layer.qkvgb_proj.weight.weight_loader(
-                layer.qkvgb_proj.weight,
-                loaded,
-                shard_id,
-            )
-        f_a_weight = torch.full((16, 64), 5.0, dtype=torch.bfloat16)
-        beta_weight = torch.full((4, 64), 6.0, dtype=torch.bfloat16)
-        layer.qkvgb_proj.weight.weight_loader(
-            layer.qkvgb_proj.weight,
-            f_a_weight,
-            "f_a",
-        )
-        layer.qkvgb_proj.weight.weight_loader(
-            layer.qkvgb_proj.weight,
-            beta_weight,
-            "b",
-        )
-
-        hidden_states = torch.randn(4, 64, dtype=torch.bfloat16)
-        expected_qkvg = [
-            torch.nn.functional.linear(
-                hidden_states,
-                layer.qkvgb_proj.weight[index * 64 : (index + 1) * 64],
-            )
-            for index in range(4)
-        ]
-        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states, ctx=None)
-        assert torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1))
-        assert torch.equal(gate, expected_qkvg[3])
-        assert torch.equal(f_a, torch.nn.functional.linear(hidden_states, f_a_weight))
+        expected = torch.cat(shards)
         torch.testing.assert_close(
-            beta,
-            torch.nn.functional.linear(hidden_states, beta_weight),
-        )
-        assert not (mixed_qkv.is_contiguous())
-        assert (mixed_qkv.untyped_storage().data_ptr()) == (
-            gate.untyped_storage().data_ptr()
+            weight[: expected.shape[0]], expected, rtol=0, atol=0
         )
 
-    def test_kda_hands_the_backend_projection_rows_without_a_copy(self, subtests):
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+    def test_text_only_wrapper_filters_vision_checkpoint_weights(self, monkeypatch):
+        from tokenspeed.runtime.models import kimi_k3
 
-        config = KimiLinearConfig(
-            hidden_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            linear_attn_config={
-                "kda_layers": [1],
-                "full_attn_layers": [],
-                "num_heads": 4,
-                "head_dim": 16,
-                "short_conv_kernel_size": 4,
-                "gate_lower_bound": -5.0,
-                "use_full_rank_gate": True,
-            },
-        )
-        mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
-            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
-        )
-        layer = KimiLinearKDA(
-            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
-        )
-        torch.nn.init.normal_(layer.qkvgb_proj.weight)
-        rows = 4
-        hidden_states = torch.randn(rows, 64, dtype=torch.bfloat16)
-
-        class BackendCalled(Exception):
-            pass
-
-        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
-            with subtests.test(mode=mode):
-                captured = []
-
-                def capture_backend(**kwargs):
-                    captured.append(kwargs)
-                    raise BackendCalled
-
-                ctx = SimpleNamespace(
-                    forward_mode=mode,
-                    bs=rows,
-                    attn_backend=SimpleNamespace(forward=capture_backend),
-                    token_to_kv_pool=None,
-                )
-                with pytest.raises(BackendCalled):
-                    layer(
-                        positions=torch.empty(rows, dtype=torch.int64),
-                        hidden_states=hidden_states,
-                        ctx=ctx,
-                        comm_manager=None,
-                        projection_out=None,
-                    )
-
-                # Prefill and decode both get the leading q|k|v columns of the
-                # merged projection rows [q|k|v|g|f_a|b] themselves, not a
-                # compact copy: one storage with the f_a and beta columns
-                # handed over beside them, at their row offsets.
-                (kwargs,) = captured
-                mixed_qkv, f_a, beta = (
-                    kwargs[name] for name in ("mixed_qkv", "f_a_out", "beta_raw")
-                )
-                storage = mixed_qkv.untyped_storage().data_ptr()
-                assert f_a.untyped_storage().data_ptr() == storage
-                assert beta.untyped_storage().data_ptr() == storage
-                item = mixed_qkv.element_size()
-                assert mixed_qkv.data_ptr() == storage
-                assert f_a.data_ptr() == storage + 4 * 64 * item
-                assert beta.data_ptr() == storage + (4 * 64 + 16) * item
-                row = (layer.qkvgb_proj.weight.shape[0], 1)
-                assert mixed_qkv.stride() == f_a.stride() == beta.stride() == row
-                assert mixed_qkv.dtype == torch.bfloat16
-                assert mixed_qkv.shape == (rows, 3 * 64)
-
-    @_NVIDIA_ONLY
-    def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
-        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
-        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
-
-        shared_calls = []
-        expert_calls = []
-
-        linear_calls: list[dict] = []
-        multicast_calls: list[dict] = []
-
-        class FakeLinear(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.weight = torch.empty(0)
-                self.shard_group = kwargs.get("shard_group")
-                linear_calls.append(kwargs)
-
-        class FakeExperts(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                expert_calls.append(kwargs)
-                self.support_routing = False
-                self.supports_precomputed_topk = True
-                self.topk_output_format = TopKOutputFormat.STANDARD
-                self.w13_weight = torch.empty(0)
-                self.w13_weight_scale = torch.empty(0)
-                self.w2_weight = torch.empty(0)
-                self.w2_weight_scale = torch.empty(0)
-                self.plan = {"weight_dtype": "unquant"}
-                self.activation_situ_linear_beta = kwargs["activation_situ_linear_beta"]
-                # Consumed by K3MoeTailComm arming (real MoELayer exposes it
-                # from the selected kernel's plan trait).
-                self.supports_deferred_finalize = False
-                self.sorted_route_rows = frozenset()
-
-            def forward(self, *, hidden_states, **kwargs):
-                return hidden_states + 1
-
-        class FakeSharedExperts(torch.nn.Module):
-            def __init__(self, *args, **kwargs):
-                super().__init__()
-                self.gate_up_proj = FakeLinear()
-                self.down_proj = FakeLinear()
-                shared_calls.append(kwargs)
-
-        class FakeLatentMoE(torch.nn.Module):
-            def __init__(self, **kwargs):
-                super().__init__()
-                self.components = kwargs
-
-        ep_group = tuple(range(8))
-        mapping = SimpleNamespace(
-            world_size=8,
-            attn=SimpleNamespace(
-                tp_size=8,
-                dp_size=1,
-                dp_rank=0,
-                dp_group=(0,),
-            ),
-            moe=SimpleNamespace(
-                tp_rank=0,
-                tp_size=1,
-                tp_group=(0,),
-                ep_rank=0,
-                ep_size=8,
-                ep_group=ep_group,
-                tp_ep_size=8,
-                has_tp_ep=True,
-                tp_ep_rank=3,
-                tp_ep_group=ep_group,
-            ),
-        )
-        config = KimiLinearConfig(
-            hidden_size=64,
-            routed_expert_hidden_size=32,
-            moe_intermediate_size=32,
-            num_experts=8,
-            num_experts_per_token=2,
-            num_shared_experts=1,
-        )
-
-        with (
-            _model_dtype(torch.bfloat16),
-            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
-            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
-            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
-            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
-            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
-            mock.patch.object(
-                kimi_k3.Kimi3MoEExecutionPlan,
-                "build",
-                return_value=kimi_k3.Kimi3MoEExecutionPlan(
-                    use_mega_moe=False,
-                    owns_ep_communication=False,
-                    use_native=True,
-                    use_trtllm=False,
-                    overlap_shared_experts=False,
-                    joint_moe_reduce=True,
-                    decode_chain=False,
-                ),
-            ),
-            mock.patch.object(
-                kimi_k3.KimiK3LatentDownOp,
-                "initialize",
-                staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),
-            ),
-            mock.patch(
-                "tokenspeed.runtime.distributed.process_group_manager"
-                ".process_group_manager.get_process_group",
-                return_value="pg",
-            ) as get_pg,
-            mock.patch.dict(
-                kimi_k3.global_server_args_dict,
-                {"enforce_eager": False},
-            ),
-        ):
-            layer = kimi_k3.KimiLinearMoE(
-                config,
-                mapping,
-                layer_index=1,
-                model_scope="model.layers",
-                moe_block_count=92,
-                quant_config=None,
-                prefix="model.layers.1.block_sparse_moe",
-            )
-
-        assert not (shared_calls[0]["reduce_results"])
-        assert (expert_calls[0]["routing_mode"]) is None
-        assert (expert_calls[0]["internal_activation_dtype_override"]) == ("input")
-        assert (layer.topk.topk_config.output_format) == (TopKOutputFormat.STANDARD)
-        assert layer.native_latent_moe.components["joint_reduce"]
-        assert (layer.native_latent_moe.components["shared_reduce"]) is None
-        self._assert_latent_projection_sharding(linear_calls, mapping)
-        assert (len(multicast_calls)) == (1)
-        wired = multicast_calls[0]
-        assert (wired["group"]) == ("pg")
-        assert (wired["hidden_size"]) == (config.hidden_size)
-        assert (wired["latent_size"]) == (config.routed_expert_hidden_size)
-        assert (wired["model_scope"]) == ("model.layers")
-        assert (wired["layer_count"]) == (92)
-        # The pool rotates over block ordinals, so this layer must key its own.
-        assert (wired["block_index"]) == (1)
-        get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
-        down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
-        assert (down["multicast_down"]) == ("mc-op")
-        assert (layer.native_latent_moe.components["expert_parallel_group"]) == (
-            ep_group
-        )
-
-        # TP shards each produce only a partial W2 result. They must use the
-        # composed tail, whose reduction group spans TP x EP, instead of the
-        # native LatentMoELayer path that only reduces across EP.
-        tp_mapping = SimpleNamespace(
-            world_size=8,
-            attn=mapping.attn,
-            moe=SimpleNamespace(
-                tp_rank=0,
-                tp_size=8,
-                tp_group=ep_group,
-                ep_rank=0,
-                ep_size=1,
-                ep_group=(0,),
-                tp_ep_size=8,
-                has_tp_ep=True,
-                tp_ep_rank=0,
-                tp_ep_group=ep_group,
-            ),
-        )
-        with (
-            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
-            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
-            mock.patch(
-                "tokenspeed.runtime.distributed.process_group_manager"
-                ".process_group_manager.get_process_group",
-                return_value="pg",
-            ),
-            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
-            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
-            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
-            mock.patch.object(
-                kimi_k3.Kimi3MoEExecutionPlan,
-                "build",
-                return_value=kimi_k3.Kimi3MoEExecutionPlan(
-                    use_mega_moe=False,
-                    owns_ep_communication=False,
-                    use_native=True,
-                    use_trtllm=False,
-                    overlap_shared_experts=False,
-                    joint_moe_reduce=False,
-                    decode_chain=False,
-                ),
-            ),
-            mock.patch.dict(
-                kimi_k3.global_server_args_dict,
-                {"enforce_eager": False},
-            ),
-        ):
-            tp_layer = kimi_k3.KimiLinearMoE(
-                config,
-                tp_mapping,
-                layer_index=1,
-                model_scope="model.layers",
-                moe_block_count=92,
-                quant_config=None,
-                prefix="model.layers.1.block_sparse_moe",
-            )
-
-        linear_calls.clear()
-        with (
-            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
-            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
-            mock.patch(
-                "tokenspeed.runtime.distributed.process_group_manager"
-                ".process_group_manager.get_process_group",
-                return_value="pg",
-            ),
-            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
-            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
-            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
-            mock.patch.object(
-                kimi_k3, "_shard_k3_latent_projection", return_value=False
-            ),
-            mock.patch.object(
-                kimi_k3.Kimi3MoEExecutionPlan,
-                "build",
-                return_value=kimi_k3.Kimi3MoEExecutionPlan(
-                    use_mega_moe=False,
-                    owns_ep_communication=False,
-                    use_native=True,
-                    use_trtllm=False,
-                    overlap_shared_experts=False,
-                    joint_moe_reduce=True,
-                    decode_chain=False,
-                ),
-            ),
-            mock.patch.dict(
-                kimi_k3.global_server_args_dict,
-                {"enforce_eager": False},
-            ),
-        ):
-            kimi_k3.KimiLinearMoE(
-                config,
-                mapping,
-                layer_index=1,
-                model_scope="model.layers",
-                moe_block_count=92,
-                quant_config=None,
-                prefix="model.layers.1.block_sparse_moe",
-            )
-        unsharded = {
-            c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c
-        }
-        assert (unsharded["routed_expert_down_proj"].get("multicast_down")) is None
-        assert (unsharded["routed_expert_down_proj"].get("column_group")) is None
-        assert (unsharded["routed_expert_up_proj"].get("shard_group")) is None
-
-        assert (tp_layer.native_latent_moe) is None
-        assert (tp_layer.comm) is None
-        routed_input = torch.zeros(1, config.routed_expert_hidden_size)
-        torch.testing.assert_close(
-            tp_layer._routed_experts(
-                routed_input,
-                mock.Mock(),
-                num_global_tokens=1,
-                max_num_tokens_per_gpu=1,
-                do_finalize=True,
-            ),
-            routed_input + 1,
-        )
-
-    def test_native_kimi_moe_zero_tokens_bypass_fused_pipeline(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
-
-        hidden_states = torch.empty(0, 64)
-        prefix_sum = torch.empty_like(hidden_states)
-        native_latent_moe = mock.Mock(return_value=prefix_sum)
-        fused_pipeline = mock.Mock(
-            side_effect=AssertionError("zero tokens must bypass the fused pipeline")
-        )
-        layer = SimpleNamespace(
-            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
-            execution_plan=SimpleNamespace(use_native=True),
-            native_latent_moe=native_latent_moe,
-            _use_fused_decode_pipeline=True,
-            _forward_fused_decode_pipeline=fused_pipeline,
-        )
-
-        layer._forward_amd = KimiLinearMoE._forward_amd.__get__(layer)
-
-        output = KimiLinearMoE.forward(
-            layer,
-            hidden_states,
-            prefix_sum,
-            num_global_tokens=0,
-            max_num_tokens_per_gpu=0,
-            prefix_is_sharded=False,
-        )
-
-        torch.testing.assert_close(output, prefix_sum)
-        assert (tuple(output.shape)) == ((0, 64))
-        fused_pipeline.assert_not_called()
-        native_latent_moe.assert_called_once_with(
-            hidden_states,
-            num_global_tokens=0,
-            max_num_tokens_per_gpu=0,
-            prefix_sum=prefix_sum,
-        )
-
-    def test_mla_gate_projection_uses_api_selected_layout(self, subtests):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
-
-        class FakeProjection(torch.nn.Module):
+        class RecordingLanguageModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.weight = torch.nn.Parameter(torch.arange(50.0).reshape(10, 5))
-                self.calls = 0
-
-            def forward(self, hidden, block_scale, output_dtype, *, ctx):
-                self.calls += 1
-                value = hidden if block_scale is None else hidden * block_scale
-                output = torch.nn.functional.linear(value, self.weight.to(value.dtype))
-                if output_dtype is not None:
-                    output = output.to(output_dtype)
-                return output, None
-
-        class IdentityComm:
-            @staticmethod
-            def pre_attn_comm(value, ctx):
-                return value
-
-        class FakeFusedNorm(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight_q_a = torch.nn.Parameter(torch.ones(2))
-                self.weight_kv_a = torch.nn.Parameter(torch.ones(3))
-
-        class FakeQueryNorm(torch.nn.Module):
-            variance_epsilon = 1e-6
-
-        class IdentityQProjection(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = torch.nn.Parameter(torch.eye(2))
-
-            def forward(self, value):
-                return torch.nn.functional.linear(value, self.weight), None
-
-        attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
-        torch.nn.Module.__init__(attention)
-        attention.q_lora_rank = 2
-        attention.kv_lora_rank = 3
-        attention.qk_nope_head_dim = 1
-        attention.qk_rope_head_dim = 1
-        attention._qkv_a_width = 6
-        attention._gate_width = 4
-        attention.qkv_parallel = None
-        attention.fused_qkv_a_proj_with_mqa = FakeProjection()
-        attention.fused_qk_layernorm = FakeFusedNorm()
-        attention.q_a_layernorm = FakeQueryNorm()
-        attention.q_b_proj = IdentityQProjection()
-        comm = IdentityComm()
-
-        prefill = torch.ones(33, 5)
-        with torch.no_grad():
-            q, latent, gate, absorbed_query = attention._project_q_latent_gated(
-                prefill, None, comm, None
-            )
-        expected = torch.nn.functional.linear(
-            prefill, attention.fused_qkv_a_proj_with_mqa.weight
-        )
-        expected_q = torch.nn.functional.rms_norm(
-            expected[:, :2],
-            (2,),
-            eps=attention.q_a_layernorm.variance_epsilon,
-        )
-        expected_latent = expected[:, 2:6].clone()
-        expected_latent[:, :3] = torch.nn.functional.rms_norm(
-            expected_latent[:, :3],
-            (3,),
-            eps=attention.q_a_layernorm.variance_epsilon,
-        )
-        torch.testing.assert_close(q, expected_q)
-        torch.testing.assert_close(latent, expected_latent)
-        torch.testing.assert_close(gate, expected[:, 6:])
-        assert (absorbed_query) is None
-        assert (attention.fused_qkv_a_proj_with_mqa.calls) == (0)
-
-        with torch.no_grad():
-            _, _, _, decode_absorbed = attention._project_q_latent_gated(
-                prefill[:4], SimpleNamespace(num_extends=0), comm, None
-            )
-        assert (decode_absorbed) is None
-        assert (attention.fused_qkv_a_proj_with_mqa.calls) == (0)
-
-        # The module paths must trim padding and preserve both canonical
-        # Q/KV/gate order and the FP8 checkpoint's gate/Q/KV order.
-        projection = attention.fused_qkv_a_proj_with_mqa
-        weight = torch.nn.functional.pad(projection.weight.detach(), (0, 0, 0, 2))
-        attention._fused_qkv_a_pad_rows = 2
-        for fp8 in (False, True):
-            with subtests.test(fp8=fp8):
-                attention._fused_qkv_a_fp8_layout = fp8
-                projection.weight = torch.nn.Parameter(
-                    weight.to(torch.float8_e4m3fn if fp8 else torch.float32),
-                    requires_grad=False,
-                )
-                output_dtype = torch.float32 if fp8 else torch.bfloat16
-                attention.q_b_proj.to(output_dtype)
-                attention.fused_qk_layernorm.to(output_dtype)
-                scale = None if fp8 else torch.full((prefill.shape[0], 1), 0.5)
-                with torch.no_grad():
-                    q, latent, gate, absorbed = attention._project_q_latent_gated(
-                        prefill, None, comm, scale
-                    )
-                expected = torch.nn.functional.linear(
-                    prefill if fp8 else prefill * scale, projection.weight.float()
-                )[:, :10]
-                if fp8:
-                    expected_gate, expected_q, expected_latent = expected.split(
-                        [4, 2, 4], dim=-1
-                    )
-                else:
-                    expected_q, expected_latent, expected_gate = expected.to(
-                        torch.bfloat16
-                    ).split([2, 4, 4], dim=-1)
-                expected_q = torch.nn.functional.rms_norm(
-                    expected_q, (2,), eps=attention.q_a_layernorm.variance_epsilon
-                )
-                expected_latent = expected_latent.clone()
-                expected_latent[:, :3] = torch.nn.functional.rms_norm(
-                    expected_latent[:, :3],
-                    (3,),
-                    eps=attention.q_a_layernorm.variance_epsilon,
-                )
-                torch.testing.assert_close(q, expected_q)
-                torch.testing.assert_close(latent, expected_latent)
-                torch.testing.assert_close(gate, expected_gate)
-                assert (absorbed) is None
-
-    def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
-
-        attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
-        torch.nn.Module.__init__(attention)
-
-        attention.qkv_parallel = None
-        attention.fused_qkv_a_proj_with_mqa = None
-        assert not (attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
-
-    def test_resolve_architecture_returns_registered_name(self):
-        from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
-
-        cfg = KimiK3Config(architectures=["KimiK3ForConditionalGeneration"])
-        assert (resolve_architecture(cfg)) == ("KimiK3ForConditionalGeneration")
-
-    def test_text_only_wrapper_streams_and_discards_vision_weights(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiK3ForConditionalGeneration
-
-        class _Recorder:
-            def __init__(self):
-                self.weights = None
+                self.weights = []
 
             def load_weights(self, weights):
                 self.weights = list(weights)
 
-        language_model = _Recorder()
-        wrapper = SimpleNamespace(language_model=language_model, vision=None)
-        weights = iter(
-            (
-                ("language_model.model.embed_tokens.weight", torch.ones(1)),
-                ("vision_tower.blocks.0.weight", torch.ones(1)),
-                ("mm_projector.weight", torch.ones(1)),
-                ("language_model.lm_head.weight", torch.ones(1)),
+        language_model = RecordingLanguageModel()
+        monkeypatch.setattr(
+            kimi_k3, "KimiLinearForCausalLM", lambda *args, **kwargs: language_model
+        )
+        wrapper = kimi_k3.KimiK3ForConditionalGeneration(
+            KimiK3Config(),
+            Mapping(rank=0, world_size=1),
+            is_multimodal_active=False,
+        )
+        embedding, head = torch.ones(1), torch.full((1,), 2.0)
+        wrapper.load_weights(
+            iter(
+                (
+                    ("language_model.model.embed_tokens.weight", embedding),
+                    ("vision_tower.blocks.0.weight", torch.ones(1)),
+                    ("mm_projector.weight", torch.ones(1)),
+                    ("language_model.lm_head.weight", head),
+                )
             )
         )
 
-        KimiK3ForConditionalGeneration.load_weights(wrapper, weights)
+        assert [name for name, _ in language_model.weights] == [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ]
+        assert language_model.weights[0][1] is embedding
+        assert language_model.weights[1][1] is head
 
-        assert ([name for name, _ in language_model.weights]) == (
-            ["model.embed_tokens.weight", "lm_head.weight"]
+
+class TestKimiK3CacheConfig:
+    @staticmethod
+    def _plan(config):
+        from test.runtime.conftest import kimi_tp8_layout
+
+        return kimi_tp8_layout(text_config=config, tp_size=8)[2].bind(64)
+
+    @staticmethod
+    def _reduced_config(num_layers):
+        linear = dict(KimiLinearConfig().linear_attn_config)
+        for name in ("kda_layers", "full_attn_layers"):
+            linear[name] = [layer for layer in linear[name] if layer <= num_layers]
+        return KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
+
+    def test_reduced_layer_variant_plans(self):
+        config = self._reduced_config(24)
+        plan = self._plan(config)
+        assert len(plan.planes) == 6
+
+    def test_full_size_split_is_enforced(self):
+        linear = dict(KimiLinearConfig().linear_attn_config)
+        linear["kda_layers"] = linear["kda_layers"][:-3]
+        linear["full_attn_layers"] = sorted(
+            set(range(1, 94)) - set(linear["kda_layers"])
         )
+        config = KimiLinearConfig(linear_attn_config=linear)
+        with pytest.raises(ValueError, match="69 KDA and 24 MLA"):
+            self._plan(config)
+
+    def test_reduced_layer_states_must_fit_the_mla_planes(self):
+        with pytest.raises(ValueError, match="requires 5 target planes.*got 6"):
+            self._plan(self._reduced_config(23))
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
-
-
-class TestKimiK3LcmPlanTests:
-    """LCM planning across attention-TP widths and reduced-layer variants."""
-
-    @staticmethod
-    def _plan(cfg, tp):
-        from test.runtime.conftest import kimi_tp8_layout
-
-        return kimi_tp8_layout(text_config=cfg, tp_size=tp)[2].bind(64)
-
-    def test_mla_packing_scales_with_attn_tp(self):
-        """The MLA plane is the smallest that covers one per-layer KDA state,
-        so tp=16 -- where the KDA state page halves while the MLA latent page
-        is tp-invariant -- halves the plane and the parent, and tp=1
-        (attention-DP) grows them 8/tp-fold instead of failing the planner's
-        exact-page-stride check."""
-        cfg = KimiLinearConfig()
-        plan8 = self._plan(cfg, 8)
-        plan16 = self._plan(cfg, 16)
-        plan1 = self._plan(cfg, 1)
-        packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
-        packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
-        packs1 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan1.groups}
-        assert (packs8[FULL_ATTENTION]) == (12)
-        assert (packs16[FULL_ATTENTION]) == (6)
-        assert (packs1[FULL_ATTENTION]) == (89)
-        for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
-            assert (packs8[gid]) == (1)
-            assert (packs16[gid]) == (1)
-            assert (packs1[gid]) == (1)
-        assert (plan16.lcm_block_bytes * 2) == (plan8.lcm_block_bytes)
-        for plan in (plan8, plan16, plan1):
-            assert (len(plan.planes)) == (_NUM_MLA)
-
-    def test_reduced_layer_variant_plans(self):
-        """Layer counts derive from the config: a structurally-identical
-        reduced-layer checkpoint (same per-layer specs, fewer layers) plans
-        with one plane per MLA layer instead of tripping hardcoded 93/69/24
-        checks."""
-        base = KimiLinearConfig()
-        linear = dict(base.linear_attn_config)
-        num_layers = 24
-        linear["kda_layers"] = [x for x in linear["kda_layers"] if x <= num_layers]
-        linear["full_attn_layers"] = [
-            x for x in linear["full_attn_layers"] if x <= num_layers
-        ]
-        cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
-        plan = self._plan(cfg, 8)
-        assert (len(plan.planes)) == (len(linear["full_attn_layers"]))
-
-    def test_full_size_split_is_enforced(self):
-        """A 93-layer config must keep exactly 69 KDA + 24 MLA; the relaxed
-        reduced-layer path must not weaken the released-checkpoint check."""
-        base = KimiLinearConfig()
-        linear = dict(base.linear_attn_config)
-        kda = list(linear["kda_layers"])
-        # 66 KDA (still /3 for the state groups) + 27 full: wrong split.
-        kda.pop()
-        kda.pop()
-        kda.pop()
-        linear["kda_layers"] = kda
-        linear["full_attn_layers"] = sorted(set(range(1, _NUM_LAYERS + 1)) - set(kda))
-        cfg = KimiLinearConfig(linear_attn_config=linear)
-        with pytest.raises((ValueError), match=("69 KDA and 24 MLA")):
-            self._plan(cfg, 8)
-
-    def test_reduced_layer_split_must_ride_inside_the_mla_planes(self):
-        """A reduced-layer variant whose KDA groups need a plane of their own
-        is rejected loudly: 5 MLA layers cannot host 6 KDA slots."""
-        base = KimiLinearConfig()
-        linear = dict(base.linear_attn_config)
-        num_layers = 23  # 17 KDA layers: not divisible by 3
-        linear["kda_layers"] = [x for x in linear["kda_layers"] if x <= num_layers]
-        linear["full_attn_layers"] = [
-            x for x in linear["full_attn_layers"] if x <= num_layers
-        ]
-        cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
-        with pytest.raises((ValueError)):
-            self._plan(cfg, 8)

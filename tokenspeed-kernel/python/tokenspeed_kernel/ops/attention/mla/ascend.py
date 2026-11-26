@@ -36,24 +36,22 @@ def ascend_mla_dcp_kernels():
     return mla_dcp
 
 
-def prepare_ascend_mla_prefill(
+def prepare_ascend_mla_qcp_prefill(
     cache,
     *,
     ranks,
     history_group,
-    max_current_rows,
-    history_null_rows,
+    layout,
 ):
-    """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
-    from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
+    """Prepare shared QCP KV transport for MLA, without an Index-K plane."""
+    from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
-    return AscendDSAPrefill(
+    return AscendQCPPrefillTransport(
         cache,
         None,
         ranks=ranks,
         history_group=history_group,
-        max_current_rows=max_current_rows,
-        history_null_rows=history_null_rows,
+        layout=layout,
     )
 
 
