@@ -31,6 +31,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from tokenspeed_cli.server_args import (
+    BLOCKWISE_LOGPROB_ORDERS as BLOCKWISE_LOGPROB_ORDERS,
+)
+from tokenspeed_cli.server_args import BLOCKWISE_VOCAB_BLOCK as BLOCKWISE_VOCAB_BLOCK
+from tokenspeed_cli.server_args import DSA_SLOT_ORDERS as DSA_SLOT_ORDERS
+from tokenspeed_cli.server_args import LAYER_BOUNDARY_NORMS as LAYER_BOUNDARY_NORMS
+from tokenspeed_cli.server_args import LOGPROB_ORDERS as LOGPROB_ORDERS
+from tokenspeed_cli.server_args import MLA_LORA_SCALES as MLA_LORA_SCALES
+from tokenspeed_cli.server_args import MOE_COMBINE_ORDERS as MOE_COMBINE_ORDERS
+from tokenspeed_cli.server_args import ROUTER_TOPKS as ROUTER_TOPKS
+from tokenspeed_cli.server_args import SAMPLING_STREAMS as SAMPLING_STREAMS
+from tokenspeed_cli.server_args import YARN_FREQUENCY_DEVICES as YARN_FREQUENCY_DEVICES
+from tokenspeed_cli.server_args import YARN_RAMP_MASK_DEVICES as YARN_RAMP_MASK_DEVICES
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -100,65 +114,6 @@ def resolve_numerics_envelope(server_args: ServerArgs) -> None:
 # token id in every batch shape: ``greedy`` is a canonical argmax, the
 # FlashInfer backends overlay one on their pool route under rl-bitwise.
 RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "greedy"})
-
-# ``--sampling-stream``: which random stream the FlashInfer backends' sampled
-# (non-greedy) rows draw from. ``batch`` is flashinfer's Philox stream keyed by
-# the batch row; ``per-request`` is the Gumbel-max pool route keyed by
-# (request seed, position) and position-keyed chain verify coins, which the
-# bitwise envelope requires.
-SAMPLING_STREAMS = ("batch", "per-request")
-
-# ``--yarn-ramp-mask-device`` selects the deepseek_yarn linear ramp device;
-# ``--yarn-frequency-device`` selects powers, divisions and interpolation.
-# Under auto, both devices default independently to CUDA.
-# rl-bitwise pins a CPU ramp and CUDA frequency construction.
-YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
-YARN_FREQUENCY_DEVICES = ("cuda", "cpu")
-
-# ``--mla-lora-scale``: where LongCat-style MLA applies its sqrt(hidden /
-# lora_rank) norm scales — folded into the q_a/kv_a layernorm weights at load,
-# or multiplied at runtime after q_b_proj / kv_a_layernorm as the trainer does.
-MLA_LORA_SCALES = ("folded", "runtime")
-
-# ``--layer-boundary-norm``: the norm at each physical layer boundary — the
-# fused add+norm kernel, or a bf16 ``hidden + residual`` materialized first and
-# a standalone RMSNorm, as the trainer does.
-LAYER_BOUNDARY_NORMS = ("fused", "unfused")
-
-# ``--router-topk``: correction-bias MoE routing — the fused CUDA kernel, or
-# fp32 ``torch.softmax`` + ``torch.topk(probs + bias)`` in PyTorch tie order
-# with ``-1`` zero-expert ids, as the trainer does.
-ROUTER_TOPKS = ("fused", "torch")
-
-# ``--logprob-order``: the selected-token log-softmax behind every returned
-# logprob — ``torch.log_softmax``, or fixed-width blockwise reduction
-# over ``BLOCKWISE_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-BLOCKWISE_VOCAB_BLOCK = 32768
-# Block width describes the trainer's reduction, independently of serving TP.
-BLOCKWISE_LOGPROB_ORDERS = {
-    "blockwise": (BLOCKWISE_VOCAB_BLOCK, "negative-cross-entropy"),
-    "blockwise-direct": (BLOCKWISE_VOCAB_BLOCK, "direct"),
-    "blockwise-16384": (16384, "negative-cross-entropy"),
-    "blockwise-direct-16384": (16384, "direct"),
-}
-LOGPROB_ORDERS = ("torch", *BLOCKWISE_LOGPROB_ORDERS)
-
-# ``--moe-combine-order``: how a token's routed-expert contributions meet
-# across the MoE TP-EP group — ``rank``: per-rank partials summed by the
-# host's all-reduce / reduce-scatter, the identity zero-expert residual added
-# around it; ``slot``: the MoE leaf folds the top-k slots in fp32 slot order
-# across the EP group itself, residual included, as the trainer's grouped MLP
-# does, and the host reduces nothing. Mirrors ``tokenspeed_kernel``'s
-# ``moe.COMBINE_ORDERS``.
-MOE_COMBINE_ORDERS = ("rank", "slot")
-
-# ``--dsa-slot-order``: the order the sparse attention cores reduce a token's
-# selected KV slots in — ``selection``: as the top-k leaf emitted them (what
-# every core does); ``sorted``: ascending token position, so the reduction is
-# batch-invariant whenever the selected set is; served only by cores
-# declaring the ``slot_order`` trait (registered batch-invariant leaves). Mirrors
-# ``tokenspeed_kernel``'s ``attention.dsa.SLOT_ORDERS``.
-DSA_SLOT_ORDERS = ("selection", "sorted")
 
 
 def require_verified_numerics(

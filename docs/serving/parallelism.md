@@ -3,6 +3,11 @@
 TokenSpeed exposes familiar `--tensor-parallel-size` and `--tp` entry points
 plus additional split parallelism controls for attention, dense, and MoE layers.
 
+Python launchers can register these options with `tokenspeed_cli.add_server_cli_args()`.
+The declarations load with standard-library dependencies only. During native
+engine startup, TokenSpeed supplies the registered numerics profiles and
+validates the resolved configuration.
+
 Scheduler process names in `ps` include their parallel ranks, for example
 `tokenspeed::scheduler_tp1_ep3_dp0`. `tp` always identifies the attention TP
 rank, including `tp0` for a single process. Other suffixes appear only when

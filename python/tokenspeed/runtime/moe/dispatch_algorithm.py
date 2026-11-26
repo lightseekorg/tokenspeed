@@ -30,13 +30,7 @@ routed experts) unmapped.
 
 from __future__ import annotations
 
-EP_DISPATCH_ALGORITHMS: tuple[str, ...] = (
-    "static",
-    "dynamic",
-    "fake",
-    "static_with_zero_expert",
-    "dynamic_with_zero_expert",
-)
+from tokenspeed_cli.server_args import EP_DISPATCH_ALGORITHMS as EP_DISPATCH_ALGORITHMS
 
 STATIC_EP_DISPATCH_ALGORITHMS: frozenset[str] = frozenset(
     {"static", "static_with_zero_expert"}

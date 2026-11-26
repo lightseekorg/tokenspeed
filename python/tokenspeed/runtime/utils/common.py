@@ -52,6 +52,7 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 from starlette.routing import Mount
+from tokenspeed_cli.server_args import nullable_str as nullable_str
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.config import metrics_enabled
@@ -531,12 +532,6 @@ def dataclass_to_string_truncated(
         )
     else:
         return str(data)
-
-
-def nullable_str(val: str):
-    if not val or val == "None":
-        return None
-    return val
 
 
 def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
