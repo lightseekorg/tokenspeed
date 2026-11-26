@@ -1920,7 +1920,11 @@ separate DRAM provider over RDMA:
 }
 ```
 
-Set `local_hostname` to this node's reachable address. For RDMA, validate
+When the deployment launcher sets `TOKENSPEED_HOST_IP` to this node's reachable
+address, omit `local_hostname` to reuse that address automatically. Explicit
+`local_hostname`, `MOONCAKE_LOCAL_HOSTNAME`, and `LOCAL_HOSTNAME` overrides take
+precedence, in that order. Without any of these values, the legacy default is
+`localhost`, which is only appropriate for local connections. For RDMA, validate
 connectivity between all clients and providers and set `device_name` when a
 specific HCA is required. The default protocol is `tcp`; choose `rdma`
 explicitly. Without JSON connection settings, the client reads

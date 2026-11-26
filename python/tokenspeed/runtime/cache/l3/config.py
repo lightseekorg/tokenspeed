@@ -254,6 +254,7 @@ class MooncakeStoreConfig:
             extra_config.get("local_hostname")
             or os.environ.get("MOONCAKE_LOCAL_HOSTNAME")
             or os.environ.get("LOCAL_HOSTNAME")
+            or os.environ.get("TOKENSPEED_HOST_IP")
             or "localhost"
         )
         return MooncakeStoreConfig(
