@@ -464,6 +464,9 @@ def _apply_backend_overrides(
     server_args: ServerArgs,
     target: _AttnSideProfile,
     draft: _AttnSideProfile | None,
+    *,
+    target_arch: AttentionArch,
+    draft_arch: AttentionArch | None,
 ) -> None:
     """The one place family resolution writes back into ``server_args``.
 
@@ -475,6 +478,16 @@ def _apply_backend_overrides(
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
 
+    if (
+        draft is not None
+        and draft_arch is not None
+        and server_args.draft_attention_backend_inherited
+        and draft_arch != target_arch
+    ):
+        # An unrequested draft backend copied from --attention-backend does not
+        # apply across attention architectures (e.g. DSA target with MLA/MHA draft).
+        server_args.drafter_attention_backend = None
+
     if target.is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
         # hybrid_linear_attn. The user's original choice stays in the profile
@@ -482,17 +495,19 @@ def _apply_backend_overrides(
         server_args.attention_backend = HYBRID_LINEAR_ATTN_BACKEND
         if (
             draft is not None
+            and draft_arch == AttentionArch.MLA
             and target.is_kda
             and not target.is_dsa_kda
             and server_args.kv_parallel_size > 1
             and server_args.drafter_attention_backend
             in (None, HYBRID_LINEAR_ATTN_BACKEND)
         ):
-            # A K3 continuation must resolve its history consumer before
-            # AttnConfig validates its DCP decode. Inherit the target's resolved leaf,
-            # while preserving an explicitly requested draft leaf.
+            # A K3 MLA draft resolves its leaf backend before AttnConfig checks
+            # DCP decode while preserving an explicit --drafter-attention-backend.
+            # When the target is Kimi DSA-KDA (--attention-backend dsa), clear
+            # that DSA request so non-DSA MLA drafts resolve the MLA leaf.
             server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
-                target.requested_backend,
+                None if target.is_kimi_dsa_kda else target.requested_backend,
                 is_kda=True,
                 is_dsa=False,
                 is_qsa=False,
@@ -1366,8 +1381,8 @@ def _validate_unsharded_draft_storage(
                 f"{field.group_id!r}, which holds this draft's K/V head rows; "
                 "PD cannot transfer those from a page-sharded group. Launch "
                 "with --kv-parallel-size 1, or use a draft its recipe hosts "
-                "in an unsharded group (Kimi-K3: a GQA block draft whose every "
-                "layer slides)"
+                "in an unsharded group (Kimi-K3: a GQA or MLA block draft "
+                "whose every layer slides)"
             )
 
 
@@ -1412,7 +1427,17 @@ def create_attn_components(
     _check_pd_support(
         server_args, target, draft, has_draft_model=draft_model_config is not None
     )
-    _apply_backend_overrides(server_args, target, draft)
+    _apply_backend_overrides(
+        server_args,
+        target,
+        draft,
+        target_arch=model_config.attention_arch,
+        draft_arch=(
+            draft_model_config.attention_arch
+            if draft_model_config is not None
+            else None
+        ),
+    )
 
     config = _create_attn_config(server_args, model_config)
     softmax_attn = config.component(SoftmaxAttnConfig)

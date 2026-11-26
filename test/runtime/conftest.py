@@ -131,10 +131,15 @@ def kimi_recipe(
     if not draft_layers:
         draft_attn_config = None
     elif draft_attn == "mla":
+        draft_block_decode = (
+            draft_window is not None or speculative_algorithm == "DFLASH"
+        )
         draft_attn_config = dataclasses.replace(
             attn_config,
             kv_cache_dtype=torch.bfloat16,
-            components=(mla, linear_attn),
+            is_draft=draft_layers > 0,
+            draft_block_decode=draft_block_decode,
+            components=(mla,) if draft_block_decode else (mla, linear_attn),
         )
     elif draft_attn == "mha":
         gqa = MHAConfig(

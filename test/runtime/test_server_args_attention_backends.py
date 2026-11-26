@@ -1009,5 +1009,364 @@ class TestL3StorageBackend:
         assert (args.kvstore_io_backend) == ("direct")
 
 
+class TestKimiK3SlidingMlaDraftRouting:
+    @staticmethod
+    def _nvidia_platform(monkeypatch):
+        from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
+
+        monkeypatch.setattr(
+            Platform,
+            "_instance",
+            PlatformInfo(
+                vendor="nvidia",
+                arch_version=ArchVersion(10, 0),
+                device_name="CPU-NVIDIA-Stub",
+                device_count=8,
+                total_memory=0,
+                memory_bandwidth=0.0,
+                sm_count=0,
+                max_threads_per_sm=0,
+                max_shared_memory_per_sm=0,
+            ),
+        )
+
+    @staticmethod
+    def _mla_draft_model_config(*, layer_types, sliding_window):
+        import torch
+
+        hf_config = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            layer_types=layer_types,
+            sliding_window=sliding_window,
+            vocab_size=128,
+        )
+        return SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+            dtype=torch.bfloat16,
+            context_len=4096,
+            attention_arch=AttentionArch.MLA,
+            num_attention_layers=len(layer_types),
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            head_dim=192,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            scaling=192**-0.5,
+            attention_qk_rope_head_dim=64,
+            attention_chunk_size=None,
+            is_local_attention_model=False,
+            draft_sample_from_anchor=False,
+        )
+
+    def test_mla_config_generate_skips_kvp_sharding_for_sliding_block_draft(
+        self, monkeypatch
+    ):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+        self._nvidia_platform(monkeypatch)
+        server_args = ServerArgs(
+            model="x",
+            device="cpu",
+            dtype="bfloat16",
+            kv_cache_dtype="bfloat16",
+            max_model_len=4096,
+            world_size=8,
+            attn_tp_size=8,
+            kv_parallel_size=8,
+            decode_context_parallel_size=8,
+            speculative_algorithm="DFLASH",
+            drafter_attention_backend="tokenspeed_mla",
+        )
+        server_args.mapping.rank = 0
+
+        sliding_draft = self._mla_draft_model_config(
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=1024,
+        )
+        sliding_cfg = MLAConfig.generate(server_args, sliding_draft, is_draft=True)
+        assert sliding_cfg.kvp_size == 1
+        assert sliding_cfg.kvp_group == (0,)
+        assert sliding_cfg.draft_block_decode
+
+        full_draft = self._mla_draft_model_config(
+            layer_types=["full_attention"] * 5,
+            sliding_window=None,
+        )
+        full_cfg = MLAConfig.generate(server_args, full_draft, is_draft=True)
+        assert full_cfg.kvp_size == 8
+        assert full_cfg.kvp_group == tuple(range(8))
+
+    def test_sliding_mla_draft_configures_runtime_without_local_visible_lens(
+        self, monkeypatch
+    ):
+        from dataclasses import replace
+
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends.paged import tokenspeed_mla
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+        self._nvidia_platform(monkeypatch)
+        server_args = ServerArgs(
+            model="x",
+            device="cpu",
+            dtype="bfloat16",
+            kv_cache_dtype="bfloat16",
+            max_model_len=4096,
+            world_size=8,
+            attn_tp_size=8,
+            kv_parallel_size=8,
+            decode_context_parallel_size=8,
+            speculative_algorithm="DFLASH",
+            drafter_attention_backend="tokenspeed_mla",
+        )
+        server_args.mapping.rank = 0
+        sliding_draft = self._mla_draft_model_config(
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=1024,
+        )
+        cfg = MLAConfig.generate(server_args, sliding_draft, is_draft=True)
+        assert cfg.kvp_size == 1
+        assert cfg.kvp_group == (0,)
+        assert tokenspeed_mla.CuteDSLMLABackend.supports_layer_sliding_window
+
+        spec = cfg.component(MLAConfig)
+        mla_backend = MLAAttnBackend(
+            replace(cfg, device="cpu", components=(replace(spec, backend_name="mla"),)),
+            replace(spec, backend_name="mla"),
+            kernel_page_size=64,
+        )
+        assert mla_backend.supports_layer_sliding_window
+        assert mla_backend.kvp_group == (0,)
+        assert not mla_backend._dcp_causal_block
+        mla_backend.configure_runtime(
+            block_granularity=128, virtual_block_count=128, shard_count=1
+        )
+        assert mla_backend.cache_placement(None) is None
+
+        # An unsharded sliding MLA backend refuses attachment to a KVP-sharded
+        # group (`shard_count=8 != len(kvp_group)=1`).
+        with pytest.raises(ValueError, match="MLA cache and KVP topology disagree"):
+            mla_backend.configure_runtime(
+                block_granularity=128, virtual_block_count=128, shard_count=8
+            )
+
+        if torch.cuda.is_available():
+            cuda_cfg = replace(cfg, device="cuda")
+            cuda_backend = tokenspeed_mla.CuteDSLMLABackend(
+                cuda_cfg, spec, kernel_page_size=64
+            )
+            assert cuda_backend._dcp is None
+            cuda_backend.configure_runtime(
+                block_granularity=128, virtual_block_count=128, shard_count=1
+            )
+            assert cuda_backend._dcp is None
+
+    def test_kimi_k3_and_k31_backend_overrides_and_unsharded_validation(
+        self, monkeypatch
+    ):
+        from dataclasses import replace
+        from test.runtime.conftest import kimi_layout, kimi_recipe
+
+        self._nvidia_platform(monkeypatch)
+
+        def make_args(
+            *,
+            attention_backend: str | None = None,
+            drafter_attention_backend: str | None = None,
+            kv_parallel_size: int = 8,
+        ) -> ServerArgs:
+            args = ServerArgs(
+                model="x",
+                device="cpu",
+                dtype="bfloat16",
+                max_model_len=4096,
+                world_size=8,
+                attn_tp_size=8,
+                kv_parallel_size=kv_parallel_size,
+                decode_context_parallel_size=kv_parallel_size,
+                attention_backend=attention_backend,
+                drafter_attention_backend=drafter_attention_backend,
+                speculative_algorithm="DFLASH",
+            )
+            args.mapping.rank = 0
+            return args
+
+        k3_target = registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK3ForConditionalGeneration"]
+                ),
+                model_profile=None,
+            ),
+            None,
+        )
+        k31_target = registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK31ForConditionalGeneration"]
+                ),
+                model_profile=None,
+            ),
+            "dsa",
+        )
+        draft_side = registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+                model_profile=None,
+            ),
+            None,
+        )
+
+        # Kimi-K3 + MLA draft inherits tokenspeed_mla unless explicitly pinned.
+        args_k3 = make_args()
+        registry._apply_backend_overrides(
+            args_k3,
+            k3_target,
+            draft_side,
+            target_arch=AttentionArch.MLA,
+            draft_arch=AttentionArch.MLA,
+        )
+        assert args_k3.drafter_attention_backend == "tokenspeed_mla"
+
+        args_pinned = make_args(drafter_attention_backend="flashmla")
+        assert not args_pinned.draft_attention_backend_inherited
+        registry._apply_backend_overrides(
+            args_pinned,
+            k3_target,
+            draft_side,
+            target_arch=AttentionArch.MLA,
+            draft_arch=AttentionArch.MLA,
+        )
+        assert args_pinned.drafter_attention_backend == "flashmla"
+
+        # Kimi-K3.1 (--attention-backend dsa, no --drafter-attention-backend):
+        # ServerArgs copies "dsa" with draft_attention_backend_inherited=True,
+        # and _apply_backend_overrides clears that cross-arch copy so MLA
+        # drafts resolve tokenspeed_mla (KVP=8) or None (KVP=1), never DSA.
+        args_k31 = make_args(attention_backend="dsa", kv_parallel_size=8)
+        assert args_k31.draft_attention_backend_inherited
+        registry._apply_backend_overrides(
+            args_k31,
+            k31_target,
+            draft_side,
+            target_arch=AttentionArch.DSA,
+            draft_arch=AttentionArch.MLA,
+        )
+        assert args_k31.drafter_attention_backend == "tokenspeed_mla"
+
+        args_k31_kvp1 = make_args(attention_backend="dsa", kv_parallel_size=1)
+        registry._apply_backend_overrides(
+            args_k31_kvp1,
+            k31_target,
+            draft_side,
+            target_arch=AttentionArch.DSA,
+            draft_arch=AttentionArch.MLA,
+        )
+        assert args_k31_kvp1.drafter_attention_backend is None
+
+        # Explicit --drafter-attention-backend on same-arch or custom overrides stays.
+        args_explicit = make_args(
+            attention_backend="dsa", drafter_attention_backend="flashmla"
+        )
+        registry._apply_backend_overrides(
+            args_explicit,
+            k31_target,
+            draft_side,
+            target_arch=AttentionArch.DSA,
+            draft_arch=AttentionArch.MLA,
+        )
+        assert args_explicit.drafter_attention_backend == "flashmla"
+
+        # MHA drafts clear cross-arch inherited backends and keep None instead of mla.
+        args_mha = make_args(attention_backend="dsa")
+        registry._apply_backend_overrides(
+            args_mha,
+            k31_target,
+            draft_side,
+            target_arch=AttentionArch.DSA,
+            draft_arch=AttentionArch.MHA,
+        )
+        assert args_mha.drafter_attention_backend is None
+
+        # _validate_unsharded_draft_storage accepts Kimi-K3.1 sliding MLA draft
+        # at KVP=8 (DRAFT_SLIDING_ATTENTION shard_count=1), and refuses
+        # non-sliding MLA draft hosted in sharded FULL_ATTENTION.
+        sliding_recipe = kimi_recipe(
+            tp_size=8,
+            dsa_index_k_format="fp8_scaled",
+            mamba_ssm_dtype="bfloat16",
+            draft_layers=5,
+            draft_attn="mla",
+            draft_window=1024,
+            speculative_algorithm="DFLASH",
+        )
+        sliding_recipe.attn_config = replace(
+            sliding_recipe.attn_config,
+            kvp_size=8,
+            kvp_group=tuple(range(8)),
+            components=(
+                replace(
+                    sliding_recipe.attn_config.components[0],
+                    backend_name="tokenspeed_mla",
+                ),
+                sliding_recipe.attn_config.components[1],
+            ),
+        )
+        sliding_groups, sliding_layout = kimi_layout(sliding_recipe)
+        registry._validate_unsharded_draft_storage(
+            SimpleNamespace(
+                memory_plan=sliding_layout.bind(1),
+                cache_group_specs=tuple(spec for spec, _ in sliding_groups),
+            ),
+            num_target_layers=sliding_recipe.num_target_layers,
+        )
+
+        full_recipe = kimi_recipe(
+            tp_size=8,
+            dsa_index_k_format="fp8_scaled",
+            mamba_ssm_dtype="bfloat16",
+            draft_layers=5,
+            draft_attn="mla",
+            draft_window=None,
+            speculative_algorithm="DFLASH",
+        )
+        full_recipe.attn_config = replace(
+            full_recipe.attn_config,
+            kvp_size=8,
+            kvp_group=tuple(range(8)),
+            components=(
+                replace(
+                    full_recipe.attn_config.components[0],
+                    backend_name="tokenspeed_mla",
+                ),
+                full_recipe.attn_config.components[1],
+            ),
+        )
+        full_groups, full_layout = kimi_layout(full_recipe)
+        with pytest.raises(ValueError, match="MLA block draft whose every layer"):
+            registry._validate_unsharded_draft_storage(
+                SimpleNamespace(
+                    memory_plan=full_layout.bind(1),
+                    cache_group_specs=tuple(spec for spec, _ in full_groups),
+                ),
+                num_target_layers=full_recipe.num_target_layers,
+            )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

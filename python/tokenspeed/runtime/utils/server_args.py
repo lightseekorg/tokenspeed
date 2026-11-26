@@ -722,6 +722,10 @@ class ServerArgs:
     # including the verify window; None keeps max(16, draft tokens).
     kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
+    # True when drafter_attention_backend was inherited from attention_backend
+    # rather than passed explicitly, so family overrides can reset it when the
+    # draft has a different attention architecture.
+    draft_attention_backend_inherited: bool = False
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
@@ -2159,6 +2163,7 @@ class ServerArgs:
             and self.drafter_attention_backend is None
         ):
             self.drafter_attention_backend = self.attention_backend
+            self.draft_attention_backend_inherited = self.attention_backend is not None
 
         if (
             self.speculative_algorithm in ("MTP", "DSPARK")

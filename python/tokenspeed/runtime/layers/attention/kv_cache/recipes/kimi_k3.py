@@ -115,9 +115,9 @@ class KimiK3Recipe(CacheRecipe):
     Draft layers are continuation layers of the one big model and join the
     target's full-attention group, sharing its packing and page-id space:
     an MLA draft as latent planes, a GQA block draft as K and V planes. A GQA
-    block draft that only reads a sliding window keeps its K and V pages in
-    a sliding-window group of its own (:attr:`draft_window_tokens`), inside
-    the target's MLA planes.
+    or MLA block draft that only reads a sliding window keeps its pages in a
+    sliding-window group of its own (:attr:`draft_window_tokens`), inside the
+    target's MLA planes without page sharding.
     """
 
     family = "kimi_k3"
@@ -197,39 +197,33 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def draft_window_tokens(self) -> int | None:
-        """The window a GQA block draft whose every layer slides retains, or
-        None when the draft joins the full-attention group.
+        """The window a GQA or MLA block draft whose every layer slides
+        retains, or None when the draft joins the full-attention group.
 
         Such a draft owns a sliding-window group: its layers read nothing
         older than the window, so the group keeps that window rather than the
-        whole history. KVP leaves it unsharded, since PD cannot transfer K/V
-        head rows out of a page-sharded group.
+        whole history. KVP leaves it unsharded: PD cannot transfer K/V head
+        rows out of a page-sharded group for GQA, and MLA DCP cannot combine
+        ``local_visible_lens`` with a sliding window.
         """
         config = self.draft_attn_config
-        if (
-            not self.num_draft_layers
-            or not config.draft_block_decode
-            or not isinstance(config.component(SoftmaxAttnConfig), MHAConfig)
+        if not self.num_draft_layers or not config.draft_block_decode:
+            return None
+        softmax = config.component(SoftmaxAttnConfig)
+        if isinstance(softmax, DSAConfig) or not isinstance(
+            softmax, (MHAConfig, MLAConfig)
         ):
             return None
         hf_config = getattr(self.draft_model_config, "hf_config", None)
         if hf_config is None:
             return None
-        from tokenspeed.runtime.models.dflash import (
-            get_dflash_attention_sliding_window_size,
-            get_dflash_attention_window_sink,
-            get_dflash_layer_types,
+        from tokenspeed.runtime.layers.attention.configs.base import (
+            get_dflash_sliding_window_tokens,
         )
 
-        layer_types = get_dflash_layer_types(hf_config)
-        if (
-            layer_types is None
-            or len(layer_types) != self.num_draft_layers
-            or any(layer_type != _SLIDING_ATTENTION for layer_type in layer_types)
-            or get_dflash_attention_window_sink(hf_config)
-        ):
-            return None
-        return get_dflash_attention_sliding_window_size(hf_config) + 1
+        return get_dflash_sliding_window_tokens(
+            hf_config, num_layers=self.num_draft_layers
+        )
 
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
@@ -331,12 +325,32 @@ class KimiK3Recipe(CacheRecipe):
     def _recurrent_dtype(self) -> torch.dtype:
         return kda_recurrent_state_dtype(self.server_args)
 
+    def _mla_latent_field(
+        self, config: AttnConfig, layer_id: int, plane_id: str
+    ) -> CacheFieldSpec:
+        spec = config.component(MLAConfig)
+        latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
+        return CacheFieldSpec(
+            f"layer.{layer_id}.latent_kv",
+            plane_id,
+            (self.prefix_granularity, 1, latent_width),
+            scatter_stored_dtype_name(config.kv_cache_dtype),
+        )
+
     @override
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
     ) -> tuple[CacheFieldSpec, ...]:
         plane_id = f"slot.{occurrence}"
         if group_id == DRAFT_SLIDING_ATTENTION:
+            if isinstance(
+                self.draft_attn_config.component(SoftmaxAttnConfig), MLAConfig
+            ):
+                # Sliding MLA block draft: one contiguous latent plane per
+                # layer, matching FULL_ATTENTION without page sharding.
+                return (
+                    self._mla_latent_field(self.draft_attn_config, layer_id, plane_id),
+                )
             fields = mha_layer_fields(
                 self.draft_attn_config, self.prefix_granularity, layer_id, occurrence
             )
@@ -366,15 +380,8 @@ class KimiK3Recipe(CacheRecipe):
                 return mha_layer_fields(
                     config, self.prefix_granularity, layer_id, occurrence
                 )
-            spec = config.component(MLAConfig)
-            latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
-            latent = CacheFieldSpec(
-                f"layer.{layer_id}.latent_kv",
-                plane_id,
-                (self.prefix_granularity, 1, latent_width),
-                scatter_stored_dtype_name(config.kv_cache_dtype),
-            )
-            if isinstance(spec, DSAConfig):
+            latent = self._mla_latent_field(config, layer_id, plane_id)
+            if isinstance(config.component(MLAConfig), DSAConfig):
                 # Own plane (latent stride = payload), same group: moves with latent.
                 return (
                     latent,
@@ -413,6 +420,14 @@ class KimiK3Recipe(CacheRecipe):
         # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
         # while larger tp shrinks the state and the parent with it.
         mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
+        if DRAFT_SLIDING_ATTENTION in fields_by_group:
+            key = fields_by_group[DRAFT_SLIDING_ATTENTION][0]
+            if key.exact_page_stride:
+                # Contiguous sliding-window latent planes require
+                # mla_plane_bytes to be an exact multiple of payload_bytes so
+                # LatentPlanes.from_buffers sees payload_bytes == stride.
+                step = key.payload_bytes // math.gcd(mla_page_bytes, key.payload_bytes)
+                mla_packing = -(-mla_packing // step) * step
         linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
         packing = {
             spec.group_id: (
@@ -421,21 +436,26 @@ class KimiK3Recipe(CacheRecipe):
             for spec, _ in groups
         }
         if DRAFT_SLIDING_ATTENTION in fields_by_group:
-            # As many K (or V) pages as fit one MLA plane at an aligned stride.
-            # KVP does not shard the group, so a sharded arena holds fewer
-            # window tokens per parent than history tokens.
             key = fields_by_group[DRAFT_SLIDING_ATTENTION][0]
             mla_plane_bytes = mla_packing * mla_page_bytes
-            stride_unit = math.lcm(key.element_size, key.page_stride_alignment_bytes)
-            draft_packing = next(
-                (
-                    count
-                    for count in range(mla_plane_bytes // key.payload_bytes, 0, -1)
-                    if mla_plane_bytes % (count * stride_unit) == 0
-                ),
-                None,
-            )
-            if draft_packing is None:
+            if key.exact_page_stride:
+                draft_packing = mla_plane_bytes // key.payload_bytes
+            else:
+                # As many K (or V) pages as fit one MLA plane at an aligned
+                # stride. KVP does not shard the group, so a sharded arena
+                # holds fewer window tokens per parent than history tokens.
+                stride_unit = math.lcm(
+                    key.element_size, key.page_stride_alignment_bytes
+                )
+                draft_packing = next(
+                    (
+                        count
+                        for count in range(mla_plane_bytes // key.payload_bytes, 0, -1)
+                        if mla_plane_bytes % (count * stride_unit) == 0
+                    ),
+                    None,
+                )
+            if draft_packing is None or draft_packing < 1:
                 raise ValueError(
                     f"a draft K page of {key.payload_bytes} bytes does not fit "
                     f"the {mla_plane_bytes}-byte MLA plane"
@@ -470,18 +490,28 @@ class KimiK3Recipe(CacheRecipe):
             else 2
         )
         draft_slides = self.draft_window_tokens is not None
-        num_draft_planes = (
-            0 if draft_slides else planes_per_draft_layer * self.num_draft_layers
-        )
-        expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
+        num_draft_planes = planes_per_draft_layer * self.num_draft_layers
+        if draft_slides:
+            # Sliding draft layers share slot.0.. planes with target MLA
+            # layers across separate cache groups rather than adding new ones.
+            expected = max(num_mla_layers, num_draft_planes) + self.num_index_k_planes
+        else:
+            expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
         if len(layout.plane_bytes) != expected:
+            if draft_slides:
+                raise ValueError(
+                    f"Kimi-K3 LCM with sliding draft requires "
+                    f"{max(num_mla_layers, num_draft_planes)} slot planes plus "
+                    f"{self.num_index_k_planes} index-K planes, got "
+                    f"{len(layout.plane_bytes)}"
+                )
             raise ValueError(
                 f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
                 f"MLA layer) plus {num_draft_planes} draft planes and "
                 f"{self.num_index_k_planes} index-K planes, got "
                 f"{len(layout.plane_bytes)}"
             )
-        if draft_slides:
+        if draft_slides and planes_per_draft_layer == 2:
             plane_bytes = dict(layout.plane_bytes)
             for occurrence in range(self.num_draft_layers):
                 key_plane, value_plane = (
