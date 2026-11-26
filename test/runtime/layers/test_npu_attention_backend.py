@@ -80,7 +80,6 @@ def test_npu_reuses_standard_mha_backend():
 
 
 def test_npu_allreduce_rmsnorm_uses_device_process_group(monkeypatch):
-    norm = RMSNorm(4)
     x = torch.ones(1, 4)
     residual = torch.zeros_like(x)
     process_group = object()
@@ -108,6 +107,11 @@ def test_npu_allreduce_rmsnorm_uses_device_process_group(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(layernorm_module, "rmsnorm", reference_rmsnorm)
+
+    # Construct after monkeypatching so self.kernel binds to the reference
+    # rmsnorm; the allreduce-fusion guard (layernorm.py) rejects any other
+    # kernel.
+    norm = RMSNorm(4)
 
     output, output_residual, aux = norm.forward_with_allreduce_fusion(
         rank=0,
