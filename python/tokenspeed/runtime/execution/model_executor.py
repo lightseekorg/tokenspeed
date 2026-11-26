@@ -29,6 +29,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_kernel.ops.attention.dsa import set_dsa_prims_workspace_region
 from tokenspeed_kernel.ops.gemm.hipblaslt import (
     hipblaslt_autotune_enabled,
     hipblaslt_online_tuning,
@@ -649,6 +650,9 @@ class ModelExecutor:
             enable=config.enable_memory_saver, device=config.device
         )
         register_hc_workspace_region(self.memory_saver_adapter)
+        set_dsa_prims_workspace_region(
+            partial(self.memory_saver_adapter.named_region, "workspace")
+        )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend

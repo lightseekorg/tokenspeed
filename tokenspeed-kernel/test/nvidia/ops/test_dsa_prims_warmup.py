@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.tuning import kernel_warmup
@@ -98,6 +100,7 @@ def fake_prims(monkeypatch: pytest.MonkeyPatch):
     dsa_prims._warmed_plans.clear()
     dsa_prims._captured_plans.clear()
     dsa_prims._warmed_buckets.clear()
+    dsa_prims.set_dsa_prims_workspace_region(nullcontext)
     planned: list[tuple[int, int]] = []
     runs: list[tuple[int, int, int]] = []
     capturing = {"active": False}
@@ -113,6 +116,7 @@ def fake_prims(monkeypatch: pytest.MonkeyPatch):
     dsa_prims._warmed_plans.clear()
     dsa_prims._captured_plans.clear()
     dsa_prims._warmed_buckets.clear()
+    dsa_prims.set_dsa_prims_workspace_region(nullcontext)
 
 
 def _inputs(rows: int, *, heads: int = 4, topk: int = 512):
@@ -443,3 +447,126 @@ def test_capture_transfers_warmed_plan_ownership_to_graph(fake_prims, monkeypatc
     # Dropping the graph owner releases the captured plan via WeakValueDictionary.
     retained.clear()
     assert len(dsa_prims._captured_plans) == 0
+
+
+def test_workspace_region_wraps_plan_metadata_and_first_eager_run(
+    fake_prims, monkeypatch
+):
+    planned, runs, capturing, _stream = fake_prims
+    in_region = {"depth": 0, "entries": 0}
+    events: list[tuple[str, bool]] = []
+
+    @contextmanager
+    def region():
+        in_region["depth"] += 1
+        in_region["entries"] += 1
+        try:
+            yield
+        finally:
+            in_region["depth"] -= 1
+
+    class _TrackingWrapper(_FakeWrapper):
+        def __init__(self, planned_list, runs_list):
+            events.append(("init", in_region["depth"] > 0))
+            super().__init__(planned_list, runs_list)
+
+        def plan(self, *args, **kwargs):
+            events.append(("plan", in_region["depth"] > 0))
+            return super().plan(*args, **kwargs)
+
+        def run(self, *args, **kwargs):
+            events.append(("run", in_region["depth"] > 0))
+            return super().run(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dsa_prims, "_make_wrapper", lambda: _TrackingWrapper(planned, runs)
+    )
+    monkeypatch.setattr(dsa_prims, "retain_for_capture", lambda _plan: None)
+    dsa_prims.set_dsa_prims_workspace_region(region)
+
+    # 1. Warmup ladder creates 3 buckets (1, 2, 4); every init, plan, offset
+    #    allocation, and first run must execute inside the workspace region.
+    q4, kv4, slots4, lens4 = _inputs(4)
+    with kernel_warmup(enabled=True):
+        dsa_prims.sparse_attention(
+            q4,
+            kv4,
+            slots4,
+            lens4,
+            mode="prefill",
+            query_width=1,
+            softmax_scale=1.0,
+            return_lse=False,
+            out=None,
+        )
+    assert events == [("init", True), ("plan", True), ("run", True)] * 3
+
+    # 2. Steady-state reuse of an already-warmed row count must NOT enter region.
+    events.clear()
+    entries_before = in_region["entries"]
+    dsa_prims.sparse_attention(
+        q4,
+        kv4,
+        slots4,
+        lens4,
+        mode="prefill",
+        query_width=1,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    assert events == [("run", False)]
+    assert in_region["entries"] == entries_before
+
+    # 3. Lazy eager row-count growth (rows=3 on bucket 4) allocates offsets inside
+    #    the region, while the already-initialized plan's run stays outside.
+    events.clear()
+    q3, kv3, slots3, lens3 = _inputs(3)
+    dsa_prims.sparse_attention(
+        q3,
+        kv3,
+        slots3,
+        lens3,
+        mode="prefill",
+        query_width=1,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    assert in_region["entries"] == entries_before + 1
+    assert events == [("run", False)]
+
+    # 4. Lazy eager bucket growth in _plans (rows=8) wraps init, plan, offsets,
+    #    and first run inside the region.
+    events.clear()
+    q8, kv8, slots8, lens8 = _inputs(8)
+    dsa_prims.sparse_attention(
+        q8,
+        kv8,
+        slots8,
+        lens8,
+        mode="prefill",
+        query_width=1,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    assert events == [("init", True), ("plan", True), ("run", True)]
+
+    # 5. CUDA graph capture must never enter the workspace region.
+    events.clear()
+    entries_before = in_region["entries"]
+    capturing["active"] = True
+    dsa_prims.sparse_attention(
+        q4,
+        kv4,
+        slots4,
+        lens4,
+        mode="prefill",
+        query_width=1,
+        softmax_scale=1.0,
+        return_lse=False,
+        out=None,
+    )
+    assert events == [("run", False)]
+    assert in_region["entries"] == entries_before

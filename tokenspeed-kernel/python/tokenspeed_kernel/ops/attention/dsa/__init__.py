@@ -2738,6 +2738,10 @@ import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 if current_platform().is_npu:
     import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
 
+from tokenspeed_kernel.thirdparty.flashinfer.dsa_prims import (  # noqa: E402
+    set_dsa_prims_workspace_region,
+)
+
 # isort: on
 
 __all__ = [
@@ -2772,4 +2776,5 @@ __all__ = [
     "plan_dsa_index_candidates",
     "plan_dsa_topk",
     "select_dsa_prefill_topk_for_rows",
+    "set_dsa_prims_workspace_region",
 ]

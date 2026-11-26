@@ -47,11 +47,20 @@ indices. `k_scale` multiplies the logit scale, as in the existing D576 facade;
 native MLA value storage stays at unit scale.
 
 Plans bucket request capacity to powers of two. Live rows and lengths remain
-runtime inputs. Scratch is separate per CUDA stream. Warm the geometry and
-row count on the capture stream before capture, inside the normal runtime
-warmup. Use `tokenspeed_kernel.workspace.capture_session(graph)` when capturing
-standalone calls. Captured plans live with their graph owner. Graphs sharing
-a plan must replay in order; concurrent streams need their own warmed plans.
+runtime inputs. Scratch is separate per CUDA stream. During startup
+`kernel_warmup(enabled=True)`, each non-capturing launch warms every smaller
+power-of-two bucket (`1, 2, ..., bucket / 2`) in addition to the requested
+bucket and pins them in `_warmed_plans` so steady-state serving never triggers
+a cold CuTe DSL compilation or evicts warmed plans from the eager LRU.
+`ModelExecutor` registers its CPU-backed named `"workspace"` region via
+`set_dsa_prims_workspace_region(...)` so plan scratch, offset tables, and first
+eager runs allocate inside the memory-saver workspace region and leave zero
+bytes in ordinary Torch CUDA allocator segments after release. Warm the
+geometry and row count on the capture stream before capture, inside the normal
+runtime warmup. Use `tokenspeed_kernel.workspace.capture_session(graph)` when
+capturing standalone calls. Captured plans live with their graph owner. Graphs
+sharing a plan must replay in order; concurrent streams need their own warmed
+plans.
 
 The adapter tests check both solutions against an FP32 reference. From the
 repo root:

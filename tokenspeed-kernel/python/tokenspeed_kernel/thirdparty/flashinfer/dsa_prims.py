@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
@@ -35,6 +37,28 @@ if TYPE_CHECKING:
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchSparseMLADecodePagedTSWrapper,
     )
+
+_WORKSPACE_REGION: Callable[[], AbstractContextManager[object]] = nullcontext
+
+
+def set_dsa_prims_workspace_region(
+    region: Callable[[], AbstractContextManager[object]],
+) -> None:
+    """Allocate later persistent Prims-TS DSA plan tensors inside ``region()``.
+
+    Both warmed plans and eager LRU plans hold persistent device scratch and
+    offset tables across calls. A runtime that releases GPU memory registers a
+    CPU-backed named workspace region once at startup so ``weights``
+    release/resume unmaps and restores these buffers with zero bytes pinned in
+    ordinary Torch CUDA allocator segments.
+
+    Args:
+        region: Factory of the allocation scope entered around plan creation,
+            persistent offset/length tables, and each plan's first eager run.
+            CUDA graph capture never enters this scope.
+    """
+    global _WORKSPACE_REGION
+    _WORKSPACE_REGION = region
 
 
 def _make_wrapper() -> BatchSparseMLADecodePagedTSWrapper:
@@ -50,6 +74,7 @@ class _SparsePlan:
     wrapper: Any
     offsets: dict[int, torch.Tensor] = field(default_factory=dict)
     full_lengths: dict[int, torch.Tensor] = field(default_factory=dict)
+    run_initialized: bool = False
 
 
 # Scratch is per stream; captured plans live with their graphs, warmed plans
@@ -124,24 +149,25 @@ def _get_plan(
     if plan is None:
         if capturing:
             raise RuntimeError("warm up Prims-TS DSA on the capture stream first")
-        wrapper = _make_wrapper()
-        wrapper.plan(
-            q.device,
-            batch_capacity,
-            heads,
-            max_topk=topk,
-            max_extra_topk=0,
-            max_q_len=query_width,
-            packed_query=True,
-            q_dtype=q.dtype,
-            qk_rope_head_dim=64,
-            kv_cache_format="native",
-            extra_kv_cache_format="native",
-            kv_layout="NHD",
-            use_attention_sinks=False,
-            return_lse=return_lse,
-            assume_valid_prefix=False,
-        )
+        with _WORKSPACE_REGION():
+            wrapper = _make_wrapper()
+            wrapper.plan(
+                q.device,
+                batch_capacity,
+                heads,
+                max_topk=topk,
+                max_extra_topk=0,
+                max_q_len=query_width,
+                packed_query=True,
+                q_dtype=q.dtype,
+                qk_rope_head_dim=64,
+                kv_cache_format="native",
+                extra_kv_cache_format="native",
+                kv_layout="NHD",
+                use_attention_sinks=False,
+                return_lse=return_lse,
+                assume_valid_prefix=False,
+            )
         plan = _SparsePlan(wrapper)
         if warming:
             _warmed_plans[key] = plan
@@ -157,14 +183,15 @@ def _get_plan(
     if rows not in plan.offsets:
         if capturing:
             raise RuntimeError("warm up the Prims-TS DSA row count before capture")
-        plan.offsets[rows] = torch.tensor(
-            [min(i * query_width, rows) for i in range(batch_capacity + 1)],
-            device=q.device,
-            dtype=torch.int32,
-        )
-        plan.full_lengths[rows] = torch.full(
-            (rows,), topk, device=q.device, dtype=torch.int32
-        )
+        with _WORKSPACE_REGION():
+            plan.offsets[rows] = torch.tensor(
+                [min(i * query_width, rows) for i in range(batch_capacity + 1)],
+                device=q.device,
+                dtype=torch.int32,
+            )
+            plan.full_lengths[rows] = torch.full(
+                (rows,), topk, device=q.device, dtype=torch.int32
+            )
     if capturing:
         retain_for_capture(plan)
         _captured_plans[key] = plan
@@ -195,6 +222,23 @@ def _run_plan(
         return_lse=return_lse,
     )
     lengths = plan.full_lengths[rows] if topk_lens is None else topk_lens
+    if not plan.run_initialized and not torch.cuda.is_current_stream_capturing():
+        with _WORKSPACE_REGION():
+            plan.wrapper.run(
+                q,
+                kv_cache,
+                topk_slots,
+                lengths,
+                qo_indptr=plan.offsets[rows],
+                softmax_scale=softmax_scale,
+                output_scale=1.0,
+                kv_cache_scale=1.0,
+                out=output_3d,
+                lse=lse,
+                validate=False,
+            )
+        plan.run_initialized = True
+        return
     plan.wrapper.run(
         q,
         kv_cache,
