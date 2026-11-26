@@ -54,6 +54,7 @@ HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
 logger = logging.getLogger(__name__)
 
 _is_nvidia = current_platform().is_nvidia
+_is_npu = current_platform().is_npu
 
 
 def _use_pdl(enable_pdl: bool | None) -> bool:
@@ -2294,6 +2295,15 @@ def store_kv_cache(
     """
     n_tokens = k_src.shape[0]
     if n_tokens == 0:
+        return
+    # Ascend flattens the K and V grids and caps the launch at 65,535 tasks.
+    max_npu_tokens = 65_535 // 2
+    if _is_npu and n_tokens > max_npu_tokens:
+        for start in range(0, n_tokens, max_npu_tokens):
+            rows = slice(start, start + max_npu_tokens)
+            store_kv_cache(
+                k_src[rows], v_src[rows], k_dst, v_dst, loc[rows], enable_pdl
+            )
         return
     n_kv_k = k_src.numel() // n_tokens
     n_kv_v = v_src.numel() // n_tokens
