@@ -51,6 +51,7 @@ from tokenspeed_engine._native import (
     FrontendListener,
     L3Executor,
     PendingFrontend,
+    RequestCancelled,
     TransferEngine,
 )
 
@@ -61,6 +62,7 @@ __all__ = [
     "FrontendListener",
     "L3Executor",
     "PendingFrontend",
+    "RequestCancelled",
     "TransferEngine",
     "host_binary",
 ]

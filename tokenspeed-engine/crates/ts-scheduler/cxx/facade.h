@@ -67,6 +67,7 @@ struct PeerEventView;
 struct PeerAnswerView;
 struct PeerLookupView;
 struct PeerFetchView;
+struct PeerLocalChoice;
 struct PinSampleView;
 struct PeerStatsView;
 struct PeerLeaseView;
@@ -84,6 +85,12 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                   rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
                   rust::Slice<const CacheEvent> cache_events);
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
+bool release_peer_pin(const std::shared_ptr<tokenspeed::PeerPinRelease>& handle);
+std::shared_ptr<tokenspeed::PeerPinRelease> peer_release_handle(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
+bool enable_async_host_peer(tokenspeed::Scheduler& scheduler);
+bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive);
+rust::Vec<PeerFetchView> reserve_peer_host(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int32_t tokens, bool& retry);
+bool apply_peer_export(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
@@ -119,6 +126,7 @@ rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& 
 rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
+bool defers_decode_state(const tokenspeed::Scheduler& scheduler);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
 bool storage_current_pending(const tokenspeed::Scheduler& scheduler);
 bool storage_progress_pending(const tokenspeed::Scheduler& scheduler);
@@ -153,6 +161,7 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<DiskOpView> plan_disk_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<PeerLocalChoice> plan_peer_local_choices(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan);
 
 SharedL2AnswerView shared_l2_pool_lookup(tokenspeed::SharedL2Pool& pool, std::uint64_t client,

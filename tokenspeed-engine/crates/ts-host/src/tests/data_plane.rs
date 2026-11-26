@@ -252,7 +252,7 @@ class Plane:
             raise RuntimeError("the completion failed")
         from array import array
         cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
-        return ([launched], [1], None, None, None, None, None, None, cumulative)
+        return ([launched], [1], None, None, None, None, None, None, cumulative, [0])
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -309,7 +309,7 @@ fn start(plane: &Py<PyAny>) -> PythonDataPlane {
         let shared_l2_handle = Py::new(py, crate::shared_l2::Handle::new()).unwrap();
         (plane.clone_ref(py), shared_l2_handle)
     });
-    PythonDataPlane::start(plane, None, None, shared_l2_handle).unwrap()
+    PythonDataPlane::start(plane, None, None, false, shared_l2_handle).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -410,6 +410,8 @@ fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
     let result = data_plane.complete(forward).unwrap();
     assert_eq!(result.output_tokens, [100]);
     assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
+    // The device's per-row request ends ride the same result.
+    assert_eq!(result.request_ends, Some(vec![0]));
 }
 
 #[test]
@@ -428,7 +430,7 @@ fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
     assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
     let polled = data_plane.poll_cache_events().unwrap();
     assert_eq!(polled.len(), 1);
-    data_plane.release(&["r".to_owned()]).unwrap();
+    data_plane.release(&["r".to_owned()], None).unwrap();
     // Answered once everything queued before it ran.
     data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
     drop(data_plane);
@@ -565,7 +567,7 @@ fn a_failed_launch_fails_the_commit_waiting_for_it() {
     assert!(error.0.contains("the launch failed"), "{}", error.0);
     // Every later call reports the failure, on either thread's side.
     assert!(data_plane.poll_cache_events().is_err());
-    assert!(data_plane.release(&["r".to_owned()]).is_err());
+    assert!(data_plane.release(&["r".to_owned()], None).is_err());
 }
 
 #[test]
@@ -981,7 +983,7 @@ fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
     });
     let mut data_plane = {
         let (plane, handle) = Python::attach(|py| (plane.clone_ref(py), handle.clone_ref(py)));
-        PythonDataPlane::start(plane, None, None, handle).unwrap()
+        PythonDataPlane::start(plane, None, None, false, handle).unwrap()
     };
     let call = |function: &str| {
         Python::attach(|py| {

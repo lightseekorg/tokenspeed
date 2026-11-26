@@ -128,6 +128,8 @@ struct StorageReadyHold {
 struct PeerHit {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
+    unsigned source_mask{0};               // Device=1, Host=2, Disk=4; mixed sources combine bits.
+    std::vector<std::uint8_t> checkpoint;  // Original holder answer, for an exact re-PIN.
 };
 
 // How far a waiting prompt's lookup at a shared L2 pool has come: not handed
@@ -146,6 +148,8 @@ struct AdmissionResources {
     // what the holder answered.
     bool peer_prepared{false};
     std::optional<PeerHit> peer_hit;
+    // Successful later first admissions while this is the oldest waiting prompt.
+    std::int32_t prefill_bypasses{0};
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
@@ -169,8 +173,6 @@ struct Submitted {
     TokenContainer* TokenContainerPtr() const { return admission.token_container; }
     std::int32_t PrefixGranularity() const { return admission.prefix_granularity; }
 
-    // Successful later first admissions while this is the oldest waiting prompt.
-    std::int32_t prefill_bypasses{0};
     AdmissionResources admission;
 };
 

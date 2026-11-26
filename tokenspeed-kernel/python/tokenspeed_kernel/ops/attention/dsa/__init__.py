@@ -2363,6 +2363,67 @@ def dsa_prefill_topk(
         return kernel(**kernel_kwargs)
 
 
+def dsa_paged_score(
+    q: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+    q_len_per_req: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute FP32 DSA scores in logical token order over paged BF16 keys.
+
+    Args:
+        q: Packed BF16 queries [tokens, index_heads, head_dim].
+        index_k_cache: Packed BF16 index-key plane [physical_slots, head_dim].
+        weights: FP32 head weights [tokens, index_heads], with score scale folded in.
+        block_table: INT32 logical-to-physical page map [requests, max_pages].
+        context_lens: INT32 visible token count [tokens] for each query, including
+            its own position.
+        max_seq_len: Output width in tokens, independent of each row's visibility.
+        page_size: Number of tokens per physical page.
+        q_len_per_req: Consecutive queries per request, 1 for plain decode.
+            Query row r uses block_table[r // q_len_per_req].
+        out: Optional contiguous FP32 output [tokens, max_seq_len].
+
+    Returns:
+        FP32 scores computed as sum_h(weights[h] * relu(dot(q[h], k))).
+        Invisible tokens and invalid pages receive -inf.
+    """
+    if q.ndim != 3 or index_k_cache.ndim != 2:
+        raise ValueError("Expected Q [tokens, heads, dim] and K [physical_slots, dim]")
+    kernel = select_kernel(
+        "attention",
+        "dsa_paged_score",
+        _attention_format_signature(
+            q=q,
+            index_k_cache=index_k_cache,
+            weights=weights,
+            block_table=block_table,
+            context_lens=context_lens,
+        ),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2],
+            "page_size": page_size,
+        },
+    )
+    return kernel(
+        q,
+        index_k_cache,
+        weights,
+        block_table,
+        context_lens,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        out=out,
+    )
+
+
 def dsa_decode_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -2700,6 +2761,7 @@ __all__ = [
     "dsa_decode_index_candidates_supported",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
+    "dsa_paged_score",
     "dsa_prefill",
     "dsa_prefill_dcp_records",
     "dsa_prefill_dcp_records_supported",

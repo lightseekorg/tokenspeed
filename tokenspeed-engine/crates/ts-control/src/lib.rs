@@ -44,6 +44,7 @@ pub mod peer;
 pub mod relay;
 pub mod request;
 pub mod request_stats;
+mod request_timing;
 pub mod sampling;
 pub mod shared_l2;
 pub mod startup;

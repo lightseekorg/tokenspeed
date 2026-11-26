@@ -92,6 +92,26 @@ public:
     // instead. Both ends share a residue class under page-cyclic sharding, so
     // the rank that owns one end owns the other.
     std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
+    // The live State blocks of this plan's retraction victims that the
+    // runtime must fold, per deferred-decode-state group id
+    // (CacheGroupConfig::deferred_decode_state), as (request pool index, page
+    // id): a decoding victim's accepted decode records stay in its request
+    // slot, outside the block its decode steps write in place. The runtime
+    // folds each slot's records into its block on the execution stream ahead
+    // of the plan's stores, copies, zeroing and forward, so the image and every
+    // reader of the published endpoint see the complete state. A victim is
+    // listed once its retraction published its frontier, also when the image
+    // is then refused and the victim aborted, since the publication stands. A
+    // block the publication swapped for another request's equal entry is not
+    // listed: that entry already holds the complete state. No op id, no ACK.
+    std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> state_folds;
+    // Set when this plan's retractions published decoded endpoints of
+    // deferred-decode-state groups (CacheGroupConfig::deferred_decode_state)
+    // while peers can pin. The runtime commits the victims' state before the
+    // plan's stores, copies and forward, then acknowledges this op id with
+    // cache::StateCommitDone; until then no PIN exports those blocks
+    // (PeerPagesMatch), because a remote read does not observe device order.
+    std::optional<std::uint32_t> state_commit_fence;
 
     // The plan separates its streams by executor, and the two remote
     // streams are the transfer peer's half of the role: work the peer runs
@@ -119,6 +139,7 @@ public:
     // pin and reports PeerFetchDone. Like the remote streams, they take no
     // batch slot or token budget.
     std::vector<PeerFetchOperation> peer_fetches;
+    std::vector<std::pair<std::string, std::string>> peer_local_choices;
 
     // Requests the scheduler aborted while building this plan (none on most
     // rounds): the last resort of a retraction whose victim could not be

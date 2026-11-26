@@ -690,6 +690,119 @@ def test_megamoe_buffers_survive_sleep_with_zero_ordinary_bytes():
         )
 
 
+def _check_checkpoint_metadata_on_cuda():
+    """Retain real checkpoint consumers through growth and repeated sleep/wake."""
+    from test.runtime.test_gdn_state_checkpoint_in_forward import (
+        _checkpointing_state_backend,
+    )
+
+    from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+        in_forward_state_checkpoints,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    retained = []
+    consumers = []
+    scans = []
+    with saver.named_region("attention_state"):
+        backend = _checkpointing_state_backend(spec_tokens=1, device="cuda")
+    for offsets in ([256, 0, 128], [0, 0], [0, 64, 0, 64, 0, 64, 0, 64, 0], [64]):
+        count = len(offsets)
+        host_offsets = torch.tensor(offsets, dtype=torch.int32)
+        lengths = torch.full((count,), 512, dtype=torch.int32)
+        # This is the same region as ForwardStepRunner._init_forward_metadata
+        # and prefill graph construction, including the fresh packed upload.
+        with saver.named_region("attention_state"):
+            base = torch.arange(count * 3, dtype=torch.int32, device="cuda").view(
+                count, 3
+            )
+            tables = {"state0": base, "state1": base + 100}
+            if not any(offsets):
+                tables = {group: table[:, :2] for group, table in tables.items()}
+            checkpoints = in_forward_state_checkpoints(
+                host_offsets, lengths, count, tables, tuple(tables)
+            )
+            if checkpoints is not None:
+                scan, scan_rows = backend._scan_state_checkpoints(checkpoints, lengths)
+                scan.states.copy_(
+                    torch.arange(
+                        scan.states.numel(), dtype=torch.float32, device="cuda"
+                    ).reshape_as(scan.states)
+                )
+                scans.append((scan, scan_rows, scan.states[scan_rows].cpu()))
+        tensors = list(tables.values())
+        if checkpoints is None:
+            assert not any(offsets)
+        else:
+            rows = [row for row, offset in enumerate(offsets) if offset]
+            positions = [row * 512 + offsets[row] for row in rows]
+            consumers.append((checkpoints, tables, rows, positions))
+            tensors.extend(
+                (
+                    checkpoints.device_rows,
+                    checkpoints.device_offsets,
+                    checkpoints.token_index,
+                    *checkpoints.blocks_by_group.values(),
+                )
+            )
+            tensors.extend((scan.cu_starts, scan_rows, scan.states))
+        retained.extend((tensor, tensor.data_ptr(), tensor.cpu()) for tensor in tensors)
+        # Keep the older dataclasses and shared-storage views alive, as captured
+        # and last-forward metadata can remain live across release and growth.
+        for _ in range(3):
+            torch.cuda.synchronize()
+            saver.pause(tag="weights")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                segment["total_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == torch.cuda.current_device()
+                and tuple(segment["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            for tensor, pointer, expected in retained:
+                assert tensor.data_ptr() == pointer
+                torch.testing.assert_close(tensor.cpu(), expected, rtol=0, atol=0)
+            with saver.named_region("attention_state"):
+                for scan, scan_rows, expected in scans:
+                    torch.testing.assert_close(
+                        scan.states[scan_rows].cpu(), expected, rtol=0, atol=0
+                    )
+                for checkpoints, tables, rows, positions in consumers:
+                    actual_positions = (
+                        checkpoints.device_rows * 512 + checkpoints.device_offsets
+                    )
+                    assert actual_positions.cpu().tolist() == positions
+                    for table in tables.values():
+                        actual_blocks = table[checkpoints.device_rows, 2]
+                        expected_blocks = table.cpu()[rows, 2]
+                        torch.testing.assert_close(
+                            actual_blocks.cpu(), expected_blocks, rtol=0, atol=0
+                        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_checkpoint_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_checkpoint_metadata_on_cuda; _check_checkpoint_metadata_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )
+
+
 @pytest.mark.parametrize("with_draft", [False, True])
 def test_capture_metadata_survives_sleep_for_target_and_draft(
     memory, buffers, with_draft
@@ -803,3 +916,151 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
                 metadata.tables_cpu(active_forward_op=op)["full"].tolist()
                 == [[count]] * count
             )
+
+
+def _check_sampled_drafting_on_cuda(sparse: bool):
+    """Check the recorded draft q and the sampler's scratch survive a weights release.
+
+    The drafter is the real one and binds through its own
+    ``bind_sampling_backend``: base DFLASH allocating the dense ``draft_probs``
+    rows plus the shared sampler's scratch, or DFlash2 allocating its sparse
+    ``future_draft_q``. Only the verifier is stood in, since constructing one
+    needs the sampling kernels' GPU libraries.
+
+    Args:
+        sparse: Bind DFlash2 (sparse q) instead of base DFLASH (dense rows).
+    """
+    from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+    from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+
+    vocab, pool, width, max_bs, top_k = 64, 6, 4, 4, 3
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.memory_saver_adapter = saver
+
+    with saver.named_region("runtime_states"):
+        executor.runtime_states = RuntimeStates(
+            req_pool_size=pool,
+            input_vocab_size=vocab,
+            vocab_size=vocab,
+            output_length=width,
+            device="cuda",
+        )
+        buffers = InputBuffers(
+            max_bs=max_bs,
+            max_num_tokens=max_bs * width,
+            state_write_padding_pool_index=pool,
+            device="cuda",
+        )
+        pools = SpeculativeSamplingPools(
+            temperature=torch.ones(pool + 1, device="cuda"),
+            top_k=torch.ones(pool + 1, dtype=torch.int32, device="cuda"),
+            top_p=torch.ones(pool + 1, device="cuda"),
+            seed=torch.zeros(pool + 1, dtype=torch.int64, device="cuda"),
+        )
+
+    drafter_cls = DFlash2 if sparse else DFlash
+    drafter = drafter_cls.__new__(drafter_cls)
+    BaseDrafter.__init__(
+        drafter,
+        spec_num_tokens=width,
+        runtime_states=executor.runtime_states,
+        input_buffers=buffers,
+    )
+    # wire_target binds the target's head and processor; DFLASH has no head
+    # of its own, and the pairing check only reads the verifier.
+    drafter.logits_processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=vocab),
+        do_argmax=True,
+        dp_lm_head_tp=False,
+        attn_tp_size=1,
+    )
+    if sparse:
+        drafter.selector_top_k = top_k
+    executor.drafter = drafter
+    # Constructing a real verifier needs the sampling kernels' GPU libraries;
+    # the bind path reads only these three members of it.
+    executor.sampling_backend = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_speculative_sampling=True, sampling_stream="batch"
+        ),
+        reads_sparse_draft_q=lambda: sparse,
+        speculative_sampling_pools=lambda: pools,
+    )
+    executor._samples_from_vocab_shard = False
+    executor._init_sampled_drafting(
+        SimpleNamespace(
+            enable_speculative_sampling=True,
+            spec_draft_tree=False,
+            spec_algo="DFLASH",
+            spec_reject_draft_prob_threshold=2.0,
+        ),
+        width,
+    )
+    sampler = executor.drafter.draft_sampler
+    states = executor.runtime_states
+    # Sampling the dense rows needs whole-vocabulary logits, so the bind turns
+    # the fused argmax off; the DFlash2 walk reads its selector's top-K instead.
+    assert drafter.logits_processor.do_argmax is sparse
+    if sparse:
+        # DFlash2 records no dense rows; its walk writes the sparse tables.
+        assert states.draft_probs is None and sampler is None
+        draft_q = states.future_draft_q
+        assert draft_q is executor.drafter._draft_q
+        retained = [draft_q.q, draft_q.q_ids, draft_q.slot, draft_q.pos]
+        draft_q.q[3, 1, :] = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+        draft_q.q_ids[3, 1, :] = torch.tensor(
+            [7, 8, 9], dtype=torch.int32, device="cuda"
+        )
+        draft_q.slot[3, :] = 1
+    else:
+        assert states.draft_probs is not None and sampler is not None
+        retained = [states.draft_probs, sampler._offsets_pool, sampler._gumbel_out]
+        # Persistent contents, not just addresses: a recorded row must come back.
+        states.draft_probs[3, 1, :] = torch.arange(vocab, device="cuda") / vocab
+    snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+    for _ in range(3):
+        torch.cuda.synchronize()
+        saver.pause(tag="weights")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        ordinary_bytes = sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+        assert ordinary_bytes == 0, ordinary_bytes
+        saver.resume(tag="weights")
+        for tensor, pointer, reference in snapshots:
+            assert tensor.data_ptr() == pointer
+            torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense-q", "dflash2-sparse-q"])
+def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes(sparse):
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    # Preload hooks must be installed before CUDA initializes in the child.
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_sampled_drafting_on_cuda; "
+                f"_check_sampled_drafting_on_cuda({sparse})",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )

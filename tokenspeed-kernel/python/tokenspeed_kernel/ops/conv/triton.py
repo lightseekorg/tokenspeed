@@ -55,6 +55,7 @@ from tokenspeed_kernel.ops.conv._triton.sconv import (
     select_decode_config,
     select_prefill_config,
 )
+from tokenspeed_kernel.ops.conv.replay import BankedConvReplayPayload
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -399,7 +400,9 @@ def triton_causal_conv1d_update(
     *,
     parent_indices: torch.Tensor | None,
     out: torch.Tensor | None = None,
-    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    replay_payload: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | BankedConvReplayPayload | None
+    ) = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -428,7 +431,9 @@ def triton_causal_conv1d_update(
         window ends at token parent_indices[b, t] (the initial window when
         negative) instead of token t - 1.
     out: destination shaped and typed like x, not overlapping it; None writes over x.
-    replay_payload: (payload, a, b) to fill, or None; row i * seqlen + t: [k/v channels | a | b].
+    replay_payload: (payload, a, b), a BankedConvReplayPayload, or None;
+        row i * seqlen + t saves [k/v channels | a | b]. A banked payload
+        selects its destination on device and must retain both banks.
     returns: the output, (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
@@ -555,6 +560,35 @@ def triton_causal_conv1d_update(
     block_n, num_warps = (
         (_UPDATE_BLOCK_CHANNELS, _update_num_warps()) if seqlen > 1 else (256, 4)
     )
+    replay_bank = None
+    replay_bank_stride = 0
+    if isinstance(replay_payload, BankedConvReplayPayload):
+        replay_bank = replay_payload.bank
+        replay_bank_stride = replay_payload.bank_stride
+        if (
+            replay_bank.shape != (1,)
+            or replay_bank.dtype != torch.int32
+            or replay_bank.device != x.device
+        ):
+            raise ValueError("replay bank must be a device int32 scalar")
+        payload = replay_payload.payload
+        bank_end = (
+            payload.storage_offset()
+            + replay_bank_stride
+            + sum(
+                (size - 1) * stride
+                for size, stride in zip(payload.shape, payload.stride())
+            )
+            + 1
+        )
+        if (
+            replay_bank_stride < payload.numel()
+            or bank_end * payload.element_size() > payload.untyped_storage().nbytes()
+        ):
+            raise ValueError(
+                "replay payload storage must contain both non-overlapping banks"
+            )
+        replay_payload = (replay_payload.payload, replay_payload.a, replay_payload.b)
     if replay_payload is not None:
         payload, replay_a, replay_b = replay_payload
         gate_heads = replay_a.shape[-1]
@@ -570,6 +604,7 @@ def triton_causal_conv1d_update(
             or replay_b.stride(-1) != 1
             or not 0 <= replay_first_channel < dim
             or any(t.dtype != x.dtype for t in replay_payload)
+            or any(t.device != x.device for t in replay_payload)
         ):
             raise ValueError(
                 "replay_payload needs a [batch * seqlen, width] payload saving "
@@ -597,6 +632,8 @@ def triton_causal_conv1d_update(
         payload,
         replay_a,
         replay_b,
+        replay_bank,
+        replay_bank_stride,
         # Matrix dimensions
         batch,
         dim,

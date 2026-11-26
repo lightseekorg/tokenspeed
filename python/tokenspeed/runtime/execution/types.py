@@ -342,6 +342,11 @@ class ModelExecutionResult:
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
+    # Per-request device verdicts (int32, [bs]): 0 while the request runs,
+    # REQUEST_ENDED once the device ended it, REQUEST_ENDED_INCOMPLETE when a
+    # deferred decode state could not be completed (tokenspeed_kernel.ops.
+    # metadata.stop_conditions); None from a forward that reports none.
+    output_request_ends: torch.Tensor | None = None
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None

@@ -34,6 +34,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import timedelta
 from multiprocessing import shared_memory
 
@@ -59,6 +60,7 @@ from tokenspeed.runtime.engine.gc_hooks import (  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import MsgpackEncoder  # noqa: E402
 from tokenspeed.runtime.epd.encode_host import (  # noqa: E402
     EncodeDataPlane,
+    EncodeSettings,
     SendRing,
     assign_encoded_embeddings,
     embedding_cache_bytes,
@@ -74,6 +76,44 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle  # noqa:
 from tokenspeed.runtime.utils.env import envs  # noqa: E402
 
 HIDDEN = 4
+
+
+@pytest.mark.parametrize(
+    "rank,tp_ranks,expected", [(0, (0,), 0), (3, (3, 7), 0), (7, (3, 7), 1)]
+)
+def test_native_encode_settings_report_the_group_local_metric_rank(
+    rank, tp_ranks, expected
+):
+    settings = EncodeSettings(
+        rank=rank,
+        tp_ranks=tp_ranks,
+        collective_bind_host="127.0.0.1",
+        handshake_address=None,
+        engine_index=0,
+        ready_response=None,
+        bootstrap_port=None,
+        bootstrap_url="http://127.0.0.1:1/route",
+        library="unused-mooncake-library",
+        local_ip="127.0.0.1",
+        protocol="tcp",
+        ib_device="",
+        bootstrap_timeout_s=1.0,
+        transfer_workers=1,
+        ring_slots=2,
+        ring_slot_bytes=1024,
+        ring_base=0,
+        ring_deepstack_base=0,
+        max_batch_tokens=128,
+        max_batch_items=2,
+        metrics_enabled=True,
+        metrics_prometheus_dir=None,
+        metrics_relay_endpoint=None,
+        metrics_model_name="test-encoder",
+        metrics_app_key="",
+    )
+    assert settings.attn_tp_rank == expected
+    with pytest.raises(ValueError):
+        _ = replace(settings, rank=max(tp_ranks) + 1).attn_tp_rank
 
 
 class _Tower:
@@ -115,7 +155,15 @@ def _frames(*items: MultimodalDataItem, room: int = 1) -> list[bytes]:
     return [bytes(frame) for frame in MsgpackEncoder().encode(request)]
 
 
-def _plane(tower, *, slots=4, slot_bytes=1024, cache_bytes=1 << 20, deepstack=False):
+def _plane(
+    tower,
+    *,
+    slots=4,
+    slot_bytes=1024,
+    cache_bytes=1 << 20,
+    deepstack=False,
+    metrics_options=None,
+):
     ring = SendRing(
         slots=slots, slot_bytes=slot_bytes, deepstack=deepstack, device="cpu"
     )
@@ -125,6 +173,7 @@ def _plane(tower, *, slots=4, slot_bytes=1024, cache_bytes=1 << 20, deepstack=Fa
         ring=ring,
         device="cpu",
         tp_cpu_group=None,
+        metrics_options=metrics_options,
     )
     return plane, ring
 
@@ -412,3 +461,50 @@ def test_npu_encode_lands_rows_on_selected_device():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_metric_observer_sees_cached_admissions_and_disables_on_failure():
+    calls = []
+
+    def factory(**options):
+        def observe(phase, items):
+            calls.append((phase, len(items)))
+            if phase == "encoded":
+                raise RuntimeError("monitoring unavailable")
+
+        return observe
+
+    class Tower(_Tower):
+        def get_multimodal_encoder_specs(self):
+            return {
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder, make_metrics_observer=factory
+                )
+            }
+
+    plane, _ = _plane(Tower(), metrics_options={})
+    plane.enter_forward_thread()
+    for admission in (1, 2):
+        assert plane.admit([(admission, _frames(_item(7, 2)))]) == [admission == 2]
+        plane.encode([(admission, 0)])
+        assert plane.encoded()[0][1] is None
+    assert calls == [("start", 0), ("admit", 1), ("encoded", 0)]
+
+
+def test_metric_observer_is_not_created_when_metrics_disabled():
+    def factory(**options):
+        raise AssertionError("disabled metrics must not construct observers")
+
+    class Tower(_Tower):
+        def get_multimodal_encoder_specs(self):
+            return {
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder, make_metrics_observer=factory
+                )
+            }
+
+    plane, _ = _plane(Tower())
+    plane.enter_forward_thread()
+    plane.admit([(1, _frames(_item(7, 2)))])
+    plane.encode([(1, 0)])
+    assert plane.encoded()[0][1] is None

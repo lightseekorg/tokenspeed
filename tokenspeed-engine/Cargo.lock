@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -1613,6 +1613,7 @@ dependencies = [
  "tokenspeed-pd",
  "tokenspeed-wire",
  "tokio",
+ "zeromq",
 ]
 
 [[package]]

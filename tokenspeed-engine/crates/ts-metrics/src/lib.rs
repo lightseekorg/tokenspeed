@@ -35,6 +35,9 @@
 
 mod peer;
 pub use peer::{PeerMetrics, QueuedPeerRead};
+mod encoder;
+pub use encoder::{EncoderMetrics, EncoderTransferMetrics};
+
 mod prom;
 mod relay;
 
@@ -458,6 +461,7 @@ pub struct EngineMetrics {
     prefix_prompt_tokens: Metric,
     prefix_device_hit_tokens: Metric,
     prefix_host_hit_tokens: Metric,
+    prefix_peer_hit_tokens: Metric,
     prefix_l3_hit_tokens: Metric,
     /// Serving-time compile totals already exported.
     exported_compiles: u64,
@@ -834,6 +838,12 @@ impl EngineMetrics {
                 "Admitted prompt tokens served from the Device prefix cache (L1).",
                 names,
             ),
+            prefix_peer_hit_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_peer_hit_tokens",
+                "Additional Device peer tokens used at first prefill dispatch.",
+                names,
+            ),
             prefix_host_hit_tokens: Metric::counter(
                 exporter,
                 "tokenspeed:prefix_host_hit_tokens",
@@ -1121,14 +1131,36 @@ impl EngineMetrics {
         host_hit_tokens: u64,
         l3_hit_tokens: u64,
     ) {
+        self.record_prefix_hits_with_peer(
+            prompt_tokens,
+            device_hit_tokens,
+            host_hit_tokens,
+            l3_hit_tokens,
+            0,
+        );
+    }
+
+    /// Report local tier hits and additional Device peer hits against the same prompt count.
+    pub fn record_prefix_hits_with_peer(
+        &self,
+        prompt_tokens: u64,
+        device_hit_tokens: u64,
+        host_hit_tokens: u64,
+        l3_hit_tokens: u64,
+        peer_hit_tokens: u64,
+    ) {
         let labels = self.labels();
+        if peer_hit_tokens > 0 {
+            self.prefix_peer_hit_tokens
+                .inc(&labels, peer_hit_tokens as f64);
+        }
         if prompt_tokens > 0 {
             self.prefix_prompt_tokens.inc(&labels, prompt_tokens as f64);
             // One weighted event keeps numerator and denominator atomic.
             for (metric, hit) in [
                 (
                     &self.prefix_cache_hit_ratio,
-                    device_hit_tokens + host_hit_tokens,
+                    device_hit_tokens + host_hit_tokens + peer_hit_tokens,
                 ),
                 (&self.prefix_device_hit_ratio, device_hit_tokens),
                 (&self.prefix_host_hit_ratio, host_hit_tokens),
@@ -1161,6 +1193,9 @@ impl EngineMetrics {
 pub struct KvTransferMetrics {
     labels: [String; 2],
     latency: Metric,
+    handoffs: Metric,
+    prefill_handoff: Metric,
+    decode_wait: Metric,
     size_bytes: Metric,
     request_size_bytes: Metric,
     timeouts: Metric,
@@ -1171,8 +1206,28 @@ impl KvTransferMetrics {
     /// The metrics for `model_name` / `app_key`, exported through `exporter`.
     pub fn new(exporter: &Arc<Exporter>, model_name: &str, app_key: &str) -> Self {
         let names = ["model_name", "app_key"];
+        let handoff_duration = |name, help| {
+            Metric::histogram(
+                exporter,
+                name,
+                help,
+                &names,
+                &[
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0,
+                ],
+            )
+        };
         Self {
             labels: [model_name.to_owned(), app_key.to_owned()],
+            handoffs: Metric::counter(
+                exporter, "tokenspeed:kv_handoffs",
+                "Registered prefill rooms reaching a replica-agreed terminal state, once per request.",
+                &["model_name", "app_key", "outcome"],
+            ),
+            prefill_handoff: handoff_duration("tokenspeed:prefill_kv_handoff_seconds",
+                "Final prompt handoff on prefill to replica-agreed successful transfer retirement."),
+            decode_wait: handoff_duration("tokenspeed:decode_kv_wait_seconds",
+                "Decode landing manifest submission to replica-agreed complete KV arrival."),
             latency: Metric::histogram(
                 exporter,
                 "tokenspeed:kv_transfer_latency_seconds",
@@ -1212,6 +1267,24 @@ impl KvTransferMetrics {
         }
     }
 
+    /// One terminal handoff, emitted by the prefill replica's first member.
+    pub fn record_handoff(&self, outcome: &'static str) {
+        self.handoffs
+            .inc(&[&self.labels[0], &self.labels[1], outcome], 1.0);
+    }
+
+    /// Successful handoff duration, excluding compute before the final chunk.
+    pub fn observe_prefill_handoff(&self, seconds: f64) {
+        self.prefill_handoff
+            .observe(&[&self.labels[0], &self.labels[1]], seconds);
+    }
+
+    /// Wait for a request's complete KV after decode issued its manifest.
+    pub fn observe_decode_kv_wait(&self, seconds: f64) {
+        self.decode_wait
+            .observe(&[&self.labels[0], &self.labels[1]], seconds);
+    }
+
     /// One send's wall time.
     pub fn observe_latency(&self, seconds: f64) {
         self.latency
@@ -1219,8 +1292,7 @@ impl KvTransferMetrics {
     }
 
     /// A transfer that timed out in `stage`: on the prefill node
-    /// `bootstrapping`, or before a node under deferred allocation admitted
-    /// the request `waiting_for_announcement` (of its decode node); on the
+    /// `bootstrapping` while waiting for destination allocation; on the
     /// decode node `waiting_for_admission` before its manifest went out, then
     /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {

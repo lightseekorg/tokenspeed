@@ -267,6 +267,7 @@ fn actual_host_preserves_ack_and_labels_completed_physical_copy() {
             Python::attach(|py| plane.clone_ref(py)),
             None,
             Some(context.clone()),
+            false,
             shared_l2_handle,
         )
         .unwrap();
@@ -319,7 +320,8 @@ fn malformed_or_lost_observation_invalidates_evidence_without_changing_ack() {
         let shared_l2_handle =
             Python::attach(|py| Py::new(py, crate::shared_l2::Handle::new()).unwrap());
         let mut host =
-            PythonDataPlane::start(plane, None, Some(context.clone()), shared_l2_handle).unwrap();
+            PythonDataPlane::start(plane, None, Some(context.clone()), false, shared_l2_handle)
+                .unwrap();
         let ack = host.poll_cache_events().unwrap();
         assert_eq!(ack.len(), 1);
         assert_eq!(ack[0].op_id, 7);

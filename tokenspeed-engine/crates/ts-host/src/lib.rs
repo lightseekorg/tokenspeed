@@ -775,7 +775,17 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         built.map_err(|error| python_error(py, error))
     })?;
     if mode == "encode" {
-        return encode::serve(bootstrap, &stop);
+        let result = encode::serve(bootstrap, &stop);
+        Python::attach(|py| {
+            if let Err(error) = py
+                .import("tokenspeed.runtime.metrics.service")
+                .and_then(|module| module.getattr("metrics_service"))
+                .and_then(|service| service.call_method1("close", (2.0,)))
+            {
+                tracing::warn!(%error, "closing encode metric sinks failed");
+            }
+        });
+        return result;
     }
 
     let (bootstrap, mut scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
@@ -902,13 +912,24 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
+    let replay_retirement = Python::attach(|py| {
+        data_plane
+            .call_method0(py, "replay_retirement_enabled")?
+            .extract::<bool>(py)
+    })
+    .map_err(|error| Python::attach(|py| python_error(py, error)))?;
     // With a shared L2 pool as the Host tier, the client the rank started
     // when it joined the pool at device build is the loop's; the data plane
     // keeps the handle, for the acknowledgments of the rank's loads.
     let shared_l2_client = shared_l2_handle.get().take_client();
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams, cache_events, shared_l2_handle)
-            .map_err(HostError::DataPlane)?;
+    let data_plane = PythonDataPlane::start(
+        data_plane,
+        peers.streams,
+        cache_events,
+        replay_retirement,
+        shared_l2_handle,
+    )
+    .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -942,10 +963,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         config.stream_interval,
         Some(config.physical_context_len),
         role,
+        scheduler.defers_decode_state(),
         config.finish_log,
         metrics.is_some(),
         trace,
-    );
+    )
+    .with_timing_ranks(config.metrics.labels.dp_rank, config.metrics.tp_rank);
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,
         limits: config.limits,

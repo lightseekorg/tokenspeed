@@ -39,6 +39,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
         **kwargs,
         num_disk_pages=0,
@@ -167,6 +168,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2

@@ -58,7 +58,7 @@ def create_layer_weights(
         )
         return
 
-    if quant_kind == "fp8":
+    if quant_kind in ("fp8", "w8a16_fp8_block"):
         ispp = create_dense_weight_pair(
             spec,
             layer,

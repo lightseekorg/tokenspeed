@@ -96,7 +96,7 @@ fn run_scenario(directory: &Path) {
     engine.observe_request_completion_tokens(5);
     engine.record_decode_prefix_hits(100, 20);
     engine.record_grammar_queue(2);
-    engine.record_prefix_hits(100, 40, 30, 10);
+    engine.record_prefix_hits_with_peer(100, 40, 30, 10, 12);
 
     let transfer = KvTransferMetrics::new(&exporter, "m", "");
     transfer.observe_latency(0.003);
@@ -699,6 +699,8 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         },
     );
     engine.peer.increment("landed_tokens", 8);
+    engine.peer.holder_event("read_released");
+    engine.peer.decision("adaptive_recompute");
     let completed = engine.peer.queue_read("a".into(), 0, 64);
     let cancelled = engine.peer.queue_read("a".into(), 0, 128);
     completed.finish(
@@ -723,6 +725,20 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
     let Some(text) = render(&directory) else {
         return;
     };
+    for (metric, label) in [
+        (
+            "tokenspeed:peer_holder_events_total{",
+            r#"outcome="read_released""#,
+        ),
+        (
+            "tokenspeed:peer_decisions_total{",
+            r#"reason="adaptive_recompute""#,
+        ),
+    ] {
+        assert!(text.lines().any(|line| line.starts_with(metric)
+            && line.contains(label)
+            && line.ends_with(" 1.0")));
+    }
     for (tier, expected) in [("host", 16.0), ("disk", 8.0), ("device", 40.0)] {
         let line = text
             .lines()

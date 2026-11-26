@@ -246,6 +246,9 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
+        /// The commit of the deferred decode state a plan's retractions
+        /// published (`ExecutionPlan::state_commit_fence`).
+        StateCommit,
     }
 
     /// The kind of a plan's storage operation.
@@ -307,6 +310,9 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
+        /// The runtime committed a plan's retracted decode state
+        /// (`cache::StateCommitDone`).
+        StateCommitDone,
         /// A shared L2 pool write finished (`cache::SharedL2WriteDone`).
         SharedL2WriteDone,
     }
@@ -485,6 +491,8 @@ mod ffi {
         device_hit_tokens: u64,
         /// Tokens the Host loads (L2 including anything L3 supplied).
         host_hit_tokens: u64,
+        /// Remote Device prefix used beyond the local hit.
+        peer_hit_tokens: u64,
         /// Token spans of successful storage keys (L3), counted per cache group.
         l3_hit_tokens: u64,
     }
@@ -661,7 +669,16 @@ mod ffi {
         held: bool,
     }
 
-    /// A reader's landing in a plan (`tokenspeed::PeerFetchOperation`).
+    /// Why a hinted request entered local prefill.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerLocalChoice {
+        /// Scheduler request ID.
+        request_id: String,
+        /// Bounded scheduler decision code.
+        reason: String,
+    }
+
+    /// A peer fetch admitted by the scheduler.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerFetchView {
         /// The landing request.
@@ -676,6 +693,12 @@ mod ffi {
         end_tokens: i32,
         /// The blocks it fills.
         destinations: Vec<PeerPageView>,
+        /// Original holder answer for an exact re-PIN after admission.
+        checkpoint: Vec<u8>,
+        /// Prefix hashes at the original lookup boundary.
+        prefix_hashes: Vec<String>,
+        /// Prompt tokens through that boundary for exact checkpoint revalidation.
+        tokens: Vec<i32>,
     }
 
     /// The kind of a [`PeerEventView`].
@@ -714,6 +737,14 @@ mod ffi {
         /// Pin: the boundary the holder's answer named; LookupAnswered: the
         /// holder's boundary; FetchDone: the boundary confirmed.
         num_tokens: i32,
+        /// Reader-local monotonic times for adaptive Device feedback (zero when absent).
+        dispatch_us: i64,
+        /// First instant when the device fence and the fetch plan are both ready.
+        writable_us: i64,
+        /// RELEASE arrival on success, or protocol retirement on failure.
+        terminal_us: i64,
+        /// Reader-local original lookup answer.
+        checkpoint: Vec<u8>,
         /// FetchDone: the landing request.
         request_id: String,
     }
@@ -742,8 +773,10 @@ mod ffi {
         landing_requests: usize,
         /// Reader: tokens landed so far.
         landed_tokens: u64,
-        /// Reader: landings given up so far.
+        /// Reader: landings whose transfer failed to complete the prefix.
         failed_landings: u64,
+        /// Reader: successful Host landings whose request gave up the reservation.
+        unused_host_landings: u64,
     }
 
     /// One cache group's page counts.
@@ -919,6 +952,26 @@ mod ffi {
             now_us: i64,
             events: &[PeerEventView],
         ) -> Result<()>;
+        #[namespace = "tokenspeed"]
+        type PeerPinRelease;
+        fn peer_release_handle(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+        ) -> SharedPtr<PeerPinRelease>;
+        fn release_peer_pin(handle: &SharedPtr<PeerPinRelease>) -> bool;
+        fn enable_async_host_peer(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn enable_async_device_peer(scheduler: Pin<&mut Scheduler>, adaptive: bool) -> bool;
+        fn reserve_peer_host(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+            tokens: i32,
+            retry: &mut bool,
+        ) -> Result<Vec<PeerFetchView>>;
+        fn apply_peer_export(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
         fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
         fn peer_pages_match(
@@ -970,6 +1023,7 @@ mod ffi {
         fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
+        fn defers_decode_state(scheduler: &Scheduler) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_current_pending(scheduler: &Scheduler) -> bool;
         fn storage_progress_pending(scheduler: &Scheduler) -> bool;
@@ -1007,6 +1061,7 @@ mod ffi {
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
         fn plan_disk_ops(plan: &ExecutionPlan) -> Vec<DiskOpView>;
         fn plan_shared_l2_ops(plan: &ExecutionPlan) -> Vec<SharedL2OpView>;
+        fn plan_peer_local_choices(plan: &ExecutionPlan) -> Vec<PeerLocalChoice>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         #[namespace = "tokenspeed"]
@@ -1179,7 +1234,25 @@ pub struct Scheduler {
 // `&mut self`.
 unsafe impl Send for Scheduler {}
 
+// Unpin and owner-side revocation synchronize inside the ticket.
+/// A revocable handle to one native lease's existing strong references.
+pub struct PeerReleaseHandle(cxx::SharedPtr<ffi::PeerPinRelease>);
+impl PeerReleaseHandle {
+    /// Returns after all of this lease's strong references were dropped.
+    pub fn release(&self) -> bool {
+        ffi::release_peer_pin(&self.0)
+    }
+}
+use ffi::PeerPinRelease;
+unsafe impl Send for PeerPinRelease {}
+unsafe impl Sync for PeerPinRelease {}
+
 impl Scheduler {
+    /// A revocable, thread-safe release handle for an existing hard pin.
+    pub fn peer_release_handle(&mut self, lease: &PeerLeaseView) -> PeerReleaseHandle {
+        PeerReleaseHandle(ffi::peer_release_handle(self.pinned(), lease))
+    }
+
     /// Drive the scheduler a Python `tokenspeed_scheduler.Scheduler` owns.
     pub fn from_python(object: &Bound<'_, PyAny>) -> PyResult<Self> {
         // SAFETY: the GIL is held (`Bound`), and the returned pointer lives as
@@ -1294,6 +1367,34 @@ impl Scheduler {
         ffi::advance_peer(self.pinned(), now_us, events)
     }
 
+    /// Enable independent Device reads with the supplied admission behavior.
+    pub fn enable_async_device_peer(&mut self, adaptive: bool) -> bool {
+        ffi::enable_async_device_peer(self.pinned(), adaptive)
+    }
+    /// Enable independent reservations into the Host landing tier.
+    pub fn enable_async_host_peer(&mut self) -> bool {
+        ffi::enable_async_host_peer(self.pinned())
+    }
+
+    /// Reserve unpublished Host pages for a live reader lease.
+    pub fn reserve_peer_host(
+        &mut self,
+        lease: &PeerLeaseView,
+        tokens: i32,
+        retry: &mut bool,
+    ) -> Result<Vec<PeerFetchView>, cxx::Exception> {
+        ffi::reserve_peer_host(self.pinned(), lease, tokens, retry)
+    }
+
+    /// Change only the holder's export ledger while holding the cache mutex.
+    pub fn apply_peer_export(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::apply_peer_export(self.pinned(), event, now_us)
+    }
+
     /// A reader's lookups since the last take, to send to their holders.
     pub fn take_peer_lookups(&mut self) -> Vec<PeerLookupView> {
         ffi::take_peer_lookups(self.pinned())
@@ -1405,6 +1506,14 @@ impl Scheduler {
     /// without the forward or PD completion fence.
     pub fn can_abort_before_admission(&self, request_id: &str) -> bool {
         ffi::can_abort_before_admission(self.get(), request_id)
+    }
+
+    /// Whether a cache group defers its decode state to a request's end
+    /// (`CacheGroupConfig::deferred_decode_state`): a finish only the host
+    /// saw must then end with `ForwardEventKind::Abort`, which publishes
+    /// nothing.
+    pub fn defers_decode_state(&self) -> bool {
+        ffi::defers_decode_state(self.get())
     }
 
     /// Whether storage operations are in flight.
@@ -1813,7 +1922,12 @@ impl ExecutionPlan {
         ffi::plan_shared_l2_ops(&self.0)
     }
 
-    /// The peer prefix landings the plan admitted, in plan order.
+    /// Hinted requests this plan admitted locally, with their last decision.
+    pub fn peer_local_choices(&self) -> Vec<ffi::PeerLocalChoice> {
+        ffi::plan_peer_local_choices(&self.0)
+    }
+
+    /// Reads granted by the scheduler.
     pub fn peer_fetches(&self) -> Vec<PeerFetchView> {
         ffi::plan_peer_fetches(&self.0)
     }

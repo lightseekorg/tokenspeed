@@ -54,9 +54,6 @@ protected:
         Submit(request);
     }
 
-    // The transfer peer lets the request be admitted.
-    void Admit(const std::string& id) { scheduler_->Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{id})); }
-
     // Every Decode rank allocated the destination.
     void Grant(const std::string& id) { scheduler_->Advance(ExecutionEvent{}.With(pd::DestinationReadyEvent{id})); }
 
@@ -69,25 +66,15 @@ protected:
     }
 };
 
-// Until the transfer peer admits it a prompt is no candidate, and its
-// destination's allocation alone does not admit it.
-TEST_F(DeferredAllocationTest, APromptThePeerHasNotAdmittedIsNotScheduled) {
+TEST_F(DeferredAllocationTest, APromptComputesWithoutPeerAdmission) {
     SubmitPrompt("r", 4);
-    for (int i = 0; i < 3; ++i) {
-        EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());
-        EXPECT_EQ(scheduler_->BootstrappingSize(), 1u);
-        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
-    }
-    Grant("r");
-    EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());
-    EXPECT_EQ(scheduler_->BootstrappingSize(), 1u);
-
-    Admit("r");
     EXPECT_EQ(scheduler_->BootstrappingSize(), 0u);
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r"});
     SendForwardDone("r", {42});
-    // The allocation that came first is remembered.
-    EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 0u);
+    EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 1u);
+    EXPECT_FALSE(PlanOnce().remote_decode.has_value());
+
+    Grant("r");
     const auto send = PlanOnce();
     ASSERT_TRUE(send.remote_decode.has_value());
     EXPECT_EQ(send.remote_decode->request_ids, std::vector<std::string>{"r"});
@@ -97,7 +84,6 @@ TEST_F(DeferredAllocationTest, APromptThePeerHasNotAdmittedIsNotScheduled) {
 
 TEST_F(DeferredAllocationTest, FinalResultRetainsEveryGroupUntilGrant) {
     SubmitPrompt("r", 6);
-    Admit("r");
     const auto first = PlanOnce();
     ASSERT_EQ(FindForwardBatch(first)->input_lengths, std::vector<std::int32_t>{4});
     SendForwardDone("r");
@@ -121,11 +107,6 @@ TEST_F(DeferredAllocationTest, FinalResultRetainsEveryGroupUntilGrant) {
         EXPECT_FALSE(wait.remote_decode.has_value());
         EXPECT_EQ(scheduler_->ActiveLcmBlocks(), held);
     }
-    // The admission event again changes nothing: the destination has its own.
-    Admit("r");
-    EXPECT_FALSE(PlanOnce().remote_decode.has_value());
-    EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 1u);
-
     Grant("r");
     Grant("r");
     const auto send = PlanOnce();
@@ -148,7 +129,6 @@ TEST_F(DeferredAllocationTest, FinalResultRetainsEveryGroupUntilGrant) {
 // slot, as one awaiting its transfer does: both count as running.
 TEST_F(DeferredAllocationTest, AComputedPromptWaitingForItsDestinationIsRunning) {
     SubmitPrompt("r", 4);
-    Admit("r");
     EXPECT_EQ(scheduler_->RunningSize(), 0u);
     PlanOnce();
     SendForwardDone("r", {42});
@@ -166,12 +146,10 @@ TEST_F(DeferredAllocationTest, AComputedPromptWaitingForItsDestinationIsRunning)
 TEST_F(DeferredAllocationTest, CancellingBeforeTheFirstChunkHoldsNothing) {
     SubmitPrompt("held", 4);
     SubmitPrompt("admitted", 4, 100);
-    Admit("admitted");
     SendAbortEvent("held");
     SendAbortEvent("admitted");
     EXPECT_EQ(scheduler_->BootstrappingSize(), 0u);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
-    Admit("held");
     Grant("held");
     Grant("admitted");
     const auto cancelled = PlanOnce();
@@ -183,7 +161,6 @@ TEST_F(DeferredAllocationTest, CancellingBeforeTheFirstChunkHoldsNothing) {
 // A client abort cancels the transfer, whose retirement fails the request.
 TEST_F(DeferredAllocationTest, CancellationIgnoresLateGrant) {
     SubmitPrompt("r", 4);
-    Admit("r");
     PlanOnce();
     SendForwardDone("r", {42});
     Fail("r");
@@ -197,7 +174,6 @@ TEST_F(DeferredAllocationTest, CancellationIgnoresLateGrant) {
 // A forward abort on the P role waits for the transfer to retire.
 TEST_F(DeferredAllocationTest, CancellingWhileWaitingReleasesResourcesWithoutTransfer) {
     SubmitPrompt("r", 4);
-    Admit("r");
     PlanOnce();
     SendForwardDone("r", {42});
     PlanOnce();
@@ -219,7 +195,6 @@ TEST_F(DeferredAllocationTest, CancellingWhileWaitingReleasesResourcesWithoutTra
 // stay until its result lands, and a grant in between sends nothing.
 TEST_F(DeferredAllocationTest, CancellingDuringTheFinalForwardReleasesOnceItsResultLands) {
     SubmitPrompt("r", 4);
-    Admit("r");
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r"});
     Fail("r");
     EXPECT_TRUE(scheduler_->PdTransferPinned("r"));
@@ -234,7 +209,6 @@ TEST_F(DeferredAllocationTest, CancellingDuringTheFinalForwardReleasesOnceItsRes
 // transfer stopped, as under early allocation.
 TEST_F(DeferredAllocationTest, CancellingAGrantedPromptWaitsForItsTransferToStop) {
     SubmitPrompt("r", 4);
-    Admit("r");
     PlanOnce();
     SendForwardDone("r", {42});
     Grant("r");
@@ -249,7 +223,6 @@ TEST_F(DeferredAllocationTest, CancellingAGrantedPromptWaitsForItsTransferToStop
 
 TEST_F(DeferredAllocationTest, EarlyGrantIsRememberedWithoutSendingUncomputedKv) {
     SubmitPrompt("r", 6);
-    Admit("r");
     Grant("r");
     Grant("r");
     const auto first = PlanOnce();
@@ -284,8 +257,6 @@ protected:
 TEST_P(DeferredAllocationFullPoolTest, GrantDrainsCompletedPromptAndUnblocksPartialPromptInAFullPool) {
     SubmitPrompt("first", 4);
     SubmitPrompt("partial", 6, 100);
-    Admit("first");
-    Admit("partial");
     const auto compute = PlanOnce();
     ASSERT_EQ(FindForwardBatch(compute)->request_ids, (std::vector<std::string>{"first", "partial"}));
     EXPECT_EQ(FindForwardBatch(compute)->input_lengths, (std::vector<std::int32_t>{4, 4}));
@@ -317,7 +288,6 @@ INSTANTIATE_TEST_SUITE_P(HistoryAndState, DeferredAllocationFullPoolTest, ::test
 
 TEST_F(DeferredAllocationTest, GrantDuringFinalForwardSendsAsSoonAsItsResultLands) {
     SubmitPrompt("r", 4);
-    Admit("r");
     PlanOnce();
     Grant("r");
     EXPECT_FALSE(PlanOnce().remote_decode.has_value());
@@ -331,7 +301,6 @@ TEST_F(DeferredAllocationTest, GrantDuringFinalForwardSendsAsSoonAsItsResultLand
 
 TEST_F(DeferredAllocationTest, DecodeFailureWhileAwaitingGrantReleasesAllSourceGroups) {
     SubmitPrompt("r", 4);
-    Admit("r");
     PlanOnce();
     SendForwardDone("r", {42});
     PlanOnce();
@@ -405,7 +374,6 @@ TEST_F(DeferredAllocationTest, DecodeAdmissionPressureDoesNotBlockPrefillComputa
     EXPECT_EQ(decode.WaitingSize(), 1u);
 
     SubmitPrompt("later", 4, 100);
-    Admit("later");
     ASSERT_EQ(FindForwardBatch(PlanOnce())->input_lengths, std::vector<std::int32_t>{4});
     SendForwardDone("later", {43});
     EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 1u);
@@ -515,7 +483,6 @@ protected:
                 if (setup.notice == Notice::kAtArrival) {
                     decodes[prompt.destination]->Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{prompt.id}));
                 }
-                prefill.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{prompt.id}));
             }
 
             const auto prefill_plan = prefill.NextExecutionPlan(options);

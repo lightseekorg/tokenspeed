@@ -475,6 +475,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
     const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
+    const bool awaits_bootstrap = config_.role == Role::kD ||
+                                  (config_.role == Role::kP && config_.decode_allocation_policy !=
+                                                                   SchedulerConfig::DecodeAllocationPolicy::kDeferred);
     for (const RequestSpec& spec : request_specs) {
         if (cache_event_sink_ && spec.admission_id == 0) {
             throw std::invalid_argument("cache events require the control plane admission identity");
@@ -513,7 +516,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, awaits_bootstrap));
     }
 
     // With prefix caching, every first admission reads the prompt's page
@@ -773,7 +776,17 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     }
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
+    // During this build the cache guard is exclusive. Offer an answered but
+    // unreserved request to normal admission; only a committed local admission
+    // revokes the weak grant seen by the peer worker.
+    std::vector<std::pair<Request*, std::shared_ptr<fsm::PeerHostGrant>>> local_candidates;
     for (const auto& request : requests_) {
+        auto* looking = request->GetIf<fsm::PeerLooking>();
+        if (forward_allowed_ && looking && looking->host_grant && looking->host_grant->lookup_answered &&
+            !looking->host_grant->landing) {
+            local_candidates.emplace_back(request.get(), std::move(looking->host_grant));
+            request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
+        }
         // With a shared L2 pool a waiting prompt waits for its lookup to be
         // settled, so a prefix the pool holds is not recomputed.
         if (const auto* waiting = request->GetIf<fsm::Submitted>();
@@ -800,6 +813,14 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         built = buildForwardOperations(plan, std::move(candidates), write_back_operations, options);
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
+    }
+    for (auto& [request, grant] : local_candidates) {
+        if (request->Is<fsm::Submitted>()) {
+            request->Apply(fsm::StartPeerLookupEvent{grant->lookup.lease, grant->lookup.deadline_us});
+            request->GetIf<fsm::PeerLooking>()->host_grant = std::move(grant);
+        } else if (request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone>()) {
+            plan.peer_local_choices.emplace_back(request->Id(), "host_wait_local");
+        }
     }
     // What the build's admissions and restores evicted under the write-back
     // policy goes to the Host in this plan: their pages may already be granted
@@ -865,6 +886,12 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     }
     if (!built.snapshot_stores.empty()) {
         plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
+    }
+    // The endpoints this plan's retractions published wait for the runtime's
+    // commit, which it acknowledges under one fence for the whole plan.
+    if (!uncommitted_state_pages_.empty()) {
+        plan.state_commit_fence = next_state_commit_fence_++;
+        state_commit_fences_.emplace(*plan.state_commit_fence, std::exchange(uncommitted_state_pages_, {}));
     }
     if (!built.load_backs.empty()) {
         plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
