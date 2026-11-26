@@ -84,9 +84,10 @@ does not add a complete-stream requirement to partial SDK updates.
 
 ## Replay and host boundaries
 
-Ascend MHA target replay updates FIA host sequence lengths from live decode
-metadata, including verify-width padding. Speculative attention is causal and
-aligned to the cache end. Captured native draft decode uses device lengths,
+Ascend MHA target replay updates FIA host sequence lengths from the paged
+attention router's live decode metadata, including verify-width padding. Hybrid
+models use this same router for their full-attention layers. Speculative attention
+is causal and aligned to the cache end. Captured native draft decode uses device lengths,
 including the accepted frontier computed inside the graph; eager decode uses
 normal kernel selection. Replay writes Q, workspace and outputs.
 FIA descriptors use live host lengths while tasks consume device data in graph

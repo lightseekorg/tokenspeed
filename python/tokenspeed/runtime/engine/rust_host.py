@@ -64,6 +64,7 @@ from multiprocessing.connection import Connection
 
 import msgspec
 import torch
+import torch.distributed as dist
 from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup

@@ -40,8 +40,12 @@ from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged import mha
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
@@ -111,6 +115,10 @@ def test_ascend_fia_update_reads_target_verify_metadata_for_partial_batch(width)
     runner.attn_backend.init_cuda_graph_state(4, max_extend_tokens=0)
     runner.draft_attn_backend = None
     runner.max_tokens_per_req = width
+    hybrid_runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    hybrid_runner.attn_backend = HybridLinearAttnBackend(
+        runner.attn_backend, MambaAttnBackend.__new__(MambaAttnBackend), [0]
+    )
     slot_ids = torch.tensor([2, 5, 7, 0], dtype=torch.int32)
     block_tables = {
         "full_attention": torch.arange(1, 13, dtype=torch.int32).reshape(3, 4)
@@ -136,10 +144,10 @@ def test_ascend_fia_update_reads_target_verify_metadata_for_partial_batch(width)
             settle=lambda: None,
             block_tables=block_tables,
         )
-        runner._update_npu_graph(graph, seq_lens)
-
         expected = [max(length, width) for length in raw]
-        assert graph.lengths == [{"actual_seq_lengths_kv": expected}]
+        for replay in (runner, hybrid_runner):
+            replay._update_npu_graph(graph, seq_lens)
+            assert graph.lengths == [{"actual_seq_lengths_kv": expected}]
         assert leaf.forward_decode_metadata.seq_lens.tolist() == expected
         assert seq_lens.tolist() == raw
 

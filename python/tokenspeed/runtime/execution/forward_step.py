@@ -1371,6 +1371,9 @@ class ForwardStepRunner:
         live requests and padding. Other backends receive the padded input
         lengths in ``seq_lens``.
         """
+        from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+            HybridLinearAttnBackend,
+        )
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
             MHAAttnBackend,
         )
@@ -1378,8 +1381,11 @@ class ForwardStepRunner:
             CacheGroupRouter,
         )
 
-        if type(self.attn_backend) is CacheGroupRouter:
-            leaves = self.attn_backend.child_backends()
+        backend = self.attn_backend
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        if type(backend) is CacheGroupRouter:
+            leaves = backend.child_backends()
             if leaves and all(type(leaf) is MHAAttnBackend for leaf in leaves):
                 # All native MHA groups use the same target verify width.
                 seq_lens = leaves[0].forward_decode_metadata.seq_lens

@@ -96,6 +96,7 @@ if __name__ == "__main__":
     )
     args = NS(
         mapping=mapping,
+        device="cuda",
         node_rank=1,
         model="",
         tokenizer="",
