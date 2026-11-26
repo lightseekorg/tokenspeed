@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <memory_resource>
 #include <optional>
@@ -41,8 +42,12 @@
 
 namespace tokenspeed {
 
-std::vector<HostCache::StoreCandidate> HostCache::TakePendingStores() {
-    auto pending = std::exchange(pending_stores_, {});
+std::vector<HostCache::StoreCandidate> HostCache::TakePendingStores(std::size_t max_candidates) {
+    const auto past_end =
+        pending_stores_.begin() + static_cast<std::ptrdiff_t>(std::min(max_candidates, pending_stores_.size()));
+    std::vector<StoreCandidate> pending(std::make_move_iterator(pending_stores_.begin()),
+                                        std::make_move_iterator(past_end));
+    pending_stores_.erase(pending_stores_.begin(), past_end);
     std::erase_if(pending, [this](const StoreCandidate& candidate) {
         const auto& index = store_.Groups()[candidate.key.group_id].Index();
         auto location = store_.LocationOf(store_.DevicePool(), candidate.key.group_id, candidate.key);
@@ -291,6 +296,33 @@ void HostCache::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
         node->latest_state_access_epoch =
             std::max({node->latest_state_access_epoch, metadata.eviction.last_access_epoch, metadata.max_access_epoch});
     }
+}
+
+void HostCache::TouchHostKeys(std::span<const CacheKey> keys) {
+    _assert(store_.HostPool() != nullptr, "TouchHostKeys requires a host pool");
+    const std::uint64_t access_epoch = history_.IssueAccessEpoch();
+    for (const CacheKey& key : keys) {
+        _assert(key.group_id < store_.Groups().size(), "Host touch key group id out of range");
+        PrefixCacheIndex& index = store_.Groups()[key.group_id].Index();
+        // TouchExisting refreshes the entries of the keys whose source block
+        // is present: the entry's own block stands for it.
+        const CacheBlockRef block = index.Find(*store_.HostPool(), key);
+        if (!block) {
+            continue;
+        }
+        index.TouchExisting(*store_.HostPool(), std::span{&key, 1}, std::span{&block, 1}, access_epoch,
+                            /*session=*/nullptr);
+        // A hit keeps its tail young under the per-prior cap.
+        store_.Boundaries().TouchTail(key.content_hash);
+    }
+}
+
+bool HostCache::TryEvictHostEntry(const CacheKey& key) {
+    _assert(store_.HostPool() != nullptr, "TryEvictHostEntry requires a host pool");
+    _assert(key.group_id < store_.Groups().size(), "Host entry key group id out of range");
+    const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.HostPool(), key.group_id, key);
+    return !location ||
+           evictor_.EvictHostCachedBlock(key.group_id, *location, &CacheEvictor::HostEvictionStats::released);
 }
 
 void HostCache::CacheHostTail(const ContentHash& prior, const TailPublication& tail) {

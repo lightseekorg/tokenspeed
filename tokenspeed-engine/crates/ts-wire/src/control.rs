@@ -331,6 +331,8 @@ control_struct! {
     ReleaseMemoryOccupationReqInput {
         /// The regions.
         tags: Option<Vec<String>> = None,
+        /// Shared identity of this replica-wide operation.
+        transition_id: Option<String> = None,
     }
     /// [`ReleaseMemoryOccupationReqInput`]'s reply.
     ReleaseMemoryOccupationReqOutput {
@@ -344,6 +346,8 @@ control_struct! {
     ResumeMemoryOccupationReqInput {
         /// The regions.
         tags: Option<Vec<String>> = None,
+        /// Shared identity of this replica-wide operation.
+        transition_id: Option<String> = None,
     }
     /// [`ResumeMemoryOccupationReqInput`]'s reply.
     ResumeMemoryOccupationReqOutput {

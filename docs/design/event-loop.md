@@ -14,13 +14,14 @@ One engine rank is one `ts-host` process. Its threads:
 
 | thread | runs | holds |
 | --- | --- | --- |
-| control (`ts-host` main) | `ts_control::event_loop::EventLoop`: the frontend wire, the collectives between ranks, the C++ scheduler, commit post-processing, control operations; the data plane's completion queries | the scheduler, every request's state, the collective mesh; the GIL only during a completion query |
+| control (`ts-host` main) | `ts_control::event_loop::EventLoop`: the frontend wire, the collectives between ranks, the C++ scheduler, commit post-processing, control operations; the data plane's completion queries and, with a shared L2 pool, the round's blocking lookup at the pool's owner | the scheduler, every request's state, the collective mesh; the GIL only during a completion query |
 | forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
 
 Peripheral threads stay off the round: the wire's Tokio runtime
 (`ts_control::transport`, which also encodes each round's outputs), the PD
 transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
-publisher, the expert-rebalance solver.
+publisher, the expert-rebalance solver. With a shared L2 pool, so do the
+pool client's threads (its writes, its notices, its loads' reads).
 
 Request traces use a bounded, lossy background queue. Plugins register a provider
 with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
@@ -219,6 +220,20 @@ the device (no batch, no cache op, no remote stream: `plan.needs_device()`)
 queues nothing: a loop waiting on a transfer would otherwise hand the forward
 thread an empty plan per round, each costing a turn of the GIL.
 
+With a shared L2 pool the control thread also calls the pool's client
+(`RankClient`, `ts-control/src/shared_l2/client.rs`), which is Rust like the
+L3 executor: no call takes the GIL or touches a stream. The lookup sends one
+request to the pool's owner and waits for the reply; the other calls hand
+work to the client's threads and read what they finished or where they
+failed: the poll once at the head of every round, the failure check once
+when a forward has landed. A load from the pool is the forward thread's to
+hand over, like a Host L2 load (through the shared L2 handle,
+`SharedL2Handle.submit_load`, which only queues it for the client's
+loader), and its acknowledgment comes back through the data plane's cache
+poll, which on a pool rank reads the loader's finished loads in the host and
+takes no GIL (`PythonDataPlane::poll_cache_events`,
+`ts-host/src/data_plane.rs`).
+
 The control thread's Python calls run under a thread-local dispatch guard
 (`maybe_control_plane_guard` in `device.py`, on by default), entered while
 it serves: any CUDA tensor op from it raises. Event waits — the inbound
@@ -244,12 +259,19 @@ how long the caller may hold each piece:
 | `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the data plane (`HostDataPlane`) only |
 | `transfer` | the PD peer's settings and device fences (`pd/host_peer.py`): what the Rust transfer peer starts from, and what hands it each plan's remote stream; None outside PD | handed to `ts-pd` at startup, held by the handle |
 | `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 settings (`cache/l3/factory.py`) |
+| `shared_l2_client_config` | the rank's client config for the shared L2 pool (`SharedL2ClientConfig`, `cache/shared_l2/client.py`); None without a pool | consumed at startup, by the scheduler's configuration |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 `HostBootstrap` (`rust_host.py`) turns the build into what the Rust side
 takes: the scheduler, a plain `HostConfig` (with L3, the settings the host
 starts its L3 executor from), and the data plane holding the handle. Nothing
 else of the build crosses.
+A rank with a shared L2 pool starts its client of the pool's owner in the
+host while it builds: the host hands `bootstrap` a shared L2 handle
+(`SharedL2Handle`, `ts-host/src/shared_l2.rs`), as it hands it the PD and peer
+outboxes, the build starts the rank's transfer engine and, once it has
+joined the pool, the client through it (`cache/shared_l2/rank.py`), and the
+loop takes the client from it.
 
 Encoder facts describe the transferred tensor, independently of the language
 embedding width. A model may declare `get_encoder_output_spec()` as a width and
@@ -400,6 +422,11 @@ Consequences:
   the result; on the forward thread, the landing of a completed remote
   prefill and the KV repair after a wake complete before anything queued
   behind them runs. A new blocking operation on the per-round path is a bug.
+  One is registered here: with a shared L2 pool, a round makes one blocking
+  lookup request before its plan when prompts wait to be looked up
+  (`shared_l2_round`). The wait is bounded by the pool client's request
+  timeout, and a request that fails or is not answered in time stops the
+  engine (the *Shared L2 pool* entry of *Subsystems in detail*).
 * Keep per-forward state resets asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden
@@ -578,6 +605,16 @@ the executor's completion poll.
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
 
+A shared L2 pool adds one exception: the pool page behind each proxy Host
+block of an answer reaches the forward thread through the pool client's
+state, not as an argument of a queued operation. The control thread hands
+the client the map when it applies the answers (`map_proxy_blocks`), before it
+queues the plan that may load from those blocks, and the forward thread's
+hand-over of that plan's load-backs reads it there (through the shared L2
+handle, `SharedL2Handle.submit_load`). The scheduler holds a
+proxy block a planned load reads until the load is acknowledged, so no later
+answer remaps the block first.
+
 Completion queries export large logprob columns as CPU buffer views, after
 the result's copy event has landed. The host validates dtype, rank, shape
 and token-ID narrowing, then copies into Rust-owned vectors while Python
@@ -597,6 +634,7 @@ single call:
 | `output` | committing a forward's results: request state, the scheduler's events, the frontend's outputs, logprobs |
 | `cache_ops` | the open cache-op count and the replica-agreed acknowledgments |
 | `l3` | the replica's agreement on its storage executors' reports: the clock, the forward and storage permissions, the queue pressure, each storage operation's outcome |
+| `shared_l2` | a shared L2 pool's client: as the loop sees it, with the writes in flight there, and the client itself (the owner's wire, its write and notice threads, its loads); and the pool's owner, which no rank runs (the *Shared L2 pool* entry of *Subsystems in detail*) |
 | `control` | pause and resume, memory release and resume, the weight-operation and internal-operation queues |
 | `pd` | the transfer peer as the loop sees it, and the per-round agreement on transfer progress |
 | `grammar` | grammar compilation, its cache, and the matchers |
@@ -620,10 +658,10 @@ Consequences:
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-The scheduler advances in exactly two places, both in `EventLoop::round`
-itself — never in a helper or subsystem. Helpers RETURN their events, or push
-them into the round's `events` list. Reading the round alone must reveal
-every point where the scheduler's state advances, and why:
+The scheduler advances at three explicit points in `EventLoop` — never hidden
+inside a subsystem. Helpers RETURN their events, or push them into the round's
+`events` list. Reading `EventLoop` must reveal every point where the
+scheduler's state advances, and why:
 
 * **Head of the round** — completed Host cache ops (`CacheOps::acknowledged`:
   `WriteBackDone`, `LoadBackDone`, `SnapshotDone`, `RestoreDone`, each
@@ -633,13 +671,25 @@ every point where the scheduler's state advances, and why:
   *before* `next_execution_plan`; otherwise, cache-gated admissions -- a
   request whose stored prefix landed in Host, a suspended request's restore,
   which waits for both of its store ACKs, then its own -- are delayed by a
-  full round.
+  full round. With a shared L2 pool a finished write is one more kind of
+  acknowledgment in the same batch. Its lookups' answers are applied after
+  it, right before the plan, in `shared_l2_round`, which `round_with` calls
+  (`apply_shared_l2_answers`, one call). An answer is not an event: the proxy
+  blocks it creates go back to the pool's client.
 * **Tail of the round** — forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
+* **Peer holder synchronization** — in coordinated mode, after a lock-release
+  window where `ts-peer-servicer` may have answered `Lookup`/`Pin`/`Release`
+  RPCs (`warm_up`, `gate()` when single-member with no in-flight forward or
+  unconfirmed device copy batch, and `finish_drain`), `sync_peer_holder_changes`
+  drains queued holder events and applies them through `advance_peer` before
+  the next plan or cache clear runs. Single-member replicas in autonomous mode
+  apply holder exports directly on the peer worker thread without using this
+  point.
 
 Anything that produces scheduler events (a new transfer backend, a new async
-op kind) either returns events into one of these two points or adds a new
+op kind) either returns events into one of these points or adds a new
 explicit call site in `round` with a comment stating why the existing points
 don't fit. It must not advance the scheduler itself.
 
@@ -663,6 +713,16 @@ pending commit's side effects must commit the queue first, and
 eager-grammar batch, whose bitmask fill reads matchers only a pending commit
 advances). Rounds that run no real forward (a frozen pause, a DP idle forward)
 commit the queue fully.
+
+One dependency on uncommitted forwards is handled in a second place, by
+waiting for the commits instead of forcing them: a shared L2 pool's write,
+whose Device blocks a forward in flight may still be filling (the special
+cases of the *Shared L2 pool* entry in *Subsystems in detail*). The write is
+no dispatch to the data plane, so `shared_l2`'s `Pool` keeps the op
+(`withheld_writes`) until the forwards that were in flight when its plan was
+made are committed, which `commit_down_to` reports one by one, and the queue
+keeps its depth. It is the only dependency handled outside
+`plan_and_dispatch`.
 
 Prefer removing a dependency over registering one. The P-side remote decode
 was registered here until the C++ scheduler learned to hold it until its
@@ -847,9 +907,13 @@ address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered
-requests never register one. An empty memory-resume request is a successful
+requests never register one. An explicit empty release list is refused before
+the scheduler drains. Omitting the list releases all configured regions.
+An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+The following memory-release and NCCL coordination uses protocol 2.
 
 With attention DP, memory release waits for every rank to stop admissions
 and drain its requests, forwards, cancelled embedding receives, cache copies,
@@ -906,6 +970,29 @@ Until all regions are restored on every rank, it withholds forward permission
 through the scheduler's storage tick and suppresses idle forwards. This covers
 staggered and partial resumes without building a batch that cannot execute;
 control operations and cache acknowledgments continue to progress.
+
+**Coordinated memory transitions (protocol 3)** extend the same control gate
+from 12 columns under protocol 2 to 15. The three added values coordinate
+call readiness, cancellation and timeout over the replica, or the existing
+attention-DP domain when present, including shared MoE TP/EP. All members
+must match direction, canonical tags and any transition ID before pause or
+allocator changes. Normal and idle forwards can progress while a call waits
+for missing participants. Cancellation and timeout refuse the whole observed
+batch at that gate; cancellation preserves the current device mappings.
+
+Release checks device prerequisites before its drain and again after the
+domain drains requests, forwards, cache work and PD transfers. Every stage
+must retire its KV transfers before source KV is released. Readiness is MIN-reduced directly
+over this domain. All members must report L1 clearability before any index
+is cleared; resume checks local prerequisites, including valid weights before
+KV wake. Successful tags and replies are published only after every member
+confirms device completion. A device-apply failure or L1-clear failure after
+readiness agreement is fatal to the entire domain through the host failure
+path, including otherwise healthy ranks; deployment supervision owns recovery.
+
+Protocol selection, startup compatibility, the timeout/retry contract and
+NCCL participation requirements are defined in the
+[memory-transition serving contract](../serving/ascend-memory-saver.md#memory-transition-protocol).
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
@@ -1033,6 +1120,184 @@ holds no pages yet finishes there (the forward path would never reap it),
 any other detaches from its storage work. Without L3 the round runs none of
 this. L3 requires PP=1; the D role receives its missing cache from its
 prefill peer.
+
+**Shared L2 pool** (`shared_l2`, `--shared-l2-config`). The rank's Host tier
+is the proxy of one Host L2 pool that every rank shares; its main rule, three
+sentences on the lookup, the hit and the write, is stated in the
+[scheduler design](scheduler.md#1-admission-is-per-chunk) (*A shared L2 pool
+is asked before admission, never by it*).
+
+The C++ scheduler decides what to ask the pool and what to write, the pool's
+client (`RankClient`, `ts-control/src/shared_l2/client.rs`) talks to the
+owner and copies between the rank's Device blocks and the providers' pages
+over the host's transfer engine, and the loop relays between the two. The
+rank joins the pool at device build and starts the client then
+(`cache/shared_l2/rank.py`, through the host's shared L2 handle). The pool
+needs a replica of one member (attention TP 1, no pipeline): the client
+answers one rank.
+
+The pool's owner is a process of its own and runs no loop of this document.
+Its launcher (`python -m tokenspeed.runtime.cache.shared_l2 owner`) builds
+the scheduler's `SharedL2Pool` when the first rank reports its cache geometry
+(`cache/shared_l2/owner.py`), and the host extension serves the pool on one
+thread with the GIL released (`run_shared_l2_owner` in
+`ts-host/src/shared_l2_owner.rs`, over `Owner::serve` in
+`ts-control/src/shared_l2/owner.rs`), as a rank's host drives a scheduler
+that Python built. That module's header lists the requests the owner
+answers.
+
+The loop's part:
+
+* *Lookups.* A round that may forward starts, right before its plan
+  (`shared_l2_round`, one call in `round_with`), the lookups of the waiting
+  prompts the scheduler has not handed out yet (`start_shared_l2_lookups`)
+  and, if there are any, asks the owner about all of them in one request
+  (`PoolClient::lookup`). The round waits for the reply, for up to the
+  client's request timeout, and applies the answers in one call before it
+  plans (`apply_shared_l2_answers`): a prompt taken in at
+  the head of a round is admitted by that round's plan, behind the prefix
+  the pool holds for it, and a miss, which is only an answer in which the
+  owner names no page for the prompt, computes as on a rank without a pool.
+  The proxy blocks the answers created go back to the client in one call
+  (`map_proxy_blocks`), which maps them to pool pages before any plan can
+  load from them. No
+  lookup is sent anywhere else. On ranks whose rounds attention DP keeps in
+  step, the request lies between the round's two DP collectives, the gate
+  and the batch gather, on the asking rank alone: its peers wait for it at
+  the gather as they wait for a rank whose commit takes longer.
+* *Poll.* The head of every round polls the client
+  (`PoolClient::poll_writes`, which never waits), whether or not a write is
+  in flight. The poll returns
+  the writes the client finished, which reach the scheduler as
+  acknowledgments in the head's `advance_head` and let go of the Device
+  blocks they read, and raises a failure that the client recorded on its
+  own threads for a write or a notice (a release, a touch, a ping), before
+  that round plans. An idle rank's loop still runs a round about every
+  10 ms (its wait for a request), so it reads a failed ping within about
+  that time.
+* *Ops.* Each plan's shared L2 ops (write, release, touch) go to the
+  client when the plan is dispatched, next to the L3 submit; the client
+  carries them out on its own threads. A plan that carries shared L2 ops
+  only is not handed to the data plane.
+
+A hit's load is not the loop's: it is a load-back of the plan, which the
+forward thread hands to the client's loader before it puts the load's waits
+on its streams (`SharedL2LoadExecutor.submit_load_backs`, `Loads::submit` in
+`ts-control/src/shared_l2/load.rs`). Handed over first, a load the loader
+refuses leaves no stream waiting on a word that nobody sets; the loader
+reads nothing before the load's start word anyway, which the stream writes
+once the plan's page zeroing is done. The loader then reads the pages layer
+by layer and sets each layer's ready word, and the acknowledgment returns
+through the loop's poll of the data plane's cache acknowledgments, counted
+and agreed between the ranks like any other (`cache_ops`). The host answers
+that poll from the loader's finished loads without entering Python
+(`PythonDataPlane::poll_cache_events`): load-backs are the only cache ops of
+a pool rank that the data plane acknowledges, since its plans carry no
+write-back (the pool is written by the client) and no snapshot store or
+restore (a pool rank does not retract). The poll raises a failure the client
+recorded, like the client's own poll.
+
+The special cases, one sentence each, with where the code is:
+
+* *A pool operation fails.* Every failure of the pool is a loop error and
+  stops the engine, as a failed load-back does: a lookup request the owner
+  did not answer in time or answered with an error, a reply without one hit
+  for each lookup, an answer the scheduler cannot apply (it names no prompt
+  that waits for one, lies outside its prompt, or is malformed), a write
+  that failed at its reservation, its copy or its commit, a release or a
+  touch the owner refused, a ping the owner did not answer, an owner that
+  does not know the rank (`PoolError` in `ts-control/src/shared_l2/mod.rs`,
+  raised by the lookup, by the poll and by the check when a forward has
+  landed; `ApplySharedL2Answers` for an answer). A panic of the client's
+  load thread, of a write thread or of its notice thread is that thread's
+  failure and stops the engine the same way (`panic_as_failure`, same
+  file).
+* *A write names blocks a forward in flight may still be filling.* The
+  scheduler starts a publication's write in the plan after its chunk's,
+  whether or not the chunk's forward landed, and the client reads the
+  Device blocks over RDMA, which nothing orders behind the device's
+  streams, so a plan's writes are withheld until the forwards that were in
+  flight when the plan was made are committed (`Pool::dispatch` and
+  `Pool::forward_landed` in `shared_l2/mod.rs`, the second called from
+  `commit_down_to`).
+* *The lone-request compaction would move a block a queued write names.* A
+  publication that waits in the store queue for its write pins nothing, and
+  a write started in the compaction's plan would name a block that plan's
+  copy has yet to fill, which the client reads outside the device's
+  streams, so the scheduler compacts no request while one waits, and a
+  plan's own copies fill no block its writes name
+  (`LoneRequestRecovery::AdmitFirstChunk` and `AdmitStep`,
+  `scheduler/lone_request_recovery.cpp`; [scheduler](scheduler.md) §1.4).
+* *A load from the pool fails.* The loader lets the forward that waited on
+  the load go, over pages it never filled, and the failure stops the engine
+  before the results of that forward are committed or streamed: the loader
+  records the failure for the client before it sets the ready words that
+  let the forward go (`Loader::run` in `shared_l2/load.rs`, into the
+  client's `FailureLatch`), and the loop checks the client when the forward
+  has landed, before it commits (`Pool::forward_landed`, called from
+  `commit_down_to`).
+* *A client thread that does not end at shutdown.* A thread that still
+  waits for the owner or for a copy when the rank closes keeps its socket,
+  the transfer engine, the registered cache and the signal words in use, and
+  a stream may still wait on a ready word it would have set, so the close
+  waits for the threads for 10 seconds and then leaves all of those, and
+  the streams, as they are for the process's exit to take. When every
+  thread has ended, the close itself stops the transfer engine, after them,
+  and the rank then synchronizes its streams and frees the words
+  (`RankThreads::close` in `shared_l2/client.rs`;
+  `SharedL2LoadExecutor.shutdown`).
+* *A frozen round.* Its plan forwards nothing and starts no write, but it
+  still releases the tickets nothing holds any more, such as one whose last
+  holder was a load-back acknowledged at the round's head, so a frozen
+  round hands its plan's shared L2 ops to the client too and the owner does
+  not keep those pages pinned (`Pool::dispatch` in the frozen branch of
+  `round_with`).
+* *A cache flush or a stall count while a write is in flight.* A pool write
+  the client has not reported is a cache transfer in flight: a flush, which
+  clears the rank's Device cache and its proxy Host tier and leaves the pool
+  to the ranks that go on loading from it (the pool is emptied at its owner,
+  `clear`), is refused like every flush during a transfer, because the
+  write reads Device blocks the flush would drop, and the scheduler's stall
+  diagnostic counts no stall, so a request that waits behind the write is
+  not aborted for no progress (`TierTransferManager::HasAnyInFlight`,
+  `cache/tier/transfer_manager.h`).
+* *A weight load or a forward reload.* The pool has no weight version, so a
+  page written under one set of weights, or by one forward, would be read
+  back under another: with a pool the loop refuses the operation when it
+  arrives, before it is queued for the gate, so nothing drains and nothing
+  is flushed for it (`EventLoop::control`).
+* *KV the pool holds past its last checkpoint.* The answer reports how far
+  that KV reaches, and the reach joins the Host tier's KV reach, so the
+  prompt's first chunk is cut at that junction and the checkpoint cut
+  there is where the next prompt sharing that KV, on any rank, resumes
+  (`AdmissionResources::shared_l2_kv_tokens`, read by
+  `Scheduler::matchPrefixAtAdmission` in `scheduler/operations/forward.cpp`).
+* *A configuration the pool does not cover.* It is refused at start and
+  never served around: the server arguments refuse it
+  (`ServerArgs.validate_cache_options`, `resolve_retraction_snapshot_options`
+  and `validate_startup_requests`; `resolve_dspark_prefix_replay_tokens` for
+  a DSpark captured-context replay), `SchedulerConfig::Validate` refuses
+  again what the scheduler relies on (the P and fused roles only, prefix
+  caching, a write-through Host policy, replicated groups, no L3, no
+  snapshot pool, so that a pool rank never retracts, and no peer prefix
+  sharing, whose holder would export proxy blocks that hold no bytes), a
+  rank refuses to start on a device without ordered GPUDirect RDMA writes or
+  CUDA stream memory operations (`cache/shared_l2/executor.py`), and the
+  owner refuses a rank whose cache geometry or deployment identity differs
+  from the first rank's (`Owner::hello` in
+  `ts-control/src/shared_l2/owner.rs`); the
+  [server configuration](../configuration/server.md#shared-l2-pool) has the
+  operator's list.
+* *A hit the proxy Host tier has no room for.* It is a fatal check and not
+  a miss: the tier holds at most what the pool pins and is sized past the
+  pool (`SharedL2Proxy::MirrorAnswer`, `cache/tier/shared_l2_proxy.cpp`).
+
+Known limit: nothing guards a rank process that was frozen for longer than
+the owner's client timeout; the
+[server configuration](../configuration/server.md#shared-l2-pool) says what
+it can read and write after it resumes, and what an operator does about it.
+
+Without a pool the loop makes none of these calls.
 
 **PD source retirement.** A terminal status alone does not release source
 pages. The prefill peer counts queued and executing transfer jobs. A failure
@@ -1329,12 +1594,17 @@ For orientation, one `EventLoop::round`:
    same-round gate.
 2. Agree the L3 reports into the round's storage tick (without L3, a tick
    only when a freeze starts or ends); while a cache op is open, poll the
-   data plane's acknowledgments and intersect them; then **advance the
-   scheduler (head)** with both, so this round's plan sees them.
+   data plane's acknowledgments and intersect them; with a shared L2 pool,
+   poll its client for the finished writes and for a failure it stored;
+   then **advance the scheduler (head)** with all of it, so this round's
+   plan sees them.
 3. Frozen? Commit what is dispatched, plan (the tick forbade forwards, so
    the plan carries cache and storage work only) and dispatch that work,
    and join the attention-DP agreement.
-   Otherwise: plan (`next_execution_plan`), count its cache ops, finish the
+   Otherwise: with a shared L2 pool, look the waiting prompts not asked yet
+   up in one request, wait for the reply and apply the answers
+   (`shared_l2_round`); then plan
+   (`next_execution_plan`), count its cache ops, finish the
    requests the plan aborted (`plan.aborts`: a capacity retraction whose
    victim could not be imaged aborted the newest resident inside the plan
    build; the scheduler released its pages in that round and emits nothing
@@ -1346,7 +1616,8 @@ For orientation, one `EventLoop::round`:
    a pending commit (Principle 4).
 4. **One `DataPlane::execute(plan, dispatch)` per round** that has device
    work, after the control thread submitted the plan's storage operations to
-   the L3 executor (Host workers: no stream, no Device page). The forward
+   the L3 executor (Host workers: no stream, no Device page) and its shared
+   L2 ops to the pool's client. The forward
    thread adapts the plan's cache ops once (`cache_ops_from_plan`), sets the
    storage subset aside and turns the rest into one
    `DeviceHandle.execute(plan, planned, cache_ops=...)`, which submits in an
@@ -1461,8 +1732,9 @@ variants as in model warmup. Only
 then does the host complete the frontend handshake and report ready: no
 client request waits behind them or is timed with them.
 
-A disaggregated node is refused (its requests need a peer), and so is an
-L3 store (the flush would delete its shared namespace).
+A disaggregated node is refused (its requests need a peer), and so are an
+L3 store (the flush would delete its shared namespace) and a shared L2 pool
+(the flush would leave the startup prefixes in the pool).
 
 ## Checklist for extending the loop
 

@@ -261,6 +261,7 @@ class TestDeferredDecodeState:
                 landing_tier=ts.PeerLandingTier.Device,
                 max_host_landing_blocks=0,
                 host_ready_timeout_us=0,
+                versioned_shards=False,
             )
         groups = cfg.cache_groups
         for group in groups:

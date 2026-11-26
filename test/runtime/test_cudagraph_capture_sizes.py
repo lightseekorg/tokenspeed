@@ -81,6 +81,7 @@ def _config(
         query_shard_rank=0,
         prefill_graph_max_tokens=256,
         enable_memory_saver=False,
+        acl_graph_memory_policy="discard",
     )
 
 

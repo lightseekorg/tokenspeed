@@ -729,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_usage_is_independent_of_stream_chunking() {
+        // The LongCat adapter supplies the ids of <longcat_think> and
+        // </longcat_think>; the counter uses the same path as other parsers.
+        let grammar = reasoning(Some((1, 2)), None);
+        for (prompt, output, expected) in [
+            (vec![1], vec![10, 11, 2, 12, 13], 2),
+            (vec![1, 2], vec![12, 13], 0),
+            (vec![], vec![1, 10, 11, 2, 12], 2),
+            (vec![1, 10, 2, 12, 1], vec![10, 11], 2),
+            (vec![1], vec![2, 12], 0),
+        ] {
+            for chunk_size in 1..=output.len() {
+                let mut tokens = ReasoningTokens::new(&grammar, &prompt);
+                for chunk in output.chunks(chunk_size) {
+                    tokens.push(chunk.iter().copied());
+                }
+                assert_eq!(tokens.count(), expected, "prompt: {prompt:?}");
+            }
+        }
+    }
+
+    #[test]
     fn the_budget_ends_a_request_before_a_stop_token() {
         let mut request = state(2, &[7]);
         request.output_ids = vec![1, 7];

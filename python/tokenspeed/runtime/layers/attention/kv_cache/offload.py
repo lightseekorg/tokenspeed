@@ -61,28 +61,30 @@ class OffloadField:
     active_tokens: int = 0  # Prepared write rows awaiting commit.
 
     @property
-    def device_nbytes(self) -> int:
-        return sum(
-            t.nbytes
-            for t in (
-                self.device,
-                self.keys,
-                self.seeded,
-                self.miss_ids,
-                self.miss_dst,
-                self.indices,
-                self.entry_dest,
-                self.hash_keys,
-                self.hash_owners,
-                self.lru_slots,
-                self.slot_order,
-                self.free_counts,
-                self.miss_counts,
-                self.current_full,
-                self.current_hot,
-                self.accepted_full,
-            )
+    def device_buffers(self) -> tuple[torch.Tensor, ...]:
+        """Device allocations owned here; Host history belongs to the arena."""
+        return (
+            self.device,
+            self.keys,
+            self.seeded,
+            self.miss_ids,
+            self.miss_dst,
+            self.indices,
+            self.entry_dest,
+            self.hash_keys,
+            self.hash_owners,
+            self.lru_slots,
+            self.slot_order,
+            self.free_counts,
+            self.miss_counts,
+            self.current_full,
+            self.current_hot,
+            self.accepted_full,
         )
+
+    @property
+    def device_nbytes(self) -> int:
+        return sum(t.nbytes for t in self.device_buffers)
 
 
 class SparseKVOffload:
@@ -345,6 +347,19 @@ class SparseKVOffload:
     def synchronize(self):
         self.prefetch_stream.synchronize()
         self.write_stream.synchronize()
+
+    def release_probe_storage(self) -> None:
+        """Discard a quiesced probe's hot KV, metadata and prepared batch storage.
+
+        The caller has drained the device and destroyed the captured graphs.
+        Retained views must not execute again. The arena releases Host history.
+        """
+        for state in self.fields.values():
+            for buffer in state.device_buffers:
+                buffer.untyped_storage().resize_(0)
+        for buffer in (self.requests, self.valid_requests):
+            if buffer is not None:
+                buffer.untyped_storage().resize_(0)
 
     def clear(self):
         for state in self.fields.values():

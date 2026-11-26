@@ -119,14 +119,53 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
     return tag.model_dump_json(by_alias=True)
 
 
+def _structural_tag_for_longcat(
+    content_format: Any, *, prompt_opens_reasoning: bool
+) -> str:
+    """Constrain LongCat's answer after its free-form reasoning block.
+
+    Continue the block when the prompt opened it; otherwise allow an optional
+    ``<longcat_think>...</longcat_think>`` block before the answer. Standard
+    tag primitives avoid requiring the native LongCat tool-protocol extension;
+    this wrapper does not implement that tool protocol.
+    """
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        OptionalFormat,
+        SequenceFormat,
+        StructuralTag,
+        TagFormat,
+    )
+
+    reasoning = TagFormat(
+        begin="" if prompt_opens_reasoning else "<longcat_think>",
+        content=AnyTextFormat(),
+        end="</longcat_think>",
+    )
+    tag = StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                (
+                    reasoning
+                    if prompt_opens_reasoning
+                    else OptionalFormat(content=reasoning)
+                ),
+                content_format,
+            ]
+        )
+    )
+    return tag.model_dump_json(by_alias=True)
+
+
 def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
     """Return the strings that open and close the reasoning block.
 
     For example ``("<think>", "</think>")``. They are read from xgrammar's
-    builtin template in ``"auto"`` mode, where the block is optional and
-    keeps its opener. Returns ``None`` when the parser has no mapping or the
-    template has another layout.
+    builtin template in ``"auto"`` mode, or the model-specific layout.
+    Returns ``None`` when neither supplies a pair of markers.
     """
+    if reasoning_parser == "longcat_xml":
+        return ("<longcat_think>", "</longcat_think>")
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
     if model is None:
         return None
@@ -165,9 +204,13 @@ def structural_tag_for_reasoning_response(
     ``"enabled"`` mode). If not, the reply may open the block itself or
     answer directly (``"auto"``).
 
-    Returns ``None`` if ``reasoning_parser`` has no xgrammar mapping —
+    Returns ``None`` if ``reasoning_parser`` has no supported layout —
     the caller should leave the user's constraint unchanged in that case.
     """
+    if reasoning_parser == "longcat_xml":
+        return _structural_tag_for_longcat(
+            content_format, prompt_opens_reasoning=prompt_opens_reasoning
+        )
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
     if reasoning_parser == "inkling2":
@@ -320,7 +363,15 @@ def _reasoning_implicit_closer_id(reasoning_parser: str, tokenizer) -> int | Non
 def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | None:
     """The engine's ``ReasoningGrammar`` for ``reasoning_parser``, or None
     when xgrammar has no template for it: a JSON schema then constrains the
-    whole reply."""
+    whole reply.
+
+    The engine's ``--reasoning-parser`` enables this configuration; setting a
+    frontend parser alone does not enable the engine counter. Single-token
+    markers also enable host-side usage accounting, independently of schema
+    constraints, including with ``--grammar-backend none``. The host excludes
+    prompt tokens and delimiters, continues a prompt-opened reasoning block,
+    and counts committed reasoning tokens even without a generated closer.
+    """
     from xgrammar.structural_tag import JSONSchemaFormat
 
     tags = [

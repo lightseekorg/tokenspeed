@@ -27,7 +27,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
@@ -253,3 +255,65 @@ def test_json_schema_wrap_assumes_open_reasoning_without_marker_tokens():
 
     assert _accepts(structural_tag, "Paris.\n</think>\n\n" + _ANSWER)
     assert not _accepts(structural_tag, _ANSWER)
+
+
+@pytest.fixture
+def longcat_tokenizer():
+    # A real tokenizer with a small vocabulary; no model download is needed.
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(
+                {"[UNK]": 0, "<longcat_think>": 1, "</longcat_think>": 2},
+                unk_token="[UNK]",
+            )
+        ),
+        unk_token="[UNK]",
+    )
+    return tokenizer
+
+
+def test_longcat_reasoning_usage_has_token_boundaries(longcat_tokenizer):
+    grammar = reasoning_grammar("longcat_xml", longcat_tokenizer)
+    assert grammar is not None
+    assert grammar.markers == (1, 2)
+    assert grammar.implicit_closer is None
+
+
+@pytest.mark.parametrize(
+    "prompt_ids,accepted,refused",
+    [
+        ([1], ["thinking</longcat_think>" + _ANSWER], [_ANSWER]),
+        (
+            [1, 2],
+            [_ANSWER, "<longcat_think>thinking</longcat_think>" + _ANSWER],
+            ["thinking</longcat_think>" + _ANSWER],
+        ),
+        (
+            [],
+            [_ANSWER, "<longcat_think>thinking</longcat_think>" + _ANSWER],
+            ["thinking</longcat_think>" + _ANSWER],
+        ),
+    ],
+)
+def test_longcat_schema_waits_for_reasoning(
+    longcat_tokenizer, prompt_ids, accepted, refused
+):
+    grammar = reasoning_grammar("longcat_xml", longcat_tokenizer)
+    assert grammar is not None
+    tag = _host_tag(grammar, prompt_ids)
+    for reply in accepted:
+        assert _accepts(tag, reply), reply
+        assert not _accepts(tag, reply.replace(_ANSWER, _WRONG_ANSWER))
+    for reply in refused:
+        assert not _accepts(tag, reply), reply
+
+
+def test_longcat_unknown_tokens_are_not_reasoning_markers():
+    # A tokenizer for another model maps both tags to its unknown token.
+    longcat_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    grammar = reasoning_grammar("longcat_xml", longcat_tokenizer)
+    assert grammar is not None
+    assert grammar.markers is None

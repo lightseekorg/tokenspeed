@@ -194,6 +194,7 @@ class _CPUInputGraph(PrefillGraph):
             disable_prefill_graph=False,
             prefill_graph_max_tokens=4,
             prefill_graph_capture_sizes=[4],
+            acl_graph_memory_policy="discard",
         )
         runner = _CPURunner(model, _RunnerConfig(False), True, False)
         super().__init__(
@@ -202,7 +203,9 @@ class _CPUInputGraph(PrefillGraph):
             token_to_kv_pool=None,
             input_buffers=None,
             config=config,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(
+                enable=False, device="cpu"
+            ),
             drafter=None,
             num_warmup=0,
             graph_supported=True,

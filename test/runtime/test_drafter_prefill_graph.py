@@ -356,6 +356,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         enable_memory_saver=False,
         prefill_graph_max_tokens=32,
         prefill_graph_capture_sizes=[16, 32],
+        acl_graph_memory_policy="discard",
     )
     return prefill_graph_module.PrefillGraph(
         model_runner=model_runner,
@@ -363,7 +364,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         token_to_kv_pool=None,
         input_buffers=None,
         config=config,
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
 
 

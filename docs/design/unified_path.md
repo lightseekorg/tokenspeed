@@ -422,9 +422,13 @@ from one first bound to that pool:
   one pool, was reserved 11.64 GB and booted with 6.64 GB more device memory
   free than the same launch without the ladder.
   The result is reduced across ranks with MAX. The orchestrator
-  releases the probe's graphs and collects the cycles they sit in, then
-  rebuilds on the memory profile the probe build took -- where a boot without
-  a reserve takes it -- minus the projection. The reserve covers the bytes
+  releases the probe's graphs and collects the cycles they sit in. It then
+  discards the probe arena's backing storage before allocating the serving
+  arena, including sparse offload's Host history, device hot KV, residency
+  metadata and prepared batch tensors. The old views can still carry geometry
+  into the rebind, but must not read or write retired storage. The serving
+  pool is sized from the profile the probe build took minus the projection.
+  The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
   probe releases them and the serving capture pays them again. On CUDA, what

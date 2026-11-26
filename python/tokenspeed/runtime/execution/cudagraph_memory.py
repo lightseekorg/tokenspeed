@@ -280,15 +280,18 @@ def reserve_and_rebind(
 ) -> AttentionBuild:
     """Measure a capture on the probe pool, then rebuild the real one under it.
 
-    Order: measure, release (``empty_cache`` cannot return a live graph pool),
-    rebuild on the probe build's memory profile less the reserve, publish. The
-    backends are handed back rather than rebuilt, so what serves is what was
-    measured.
+    Release the probe's graph and KV storage before allocating the serving
+    arena from the original profile less the reserve. Reuse the measured
+    backends and publish their new pool geometry to the executor.
     """
     graph_reserve_bytes = probe_cudagraph_memory(
         executor, server_args, gpu_id, startup_resident_bytes=startup_resident_bytes
     )
+    device = torch.get_device_module(server_args.device)
+    device.synchronize(gpu_id)
     executor.release_graphs()
+    executor.token_to_kv_pool.arena.release_probe_storage()
+    device.empty_cache()
     attention = build_components(
         graph_reserve_bytes=graph_reserve_bytes,
         probe_batch_rows=None,

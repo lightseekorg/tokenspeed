@@ -140,6 +140,7 @@ class CpuConfig:
     startup_requests: bool = False
     memory_saver: bool = False
     memory_regions: tuple = ()
+    backup_device_kv: bool = False
     allow_reload_forward: bool = False
     l3: object = None
     disk: object = None
@@ -222,7 +223,10 @@ class CpuBootstrap:
 
 retained_schedulers = []
 
-def bootstrap(*args):
+def prepare_bootstrap(fd):
+    return False, start
+
+def start(outbox, protocol, spans, peer, shared):
     result = CpuBootstrap()
     if retain_owner:
         # Keep an explicit native owner as well as the frozen Python cycle:

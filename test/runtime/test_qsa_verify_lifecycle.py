@@ -458,6 +458,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         attention_tp_size=attn_tp_size,
         moe_tp_ep_size=moe_ep_size,
         world_size=world_size,
+        acl_graph_memory_policy="discard",
     )
     runner = ForwardStepRunner(
         forward_func=lambda *args, **kwargs: None,

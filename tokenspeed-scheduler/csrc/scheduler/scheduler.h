@@ -41,6 +41,7 @@
 #include "cache/tier/disk_manager.h"
 #include "cache/tier/peer_exports.h"
 #include "cache/tier/peer_host_landings.h"
+#include "cache/tier/shared_l2_proxy.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -161,12 +162,32 @@ public:
     // Resident chunks must be able to consume their own reservations.
     static constexpr float kPrefillWatermark = 0.9F;
 
+    // With a shared L2 pool (SchedulerConfig::shared_l2_config) a waiting
+    // prompt is admitted only once its lookup is answered. Before a plan the
+    // runtime starts the lookups, asks the pool's owner about all of them in
+    // one request, waits for its reply and applies the answers.
+    //
+    // The waiting prompts' lookups not handed out yet, each once. A prompt
+    // whose Device prefix already covers what it may reuse asks nothing.
+    std::vector<SharedL2Lookup> StartSharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier, each for the
+    // request it names; returns the proxy blocks created, each with the pool
+    // page a load-back from it reads. An answer the scheduler cannot take --
+    // one whose request has no lookup that waits for it, that lies outside
+    // its prompt, or that does not name, under a ticket, a bucket and a page
+    // for each key of the rank's cache groups and a tail inside a page --
+    // throws std::invalid_argument, and the runtime stops serving: nothing of
+    // that answer is kept, and the answers after it are not applied.
+    std::vector<SharedL2ProxyBlock> ApplySharedL2Answers(const std::vector<SharedL2Answer>& answers);
+
     void Advance(const ExecutionEvent& event);
     KvEventBatch DrainKvEventBatch();
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
     bool ClearL1Cache();
+    // Same Device L1 readiness checks as ClearL1Cache, with no mutation.
+    bool CanClearL1Cache() const;
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
@@ -237,13 +258,17 @@ public:
     // A holder's answers: reads of the cache as it stands, which the runtime
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
-    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases) const {
+        if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
+            return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
+        }
         return PeerExports::AnswerLookup(coordinator_, lookup);
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages) const;
+    bool PeerLeaseCanPin(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->CanPin(lease); }
     std::shared_ptr<PeerPinRelease> PeerReleaseHandle(const PeerLeaseId& id) {
-        return peer_exports_->ReleaseHandle(id);
+        return peer_exports_ ? peer_exports_->ReleaseHandle(id) : nullptr;
     }
     bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
     // Plans built so far: no cache entry leaves between two plans.
@@ -264,6 +289,10 @@ public:
     bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
     void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint);
     void ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us);
+    // v1 member tickets are independent of legacy messages and timers.
+    bool PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us);
+    bool ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us);
+    void RetirePeerTarget(const PeerLeaseId& lease) { peer_target_holds_.erase(lease); }
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
     }
@@ -688,6 +717,7 @@ private:
     bool ownsStorageLease(const StorageLease& lease) const;
     bool peerHostLandingsPending() const { return peer_host_landings_ && peer_host_landings_->NumLandings() > 0; }
     std::int32_t cacheablePrefixTokens(const Request& request) const;
+    void handleEvent(const cache::SharedL2WriteDone& event);
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
@@ -991,9 +1021,14 @@ private:
     std::unique_ptr<StorageTransferManager> storage_transfers_;
     // The Disk tier's prefetches and cleaning writes; null without one.
     std::unique_ptr<DiskTransferManager> disk_transfers_;
+    // The rank's proxy of its shared L2 pool; null without one.
+    std::unique_ptr<SharedL2Proxy> shared_l2_proxy_;
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
     std::unique_ptr<PeerExports> peer_exports_;
+    std::unique_ptr<PeerExports> peer_offer_tickets_;
+    std::unordered_map<std::string, PeerLeaseId> peer_target_attempts_;
+    std::unordered_map<PeerLeaseId, std::vector<CacheBlockRef>, PeerLeaseIdHash> peer_target_holds_;
     // A reader's landings into Host, with PeerLandingTier::kHost; null
     // otherwise. The fetches started since the last plan go out with it.
     std::unique_ptr<PeerHostLandings> peer_host_landings_;

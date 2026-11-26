@@ -38,6 +38,10 @@ impl Writer {
         self.0.push(value);
     }
 
+    pub(crate) fn fixed(&mut self, value: &[u8]) {
+        self.0.extend_from_slice(value);
+    }
+
     pub(crate) fn flag(&mut self, value: bool) {
         self.0.push(u8::from(value));
     }
@@ -112,7 +116,7 @@ impl<'a> Reader<'a> {
         Some(taken)
     }
 
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
         self.take(N)?.try_into().ok()
     }
 

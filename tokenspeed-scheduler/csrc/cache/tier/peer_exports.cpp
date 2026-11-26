@@ -141,6 +141,19 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 
+bool PeerExports::CanAcceptLookup(const PeerLeaseId& lease, std::size_t pending_new_leases) const {
+    if (leases_.contains(lease)) {
+        return true;
+    }
+    const auto limit = static_cast<std::size_t>(max_leases_);
+    return leases_.size() < limit && pending_new_leases < limit - leases_.size();
+}
+
+bool PeerExports::CanPin(const PeerLeaseId& lease) const {
+    const auto it = leases_.find(lease);
+    return it != leases_.end() && it->second.phase == Phase::kSoft;
+}
+
 bool PeerPinRelease::Release() noexcept {
     std::lock_guard lock(mutex_);
     if (released_) return true;
