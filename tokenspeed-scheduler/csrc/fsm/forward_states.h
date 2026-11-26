@@ -216,6 +216,12 @@ struct ForwardResources {
     // still writes KV into this request's tables -- retract it mid-flight
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
+    // A model forward has already run on the request's execution slot
+    // (Request::ExecutionSlot). An admission and a restore build a new
+    // bundle, and the slot is acquired with it (or, for a D-role permit, at
+    // the first decode, the first forward that has one), so the first
+    // forward of each ownership finds this false.
+    bool execution_slot_forwarded{false};
 
     std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }

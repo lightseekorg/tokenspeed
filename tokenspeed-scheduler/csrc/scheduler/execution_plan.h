@@ -24,6 +24,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -60,6 +61,24 @@ struct SchedulerAbort {
     bool operator==(const SchedulerAbort&) const = default;
 };
 
+// One retraction victim's live State block to fold, in one
+// deferred-decode-state group (ExecutionPlan::state_folds). Three int32 in
+// declaration order: the bindings view a group's folds as an (n, 3) array.
+struct StateFold {
+    // The victim's request-pool row.
+    std::int32_t request_slot{-1};
+    // The live block (slot 1 of the group's row).
+    std::int32_t page{0};
+    // Request::ExecutionSlot, taken before the retraction releases it: the
+    // row of the execution workspace holding the victim's decode records. -1
+    // when it holds none: a D-role victim that never got a decode permit.
+    std::int32_t execution_slot{-1};
+
+    bool operator==(const StateFold&) const = default;
+};
+static_assert(std::is_standard_layout_v<StateFold> && sizeof(StateFold) == 3 * sizeof(std::int32_t),
+              "StateFold is viewed as three int32 columns");
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
@@ -94,17 +113,21 @@ public:
     std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
     // The live State blocks of this plan's retraction victims that the
     // runtime must fold, per deferred-decode-state group id
-    // (CacheGroupConfig::deferred_decode_state), as (request pool index, page
-    // id): a decoding victim's accepted decode records stay in its request
-    // slot, outside the block its decode steps write in place. The runtime
-    // folds each slot's records into its block on the execution stream ahead
-    // of the plan's stores, copies, zeroing and forward, so the image and every
-    // reader of the published endpoint see the complete state. A victim is
-    // listed once its retraction published its frontier, also when the image
-    // is then refused and the victim aborted, since the publication stands. A
-    // block the publication swapped for another request's equal entry is not
+    // (CacheGroupConfig::deferred_decode_state), as StateFold rows: a
+    // decoding victim's accepted decode records stay in its execution slot's
+    // workspace, outside the block its decode steps write in place. The
+    // runtime folds each slot's records into its block on the execution
+    // stream ahead of the plan's stores, copies, zeroing and forward, so the
+    // image and every reader of the published endpoint see the complete
+    // state. The retraction releases the execution slot while the plan is
+    // built, and a later row of the same plan may take it as a fresh slot;
+    // the fold runs first, so the new owner's workspace is cleared after it
+    // (docs/design/scheduler.md, Execution slots). A victim is listed once
+    // its retraction published its frontier, also when the image is then
+    // refused and the victim aborted, since the publication stands. A block
+    // the publication swapped for another request's equal entry is not
     // listed: that entry already holds the complete state. No op id, no ACK.
-    std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> state_folds;
+    std::map<std::string, std::vector<StateFold>> state_folds;
     // Set when this plan's retractions published decoded endpoints of
     // deferred-decode-state groups (CacheGroupConfig::deferred_decode_state)
     // while peers can pin. The runtime commits the victims' state before the

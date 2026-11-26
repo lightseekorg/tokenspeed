@@ -572,11 +572,15 @@ private:
     using StateCommitPages = std::set<std::pair<std::uint32_t, std::int32_t>>;
     // The live block (slot 1, which a decode step writes in place) of each of
     // `request`'s deferred-decode-state groups once it has decoded: its
-    // accepted decode records stay in its request slot until the runtime
-    // folds them into that block. None before its first decode.
+    // accepted decode records stay in its execution slot's workspace
+    // (Request::ExecutionSlot) until the runtime folds them into that block.
+    // None before its first decode, nor before its first forward since its
+    // admission or restore (Request::ExecutionSlotForwarded): its slot then
+    // holds no record of its own.
     StateCommitPages liveDeferredStatePages(const Request& request) const;
     // Lists each of `live_state` that `victim` still holds after its
-    // retraction's publication in `plan`'s state_folds. A block the
+    // retraction's publication in `plan`'s state_folds, with the victim's
+    // execution slot: called before the retraction releases it. A block the
     // publication swapped for another request's equal entry is left out: that
     // entry already holds the complete state.
     void planStateFolds(const Request& victim, const StateCommitPages& live_state, ExecutionPlan& plan) const;

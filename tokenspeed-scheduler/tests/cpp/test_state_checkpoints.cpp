@@ -5903,7 +5903,7 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
 // the runtime folds them in where a plan says (ExecutionPlan::state_folds).
 class StateFoldSuite : public StateCheckpointSuite {
 protected:
-    using Folds = std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>>;
+    using Folds = std::map<std::string, std::vector<StateFold>>;
 
     // `snapshot_pages` 0 keeps the suite's pool, which holds any image.
     void Start(bool deferred, std::int32_t snapshot_pages, std::int32_t force_retraction_interval) {
@@ -5918,8 +5918,9 @@ protected:
         scheduler_ = std::make_unique<Scheduler>(config_);
     }
 
-    // Per deferred group, `id`'s request pool index and live block (slot 1)
-    // in `plan`'s batch: what its retraction lists for the fold.
+    // Per deferred group, `id`'s request pool index, live block (slot 1) and
+    // execution slot in `plan`'s batch: what its retraction lists for the
+    // fold.
     Folds LiveBlocks(const ExecutionPlan& plan, const std::string& id) const {
         const ForwardBatch* batch = FindForwardBatch(plan);
         ASSERT_TRUE_OR_RETURN(batch != nullptr, {});
@@ -5930,8 +5931,11 @@ protected:
         Folds folds;
         for (const CacheGroupConfig& group : config_.cache_groups) {
             if (group.deferred_decode_state) {
-                folds[group.group_id].emplace_back(batch->request_pool_indices.at(row),
-                                                   tables.at(group.group_id).at(row).at(1));
+                folds[group.group_id].push_back(StateFold{
+                    .request_slot = batch->request_pool_indices.at(row),
+                    .page = tables.at(group.group_id).at(row).at(1),
+                    .execution_slot = batch->execution_slots.at(row),
+                });
             }
         }
         return folds;
@@ -5981,7 +5985,7 @@ TEST_F(StateFoldSuite, ARefusedImageStillFoldsTheEndpointItsRetractionPublished)
 
     const Resume hit = Probe("hit", {1, 2, 3, 4, 5, 6, 101, 77});
     EXPECT_EQ(hit.prefix_tokens, 7);
-    EXPECT_EQ(hit.state_row.at(0), live.at("state0").front().second) << "the hit reads the folded block";
+    EXPECT_EQ(hit.state_row.at(0), live.at("state0").front().page) << "the hit reads the folded block";
 }
 
 // "a" finishes at 9 computed tokens and publishes that endpoint; "b" extends

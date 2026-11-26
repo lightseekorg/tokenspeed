@@ -137,7 +137,12 @@ using SnapshotSlotAllocator = ReqPoolAllocator;
 using SnapshotSlotIndex = ReqPoolIndex;
 
 // A decode keeps its execution permit across rounds, including finishing
-// forwards and a restore awaiting its ACK. These indices never address data.
+// forwards and a restore awaiting its ACK. On the D role the permit is the
+// request's execution slot (Request::ExecutionSlot): it addresses the
+// runtime's per-slot execution workspace, which therefore needs only
+// max_batch_size rows however many requests are resident. The release
+// points keep that safe: a permit returns only once no forward is in flight
+// for its holder (docs/design/scheduler.md, Execution slots).
 using DecodeSlotAllocator = ReqPoolAllocator;
 using DecodeSlotIndex = ReqPoolIndex;
 

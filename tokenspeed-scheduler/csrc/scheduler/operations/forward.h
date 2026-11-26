@@ -54,6 +54,12 @@ struct ForwardOperationBase {
     std::int32_t request_pool_index{-1};
     std::int32_t input_length{0};
     std::int32_t prefill_length{0};
+    // Request::ExecutionSlot when the row runs in this engine's model batch;
+    // -1 for a row the transfer peer runs (remote prefill or remote decode).
+    std::int32_t execution_slot{-1};
+    // The first forward of the request on execution_slot: the runtime starts
+    // the slot's execution workspace empty before this forward reads it.
+    bool execution_slot_fresh{false};
 
     // Per-group block tables. A History group's row uses absolute
     // logical-page indexing; null holes are page 0 and rows are not
@@ -170,6 +176,10 @@ private:
 struct ForwardBatch {
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
+    // Parallel to request_pool_indices: ForwardOperationBase::execution_slot
+    // and ForwardOperationBase::execution_slot_fresh.
+    std::vector<std::int32_t> execution_slots;
+    std::vector<bool> execution_slot_fresh;
     std::vector<std::int32_t> input_lengths;
     // Per-request total number of prompt tokens (Request::PrefillSize()).
     std::vector<std::int32_t> prefill_lengths;
@@ -209,6 +219,8 @@ struct ForwardBatch {
         }
         request_ids.reserve(ops.size());
         request_pool_indices.reserve(ops.size());
+        execution_slots.reserve(ops.size());
+        execution_slot_fresh.reserve(ops.size());
         input_lengths.reserve(ops.size());
         prefill_lengths.reserve(ops.size());
         input_ids.reserve(input_tokens);
@@ -224,6 +236,8 @@ struct ForwardBatch {
                 [this](auto& inner) {
                     request_ids.push_back(std::move(inner.request_id));
                     request_pool_indices.push_back(inner.request_pool_index);
+                    execution_slots.push_back(inner.execution_slot);
+                    execution_slot_fresh.push_back(inner.execution_slot_fresh);
                     input_lengths.push_back(inner.input_length);
                     prefill_lengths.push_back(inner.prefill_length);
                 },
