@@ -309,6 +309,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Metadata replies must precede the next device dispatch.
+    required_demote_ack: Option<Arc<Mutex<Vec<ControlOutput>>>>,
     /// Exported gauges checked against the actual dispatch.
     metrics_dir: Option<PathBuf>,
     /// Every data-plane admission must already have a fresh identity.
@@ -749,6 +751,15 @@ impl DataPlane for FakeDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if let Some(replies) = self.required_demote_ack.take() {
+            let replies = replies.lock().unwrap();
+            assert!(
+                matches!(replies.as_slice(),
+                [ControlOutput::DemoteSessions(session), ControlOutput::DemoteCacheGroups(group)]
+                if session.success && group.success),
+                "metadata ACKs must arrive before dispatching the next forward"
+            );
+        }
         if let Some(id) = dispatch.retirement_id {
             self.replay_pending
                 .push_back((id, self.replay_ack_polls.unwrap()));
@@ -9641,4 +9652,105 @@ fn duplicate_bootstrap_room_is_refused_while_epd_staged_and_released_on_epd_fail
     assert_room_conflict_409(&ranks[0].outputs, "dup-same-round");
     assert_room_conflict_409(&ranks[0].outputs, "dup-while-staged");
     assert_scripted_tokens(&ranks[0], "after-epd-fail", 1);
+}
+
+#[test]
+fn metadata_demotion_ack_precedes_the_next_forward() {
+    for depth in [0, 1] {
+        let setup = Setup::default();
+        let (mut listeners, addresses) = mesh_listeners(1);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let mut device = fake_device(Layout::Single, 0, &setup);
+        let plans = device.plans.clone();
+        device.required_demote_ack = Some(replies.clone());
+        let mut script: Script = vec![Vec::new(); 10];
+        script[0] = vec![
+            EngineRequest::Control(Box::new(ControlRequest::DemoteSessions(
+                ts_wire::control::DemoteSessionsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    session_ids: vec!["finished".into()],
+                    ended: true,
+                },
+            ))),
+            EngineRequest::Control(Box::new(ControlRequest::DemoteCacheGroups(
+                ts_wire::control::DemoteCacheGroupsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    cache_group_ids: vec!["finished".into()],
+                    ended: true,
+                },
+            ))),
+            EngineRequest::Add(Box::new(request("next", 16, budget(3)))),
+        ];
+        let frontend = ScriptedFrontend {
+            script: script.into(),
+            react: no_reaction,
+            reacted: Vec::new(),
+            replies: replies.clone(),
+            finished: Arc::new(Mutex::new(Vec::new())),
+            outputs: Arc::new(Mutex::new(Vec::new())),
+        };
+        let spec = RankSpec {
+            rank: 0,
+            layout: Layout::Single,
+            tiers: Tiers::DeviceOnly,
+            config: loop_config(depth, false, &setup),
+            setup,
+            mesh_listener: listeners.pop().unwrap(),
+            addresses,
+            scheduler_observer: None,
+        };
+        run_rank(spec, device, None, || frontend, &AtomicBool::new(false)).unwrap();
+        assert!(!plans.lock().unwrap().is_empty());
+        assert_eq!(replies.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn metadata_demotion_agrees_on_mirrored_schedulers_without_a_forward() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2)] {
+        let (_, _, engines) = layout.sizes();
+        let mut script: Script = vec![Vec::new(); 3];
+        script[0] = vec![
+            EngineRequest::Control(Box::new(ControlRequest::DemoteSessions(
+                ts_wire::control::DemoteSessionsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    session_ids: vec!["ended".into()],
+                    ended: true,
+                },
+            ))),
+            EngineRequest::Control(Box::new(ControlRequest::DemoteCacheGroups(
+                ts_wire::control::DemoteCacheGroupsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    cache_group_ids: vec!["ended".into()],
+                    ended: true,
+                },
+            ))),
+        ];
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script; engines],
+            no_reaction,
+        );
+        let mut owners = 0;
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(rank.forwards, 0);
+            if !rank.replies.is_empty() {
+                owners += 1;
+                assert!(matches!(&rank.replies[0], ControlOutput::DemoteSessions(r) if r.success));
+                assert!(
+                    matches!(&rank.replies[1], ControlOutput::DemoteCacheGroups(r) if r.success)
+                );
+                assert_eq!(rank.replies.len(), 2);
+            }
+        }
+        assert_eq!(owners, engines);
+    }
 }
