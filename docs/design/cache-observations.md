@@ -97,7 +97,7 @@ that record does not establish successful request resume. Consumers must join
 the request's admission lifetime and successful output separately. Allocating a
 slot to another admission likewise establishes ownership, not a GPU overwrite.
 
-## Joining execution observations
+## Execution observation joins
 
 [Execution observations](execution-observations.md) reuse this bounded publisher.
 Records additionally carry `publication_order`, one native order shared between

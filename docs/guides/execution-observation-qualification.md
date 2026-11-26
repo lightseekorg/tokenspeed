@@ -1,4 +1,4 @@
-# Qualifying execution observations with local assets
+# Qualify execution observations with local assets
 
 Run from the repository root with this source tree and its newly built
 `tokenspeed_engine` host/client bindings on `PYTHONPATH`. Tests must use those
