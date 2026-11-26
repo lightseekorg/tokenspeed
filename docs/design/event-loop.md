@@ -635,10 +635,10 @@ Consequences:
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-The scheduler advances in exactly two places, both in `EventLoop::round`
-itself — never in a helper or subsystem. Helpers RETURN their events, or push
-them into the round's `events` list. Reading the round alone must reveal
-every point where the scheduler's state advances, and why:
+The scheduler advances at three explicit points in `EventLoop` — never hidden
+inside a subsystem. Helpers RETURN their events, or push them into the round's
+`events` list. Reading `EventLoop` must reveal every point where the
+scheduler's state advances, and why:
 
 * **Head of the round** — completed Host cache ops (`CacheOps::acknowledged`:
   `WriteBackDone`, `LoadBackDone`, `SnapshotDone`, `RestoreDone`, each
@@ -656,9 +656,17 @@ every point where the scheduler's state advances, and why:
 * **Tail of the round** — forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
+* **Peer holder synchronization** — in coordinated mode, after a lock-release
+  window where `ts-peer-servicer` may have answered `Lookup`/`Pin`/`Release`
+  RPCs (`warm_up`, `gate()` when single-member with no in-flight forward or
+  unconfirmed device copy batch, and `finish_drain`), `sync_peer_holder_changes`
+  drains queued holder events and applies them through `advance_peer` before
+  the next plan or cache clear runs. Single-member replicas in autonomous mode
+  apply holder exports directly on the peer worker thread without using this
+  point.
 
 Anything that produces scheduler events (a new transfer backend, a new async
-op kind) either returns events into one of these two points or adds a new
+op kind) either returns events into one of these points or adds a new
 explicit call site in `round` with a comment stating why the existing points
 don't fit. It must not advance the scheduler itself.
 

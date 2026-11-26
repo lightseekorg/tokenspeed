@@ -973,13 +973,18 @@ mod ffi {
             now_us: i64,
         ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
-        fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
+        fn answer_peer_lookup(
+            scheduler: &Scheduler,
+            lookup: &PeerEventView,
+            pending_new_leases: usize,
+        ) -> PeerAnswerView;
         fn peer_pages_match(
             scheduler: &Scheduler,
             lookup: &PeerEventView,
             num_tokens: i32,
             pages: &[PeerPageView],
         ) -> bool;
+        fn peer_lease_can_pin(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
         fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
@@ -1051,6 +1056,7 @@ mod ffi {
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
+        fn plan_has_pages_to_copy(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_forward_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
@@ -1401,9 +1407,15 @@ impl Scheduler {
     }
 
     /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
-    /// read from the cache as it stands; it changes nothing.
-    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
-        ffi::answer_peer_lookup(self.get(), lookup)
+    /// read from the cache as it stands; it changes nothing. Bounded by the
+    /// `pending_new_leases` unsynced lookup hits already queued in the holder
+    /// servicer.
+    pub fn answer_peer_lookup_bounded(
+        &self,
+        lookup: &PeerEventView,
+        pending_new_leases: usize,
+    ) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases)
     }
 
     /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to
@@ -1415,6 +1427,11 @@ impl Scheduler {
         pages: &[PeerPageView],
     ) -> bool {
         ffi::peer_pages_match(self.get(), lookup, num_tokens, pages)
+    }
+
+    /// Whether `lease` still holds an active soft pin eligible to become hard.
+    pub fn peer_lease_can_pin(&self, lease: &PeerLeaseView) -> bool {
+        ffi::peer_lease_can_pin(self.get(), lease)
     }
 
     /// Whether `lease`'s pin holds its pages now.
@@ -1860,6 +1877,13 @@ impl ExecutionPlan {
     /// the pool client's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
+    }
+
+    /// Whether the plan relocates or copies any Device cache blocks
+    /// (`pages_to_copy`), whose destinations enter `PrefixCacheIndex` during
+    /// `next_execution_plan` before `copy_cache_pages` runs on the device.
+    pub fn has_pages_to_copy(&self) -> bool {
+        ffi::plan_has_pages_to_copy(&self.0)
     }
 
     /// P role: the prompts whose KV goes to their decode node now.

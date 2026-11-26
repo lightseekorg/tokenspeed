@@ -386,10 +386,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
     nb::class_<tokenspeed::DiskConfig>(m, "DiskConfig")
         .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
-                      std::int64_t>(),
+                      std::int64_t, std::int32_t, bool>(),
              nb::arg("max_operations"), nb::arg("max_blocks_per_operation"), nb::arg("max_host_blocks"),
              nb::arg("max_write_host_blocks"), nb::arg("max_queued_cleanings"), nb::arg("min_prefetch_tokens"),
-             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"))
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("min_clean_tokens"),
+             nb::arg("require_reuse_for_cleaning"))
         .def_ro("max_operations", &tokenspeed::DiskConfig::max_operations)
         .def_ro("max_blocks_per_operation", &tokenspeed::DiskConfig::max_blocks_per_operation)
         .def_ro("max_host_blocks", &tokenspeed::DiskConfig::max_host_blocks)
@@ -397,7 +398,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("max_queued_cleanings", &tokenspeed::DiskConfig::max_queued_cleanings)
         .def_ro("min_prefetch_tokens", &tokenspeed::DiskConfig::min_prefetch_tokens)
         .def_ro("wait_timeout_us", &tokenspeed::DiskConfig::wait_timeout_us)
-        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us);
+        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us)
+        .def_ro("min_clean_tokens", &tokenspeed::DiskConfig::min_clean_tokens)
+        .def_ro("require_reuse_for_cleaning", &tokenspeed::DiskConfig::require_reuse_for_cleaning);
     scheduler_config.def_rw("disk_config", &tokenspeed::SchedulerConfig::disk_config);
     nb::class_<tokenspeed::DiskStats>(m, "DiskStats")
         .def_ro("operations", &tokenspeed::DiskStats::operations)

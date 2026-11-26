@@ -357,7 +357,8 @@ void SchedulerConfig::Validate() const {
                 throw std::invalid_argument("Scheduler: Host packing must be positive and divisible by shard_count");
             }
             const std::int64_t parents =
-                std::max(host_allocator.NumUsableBlocks(), snapshot_allocator.NumUsableBlocks());
+                std::max({host_allocator.NumUsableBlocks(), snapshot_allocator.NumUsableBlocks(),
+                          disk_allocator.NumUsableBlocks()});
             if (parents * packing > std::numeric_limits<std::int32_t>::max()) {
                 throw std::invalid_argument("Scheduler: Host cache block ids exceed int32 range");
             }

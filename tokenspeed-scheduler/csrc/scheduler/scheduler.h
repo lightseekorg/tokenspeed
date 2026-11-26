@@ -256,13 +256,17 @@ public:
     // A holder's answers: reads of the cache as it stands, which the runtime
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
-    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases) const {
+        if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
+            return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
+        }
         return PeerExports::AnswerLookup(coordinator_, lookup);
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages) const;
+    bool PeerLeaseCanPin(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->CanPin(lease); }
     std::shared_ptr<PeerPinRelease> PeerReleaseHandle(const PeerLeaseId& id) {
-        return peer_exports_->ReleaseHandle(id);
+        return peer_exports_ ? peer_exports_->ReleaseHandle(id) : nullptr;
     }
     bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
     // Plans built so far: no cache entry leaves between two plans.

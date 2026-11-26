@@ -2297,8 +2297,9 @@ than computing it; it never reads itself, since its prefill server sends what
 it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
 `--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
 Peer sharing is refused with
-`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
-`--query-context-parallel-size > 1`; the
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1`,
+`--query-context-parallel-size > 1` and `--enable-memory-saver` (releasing
+Device KV memory invalidates registered Mooncake MRs); the
 scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
 groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
@@ -2333,7 +2334,7 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `queue_depth` | 32 | Requests in flight on the drive; with `psync`, threads. |
 | `write_queue_depth` | 8 | Of those, at most this many writes. |
 | `max_io_bytes` | 4194304 | Longer ranges are issued as several requests; a multiple of 4096. |
-| `max_operations` | 16 | Disk operations in flight, reads and writes. |
+| `max_operations` | 16 | Disk operations in flight, reads and writes. Cleaning writes are capped at `max(1, max_operations / 4)` concurrent operations, and one operation is reserved for reads when `max_operations > 1`. |
 | `max_blocks_per_operation` | 4096 | Blocks one operation moves. |
 | `host_blocks_fraction` | 0.25 | The share of Host L2 blocks Disk operations may hold at once. |
 | `write_host_blocks_fraction` | 0.5 | Of those, the share writes may hold. |
@@ -2342,6 +2343,8 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
 | `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
 | `push_ring_mb` | 512 | With `--peer-prefix-port`, the staging memory a peer push reads Disk blocks into, rounded up to whole blocks. |
+| `min_clean_tokens` | 0 | Minimum prefix branch length (in tokens) required to clean a Host tip to Disk when the branch length is known; `0` disables the length filter. |
+| `require_reuse_for_cleaning` | false | When `true`, skip cleaning Host tips that were never reused after initial publication. |
 
 The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
 and is refused with `--kvstore-storage-backend` and

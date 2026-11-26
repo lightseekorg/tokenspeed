@@ -242,16 +242,36 @@ impl Sockets {
         })?;
         runtime.spawn(async move {
             let mut pull = pull;
+            let mut consecutive_errors: u32 = 0;
             loop {
                 match pull.recv().await {
                     Ok(message) => {
+                        consecutive_errors = 0;
                         if incoming.send(message.into_vec()).is_err() {
                             return;
                         }
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "PD control socket closed");
+                    Err(zeromq::ZmqError::NoMessage) => {
+                        tracing::warn!("PD control socket closed");
                         return;
+                    }
+                    Err(error) => {
+                        // `PullSocket::recv` already disconnects only the failing
+                        // peer (e.g. a peer whose PUSH timed out and closed mid-frame);
+                        // keep serving the remaining and reconnecting peers. Back off
+                        // briefly on repeated errors so an unexpected non-consuming
+                        // failure cannot spin hot or flood logs.
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        tracing::warn!(
+                            %error,
+                            consecutive_errors,
+                            "PD control peer disconnected with error"
+                        );
+                        if consecutive_errors >= 2 {
+                            let delay_ms =
+                                5u64.saturating_mul(1u64 << (consecutive_errors - 2).min(5));
+                            tokio::time::sleep(Duration::from_millis(delay_ms.min(100))).await;
+                        }
                     }
                 }
             }
@@ -637,5 +657,59 @@ mod tests {
         assert_eq!(parse_uint(b"101", 100), None);
         assert_eq!(parse_uint(b"", 100), None);
         assert_eq!(parse_uint(b"4a", 100), None);
+    }
+
+    #[test]
+    fn a_truncated_peer_stream_does_not_close_the_pull_socket() {
+        use std::io::{Read, Write};
+
+        let (incoming, received) = mpsc::channel();
+        let receiver = Sockets::start("127.0.0.1", incoming).unwrap();
+        let (unused, _) = mpsc::channel();
+        let healthy = Sockets::start("127.0.0.1", unused).unwrap();
+
+        // Complete a ZMTP 3.0 NULL + PUSH READY handshake over raw TCP, then
+        // send a truncated message frame and drop the stream so `PullSocket`
+        // observes `Codec Error: bytes remaining in stream`.
+        {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", receiver.port())).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut greeting = [0u8; 64];
+            greeting[0] = 0xff;
+            greeting[9] = 0x7f;
+            greeting[10] = 3; // ZMTP major 3
+            greeting[11] = 0; // ZMTP minor 0
+            greeting[12..16].copy_from_slice(b"NULL");
+            stream.write_all(&greeting).unwrap();
+            let mut server_greeting = [0u8; 64];
+            stream.read_exact(&mut server_greeting).unwrap();
+
+            let ready_body = b"\x05READY\x0bSocket-Type\x00\x00\x00\x04PUSH";
+            let mut ready = Vec::with_capacity(2 + ready_body.len());
+            ready.push(0x04); // short command frame
+            ready.push(ready_body.len() as u8);
+            ready.extend_from_slice(ready_body);
+            stream.write_all(&ready).unwrap();
+            let mut hdr = [0u8; 2];
+            stream.read_exact(&mut hdr).unwrap();
+            let mut body = vec![0u8; hdr[1] as usize];
+            stream.read_exact(&mut body).unwrap();
+
+            // Claim a 10-byte message frame but only transmit 2 bytes before EOF.
+            stream.write_all(&[0x00, 10, b'h', b'i']).unwrap();
+            stream.flush().unwrap();
+        }
+
+        for label in ["after-trunc-1", "after-trunc-2"] {
+            healthy
+                .send("127.0.0.1", receiver.port(), vec![ascii(label)])
+                .unwrap();
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                vec![ascii(label)]
+            );
+        }
     }
 }
