@@ -35,8 +35,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "torch_npu_memory_saver":
         raise
     raise ModuleNotFoundError(
-        "Ascend Memory Saver requires torch-npu-memory-saver==0.1.5. "
-        "See docs/serving/ascend-memory-saver.md for the pinned source install.",
+        "Install Ascend Memory Saver with 'python -m pip install torch-npu-memory-saver==0.1.5'.",
         name=exc.name,
     ) from exc
 

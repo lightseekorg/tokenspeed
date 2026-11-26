@@ -61,21 +61,21 @@ export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-9.0.0
 source "$TOKENSPEED_CANN_ROOT/set_env.sh"
 TOKENSPEED_TVM_FFI_VERSION=0.1.13.post3 bash test/ci_system/install_triton_ascend.sh
 
-# Build the pinned saver source against the configured CANN toolkit.
-python -m pip install --no-deps \
-  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@631cb80fe0aa9fe7ef8fb5311f12d0293db97169"
 TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
-  -e ./tokenspeed-kernel/python ./tokenspeed-engine -e './python[ascend-memory-saver]'
+  -e ./tokenspeed-kernel/python ./tokenspeed-engine -e ./python
 export TORCH_DEVICE_BACKEND_AUTOLOAD=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
 export TORCH_HCCL_ZERO_COPY=0
 export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-The pinned saver source installs version `0.1.5` and its matching ABI 4
-allocator. Install it before the TokenSpeed `ascend-memory-saver` extra.
-See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/631cb80fe0aa9fe7ef8fb5311f12d0293db97169/README.md)
-for compiler and CMake requirements.
+The NPU kernel backend installs [torch-npu-memory-saver 0.1.5](https://pypi.org/project/torch-npu-memory-saver/0.1.5/)
+from PyPI and builds its ABI 4 allocator against the active CANN toolkit.
+To add it to an existing NPU installation, run `python -m pip install torch-npu-memory-saver==0.1.5`.
+For CPython 3.12 on Linux AArch64 with CANN 9.0.0, you can skip the saver build:
+download the [A2-tested wheel](https://github.com/yanlonghu/torch_npu_memory_saver/releases/download/v0.1.5/torch_npu_memory_saver-0.1.5-cp312-cp312-linux_aarch64.whl)
+and run `python -m pip install ./torch_npu_memory_saver-0.1.5-cp312-cp312-linux_aarch64.whl` before installing TokenSpeed.
+
 Ascend requires protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
 automatic, including with Memory Saver disabled.
