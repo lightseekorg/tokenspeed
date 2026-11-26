@@ -830,6 +830,7 @@ def test_executor_input_capacity_covers_decode_capture(
         enable_speculative_sampling=False,
         state_checkpoint_in_forward=False,
         enforce_eager=False,
+        acl_graph_memory_policy="discard",
         enable_dp_local_cuda_graph=False,
         prefix_granularity=1,
         context_len=32,
