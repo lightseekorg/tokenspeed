@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.tuning import (
     save_autotune_cache,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
+    set_runtime_max_num_tokens,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -1286,6 +1287,15 @@ class ModelExecutor:
             if self.config.chunked_prefill_size > 0:
                 num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
         set_autotune_max_num_tokens(num_tokens)
+        # Aggregated engines may run pure-decode steps larger than
+        # chunked_prefill_size (up to input_ids_buf); prefill-only and
+        # decode-only roles are bounded directly by num_tokens.
+        workspace_max_tokens = (
+            num_tokens
+            if decode_only or self.config.prefill_only
+            else max(num_tokens, ib.input_ids_buf.numel())
+        )
+        set_runtime_max_num_tokens(workspace_max_tokens)
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)

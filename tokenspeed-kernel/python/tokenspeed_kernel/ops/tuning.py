@@ -45,6 +45,7 @@ __all__ = [
     "autotune",
     "autotune_cache_path",
     "get_autotune_max_num_tokens",
+    "get_runtime_max_num_tokens",
     "is_autotuning",
     "is_warming_up",
     "kernel_warmup",
@@ -52,6 +53,7 @@ __all__ = [
     "save_autotune_cache",
     "set_autotune_max_num_tokens",
     "set_autotune_process_group",
+    "set_runtime_max_num_tokens",
     "untuned",
 ]
 
@@ -61,6 +63,7 @@ _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+_runtime_max_num_tokens: int | None = None
 _autotune_process_group: dist.ProcessGroup | None = None
 _warmup_enabled: ContextVar[bool] = ContextVar("kernel_warmup_enabled", default=False)
 
@@ -297,13 +300,21 @@ def set_autotune_max_num_tokens(num_tokens: int) -> None:
     tactic cache key, so a value derived from the current batch makes lookups
     resolve to the wrong bucket.
 
+    Also records the unclamped ceiling for :func:`get_runtime_max_num_tokens`
+    so fixed-capacity workspaces (such as Decode-only MegaMoE runners) do not
+    allocate for the 8192-token autotune floor.
+
     Args:
         num_tokens: Largest token count a single forward can carry (the
-            runtime's ``chunked_prefill_size``). Raised to flashinfer's own
-            default floor when smaller.
+            runtime's ``chunked_prefill_size`` or Decode token cap). Raised to
+            flashinfer's own default floor for autotuning when smaller.
     """
-    global _autotune_max_num_tokens
-    _autotune_max_num_tokens = max(int(num_tokens), _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)
+    global _autotune_max_num_tokens, _runtime_max_num_tokens
+    tokens = int(num_tokens)
+    if tokens <= 0:
+        raise ValueError(f"num_tokens must be positive, got {tokens}")
+    _runtime_max_num_tokens = tokens
+    _autotune_max_num_tokens = max(tokens, _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)
 
 
 def get_autotune_max_num_tokens() -> int:
@@ -313,6 +324,35 @@ def get_autotune_max_num_tokens() -> int:
         The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
     """
     return _autotune_max_num_tokens
+
+
+def set_runtime_max_num_tokens(num_tokens: int) -> None:
+    """Set the unclamped per-forward token ceiling for workspace allocation.
+
+    Use when the runtime's worst-case forward token count differs from the
+    tuning batch size (for example, an aggregated engine whose pure-decode
+    token budget exceeds ``chunked_prefill_size``).
+
+    Args:
+        num_tokens: Positive upper bound on local tokens per rank per forward.
+    """
+    global _runtime_max_num_tokens
+    tokens = int(num_tokens)
+    if tokens <= 0:
+        raise ValueError(f"num_tokens must be positive, got {tokens}")
+    _runtime_max_num_tokens = tokens
+
+
+def get_runtime_max_num_tokens() -> int:
+    """Unclamped per-forward token ceiling for fixed-capacity workspaces.
+
+    Unlike :func:`get_autotune_max_num_tokens`, which keeps FlashInfer's
+    8192-token floor for tactic bucket mapping, this returns the exact startup
+    ceiling (falling back to the default floor before startup sets it).
+    """
+    if _runtime_max_num_tokens is None:
+        return _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+    return _runtime_max_num_tokens
 
 
 @contextlib.contextmanager
