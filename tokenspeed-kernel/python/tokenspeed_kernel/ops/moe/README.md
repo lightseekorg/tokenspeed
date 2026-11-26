@@ -500,6 +500,30 @@ the fused, atomic finalize; it always finalizes. On GB300 at K3 prefill shapes
 (896 experts, top-16, uniform routing) the routed MoE layer is 5-6% faster than
 TRT-LLM-Gen at 16K rows and 11% faster at 24K rows beside a peer weight copy.
 
+
+## FlashInfer Cake MXFP4 SiTU (`flashinfer_cake.py`)
+
+`flashinfer_cake_mxfp4_situ_routed_moe_apply` runs Kimi-K3 MXFP4 SiTU experts on
+FlashInfer's Cake dense grouped-GEMM kernels (`--moe-backend flashinfer_cake`);
+`auto` keeps the TRT-LLM-Gen kernel. Both take MXFP8 activations on MXFP4
+weights. Cake is the faster of the two on prefill-sized batches (one K3.1 MoE
+layer of 24,576 rows on one GB300 GPU holding all 896 experts: 9.8 ms against
+11.4 ms) and the slower one at a couple of thousand rows, so it is meant for
+prefill ranks.
+
+- Routing is precomputed top-k; the kernel always finalizes.
+- One rank holds every expert it routes to (`supports_ep` is false); DWDP prefill
+  ranks qualify, and the preprocessor returns expert-major weights for the
+  peer-weight store.
+- The dense chain serves 1025..7168 rows and 8192 rows upward. Other counts are
+  padded up to the next served count with rows whose output is dropped.
+- Each call takes its scratch from the CUDA caching allocator (1.8 GiB at 24,576
+  rows) and keeps nothing afterwards.
+- The chain rounds every expert's output to BF16 and adds the top-k of them in
+  BF16 in no fixed order, where TRT-LLM-Gen sums in FP32 and rounds once. The
+  result differs from TRT-LLM-Gen by about one BF16 ulp per element and is not
+  bit-reproducible between runs.
+
 ## FP8 per-channel experts
 
 Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output

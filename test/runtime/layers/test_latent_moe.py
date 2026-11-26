@@ -307,6 +307,23 @@ def test_kimi3_moe_execution_policy_honours_a_forced_cutedsl_backend() -> None:
     assert not plan.owns_ep_communication
 
 
+def test_kimi3_moe_execution_policy_honours_a_forced_cake_backend() -> None:
+    """Asked for FlashInfer's Cake experts, the plan routes to them alone."""
+    with mock.patch.object(
+        latent_module, "native_latent_moe_available", return_value=False
+    ):
+        plan = Kimi3MoEExecutionPlan.build(
+            _plan_mapping(), MoeBackend.FLASHINFER_CAKE, alt_stream=None
+        )
+
+    assert plan.use_cake
+    assert not plan.use_cutedsl
+    assert not plan.use_trtllm
+    assert not plan.use_marlin
+    assert not plan.use_native
+    assert not plan.owns_ep_communication
+
+
 def test_kimi3_moe_execution_policy_takes_marlin_when_its_probe_says_yes() -> None:
     """The probe decides AUTO, and the contraction shard's gate rides on it."""
     with (

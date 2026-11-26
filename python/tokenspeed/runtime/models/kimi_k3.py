@@ -2665,10 +2665,11 @@ class KimiLinearMoE(nn.Module):
             and not plan.use_native
             and not plan.use_marlin
         ):
-            if not (plan.use_trtllm or plan.use_cutedsl):
+            if not (plan.use_trtllm or plan.use_cutedsl or plan.use_cake):
                 raise RuntimeError(
                     "Kimi-K3 SiTU MoE requires the native, FlashInfer TRT-LLM, "
-                    "FlashInfer CuTe DSL (NVFP4), or Marlin (Hopper W4A16) "
+                    "FlashInfer CuTe DSL (NVFP4), FlashInfer Cake (MXFP4), or "
+                    "Marlin (Hopper W4A16) "
                     "backend; no portable SiTU "
                     f"Triton fallback exists (selected MoE backend: "
                     f"{moe_backend.value!r})."
@@ -2731,6 +2732,7 @@ class KimiLinearMoE(nn.Module):
                     _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
                     if self.execution_plan.use_trtllm
                     or self.execution_plan.use_mega_moe
+                    or self.execution_plan.use_cake
                     else None
                 )
             ),
@@ -3191,11 +3193,13 @@ class KimiLinearMoE(nn.Module):
             or plan.use_native
             or plan.use_trtllm
             or plan.use_cutedsl
+            or plan.use_cake
             or plan.use_marlin
         ):
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
-                "FlashInfer TRT-LLM, FlashInfer CuTe DSL, or Marlin SiTU MoE path."
+                "FlashInfer TRT-LLM, FlashInfer CuTe DSL, FlashInfer Cake, or "
+                "Marlin SiTU MoE path."
             )
         out = self.experts(
             hidden_states=routed_in,

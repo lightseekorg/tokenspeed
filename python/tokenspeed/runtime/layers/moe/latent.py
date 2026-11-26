@@ -145,6 +145,8 @@ class Kimi3MoEExecutionPlan:
     # FlashInfer's CuTe DSL NVFP4 SiTU experts on precomputed top-k.
     use_cutedsl: bool
     use_marlin: bool = False
+    # FlashInfer's Cake MXFP4 SiTU experts (W4A8) on precomputed top-k.
+    use_cake: bool = False
 
     @classmethod
     def build(
@@ -186,6 +188,12 @@ class Kimi3MoEExecutionPlan:
             and not use_marlin
             and moe_backend.is_flashinfer_cutedsl()
         )
+        use_cake = (
+            not owns_ep_communication
+            and not use_native
+            and not use_marlin
+            and moe_backend.is_flashinfer_cake()
+        )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
@@ -193,6 +201,7 @@ class Kimi3MoEExecutionPlan:
             owns_ep_communication=owns_ep_communication,
             use_marlin=use_marlin,
             use_cutedsl=use_cutedsl,
+            use_cake=use_cake,
             overlap_shared_experts=(
                 use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),

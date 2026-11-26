@@ -4408,7 +4408,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
+            "flashinfer_cutlass, flashinfer_cutedsl, flashinfer_cake, deep_gemm, "
+            "mega_moe, "
             "gluon_petit, or a registered plugin solution. Under --numerics "
             "rl-bitwise the selected kernel must declare batch invariance.",
         )

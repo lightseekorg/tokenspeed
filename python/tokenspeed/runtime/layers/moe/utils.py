@@ -79,6 +79,7 @@ class MoeBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_CAKE = "flashinfer_cake"
     GLUON_PETIT = "gluon_petit"
 
     DEEP_GEMM = "deep_gemm"
@@ -120,6 +121,9 @@ class MoeBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_cake(self):
+        return self == MoeBackend.FLASHINFER_CAKE
 
     def is_gluon_petit(self):
         return self == MoeBackend.GLUON_PETIT
