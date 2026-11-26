@@ -33,10 +33,12 @@ from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.kpool._triton.score import (
+    _kpool_sort_topk_kernel,
+)
 from tokenspeed_kernel.ops.attention.kpool.triton import (
     _DEFAULT_CHUNK_POOLS,
     _empty_result,
-    _kpool_sort_topk_kernel,
     dense_kpool_decode_topk,
     expand_kpool_to_flat_kv,
 )

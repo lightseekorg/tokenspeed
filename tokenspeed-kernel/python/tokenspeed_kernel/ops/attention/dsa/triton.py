@@ -26,7 +26,11 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     merge_packed_index_candidates,
 )
 from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_ue8m0
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -90,11 +94,14 @@ def _dsa_store_output(
     partial_out,
     partial_lse,
     lse,
+    sinks,
     RETURN_LSE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     acc,
     m_i,
     l_i,
     rows,
+    heads,
     head_mask,
     split,
     kv_lora_rank: tl.constexpr,
@@ -104,19 +111,19 @@ def _dsa_store_output(
     # Rows without any valid key are zero.
     result = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
     if NUM_SPLITS == 1:
+        lse_nat = tl.where(
+            l_i > 0.0, (m_i + tl.log2(l_i)) * 0.6931471805599453, -float("inf")
+        )
+        if HAS_SINKS:
+            sink_val = tl.load(sinks + heads, mask=head_mask, other=0.0).to(tl.float32)
+            result = result * tl.sigmoid(lse_nat - sink_val)[:, None]
         tl.store(
             out + rows[:, None] * kv_lora_rank + dims[None, :],
             result.to(out.dtype.element_ty),
             mask=head_mask[:, None],
         )
         if RETURN_LSE:
-            tl.store(
-                lse + rows,
-                tl.where(
-                    l_i > 0.0, (m_i + tl.log2(l_i)) * 0.6931471805599453, -float("inf")
-                ),
-                mask=head_mask,
-            )
+            tl.store(lse + rows, lse_nat, mask=head_mask)
     else:
         split_rows = rows * NUM_SPLITS + split
         tl.store(
@@ -143,7 +150,9 @@ def _dsa_packed_kv_kernel(
     partial_out,
     partial_lse,
     lse,
+    sinks,
     RETURN_LSE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -155,7 +164,10 @@ def _dsa_packed_kv_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     split = tl.program_id(2)
@@ -228,16 +240,21 @@ def _dsa_packed_kv_kernel(
         partial_out,
         partial_lse,
         lse,
+        sinks,
         RETURN_LSE,
+        HAS_SINKS,
         acc,
         m_i,
         l_i,
         rows,
+        heads,
         head_mask,
         split,
         kv_lora_rank,
         NUM_SPLITS,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -338,7 +355,9 @@ def _dsa_dense_kv_kernel(
     partial_out,
     partial_lse,
     lse,
+    sinks,
     RETURN_LSE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -353,7 +372,10 @@ def _dsa_dense_kv_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_ROPE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     split = tl.program_id(2)
@@ -387,16 +409,21 @@ def _dsa_dense_kv_kernel(
         partial_out,
         partial_lse,
         lse,
+        sinks,
         RETURN_LSE,
+        HAS_SINKS,
         acc,
         m_i,
         l_i,
         rows,
+        heads,
         head_mask,
         split,
         kv_lora_rank,
         NUM_SPLITS,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
@@ -478,11 +505,17 @@ def _dsa_merge_splits_kernel(
     partial_lse,
     out,
     output_lse,
+    sinks,
     RETURN_LSE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+    num_heads: tl.constexpr,
     kv_lora_rank: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # Log-sum-exp combine of the split partial outputs of one (token, head).
     row = tl.program_id(0).to(tl.int64)
     dims = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -494,21 +527,26 @@ def _dsa_merge_splits_kernel(
     total = tl.sum(weights, axis=0)
     partial = tl.load(partial_out + split_rows[:, None] * kv_lora_rank + dims[None, :])
     merged = tl.sum(partial * weights[:, None], axis=0)
+    out_val = tl.where(total > 0.0, merged / total, 0.0)
+    lse_nat = tl.where(
+        total > 0.0,
+        (max_lse + tl.log2(total)) * 0.6931471805599453,
+        -float("inf"),
+    )
+    if HAS_SINKS:
+        head = row % num_heads
+        sink_val = tl.load(sinks + head).to(tl.float32)
+        out_val = out_val * tl.sigmoid(lse_nat - sink_val)
     tl.store(
         out + row * kv_lora_rank + dims,
-        tl.where(total > 0.0, merged / total, 0.0).to(out.dtype.element_ty),
+        out_val.to(out.dtype.element_ty),
     )
 
     if RETURN_LSE:
         if tl.program_id(1) == 0:
-            tl.store(
-                output_lse + row,
-                tl.where(
-                    total > 0.0,
-                    (max_lse + tl.log2(total)) * 0.6931471805599453,
-                    -float("inf"),
-                ),
-            )
+            tl.store(output_lse + row, lse_nat)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _num_kv_splits(num_programs: int, topk: int) -> int:
@@ -534,6 +572,7 @@ def _launch_dsa_kernel(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     return_lse: bool,
+    sinks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     tokens, num_heads, head_dim = q.shape
     topk = topk_indices.shape[1]
@@ -547,6 +586,8 @@ def _launch_dsa_kernel(
         if return_lse
         else None
     )
+    has_sinks = sinks is not None
+    sinks_arg = sinks.contiguous() if sinks is not None else out
     head_blocks = triton.cdiv(num_heads, _BLOCK_H)
     num_splits = _num_kv_splits(tokens * head_blocks, topk)
     # Split programs write FP32 partial outputs and their base-2 log-sum-exp
@@ -561,6 +602,8 @@ def _launch_dsa_kernel(
         partial_lse = torch.empty(
             (tokens, num_heads, num_splits), dtype=torch.float32, device=q.device
         )
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     kernel[(tokens, head_blocks, num_splits)](
         q,
         *kv_args,
@@ -569,8 +612,10 @@ def _launch_dsa_kernel(
         out,
         partial_out,
         partial_lse,
-        lse,
+        lse if lse is not None else out,
+        sinks_arg,
         return_lse,
+        has_sinks,
         num_heads,
         head_dim,
         kv_lora_rank,
@@ -582,9 +627,11 @@ def _launch_dsa_kernel(
         BLOCK_H=_BLOCK_H,
         BLOCK_N=_BLOCK_N,
         BLOCK_ROPE=max(16, triton.next_power_of_2(qk_rope_head_dim)),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         # AMD uses single-stage loops, like the grouped Triton decode kernel.
         num_stages=1 if current_platform().is_amd else 2,
+        **pdl_kwargs,
     )
     if num_splits > 1:
         block_d = min(kv_lora_rank, 128)
@@ -592,12 +639,17 @@ def _launch_dsa_kernel(
             partial_out,
             partial_lse,
             out,
-            lse,
+            lse if lse is not None else out,
+            sinks_arg,
             return_lse,
+            has_sinks,
+            num_heads,
             kv_lora_rank,
             num_splits,
             BLOCK_D=block_d,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **pdl_kwargs,
         )
     return out, lse
 
@@ -612,6 +664,7 @@ def _run_packed_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     return_lse: bool,
+    sinks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     return _launch_dsa_kernel(
         _dsa_packed_kv_kernel,
@@ -628,6 +681,7 @@ def _run_packed_kv(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         return_lse=return_lse,
+        sinks=sinks,
     )
 
 
@@ -661,6 +715,7 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     return_lse: bool,
+    sinks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     kv_cache, kv_layout_args = _dense_kv_layout(kv_cache)
     return _launch_dsa_kernel(
@@ -674,6 +729,7 @@ def _run_dense_kv(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         return_lse=return_lse,
+        sinks=sinks,
     )
 
 
@@ -791,6 +847,7 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     return_lse: bool,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q = _flatten_query(q).contiguous()
     topk_slots = topk_slots.contiguous()
@@ -813,6 +870,7 @@ def _run_dsa(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             return_lse=return_lse,
+            sinks=sinks,
         )
     else:
         result, lse = _run_dense_kv(
@@ -824,6 +882,7 @@ def _run_dsa(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             return_lse=return_lse,
+            sinks=sinks,
         )
 
     if out is not None:
