@@ -1054,6 +1054,9 @@ def sharded_weight_loader(shard_axis: int, tp_rank: int) -> LoaderFunction:
     return loader
 
 
+_DUMMY_SUB16_CHUNK_ELEMS = 16 * 1024 * 1024
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -1077,11 +1080,30 @@ def initialize_dummy_weights(
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             if torch.finfo(param.data.dtype).bits < 16:
-                # uniform_ doesn't support < 16-bit datatypes (FP8)
+                # uniform_ doesn't support < 16-bit datatypes (FP8).
+                # Fill in bounded chunks so large host-resident FP8 tables do
+                # not allocate a 2x-sized float16 copy of the entire tensor.
                 dtype = param.data.dtype
-                tmp_param = param.data.to(torch.float16)
-                tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
-                param.data.copy_(tmp_param)
+                numel = param.data.numel()
+                if numel == 0:
+                    continue
+                chunk_size = min(numel, _DUMMY_SUB16_CHUNK_ELEMS)
+                scratch = torch.empty(
+                    chunk_size, dtype=torch.float16, device=param.data.device
+                )
+                is_contiguous = param.data.is_contiguous()
+                dst = (
+                    param.data.view(-1)
+                    if is_contiguous
+                    else torch.empty(numel, dtype=dtype, device=param.data.device)
+                )
+                for start in range(0, numel, chunk_size):
+                    end = min(start + chunk_size, numel)
+                    buf = scratch[: end - start]
+                    buf.uniform_(low, high, generator=generator)
+                    dst[start:end].copy_(buf.to(dtype))
+                if not is_contiguous:
+                    param.data.copy_(dst.view(param.data.shape))
             else:
                 param.uniform_(low, high, generator=generator)
 
