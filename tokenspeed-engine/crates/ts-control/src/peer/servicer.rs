@@ -147,11 +147,6 @@ impl Holder {
         }
     }
 
-    /// Gate new Device pins without affecting existing leases or other tiers.
-    pub fn block_device_pins(&mut self, blocked: bool) {
-        self.device_pin_gate.block(blocked);
-    }
-
     pub(super) fn matches_stamp(&self, stamp: &Stamp) -> bool {
         self.stamp == *stamp
     }

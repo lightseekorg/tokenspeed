@@ -276,7 +276,7 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
             case PeerEventKind::LookupAnswered: {
                 unsigned tiers = 0;
                 for (const auto& page : event.pages) {
-                    tiers |= page.tier == PeerTier::Device ? 1u : 2u;
+                    tiers |= 1u << static_cast<unsigned>(FromView(page.tier));
                 }
                 execution_event.With(tokenspeed::cache::PeerLookupAnswered{
                     .lease = FromView(event.lease), .num_tokens = event.num_tokens, .source_mask = tiers, .checkpoint = {event.checkpoint.begin(), event.checkpoint.end()}});
@@ -340,7 +340,8 @@ PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler) {
                          .looking_requests = stats.looking_requests,
                          .landing_requests = stats.landing_requests,
                          .landed_tokens = stats.landed_tokens,
-                         .failed_landings = stats.failed_landings};
+                         .failed_landings = stats.failed_landings,
+                         .unused_host_landings = stats.unused_host_landings};
 }
 
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,

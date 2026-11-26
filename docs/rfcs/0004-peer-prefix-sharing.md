@@ -480,10 +480,13 @@ and peer reads may overlap on separate pages. Each ticket retains its existing
 block references through DMA retirement. Publishing a duplicate key adopts the
 canonical Host reference. An aborted transfer releases its unpublished blocks
 on retirement. Only the scheduler can
-publish a completed landing for its owning request.
+publish a completed landing for its owning request. A successful Host transfer
+whose request gave up its reservation increments `unused_host_landings`.
+An incomplete transfer increments `failed_landings`.
 
 The existing servicer timestamps and forwards incoming messages to the existing
-Host protocol worker. A pending lookup, PIN or reservation yields on cache
+Host protocol worker. The worker registers its wake handle before draining any
+queue, so the first arrival can also wake an idle worker. A pending lookup, PIN or reservation yields on cache
 contention. RELEASE uses a capability bound to the hard lease's existing
 source references. It drops their strong counts before acknowledging, including
 while DP is waiting in a forward. Only the cache owner runs uniqueness observers,
@@ -506,7 +509,8 @@ Adaptive admission probes the local prefix again when the request reaches
 its place in the prefill queue. It compares the compute saved on the additional
 prefix with the estimated exposed wait for a landing, including failed attempts.
 The estimate starts with experimental Lite17B values and updates from retired
-attempts on this reader, grouped by source tier and locality. Successful
+attempts on this reader, grouped by the combination of Device, Host and Disk
+sources and by locality. Disk pushes have independent feedback from Host reads. Successful
 samples price the interval from writable pages through RELEASE acknowledgement.
 The first sample replaces the prior. After eight samples the update weight is
 1/8. The scheduler separately measures dispatch to writable pages and RELEASE

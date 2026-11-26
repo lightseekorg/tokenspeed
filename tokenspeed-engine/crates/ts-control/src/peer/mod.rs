@@ -122,7 +122,7 @@ impl PeerProgress {
     /// Configure the scheduler and select the matching protocol owner before startup.
     pub fn for_replica(members: usize, scheduler: &mut Scheduler) -> Result<Self, PeerError> {
         match members {
-            0 => Err(PeerError::Report),
+            0 => Err(PeerError::Topology),
             1 if scheduler.enable_async_host_peer() => Ok(Self::Host),
             1 if scheduler.enable_async_device_peer(true) => Ok(Self::Device),
             1 => Err(PeerError::Topology),
@@ -410,12 +410,29 @@ impl PeerListener {
     }
 }
 
+#[derive(Default)]
+struct DriverWake(std::sync::OnceLock<thread::Thread>);
+
+impl DriverWake {
+    fn run(&self, drive: impl FnOnce()) {
+        // Earlier arrivals are in the queue; arrivals after the first drain must wake us.
+        self.0.set(thread::current()).expect("one protocol worker");
+        drive();
+    }
+
+    fn notify(&self) {
+        if let Some(worker) = self.0.get() {
+            worker.unpark();
+        }
+    }
+}
+
 /// The first member's endpoint and the threads around it.
 struct Endpoint {
     net: Arc<PeerNet>,
     holder: Arc<Mutex<Holder>>,
     replies: Arc<Mutex<VecDeque<(Instant, Reply)>>>,
-    driver: Arc<std::sync::OnceLock<thread::Thread>>,
+    driver: Arc<DriverWake>,
     requests: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     control: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     _servicer: thread::JoinHandle<()>,
@@ -1088,7 +1105,7 @@ fn start_endpoint(
         settings.record_lifetime,
     )));
     let replies = Arc::new(Mutex::new(VecDeque::new()));
-    let driver = Arc::new(std::sync::OnceLock::<thread::Thread>::new());
+    let driver = Arc::new(DriverWake::default());
     let autonomous = progress != PeerProgress::Coordinated;
     let requests = Arc::new(Mutex::new(VecDeque::new()));
     let control = Arc::new(Mutex::new(VecDeque::new()));
@@ -1112,9 +1129,7 @@ fn start_endpoint(
                             } else {
                                 requests.lock().push_back((Instant::now(), request));
                             }
-                            if let Some(worker) = wake.get() {
-                                worker.unpark();
-                            }
+                            wake.notify();
                         }
                         Ok(Inbound::Request(Request::Reading { .. })) => continue,
                         Ok(Inbound::Request(request)) => {
@@ -1140,9 +1155,7 @@ fn start_endpoint(
                         }
                         Ok(Inbound::Reply(reply)) => {
                             incoming.lock().push_back((Instant::now(), reply));
-                            if let Some(worker) = wake.get() {
-                                worker.unpark();
-                            }
+                            wake.notify();
                         }
                         Err(_) => tracing::warn!("a malformed peer message dropped"),
                     }
@@ -1161,8 +1174,39 @@ fn start_endpoint(
 }
 
 #[cfg(test)]
-mod identity_metrics_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn first_arrival_after_an_empty_drain_wakes_the_new_worker() {
+        let wake = DriverWake::default();
+        let (send, queue) = mpsc::channel();
+        let (empty, drained) = mpsc::channel();
+        let (handled, result) = mpsc::channel();
+        thread::scope(|scope| {
+            let wake_ref = &wake;
+            let worker = scope.spawn(move || {
+                wake_ref.run(|| {
+                    assert!(queue.try_recv().is_err());
+                    empty.send(()).unwrap();
+                    loop {
+                        thread::park();
+                        if let Ok(message) = queue.try_recv() {
+                            handled.send(message).unwrap();
+                            break;
+                        }
+                    }
+                })
+            });
+            drained.recv().unwrap();
+            send.send(17).unwrap();
+            wake.notify();
+            let received = result.recv_timeout(Duration::from_secs(3));
+            // Let a broken worker exit as well, so a regression fails instead of hanging CI.
+            worker.thread().unpark();
+            assert_eq!(received.unwrap(), 17);
+        });
+    }
 
     #[test]
     fn distinguishes_identity_components_visible_in_lookup_replies() {

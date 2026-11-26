@@ -255,6 +255,7 @@ public:
         std::size_t landing_requests{0};
         std::uint64_t landed_tokens{0};
         std::uint64_t failed_landings{0};
+        std::uint64_t unused_host_landings{0};
     };
     PeerStats GetPeerStats() const;
     bool EnableAsyncHostPeer();
@@ -635,7 +636,7 @@ private:
         std::int64_t last_attempt_us{0};
         double failure_us{0.0};  // unconditional expected wasted wait per attempt
     };
-    std::array<LandingCost, 8> device_landing_cost_{};
+    std::array<LandingCost, 16> device_landing_cost_{};
     // Median of five complete admissions in the same local batch condition.
     // A single unusually long forward must not set the next reader's local price.
     struct DispatchWait {
@@ -1003,6 +1004,7 @@ private:
     std::vector<PeerLookupRequest> peer_lookups_;
     std::uint64_t peer_landed_tokens_{0};
     std::uint64_t peer_failed_landings_{0};
+    std::uint64_t peer_unused_host_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

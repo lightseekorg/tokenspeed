@@ -73,7 +73,7 @@ pub struct Peer {
     member: usize,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     next_sample_us: i64,
-    previous_totals: [u64; 2],
+    previous_totals: [u64; 3],
 }
 
 impl Peer {
@@ -113,13 +113,13 @@ impl Peer {
             let thread = thread::Builder::new()
                 .name("ts-peer-host".into())
                 .spawn(move || {
-                    if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
-                        tracing::error!(%error, "peer worker stopped");
-                        let _ = tx.send(Err(error));
-                    }
+                    wake.run(|| {
+                        if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
+                            tracing::error!(%error, "peer worker stopped");
+                            let _ = tx.send(Err(error));
+                        }
+                    })
                 })?;
-            wake.set(thread.thread().clone())
-                .expect("one protocol worker");
             Driver::Background(Worker {
                 commands,
                 rounds,
@@ -140,7 +140,7 @@ impl Peer {
             member,
             metrics: None,
             next_sample_us: 0,
-            previous_totals: [0; 2],
+            previous_totals: [0; 3],
         })
     }
 
@@ -313,8 +313,15 @@ impl Peer {
         ] {
             metrics.snapshot(name, n);
         }
-        let totals = [stats.landed_tokens, stats.failed_landings];
-        for (i, name) in ["landed_tokens", "failed_landings"].iter().enumerate() {
+        let totals = [
+            stats.landed_tokens,
+            stats.failed_landings,
+            stats.unused_host_landings,
+        ];
+        for (i, name) in ["landed_tokens", "failed_landings", "unused_host_landings"]
+            .iter()
+            .enumerate()
+        {
             metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
         }
         self.previous_totals = totals;
