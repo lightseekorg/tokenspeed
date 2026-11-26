@@ -62,7 +62,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 7,
                 1,
                 None,
-                (std::time::SystemTime::now(), std::time::Instant::now()),
+                None, (std::time::SystemTime::now(), std::time::Instant::now()),
             );
             p.finish_remote_prefill_only("ok");
             let mut failed = RequestState::new(vec![8, 9], 3, BTreeSet::new(), true, None, false);
@@ -86,7 +86,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 12,
                 0,
                 None,
-                (std::time::SystemTime::now(), std::time::Instant::now()),
+                None, (std::time::SystemTime::now(), std::time::Instant::now()),
             );
             assert_eq!(
                 p.finish_remote_prefill_only("duplicate").released,

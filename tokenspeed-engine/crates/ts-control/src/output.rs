@@ -2209,7 +2209,7 @@ mod tests {
         );
         register(&mut p, "one", 3, 1, &[]);
         let observed = (SystemTime::now(), Instant::now());
-        p.remote_prefill_done("one", 9, 0, None, observed);
+        p.remote_prefill_done("one", 9, 0, None, None, observed);
         let c = p.finish_remote_prefill_only("one");
         let timing = c.outputs[0].request_timing.as_ref().unwrap();
         assert_eq!(timing.kv_output_tokens, Some(1));
