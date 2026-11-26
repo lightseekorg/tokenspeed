@@ -692,7 +692,9 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
                                                   : PrefixKeyIsHit(index, *store_.HostPool(), key, extra_hits);
             });
         if (!route) return true;
-        const std::int32_t split_tokens = route->split_tokens;
+        // State-only routes have no Device KV prefix, even when every empty
+        // history dependency is satisfied by the resolver.
+        const std::int32_t split_tokens = has_kv ? route->split_tokens : 0;
         const auto make_tail = [&] {
             return PrefixProbe::TailHit{.tail_tokens = tail_tokens,
                                         .hash = published_hash,

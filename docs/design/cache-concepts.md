@@ -1298,6 +1298,9 @@ Its responsibilities:
   State group's hits count from page 0 on both tiers, since a Host
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
+  Without KV groups the Host-suffix split is zero: State-only hits claim
+  the actual checkpoints, never an implicit Device prefix. This also lets
+  an empty-Device shared L2 pool pin Host checkpoints through the same probe.
   The probe records the longest usable KV boundary even when its State is
   missing, since admission uses that reach for the junction cut; with a
   State group the reach is at least the prefix-closed groups' coverage (on
