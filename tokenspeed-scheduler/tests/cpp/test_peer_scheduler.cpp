@@ -1682,8 +1682,8 @@ TEST(PeerDiskInterleavingTest, AsyncHostPeerWithDiskReadyHoldCompletesAndPreserv
             {RequestSpec{.request_id = "blk", .tokens = MakeAlignedTokens(2, kP, 8000), .max_new_tokens = 1}});
         ASSERT_EQ(PrefillRows(Plan(reader)).size(), 1u);
 
-        reader.SubmitRequests(
-            {RequestSpec{.request_id = "r-async-ok", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
+        reader.SubmitRequests({RequestSpec{
+            .request_id = "r-async-ok", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
         const auto reads = ExtractDiskOps(Plan(reader));
         ASSERT_EQ(reads.size(), 1u);
         Send(reader, cache::DiskDone{.op_id = reads[0].op_id, .success = true});
@@ -1753,8 +1753,8 @@ TEST(PeerDiskInterleavingTest, AsyncHostPeerWithDiskReadyHoldCompletesAndPreserv
             {RequestSpec{.request_id = "blk", .tokens = MakeAlignedTokens(2, kP, 8000), .max_new_tokens = 1}});
         ASSERT_EQ(PrefillRows(Plan(reader)).size(), 1u);
 
-        reader.SubmitRequests(
-            {RequestSpec{.request_id = "r-async-fail", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
+        reader.SubmitRequests({RequestSpec{
+            .request_id = "r-async-fail", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
         const auto reads = ExtractDiskOps(Plan(reader));
         ASSERT_EQ(reads.size(), 1u);
         Send(reader, cache::DiskDone{.op_id = reads[0].op_id, .success = true});
