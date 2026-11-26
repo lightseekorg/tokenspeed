@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _DSV4_PROFILE,
     _DSV41_FLASH_DSPARK_PROFILE,
     _DSV41_FLASH_PROFILE,
+    _GLM53_FLASH_PROFILE,
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
     _MUSE_SPARK_PROFILE,
@@ -287,6 +288,36 @@ def _dsv41_layer(profile: _Profile, ep_size: int = 8) -> SimpleNamespace:
     )
 
 
+def _glm53_flash_layer(
+    ep_size: int = 8, alpha: float | None = 1.0, limit: float | None = 10.0
+) -> SimpleNamespace:
+    # GLM-5.3 Flash passes activation_alpha=1.0 (standard SiLU) explicitly.
+    return SimpleNamespace(
+        num_experts=288,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=2048,
+        ep_size=ep_size,
+        tp_size=1,
+        num_local_experts=288 // ep_size,
+        activation="swiglu",
+        swiglu_beta=None,
+        swiglu_arg=SimpleNamespace(alpha=alpha, limit=limit),
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+
+
+def test_validate_layer_selects_glm53_flash_profile() -> None:
+    assert _validate_layer(_glm53_flash_layer()) == _GLM53_FLASH_PROFILE
+    assert _validate_layer(_glm53_flash_layer(alpha=None)) == _GLM53_FLASH_PROFILE
+    with pytest.raises(ValueError, match="nonstandard SiLU alpha"):
+        _validate_layer(_glm53_flash_layer(alpha=1.702))
+    with pytest.raises(ValueError, match="glm53_flash requires the checkpoint"):
+        _validate_layer(_glm53_flash_layer(limit=None))
+
+
 def _kimi_k3_layer(ep_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         num_experts=896,
@@ -323,6 +354,7 @@ def test_validate_layer_accepts_dsv41_at_ep4_and_ep8(profile, ep_size) -> None:
         (partial(_dsv4_layer, None), 4, "supports EP8 for dsv4; got EP4"),
         (_kimi_k3_layer, 4, "supports EP8 for kimi_k3; got EP4"),
         (_muse_spark_layer, 4, "supports EP8 for muse_spark; got EP4"),
+        (_glm53_flash_layer, 4, "supports EP8 for glm53_flash; got EP4"),
         (
             partial(_dsv41_layer, _DSV41_FLASH_PROFILE),
             2,
@@ -334,6 +366,7 @@ def test_validate_layer_accepts_dsv41_at_ep4_and_ep8(profile, ep_size) -> None:
         "dsv4-ep4",
         "kimi_k3-ep4",
         "muse_spark-ep4",
+        "glm53_flash-ep4",
         "dsv41_flash-ep2",
     ],
 )
@@ -701,6 +734,9 @@ def test_largest_capacity_per_world_size() -> None:
         (_DSV41_FLASH_DSPARK_PROFILE, 8, 5280),
         # Muse Spark's heap reaches 2**32 above 2368 rows at EP8.
         (_MUSE_SPARK_PROFILE, 8, 2368),
+        # GLM-5.3 Flash's heap reaches 2**32 above 2464 rows at EP8
+        # (reserved 4,253,855,744 B there).
+        (_GLM53_FLASH_PROFILE, 8, 2464),
         # Profiles that do not raise their capacity at EP8 keep 1024 rows.
         (_GPT_OSS_120B_PROFILE, 8, 1024),
         (_DSV4_PROFILE, 8, 1024),
@@ -710,6 +746,7 @@ def test_largest_capacity_per_world_size() -> None:
         (_DSV4_PROFILE, 4, 1024),
         (_KIMI_K3_PROFILE, 4, 1024),
         (_MUSE_SPARK_PROFILE, 4, 1024),
+        (_GLM53_FLASH_PROFILE, 4, 1024),
     ],
 )
 def test_largest_capacity_per_profile(profile, world_size, largest) -> None:

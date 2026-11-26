@@ -33,7 +33,9 @@ is also accepted for the DeepSeek V4.1 Flash and DSpark geometries), BF16 model
 activations, serialized MXFP4 expert weights, trivial expert placement, and no
 more than 1024 tokens per rank. The registered profiles are GPT-OSS 120B, Kimi
 K3, Muse Spark, the DeepSeek V4 expert geometry with unclamped SiLU, and
-DeepSeek V4.1 Flash (with its DSpark draft) with SiLU clamped at 10. Muse Spark
+DeepSeek V4.1 Flash (with its DSpark draft) and GLM-5.3 Flash (target and MTP
+draft, experts requantized from block FP8 to MXFP4 at load) with SiLU clamped
+at 10. Muse Spark
 and DeepSeek V4 checkpoints that declare a SiLU activation clamp are rejected,
 because Petit registers only unclamped SiLU for those geometries. Explicit FP8
 activation requests are also rejected; this backend quantizes activations to

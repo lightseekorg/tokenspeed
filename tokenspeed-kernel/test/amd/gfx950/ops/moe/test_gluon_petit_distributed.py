@@ -100,6 +100,18 @@ _PROFILES = {
         activation="silu",
         has_bias=False,
     ),
+    # Block-FP8 experts requantized to MXFP4 at load; SwiGLU clamped at 10.
+    "glm53_flash": _BenchmarkProfile(
+        name="glm53_flash",
+        experts=288,
+        top_k=8,
+        hidden=4096,
+        logical_intermediate=2048,
+        compute_intermediate=2048,
+        activation="swiglu",
+        has_bias=False,
+        clamp=10.0,
+    ),
     **{
         name: _BenchmarkProfile(
             name=name,
@@ -395,8 +407,8 @@ _REQUIRES_EP8 = pytest.mark.skipif(
 _RAISED_CAPACITY = {4: 4096, 8: 2560}.get(_WORLD_SIZE, 4096)
 # A profile whose own limit is below that serves its own raised capacity in
 # the raised-capacity cases: Muse Spark's EP8 2304-token chunks (a 256-multiple
-# below its 2368-row limit).
-_PROFILE_RAISED_CAPACITY = {"muse_spark": 2304}
+# below its 2368-row limit) and GLM-5.3 Flash's (below its 2464-row limit).
+_PROFILE_RAISED_CAPACITY = {"muse_spark": 2304, "glm53_flash": 2304}
 
 
 def _profile_capacity(profile_name: str, capacity: int) -> int:

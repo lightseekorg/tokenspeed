@@ -3164,6 +3164,20 @@ _MUSE_SPARK_PROFILE = _Profile(
     activation="silu",
     raised_capacity_world_sizes=frozenset({8}),
 )
+# GLM-5.3 Flash: block-FP8 checkpoint experts requantized to MXFP4 at load
+# (--moe-requant-experts mxfp4), SwiGLU clamped at 10 like DeepSeek V4.1.
+# Its MTP draft layer has the same geometry and shares this profile.
+_GLM53_FLASH_PROFILE = _Profile(
+    name="glm53_flash",
+    num_experts=288,
+    top_k=8,
+    model_dim=4096,
+    logical_intermediate=2048,
+    inter_dim=2048,
+    has_bias=False,
+    activation="silu_clamped",
+    raised_capacity_world_sizes=frozenset({8}),
+)
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
     _DSV4_PROFILE,
@@ -3171,6 +3185,7 @@ _PROFILES = (
     _DSV41_FLASH_PROFILE,
     _DSV41_FLASH_DSPARK_PROFILE,
     _MUSE_SPARK_PROFILE,
+    _GLM53_FLASH_PROFILE,
 )
 # Union over profiles, for checks made before the model is known: kernel
 # selection and the runtime's MoELayer.
@@ -3464,7 +3479,8 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
     if w.w13_input_layout != "concatenated":
         raise ValueError("Gluon Petit SiLU MegaMoE requires concatenated W13 input")
     swiglu_arg = getattr(w, "swiglu_arg", None)
-    if swiglu_arg is not None and swiglu_arg.alpha is not None:
+    # alpha 1.0 is standard SiLU (GLM-5.3 Flash passes it explicitly).
+    if swiglu_arg is not None and swiglu_arg.alpha not in (None, 1.0):
         raise ValueError(
             "Gluon Petit SiLU MegaMoE does not support nonstandard SiLU alpha"
         )
@@ -3477,7 +3493,7 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
     if profile.activation == "silu_clamped":
         if swiglu_arg is None or swiglu_arg.limit != 10.0:
             raise ValueError(
-                "Gluon Petit V4.1 requires the checkpoint SiLU clamp of 10"
+                f"Gluon Petit {profile.name} requires the checkpoint SiLU clamp of 10"
             )
         return profile
     if swiglu_arg is not None and swiglu_arg.limit is not None:

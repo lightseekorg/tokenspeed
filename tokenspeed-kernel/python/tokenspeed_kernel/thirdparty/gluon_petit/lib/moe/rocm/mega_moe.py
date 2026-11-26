@@ -251,6 +251,17 @@ def _MegaMoESolutions():
         4096,
         (P.kCta56, P.kCta128, P.kCta192),
     )
+    # GLM-5.3 Flash: 36 experts per rank; 288 experts take the default
+    # producer rule (cta128 below 12 rows, cta64 below 24, else cta56).
+    register(
+        kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+        8,
+        288,
+        8,
+        4096,
+        2048,
+        (P.kCta56, P.kCta64, P.kCta128),
+    )
     for ranks in (4, 8):
         for experts, topk in ((384, 6), (128, 3)):
             register(

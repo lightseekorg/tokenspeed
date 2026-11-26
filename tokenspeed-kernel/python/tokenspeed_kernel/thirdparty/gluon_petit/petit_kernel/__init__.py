@@ -369,6 +369,15 @@ class MegaMoeConfig:
             and not self.has_bias
             and activation_function is MegaMoeActivationFunction.silu_clamped
         )
+        glm53_flash_config = (
+            self.world_size == 8
+            and self.num_experts == 288
+            and self.topk == 8
+            and self.model_dim == 4096
+            and self.inter_dim == 2048
+            and not self.has_bias
+            and activation_function is MegaMoeActivationFunction.silu_clamped
+        )
         supported = (
             stages is MegaMoeStages.two_stage
             and activation is MegaMoeActivation.mxfp4
@@ -378,6 +387,7 @@ class MegaMoeConfig:
                 or kimi_config
                 or deepseek_v41_config
                 or muse_spark_config
+                or glm53_flash_config
             )
         )
         if not supported:

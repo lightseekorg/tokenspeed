@@ -378,7 +378,7 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires serialized MXFP4 expert weights"
                 )
-            if swiglu_beta is None and activation_alpha is not None:
+            if swiglu_beta is None and activation_alpha not in (None, 1.0):
                 raise ValueError(
                     "Gluon Petit MegaMoE does not support nonstandard SiLU alpha"
                 )
