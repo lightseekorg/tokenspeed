@@ -480,22 +480,6 @@ impl<'a> PeerReadPlan<'a> {
             pushes,
         })
     }
-
-    /// Resolve all requested slots into one-sided READ batches only (rejects Disk sources).
-    pub fn reads(
-        &self,
-        sources: &[ReadEndpoint<'_>],
-        dest: &ReadEndpoint<'_>,
-        pages: &[(PeerPageView, PeerPageView)],
-    ) -> Result<BTreeMap<usize, Spans>, LayoutError> {
-        let planned = self.plan(sources, dest, pages)?;
-        if !planned.pushes.is_empty() {
-            return Err(LayoutError::new(
-                "Disk sources require PeerReadPlan::plan for holder push",
-            ));
-        }
-        Ok(planned.reads)
-    }
 }
 
 #[cfg(test)]
@@ -715,11 +699,6 @@ mod disk_tests {
         ];
 
         let planner = PeerReadPlan::new(&src_c, &dst_c, 8, 8, 3).unwrap();
-        // `reads` rejects Disk sources.
-        assert!(planner
-            .reads(&src_eps, &readers[3].endpoint(), &pairs)
-            .is_err());
-
         let planned = planner
             .plan(&src_eps, &readers[3].endpoint(), &pairs)
             .unwrap();
@@ -952,9 +931,9 @@ mod tests {
         ];
         for reader in 0..8 {
             let plan = PeerReadPlan::new(&src, &dst, 1, 8, reader).unwrap();
-            let spans = &plan
-                .reads(&[endpoint(&sg)], &endpoint(&dg), &pages)
-                .unwrap()[&0];
+            let planned = plan.plan(&[endpoint(&sg)], &endpoint(&dg), &pages).unwrap();
+            assert!(planned.pushes.is_empty());
+            let spans = &planned.reads[&0];
             let mut actual: Vec<_> = spans
                 .sources
                 .iter()
@@ -994,7 +973,7 @@ mod tests {
         };
         // The KV field fits, but the registered state range ends one byte early.
         assert!(plan
-            .reads(
+            .plan(
                 std::slice::from_ref(&source),
                 &end(&dg, &[(100, 101)]),
                 &pages
@@ -1007,7 +986,7 @@ mod tests {
             regions: &[(100, 108)],
         };
         assert!(plan
-            .reads(&[short], &end(&dg, &[(100, 150)]), &pages)
+            .plan(&[short], &end(&dg, &[(100, 150)]), &pages)
             .is_err());
         dg.device[1].address = 103;
         let alias = ReadEndpoint {
@@ -1017,12 +996,12 @@ mod tests {
             regions: &[(100, 150)],
         };
         assert!(plan
-            .reads(std::slice::from_ref(&source), &alias, &pages)
+            .plan(std::slice::from_ref(&source), &alias, &pages)
             .unwrap_err()
             .to_string()
             .contains("alias"));
         // Shorten a planned fragment, leaving the last byte of the owned KV page uncovered.
         plan.groups[0][0].1.bytes_per_row = 0;
-        assert!(plan.reads(&[source], &alias, &pages[..1]).is_err());
+        assert!(plan.plan(&[source], &alias, &pages[..1]).is_err());
     }
 }

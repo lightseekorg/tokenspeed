@@ -378,7 +378,8 @@ impl Control {
             Message::Lookup(k, ..) if self.rank == 0 => {
                 let existing = self.offers.has(k);
                 let reply = if self.admission {
-                    self.offers.lookup(k, &self.gen, &self.layout, &m, s, now)
+                    self.offers
+                        .lookup(k, &self.gen, &self.layout, &m, s, self.pusher.as_ref(), now)
                 } else {
                     Message::Offered(k.clone(), None)
                 };
@@ -549,7 +550,7 @@ impl Control {
         }
         let expired = self
             .offers
-            .expire(now, retirement_bound_ms, self.pusher.as_ref());
+            .expire(now, retirement_bound_ms, s, self.pusher.as_ref());
         self.votes.extend(expired);
         round.events.append(&mut self.missing);
         Ok(())

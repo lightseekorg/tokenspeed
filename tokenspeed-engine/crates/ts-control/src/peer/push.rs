@@ -222,6 +222,13 @@ pub trait PagePusher: Send + Sync {
         true
     }
 
+    /// Whether this endpoint's holder can currently serve Disk-tier pushes.
+    /// Returns `false` if no Disk holder is attached, the Disk executor broke,
+    /// or the unknown-retirement fence overflowed and quarantined Disk serving.
+    fn can_serve_disk(&self) -> bool {
+        true
+    }
+
     /// Start one or more Disk pushes without blocking the caller thread.
     /// Sets `cancelling` to `true` once an unacknowledged cancel exceeds its
     /// grace period (so the reader can freeze early and fall back locally while
@@ -493,9 +500,13 @@ impl Drop for SlotGuard<'_> {
 /// duplicate or late-arriving Push messages after a Cancel.
 const MAX_FENCED_JOBS: usize = 16_384;
 /// Maximum `UnknownRetirement` job keys stored explicitly; if exceeded, the
-/// holder conservatively answers `Unknown` for any unrecognized Cancel so an
-/// unknown RDMA write retirement is never downgraded to `Cancelled`.
+/// holder quarantines Disk serving and records per-`(reply_to, incarnation)`
+/// high-water marks so overflowed unknown retirements still answer `Unknown`
+/// without falsely freezing brand-new jobs from healthy readers.
 const MAX_UNKNOWN_FENCED_JOBS: usize = 65_536;
+/// Maximum distinct `(reply_to, incarnation)` high-water mark entries tracked
+/// after `unknown` overflows before falling back to conservative `Unknown`.
+const MAX_UNKNOWN_HWM_PEERS: usize = 4_096;
 /// Upper bound on concurrent push worker threads per holder.
 const MAX_PUSH_WORKERS: usize = 16;
 /// Upper bound on queued pushes waiting for a worker before fast-failing.
@@ -514,46 +525,123 @@ struct JobKey {
 
 /// Set of `(reply_to, job)` keys that may never start again.
 ///
-/// Clean completions/cancellations use a bounded FIFO (`MAX_FENCED_JOBS`).
-/// `UnknownRetirement` entries are NEVER FIFO-evicted by normal push traffic so
-/// a late `Cancel` retry can never misclassify an RDMA write fault as cleanly
-/// cancelled (`Cancelled`), which would cause premature reader unfreeze.
+/// Clean completions/cancellations use a bounded FIFO (`MAX_FENCED_JOBS`) with
+/// sequence-tagged queue entries so upgrading a key to `unknown` never shrinks
+/// the live clean window or lets a ghost queue entry evict a re-inserted key.
+/// `UnknownRetirement` entries are NEVER FIFO-evicted by normal push traffic;
+/// if `unknown` reaches `MAX_UNKNOWN_FENCED_JOBS`, Disk serving is quarantined
+/// and overflowed unknown keys are bounded per `(reply_to, incarnation)` high-
+/// water mark so replays stay `Unknown` while fresh jobs fail cleanly (`Done`).
 #[derive(Default)]
 struct FencedJobs {
-    clean: HashSet<JobKey>,
-    order: VecDeque<JobKey>,
+    clean: HashMap<JobKey, u64>,
+    order: VecDeque<(JobKey, u64)>,
     unknown: HashSet<JobKey>,
-    /// Keys cancelled after `unknown_overflowed` became true: fenced against
-    /// late `Push`es without ever entering `clean` (so repeat `Cancel`s stay
-    /// `Unknown` and never downgrade to `Cancelled`).
-    overflow_cancelled: HashSet<JobKey>,
-    overflow_order: VecDeque<JobKey>,
+    /// Keys cancelled after `unknown_overflowed` became true whose retirement
+    /// may have been unknown: fenced against late `Push`es without ever
+    /// entering `clean` (so repeat `Cancel`s stay `Unknown`).
+    overflow_cancelled: HashMap<JobKey, u64>,
+    overflow_order: VecDeque<(JobKey, u64)>,
+    next_seq: u64,
+    /// Per `(reply_to, incarnation = (job >> 32) as u32)` maximum `job` id among
+    /// unknown retirements that could not fit in `unknown`.
+    unknown_hwm: HashMap<String, HashMap<u32, u64>>,
+    unknown_hwm_entries: usize,
     unknown_overflowed: bool,
+    hwm_overflowed: bool,
 }
 
 impl FencedJobs {
     fn contains(&self, key: &JobKey) -> bool {
         self.unknown.contains(key)
-            || self.clean.contains(key)
-            || self.overflow_cancelled.contains(key)
+            || self.clean.contains_key(key)
+            || self.overflow_cancelled.contains_key(key)
     }
 
-    fn unknown(&self, key: &JobKey) -> bool {
-        self.unknown.contains(key) || (self.unknown_overflowed && !self.clean.contains(key))
+    fn is_unknown_overflowed(&self) -> bool {
+        self.unknown_overflowed
+    }
+
+    /// Whether `key` is known or conservatively suspected to have retired with
+    /// unknown RDMA write state.
+    fn may_be_unknown(&self, key: &JobKey) -> bool {
+        if self.unknown.contains(key) {
+            return true;
+        }
+        if !self.unknown_overflowed || self.clean.contains_key(key) {
+            return false;
+        }
+        if self.hwm_overflowed {
+            return true;
+        }
+        let incarnation = (key.job >> 32) as u32;
+        self.unknown_hwm
+            .get(key.reply_to.as_str())
+            .and_then(|incarnations| incarnations.get(&incarnation))
+            .is_some_and(|&max_job| key.job <= max_job)
+    }
+
+    fn alloc_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        seq
+    }
+
+    fn record_unknown_overflow(&mut self, key: JobKey) {
+        if !self.unknown_overflowed {
+            self.unknown_overflowed = true;
+            tracing::error!(
+                unknown_fenced = self.unknown.len(),
+                job = key.job,
+                reader = %key.reply_to,
+                "peer push unknown-retirement fence capacity reached; quarantining holder Disk pushes"
+            );
+        }
+        let incarnation = (key.job >> 32) as u32;
+        if let Some(incarnations) = self.unknown_hwm.get_mut(key.reply_to.as_str()) {
+            if let Some(max_job) = incarnations.get_mut(&incarnation) {
+                *max_job = (*max_job).max(key.job);
+                return;
+            }
+            if self.unknown_hwm_entries < MAX_UNKNOWN_HWM_PEERS {
+                incarnations.insert(incarnation, key.job);
+                self.unknown_hwm_entries += 1;
+            } else {
+                self.hwm_overflowed = true;
+            }
+            return;
+        }
+        if self.unknown_hwm_entries < MAX_UNKNOWN_HWM_PEERS {
+            let mut incarnations = HashMap::new();
+            incarnations.insert(incarnation, key.job);
+            self.unknown_hwm.insert(key.reply_to, incarnations);
+            self.unknown_hwm_entries += 1;
+        } else {
+            self.hwm_overflowed = true;
+        }
     }
 
     fn insert_overflow_cancelled(&mut self, key: JobKey) {
         if self.unknown.contains(&key)
-            || self.clean.contains(&key)
-            || !self.overflow_cancelled.insert(key.clone())
+            || self.clean.contains_key(&key)
+            || self.overflow_cancelled.contains_key(&key)
         {
             return;
         }
-        self.overflow_order.push_back(key);
-        while self.overflow_order.len() > MAX_FENCED_JOBS {
-            if let Some(oldest) = self.overflow_order.pop_front() {
+        let seq = self.alloc_seq();
+        self.overflow_cancelled.insert(key.clone(), seq);
+        self.overflow_order.push_back((key, seq));
+        while self.overflow_cancelled.len() > MAX_FENCED_JOBS {
+            let Some((oldest, oldest_seq)) = self.overflow_order.pop_front() else {
+                break;
+            };
+            if self.overflow_cancelled.get(&oldest) == Some(&oldest_seq) {
                 self.overflow_cancelled.remove(&oldest);
             }
+        }
+        if self.overflow_order.len() > MAX_FENCED_JOBS * 2 {
+            self.overflow_order
+                .retain(|(k, s)| self.overflow_cancelled.get(k) == Some(s));
         }
     }
 
@@ -567,19 +655,27 @@ impl FencedJobs {
             if self.unknown.len() < MAX_UNKNOWN_FENCED_JOBS {
                 self.unknown.insert(key);
             } else {
-                self.unknown_overflowed = true;
+                self.record_unknown_overflow(key);
             }
             return;
         }
-        if self.unknown.contains(&key) || !self.clean.insert(key.clone()) {
+        if self.unknown.contains(&key) || self.clean.contains_key(&key) {
             return;
         }
         self.overflow_cancelled.remove(&key);
-        self.order.push_back(key);
-        while self.order.len() > MAX_FENCED_JOBS {
-            if let Some(oldest) = self.order.pop_front() {
+        let seq = self.alloc_seq();
+        self.clean.insert(key.clone(), seq);
+        self.order.push_back((key, seq));
+        while self.clean.len() > MAX_FENCED_JOBS {
+            let Some((oldest, oldest_seq)) = self.order.pop_front() else {
+                break;
+            };
+            if self.clean.get(&oldest) == Some(&oldest_seq) {
                 self.clean.remove(&oldest);
             }
+        }
+        if self.order.len() > MAX_FENCED_JOBS * 2 {
+            self.order.retain(|(k, s)| self.clean.get(k) == Some(s));
         }
     }
 }
@@ -911,6 +1007,7 @@ impl Holder {
         enum Reject {
             InFlightDuplicate,
             FencedUnknown,
+            Quarantined,
             Clean,
         }
         let reject = {
@@ -918,9 +1015,16 @@ impl Holder {
             if running_map.contains_key(&key) {
                 Some(Reject::InFlightDuplicate)
             } else {
-                let fenced = self.state.fenced.lock();
-                if fenced.unknown(&key) {
+                let mut fenced = self.state.fenced.lock();
+                if fenced.may_be_unknown(&key) {
                     Some(Reject::FencedUnknown)
+                } else if fenced.is_unknown_overflowed() {
+                    // Holder Disk serving is quarantined after unknown-fence
+                    // overflow, but `key` is provably not an overflowed unknown
+                    // job: record it in `clean` and reject cleanly (`Done`) so
+                    // healthy readers never freeze destination memory.
+                    fenced.insert(key.clone(), false);
+                    Some(Reject::Quarantined)
                 } else {
                     let offer_unauthorized = match offer {
                         Some(pair) => !self.state.active_offers.lock().contains(&pair),
@@ -957,6 +1061,24 @@ impl Holder {
                     );
                     if let Some(sockets) = sockets.upgrade() {
                         send(&sockets, &key.reply_to, &Message::Unknown { job: key.job });
+                    }
+                }
+                Reject::Quarantined => {
+                    tracing::warn!(
+                        job = key.job,
+                        ?offer,
+                        reader = key.reply_to,
+                        "rejecting peer push cleanly because holder Disk serving is quarantined after unknown-fence overflow"
+                    );
+                    if let Some(sockets) = sockets.upgrade() {
+                        send(
+                            &sockets,
+                            &key.reply_to,
+                            &Message::Done {
+                                job: key.job,
+                                ok: false,
+                            },
+                        );
                     }
                 }
                 Reject::Clean => {
@@ -1014,7 +1136,7 @@ impl Holder {
                 Some(active.clone())
             } else {
                 let mut fenced = self.state.fenced.lock();
-                fenced_unknown = fenced.unknown(&key);
+                fenced_unknown = fenced.may_be_unknown(&key);
                 if !fenced.contains(&key) {
                     if fenced_unknown {
                         fenced.insert_overflow_cancelled(key.clone());
@@ -1051,6 +1173,10 @@ impl Holder {
                 send(sockets, &key.reply_to, &msg);
             }
         }
+    }
+
+    fn can_serve_disk(&self) -> bool {
+        !self.state.source.executor.broken() && !self.state.fenced.lock().is_unknown_overflowed()
     }
 
     /// Authorizes `(incarnation, offer_id)` to serve Disk pushes once pinned.
@@ -1841,6 +1967,25 @@ impl PushEndpoint {
             .is_none_or(|holder| holder.cancel_offer(incarnation, offer_id))
     }
 
+    /// Whether the active holder can currently serve Disk-tier pushes.
+    pub fn can_serve_disk(&self) -> bool {
+        self.holder
+            .lock()
+            .as_ref()
+            .is_some_and(|holder| holder.can_serve_disk())
+    }
+
+    /// Simulate an unknown-retirement fence overflow for `key` in tests.
+    #[cfg(test)]
+    fn force_unknown_overflow_for_test(&self, reply_to: &str, job: u64) {
+        if let Some(holder) = self.holder.lock().as_ref() {
+            holder.state.fenced.lock().record_unknown_overflow(JobKey {
+                reply_to: reply_to.to_owned(),
+                job,
+            });
+        }
+    }
+
     /// Override cancel freeze/retry timings in unit and integration tests.
     #[cfg(test)]
     pub fn set_cancel_timing_for_test(
@@ -1897,6 +2042,10 @@ impl PagePusher for PushEndpoint {
 
     fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
         PushEndpoint::cancel_offer(self, incarnation, offer_id)
+    }
+
+    fn can_serve_disk(&self) -> bool {
+        PushEndpoint::can_serve_disk(self)
     }
 
     fn push(
@@ -2225,9 +2374,9 @@ mod tests {
             job: 42,
         };
         fenced.insert(a.clone(), false);
-        assert!(fenced.contains(&a) && !fenced.unknown(&a) && !fenced.contains(&b));
+        assert!(fenced.contains(&a) && !fenced.may_be_unknown(&a) && !fenced.contains(&b));
         fenced.insert(b.clone(), true);
-        assert!(fenced.contains(&b) && fenced.unknown(&b));
+        assert!(fenced.contains(&b) && fenced.may_be_unknown(&b));
         for job in 0..(MAX_FENCED_JOBS as u64 + 100) {
             fenced.insert(
                 JobKey {
@@ -2239,7 +2388,7 @@ mod tests {
         }
         assert!(!fenced.contains(&a));
         // Unknown-retirement entries must never be evicted by clean FIFO traffic.
-        assert!(fenced.contains(&b) && fenced.unknown(&b));
+        assert!(fenced.contains(&b) && fenced.may_be_unknown(&b));
         assert!(fenced.contains(&JobKey {
             reply_to: "10.0.0.3:7200".into(),
             job: MAX_FENCED_JOBS as u64 + 99
@@ -2446,32 +2595,39 @@ mod tests {
         // 3. Overflowing 1 worker + MAX_QUEUED_PUSHES rejects cleanly without blocking.
         *writer.hold.0.lock().unwrap() = true;
         writer.entered.store(0, Ordering::SeqCst);
-        std::thread::scope(|scope| {
-            let mut hs = Vec::new();
-            for i in 0..(1 + MAX_QUEUED_PUSHES) {
-                let (r, t) = (&reader, holder.name().to_owned());
-                hs.push(
-                    scope.spawn(move || {
-                        r.push(&t, &format!("q{i}"), Duration::from_secs(5), one(1))
-                    }),
-                );
-            }
-            let wait = Instant::now();
-            while writer.entered.load(Ordering::Acquire) < 1
-                || holder.active_push_jobs() < 1 + MAX_QUEUED_PUSHES
-            {
-                assert!(wait.elapsed() < Duration::from_secs(5));
-                thread::sleep(Duration::from_millis(2));
-            }
-            assert!(reader
-                .push(holder.name(), "ovf", Duration::from_secs(5), one(1))
-                .is_err());
-            *writer.hold.0.lock().unwrap() = false;
-            writer.hold.1.notify_all();
-            for h in hs {
-                assert_eq!(h.join().unwrap(), Ok(()));
-            }
-        });
+        let (qtx, qrx) = mpsc::channel::<Vec<Bytes>>();
+        let raw_client = Sockets::start_at("127.0.0.1", 0, qtx).unwrap();
+        let reply_ep = format!("127.0.0.1:{}", raw_client.port());
+        let (h_host, h_port) = split_endpoint(holder.name()).unwrap();
+        let total = 1 + MAX_QUEUED_PUSHES;
+        for i in 0..total {
+            let msg = Message::Push {
+                job: (900u64 << 32) | (i as u64 + 1),
+                offer: None,
+                reply_to: reply_ep.clone(),
+                session: format!("q{i}"),
+                budget_us: 30_000_000,
+                items: one(1),
+            };
+            raw_client.send(h_host, h_port, msg.frames()).unwrap();
+        }
+        let wait = Instant::now();
+        while writer.entered.load(Ordering::Acquire) < 1 || holder.active_push_jobs() < total {
+            assert!(wait.elapsed() < Duration::from_secs(15));
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(reader
+            .push(holder.name(), "ovf", Duration::from_secs(5), one(1))
+            .is_err());
+        *writer.hold.0.lock().unwrap() = false;
+        writer.hold.1.notify_all();
+        for _ in 0..total {
+            let reply = Message::decode(&qrx.recv_timeout(Duration::from_secs(15)).unwrap());
+            assert!(
+                matches!(reply, Some(Message::Done { ok: true, .. })),
+                "expected Done{{ok:true}}, got {reply:?}"
+            );
+        }
     }
 
     #[test]
@@ -3229,29 +3385,43 @@ mod tests {
         use ts_l3::{GroupLayout, HostLayout};
 
         // 1. P1-2: After `unknown_overflowed`, cancelling an unrecognized job
-        //    must NEVER insert it into `clean` (repeat cancels must stay Unknown).
-        let mut fenced = FencedJobs {
-            unknown_overflowed: true,
-            ..FencedJobs::default()
-        };
-        let ghost = JobKey {
+        //    within the overflowed peer/incarnation HWM must NEVER insert it
+        //    into `clean` (repeat cancels must stay Unknown), while fresh jobs
+        //    beyond the HWM or from other readers are cleanly classified.
+        let mut fenced = FencedJobs::default();
+        let overflowed = JobKey {
             reply_to: "10.0.0.9:7200".into(),
-            job: 999,
+            job: (7u64 << 32) | 999,
         };
-        assert!(fenced.unknown(&ghost));
-        fenced.insert_overflow_cancelled(ghost.clone());
-        assert!(fenced.contains(&ghost));
+        fenced.record_unknown_overflow(overflowed.clone());
+        assert!(fenced.is_unknown_overflowed());
+        assert!(fenced.may_be_unknown(&overflowed));
+        fenced.insert_overflow_cancelled(overflowed.clone());
+        assert!(fenced.contains(&overflowed));
         assert!(
-            fenced.unknown(&ghost),
+            fenced.may_be_unknown(&overflowed),
             "overflow_cancelled key must remain unknown on repeat cancel"
         );
-        // Clean completions after overflow remain cleanly classified.
-        let clean_key = JobKey {
+        // Fresh job from the same reader beyond the overflow HWM is NOT unknown.
+        let fresh_same_reader = JobKey {
             reply_to: "10.0.0.9:7200".into(),
-            job: 1000,
+            job: (7u64 << 32) | 1000,
         };
-        fenced.insert(clean_key.clone(), false);
-        assert!(fenced.contains(&clean_key) && !fenced.unknown(&clean_key));
+        assert!(!fenced.may_be_unknown(&fresh_same_reader));
+        // Fresh job from a different reader or different incarnation is NOT unknown.
+        let fresh_other_inc = JobKey {
+            reply_to: "10.0.0.9:7200".into(),
+            job: (8u64 << 32) | 1,
+        };
+        let fresh_other_reader = JobKey {
+            reply_to: "10.0.0.10:7200".into(),
+            job: (7u64 << 32) | 1,
+        };
+        assert!(!fenced.may_be_unknown(&fresh_other_inc));
+        assert!(!fenced.may_be_unknown(&fresh_other_reader));
+        // Clean completions after overflow remain cleanly classified.
+        fenced.insert(fresh_same_reader.clone(), false);
+        assert!(fenced.contains(&fresh_same_reader) && !fenced.may_be_unknown(&fresh_same_reader));
 
         // 2. P1-1 & P2-1: Single-slot (1-worker) holder proves:
         //    - duplicate in-flight Push receives NO reply until the active job finishes;
@@ -3424,5 +3594,124 @@ mod tests {
         raw_reader.send(h_host, h_port, p1.frames()).unwrap();
         let replay = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
         assert_eq!(replay, Some(Message::Unknown { job: 1 }));
+
+        // 3. Unknown-fence overflow quarantines Disk serving (`can_serve_disk() == false`),
+        //    still answers `Unknown` for replays within the overflowed peer/incarnation HWM,
+        //    but cleanly rejects fresh jobs (`Done { ok: false }` + `Cancelled`) without
+        //    freezing healthy readers' destination blocks.
+        assert!(holder.can_serve_disk());
+        let ovf_job = (42u64 << 32) | 10;
+        holder.force_unknown_overflow_for_test(&reply_ep, ovf_job);
+        assert!(!holder.can_serve_disk());
+        holder.activate_offer(500, 3);
+
+        // Replay of overflowed job (job <= HWM) -> Unknown on Push and Cancel.
+        let replay_ovf = Message::Push {
+            job: ovf_job,
+            offer: Some((500, 3)),
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: items.clone(),
+        };
+        raw_reader
+            .send(h_host, h_port, replay_ovf.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Unknown { job: ovf_job })
+        );
+        let cancel_ovf = Message::Cancel {
+            job: ovf_job,
+            reply_to: reply_ep.clone(),
+        };
+        raw_reader
+            .send(h_host, h_port, cancel_ovf.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Unknown { job: ovf_job })
+        );
+
+        // Fresh job from the same reader beyond HWM -> clean Done{ok:false} + Cancelled.
+        let fresh_job = (42u64 << 32) | 11;
+        let fresh_push = Message::Push {
+            job: fresh_job,
+            offer: Some((500, 3)),
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: items.clone(),
+        };
+        raw_reader
+            .send(h_host, h_port, fresh_push.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Done {
+                job: fresh_job,
+                ok: false
+            })
+        );
+        let cancel_fresh = Message::Cancel {
+            job: fresh_job,
+            reply_to: reply_ep.clone(),
+        };
+        raw_reader
+            .send(h_host, h_port, cancel_fresh.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Cancelled { job: fresh_job })
+        );
+
+        // Fresh job from another reader (different reply_to) -> clean Done{ok:false}.
+        let (other_tx, other_rx) = mpsc::channel::<Vec<Bytes>>();
+        let other_reader = Sockets::start_at("127.0.0.1", 0, other_tx).unwrap();
+        let other_ep = format!("127.0.0.1:{}", other_reader.port());
+        let other_push = Message::Push {
+            job: (42u64 << 32) | 1,
+            offer: Some((500, 3)),
+            reply_to: other_ep,
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items,
+        };
+        other_reader
+            .send(h_host, h_port, other_push.frames())
+            .unwrap();
+        assert_eq!(
+            Message::decode(&other_rx.recv_timeout(Duration::from_secs(2)).unwrap()),
+            Some(Message::Done {
+                job: (42u64 << 32) | 1,
+                ok: false
+            })
+        );
+    }
+
+    #[test]
+    fn upgrading_clean_fence_to_unknown_preserves_full_clean_window() {
+        let mut fenced = FencedJobs::default();
+        let key = |job: u64| JobKey {
+            reply_to: "10.0.0.1:7200".into(),
+            job,
+        };
+        // Fill `clean` halfway, upgrade all of those keys to `unknown`, then
+        // insert `MAX_FENCED_JOBS` live clean keys: none of the live clean keys
+        // may be prematurely evicted by ghosts left in `order`.
+        for j in 0..(MAX_FENCED_JOBS as u64) {
+            fenced.insert(key(j), false);
+            fenced.insert(key(j), true);
+        }
+        assert_eq!(fenced.clean.len(), 0);
+        let base = MAX_FENCED_JOBS as u64;
+        for j in base..(base + MAX_FENCED_JOBS as u64) {
+            fenced.insert(key(j), false);
+        }
+        assert_eq!(fenced.clean.len(), MAX_FENCED_JOBS);
+        assert!(fenced.contains(&key(base)));
+        assert!(!fenced.may_be_unknown(&key(base)));
+        assert!(fenced.contains(&key(base + MAX_FENCED_JOBS as u64 - 1)));
+        assert!(fenced.order.len() <= MAX_FENCED_JOBS * 2);
     }
 }

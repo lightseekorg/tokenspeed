@@ -404,6 +404,12 @@ impl Attempt {
             // via FetchFrozen; mark this Rust Attempt finished so prompt/hash
             // memory and the 4096-attempt table slot are reclaimed without
             // emitting TargetRetired or Release.
+            tracing::error!(
+                holder = %v.key.holder.name,
+                lease = v.key.lease,
+                offer = v.offer,
+                "peer transfer retired with unknown write state; leaving reader targets frozen and omitting holder Release"
+            );
             self.phase = Phase::Finished;
             return None;
         }
