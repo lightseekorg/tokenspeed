@@ -85,7 +85,9 @@ std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
 }  // namespace
 
 Scheduler::PeerStats Scheduler::GetPeerStats() const {
-    PeerStats stats{.landed_tokens = peer_landed_tokens_, .failed_landings = peer_failed_landings_};
+    PeerStats stats{.landed_tokens = peer_landed_tokens_,
+                    .failed_landings = peer_failed_landings_,
+                    .unused_host_landings = peer_unused_host_landings_};
     if (peer_exports_) {
         stats.leases = peer_exports_->NumLeases();
         stats.pinned_blocks = peer_exports_->NumPinnedBlocks();
@@ -227,10 +229,12 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         if (const std::optional<std::int32_t> landed =
                 peer_host_landings_->Finish(event.request_id, event.num_tokens)) {
             const auto* owner = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
-            if (*landed > 0 && (!async_host_peer_ || (owner && owner->admission.storage_hold))) {
-                peer_landed_tokens_ += static_cast<std::uint64_t>(*landed);
-            } else {
+            if (*landed == 0) {
                 ++peer_failed_landings_;
+            } else if (async_host_peer_ && !(owner && owner->admission.storage_hold)) {
+                ++peer_unused_host_landings_;
+            } else {
+                peer_landed_tokens_ += static_cast<std::uint64_t>(*landed);
             }
             // A request that let go of the landing has nothing to step.
             auto* looking = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
@@ -555,7 +559,7 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
                 return std::string_view(endpoint).substr(0, endpoint.rfind(':'));
             };
             const bool remote_node = host(request->PeerHolder()) != host(config_.peer_config->name);
-            path = (hit.source_mask & 3) + (remote_node ? 4 : 0);
+            path = (hit.source_mask & 7) + (remote_node ? 8 : 0);
             // Cold-start estimates for Lite17B. Never use the preceding forward
             // as overlap: HBM grants are made only in this round.
             constexpr double compute_us_per_token = 80.0;

@@ -115,6 +115,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     gc.collect()
     assert exported[8].tolist() == [0.875]
     assert exported[9] == [1]
+    assert len(exported) == 10
 
 
 def test_completed_result_keeps_absent_columns_absent():

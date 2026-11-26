@@ -1164,6 +1164,9 @@ TEST_F(AsyncHostReservationTest, HostCreditRetriesPastLookupTimeoutUntilDmaRetir
     EXPECT_FALSE(reader.ReservePeerHost(lookup.lease, prefix.size(), retry));
     EXPECT_TRUE(retry);
     Send(reader, cache::PeerFetchDone{.request_id = "busy", .num_tokens = first->end_tokens});
+    EXPECT_EQ(reader.GetPeerStats().unused_host_landings, 1u);
+    EXPECT_EQ(reader.GetPeerStats().failed_landings, 0u);
+    EXPECT_EQ(reader.GetPeerStats().landed_tokens, 0u);
     auto next = reader.ReservePeerHost(lookup.lease, prefix.size(), retry);
     ASSERT_TRUE(next);
     EXPECT_FALSE(retry);

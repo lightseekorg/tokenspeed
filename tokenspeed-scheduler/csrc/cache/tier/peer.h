@@ -188,7 +188,7 @@ struct PeerRelease {
 struct PeerLookupAnswered {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
-    unsigned source_mask{0};  // Device=1, Host=2, mixed=3.
+    unsigned source_mask{0};  // Device=1, Host=2, Disk=4; mixed sources combine bits.
     std::vector<std::uint8_t> checkpoint;
 };
 struct PeerFetchDone {

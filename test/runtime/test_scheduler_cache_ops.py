@@ -201,7 +201,13 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
 
 
 @pytest.mark.parametrize(
-    "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
+    "kind",
+    [
+        "WriteBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateCommitDoneEvent",
+    ],
 )
 def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()

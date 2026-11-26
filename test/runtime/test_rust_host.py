@@ -568,7 +568,7 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle) -> HostDataPlane:
+def _data_plane(handle: DeviceHandle, *, defer_recurrent_state=False) -> HostDataPlane:
     """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
@@ -588,6 +588,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         attn_tp_cpu_group=None,
         epd_publisher=None,
         starting=False,
+        defer_recurrent_state=defer_recurrent_state,
     )
 
 

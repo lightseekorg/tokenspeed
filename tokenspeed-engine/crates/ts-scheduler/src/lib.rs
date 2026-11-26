@@ -772,8 +772,10 @@ mod ffi {
         landing_requests: usize,
         /// Reader: tokens landed so far.
         landed_tokens: u64,
-        /// Reader: landings given up so far.
+        /// Reader: landings whose transfer failed to complete the prefix.
         failed_landings: u64,
+        /// Reader: successful Host landings whose request gave up the reservation.
+        unused_host_landings: u64,
     }
 
     /// One cache group's page counts.

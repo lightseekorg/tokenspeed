@@ -67,13 +67,14 @@ enum Driver {
 pub struct Peer {
     driver: Driver,
     versioned: Option<super::coordinated::Control>,
+    device_pin_gate: Arc<servicer::DevicePinGate>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
     member: usize,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     next_sample_us: i64,
-    previous_totals: [u64; 2],
+    previous_totals: [u64; 3],
 }
 
 impl Peer {
@@ -102,6 +103,11 @@ impl Peer {
             transfers,
         )?;
         let (port, fence, origin) = (protocol.port(), protocol.fence(), protocol.origin);
+        let device_pin_gate = protocol
+            .endpoint
+            .as_ref()
+            .map(|e| e.holder.lock().device_pin_gate.clone())
+            .unwrap_or_default();
         let driver = if background {
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
@@ -109,13 +115,13 @@ impl Peer {
             let thread = thread::Builder::new()
                 .name("ts-peer-host".into())
                 .spawn(move || {
-                    if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
-                        tracing::error!(%error, "peer worker stopped");
-                        let _ = tx.send(Err(error));
-                    }
+                    wake.run(|| {
+                        if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
+                            tracing::error!(%error, "peer worker stopped");
+                            let _ = tx.send(Err(error));
+                        }
+                    })
                 })?;
-            wake.set(thread.thread().clone())
-                .expect("one protocol worker");
             Driver::Background(Worker {
                 commands,
                 rounds,
@@ -130,13 +136,14 @@ impl Peer {
         Ok(Self {
             versioned: None,
             driver,
+            device_pin_gate,
             port,
             fence,
             origin,
             member,
             metrics: None,
             next_sample_us: 0,
-            previous_totals: [0; 2],
+            previous_totals: [0; 3],
         })
     }
 
@@ -164,8 +171,14 @@ impl Peer {
         incarnation: u64,
         channel: Option<super::VersionedChannel>,
     ) {
-        let (control, fence) =
-            super::coordinated::Control::new(layout, self.member, name, incarnation, channel);
+        let (control, fence) = super::coordinated::Control::new(
+            layout,
+            self.member,
+            name,
+            incarnation,
+            channel,
+            self.device_pin_gate.clone(),
+        );
         if control.reader() {
             self.fence = fence;
         }
@@ -291,6 +304,10 @@ impl Peer {
     pub fn port(&self) -> Option<u16> {
         self.port
     }
+    /// Gate new Device pins immediately, including when the protocol runs in the background.
+    pub fn block_device_pins(&self, blocked: bool) {
+        self.device_pin_gate.block(blocked);
+    }
     /// The data-plane fence endpoint.
     pub fn fence(&self) -> PeerFence {
         self.fence.clone()
@@ -356,8 +373,15 @@ impl Peer {
         ] {
             metrics.snapshot(name, n);
         }
-        let totals = [stats.landed_tokens, stats.failed_landings];
-        for (i, name) in ["landed_tokens", "failed_landings"].iter().enumerate() {
+        let totals = [
+            stats.landed_tokens,
+            stats.failed_landings,
+            stats.unused_host_landings,
+        ];
+        for (i, name) in ["landed_tokens", "failed_landings", "unused_host_landings"]
+            .iter()
+            .enumerate()
+        {
             metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
         }
         self.previous_totals = totals;
@@ -507,6 +531,7 @@ impl Exports {
                 let mut answer = holder.answer(lease, PeerAnswerKind::Pin);
                 if p.progress == PeerProgress::Device
                     && holder.matches_stamp(&stamp)
+                    && holder.device_pin_gate.allows(&checkpoint.pages)
                     && cache
                         .apply_peer_export(&checkpoint, micros)
                         .map_err(|e| PeerError::Worker(e.to_string()))?

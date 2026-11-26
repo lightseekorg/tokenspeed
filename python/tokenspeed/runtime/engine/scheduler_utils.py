@@ -53,17 +53,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     scheduler_role,
 )
 
-# The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
-# load-back ticket, a retraction image's snapshot store, a restore, a plan's
-# state commit fence. The data plane reports them to the Rust control plane
-# as ``(kind, op_id)`` payloads.
-_CACHE_EVENT_TYPES = {
-    "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
-    "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
-    "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
-    "RestoreDoneEvent": Cache.RestoreDoneEvent,
-    "StateCommitDoneEvent": Cache.StateCommitDoneEvent,
-}
+# The data plane reports Host cache and state commit ACKs as ``(kind, op_id)``.
+_CACHE_EVENT_TYPES = frozenset(
+    {
+        "WriteBackDoneEvent",
+        "LoadBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateCommitDoneEvent",
+    }
+)
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,

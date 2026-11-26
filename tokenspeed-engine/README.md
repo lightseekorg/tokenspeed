@@ -32,10 +32,29 @@ and the host launcher remains `ts-host`, backed by the `_host` extension. For ex
 
 ```toml
 [dependencies]
-ts-client = { package = "tokenspeed-client", version = "0.1.0" }
+ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 ```
 
 ## Wire conformance
+
+The native frontend offers two distinct request operations. `abort(rid)`
+only sends the engine's abort and does not guarantee a terminal output.
+`cancel(rid)` also closes that client's output stream after a successful send:
+Rust receives `StreamError::Cancelled`; Python's `next_outputs()` receives
+`(rid, RequestCancelled)`, an `EngineError` subclass, after already queued
+chunks.
+
+A finish is preserved when it wins the race. A failed or interrupted cancel
+send leaves ownership attached for retry unless the stream ended independently.
+
+Cancellation changes no engine retirement fence or engine-reported load; use
+fresh request ids for subsequent submissions. See the
+[request lifecycle contract](../docs/design/event-loop.md#request-identity-and-submission-failures).
+
+`tokenspeed-client` 0.2 makes `StreamError` non-exhaustive and adds `Cancelled`.
+Rust callers updating from 0.1 must include a fallback match arm. The minor
+version change keeps this source incompatibility out of ordinary 0.1 updates;
+the engine wire schema and Python wheel versioning are unchanged.
 
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
@@ -89,8 +108,15 @@ The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
 an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
 installed. The scheduler source is bundled in its crate; the grammar build
-downloads the pinned, SHA256-checked xgrammar source release and therefore
-needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+downloads the pinned, SHA256-checked tokenspeed-xgrammar source release and needs
+network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+Keep that source pin aligned with the Python dependency, which still imports as
+`xgrammar`, and regenerate the tokenizer fixtures with
+`python tokenspeed-engine/crates/ts-grammar/tests/fixtures/generate.py` when upgrading.
+Rebuild the engine alongside the Python dependency so their tokenizer serialization
+formats agree.
+In an existing environment, uninstall the upstream `xgrammar` distribution before
+installing `tokenspeed-xgrammar`; both own the `xgrammar` module.
 
 For `cargo test --locked`, install `numpy` and `prometheus-client` in that
 interpreter too. The metrics tests read the real Prometheus multiprocess files.

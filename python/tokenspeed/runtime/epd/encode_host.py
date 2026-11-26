@@ -226,6 +226,8 @@ class EncodeSettings:
         rank: This rank.
         tp_ranks: The attention-TP group, in rank order; its first rank takes
             the frontend's requests and hosts the bootstrap server.
+        attn_tp_rank: This rank's position in that group, used by native
+            transfer metrics.
         collective_bind_host: Where the rank listens for the other ranks'
             collective connections.
         handshake_address: On the first rank, the frontend's handshake
@@ -279,6 +281,11 @@ class EncodeSettings:
     metrics_relay_endpoint: str | None
     metrics_model_name: str
     metrics_app_key: str
+
+    @property
+    def attn_tp_rank(self) -> int:
+        """The group-local rank consumed by the native encode host."""
+        return self.tp_ranks.index(self.rank)
 
 
 class EncodeDataPlane:

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Retry helper for Hugging Face Hub rate limits.
+"""Retry helper for Hugging Face Hub rate limits and transient server errors.
 
 Keep this module free of tokenspeed imports and heavy dependencies so every
 entry point (CLI, scheduler, config/tokenizer loading, tests) can use it
@@ -47,22 +47,24 @@ _T = TypeVar("_T")
 # Anonymous Hugging Face API access is bucketed per egress IP (a few hundred
 # requests per five-minute window). Data/expert-parallel startup fans out one
 # model loader per rank, so a single server start can drain that bucket and
-# the hub answers 429. Wait out the window instead of failing engine startup;
-# the engine startup timeout still bounds the total wait across calls.
+# the hub answers 429. Transient server errors can also interrupt metadata
+# queries. Retry both instead of failing engine startup; the engine startup
+# timeout still bounds the total wait across calls.
 HF_RATE_LIMIT_RETRY_BUDGET_S = 900.0
 HF_RATE_LIMIT_BASE_DELAY_S = 5.0
 HF_RATE_LIMIT_MAX_DELAY_S = 300.0
 
 
 def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _T:
-    """Run ``call``, retrying Hugging Face Hub 429 rate limits.
+    """Run ``call``, retrying Hub 429 and transient 500/502/503/504 errors.
 
     The hub answers an exhausted rate-limit window with 429 and usually a
     ``Retry-After`` hint; without the hint, back off exponentially from
     ``HF_RATE_LIMIT_BASE_DELAY_S`` up to ``HF_RATE_LIMIT_MAX_DELAY_S``. Once
     waiting again would exceed ``HF_RATE_LIMIT_RETRY_BUDGET_S``, re-raise the
-    last error so a hard quota failure still surfaces instead of hanging.
-    Any non-429 error propagates immediately.
+    last error so a persistent failure still surfaces instead of hanging.
+    Transient server errors use the same retry budget; other errors propagate
+    immediately.
 
     Args:
         description (str): What ``call`` is doing, embedded in the retry
@@ -73,8 +75,8 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _
         _T: The result of ``call``.
 
     Raises:
-        HfHubHTTPError: Immediately for any non-429 hub error, and for a 429
-            once waiting again would exceed ``HF_RATE_LIMIT_RETRY_BUDGET_S``.
+        HfHubHTTPError: Immediately for a non-retryable hub error, or once
+            waiting again would exceed ``HF_RATE_LIMIT_RETRY_BUDGET_S``.
     """
     waited_s = 0.0
     attempt = 0
@@ -83,7 +85,13 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _
             return call()
         except HfHubHTTPError as exc:
             response = exc.response
-            if response is None or response.status_code != 429:
+            if response is None or response.status_code not in (
+                429,
+                500,
+                502,
+                503,
+                504,
+            ):
                 raise
             retry_after_s = _retry_after_s(response)
             delay_s = (
@@ -99,7 +107,7 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _
             waited_s += delay_s
             attempt += 1
             logger.warning(
-                f"Hugging Face rate limit (429) while {description}; "
+                f"Hugging Face Hub error ({response.status_code}) while {description}; "
                 f"retrying in {delay_s:.1f}s "
                 f"({HF_RATE_LIMIT_RETRY_BUDGET_S - waited_s:.0f}s of retry budget left)",
             )

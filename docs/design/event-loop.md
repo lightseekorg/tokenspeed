@@ -109,6 +109,26 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+The native frontend's `abort(rid)` only sends the ordinary wire abort. A
+client abort suppresses terminal output in the engine, so callers must not
+wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
+`Frontend.cancel`) sends that same abort and then detaches the local stream.
+The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
+`(rid, RequestCancelled)` exception value, after any already queued outputs.
+It creates no finish chunk or token/finish metrics. Only that stream and the
+client's in-flight count change; engine-reported load and slot, cache and
+transfer retirement keep their existing owners and fences.
+
+Cancellation returns `true` only when it closes the local stream. If a finish,
+stream error or another cancellation wins, its result is preserved and
+cancellation returns `false`. A failed send or a dropped cancellation future
+does not detach the stream: the caller can retry, even if the engine already
+received the abort. Stream drop and send cleanup compare the original local
+admission's channel before removing an entry. This protects a later local
+owner, but adds no wire identity: new submissions must use fresh request ids
+to avoid delayed output or abort messages reaching a reused id. Local closure
+is never evidence that engine resources are free.
+
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
 request — including fan-out children and retries — must use a fresh room. At
@@ -1557,3 +1577,26 @@ disabled metrics and prefill output do not create an observation.
 Admission failures prepare their final output before logging completion, as the
 other terminal paths do. Preparing that output consumes a sampled TTFT trace;
 completion logging therefore emits no second breakdown for the same request.
+
+### Request-level PD transfer metrics
+
+The first prefill replica member reports one `tokenspeed:kv_handoffs_total`
+increment at the replica-agreed terminal transition. A timeout awaiting the
+decode landing manifest, or rejected registration/preallocation,
+is labeled `handshake_failed`; other failures (including cancelled transfers)
+are labeled `failed`. Cleanup and per-rank write retries do not add outcomes.
+On success, `tokenspeed:prefill_kv_handoff_seconds` starts at the final prompt
+handoff and ends when the replica can retire the transfer. Earlier layerwise
+writes can overlap compute. The first decode member observes
+`tokenspeed:decode_kv_wait_seconds` from local landing-manifest submission
+to replica-agreed full KV arrival; time waiting for an execution slot after
+KV arrival is measured separately.
+
+## Recurrent-state materialization feedback
+
+The data plane retires replay for snapshot and abort slots before running
+the corresponding plan. Releases use the same forward queue and retire any
+remaining replay ahead of later plans. The control plane tracks retirement
+fences separately from scheduler cache operations. Peer export, cache clear
+and drain wait for replica completion, including releases queued after the
+last forward's results.

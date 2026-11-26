@@ -578,6 +578,16 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
+Checkpoint positions and scan indices are planned on the host. Each metadata
+preparation packs its related tensors into one pinned upload without
+synchronizing the model stream. Checkpoint writers reuse the uploaded row
+and offset views. These mirrors stay live-sized; only the token and block
+slots consumed by captured
+state writers keep the fixed capacity shape. Retained device views belong to
+the existing `attention_state` region and follow its `weights` release/resume
+lifecycle. Each upload has fresh host staging storage so overlapping forwards
+cannot overwrite metadata whose transfer is still in flight.
+
 For PD landing into a partial history block, follow the
 [block-table export contract](#block-tables-and-exported-page-ids) above.
 
@@ -3503,3 +3513,17 @@ unusable State checkpoint eligible for an optimistic storage query.
 Query/GET still requires all Full, State and window
 objects; diverging prompts therefore cannot reuse a checkpoint solely because
 they share a group or boundary length.
+
+## Deferred recurrent state workspace
+
+Deferred GDN payloads are execution workspace, rather than a cache group:
+they never enter prefix matching, tier storage, retraction images or PD
+transfers. Two batch-sized banks retain replay inputs until the next forward
+consumes them or materializes dropouts. Only the small slot/generation records
+are slot state, owned by `GdnPendingState` through `SlotStateExporter`.
+Export and import reject records that still name a pending payload.
+
+The runtime retires replay before reading or reusing its old State block or
+request slot. It materializes the state at a request exit to cover published
+checkpoints and snapshots. Until then the bank and live block together
+describe the logical frontier. This adds no State slot or cache span.

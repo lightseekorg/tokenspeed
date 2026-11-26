@@ -633,7 +633,6 @@ fn independent_device_choice(adaptive: bool) {
         } else {
             TestDriver::Eager
         };
-        cfg.peer.timeouts.answer_us = 50_000;
         Replica::with_listener(cfg, listener, base, &arena, "Fused")
     };
     let mut holder = replica(HOLDER_BASE);
@@ -647,10 +646,17 @@ fn independent_device_choice(adaptive: bool) {
         .submit_requests(&[spec("r", tokens, &holder.name)])
         .unwrap();
     reader.round();
-    std::thread::sleep(Duration::from_millis(160));
-    // This round comes well after the 50 ms lookup budget.
-    let report = reader.peer.report();
-    let round = reader.peer.agree(&[report]).unwrap();
+    // Wait for the protocol result without giving the scheduler another round.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let round = loop {
+        let report = reader.peer.report();
+        let round = reader.peer.agree(&[report]).unwrap();
+        if !round.events.is_empty() {
+            break round;
+        }
+        assert!(Instant::now() < deadline, "lookup did not complete");
+        std::thread::yield_now();
+    };
     assert!(round.events.iter().any(|event| event.num_tokens > 0));
     let mut sched = reader.scheduler.lock();
     sched.advance_peer(round.now_us, &round.events).unwrap();
@@ -666,6 +672,7 @@ fn independent_device_choice(adaptive: bool) {
     let addr = READER_BASE + page.block_id as u64 * PAGE_BYTES;
     drop(sched);
     reader.peer.dispatch(fetches, vec![], round.now_us);
+    // Give a premature write time to surface while the device fence stays closed.
     std::thread::sleep(Duration::from_millis(120));
     assert_eq!(arena.read_bytes(addr, 1), vec![0]);
     reader.peer.fence().ready();
@@ -813,6 +820,51 @@ fn a_prefill_replica_lands_a_prefix_from_a_plan_with_no_other_device_work() {
         std::thread::sleep(Duration::from_millis(2));
     }
     panic!("the prefill replica never prefilled r; landing plans {landing_plans:?}");
+}
+
+#[test]
+fn a_reader_cannot_pin_device_pages_during_replay_retirement() {
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start("v1", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+
+    let mut longer = tokens;
+    longer.extend(1000..1000 + PAGE);
+    holder.peer.block_device_pins(true);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("blocked", longer.clone(), &holder.name)])
+        .unwrap();
+    let (prefix, fetches) = rounds_until_prefill(&mut reader, Some(&mut holder), "blocked");
+    // A reader reserves the landing before it asks the holder to pin.
+    assert_eq!(fetches.len(), 1);
+    assert_eq!(prefix, 0);
+    assert_eq!(reader.scheduler.lock().peer_stats().landed_tokens, 0);
+    for destination in &fetches[0].destinations {
+        let page = arena.read_bytes(
+            READER_BASE + destination.block_id as u64 * PAGE_BYTES,
+            PAGE_BYTES as usize,
+        );
+        assert!(page.iter().all(|&byte| byte == 0));
+    }
+
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "blocked", vec![7]),
+        event(ForwardEventKind::Abort, "blocked", Vec::new()),
+    ]);
+    holder.peer.block_device_pins(false);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("ready", longer, &holder.name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "ready");
+    assert_eq!(landings.len(), 1);
+    assert!(prefix >= 5 * PAGE);
+    assert_eq!(prefix, landings[0].end_tokens);
 }
 
 #[test]
@@ -1145,6 +1197,12 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
     let arena = Arena::new(270_000);
     let bound = || PeerListener::bind("127.0.0.1", 0).unwrap();
     let address = |port| format!("127.0.0.1:{port}");
+    // Only the late-reply control needs the production 50 ms deadline.
+    let lookup_budget = if holder_delay.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(50)
+    };
     let config = |name: &str| {
         let mut cfg = settings(name, "v1");
         cfg.driver = if autonomous {
@@ -1152,7 +1210,11 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
         } else {
             TestDriver::Coordinated
         };
-        cfg.peer.timeouts.answer_us = 50_000;
+        cfg.peer.timeouts.answer_us = lookup_budget.as_micros() as i64;
+        if hold_reader {
+            // The holder's soft lease must survive the intentional wait on the reader lock.
+            cfg.soft_pin_us = 4_000_000;
+        }
         cfg
     };
     let listener = bound();
@@ -1323,7 +1385,8 @@ fn host_during_forward(autonomous: bool, holder_delay: Duration, contend: bool, 
                 let mut guard = (hold_reader && lookup).then(|| reader_cache.lock());
                 proxy.reply(&actual,&reply).unwrap();
                 if let Some(round) = guard.as_mut() {
-                    std::thread::sleep(Duration::from_millis(150));
+                    // Keep the lock through the budget even if the wire reply was immediate.
+                    std::thread::sleep(lookup_budget + Duration::from_millis(10));
                     let until = Instant::now() + Duration::from_secs(2);
                     while round.peer_stats().landing_requests == 0 {
                         parking_lot::MutexGuard::bump(round);
@@ -1533,13 +1596,21 @@ fn held_host_read(shutdown: bool) {
     assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
 }
 
-fn delayed_checkpoint_pin(evict: bool) {
+#[derive(Clone, Copy, Debug)]
+enum CheckpointState {
+    Ready,
+    Evicted,
+    Replaying,
+    Retired,
+}
+
+fn delayed_checkpoint_pin(state: CheckpointState) {
     let arena = Arena::new(200_000);
     let replica = |base| {
         let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
         cfg.driver = TestDriver::Automatic;
-        cfg.peer.timeouts.answer_us = 50_000;
+        // This test exercises checkpoint expiry; allow the normal loopback lookup budget.
         // Also expire the Rust holder's lookup metadata before the PIN.
         cfg.peer.record_lifetime = Duration::from_secs(2);
         cfg.pages = 512;
@@ -1570,12 +1641,17 @@ fn delayed_checkpoint_pin(evict: bool) {
         ])
         .unwrap();
     assert_eq!(reader.round().0, vec![("forward".into(), 0)]);
+    if matches!(state, CheckpointState::Replaying | CheckpointState::Retired) {
+        holder.peer.block_device_pins(true);
+    }
     std::thread::sleep(Duration::from_secs(4));
     // Retire the soft lease explicitly before the late grant.
     holder.round();
     assert_eq!(holder.scheduler.lock().peer_stats().leases, 0);
-    if evict {
-        assert!(holder.scheduler.lock().clear_cache());
+    match state {
+        CheckpointState::Ready | CheckpointState::Replaying => {}
+        CheckpointState::Evicted => assert!(holder.scheduler.lock().clear_cache()),
+        CheckpointState::Retired => holder.peer.block_device_pins(false),
     }
     reader.advance(&[
         event(ForwardEventKind::ExtendResult, "forward", vec![7]),
@@ -1589,7 +1665,7 @@ fn delayed_checkpoint_pin(evict: bool) {
     );
     let fetch = &fetches[0];
     let addr = READER_BASE + fetch.destinations[0].block_id as u64 * PAGE_BYTES;
-    if !evict {
+    if matches!(state, CheckpointState::Ready | CheckpointState::Retired) {
         assert_eq!(prefix, 2048);
         assert_eq!(arena.read_bytes(addr, 1), vec![29]);
     } else {
@@ -1598,17 +1674,120 @@ fn delayed_checkpoint_pin(evict: bool) {
     }
     assert_eq!(holder.scheduler.lock().peer_stats().pinned_blocks, 0);
     println!(
-        "delayed PIN evict={evict} forward_ms=4000 fetches={} consumed={prefix}",
+        "delayed PIN state={state:?} forward_ms=4000 fetches={} consumed={prefix}",
         fetches.len()
     );
 }
 #[test]
 fn expired_checkpoint_pin_keeps_an_unchanged_prefix() {
-    delayed_checkpoint_pin(false);
+    delayed_checkpoint_pin(CheckpointState::Ready);
 }
 #[test]
 fn expired_checkpoint_pin_rejects_an_evicted_prefix() {
-    delayed_checkpoint_pin(true);
+    delayed_checkpoint_pin(CheckpointState::Evicted);
+}
+
+#[test]
+fn expired_checkpoint_pin_rejects_device_pages_during_replay() {
+    delayed_checkpoint_pin(CheckpointState::Replaying);
+}
+
+#[test]
+fn expired_checkpoint_pin_accepts_device_pages_after_replay_retires() {
+    delayed_checkpoint_pin(CheckpointState::Retired);
+}
+
+// Exercise the lookup-answer bridge as well as the scheduler's feedback key.
+#[test]
+fn slow_disk_push_does_not_penalize_host_only_reads() {
+    use ts_control::peer::servicer::empty_event;
+    use ts_scheduler::{PeerEventKind, PeerEventView, PeerPageView};
+
+    let mut reader = scheduler(
+        "127.0.0.1:3100",
+        1,
+        "Fused",
+        Landing::Device,
+        1_000_000,
+        512,
+        2_000_000,
+    );
+    assert!(reader.enable_async_device_peer(true));
+    let mut now = 1;
+    for (i, (id, tiers, expect_read)) in [
+        ("disk", vec![PeerTier::Host, PeerTier::Disk], true),
+        ("same-path", vec![PeerTier::Host, PeerTier::Disk], false),
+        ("host", vec![PeerTier::Host], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        reader.advance_peer(now, &[]).unwrap();
+        let offset = 10_000 * i as i32;
+        reader
+            .submit_requests(&[spec(
+                id,
+                (offset..offset + 4096 + PAGE).collect(),
+                "127.0.0.1:3101",
+            )])
+            .unwrap();
+        reader.next_execution_plan(true, false);
+        let lookup = reader.take_peer_lookups().pop().unwrap();
+        let pages = tiers
+            .into_iter()
+            .enumerate()
+            .map(|(i, tier)| PeerPageView {
+                group_id: 0,
+                slot: i as i32,
+                block_id: 1,
+                tier,
+            })
+            .collect();
+        reader
+            .advance_peer(
+                now,
+                &[PeerEventView {
+                    kind: PeerEventKind::LookupAnswered,
+                    lease: lookup.lease,
+                    num_tokens: 4096,
+                    pages,
+                    ..empty_event()
+                }],
+            )
+            .unwrap();
+        let plan = reader.next_execution_plan(true, false);
+        assert_eq!(!plan.peer_fetches().is_empty(), expect_read, "{id}");
+        if expect_read {
+            let start = now;
+            now += 4_000_000;
+            reader
+                .advance_peer(
+                    now,
+                    &[PeerEventView {
+                        kind: PeerEventKind::FetchDone,
+                        request_id: id.into(),
+                        num_tokens: 4096,
+                        dispatch_us: start,
+                        writable_us: start,
+                        terminal_us: now,
+                        ..empty_event()
+                    }],
+                )
+                .unwrap();
+            assert!(!reader
+                .next_execution_plan(true, false)
+                .forward_batches()
+                .is_empty());
+        }
+        reader
+            .advance(&[
+                event(ForwardEventKind::ExtendResult, id, vec![7]),
+                event(ForwardEventKind::Finish, id, vec![]),
+            ])
+            .unwrap();
+        reader.next_execution_plan(true, false);
+        now += 1;
+    }
 }
 
 #[test]
@@ -1618,6 +1797,10 @@ fn topology_selects_the_protocol_owner() {
         (Landing::Device, PeerProgress::Device),
     ] {
         let mut scheduler = scheduler("test", 1, "Fused", landing, 50_000, PAGES, 2_000_000);
+        assert!(matches!(
+            PeerProgress::for_replica(0, &mut scheduler),
+            Err(ts_control::peer::PeerError::Topology)
+        ));
         assert_eq!(
             PeerProgress::for_replica(2, &mut scheduler).unwrap(),
             PeerProgress::Coordinated

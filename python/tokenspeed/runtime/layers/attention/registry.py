@@ -930,6 +930,11 @@ def _gdn_linear_attn_backend(
         writes_state_checkpoints_in_forward=(
             server_args.writes_state_checkpoints_in_forward
         ),
+        defer_recurrent_state=(
+            server_args.enable_deferred_gdn_state
+            and not server_args.decode_monokernel
+            and server_args.pipeline_parallel_size == 1
+        ),
     )
 
 
@@ -1729,8 +1734,6 @@ def create_attn_components(
         producer_fields_by_step=stage_schedules[server_args.mapping.pp_rank],
         logical_plan=logical_plan,
         peer_state_abi=(
-            getattr(recipe, "peer_state_abi", None)
-            if server_args.peer_prefix_port
-            else None
+            recipe.peer_state_abi if server_args.peer_prefix_port else None
         ),
     )

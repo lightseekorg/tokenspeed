@@ -98,6 +98,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,7 @@ logger = logging.getLogger(__name__)
 _TAPE_MAX_STATE_GROUPS = 8
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.gdn import GdnPendingReplay
     from tokenspeed_kernel.ops.metadata import PrepTape
 
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
@@ -861,6 +863,8 @@ class MambaAttnBackend(AttentionBackend):
             parameters,
             rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
             **tables,
+            request_mask=None,
+            selected_requests=None,
         )
 
     def tree_support(self) -> TreeSupport:
@@ -1169,6 +1173,11 @@ class MambaAttnBackend(AttentionBackend):
         every_n_tokens, cu_starts, rows = scan_checkpoint_plan(
             checkpoints, scan_seq_lens_cpu
         )
+        # Keep scan planning on the host, then stage both consumer indices in
+        # one transfer without waiting for work already on the model stream.
+        device_cu_starts, device_rows = upload_packed(
+            (cu_starts.to(torch.int32), rows), self.device
+        )
         ssm_states = self._state_components(self._state_layer_ids()[0])[1]
         states = torch.empty(
             (int(cu_starts[-1]), *ssm_states.shape[1:]),
@@ -1179,9 +1188,9 @@ class MambaAttnBackend(AttentionBackend):
             GdnStateCheckpoints(
                 every_n_tokens=every_n_tokens,
                 states=states,
-                cu_starts=cu_starts.to(device=self.device, dtype=torch.int32),
+                cu_starts=device_cu_starts,
             ),
-            rows.to(self.device),
+            device_rows,
         )
 
     def _prepare_mixed_verify_metadata(
@@ -2267,6 +2276,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_scratch,
                 state_in_blocks,
                 output_indices,
+                layer_id=layer_id,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 D=D,
@@ -2418,6 +2428,11 @@ class MambaAttnBackend(AttentionBackend):
         """
         return None
 
+    def _pending_replay_descriptor(
+        self, layer_id: int, batch: int
+    ) -> GdnPendingReplay | None:
+        return None
+
     def _verify_scan(
         self,
         query: torch.Tensor,
@@ -2428,6 +2443,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,
@@ -2459,6 +2475,7 @@ class MambaAttnBackend(AttentionBackend):
                 ReplaySSM.
             state_in_blocks: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
+            layer_id: Layer whose previous accepted state the scan may consume.
             A_log: Per-channel decay parameter.
             dt_bias: Per-channel timestep bias.
             D: Mamba2 per-head skip coefficient; None for GDN and KDA.
@@ -2529,6 +2546,7 @@ class MambaAttnBackend(AttentionBackend):
             tree_ancestors=self._verify_ancestors(batch_size),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
+            pending_replay=self._pending_replay_descriptor(layer_id, batch_size),
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:

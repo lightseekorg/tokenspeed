@@ -1,3 +1,23 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 //! Per-member exact pin and close votes for versioned source offers.
 use super::{
     registered::Replica,
@@ -6,6 +26,7 @@ use super::{
 use crate::codec::Writer;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use ts_scheduler::{PeerEventView, PeerLeaseView, PeerPageView, PeerTier, Scheduler};
 
 /// One vote from a member; the reporting rank comes from the collective.
@@ -56,13 +77,15 @@ struct Record {
     until: i64,
 }
 pub(super) struct Offers {
+    device_pin_gate: Arc<super::servicer::DevicePinGate>,
     next: u64,
     records: HashMap<Key, Record>,
 }
 
 impl Offers {
-    pub fn new() -> Self {
+    pub fn new(device_pin_gate: Arc<super::servicer::DevicePinGate>) -> Self {
         Self {
+            device_pin_gate,
             next: 1,
             records: HashMap::new(),
         }
@@ -238,7 +261,8 @@ impl Offers {
         match r.phase {
             Phase::Soft if r.until > now => {
                 r.phase = Phase::Preparing;
-                r.held = s.pin_peer_offer(&r.checkpoint, now).unwrap_or(false);
+                r.held = self.device_pin_gate.allows(&r.checkpoint.pages)
+                    && s.pin_peer_offer(&r.checkpoint, now).unwrap_or(false);
                 (
                     None,
                     Some(Vote {
