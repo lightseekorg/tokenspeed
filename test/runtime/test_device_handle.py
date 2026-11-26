@@ -2010,6 +2010,23 @@ def test_replica_kv_resume_completes_clear_before_registration_and_reply():
     ]
 
 
+def test_ascend_saver_forwards_replay_retirement():
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+
+    executor = _SleepExecutor([])
+    saver = SimpleNamespace(assert_active=mock.Mock())
+    executor.model_runner = SimpleNamespace(memory_saver_adapter=saver)
+    handle = AscendMemorySaverDeviceHandle(executor)
+    with mock.patch.object(handle, "retire_replay") as retire:
+        handle.execute(
+            _plan(), None, cache_ops=(), retirement_slots=[2], retirement_id=9
+        )
+    saver.assert_active.assert_called_once_with()
+    retire.assert_called_once_with(9, [2])
+
+
 @pytest.mark.parametrize("operation", ["plan_without_forward", "idle_forward"])
 def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
     from tokenspeed.runtime.execution.ascend_memory_saver_device import (
@@ -2030,7 +2047,9 @@ def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
 
     with pytest.raises(RuntimeError, match="Memory is unavailable"):
         if operation == "plan_without_forward":
-            handle.execute(None, None, cache_ops=())
+            handle.execute(
+                None, None, cache_ops=(), retirement_slots=[2], retirement_id=9
+            )
         else:
             handle.run_idle_forward(None)
 

@@ -52,10 +52,18 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
         planned: PlannedForward | None,
         *,
         cache_ops: Sequence,
+        retirement_slots: Sequence[int] = (),
+        retirement_id: int | None = None,
     ) -> ModelExecutionResult | None:
         # A round can still touch KV storage when it has no model forward.
         self._require_active_pools()
-        return super().execute(execution_plan, planned, cache_ops=cache_ops)
+        return super().execute(
+            execution_plan,
+            planned,
+            cache_ops=cache_ops,
+            retirement_slots=retirement_slots,
+            retirement_id=retirement_id,
+        )
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         self._require_active_pools()
