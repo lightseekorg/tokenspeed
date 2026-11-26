@@ -102,6 +102,14 @@ updater receives `update_weights(models, version=..., snapshot=...)`. Tensor
 data remains in the SDK's store. Requests without a snapshot use the SDK
 protocol without one.
 
+## Control cancellation
+
+Control replies carry an operation kind but no request identifier. The client
+serializes each kind and retains its turn after caller cancellation until all
+engine replies arrive or the connection closes. Cancelling a caller does not
+cancel a dispatched operation. A partial-send failure closes the connection:
+late replies cannot safely be assigned to a subsequent operation.
+
 ## Building
 
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL

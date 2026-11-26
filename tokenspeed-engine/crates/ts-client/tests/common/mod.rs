@@ -72,6 +72,7 @@ pub struct FakeEngine {
     pub received: mpsc::UnboundedReceiver<EngineRequest>,
     commands: mpsc::UnboundedSender<Command>,
     task: JoinHandle<()>,
+    pub control_replies: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 enum Command {
@@ -160,6 +161,8 @@ pub enum Role {
     Scheduler,
     /// A scheduler that sends no terminal output for a client abort.
     SilentScheduler,
+    /// A scheduler whose control replies wait for explicit permits.
+    GatedScheduler,
     /// An EPD encode server, which takes encode requests only.
     Encoder,
 }
@@ -174,6 +177,8 @@ pub fn start_as(
 ) -> FakeEngine {
     let (received_tx, received) = mpsc::unbounded_channel();
     let (commands, commands_rx) = mpsc::unbounded_channel();
+    let control_replies = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let reply_gate = control_replies.clone();
     let handshake_address = handshake_address.to_owned();
     let task = tokio::spawn(async move {
         run(
@@ -184,6 +189,7 @@ pub fn start_as(
             role,
             received_tx,
             commands_rx,
+            reply_gate,
         )
         .await;
     });
@@ -191,6 +197,7 @@ pub fn start_as(
         received,
         commands,
         task,
+        control_replies,
     }
 }
 
@@ -202,6 +209,7 @@ async fn run(
     role: Role,
     received: mpsc::UnboundedSender<EngineRequest>,
     mut commands: mpsc::UnboundedReceiver<Command>,
+    control_replies: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     let mut handshake = DealerSocket::with_options(options(index));
     handshake.connect(&handshake_address).await.unwrap();
@@ -230,7 +238,9 @@ async fn run(
         ..Default::default()
     };
     match role {
-        Role::Scheduler | Role::SilentScheduler => registration.declare_scheduler(),
+        Role::Scheduler | Role::SilentScheduler | Role::GatedScheduler => {
+            registration.declare_scheduler()
+        }
         Role::Encoder => registration.declare_encoder(),
     }
     input
@@ -313,6 +323,9 @@ async fn run(
             }
             // A flush succeeds on engine 0 only; nothing else is paused.
             EngineRequest::Control(request) => {
+                if role == Role::GatedScheduler {
+                    control_replies.acquire().await.unwrap().forget();
+                }
                 let reply = match *request {
                     ControlRequest::FlushCache(_) => {
                         ControlOutput::FlushCache(FlushCacheReqOutput {

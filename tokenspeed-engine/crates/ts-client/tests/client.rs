@@ -890,3 +890,204 @@ fn consuming_output_rows_preserves_request_timing_and_legacy_missing_values() {
     assert_eq!(consumed[1].1.request_timing, Some(timing));
     assert_eq!(consumed[0].1.request_timing, None);
 }
+
+#[tokio::test]
+async fn cancelled_control_does_not_steal_a_late_reply() {
+    let address = ipc_address("cancel-control");
+    let connecting = tokio::spawn(EngineClient::connect(config(
+        &address,
+        1,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    )));
+    let mut engine = common::start_as(&address, 0, 0, 1, Role::GatedScheduler);
+    let client = std::sync::Arc::new(connecting.await.unwrap().unwrap());
+    let flush = || {
+        ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })
+    };
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.control(flush()).await });
+    assert!(matches!(
+        engine.next_received().await,
+        EngineRequest::Control(_)
+    ));
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let second_client = client.clone();
+    let mut second = tokio::spawn(async move { second_client.control(flush()).await });
+    // Give the next caller a chance to reach the serialized operation.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err()
+    );
+    engine.control_replies.add_permits(1);
+    assert!(matches!(
+        engine.next_received().await,
+        EngineRequest::Control(_)
+    ));
+    // The first operation's late acknowledgement must not complete the second.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err()
+    );
+    engine.control_replies.add_permits(1);
+    let outputs = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert!(matches!(&outputs[0], ControlOutput::FlushCache(reply) if reply.success));
+}
+
+#[tokio::test]
+async fn cancelled_control_waits_for_every_engine_reply() {
+    let address = ipc_address("cancel-control-all-engines");
+    let connecting = tokio::spawn(EngineClient::connect(config(
+        &address,
+        2,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    )));
+    let mut engines = (0..2)
+        .map(|index| common::start_as(&address, index, i64::from(index), 2, Role::GatedScheduler))
+        .collect::<Vec<_>>();
+    let client = std::sync::Arc::new(connecting.await.unwrap().unwrap());
+    let flush = || {
+        ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })
+    };
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.control(flush()).await });
+    for engine in &mut engines {
+        assert!(matches!(
+            engine.next_received().await,
+            EngineRequest::Control(_)
+        ));
+    }
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let second_client = client.clone();
+    let mut second = tokio::spawn(async move { second_client.control(flush()).await });
+    engines[0].control_replies.add_permits(1);
+    // One rank's reply is insufficient to release the first operation's turn.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), engines[0].received.recv())
+            .await
+            .is_err()
+    );
+    engines[1].control_replies.add_permits(1);
+    for engine in &mut engines {
+        assert!(matches!(
+            engine.next_received().await,
+            EngineRequest::Control(_)
+        ));
+    }
+    engines[0].control_replies.add_permits(1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err()
+    );
+    engines[1].control_replies.add_permits(1);
+    let replies = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replies.len(), 2);
+}
+
+#[tokio::test]
+async fn dropped_client_prevents_a_cancelled_control_task_from_sending() {
+    use std::{
+        future::{poll_fn, Future},
+        task::Poll,
+    };
+    let (client, mut engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
+    let mut operation = Box::pin(
+        client.control(ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })),
+    );
+    // Poll once without yielding to the spawned task, then close the client.
+    assert!(poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx)))
+        .await
+        .is_pending());
+    drop(operation);
+    drop(client);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), engines[0].received.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn partial_control_send_failure_closes_the_connection() {
+    let address = ipc_address("partial-control-send");
+    let connecting = tokio::spawn(EngineClient::connect(config(
+        &address,
+        2,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    )));
+    let mut first = common::start_as(&address, 0, 0, 2, Role::GatedScheduler);
+    let second = start(&address, 1, 1, 2);
+    let client = connecting.await.unwrap().unwrap();
+    let mut stream = client
+        .generate(TokenizedGenerateReqInput {
+            data_parallel_rank: Some(0),
+            ..request("live", None)
+        })
+        .await
+        .unwrap();
+    next(&mut stream).await.unwrap().unwrap();
+    assert!(matches!(first.next_received().await, EngineRequest::Add(_)));
+    second.disconnect_input().await;
+    // Observe the real ZMQ disconnect before broadcasting to the two engines.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0.. {
+            let probe = TokenizedGenerateReqInput {
+                data_parallel_rank: Some(1),
+                ..request(&format!("probe-{i}"), None)
+            };
+            if client.generate(probe).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let flush = || {
+        ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })
+    };
+    assert!(matches!(
+        client.control(flush()).await,
+        Err(Error::Zmq(_)) | Err(Error::SendTimeout { .. })
+    ));
+    assert!(matches!(
+        first.next_received().await,
+        EngineRequest::Control(_)
+    ));
+    first.control_replies.add_permits(1);
+    assert!(matches!(
+        client.control(flush()).await,
+        Err(Error::Unavailable(_))
+    ));
+    assert!(matches!(
+        next(&mut stream).await,
+        Some(Err(StreamError::Transport(_)))
+    ));
+    assert_eq!(next(&mut stream).await, None);
+    assert_eq!(client.in_flight(), [0, 0]);
+}

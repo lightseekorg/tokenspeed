@@ -610,7 +610,10 @@ impl EngineClient {
     /// a time; some (a `wait` pause, a weight load) answer only when done,
     /// so callers bound the wait themselves. An engine that takes no control
     /// operations (an EPD encode server) refuses the call before it is sent:
-    /// it would answer none.
+    /// it would answer none. Once dispatched, cancellation stops only the caller
+    /// waiting; the operation retains its turn until all replies arrive or the
+    /// connection closes. A send failure closes the connection because a partial
+    /// broadcast cannot be safely correlated with subsequent operations.
     pub async fn control(&self, request: ControlRequest) -> Result<Vec<ControlOutput>> {
         self.shared.require(REQUEST_CONTROL)?;
         let tag = request.reply_tag();
@@ -618,27 +621,48 @@ impl EngineClient {
             .entry(tag)
             .or_default()
             .clone();
-        let _turn = turn.lock().await;
+        let turn = turn.lock_owned().await;
         if let Some(reason) = self.shared.closed() {
             return Err(Error::Unavailable(reason));
         }
-        let (done, replies) = oneshot::channel();
-        lock(&self.shared.controls).insert(
-            tag,
-            ControlWaiter {
-                replies: Vec::new(),
-                done,
-            },
-        );
-        let frames = EngineRequest::Control(Box::new(request)).to_frames();
-        for engine in 0..self.shared.engines.len() {
-            if let Err(error) = self.shared.send(engine, frames.clone()).await {
-                lock(&self.shared.controls).remove(tag);
-                return Err(error);
+        let shared = self.shared.clone();
+        // Replies have no operation id. The dispatched operation owns the turn
+        // until every reply arrives, even when the caller drops its future.
+        let operation = tokio::spawn(async move {
+            let _turn = turn;
+            let (done, replies) = oneshot::channel();
+            {
+                let mut controls = lock(&shared.controls);
+                // The client can close after the caller yields to this task.
+                // Serialize registration with close() clearing the waiters.
+                if let Some(reason) = shared.closed() {
+                    return Err(Error::Unavailable(reason));
+                }
+                controls.insert(
+                    tag,
+                    ControlWaiter {
+                        replies: Vec::new(),
+                        done,
+                    },
+                );
             }
-        }
-        replies.await.map_err(|_| {
-            Error::Unavailable(self.shared.closed().unwrap_or(StreamError::ClientClosed))
+            let frames = EngineRequest::Control(Box::new(request)).to_frames();
+            for engine in 0..shared.engines.len() {
+                if let Err(error) = shared.send(engine, frames.clone()).await {
+                    // A partial broadcast has ambiguous late replies. Refuse new
+                    // operations rather than attributing them to another caller.
+                    shared.close(StreamError::Transport(error.to_string()));
+                    return Err(error);
+                }
+            }
+            replies.await.map_err(|_| {
+                Error::Unavailable(shared.closed().unwrap_or(StreamError::ClientClosed))
+            })
+        });
+        operation.await.unwrap_or_else(|error| {
+            let reason = StreamError::Transport(format!("control operation failed: {error}"));
+            self.shared.close(reason.clone());
+            Err(Error::Unavailable(reason))
         })
     }
 
