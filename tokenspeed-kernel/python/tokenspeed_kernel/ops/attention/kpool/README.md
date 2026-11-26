@@ -40,3 +40,9 @@ table.
 Scoring workspaces use row tiling under `max_logits_bytes`. The cap includes
 the persistent sort or radix intermediates as well as logits; one row remains
 legal when its workspace exceeds the cap.
+
+`hy4_compress.py` provides Hy4-flash's 4:1 gated group pooling
+(`hy4_pool_group_keys`), interleaved 3D M-RoPE (`compute_hy4_mrope_cos_sin`,
+`apply_interleaved_rope_last_dim`), and masked FP8+scale scatter writes
+(`hy4_quantize_and_store_index_k`) into the paged index-K cache with raw int32
+scale bit stores and runtime page-count / stride arguments.

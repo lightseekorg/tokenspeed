@@ -134,7 +134,9 @@ def attn_merge_state(
 import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
+from tokenspeed_kernel.ops.attention.sink import apply_attention_sink  # noqa: E402
 
 __all__ = [
+    "apply_attention_sink",
     "attn_merge_state",
 ]

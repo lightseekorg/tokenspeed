@@ -36,7 +36,7 @@ def tanh(x):
 def _mla_decode_kernel(
     Q,
     KV_Cache,
-    O,
+    Out,
     LSE,
     page_table,
     cache_seqlens,
@@ -69,10 +69,11 @@ def _mla_decode_kernel(
     HAS_LSE: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     NONCAUSAL_BLOCK_SIZE: tl.constexpr,
+    Q_LEN: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
-    cur_q = tl.program_id(1)
-    cur_head = tl.program_id(2)
+    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_q = tl.program_id(1).to(tl.int64)
+    cur_head = tl.program_id(2).to(tl.int64)
 
     offs_r = tl.arange(0, BLOCK_R)
     offs_rope = tl.arange(0, BLOCK_ROPE)
@@ -87,35 +88,49 @@ def _mla_decode_kernel(
         other=0.0,
     )
 
-    cache_len = tl.load(cache_seqlens + cur_batch)
-    if WINDOW_LEFT >= 0:
-        # DFlash2 flattens each non-causal proposal block into one decode row
-        # per position. Every row sees the whole proposal block, while its
-        # historical context follows the reference mask
-        #     query_position - key_position <= window_left.
-        block_position = cur_batch % NONCAUSAL_BLOCK_SIZE
-        context_len = cache_len - NONCAUSAL_BLOCK_SIZE
-        window_start = tl.maximum(
-            0,
-            context_len - WINDOW_LEFT + block_position,
-        )
-        loop_start = (window_start // BLOCK_N) * BLOCK_N
+    cache_len = tl.load(cache_seqlens + cur_batch).to(tl.int32)
+    if NONCAUSAL_BLOCK_SIZE > 1:
+        q_cache_len = cache_len
+        if WINDOW_LEFT >= 0:
+            # Non-causal draft block: every row sees the whole proposal block,
+            # while historical context obeys query_position - key_position <= window_left.
+            block_position = (
+                cur_q.to(tl.int32)
+                if Q_LEN > 1
+                else (cur_batch.to(tl.int32) % NONCAUSAL_BLOCK_SIZE)
+            )
+            context_len = cache_len - NONCAUSAL_BLOCK_SIZE
+            window_start = tl.maximum(
+                0,
+                context_len - WINDOW_LEFT + block_position,
+            )
+            loop_start = (window_start // BLOCK_N) * BLOCK_N
+        else:
+            window_start = 0
+            loop_start = 0
     else:
-        window_start = 0
-        loop_start = 0
+        # Causal decode or multi-token verify (Q_LEN >= 1): query index cur_q
+        # sees prefixes up to cache_len - (Q_LEN - 1 - cur_q).
+        q_cache_len = tl.maximum(0, cache_len - (Q_LEN - 1 - cur_q.to(tl.int32)))
+        if WINDOW_LEFT >= 0:
+            window_start = tl.maximum(0, q_cache_len - 1 - WINDOW_LEFT)
+            loop_start = (window_start // BLOCK_N) * BLOCK_N
+        else:
+            window_start = 0
+            loop_start = 0
     offs_n = tl.arange(0, BLOCK_N)
     acc = tl.zeros([BLOCK_R], dtype=tl.float32)
     e_sum = 0.0
     e_max = -float("inf")
 
-    for start_n in tl.range(loop_start, cache_len, BLOCK_N, num_stages=2):
+    for start_n in tl.range(loop_start, q_cache_len, BLOCK_N, num_stages=2):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         token_offsets = start_n + offs_n
-        mask_n = (token_offsets >= window_start) & (token_offsets < cache_len)
+        mask_n = (token_offsets >= window_start) & (token_offsets < q_cache_len)
         page_indices = token_offsets // PAGE_SIZE
-        page_offsets = token_offsets - page_indices * PAGE_SIZE
+        page_offsets = (token_offsets - page_indices * PAGE_SIZE).to(tl.int64)
         physical_pages = tl.load(
-            page_table + cur_batch * page_table_stride_b + page_indices,
+            page_table + cur_batch * page_table_stride_b + page_indices.to(tl.int64),
             mask=mask_n,
             other=0,
         ).to(tl.int64)
@@ -155,7 +170,7 @@ def _mla_decode_kernel(
 
     safe_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
     out_base = cur_batch * stride_ob + cur_q * stride_oq + cur_head * stride_oh
-    tl.store(O + out_base + offs_r, acc / safe_sum, mask=mask_r)
+    tl.store(Out + out_base + offs_r, acc / safe_sum, mask=mask_r)
 
     if HAS_LSE:
         lse = tl.where(e_sum > 0.0, tl.log(e_sum) + e_max, float("-inf"))
@@ -201,12 +216,12 @@ def mla_decode_fwd(
         raise ValueError(
             f"q must have shape [B, q_len, H, R + rope], got {tuple(q.shape)}"
         )
-    if q.shape[1] != 1:
-        raise NotImplementedError("Triton MLA decode currently supports q_len == 1")
+    q_len = int(q.shape[1])
+    if q_len < 1:
+        raise ValueError(f"q_len must be positive, got {q_len}")
     if q.shape[-1] != kv_lora_rank + qk_rope_head_dim:
         raise ValueError(
-            f"q head dim must be {kv_lora_rank + qk_rope_head_dim}, "
-            f"got {q.shape[-1]}"
+            f"q head dim must be {kv_lora_rank + qk_rope_head_dim}, got {q.shape[-1]}"
         )
     if out.shape != q.shape[:-1] + (kv_lora_rank,):
         raise ValueError(
@@ -228,10 +243,20 @@ def mla_decode_fwd(
             "window_left must cover the complete non-causal block; got "
             f"window_left={window_left}, block_size={noncausal_block_size}"
         )
-    if window_left >= 0 and q.shape[0] % noncausal_block_size:
+    if (
+        window_left >= 0
+        and noncausal_block_size > 1
+        and q_len == 1
+        and q.shape[0] % noncausal_block_size
+    ):
         raise ValueError(
             "sliding MLA decode rows must contain complete non-causal blocks: "
             f"batch={q.shape[0]}, block_size={noncausal_block_size}"
+        )
+    if noncausal_block_size > 1 and q_len > 1 and q_len != noncausal_block_size:
+        raise ValueError(
+            f"noncausal_block_size={noncausal_block_size} must match q_len={q_len} "
+            "when q_len > 1"
         )
 
     kv_cache = _normalize_kv_cache(kv_cache)
@@ -283,6 +308,7 @@ def mla_decode_fwd(
         HAS_LSE=lse is not None,
         WINDOW_LEFT=window_left,
         NONCAUSAL_BLOCK_SIZE=noncausal_block_size,
+        Q_LEN=q_len,
         num_warps=8,
         num_stages=2,
     )
