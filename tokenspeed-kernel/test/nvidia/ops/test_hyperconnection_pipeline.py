@@ -71,6 +71,7 @@ def _mix(values, inject, weights_independent, model):
         weights_independent=weights_independent,
         override="cute_fused_hyperconnection_mix",
         solution=None,
+        activation_quantization="none",
     )
 
 

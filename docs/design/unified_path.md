@@ -743,6 +743,31 @@ for larger batches. Row-derived reduction groups and token pairing belong
 only to the wider model. Other dimensions keep ordinary kernel selection;
 the fused work budget still bounds automatic selection.
 
+FP8 mixer weights use E4M3 with FP32 tensor or channel scales.
+With 16-bit input, `activation_quantization="none"` decodes resident weight
+tiles (W8A16, three compute launches), and `"fp8"` quantizes input rows
+for native FP8 MMA (W8A8, four launches). All paths merge split-K partials in
+FP32 split order and round SiLU activations to the output dtype before Up.
+W8A8 uses the FP8 scale floor and rounds the multiplier independently.
+
+Prequantized W8A8 takes E4M3 input, FP32 tensor or row scales and an explicit
+BF16 or FP16 output dtype. One cooperative kernel runs all stages and mixes
+the residual from the input codes and scale in FP32. Both SM103 schedules
+live in `_fp8_mixer/sm103.py` and share the resident loop, quantizer, MMA
+barriers, Down operand ring, Up tile loop and TMEM readers. Paired streaming
+plans share an Up tail that releases stages after the second token part.
+Operand layouts and handoffs are compile-time policies. The 16-token
+injection schedule publishes epoch-tagged activations for early Up MMA.
+The K128 schedule prefetches Up weights as Down releases stages and can
+share weights across the two token parts at 256 rows.
+
+Compiled occupancy bounds the resident grid. Each stream owns scratch and
+monotonic epochs, reader acknowledgements protect TMEM and stage reuse, and
+PDL waits order reads of producer-owned data. Startup warms the bounded
+buckets using the operator's model dimensions. Runtime rows control masks
+and rounds. The SM103 K128 injection schedule can use tiled Up weights
+through 128 tokens. The owner refreshes them in place for CUDA graph replay.
+
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional

@@ -309,6 +309,7 @@ class GatedResidualSimple(nn.Module):
             projection_scale=self._projection_scale,
             weights_independent=True,
             packed_up_weight=self.packed_up_weight,
+            activation_quantization="none",
         )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (

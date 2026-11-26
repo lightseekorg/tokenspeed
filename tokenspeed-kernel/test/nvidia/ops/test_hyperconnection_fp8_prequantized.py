@@ -1,0 +1,776 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Check prequantized FP8 fusion, mutable graphs and bounded specialization."""
+
+from dataclasses import dataclass
+
+import pytest
+import torch
+import torch.nn.functional as F
+from test_hyperconnection_fp8 import _kernel_nodes
+from test_hyperconnection_fp8 import _quantize as _quantize_fp8
+from test_hyperconnection_fp8 import fp8_device as fp8_device
+from tokenspeed_kernel.ops.residual import (
+    gated_residual_mix,
+    prepare_gated_residual_up_weight,
+)
+from tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused import (
+    _execute as _execute_generic,
+)
+from tokenspeed_kernel.ops.tuning import kernel_warmup
+from tokenspeed_kernel.platform import pdl_enabled
+from utils import assert_no_cute_compile
+
+
+@dataclass
+class Inputs:
+    x: torch.Tensor
+    xs: torch.Tensor
+    down: torch.Tensor
+    ds: torch.Tensor
+    up: torch.Tensor
+    us: torch.Tensor
+
+
+def _quantize(value, tensor):
+    codes, scale = _quantize_fp8(value, tensor)
+    return codes, scale.reshape(-1)
+
+
+def _inputs(model, rows, inject, tensor):
+    g, h, r = model
+    torch.manual_seed(837)
+    x, xs = _quantize(
+        torch.randn(rows, g * h, device="cuda", dtype=torch.bfloat16), tensor
+    )
+    down, ds = _quantize(
+        torch.randn(
+            r + (g if inject else 0), g * h, device="cuda", dtype=torch.bfloat16
+        )
+        / (g * h) ** 0.5
+        / g,
+        tensor,
+    )
+    up, us = _quantize(
+        torch.randn(g * h, r, device="cuda", dtype=torch.bfloat16) / r**0.5, tensor
+    )
+    return Inputs(x, xs, down, ds, up, us)
+
+
+def _run(v, model, dtype, independent):
+    g, h, r = model
+    return gated_residual_mix(
+        v.x,
+        v.down,
+        v.up,
+        g,
+        h,
+        r,
+        projection_rows=r + g if v.down.shape[0] > r else r,
+        weights_independent=independent,
+        activation_quantization="fp8",
+        projection_weight_scale=v.ds,
+        up_weight_scale=v.us,
+        normalized_scale=v.xs,
+        output_dtype=dtype,
+        override="cute_dsl_fp8_fused_hyperconnection_mix",
+    )
+
+
+def _warm(v, model, dtype, independent):
+    with kernel_warmup(enabled=True):
+        _run(v, model, dtype, independent)
+
+
+def _reference(v, model, dtype, projection_scale):
+    g, h, r = model
+    x = v.x.cpu().float().double()
+    xs = v.xs.cpu().double().reshape(-1, 1)
+    original = x * xs
+    p = r + g if v.down.shape[0] > r else r
+    ds = v.ds.cpu().double().reshape(-1)
+    if ds.numel() > 1:
+        ds = ds[:p]
+    projected = (x @ v.down[:p].cpu().float().double().T) * xs * ds * projection_scale
+    codes, scale = _quantize_fp8(F.silu(projected[:, :r]).to(dtype), False)
+    gate = (
+        (codes.float().double() @ v.up.cpu().float().double().T)
+        * scale.double()
+        * v.us.cpu().double()
+    )
+    mixed = (gate.sigmoid() * original).reshape(-1, g, h).mean(1)
+    return mixed, projected[:, r:] if v.down.shape[0] > r else None
+
+
+def _check(actual, v, model, dtype):
+    expected = _reference(v, model, dtype, 1.0)
+    atol, rtol = (0.004, 0.01) if dtype == torch.bfloat16 else (0.001, 0.002)
+    for a, e in zip(actual, expected, strict=True):
+        if e is None:
+            assert a is None
+        else:
+            assert a.dtype == dtype
+            torch.testing.assert_close(
+                a.cpu().double(), e, atol=atol, rtol=rtol, equal_nan=True
+            )
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@torch.inference_mode()
+def test_generic_paired_up_keeps_prefix_accumulators(model):
+    g, h, r = model
+    v = _inputs(model, 257, True, False)
+    actual = _execute_generic(
+        v.x,
+        v.xs,
+        v.down,
+        v.ds,
+        v.up,
+        v.us,
+        g=g,
+        h=h,
+        r=r,
+        p=r + g,
+        output_dtype=torch.bfloat16,
+        projection_scale=1.0,
+        weights_independent=True,
+        token_bucket=256,
+    )
+    _check(actual, v, model, torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "model,rows",
+    [
+        ((4, 2560, 320), 13),
+        ((4, 2560, 320), 129),
+        ((4, 8192, 1024), 13),
+        ((4, 8192, 1024), 127),
+    ],
+)
+@torch.inference_mode()
+def test_fused_row_quantization_scale_floor(model, rows):
+    g, h, r = model
+    dtype = torch.float16
+    x_values = torch.tensor([0.0, 0.5, 1.0, 2.0], device="cuda")
+    x_values = x_values.repeat((rows + 3) // 4)[:rows]
+    columns = torch.tensor([0, 9, 65, r - 1], device="cuda")
+    down_codes = torch.tensor([1.0, -0.5, 0.75, 0.25], device="cuda")
+    up_codes = torch.tensor([1.0, -0.5, 0.75, -1.0], device="cuda")
+
+    x = torch.zeros((rows, g * h), device="cuda")
+    x[:, 0] = x_values
+    down = torch.zeros((r + g, g * h), device="cuda")
+    down[columns, 0] = down_codes
+    down[r:, 0] = 1.0
+    ds = torch.ones(r + g, device="cuda")
+    ds[columns] = torch.tensor([0.0007, 0.0012, 0.0034, 0.0009], device="cuda")
+    ds[r:] = 0.25
+    up = torch.zeros((g * h, r), device="cuda")
+    up[0, columns] = up_codes
+    v = Inputs(
+        x.to(torch.float8_e4m3fn),
+        torch.ones(rows, device="cuda"),
+        down.to(torch.float8_e4m3fn),
+        ds,
+        up.to(torch.float8_e4m3fn),
+        torch.full((g * h,), 512.0, device="cuda"),
+    )
+
+    mixed, inject = _run(v, model, dtype, True)
+    projected = x_values[:, None] * down_codes * ds[columns]
+    codes, scale = _quantize(F.silu(projected).to(dtype), False)
+    gate = (codes.float() * up_codes).sum(dim=-1) * scale * v.us[0]
+    expected = torch.zeros_like(mixed)
+    expected[:, 0] = (gate.sigmoid() * x_values / g).to(dtype)
+    torch.testing.assert_close(mixed, expected, atol=0.00025, rtol=0.001)
+    torch.testing.assert_close(
+        inject, (x_values[:, None] * 0.25).expand(-1, g).to(dtype), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,dtype,enable_pdl,tensor,inject",
+    [
+        (16, torch.bfloat16, True, False, True),
+        (31, torch.float16, False, True, True),
+        (63, torch.bfloat16, True, False, True),
+        (127, torch.float16, True, True, True),
+        (129, torch.bfloat16, False, False, True),
+        (257, torch.bfloat16, True, False, True),
+        (17, torch.float16, False, True, False),
+    ],
+)
+@torch.inference_mode()
+def test_prepared_wide_fp8_up_graph_refresh(rows, dtype, enable_pdl, tensor, inject):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("wide prepared FP8 Up requires SM103")
+    pdl_enabled(enable_pdl)
+    model = (4, 8192, 1024)
+    v = _inputs(model, rows, inject, tensor)
+    packed = prepare_gated_residual_up_weight(v.up, *model)
+    assert packed is not None
+    assert packed.dtype == v.up.dtype
+    assert packed.nbytes == v.up.nbytes
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def mix(prepared):
+        return gated_residual_mix(
+            v.x,
+            v.down,
+            v.up,
+            *model,
+            projection_rows=model[2] + (model[0] if inject else 0),
+            weights_independent=False,
+            activation_quantization="fp8",
+            projection_weight_scale=v.ds,
+            up_weight_scale=v.us,
+            normalized_scale=v.xs,
+            output_dtype=dtype,
+            packed_up_weight=prepared,
+        )
+
+    with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+        mix(None)
+        mix(packed)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with assert_no_cute_compile():
+        with torch.cuda.graph(graph, stream=stream):
+            actual = mix(packed)
+        assert _kernel_nodes(graph) == 1
+        last = None
+        for factor in (1.0, -1.0, 0.75):
+            with torch.cuda.stream(stream):
+                v.up.copy_((v.up.float() * factor).to(v.up.dtype))
+                v.us.mul_(0.875)
+                refreshed = prepare_gated_residual_up_weight(v.up, *model)
+                assert refreshed is not None
+                packed.copy_(refreshed)
+                graph.replay()
+                expected = mix(None)
+            stream.synchronize()
+            for result, canonical in zip(actual, expected, strict=True):
+                if canonical is None:
+                    assert result is None
+                else:
+                    assert torch.equal(
+                        result.view(torch.uint8), canonical.view(torch.uint8)
+                    )
+            _check(actual, v, model, dtype)
+            if last is not None:
+                assert not torch.equal(actual[0], last)
+            with torch.cuda.stream(stream):
+                last = actual[0].clone()
+    graph.reset()
+
+
+@pytest.mark.parametrize("invalid", ["unaligned", "narrow", "half_input"])
+@torch.inference_mode()
+def test_prepared_fp8_up_validates_input_and_storage(invalid):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("wide prepared FP8 Up requires SM103")
+    model = (4, 2560, 320) if invalid == "narrow" else (4, 8192, 1024)
+    v = _inputs(model, 16, True, False)
+    packed = prepare_gated_residual_up_weight(v.up, *model)
+    if invalid == "narrow":
+        assert packed is None
+        packed = v.up.clone()
+    elif invalid == "unaligned":
+        assert packed is not None
+        backing = torch.empty(
+            packed.numel() + 1, dtype=packed.dtype, device=packed.device
+        )
+        packed = backing[1:].view_as(packed)
+    else:
+        assert packed is not None
+    fp8_input = invalid != "half_input"
+    with pytest.raises(
+        ValueError, match="wide SM103" if fp8_input else "prequantized FP8 input"
+    ):
+        gated_residual_mix(
+            v.x if fp8_input else v.x.to(torch.bfloat16),
+            v.down,
+            v.up,
+            *model,
+            projection_rows=model[2] + model[0],
+            weights_independent=True,
+            activation_quantization="fp8",
+            projection_weight_scale=v.ds,
+            up_weight_scale=v.us,
+            normalized_scale=v.xs if fp8_input else None,
+            output_dtype=torch.bfloat16 if fp8_input else None,
+            packed_up_weight=packed,
+        )
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "rows,independent", [(33, False), (33, True), (129, False), (513, False)]
+)
+@torch.inference_mode()
+def test_mutable_one_kernel_graph(model, dtype, enable_pdl, rows, independent):
+    pdl_enabled(enable_pdl)
+    # Reused rounds and the partial tail must see every replay update.
+    v = _inputs(model, rows, True, False)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _warm(v, model, dtype, independent)
+    stream.synchronize()
+    with assert_no_cute_compile():
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph, stream=stream):
+            actual = _run(v, model, dtype, independent)
+        assert _kernel_nodes(graph) == 1
+        for _ in range(3):
+            with torch.cuda.stream(stream):
+                v.x.copy_((v.x.float() * 0.875).to(v.x.dtype))
+                v.down.copy_((v.down.float() * 0.875).to(v.down.dtype))
+                v.up.copy_((v.up.float() * 0.875).to(v.up.dtype))
+                v.xs.mul_(1.125)
+                v.ds.mul_(0.875)
+                v.us.mul_(1.125)
+                graph.replay()
+            stream.synchronize()
+            _check(actual, v, model, dtype)
+
+
+@pytest.mark.parametrize(
+    "dtype,enable_pdl,tensor_scale",
+    [
+        (torch.bfloat16, True, False),
+        (torch.bfloat16, False, True),
+        (torch.float16, True, False),
+        (torch.float16, False, True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tile_rows", "tail_rows"),
+    [(16, (11, 6, 3)), (32, (29, 24, 17))],
+    ids=["tile16", "tile32"],
+)
+@torch.inference_mode()
+def test_narrow_fp8_graph_reuses_activation_workspace(
+    dtype, enable_pdl, tensor_scale, tile_rows, tail_rows
+):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("narrow FP8 activation handoff requires SM103")
+    pdl_enabled(enable_pdl)
+    model = (4, 2560, 320)
+    full = _inputs(model, tile_rows, True, tensor_scale)
+    if not tensor_scale:
+        # Distinct scales expose a row mix-up in the shared scale slots.
+        full.xs.mul_(torch.linspace(0.625, 1.375, tile_rows, device=full.x.device))
+    tails = [
+        Inputs(
+            full.x[:rows],
+            full.xs if tensor_scale else full.xs[:rows],
+            full.down,
+            full.ds,
+            full.up,
+            full.us,
+        )
+        for rows in tail_rows
+    ]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _warm(full, model, dtype, False)
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with assert_no_cute_compile():
+        with torch.cuda.graph(graph, stream=stream):
+            full_output = _run(full, model, dtype, False)
+            tail_outputs = [_run(tail, model, dtype, False) for tail in tails]
+        assert _kernel_nodes(graph) == 1 + len(tails)
+        for factor in (1.0, -0.875, 0.75):
+            with torch.cuda.stream(stream):
+                full.x.copy_((full.x.float() * factor).to(full.x.dtype))
+                full.xs.mul_(1.125)
+                full.ds.mul_(0.875)
+                full.us.mul_(1.125)
+                graph.replay()
+            stream.synchronize()
+            _check(full_output, full, model, dtype)
+            for output, tail in zip(tail_outputs, tails, strict=True):
+                _check(output, tail, model, dtype)
+    graph.reset()
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("tensor_scale", [True, False])
+@torch.inference_mode()
+def test_runtime_rows_and_scales(model, enable_pdl, tensor_scale):
+    pdl_enabled(enable_pdl)
+    v = _inputs(model, 257, False, tensor_scale)
+    _warm(v, model, torch.bfloat16, True)
+    with assert_no_cute_compile():
+        for rows in [1, 3, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257]:
+            xs = v.xs if tensor_scale else v.xs[:rows]
+            values = Inputs(v.x[:rows], xs, v.down, v.ds, v.up, v.us)
+            actual = _run(values, model, torch.bfloat16, True)
+            torch.cuda.synchronize()
+            _check(actual, values, model, torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "models",
+    [
+        ((4, 2560, 320), (4, 2560, 320)),
+        ((4, 8192, 1024), (4, 8192, 1024)),
+        ((4, 2560, 320), (4, 8192, 1024)),
+    ],
+    ids=["narrow", "wide", "mixed"],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@torch.inference_mode()
+def test_concurrent_graphs(models, enable_pdl):
+    pdl_enabled(enable_pdl)
+    values = [
+        _inputs(model, rows, True, False)
+        for model, rows in zip(models, (17, 31), strict=True)
+    ]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [
+        torch.cuda.CUDAGraph(keep_graph=True),
+        torch.cuda.CUDAGraph(keep_graph=True),
+    ]
+    outputs = []
+    for model, v, stream, graph in zip(models, values, streams, graphs, strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _warm(v, model, torch.bfloat16, False)
+        stream.synchronize()
+        with assert_no_cute_compile():
+            with torch.cuda.graph(graph, stream=stream):
+                outputs.append(_run(v, model, torch.bfloat16, False))
+        assert _kernel_nodes(graph) == 1
+    with assert_no_cute_compile():
+        for _ in range(4):
+            for v, stream, graph in zip(values, streams, graphs, strict=True):
+                with torch.cuda.stream(stream):
+                    v.xs.mul_(0.875)
+                    graph.replay()
+        for stream in streams:
+            stream.synchronize()
+    for model, out, v in zip(models, outputs, values, strict=True):
+        _check(out, v, model, torch.bfloat16)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@torch.inference_mode()
+def test_fp8_residual_uses_supplied_scale_without_half_rounding(enable_pdl):
+    pdl_enabled(enable_pdl)
+    model = (4, 2560, 320)
+    v = _inputs(model, 1, False, True)
+    v.x.copy_(torch.ones_like(v.x, dtype=torch.float32).to(v.x.dtype))
+    v.xs.fill_(0.33332)
+    v.down.zero_()
+    v.up.zero_()
+    actual, inject = _run(v, model, torch.float16, True)
+    expected = (torch.tensor(0.33332, dtype=torch.float32) * 0.5).to(torch.float16)
+    assert torch.equal(actual.cpu(), expected.expand(1, model[1]))
+    assert inject is None
+
+
+@pytest.mark.parametrize(
+    "missing", ["scale", "dtype", "bad_scale", "bad_dtype", "wrong_arithmetic"]
+)
+@torch.inference_mode()
+def test_prequantized_input_contract(missing):
+    model = (4, 2560, 320)
+    v = _inputs(model, 1, False, True)
+    kwargs = {
+        "projection_rows": model[2],
+        "weights_independent": True,
+        "activation_quantization": "fp8",
+        "projection_weight_scale": v.ds,
+        "up_weight_scale": v.us,
+        "normalized_scale": v.xs,
+        "output_dtype": torch.bfloat16,
+    }
+    if missing == "scale":
+        kwargs["normalized_scale"] = None
+    elif missing == "dtype":
+        kwargs["output_dtype"] = None
+    elif missing == "bad_scale":
+        kwargs["normalized_scale"] = v.xs.to(torch.float16)
+    elif missing == "bad_dtype":
+        kwargs["output_dtype"] = torch.float32
+    else:
+        kwargs["activation_quantization"] = "none"
+    with pytest.raises(ValueError):
+        gated_residual_mix(v.x, v.down, v.up, *model, **kwargs)
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@torch.inference_mode()
+def test_graph_produces_all_six_fp8_inputs(model, enable_pdl):
+    pdl_enabled(enable_pdl)
+    v = _inputs(model, 17, True, False)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _warm(v, model, torch.float16, False)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with assert_no_cute_compile():
+        with torch.cuda.graph(graph, stream=stream):
+            supplied = Inputs(
+                (v.x.float() * 0.875).to(v.x.dtype),
+                v.xs * 1.125,
+                (v.down.float() * 0.875).to(v.down.dtype),
+                v.ds * 0.875,
+                (v.up.float() * 0.875).to(v.up.dtype),
+                v.us * 1.125,
+            )
+            actual = _run(supplied, model, torch.float16, False)
+        for _ in range(3):
+            with torch.cuda.stream(stream):
+                v.xs.mul_(0.875)
+                v.ds.mul_(1.125)
+                v.us.mul_(0.875)
+                graph.replay()
+            stream.synchronize()
+            _check(actual, supplied, model, torch.float16)
+
+
+@torch.inference_mode()
+def test_prequantized_leading_shape_and_scalar_scale():
+    model = (4, 2560, 320)
+    v = _inputs(model, 6, True, True)
+    actual = gated_residual_mix(
+        v.x.reshape(2, 3, -1),
+        v.down,
+        v.up,
+        *model,
+        projection_rows=model[2] + model[0],
+        weights_independent=True,
+        activation_quantization="fp8",
+        projection_weight_scale=v.ds,
+        up_weight_scale=v.us,
+        normalized_scale=v.xs.reshape(()),
+        output_dtype=torch.bfloat16,
+    )
+    assert actual[0].shape == (2, 3, model[1])
+    assert actual[1].shape == (2, 3, model[0])
+    _check(
+        (actual[0].reshape(6, -1), actual[1].reshape(6, -1)), v, model, torch.bfloat16
+    )
+
+
+@pytest.mark.parametrize("down_tensor", [False, True])
+@pytest.mark.parametrize("up_tensor", [False, True])
+@torch.inference_mode()
+def test_prequantized_padded_projection_and_mixed_scales(down_tensor, up_tensor):
+    model = (4, 2560, 320)
+    g, h, r = model
+    v = _inputs(model, 17, True, False)
+    if down_tensor:
+        v.ds = v.ds.amax().reshape(1)
+    if up_tensor:
+        v.us = v.us.amax().reshape(1)
+    expected = _reference(v, model, torch.bfloat16, 0.25)
+    # Nonzero padding and scale storage must not contribute injection rows.
+    padded = torch.zeros((r + 8, g * h), device="cuda").fill_(11).to(v.down.dtype)
+    padded[: r + g].copy_(v.down)
+    if not down_tensor:
+        scales = torch.full((r + 8,), 13.0, device="cuda")
+        scales[: r + g].copy_(v.ds)
+        v.ds = scales
+    actual = gated_residual_mix(
+        v.x,
+        padded,
+        v.up,
+        *model,
+        projection_rows=r + g,
+        projection_scale=0.25,
+        weights_independent=True,
+        activation_quantization="fp8",
+        normalized_scale=v.xs,
+        output_dtype=torch.bfloat16,
+        projection_weight_scale=v.ds,
+        up_weight_scale=v.us,
+        override="cute_dsl_fp8_fused_hyperconnection_mix",
+    )
+    for a, e in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a.cpu().double(), e, atol=0.004, rtol=0.01)
+
+
+@pytest.mark.parametrize("tensor", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_prequantized_torch_reference_dispatch(tensor, dtype):
+    model = (4, 64, 16)
+    v = _inputs(model, 3, True, tensor)
+    actual = gated_residual_mix(
+        v.x,
+        v.down,
+        v.up,
+        *model,
+        projection_rows=model[2] + model[0],
+        projection_scale=0.25,
+        weights_independent=False,
+        activation_quantization="fp8",
+        normalized_scale=v.xs,
+        output_dtype=dtype,
+        projection_weight_scale=v.ds,
+        up_weight_scale=v.us,
+        solution="torch",
+    )
+    expected = _reference(v, model, dtype, 0.25)
+    for a, e in zip(actual, expected, strict=True):
+        assert a.dtype == torch.float64
+        torch.testing.assert_close(a.cpu(), e, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("argument", ["normalized_scale", "output_dtype"])
+@torch.inference_mode()
+def test_half_input_rejects_prequantized_arguments(argument):
+    model = (4, 64, 16)
+    v = _inputs(model, 1, False, True)
+    extra = {argument: v.xs if argument == "normalized_scale" else torch.float16}
+    with pytest.raises(ValueError, match="only to prequantized"):
+        gated_residual_mix(
+            v.x.to(torch.bfloat16),
+            v.down,
+            v.up,
+            *model,
+            projection_rows=model[2],
+            weights_independent=True,
+            activation_quantization="fp8",
+            projection_weight_scale=v.ds,
+            up_weight_scale=v.us,
+            **extra,
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_prequantized_zero_rows_preserve_output_contract(dtype):
+    model = (4, 2560, 320)
+    v = _inputs(model, 1, True, True)
+    v.x = v.x[:0]
+    actual = _run(v, model, dtype, True)
+    assert actual[0].shape == (0, model[1])
+    assert actual[1].shape == (0, model[0])
+    assert actual[0].dtype == actual[1].dtype == dtype
+
+
+@torch.inference_mode()
+def test_prequantized_input_offsets_beyond_int32():
+    if torch.cuda.mem_get_info()[0] < 5 * 2**30:
+        pytest.skip("requires 5 GiB free for the large input offset check")
+    model = (4, 8192, 1024)
+    rows = 2**31 // (model[0] * model[1]) + 1
+    v = _inputs(model, 1, True, False)
+    v.x = torch.empty(
+        (rows, model[0] * model[1]), device="cuda", dtype=torch.float8_e4m3fn
+    ).fill_(1)
+    v.xs = torch.full((rows,), 0.5, device="cuda")
+    v.x[-1].fill_(2)
+    v.xs[-1] = 1.25
+    v.down.zero_()
+    v.up.zero_()
+    actual, inject = _run(v, model, torch.bfloat16, False)
+    # Only inspect the boundary rows; zero gates make the expected mix exact.
+    boundary = torch.tensor([0, rows - 2, rows - 1], device="cuda")
+    expected = torch.tensor([0.25, 0.25, 1.25], dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        actual[boundary].cpu(), expected[:, None].expand(3, model[1]), atol=0, rtol=0
+    )
+    assert torch.count_nonzero(inject[boundary]).item() == 0
+
+
+@pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
+@pytest.mark.parametrize("rows", [1, 16, 17, 32, 33, 64, 65, 129, 257])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_up_preserves_token_channel_and_branch_order(model, rows, dtype):
+    g, h, r = model
+    v = _inputs(model, rows, True, False)
+    channels = torch.arange(g * h, device="cuda")
+    pattern = (channels % 11 - 5).float() * 0.25 + (channels // h).float() * 0.5
+    v.x = pattern.expand(rows, -1).contiguous().to(torch.float8_e4m3fn)
+    first_channel = 1.0 + (torch.arange(rows, device="cuda") % 4).float() * 0.5
+    v.xs = torch.linspace(0.25, 1.25, rows, device="cuda")
+    # Keep one active low-rank channel and give it contributions from three splits.
+    v.down.zero_()
+    for index, (column, weight) in enumerate(
+        ((0, 1.0), (g * h // 2, -0.5), (g * h - 1, 0.25)), start=1
+    ):
+        v.x[:, column].copy_((first_channel * index).to(v.x.dtype))
+        v.down[0, column] = weight
+    v.ds.fill_(1)
+    for branch in range(g):
+        v.down[r + branch, branch * h] = 1
+    v.up.zero_()
+    v.up[:, 0].copy_((channels % 17 - 8).float().to(v.up.dtype))
+    v.us = torch.linspace(0.125, 0.5, g * h, device="cuda")
+    actual = _run(v, model, dtype, False)
+    torch.cuda.synchronize()
+    _check(actual, v, model, dtype)
+
+
+@pytest.mark.parametrize("rows", [16, 32, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@torch.inference_mode()
+def test_small_up_tiles_preserve_all_finite_residual_codes(rows, dtype, enable_pdl):
+    pdl_enabled(enable_pdl)
+    model = (4, 8192, 1024)
+    v = _inputs(model, rows, False, False)
+    # Exercise every finite E4M3 code, including subnormals and signed zeros.
+    codes = torch.arange(v.x.numel(), device="cuda", dtype=torch.int32) % 256
+    codes.masked_fill_((codes & 127) == 127, 0)
+    v.x.view(torch.uint8).copy_(codes.to(torch.uint8).reshape_as(v.x))
+    v.xs.copy_(torch.exp2((torch.arange(rows, device="cuda") % 7 - 3).float()))
+    v.down.zero_()
+    v.up.zero_()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _warm(v, model, dtype, False)
+    stream.synchronize()
+    with assert_no_cute_compile():
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph, stream=stream):
+            actual, inject = _run(v, model, dtype, False)
+        assert _kernel_nodes(graph) == 1
+        for _ in range(3):
+            with torch.cuda.stream(stream):
+                v.x.view(torch.uint8).bitwise_xor_(128)
+                v.xs.mul_(0.5)
+                graph.replay()
+                residual = v.x.float() * v.xs[:, None]
+                expected = (
+                    residual.reshape(rows, model[0], model[1]).mean(1) * 0.5
+                ).to(dtype)
+            stream.synchronize()
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert inject is None
