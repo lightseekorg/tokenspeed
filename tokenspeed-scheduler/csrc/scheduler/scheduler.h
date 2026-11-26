@@ -258,11 +258,12 @@ public:
     // A holder's answers: reads of the cache as it stands, which the runtime
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
-    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases) const {
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases,
+                                bool include_disk = true) const {
         if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
             return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
         }
-        return PeerExports::AnswerLookup(coordinator_, lookup);
+        return PeerExports::AnswerLookup(coordinator_, lookup, include_disk);
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages) const;
@@ -278,9 +279,12 @@ public:
         std::size_t pinned_blocks{0};
         std::size_t looking_requests{0};
         std::size_t landing_requests{0};
+        std::size_t frozen_targets{0};
+        std::size_t frozen_blocks{0};
         std::uint64_t landed_tokens{0};
         std::uint64_t failed_landings{0};
         std::uint64_t unused_host_landings{0};
+        std::uint64_t frozen_landings{0};
     };
     PeerStats GetPeerStats() const;
     bool EnableAsyncHostPeer();
@@ -292,7 +296,10 @@ public:
     // v1 member tickets are independent of legacy messages and timers.
     bool PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us);
     bool ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us);
-    void RetirePeerTarget(const PeerLeaseId& lease) { peer_target_holds_.erase(lease); }
+    void RetirePeerTarget(const PeerLeaseId& lease) {
+        peer_target_holds_.erase(lease);
+        peer_frozen_targets_.erase(lease);
+    }
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
     }
@@ -1029,6 +1036,7 @@ private:
     std::unique_ptr<PeerExports> peer_offer_tickets_;
     std::unordered_map<std::string, PeerLeaseId> peer_target_attempts_;
     std::unordered_map<PeerLeaseId, std::vector<CacheBlockRef>, PeerLeaseIdHash> peer_target_holds_;
+    std::unordered_set<PeerLeaseId, PeerLeaseIdHash> peer_frozen_targets_;
     // A reader's landings into Host, with PeerLandingTier::kHost; null
     // otherwise. The fetches started since the last plan go out with it.
     std::unique_ptr<PeerHostLandings> peer_host_landings_;
@@ -1040,6 +1048,7 @@ private:
     std::uint64_t peer_landed_tokens_{0};
     std::uint64_t peer_failed_landings_{0};
     std::uint64_t peer_unused_host_landings_{0};
+    std::uint64_t peer_frozen_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

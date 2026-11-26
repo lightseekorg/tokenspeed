@@ -21,7 +21,8 @@
 //! V1 control traffic and member votes ride the normal replica collective.
 use super::{
     attempt::Attempt,
-    offers::{Offers, Vote, CLOSED, DONE, PINNED, READY},
+    offers::{Offers, Vote, CLOSED, DONE, FREEZE, PINNED, READY},
+    push::PagePusher,
     read::Reads,
     registered::Replica,
     servicer::empty_event,
@@ -32,7 +33,7 @@ use crate::codec::{Reader, Writer};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{mpsc, Arc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, Scheduler};
 
@@ -176,6 +177,7 @@ pub(super) struct Control {
     known: HashMap<String, (Generation, Arc<Replica>)>,
     attempts: BTreeMap<u64, Attempt>,
     offers: Offers,
+    pusher: Arc<dyn PagePusher>,
     pending_releases: PendingReleases,
     cap_warn_after_us: i64,
     votes: Vec<Vote>,
@@ -185,9 +187,11 @@ pub(super) struct Control {
     missing: Vec<PeerEventView>,
     admission: bool,
     retirement_bound_ms: u32,
+    push_timeout: Duration,
     pub meter: Option<Arc<ts_metrics::PeerMetrics>>,
 }
 impl Control {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: Arc<Replica>,
         rank: usize,
@@ -195,7 +199,9 @@ impl Control {
         incarnation: u64,
         ch: Option<VersionedChannel>,
         device_pin_gate: Arc<super::servicer::DevicePinGate>,
+        pusher: Arc<dyn PagePusher>,
         retirement_bound_ms: u32,
+        push_timeout: Duration,
     ) -> (Self, PeerFence) {
         let (tx, signaled) = mpsc::channel();
         (
@@ -211,6 +217,7 @@ impl Control {
                 known: HashMap::new(),
                 attempts: BTreeMap::new(),
                 offers: Offers::new(device_pin_gate),
+                pusher,
                 pending_releases: PendingReleases::default(),
                 cap_warn_after_us: 0,
                 votes: Vec::new(),
@@ -220,6 +227,7 @@ impl Control {
                 missing: Vec::new(),
                 admission: true,
                 retirement_bound_ms,
+                push_timeout,
                 meter: None,
             },
             PeerFence(tx),
@@ -426,6 +434,7 @@ impl Control {
                 }
                 let (reply, v) = self.offers.close(k, *id, *d, s, now);
                 if let Some(v) = v {
+                    self.pusher.cancel_offer(*id);
                     self.votes.push(v);
                 }
                 if let Some(r) = reply {
@@ -482,7 +491,7 @@ impl Control {
             for v in &r.votes {
                 let reply = match v.stage {
                     PINNED | CLOSED => self.offers.vote(i, v, now),
-                    READY | DONE => self
+                    READY | DONE | FREEZE => self
                         .attempts
                         .get_mut(&v.key.lease)
                         .and_then(|a| a.vote(i, v, now, round)),
@@ -495,6 +504,9 @@ impl Control {
                         // even if the reader disappeared before sending RELEASE.
                         let (_, vote) =
                             self.offers.close(key, offer.id, Disposition::Abort, s, now);
+                        if vote.is_some() {
+                            self.pusher.cancel_offer(offer.id);
+                        }
                         self.votes.extend(vote);
                     }
                     self.send(m);
@@ -513,6 +525,7 @@ impl Control {
             let (v, m) = a.tick(
                 reads,
                 self.meter.as_ref().map(|m| (m, self.rank)),
+                self.push_timeout,
                 now,
                 round,
             );
@@ -533,8 +546,11 @@ impl Control {
         for m in outgoing {
             self.send(m);
         }
-        self.votes
-            .extend(self.offers.expire(now, retirement_bound_ms, s));
+        let expired = self.offers.expire(now, retirement_bound_ms, s);
+        for v in &expired {
+            self.pusher.cancel_offer(v.offer);
+        }
+        self.votes.extend(expired);
         round.events.append(&mut self.missing);
         Ok(())
     }

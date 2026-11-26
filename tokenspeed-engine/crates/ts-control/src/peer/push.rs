@@ -60,9 +60,18 @@ const PUSH: &[u8] = b"p";
 const CANCEL: &[u8] = b"c";
 const DONE: &[u8] = b"d";
 const CANCELLED: &[u8] = b"x";
+const UNKNOWN: &[u8] = b"u";
 
-/// How long a reader waits for a cancelled push's acknowledgment.
+/// How long a reader waits for a cancelled push's acknowledgment (legacy sync push).
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
+/// How often a multi-holder push polls the reader's seal flag and cancel timers.
+const SEAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Grace window before an unacknowledged multi-holder cancel signals early freeze
+/// so the business request falls back locally while cancels retry in background.
+const CANCEL_FREEZE_WAIT: Duration = Duration::from_secs(1);
+/// Initial retry interval for unacknowledged cancels, doubling up to `CANCEL_RETRY_MAX`.
+const CANCEL_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const CANCEL_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
 /// holder's Disk block, to the reader's `address`.
@@ -108,6 +117,43 @@ impl PageWriter for EngineWriter {
     }
 }
 
+/// One holder rank's Disk push request within a multi-holder transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    /// The holder rank's push endpoint.
+    pub endpoint: String,
+    /// This member's transfer session, which the holder writes into.
+    pub session: String,
+    /// The v1 offer id authorizing this push on the holder (`0` when untagged).
+    pub offer_id: u64,
+    /// The Disk blocks and destination spans to push.
+    pub items: Vec<PushItem>,
+}
+
+impl PushTarget {
+    /// Payload bytes this target pushes.
+    pub fn bytes(&self) -> u64 {
+        self.items
+            .iter()
+            .flat_map(|item| &item.spans)
+            .map(|span| span.length)
+            .sum()
+    }
+}
+
+/// Retirement evidence for one or more holder Disk pushes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Every pushed block landed and every remote write retired.
+    Complete,
+    /// Not all blocks landed, but every holder proved no writes remain in
+    /// flight (or nothing was submitted).
+    Aborted(String),
+    /// Retirement could not be established (a remote write failed or a
+    /// cancellation went unacknowledged). Keep landing and source pinned.
+    Unknown(String),
+}
+
 /// What a reader's reads push through: its endpoint, in production.
 pub trait PagePusher: Send + Sync {
     /// Ask the holder rank at `endpoint` to push `items` into the memory
@@ -121,6 +167,60 @@ pub trait PagePusher: Send + Sync {
         budget: Duration,
         items: Vec<PushItem>,
     ) -> Result<(), String>;
+
+    /// Run one or more Disk pushes under a shared cancellation flag and
+    /// submission deadline, distinguishing cleanly retired aborts from unknown
+    /// remote write retirement.
+    fn push_many(
+        &self,
+        targets: Vec<PushTarget>,
+        budget: Duration,
+        submit_until: Instant,
+        sealed: &AtomicBool,
+    ) -> PushOutcome {
+        for target in targets {
+            if sealed.load(Ordering::SeqCst) || Instant::now() >= submit_until {
+                return PushOutcome::Aborted("peer push sealed before submission".to_owned());
+            }
+            let remaining = submit_until.saturating_duration_since(Instant::now());
+            let job_budget = budget.min(remaining);
+            if job_budget.is_zero() {
+                return PushOutcome::Aborted("peer push submission window elapsed".to_owned());
+            }
+            if let Err(error) =
+                self.push(&target.endpoint, &target.session, job_budget, target.items)
+            {
+                return PushOutcome::Unknown(error);
+            }
+        }
+        if sealed.load(Ordering::SeqCst) {
+            PushOutcome::Aborted("peer push sealed".to_owned())
+        } else {
+            PushOutcome::Complete
+        }
+    }
+
+    /// Cancel any active or queued holder-side Disk pushes tagged with
+    /// `offer_id` and fence late arrivals for that offer.
+    fn cancel_offer(&self, _offer_id: u64) {}
+
+    /// Start one or more Disk pushes without blocking the caller thread.
+    /// Sets `cancelling` to `true` once an unacknowledged cancel exceeds its
+    /// grace period (so the reader can freeze early and fall back locally while
+    /// cancels retry in the background) and invokes `finish` once every holder
+    /// reports completion, clean abort, or unknown write retirement.
+    fn start_push_many(
+        &self,
+        targets: Vec<PushTarget>,
+        budget: Duration,
+        submit_until: Instant,
+        sealed: Arc<AtomicBool>,
+        _cancelling: Arc<AtomicBool>,
+        finish: Box<dyn FnOnce(PushOutcome) + Send>,
+    ) {
+        let outcome = self.push_many(targets, budget, submit_until, &sealed);
+        finish(outcome);
+    }
 }
 
 /// A holder rank's Disk pages, as its pushes read them.
@@ -143,6 +243,7 @@ pub struct PushSource {
 enum Message {
     Push {
         job: u64,
+        offer_id: u64,
         reply_to: String,
         session: String,
         budget_us: u64,
@@ -159,6 +260,9 @@ enum Message {
     Cancelled {
         job: u64,
     },
+    Unknown {
+        job: u64,
+    },
 }
 
 impl Message {
@@ -167,12 +271,14 @@ impl Message {
         let kind = match self {
             Message::Push {
                 job,
+                offer_id,
                 reply_to,
                 session,
                 budget_us,
                 items,
             } => {
                 out.u64(*job);
+                out.u64(*offer_id);
                 out.bytes(reply_to.as_bytes());
                 out.bytes(session.as_bytes());
                 out.u64(*budget_us);
@@ -203,6 +309,10 @@ impl Message {
                 out.u64(*job);
                 CANCELLED
             }
+            Message::Unknown { job } => {
+                out.u64(*job);
+                UNKNOWN
+            }
         };
         vec![Bytes::from_static(kind), Bytes::from(out.finish())]
     }
@@ -216,6 +326,7 @@ impl Message {
         let message = match kind.as_ref() {
             PUSH => {
                 let job = reader.u64()?;
+                let offer_id = reader.u64()?;
                 let reply_to = text(&mut reader)?;
                 let session = text(&mut reader)?;
                 let budget_us = reader.u64()?;
@@ -241,6 +352,7 @@ impl Message {
                 }
                 Message::Push {
                     job,
+                    offer_id,
                     reply_to,
                     session,
                     budget_us,
@@ -256,6 +368,7 @@ impl Message {
                 ok: reader.flag()?,
             },
             CANCELLED => Message::Cancelled { job: reader.u64()? },
+            UNKNOWN => Message::Unknown { job: reader.u64()? },
             _ => return None,
         };
         reader.finish(message)
@@ -352,7 +465,8 @@ const MAX_FENCED_JOBS: usize = 16_384;
 /// Upper bound on concurrent push worker threads per holder.
 const MAX_PUSH_WORKERS: usize = 16;
 /// Upper bound on queued pushes waiting for a worker before fast-failing.
-const MAX_QUEUED_PUSHES: usize = 64;
+/// Sized for 64 concurrent TP8/KVP8 landings (8 reader ranks per holder rank).
+const MAX_QUEUED_PUSHES: usize = 512;
 /// Cap remote budgets so `Instant::now() + budget` can never overflow.
 const MAX_PUSH_BUDGET: Duration = Duration::from_secs(3600);
 
@@ -364,25 +478,58 @@ struct JobKey {
     job: u64,
 }
 
-/// Bounded FIFO set of `(reply_to, job)` keys that may never start again.
+/// Bounded FIFO set of `(reply_to, job)` keys that may never start again,
+/// remembering whether the completed job left RDMA write retirement unknown.
 #[derive(Default)]
 struct FencedJobs {
-    set: HashSet<JobKey>,
+    map: HashMap<JobKey, bool>,
     order: VecDeque<JobKey>,
 }
 
 impl FencedJobs {
     fn contains(&self, key: &JobKey) -> bool {
-        self.set.contains(key)
+        self.map.contains_key(key)
     }
 
-    fn insert(&mut self, key: JobKey) {
-        if self.set.insert(key.clone()) {
-            self.order.push_back(key);
-            while self.order.len() > MAX_FENCED_JOBS {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.set.remove(&oldest);
-                }
+    fn unknown(&self, key: &JobKey) -> bool {
+        self.map.get(key).copied().unwrap_or(false)
+    }
+
+    fn insert(&mut self, key: JobKey, unknown: bool) {
+        if let Some(entry) = self.map.get_mut(&key) {
+            *entry |= unknown;
+            return;
+        }
+        self.map.insert(key.clone(), unknown);
+        self.order.push_back(key);
+        while self.order.len() > MAX_FENCED_JOBS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// Bounded FIFO set of closed/expired v1 offer ids whose late pushes are rejected.
+#[derive(Default)]
+struct FencedOffers {
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl FencedOffers {
+    fn contains(&self, offer_id: u64) -> bool {
+        self.set.contains(&offer_id)
+    }
+
+    fn insert(&mut self, offer_id: u64) {
+        if offer_id == 0 || !self.set.insert(offer_id) {
+            return;
+        }
+        self.order.push_back(offer_id);
+        while self.order.len() > MAX_FENCED_JOBS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
             }
         }
     }
@@ -401,29 +548,38 @@ fn validate_spans(spans: &[PushSpan], block_bytes: u64) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Landed,
+    RetiredFailed,
+    UnknownRetirement,
+}
+
 enum CancelAck {
     Pending(Option<String>),
-    Finished,
+    Finished { unknown: bool },
 }
 
 /// A push the holder runs, and whether the reader cancelled it.
 struct Running {
+    offer_id: u64,
     cancelled: AtomicBool,
-    /// State machine preventing lost `Cancelled` ACKs when Cancel races finish.
+    /// State machine preventing lost `Cancelled`/`Unknown` ACKs when Cancel races finish.
     ack: Mutex<CancelAck>,
 }
 
 impl Running {
-    fn new() -> Self {
+    fn new(offer_id: u64) -> Self {
         Self {
+            offer_id,
             cancelled: AtomicBool::new(false),
             ack: Mutex::new(CancelAck::Pending(None)),
         }
     }
 
-    /// Marks the job cancelled; returns `Some(reply_to)` if the job already
-    /// finished so the caller must send `Cancelled` immediately.
-    fn cancel(&self, reply_to: String) -> Option<String> {
+    /// Marks the job cancelled; returns `Some((reply_to, unknown))` if the job
+    /// already finished so the caller must answer immediately.
+    fn cancel(&self, reply_to: String) -> Option<(String, bool)> {
         self.cancelled.store(true, Ordering::Release);
         let mut ack = self.ack.lock();
         match &mut *ack {
@@ -431,16 +587,16 @@ impl Running {
                 *slot = Some(reply_to);
                 None
             }
-            CancelAck::Finished => Some(reply_to),
+            CancelAck::Finished { unknown } => Some((reply_to, *unknown)),
         }
     }
 
     /// Transitions to `Finished` and returns any pending cancellation target.
-    fn finish(&self) -> Option<String> {
+    fn finish(&self, unknown: bool) -> Option<String> {
         let mut ack = self.ack.lock();
-        match std::mem::replace(&mut *ack, CancelAck::Finished) {
+        match std::mem::replace(&mut *ack, CancelAck::Finished { unknown }) {
             CancelAck::Pending(reply_to) => reply_to,
-            CancelAck::Finished => None,
+            CancelAck::Finished { .. } => None,
         }
     }
 }
@@ -454,38 +610,44 @@ struct QueuedPush {
 }
 
 /// Owns a push job's registration in `HolderState.running`; dropping it always
-/// fences the job and sends `Done` (and `Cancelled` if requested).
+/// fences the job and sends `Done`/`Unknown` (and `Cancelled`/`Unknown` if requested).
 struct JobGuard {
     state: Arc<HolderState>,
     sockets: Weak<Sockets>,
     key: JobKey,
     running: Arc<Running>,
-    ok: bool,
+    outcome: RunOutcome,
 }
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
+        let unknown = matches!(self.outcome, RunOutcome::UnknownRetirement);
         {
             let mut running_map = self.state.running.lock();
             running_map.remove(&self.key);
-            self.state.fenced.lock().insert(self.key.clone());
+            self.state.fenced.lock().insert(self.key.clone(), unknown);
         }
-        let ack = self.running.finish();
+        let ack = self.running.finish(unknown);
         if let Some(sockets) = self.sockets.upgrade() {
-            send(
-                &sockets,
-                &self.key.reply_to,
-                &Message::Done {
+            let reply = match self.outcome {
+                RunOutcome::Landed => Message::Done {
                     job: self.key.job,
-                    ok: self.ok,
+                    ok: true,
                 },
-            );
+                RunOutcome::RetiredFailed => Message::Done {
+                    job: self.key.job,
+                    ok: false,
+                },
+                RunOutcome::UnknownRetirement => Message::Unknown { job: self.key.job },
+            };
+            send(&sockets, &self.key.reply_to, &reply);
             if let Some(acknowledge) = ack {
-                send(
-                    &sockets,
-                    &acknowledge,
-                    &Message::Cancelled { job: self.key.job },
-                );
+                let cancel_reply = if unknown {
+                    Message::Unknown { job: self.key.job }
+                } else {
+                    Message::Cancelled { job: self.key.job }
+                };
+                send(&sockets, &acknowledge, &cancel_reply);
             }
         }
     }
@@ -497,6 +659,7 @@ struct HolderState {
     slots: Slots,
     running: Mutex<HashMap<JobKey, Arc<Running>>>,
     fenced: Mutex<FencedJobs>,
+    fenced_offers: Mutex<FencedOffers>,
 }
 
 /// The holder's half: a bounded worker pool serving Disk pushes.
@@ -531,6 +694,7 @@ impl Holder {
             },
             running: Mutex::new(HashMap::new()),
             fenced: Mutex::new(FencedJobs::default()),
+            fenced_offers: Mutex::new(FencedOffers::default()),
         });
         let worker_count = slots.clamp(1, MAX_PUSH_WORKERS);
         let (tx, rx) = mpsc::sync_channel::<QueuedPush>(MAX_QUEUED_PUSHES);
@@ -552,30 +716,31 @@ impl Holder {
                     // intentionally leaks any staging slot with in-flight NVMe DMA
                     // rather than reusing it, while `JobGuard` still fails the job
                     // back to the reader.
-                    let ok = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        state.run(
-                            &queued.session,
-                            deadline,
-                            &queued.items,
-                            &queued.guard.running,
-                        )
-                    })) {
-                        Ok(ok) => ok,
-                        Err(_) => {
-                            tracing::error!(
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.run(
+                                &queued.session,
+                                deadline,
+                                &queued.items,
+                                &queued.guard.running,
+                            )
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(_) => {
+                                tracing::error!(
                                 job = queued.guard.key.job,
                                 worker = index,
                                 free_slots = state.slots.free_count(),
                                 "peer push worker caught panic; failing job without retiring worker"
                             );
-                            false
-                        }
-                    };
-                    queued.guard.ok = ok;
+                                RunOutcome::UnknownRetirement
+                            }
+                        };
+                    queued.guard.outcome = outcome;
                     tracing::debug!(
                         job = queued.guard.key.job,
                         blocks = queued.items.len(),
-                        ok,
+                        ?outcome,
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "peer push ended"
                     );
@@ -594,6 +759,7 @@ impl Holder {
         &self,
         sockets: Weak<Sockets>,
         key: JobKey,
+        offer_id: u64,
         session: String,
         budget: Duration,
         items: Vec<PushItem>,
@@ -617,14 +783,18 @@ impl Holder {
             }
             return;
         }
-        let running = Arc::new(Running::new());
+        let running = Arc::new(Running::new(offer_id));
         {
             let mut running_map = self.state.running.lock();
-            if running_map.contains_key(&key) || self.state.fenced.lock().contains(&key) {
+            if (offer_id != 0 && self.state.fenced_offers.lock().contains(offer_id))
+                || running_map.contains_key(&key)
+                || self.state.fenced.lock().contains(&key)
+            {
                 tracing::warn!(
                     job = key.job,
+                    offer_id,
                     reader = key.reply_to,
-                    "rejecting duplicate or fenced peer push"
+                    "rejecting duplicate, fenced, or closed-offer peer push"
                 );
                 if let Some(sockets) = sockets.upgrade() {
                     send(
@@ -645,7 +815,7 @@ impl Holder {
             sockets,
             key,
             running,
-            ok: false,
+            outcome: RunOutcome::RetiredFailed,
         };
         let queued = QueuedPush {
             guard,
@@ -670,12 +840,17 @@ impl Holder {
     }
 
     fn cancel(&self, sockets: &Sockets, key: JobKey) {
+        let mut fenced_unknown = false;
         let running = {
             let running_map = self.state.running.lock();
             if let Some(active) = running_map.get(&key) {
                 Some(active.clone())
             } else {
-                self.state.fenced.lock().insert(key.clone());
+                let mut fenced = self.state.fenced.lock();
+                fenced_unknown = fenced.unknown(&key);
+                if !fenced.contains(&key) {
+                    fenced.insert(key.clone(), false);
+                }
                 None
             }
         };
@@ -683,12 +858,42 @@ impl Holder {
             Some(running) => {
                 let immediate = running.cancel(key.reply_to);
                 self.state.slots.wake_all();
-                if let Some(reply_to) = immediate {
-                    send(sockets, &reply_to, &Message::Cancelled { job: key.job });
+                if let Some((reply_to, unknown)) = immediate {
+                    let msg = if unknown {
+                        Message::Unknown { job: key.job }
+                    } else {
+                        Message::Cancelled { job: key.job }
+                    };
+                    send(sockets, &reply_to, &msg);
                 }
             }
-            None => send(sockets, &key.reply_to, &Message::Cancelled { job: key.job }),
+            None => {
+                let msg = if fenced_unknown {
+                    Message::Unknown { job: key.job }
+                } else {
+                    Message::Cancelled { job: key.job }
+                };
+                send(sockets, &key.reply_to, &msg);
+            }
         }
+    }
+
+    /// Cancels all active/queued jobs tagged with `offer_id` and fences late
+    /// pushes for that offer so closed/expired holder offers stop Disk pushes.
+    fn cancel_offer(&self, offer_id: u64) {
+        if offer_id == 0 {
+            return;
+        }
+        {
+            let running_map = self.state.running.lock();
+            self.state.fenced_offers.lock().insert(offer_id);
+            for running in running_map.values() {
+                if running.offer_id == offer_id {
+                    running.cancelled.store(true, Ordering::Release);
+                }
+            }
+        }
+        self.state.slots.wake_all();
     }
 
     /// Cancels all active jobs, closes the queue, and joins every worker.
@@ -710,18 +915,24 @@ impl Holder {
 impl HolderState {
     /// Runs one push to its end: every block read into a slot and written to
     /// the reader, unless the arrival-anchored `deadline` passes, the reader
-    /// cancels or an I/O fails. Returns whether every block actually landed via
-    /// RDMA write.
-    fn run(&self, session: &str, deadline: Instant, items: &[PushItem], job: &Running) -> bool {
+    /// cancels or an I/O fails. Reports whether every block landed, or whether
+    /// an RDMA write error left remote write retirement unknown.
+    fn run(
+        &self,
+        session: &str,
+        deadline: Instant,
+        items: &[PushItem],
+        job: &Running,
+    ) -> RunOutcome {
         // On a profile timeline: the push, and each block's write inside it.
         static PUSHES: Lanes = Lanes::new("Peer push");
         let lane = PUSHES.hold();
         let begin_ns = profile::now_ns();
         if job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return false;
+            return RunOutcome::RetiredFailed;
         }
         if self.source.executor.broken() {
-            return false;
+            return RunOutcome::RetiredFailed;
         }
 
         // Pre-validate every item before issuing any disk read or RDMA write,
@@ -756,7 +967,7 @@ impl HolderState {
                         block = item.block,
                         "peer push item has invalid block or out-of-bounds spans"
                     );
-                    return false;
+                    return RunOutcome::RetiredFailed;
                 }
             }
         }
@@ -768,6 +979,7 @@ impl HolderState {
         let mut inflight: HashMap<usize, (SlotGuard<'_>, JobId)> = HashMap::new();
         let mut cancelled_reads = false;
         let mut ok = true;
+        let mut write_failed = false;
         let stopped =
             |ok: bool| !ok || job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline;
         loop {
@@ -860,6 +1072,7 @@ impl HolderState {
                     let write_ns = profile::now_ns();
                     if let Err(error) = self.source.writer.write(session, &spans) {
                         tracing::warn!(%error, slot = slot_idx, "peer push write failed");
+                        write_failed = true;
                         block_ok = false;
                         ok = false;
                     }
@@ -897,7 +1110,219 @@ impl HolderState {
                 profile::now_ns(),
             );
         }
-        landed
+        if write_failed {
+            RunOutcome::UnknownRetirement
+        } else if landed {
+            RunOutcome::Landed
+        } else {
+            RunOutcome::RetiredFailed
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CancelTiming {
+    freeze_wait: Duration,
+    retry_initial: Duration,
+    retry_max: Duration,
+}
+
+impl Default for CancelTiming {
+    fn default() -> Self {
+        Self {
+            freeze_wait: CANCEL_FREEZE_WAIT,
+            retry_initial: CANCEL_RETRY_INITIAL,
+            retry_max: CANCEL_RETRY_MAX,
+        }
+    }
+}
+
+struct NewPushGroup {
+    group_id: u64,
+    requests: Vec<(u64, String, u16, Message)>,
+    budget: Duration,
+    sealed: Arc<AtomicBool>,
+    cancelling: Arc<AtomicBool>,
+    finish: Box<dyn FnOnce(PushOutcome) + Send>,
+}
+
+enum GroupPhase {
+    Waiting {
+        wait_deadline: Instant,
+    },
+    Cancelling {
+        freeze_at: Instant,
+        next_retry: Instant,
+        retry_interval: Duration,
+        freeze_signaled: bool,
+    },
+}
+
+struct PushGroup {
+    pending: HashMap<u64, (String, u16)>,
+    sealed: Arc<AtomicBool>,
+    cancelling: Arc<AtomicBool>,
+    abort_reason: Option<String>,
+    unknown_reason: Option<String>,
+    phase: GroupPhase,
+    finish: Option<Box<dyn FnOnce(PushOutcome) + Send>>,
+}
+
+impl PushGroup {
+    fn enter_cancelling(
+        &mut self,
+        sockets: &Sockets,
+        reply_to: &str,
+        now: Instant,
+        timing: CancelTiming,
+    ) {
+        if matches!(self.phase, GroupPhase::Cancelling { .. }) {
+            return;
+        }
+        for (&job, (host, port)) in &self.pending {
+            let cancel = Message::Cancel {
+                job,
+                reply_to: reply_to.to_owned(),
+            };
+            let _ = sockets.send(host, *port, cancel.frames());
+        }
+        let freeze_signaled = timing.freeze_wait.is_zero();
+        if freeze_signaled {
+            self.cancelling.store(true, Ordering::Release);
+        }
+        self.phase = GroupPhase::Cancelling {
+            freeze_at: now + timing.freeze_wait,
+            next_retry: now + timing.retry_initial,
+            retry_interval: timing.retry_initial,
+            freeze_signaled,
+        };
+    }
+
+    fn complete(mut self) {
+        let outcome = if let Some(reason) = self.unknown_reason {
+            PushOutcome::Unknown(reason)
+        } else if let Some(reason) = self.abort_reason {
+            PushOutcome::Aborted(reason)
+        } else if self.sealed.load(Ordering::SeqCst) {
+            PushOutcome::Aborted("peer push sealed".to_owned())
+        } else {
+            PushOutcome::Complete
+        };
+        if let Some(finish) = self.finish.take() {
+            finish(outcome);
+        }
+    }
+}
+
+fn drain_new_groups(
+    new_groups_rx: &mpsc::Receiver<NewPushGroup>,
+    sockets: &Sockets,
+    reply_to: &str,
+    timing: CancelTiming,
+    groups: &mut HashMap<u64, PushGroup>,
+    job_to_group: &mut HashMap<u64, u64>,
+) {
+    for new in new_groups_rx.try_iter() {
+        let now = Instant::now();
+        let mut pending = HashMap::with_capacity(new.requests.len());
+        let mut abort_reason = None;
+        for (job, host, port, request) in new.requests {
+            if new.sealed.load(Ordering::SeqCst) {
+                abort_reason = Some("peer push sealed during submission".to_owned());
+                break;
+            }
+            match sockets.send(&host, port, request.frames()) {
+                Ok(()) => {
+                    pending.insert(job, (host, port));
+                    job_to_group.insert(job, new.group_id);
+                }
+                Err(error) => {
+                    abort_reason = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let mut group = PushGroup {
+            pending,
+            sealed: new.sealed,
+            cancelling: new.cancelling,
+            abort_reason,
+            unknown_reason: None,
+            phase: GroupPhase::Waiting {
+                wait_deadline: now + new.budget.saturating_add(Duration::from_secs(1)),
+            },
+            finish: Some(new.finish),
+        };
+        if group.pending.is_empty() {
+            group.complete();
+            continue;
+        }
+        if group.abort_reason.is_some() {
+            group.enter_cancelling(sockets, reply_to, now, timing);
+        }
+        groups.insert(new.group_id, group);
+    }
+}
+
+fn step_groups(
+    sockets: &Sockets,
+    reply_to: &str,
+    timing: CancelTiming,
+    groups: &mut HashMap<u64, PushGroup>,
+    job_to_group: &mut HashMap<u64, u64>,
+) {
+    let now = Instant::now();
+    let mut done_ids = Vec::new();
+    for (&group_id, group) in groups.iter_mut() {
+        if group.pending.is_empty() {
+            done_ids.push(group_id);
+            continue;
+        }
+        match &mut group.phase {
+            GroupPhase::Waiting { wait_deadline } => {
+                if group.sealed.load(Ordering::SeqCst) {
+                    group
+                        .abort_reason
+                        .get_or_insert_with(|| "peer push sealed".to_owned());
+                    group.enter_cancelling(sockets, reply_to, now, timing);
+                } else if now >= *wait_deadline {
+                    group
+                        .abort_reason
+                        .get_or_insert_with(|| "the push did not finish in its budget".to_owned());
+                    group.enter_cancelling(sockets, reply_to, now, timing);
+                }
+            }
+            GroupPhase::Cancelling {
+                freeze_at,
+                next_retry,
+                retry_interval,
+                freeze_signaled,
+            } => {
+                if !*freeze_signaled && now >= *freeze_at {
+                    group.cancelling.store(true, Ordering::Release);
+                    *freeze_signaled = true;
+                }
+                if now >= *next_retry {
+                    for (&job, (host, port)) in &group.pending {
+                        let cancel = Message::Cancel {
+                            job,
+                            reply_to: reply_to.to_owned(),
+                        };
+                        let _ = sockets.send(host, *port, cancel.frames());
+                    }
+                    *retry_interval = (*retry_interval * 2).min(timing.retry_max);
+                    *next_retry = now + *retry_interval;
+                }
+            }
+        }
+    }
+    for group_id in done_ids {
+        if let Some(group) = groups.remove(&group_id) {
+            for job in group.pending.keys() {
+                job_to_group.remove(job);
+            }
+            group.complete();
+        }
     }
 }
 
@@ -908,7 +1333,12 @@ pub struct PushEndpoint {
     sockets: Option<Arc<Sockets>>,
     holder: Arc<Mutex<Option<Arc<Holder>>>>,
     waiters: Arc<Mutex<HashMap<u64, mpsc::Sender<Message>>>>,
+    new_groups: Option<mpsc::Sender<NewPushGroup>>,
+    wake: Option<mpsc::Sender<Vec<Bytes>>>,
+    #[allow(dead_code)]
+    cancel_timing: Arc<Mutex<CancelTiming>>,
     next_job: AtomicU64,
+    next_group: AtomicU64,
     dispatcher: Option<thread::JoinHandle<()>>,
 }
 
@@ -937,60 +1367,165 @@ impl PushEndpoint {
         incarnation: u64,
     ) -> Result<Self, PushError> {
         let (incoming, received) = mpsc::channel::<Vec<Bytes>>();
+        let wake = incoming.clone();
+        let (new_groups_tx, new_groups_rx) = mpsc::channel::<NewPushGroup>();
         let sockets = Arc::new(Sockets::start_at(bind_host, port, incoming)?);
         let name = crate::peer::net::join_endpoint(advertised_host, sockets.port());
         let holder: Arc<Mutex<Option<Arc<Holder>>>> = Arc::new(Mutex::new(None));
         let waiters: Arc<Mutex<HashMap<u64, mpsc::Sender<Message>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let cancel_timing = Arc::new(Mutex::new(CancelTiming::default()));
         let dispatcher = {
-            let (sockets_weak, holder, waiters) =
-                (Arc::downgrade(&sockets), holder.clone(), waiters.clone());
+            let (sockets_weak, holder, waiters, cancel_timing, local_name) = (
+                Arc::downgrade(&sockets),
+                holder.clone(),
+                waiters.clone(),
+                cancel_timing.clone(),
+                name.clone(),
+            );
             thread::Builder::new()
                 .name("ts-peer-push".to_owned())
                 .spawn(move || {
-                    for frames in received {
+                    let mut groups: HashMap<u64, PushGroup> = HashMap::new();
+                    let mut job_to_group: HashMap<u64, u64> = HashMap::new();
+                    loop {
+                        let recv_res = if groups.is_empty() {
+                            received
+                                .recv()
+                                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                        } else {
+                            received.recv_timeout(SEAL_POLL_INTERVAL)
+                        };
                         let Some(sockets) = sockets_weak.upgrade() else {
                             break;
                         };
-                        match Message::decode(&frames) {
-                            Some(Message::Push {
-                                job,
-                                reply_to,
-                                session,
-                                budget_us,
-                                items,
-                            }) => {
-                                let serving = holder.lock().clone();
-                                match serving {
-                                    Some(h) => h.enqueue(
-                                        sockets_weak.clone(),
-                                        JobKey { reply_to, job },
-                                        session,
-                                        Duration::from_micros(budget_us),
-                                        items,
-                                    ),
-                                    None => {
-                                        send(&sockets, &reply_to, &Message::Done { job, ok: false })
+                        let timing = *cancel_timing.lock();
+                        drain_new_groups(
+                            &new_groups_rx,
+                            &sockets,
+                            &local_name,
+                            timing,
+                            &mut groups,
+                            &mut job_to_group,
+                        );
+                        match recv_res {
+                            Ok(frames) if !frames.is_empty() => match Message::decode(&frames) {
+                                Some(Message::Push {
+                                    job,
+                                    offer_id,
+                                    reply_to,
+                                    session,
+                                    budget_us,
+                                    items,
+                                }) => {
+                                    let serving = holder.lock().clone();
+                                    match serving {
+                                        Some(h) => h.enqueue(
+                                            sockets_weak.clone(),
+                                            JobKey { reply_to, job },
+                                            offer_id,
+                                            session,
+                                            Duration::from_micros(budget_us),
+                                            items,
+                                        ),
+                                        None => send(
+                                            &sockets,
+                                            &reply_to,
+                                            &Message::Done { job, ok: false },
+                                        ),
                                     }
                                 }
-                            }
-                            Some(Message::Cancel { job, reply_to }) => {
-                                let serving = holder.lock().clone();
-                                match serving {
-                                    Some(h) => h.cancel(&sockets, JobKey { reply_to, job }),
-                                    None => send(&sockets, &reply_to, &Message::Cancelled { job }),
+                                Some(Message::Cancel { job, reply_to }) => {
+                                    let serving = holder.lock().clone();
+                                    match serving {
+                                        Some(h) => h.cancel(&sockets, JobKey { reply_to, job }),
+                                        None => {
+                                            send(&sockets, &reply_to, &Message::Cancelled { job })
+                                        }
+                                    }
                                 }
-                            }
-                            Some(answer @ (Message::Done { .. } | Message::Cancelled { .. })) => {
-                                let job = match answer {
-                                    Message::Done { job, .. } | Message::Cancelled { job } => job,
-                                    _ => unreachable!(),
-                                };
-                                if let Some(waiter) = waiters.lock().get(&job) {
-                                    let _ = waiter.send(answer);
+                                Some(
+                                    answer @ (Message::Done { .. }
+                                    | Message::Cancelled { .. }
+                                    | Message::Unknown { .. }),
+                                ) => {
+                                    let job = match answer {
+                                        Message::Done { job, .. }
+                                        | Message::Cancelled { job }
+                                        | Message::Unknown { job } => job,
+                                        _ => unreachable!(),
+                                    };
+                                    if let Some(group_id) = job_to_group.remove(&job) {
+                                        if let Some(group) = groups.get_mut(&group_id) {
+                                            group.pending.remove(&job);
+                                            let in_cancelling = matches!(
+                                                group.phase,
+                                                GroupPhase::Cancelling { .. }
+                                            );
+                                            match answer {
+                                                Message::Done { ok: true, .. } => {}
+                                                Message::Done { ok: false, .. } => {
+                                                    if !in_cancelling {
+                                                        group.abort_reason.get_or_insert_with(
+                                                            || {
+                                                                "the holder could not push"
+                                                                    .to_owned()
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                Message::Cancelled { .. } => {
+                                                    if !in_cancelling {
+                                                        group.abort_reason.get_or_insert_with(
+                                                            || {
+                                                                "the holder cancelled the push"
+                                                                    .to_owned()
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                Message::Unknown { .. } => {
+                                                    group.unknown_reason.get_or_insert_with(|| {
+                                                        "the holder push retired with unknown write state"
+                                                            .to_owned()
+                                                    });
+                                                }
+                                                _ => {}
+                                            }
+                                            if !group.pending.is_empty()
+                                                && (group.abort_reason.is_some()
+                                                    || group.unknown_reason.is_some())
+                                            {
+                                                group.enter_cancelling(
+                                                    &sockets,
+                                                    &local_name,
+                                                    Instant::now(),
+                                                    timing,
+                                                );
+                                            }
+                                            if group.pending.is_empty() {
+                                                if let Some(done_group) = groups.remove(&group_id) {
+                                                    done_group.complete();
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(waiter) = waiters.lock().get(&job) {
+                                        let _ = waiter.send(answer);
+                                    }
                                 }
-                            }
-                            None => tracing::warn!("a malformed peer push message dropped"),
+                                None => tracing::warn!("a malformed peer push message dropped"),
+                            },
+                            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                        if !groups.is_empty() {
+                            step_groups(
+                                &sockets,
+                                &local_name,
+                                timing,
+                                &mut groups,
+                                &mut job_to_group,
+                            );
                         }
                     }
                 })?
@@ -1000,7 +1535,11 @@ impl PushEndpoint {
             sockets: Some(sockets),
             holder,
             waiters,
+            new_groups: Some(new_groups_tx),
+            wake: Some(wake),
+            cancel_timing,
             next_job: AtomicU64::new(incarnation << 32),
+            next_group: AtomicU64::new(1),
             dispatcher: Some(dispatcher),
         })
     }
@@ -1018,6 +1557,28 @@ impl PushEndpoint {
             prev.shutdown();
         }
         Ok(())
+    }
+
+    /// Cancel active/queued pushes tagged with `offer_id` and fence late arrivals.
+    pub fn cancel_offer(&self, offer_id: u64) {
+        if let Some(holder) = self.holder.lock().as_ref() {
+            holder.cancel_offer(offer_id);
+        }
+    }
+
+    /// Override cancel freeze/retry timings in unit and integration tests.
+    #[cfg(test)]
+    pub fn set_cancel_timing_for_test(
+        &self,
+        freeze_wait: Duration,
+        retry_initial: Duration,
+        retry_max: Duration,
+    ) {
+        *self.cancel_timing.lock() = CancelTiming {
+            freeze_wait,
+            retry_initial,
+            retry_max,
+        };
     }
 
     /// `(free, total)` staging-ring slot counts on the active holder, if serving.
@@ -1043,6 +1604,8 @@ impl Drop for PushEndpoint {
         if let Some(holder) = self.holder.lock().take() {
             holder.shutdown();
         }
+        self.new_groups.take();
+        self.wake.take();
         self.sockets.take();
         if let Some(dispatcher) = self.dispatcher.take() {
             let _ = dispatcher.join();
@@ -1051,6 +1614,10 @@ impl Drop for PushEndpoint {
 }
 
 impl PagePusher for PushEndpoint {
+    fn cancel_offer(&self, offer_id: u64) {
+        PushEndpoint::cancel_offer(self, offer_id);
+    }
+
     fn push(
         &self,
         endpoint: &str,
@@ -1072,6 +1639,7 @@ impl PagePusher for PushEndpoint {
         };
         let request = Message::Push {
             job,
+            offer_id: 0,
             reply_to: self.name.clone(),
             session: session.to_owned(),
             budget_us: u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
@@ -1087,6 +1655,9 @@ impl PagePusher for PushEndpoint {
             Ok(Message::Done { ok: false, .. }) => {
                 return Err("the holder could not push".to_owned());
             }
+            Ok(Message::Unknown { .. }) => {
+                return Err("the holder push retired with unknown write state".to_owned());
+            }
             _ => {}
         }
         let cancel = Message::Cancel {
@@ -1098,6 +1669,9 @@ impl PagePusher for PushEndpoint {
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match answers.recv_timeout(remaining) {
                 Ok(Message::Done { ok: true, .. }) => return Ok(()),
+                Ok(Message::Unknown { .. }) => {
+                    return Err("the holder push retired with unknown write state".to_owned());
+                }
                 Ok(Message::Cancelled { .. } | Message::Done { .. }) => {
                     return Err("the push did not finish in its budget".to_owned());
                 }
@@ -1109,6 +1683,127 @@ impl PagePusher for PushEndpoint {
             "the push did not finish in its budget, and its cancellation went unacknowledged"
                 .to_owned(),
         )
+    }
+
+    fn start_push_many(
+        &self,
+        targets: Vec<PushTarget>,
+        budget: Duration,
+        submit_until: Instant,
+        sealed: Arc<AtomicBool>,
+        cancelling: Arc<AtomicBool>,
+        finish: Box<dyn FnOnce(PushOutcome) + Send>,
+    ) {
+        if targets.is_empty() {
+            let outcome = if sealed.load(Ordering::SeqCst) {
+                PushOutcome::Aborted("peer push sealed".to_owned())
+            } else {
+                PushOutcome::Complete
+            };
+            finish(outcome);
+            return;
+        }
+        let (Some(new_groups), Some(wake)) = (self.new_groups.as_ref(), self.wake.as_ref()) else {
+            finish(PushOutcome::Aborted("push endpoint is closed".to_owned()));
+            return;
+        };
+        if self.sockets.is_none() {
+            finish(PushOutcome::Aborted("push endpoint is closed".to_owned()));
+            return;
+        }
+        if sealed.load(Ordering::SeqCst) {
+            finish(PushOutcome::Aborted(
+                "peer push sealed before submission".to_owned(),
+            ));
+            return;
+        }
+        let Some(remaining) = submit_until.checked_duration_since(Instant::now()) else {
+            finish(PushOutcome::Aborted(
+                "peer push submission window elapsed".to_owned(),
+            ));
+            return;
+        };
+        let effective_budget = budget.min(remaining).min(MAX_PUSH_BUDGET);
+        if effective_budget.is_zero() {
+            finish(PushOutcome::Aborted("peer push budget is zero".to_owned()));
+            return;
+        }
+        let budget_us = u64::try_from(effective_budget.as_micros()).unwrap_or(u64::MAX);
+        let mut requests = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (host, port) = match split_endpoint(&target.endpoint) {
+                Ok((host, port)) => (host.to_owned(), port),
+                Err(error) => {
+                    finish(PushOutcome::Aborted(error.to_string()));
+                    return;
+                }
+            };
+            let job = self.next_job.fetch_add(1, Ordering::Relaxed);
+            requests.push((
+                job,
+                host,
+                port,
+                Message::Push {
+                    job,
+                    offer_id: target.offer_id,
+                    reply_to: self.name.clone(),
+                    session: target.session,
+                    budget_us,
+                    items: target.items,
+                },
+            ));
+        }
+        let group_id = self.next_group.fetch_add(1, Ordering::Relaxed);
+        let group = NewPushGroup {
+            group_id,
+            requests,
+            budget: effective_budget,
+            sealed,
+            cancelling,
+            finish,
+        };
+        match new_groups.send(group) {
+            Ok(()) => {
+                let _ = wake.send(Vec::new());
+            }
+            Err(mpsc::SendError(group)) => {
+                (group.finish)(PushOutcome::Aborted("push endpoint is closed".to_owned()));
+            }
+        }
+    }
+
+    fn push_many(
+        &self,
+        targets: Vec<PushTarget>,
+        budget: Duration,
+        submit_until: Instant,
+        sealed: &AtomicBool,
+    ) -> PushOutcome {
+        let (tx, rx) = mpsc::channel();
+        let sealed_bridge = Arc::new(AtomicBool::new(sealed.load(Ordering::SeqCst)));
+        let cancelling = Arc::new(AtomicBool::new(false));
+        self.start_push_many(
+            targets,
+            budget,
+            submit_until,
+            sealed_bridge.clone(),
+            cancelling,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        loop {
+            if sealed.load(Ordering::SeqCst) {
+                sealed_bridge.store(true, Ordering::SeqCst);
+            }
+            match rx.recv_timeout(SEAL_POLL_INTERVAL) {
+                Ok(outcome) => return outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return PushOutcome::Unknown("push endpoint dispatcher closed".to_owned());
+                }
+            }
+        }
     }
 }
 
@@ -1146,6 +1841,7 @@ mod tests {
         for msg in [
             Message::Push {
                 job: (7 << 32) + 1,
+                offer_id: 42,
                 reply_to: "10.0.0.3:7200".into(),
                 session: "10.0.0.3:12345".into(),
                 budget_us: 2_000_000,
@@ -1166,6 +1862,7 @@ mod tests {
             Message::Done { job: 3, ok: true },
             Message::Done { job: 4, ok: false },
             Message::Cancelled { job: 3 },
+            Message::Unknown { job: 5 },
         ] {
             assert_eq!(Message::decode(&msg.frames()), Some(msg));
         }
@@ -1224,13 +1921,18 @@ mod tests {
             reply_to: "10.0.0.2:7200".into(),
             job: 42,
         };
-        fenced.insert(a.clone());
-        assert!(fenced.contains(&a) && !fenced.contains(&b));
+        fenced.insert(a.clone(), false);
+        assert!(fenced.contains(&a) && !fenced.unknown(&a) && !fenced.contains(&b));
+        fenced.insert(b.clone(), true);
+        assert!(fenced.contains(&b) && fenced.unknown(&b));
         for job in 0..(MAX_FENCED_JOBS as u64 + 2) {
-            fenced.insert(JobKey {
-                reply_to: "10.0.0.3:7200".into(),
-                job,
-            });
+            fenced.insert(
+                JobKey {
+                    reply_to: "10.0.0.3:7200".into(),
+                    job,
+                },
+                false,
+            );
         }
         assert!(!fenced.contains(&a));
         assert!(fenced.contains(&JobKey {
@@ -1238,12 +1940,15 @@ mod tests {
             job: MAX_FENCED_JOBS as u64 + 1
         }));
 
-        let r1 = Running::new();
+        let r1 = Running::new(0);
         assert_eq!(r1.cancel("r1".into()), None);
-        assert_eq!(r1.finish(), Some("r1".into()));
-        let r2 = Running::new();
-        assert_eq!(r2.finish(), None);
-        assert_eq!(r2.cancel("r2".into()), Some("r2".into()));
+        assert_eq!(r1.finish(false), Some("r1".into()));
+        let r2 = Running::new(0);
+        assert_eq!(r2.finish(false), None);
+        assert_eq!(r2.cancel("r2".into()), Some(("r2".into(), false)));
+        let r3 = Running::new(0);
+        assert_eq!(r3.finish(true), None);
+        assert_eq!(r3.cancel("r3".into()), Some(("r3".into(), true)));
     }
 
     #[test]
@@ -1746,5 +2451,350 @@ mod tests {
             assert!(!h.join().unwrap());
         }
         assert_eq!(slots.free_count(), 1);
+    }
+
+    #[test]
+    fn push_many_parallel_complete_clean_abort_and_unknown_retirement() {
+        use std::{path::PathBuf, sync::atomic::AtomicUsize};
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        struct TestWriter {
+            ring: Arc<Memory>,
+            fail: AtomicBool,
+            panic_next: AtomicBool,
+            written: Mutex<Vec<(u64, Vec<u8>)>>,
+            hold: (std::sync::Mutex<bool>, std::sync::Condvar),
+            entered: AtomicUsize,
+        }
+        impl PageWriter for TestWriter {
+            fn write(&self, _: &str, spans: &Spans) -> Result<(), String> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let held = self.hold.0.lock().unwrap();
+                let _held = self.hold.1.wait_while(held, |b| *b).unwrap();
+                if self.panic_next.swap(false, Ordering::SeqCst) {
+                    panic!("simulated push_many writer panic");
+                }
+                if self.fail.load(Ordering::Acquire) {
+                    return Err("simulated RDMA write failure".into());
+                }
+                for ((&src, &dst), &len) in spans
+                    .sources
+                    .iter()
+                    .zip(&spans.destinations)
+                    .zip(&spans.lengths)
+                {
+                    let mut buf = vec![0u8; len as usize];
+                    self.ring
+                        .read_at(src as usize - self.ring.address(), &mut buf);
+                    self.written.lock().push((dst, buf));
+                }
+                Ok(())
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let spawn_holder = |tag: &str, fill: u8, inc: u64| {
+            let temp = TempDisk(dir.join(format!(
+                "ts-push-many-{tag}-{}-{}.bin",
+                std::process::id(),
+                profile::now_ns()
+            )));
+            let disk_file = DiskFile::create(&temp.0, (2 * BLOCK) as u64).unwrap();
+            let ring = Arc::new(Memory::map(4 * BLOCK).unwrap());
+            let mut seed = Memory::map(BLOCK).unwrap();
+            seed.write_at(0, &vec![fill; BLOCK]);
+            let executor = Arc::new(
+                ts_disk::Executor::start(
+                    disk_file,
+                    &[(ring.address(), ring.size()), (seed.address(), seed.size())],
+                    ExecutorConfig {
+                        backend: Backend::Psync,
+                        queue_depth: 2,
+                        write_queue_depth: 1,
+                        max_io_bytes: 1 << 20,
+                        write_bytes_per_second: 1 << 30,
+                    },
+                )
+                .unwrap(),
+            );
+            let (tx, rx) = mpsc::channel();
+            executor
+                .submit(
+                    Job {
+                        direction: Direction::Write,
+                        ios: vec![Io {
+                            file_offset: 0,
+                            address: seed.address(),
+                            len: BLOCK,
+                        }],
+                    },
+                    move |r| {
+                        let _ = tx.send(r.outcome);
+                    },
+                )
+                .unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+            let writer = Arc::new(TestWriter {
+                ring: ring.clone(),
+                fail: AtomicBool::new(false),
+                panic_next: AtomicBool::new(false),
+                written: Mutex::new(Vec::new()),
+                hold: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+                entered: AtomicUsize::new(0),
+            });
+            let ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", inc).unwrap();
+            ep.serve(PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: writer.clone(),
+                ring,
+                slot_bytes: BLOCK,
+            })
+            .unwrap();
+            (ep, writer, temp)
+        };
+
+        let (h1, w1, _t1) = spawn_holder("h1", 0x11, 101);
+        let (h2, w2, _t2) = spawn_holder("h2", 0x22, 102);
+        let reader = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 103).unwrap();
+        let target = |ep: &PushEndpoint, block: i32, dst: u64| PushTarget {
+            endpoint: ep.name().to_owned(),
+            session: "reader-sess".into(),
+            offer_id: 0,
+            items: vec![PushItem {
+                group: 0,
+                block,
+                spans: vec![PushSpan {
+                    offset: 16,
+                    address: dst,
+                    length: 64,
+                }],
+            }],
+        };
+
+        // 1. Parallel multi-holder fan-out succeeds and delivers both holders' bytes.
+        let sealed = AtomicBool::new(false);
+        let out = reader.push_many(
+            vec![target(&h1, 1, 1000), target(&h2, 1, 2000)],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert_eq!(out, PushOutcome::Complete);
+        assert_eq!(w1.written.lock().as_slice(), &[(1000, vec![0x11; 64])]);
+        assert_eq!(w2.written.lock().as_slice(), &[(2000, vec![0x22; 64])]);
+
+        // 2. Clean holder refusal (invalid block id) -> Aborted (not Unknown).
+        let out = reader.push_many(
+            vec![target(&h1, 99, 1000)],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(matches!(out, PushOutcome::Aborted(_)), "got {out:?}");
+
+        // 3. Sealing while one holder is paused cancels cleanly -> Aborted.
+        *w1.hold.0.lock().unwrap() = true;
+        w1.entered.store(0, Ordering::SeqCst);
+        let sealed_cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                reader.push_many(
+                    vec![target(&h1, 1, 3000)],
+                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(10),
+                    &sealed_cancel,
+                )
+            });
+            let wait = Instant::now();
+            while w1.entered.load(Ordering::Acquire) < 1 {
+                assert!(wait.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(2));
+            }
+            sealed_cancel.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(40));
+            *w1.hold.0.lock().unwrap() = false;
+            w1.hold.1.notify_all();
+            let res = handle.join().unwrap();
+            assert!(matches!(res, PushOutcome::Aborted(_)), "got {res:?}");
+        });
+        assert_eq!(h1.push_ring_slot_counts(), Some((4, 4)));
+
+        // 4. RDMA write error -> Unknown retirement (not Aborted).
+        w1.fail.store(true, Ordering::Release);
+        let out = reader.push_many(
+            vec![target(&h1, 1, 4000), target(&h2, 1, 5000)],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(matches!(out, PushOutcome::Unknown(_)), "got {out:?}");
+        w1.fail.store(false, Ordering::Release);
+
+        // 5. Writer panic -> Unknown retirement and slot leaked safely.
+        w2.panic_next.store(true, Ordering::SeqCst);
+        let out = reader.push_many(
+            vec![target(&h2, 1, 6000)],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(matches!(out, PushOutcome::Unknown(_)), "got {out:?}");
+        assert_eq!(h2.push_ring_slot_counts(), Some((3, 4)));
+
+        // 6. Holder cancel_offer stops an in-flight push tagged with that offer
+        //    and fences late arrivals for the same offer without touching NVMe.
+        *w1.hold.0.lock().unwrap() = true;
+        w1.entered.store(0, Ordering::SeqCst);
+        let mut offer_target = target(&h1, 1, 7000);
+        offer_target.offer_id = 77;
+        std::thread::scope(|scope| {
+            let t = offer_target.clone();
+            let handle = scope.spawn(|| {
+                reader.push_many(
+                    vec![t],
+                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(10),
+                    &sealed,
+                )
+            });
+            let wait = Instant::now();
+            while w1.entered.load(Ordering::Acquire) < 1 {
+                assert!(wait.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(2));
+            }
+            h1.cancel_offer(77);
+            *w1.hold.0.lock().unwrap() = false;
+            w1.hold.1.notify_all();
+            let res = handle.join().unwrap();
+            assert!(matches!(res, PushOutcome::Aborted(_)), "got {res:?}");
+        });
+        let entered_before_late = w1.entered.load(Ordering::Acquire);
+        let late_res = reader.push_many(
+            vec![offer_target],
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(10),
+            &sealed,
+        );
+        assert!(
+            matches!(late_res, PushOutcome::Aborted(_)),
+            "got {late_res:?}"
+        );
+        assert_eq!(w1.entered.load(Ordering::Acquire), entered_before_late);
+    }
+
+    #[test]
+    fn background_cancel_retry_signals_freeze_early_and_recovers_on_late_ack() {
+        for (late_unknown, expect_unknown) in [(false, false), (true, true)] {
+            let (in_tx, in_rx) = mpsc::channel::<Vec<Bytes>>();
+            let fake_holder = Sockets::start_at("127.0.0.1", 0, in_tx).unwrap();
+            let fake_ep = format!("127.0.0.1:{}", fake_holder.port());
+            let reader = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 200).unwrap();
+            reader.set_cancel_timing_for_test(
+                Duration::from_millis(40),
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+            );
+            let sealed = Arc::new(AtomicBool::new(false));
+            let cancelling = Arc::new(AtomicBool::new(false));
+            let (done_tx, done_rx) = mpsc::channel();
+            reader.start_push_many(
+                vec![PushTarget {
+                    endpoint: fake_ep,
+                    session: "s".into(),
+                    offer_id: 9,
+                    items: vec![PushItem {
+                        group: 0,
+                        block: 1,
+                        spans: vec![PushSpan {
+                            offset: 0,
+                            address: 1024,
+                            length: 64,
+                        }],
+                    }],
+                }],
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(10),
+                sealed.clone(),
+                cancelling.clone(),
+                Box::new(move |outcome| {
+                    let _ = done_tx.send(outcome);
+                }),
+            );
+            // Receive initial Push and do not answer it yet.
+            let frames = in_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let Some(Message::Push {
+                job,
+                offer_id,
+                reply_to,
+                ..
+            }) = Message::decode(&frames)
+            else {
+                panic!("expected Push");
+            };
+            assert_eq!(offer_id, 9);
+
+            // Seal the reader push -> reader sends Cancel, waits freeze_wait,
+            // signals `cancelling`, and keeps retrying Cancel until answered.
+            sealed.store(true, Ordering::SeqCst);
+            let mut cancels_seen = 0usize;
+            let start = Instant::now();
+            while cancels_seen < 3 || !cancelling.load(Ordering::Acquire) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "timed out waiting for cancel retries (seen={cancels_seen}, cancelling={})",
+                    cancelling.load(Ordering::Acquire)
+                );
+                if let Ok(cf) = in_rx.recv_timeout(Duration::from_millis(20)) {
+                    if matches!(Message::decode(&cf), Some(Message::Cancel { job: j, .. }) if j == job)
+                    {
+                        cancels_seen += 1;
+                    }
+                }
+            }
+            // Still pending (neither Aborted nor Unknown yet) before the holder replies.
+            assert!(done_rx.try_recv().is_err());
+
+            // Now the slow/recovered holder sends its late answer.
+            let reply = if late_unknown {
+                Message::Unknown { job }
+            } else {
+                Message::Cancelled { job }
+            };
+            send(&fake_holder, &reply_to, &reply);
+            let outcome = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if expect_unknown {
+                assert!(
+                    matches!(outcome, PushOutcome::Unknown(_)),
+                    "got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, PushOutcome::Aborted(_)),
+                    "got {outcome:?}"
+                );
+            }
+        }
     }
 }

@@ -87,9 +87,16 @@ std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
 }  // namespace
 
 Scheduler::PeerStats Scheduler::GetPeerStats() const {
-    PeerStats stats{.landed_tokens = peer_landed_tokens_,
+    PeerStats stats{.frozen_targets = peer_frozen_targets_.size(),
+                    .landed_tokens = peer_landed_tokens_,
                     .failed_landings = peer_failed_landings_,
-                    .unused_host_landings = peer_unused_host_landings_};
+                    .unused_host_landings = peer_unused_host_landings_,
+                    .frozen_landings = peer_frozen_landings_};
+    for (const auto& lease : peer_frozen_targets_) {
+        if (const auto it = peer_target_holds_.find(lease); it != peer_target_holds_.end()) {
+            stats.frozen_blocks += it->second.size();
+        }
+    }
     if (peer_exports_) {
         stats.leases = peer_exports_->NumLeases();
         stats.pinned_blocks = peer_exports_->NumPinnedBlocks();
@@ -199,7 +206,13 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         // A frozen landing can publish only a fallback, never readable tokens.
         if (event.frozen && event.num_tokens != 0) return;
         peer_target_attempts_.erase(attempt);
-        if (!event.frozen) RetirePeerTarget(event.lease);
+        if (event.frozen) {
+            if (peer_target_holds_.contains(event.lease) && peer_frozen_targets_.insert(event.lease).second) {
+                ++peer_frozen_landings_;
+            }
+        } else {
+            RetirePeerTarget(event.lease);
+        }
     }
     Request* request = findRequest(event.request_id);
     if (auto attempt = device_attempts_.extract(event.request_id); !attempt.empty()) {

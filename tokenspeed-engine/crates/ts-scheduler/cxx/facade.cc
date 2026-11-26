@@ -322,8 +322,8 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
 }
 
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
-                                  std::size_t pending_new_leases) {
-    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup), pending_new_leases));
+                                  std::size_t pending_new_leases, bool include_disk) {
+    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup), pending_new_leases, include_disk));
 }
 
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
@@ -371,9 +371,12 @@ PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler) {
                          .pinned_blocks = stats.pinned_blocks,
                          .looking_requests = stats.looking_requests,
                          .landing_requests = stats.landing_requests,
+                         .frozen_targets = stats.frozen_targets,
+                         .frozen_blocks = stats.frozen_blocks,
                          .landed_tokens = stats.landed_tokens,
                          .failed_landings = stats.failed_landings,
-                         .unused_host_landings = stats.unused_host_landings};
+                         .unused_host_landings = stats.unused_host_landings,
+                         .frozen_landings = stats.frozen_landings};
 }
 
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,

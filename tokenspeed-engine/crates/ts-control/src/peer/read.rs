@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::peer::{
     geometry::Spans,
-    push::{PagePusher, PushItem},
+    push::{PagePusher, PushItem, PushOutcome, PushTarget},
 };
 
 /// What moves a read's bytes.
@@ -110,6 +110,7 @@ pub enum ReadRetirement {
 /// Sealing requests cancellation; only the retirement result can release pages.
 pub struct MemberRead {
     sealed: Arc<AtomicBool>,
+    cancelling: Arc<AtomicBool>,
     result: mpsc::Receiver<ReadRetirement>,
 }
 
@@ -117,6 +118,12 @@ impl MemberRead {
     /// Stop claiming new batches. A batch claimed just before seal remains in flight.
     pub fn seal(&self) {
         self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a Disk push cancellation is retrying in the background past its
+    /// short grace period, so the landing should freeze early and fall back.
+    pub fn is_cancelling(&self) -> bool {
+        self.cancelling.load(Ordering::Acquire)
     }
 
     /// Take the single retirement result. A disconnected worker cannot certify retirement.
@@ -127,36 +134,171 @@ impl MemberRead {
 
 struct MemberJob {
     submit_until: Instant,
+    push_budget: Duration,
     batches: Vec<(String, Spans, Option<ts_metrics::QueuedPeerRead>)>,
+    pushes: Vec<PushTarget>,
+    push_observation: Option<ts_metrics::QueuedPeerRead>,
     sealed: Arc<AtomicBool>,
+    cancelling: Arc<AtomicBool>,
     done: mpsc::Sender<ReadRetirement>,
 }
 
-impl MemberJob {
-    fn run(self, reader: &dyn PageReader) {
-        for (session, spans, observation) in self.batches {
-            if self.sealed.load(Ordering::SeqCst) || Instant::now() >= self.submit_until {
-                let _ = self.done.send(ReadRetirement::Aborted);
-                return;
+fn run_member_reads(
+    batches: Vec<(String, Spans, Option<ts_metrics::QueuedPeerRead>)>,
+    submit_until: Instant,
+    sealed: &AtomicBool,
+    reader: &dyn PageReader,
+) -> ReadRetirement {
+    for (session, spans, observation) in batches {
+        if sealed.load(Ordering::SeqCst) || Instant::now() >= submit_until {
+            return ReadRetirement::Aborted;
+        }
+        if !spans.is_empty() {
+            let start = Instant::now();
+            let result = reader.read(&session, &spans);
+            if let Some(observation) = observation {
+                observation.finish(start, start.elapsed(), spans.host_bytes, 0, result.is_ok());
             }
-            if !spans.is_empty() {
-                let start = std::time::Instant::now();
-                let result = reader.read(&session, &spans);
-                if let Some(observation) = observation {
-                    observation.finish(start, start.elapsed(), spans.host_bytes, 0, result.is_ok());
-                }
-                if let Err(error) = result {
-                    let _ = self.done.send(ReadRetirement::Unknown(error));
-                    return;
-                }
+            if let Err(error) = result {
+                sealed.store(true, Ordering::SeqCst);
+                return ReadRetirement::Unknown(error);
             }
         }
-        let result = if self.sealed.load(Ordering::SeqCst) {
+    }
+    if sealed.load(Ordering::SeqCst) {
+        ReadRetirement::Aborted
+    } else {
+        ReadRetirement::Complete
+    }
+}
+
+fn finish_push_outcome(
+    outcome: PushOutcome,
+    start: Instant,
+    disk_bytes: u64,
+    sealed: &AtomicBool,
+    observation: Option<ts_metrics::QueuedPeerRead>,
+) -> ReadRetirement {
+    let ok = matches!(outcome, PushOutcome::Complete);
+    if let Some(observation) = observation {
+        observation.finish(start, start.elapsed(), 0, disk_bytes, ok);
+    }
+    match outcome {
+        PushOutcome::Complete => {
+            if sealed.load(Ordering::SeqCst) {
+                ReadRetirement::Aborted
+            } else {
+                ReadRetirement::Complete
+            }
+        }
+        PushOutcome::Aborted(reason) => {
+            sealed.store(true, Ordering::SeqCst);
+            tracing::debug!(%reason, "versioned peer disk push aborted");
             ReadRetirement::Aborted
-        } else {
-            ReadRetirement::Complete
-        };
-        let _ = self.done.send(result);
+        }
+        PushOutcome::Unknown(error) => {
+            sealed.store(true, Ordering::SeqCst);
+            ReadRetirement::Unknown(error)
+        }
+    }
+}
+
+fn combine_retirements(
+    a: ReadRetirement,
+    b: ReadRetirement,
+    sealed: &AtomicBool,
+) -> ReadRetirement {
+    match (a, b) {
+        (ReadRetirement::Unknown(error), _) | (_, ReadRetirement::Unknown(error)) => {
+            ReadRetirement::Unknown(error)
+        }
+        (ReadRetirement::Aborted, _) | (_, ReadRetirement::Aborted) => ReadRetirement::Aborted,
+        (ReadRetirement::Complete, ReadRetirement::Complete) => {
+            if sealed.load(Ordering::SeqCst) {
+                ReadRetirement::Aborted
+            } else {
+                ReadRetirement::Complete
+            }
+        }
+    }
+}
+
+struct CombineState {
+    read: Option<ReadRetirement>,
+    push: Option<ReadRetirement>,
+    sealed: Arc<AtomicBool>,
+    done: Option<mpsc::Sender<ReadRetirement>>,
+}
+
+impl CombineState {
+    fn resolve(&mut self) {
+        if self.read.is_some() && self.push.is_some() {
+            let read = self.read.take().unwrap();
+            let push = self.push.take().unwrap();
+            if let Some(done) = self.done.take() {
+                let _ = done.send(combine_retirements(read, push, &self.sealed));
+            }
+        }
+    }
+}
+
+impl MemberJob {
+    fn run(self, reader: &dyn PageReader, pusher: &dyn PagePusher) {
+        let MemberJob {
+            submit_until,
+            push_budget,
+            batches,
+            pushes,
+            push_observation,
+            sealed,
+            cancelling,
+            done,
+        } = self;
+        if pushes.is_empty() {
+            let result = if !batches.is_empty() {
+                run_member_reads(batches, submit_until, &sealed, reader)
+            } else if sealed.load(Ordering::SeqCst) {
+                ReadRetirement::Aborted
+            } else {
+                ReadRetirement::Complete
+            };
+            let _ = done.send(result);
+            return;
+        }
+        // Start Disk pushes non-blockingly so this read worker can run local
+        // one-sided READs immediately and return to the pool without waiting on
+        // multi-second NVMe pushes or background Cancel retries.
+        let has_reads = !batches.is_empty();
+        let combine = Arc::new(Mutex::new(CombineState {
+            read: (!has_reads).then_some(ReadRetirement::Complete),
+            push: None,
+            sealed: sealed.clone(),
+            done: Some(done),
+        }));
+        let disk_bytes: u64 = pushes.iter().map(PushTarget::bytes).sum();
+        let start = Instant::now();
+        let combine_push = combine.clone();
+        let sealed_push = sealed.clone();
+        pusher.start_push_many(
+            pushes,
+            push_budget,
+            submit_until,
+            sealed.clone(),
+            cancelling,
+            Box::new(move |outcome| {
+                let ret =
+                    finish_push_outcome(outcome, start, disk_bytes, &sealed_push, push_observation);
+                let mut state = combine_push.lock();
+                state.push = Some(ret);
+                state.resolve();
+            }),
+        );
+        if has_reads {
+            let read_ret = run_member_reads(batches, submit_until, &sealed, reader);
+            let mut state = combine.lock();
+            state.read = Some(read_ret);
+            state.resolve();
+        }
     }
 }
 
@@ -205,7 +347,7 @@ impl Reads {
                     let job = incoming.lock().recv();
                     let (job, observation) = match job {
                         Ok(Work::Member(member)) => {
-                            member.run(reader.as_ref());
+                            member.run(reader.as_ref(), pusher.as_ref());
                             continue;
                         }
                         Ok(Work::Legacy(job, observation)) => (job, observation),
@@ -298,17 +440,26 @@ impl Reads {
     /// Every queue entry owns exactly one completion sender regardless of the
     /// number of holder sessions. None means nothing was queued.
     pub fn submit_member(&self, batches: Vec<(String, Spans)>) -> Option<MemberRead> {
-        self.submit_member_observed(batches, Instant::now() + super::v1::SUBMIT_WINDOW, None)
+        self.submit_member_observed(
+            batches,
+            Vec::new(),
+            Duration::ZERO,
+            Instant::now() + super::v1::SUBMIT_WINDOW,
+            None,
+        )
     }
 
     pub(super) fn submit_member_observed(
         &self,
         batches: Vec<(String, Spans)>,
+        pushes: Vec<PushTarget>,
+        push_budget: Duration,
         submit_until: Instant,
         metrics: Option<(&Arc<ts_metrics::PeerMetrics>, &str, usize)>,
     ) -> Option<MemberRead> {
         let (done, result) = mpsc::channel();
         let sealed = Arc::new(AtomicBool::new(false));
+        let cancelling = Arc::new(AtomicBool::new(false));
         let batches = batches
             .into_iter()
             .map(|(session, spans)| {
@@ -318,16 +469,30 @@ impl Reads {
                 (session, spans, observation)
             })
             .collect();
+        let push_bytes: u64 = pushes.iter().map(PushTarget::bytes).sum();
+        let push_observation = if pushes.is_empty() {
+            None
+        } else {
+            metrics.map(|(m, holder, rank)| m.queue_read(holder.into(), rank, push_bytes))
+        };
         self.jobs
             .as_ref()?
             .send(Work::Member(MemberJob {
                 submit_until,
+                push_budget,
                 batches,
+                pushes,
+                push_observation,
                 sealed: sealed.clone(),
+                cancelling: cancelling.clone(),
                 done,
             }))
             .ok()?;
-        Some(MemberRead { sealed, result })
+        Some(MemberRead {
+            sealed,
+            cancelling,
+            result,
+        })
     }
 
     pub(super) fn submit_observed(
@@ -716,6 +881,8 @@ mod tests {
         let job = reads
             .submit_member_observed(
                 vec![("unreachable".into(), read_job("r", "unused", 16).spans)],
+                Vec::new(),
+                Duration::ZERO,
                 Instant::now(),
                 None,
             )
@@ -798,5 +965,263 @@ mod tests {
         drop(release);
         drop(reads);
         assert_eq!(arena.read_bytes(8, 32), vec![7; 32]);
+    }
+
+    #[test]
+    fn member_job_overlaps_reads_and_pushes_and_propagates_retirements() {
+        use std::sync::Barrier;
+
+        struct BarrierReader {
+            barrier: Option<Arc<Barrier>>,
+            fail: bool,
+        }
+        impl PageReader for BarrierReader {
+            fn read(&self, _: &str, _: &Spans) -> Result<(), String> {
+                if let Some(b) = &self.barrier {
+                    b.wait();
+                }
+                if self.fail {
+                    Err("read fault".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct MockPusher {
+            barrier: Option<Arc<Barrier>>,
+            outcome: PushOutcome,
+        }
+        impl PagePusher for MockPusher {
+            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+                unreachable!()
+            }
+            fn start_push_many(
+                &self,
+                _: Vec<PushTarget>,
+                _: Duration,
+                _: Instant,
+                _: Arc<AtomicBool>,
+                _: Arc<AtomicBool>,
+                finish: Box<dyn FnOnce(PushOutcome) + Send>,
+            ) {
+                let outcome = self.outcome.clone();
+                if let Some(b) = self.barrier.clone() {
+                    thread::spawn(move || {
+                        b.wait();
+                        finish(outcome);
+                    });
+                } else {
+                    finish(outcome);
+                }
+            }
+        }
+
+        let sample_push = || {
+            vec![PushTarget {
+                endpoint: "holder:7200".into(),
+                session: "reader".into(),
+                offer_id: 1,
+                items: vec![PushItem {
+                    group: 0,
+                    block: 1,
+                    spans: Vec::new(),
+                }],
+            }]
+        };
+        let sample_batch = || vec![("h".into(), read_job("r", "h", 16).spans)];
+
+        // 1. Both READ and Disk push run concurrently on a single worker via scope.
+        let barrier = Arc::new(Barrier::new(2));
+        let reads = Reads::start(
+            Arc::new(BarrierReader {
+                barrier: Some(barrier.clone()),
+                fail: false,
+            }),
+            Arc::new(MockPusher {
+                barrier: Some(barrier),
+                outcome: PushOutcome::Complete,
+            }),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let job = reads
+            .submit_member_observed(
+                sample_batch(),
+                sample_push(),
+                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Complete
+        );
+
+        // 2. Clean push abort yields Aborted even if READ succeeded.
+        let reads = Reads::start(
+            Arc::new(BarrierReader {
+                barrier: None,
+                fail: false,
+            }),
+            Arc::new(MockPusher {
+                barrier: None,
+                outcome: PushOutcome::Aborted("queue full".into()),
+            }),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let job = reads
+            .submit_member_observed(
+                sample_batch(),
+                sample_push(),
+                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Aborted
+        );
+
+        // 3. Unknown push retirement dominates clean READ; Unknown READ dominates
+        //    concurrent clean push (when the READ has already been submitted).
+        for (read_fail, push_outcome) in [
+            (false, PushOutcome::Unknown("write fault".into())),
+            (true, PushOutcome::Aborted("sealed".into())),
+            (true, PushOutcome::Complete),
+        ] {
+            let sync = Some(Arc::new(Barrier::new(2)));
+            let reads = Reads::start(
+                Arc::new(BarrierReader {
+                    barrier: sync.clone(),
+                    fail: read_fail,
+                }),
+                Arc::new(MockPusher {
+                    barrier: sync,
+                    outcome: push_outcome,
+                }),
+                NonZeroUsize::MIN,
+            )
+            .unwrap();
+            let job = reads
+                .submit_member_observed(
+                    sample_batch(),
+                    sample_push(),
+                    Duration::from_secs(1),
+                    Instant::now() + Duration::from_secs(5),
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ReadRetirement::Unknown(_)
+            ));
+        }
+
+        // 4. Pure-Disk landing (empty READ batches) succeeds and propagates outcomes.
+        let reads = Reads::start(
+            Arc::new(Failing),
+            Arc::new(MockPusher {
+                barrier: None,
+                outcome: PushOutcome::Complete,
+            }),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let job = reads
+            .submit_member_observed(
+                Vec::new(),
+                sample_push(),
+                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Complete
+        );
+    }
+
+    #[test]
+    fn disk_push_wait_does_not_block_rdma_read_workers() {
+        type PushFinish = Box<dyn FnOnce(PushOutcome) + Send>;
+        struct DeferredPusher {
+            finish: Mutex<Option<PushFinish>>,
+            started: mpsc::Sender<()>,
+        }
+        impl PagePusher for DeferredPusher {
+            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+                unreachable!()
+            }
+            fn start_push_many(
+                &self,
+                _: Vec<PushTarget>,
+                _: Duration,
+                _: Instant,
+                _: Arc<AtomicBool>,
+                _: Arc<AtomicBool>,
+                finish: Box<dyn FnOnce(PushOutcome) + Send>,
+            ) {
+                *self.finish.lock() = Some(finish);
+                let _ = self.started.send(());
+            }
+        }
+        let arena = Arena::new(64);
+        arena.write(0, &[5; 8]);
+        let (tx, rx) = mpsc::channel();
+        let pusher = Arc::new(DeferredPusher {
+            finish: Mutex::new(None),
+            started: tx,
+        });
+        // Single read worker: if Disk push occupied it, the second RDMA READ would deadlock.
+        let reads =
+            Reads::start(Arc::new(arena.clone()), pusher.clone(), NonZeroUsize::MIN).unwrap();
+        let disk_job = reads
+            .submit_member_observed(
+                Vec::new(),
+                vec![PushTarget {
+                    endpoint: "holder:7200".into(),
+                    session: "reader".into(),
+                    offer_id: 1,
+                    items: vec![PushItem {
+                        group: 0,
+                        block: 1,
+                        spans: Vec::new(),
+                    }],
+                }],
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(disk_job.try_retirement(), Err(mpsc::TryRecvError::Empty));
+
+        let fast_read = reads
+            .submit_member(vec![("h".into(), read_job("r", "h", 24).spans)])
+            .unwrap();
+        assert_eq!(
+            fast_read
+                .result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            ReadRetirement::Complete
+        );
+        assert_eq!(arena.read_bytes(24, 8), vec![5; 8]);
+
+        // Now complete the deferred Disk push.
+        let cb = pusher.finish.lock().take().unwrap();
+        cb(PushOutcome::Complete);
+        assert_eq!(
+            disk_job
+                .result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            ReadRetirement::Complete
+        );
     }
 }

@@ -68,13 +68,15 @@ pub struct Peer {
     driver: Driver,
     versioned: Option<super::coordinated::Control>,
     device_pin_gate: Arc<servicer::DevicePinGate>,
+    pusher: Arc<dyn PagePusher>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
     member: usize,
+    push_timeout: Duration,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     next_sample_us: i64,
-    previous_totals: [u64; 3],
+    previous_totals: [u64; 4],
 }
 
 impl Peer {
@@ -93,6 +95,8 @@ impl Peer {
         if background && replica.len() != 1 {
             return Err(PeerError::Topology);
         }
+        let push_timeout = Duration::from_micros(settings.timeouts.push_us.max(0) as u64);
+        let pusher = transfers.pusher.clone();
         let mut protocol = Protocol::start(
             settings,
             progress,
@@ -137,13 +141,15 @@ impl Peer {
             versioned: None,
             driver,
             device_pin_gate,
+            pusher,
             port,
             fence,
             origin,
             member,
+            push_timeout,
             metrics: None,
             next_sample_us: 0,
-            previous_totals: [0; 3],
+            previous_totals: [0; 4],
         })
     }
 
@@ -198,7 +204,9 @@ impl Peer {
             incarnation,
             channel,
             self.device_pin_gate.clone(),
+            self.pusher.clone(),
             retirement_bound_ms,
+            self.push_timeout,
         );
         if control.reader() {
             self.fence = fence;
@@ -391,6 +399,8 @@ impl Peer {
             ("pinned_blocks", stats.pinned_blocks),
             ("looking_requests", stats.looking_requests),
             ("landing_requests", stats.landing_requests),
+            ("frozen_targets", stats.frozen_targets),
+            ("frozen_blocks", stats.frozen_blocks),
         ] {
             metrics.snapshot(name, n);
         }
@@ -398,10 +408,16 @@ impl Peer {
             stats.landed_tokens,
             stats.failed_landings,
             stats.unused_host_landings,
+            stats.frozen_landings,
         ];
-        for (i, name) in ["landed_tokens", "failed_landings", "unused_host_landings"]
-            .iter()
-            .enumerate()
+        for (i, name) in [
+            "landed_tokens",
+            "failed_landings",
+            "unused_host_landings",
+            "frozen_landings",
+        ]
+        .iter()
+        .enumerate()
         {
             metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
         }

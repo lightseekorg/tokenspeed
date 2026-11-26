@@ -775,12 +775,18 @@ mod ffi {
         looking_requests: usize,
         /// Reader: requests landing.
         landing_requests: usize,
+        /// Reader: landings currently frozen pending DMA retirement.
+        frozen_targets: usize,
+        /// Reader: Device blocks currently held by frozen landings.
+        frozen_blocks: usize,
         /// Reader: tokens landed so far.
         landed_tokens: u64,
         /// Reader: landings whose transfer failed to complete the prefix.
         failed_landings: u64,
         /// Reader: successful Host landings whose request gave up the reservation.
         unused_host_landings: u64,
+        /// Reader: cumulative landings frozen pending DMA retirement.
+        frozen_landings: u64,
     }
 
     /// One cache group's page counts.
@@ -991,6 +997,7 @@ mod ffi {
             scheduler: &Scheduler,
             lookup: &PeerEventView,
             pending_new_leases: usize,
+            include_disk: bool,
         ) -> PeerAnswerView;
         fn peer_pages_match(
             scheduler: &Scheduler,
@@ -1448,7 +1455,18 @@ impl Scheduler {
         lookup: &PeerEventView,
         pending_new_leases: usize,
     ) -> PeerAnswerView {
-        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases)
+        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases, true)
+    }
+
+    /// Like [`Self::answer_peer_lookup_bounded`], but excludes Disk-tier pages
+    /// so holders without Disk push capability still offer their Device/Host
+    /// prefix instead of missing completely.
+    pub fn answer_peer_lookup_without_disk(
+        &self,
+        lookup: &PeerEventView,
+        pending_new_leases: usize,
+    ) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases, false)
     }
 
     /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to

@@ -26,9 +26,9 @@ use ts_scheduler::{PeerPageView, PeerTier};
 
 /// SHA-256 of the canonical representation agreed by the endpoints.
 pub type Digest = [u8; 32];
-// Earlier readers may submit an unbounded time after PIN. Never grant them
-// an offer which the holder can reclaim on a deadline.
-const VERSION: u8 = 2;
+// Wire revision 3 adds Disk-tier source pages pushed through each member's
+// push endpoint while preserving revision 2's bounded submission window.
+const VERSION: u8 = 3;
 pub(super) const SUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
 const MAX_TOKENS: usize = 1 << 20;
@@ -199,6 +199,7 @@ fn pages(r: &mut Reader<'_>) -> Option<Vec<PeerPageView>> {
         let tier = match r.u8()? {
             0 => PeerTier::Device,
             1 => PeerTier::Host,
+            2 => PeerTier::Disk,
             _ => return None,
         };
         let block_id = i32::try_from(r.i64()?).ok()?;
@@ -427,6 +428,12 @@ mod tests {
             tier: PeerTier::Host,
             block_id: 3,
         };
+        let disk_page = PeerPageView {
+            group_id: 0,
+            slot: 1,
+            tier: PeerTier::Disk,
+            block_id: 4,
+        };
         let frames = [
             Message::LayoutReq(1, "r:12".into()),
             Message::LayoutReply(1, key.holder.clone(), [2; 32], [3; 32], vec![0]),
@@ -441,7 +448,10 @@ mod tests {
                     max_tokens: 1,
                 },
             ),
-            Message::Offered(key.clone(), Some((offer.clone(), [4; 32], vec![page]))),
+            Message::Offered(
+                key.clone(),
+                Some((offer.clone(), [4; 32], vec![page, disk_page])),
+            ),
             Message::Pin(key.clone(), offer.clone()),
             Message::Grant(key.clone(), offer, true),
             Message::Release(key.clone(), 6, Disposition::Abort),
@@ -452,7 +462,7 @@ mod tests {
             .zip(&frames)
         {
             let mut bytes = m.encode();
-            assert_eq!(bytes[..2], [tag, 2]);
+            assert_eq!(bytes[..2], [tag, VERSION]);
             assert_eq!(Message::decode(&bytes, m.reply()).as_ref(), Some(m));
             assert!(Message::decode(&bytes, !m.reply()).is_none());
             for end in 0..bytes.len() {
@@ -461,7 +471,7 @@ mod tests {
             bytes.push(0);
             assert!(Message::decode(&bytes, m.reply()).is_none());
             bytes.pop();
-            bytes[1] = 1;
+            bytes[1] = VERSION - 1;
             assert!(Message::decode(&bytes, m.reply()).is_none());
         }
     }
@@ -469,7 +479,7 @@ mod tests {
     fn discovery_bytes_are_stable_and_never_decode_as_a_legacy_request() {
         let query = Message::LayoutReq(1, "a:1".into());
         let golden = [
-            0x10, 2, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, b'a', b':', b'1', 8,
+            0x10, 3, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, b'a', b':', b'1', 8,
         ];
         assert_eq!(query.encode(), golden);
         assert!(super::super::wire::Request::decode(&golden).is_err());

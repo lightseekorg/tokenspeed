@@ -79,13 +79,14 @@ PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens
                   std::span{lookup.tokens}.first(static_cast<std::size_t>(num_tokens)), num_tokens);
 }
 
-// What a holder lists for `prompt`: its Device and Host hit, or, when its
-// Disk tier extends that, the Disk-extended listing, whose Disk pages the
-// holder pushes (docs/rfcs/0006-disk-tier.md).
-PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+// What a holder lists for `prompt`: its Device and Host hit, or, when
+// `include_disk` is set and its Disk tier extends that, the Disk-extended
+// listing, whose Disk pages the holder pushes (docs/rfcs/0006-disk-tier.md).
+PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt,
+                                           bool include_disk = true) {
     PrefixProber::PrefixListing listing =
         coordinator.Prober().ListPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
-    if (coordinator.Disk().HasPool()) {
+    if (include_disk && coordinator.Disk().HasPool()) {
         PrefixProber::PrefixListing with_disk =
             coordinator.Storage().ListWithDisk(prompt, coordinator.Disk().PrefixHits(prompt));
         if (with_disk.num_tokens > listing.num_tokens) return with_disk;
@@ -117,7 +118,8 @@ std::vector<PeerPage> Pages(const PrefixProber::PrefixListing& listing) {
 
 }  // namespace
 
-PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup) {
+PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup,
+                                     bool include_disk) {
     PeerAnswer answer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
     if (!WellFormed(lookup, coordinator.PrefixGranularity())) {
         spdlog::warn("[Peer] lookup {}#{} does not cover its bound; answered as a miss", lookup.lease.reader,
@@ -125,7 +127,7 @@ PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const 
         return answer;
     }
     const PrefixProber::PrefixListing listing =
-        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
+        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens), include_disk);
     answer.num_tokens = listing.num_tokens;
     answer.pages = Pages(listing);
     return answer;

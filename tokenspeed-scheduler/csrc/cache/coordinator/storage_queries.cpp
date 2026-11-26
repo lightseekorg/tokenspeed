@@ -343,7 +343,11 @@ PrefixProber::PrefixListing StorageQueries::ListWithDisk(const PromptPrefix& pro
         }
         missing = true;
     };
-    if (suffix.device.num_common_tokens > 0) {
+    // ProbeHostSuffix overwrites suffix.device whenever a longer Host/Disk
+    // suffix exists; even when split_tokens == 0 (all KV pages live on Disk),
+    // suffix.device.per_group can still hold a Device-resident State checkpoint
+    // or Device tail (while pure-KV groups have empty hits when split == 0).
+    if (!suffix.device.per_group.empty()) {
         forEachStorageDependency(suffix.device, group_keys, /*floor_tokens=*/0,
                                  [&](const CacheKey& key, std::int32_t block) { list(key, block, true); });
     }

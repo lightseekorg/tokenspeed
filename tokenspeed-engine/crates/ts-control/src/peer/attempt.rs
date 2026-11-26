@@ -22,7 +22,8 @@
 use super::{
     geometry::Spans,
     layout::PeerReadPlan,
-    offers::{manifest, prefix, Vote, DONE, READY},
+    offers::{manifest, prefix, Vote, DONE, FREEZE, READY},
+    push::PushTarget,
     read::{MemberRead, ReadRetirement, Reads},
     registered::Replica,
     servicer::empty_event,
@@ -33,8 +34,22 @@ use super::{
 use std::{
     collections::HashMap,
     sync::{mpsc, Arc},
+    time::Duration,
 };
-use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerPageView};
+use ts_scheduler::{
+    PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerPageView, PeerTier,
+};
+
+struct MemberPlan {
+    reads: Vec<(String, Spans)>,
+    pushes: Vec<PushTarget>,
+}
+
+impl MemberPlan {
+    fn is_empty(&self) -> bool {
+        self.reads.is_empty() && self.pushes.is_empty()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -55,11 +70,12 @@ pub(super) struct Attempt {
     pages: Vec<PeerPageView>,
     phase: Phase,
     fetch: Option<PeerFetchView>,
-    batches: Option<Vec<(String, Spans)>>,
+    plan: Option<MemberPlan>,
     job: Option<MemberRead>,
     votes: [Option<u8>; 8],
     fenced: bool,
     voted: bool,
+    freeze_voted: bool,
     published: bool,
     deadline: i64,
     retry: i64,
@@ -89,11 +105,12 @@ impl Attempt {
             pages: Vec::new(),
             phase: Phase::Discovery,
             fetch: None,
-            batches: None,
+            plan: None,
             job: None,
             votes: [None; 8],
             fenced: false,
             voted: false,
+            freeze_voted: false,
             published: false,
             deadline,
             retry: 0,
@@ -179,6 +196,7 @@ impl Attempt {
                 && manifest(pages) == offer.manifest
                 && self.source.as_ref().is_some_and(|s| {
                     super::layout::covers_interval(&s.contract, 0, offer.end, pages)
+                        && (s.can_push_disk() || pages.iter().all(|p| p.tier != PeerTier::Disk))
                 })
             {
                 e.num_tokens = offer.end;
@@ -229,17 +247,33 @@ impl Attempt {
                 .collect::<Option<Vec<_>>>();
             if let Some(pairs) = pairs {
                 let endpoints: Vec<_> = src.members.iter().map(|m| m.endpoint()).collect();
+                let local_member = &local.members[rank];
                 match PeerReadPlan::new(&src.contract, &local.contract, endpoints.len(), 8, rank)
-                    .and_then(|planner| {
-                        planner.reads(&endpoints, &local.members[rank].endpoint(), &pairs)
-                    }) {
-                    Ok(batches) => {
-                        plan = Some(
-                            batches
-                                .into_iter()
-                                .map(|(i, s)| (src.members[i].geometry.session.clone(), s))
-                                .collect::<Vec<_>>(),
-                        );
+                    .and_then(|planner| planner.plan(&endpoints, &local_member.endpoint(), &pairs))
+                {
+                    Ok(planned) => {
+                        let reads = planned
+                            .reads
+                            .into_iter()
+                            .map(|(i, s)| (src.members[i].geometry.session.clone(), s))
+                            .collect::<Vec<_>>();
+                        let pushes = planned
+                            .pushes
+                            .into_iter()
+                            .map(|(i, items)| {
+                                Some(PushTarget {
+                                    endpoint: src.members[i].geometry.push.clone()?,
+                                    session: local_member.geometry.session.clone(),
+                                    offer_id: o.id,
+                                    items,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(pushes) = pushes {
+                            plan = Some(MemberPlan { reads, pushes });
+                        } else {
+                            tracing::warn!("peer reservation push target missing push endpoint");
+                        }
                     }
                     Err(e) => tracing::warn!(%e, "peer reservation cannot be planned"),
                 }
@@ -247,12 +281,12 @@ impl Attempt {
         }
         let value = match &plan {
             None => 0,
-            Some(b) if b.is_empty() => 1,
+            Some(p) if p.is_empty() => 1,
             Some(_) => 2,
         };
         self.phase = Phase::Planning;
         self.fetch = Some(f);
-        self.batches = plan;
+        self.plan = plan;
         self.deadline = now.saturating_add(2_000_000);
         Some(Vote {
             key: k.clone(),
@@ -326,9 +360,17 @@ impl Attempt {
             || self.offer.as_ref()?.id != v.offer
             || !matches!(
                 (self.phase, v.stage),
-                (Phase::Planning, READY) | (Phase::Reading, DONE)
+                (Phase::Planning, READY) | (Phase::Reading, DONE | FREEZE)
             )
         {
+            return None;
+        }
+        if v.stage == FREEZE {
+            // Early business fallback while Disk push cancels retry in the
+            // background: every member seals and freezes in the same round,
+            // while still awaiting final DONE votes for TargetRetired/RELEASE.
+            self.seal();
+            self.freeze(round);
             return None;
         }
         let entry = self.votes.get_mut(member)?;
@@ -412,6 +454,7 @@ impl Attempt {
         &mut self,
         reads: Option<&Reads>,
         meter: Option<(&Arc<ts_metrics::PeerMetrics>, usize)>,
+        push_timeout: Duration,
         now: i64,
         round: &mut PeerRound,
     ) -> (Option<Vote>, Option<Message>) {
@@ -426,10 +469,17 @@ impl Attempt {
             let mut vote = None;
             if !self.voted {
                 if self.fenced && self.job.is_none() && !self.retire_wait {
-                    if let Some(b) = self.batches.take() {
+                    if let Some(p) = self.plan.take() {
                         let metrics = meter.map(|(m, rank)| (m, self.lookup.holder.as_str(), rank));
-                        self.job = reads
-                            .and_then(|w| w.submit_member_observed(b, self.submit_until, metrics));
+                        self.job = reads.and_then(|w| {
+                            w.submit_member_observed(
+                                p.reads,
+                                p.pushes,
+                                push_timeout,
+                                self.submit_until,
+                                metrics,
+                            )
+                        });
                     }
                 }
                 let result = if let Some(j) = &self.job {
@@ -441,15 +491,27 @@ impl Attempt {
                             Some(2)
                         }
                         Err(mpsc::TryRecvError::Disconnected) => Some(2),
-                        _ => None,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if !self.freeze_voted && j.is_cancelling() {
+                                self.freeze_voted = true;
+                                vote = Some(Vote {
+                                    key: self.key.clone().unwrap(),
+                                    offer: self.offer.as_ref().unwrap().id,
+                                    stage: FREEZE,
+                                    value: 1,
+                                });
+                            }
+                            None
+                        }
                     }
-                } else if self.fenced && (self.retire_wait || self.batches.is_none()) {
+                } else if self.fenced && (self.retire_wait || self.plan.is_none()) {
                     Some(0)
                 } else {
                     None
                 };
                 if let Some(value) = result {
                     self.voted = true;
+                    self.job = None;
                     vote = Some(Vote {
                         key: self.key.clone().unwrap(),
                         offer: self.offer.as_ref().unwrap().id,
@@ -636,7 +698,7 @@ mod verification {
         let (mut a, _, _) = granted_candidate();
         let release = a.close(Disposition::Abort, 10);
         assert!(a.take_pending_release(i64::MAX).is_none());
-        a.tick(None, None, 2_000_010, &mut round);
+        a.tick(None, None, Duration::from_secs(1), 2_000_010, &mut round);
         assert!(a.take_pending_release(2_000_009).is_none());
         assert_eq!(a.take_pending_release(2_000_010), Some(release));
         assert!(a.finished());
@@ -649,7 +711,7 @@ mod verification {
             let (mut a, key, offer) = granted_candidate();
             let release = a.close(Disposition::Complete, 1);
             let mut round = PeerRound::default();
-            let (_, retry) = a.tick(None, None, 3_000_001, &mut round);
+            let (_, retry) = a.tick(None, None, Duration::from_secs(1), 3_000_001, &mut round);
             assert_eq!(retry, Some(release));
             assert_eq!(round.events.len(), 1);
             assert_eq!(round.events[0].num_tokens, 0);
@@ -657,5 +719,42 @@ mod verification {
             assert!(a.finished());
             assert!(round.landed.is_empty());
         }
+    }
+
+    #[test]
+    fn early_freeze_vote_unfreezes_and_aborts_once_background_cancel_retires() {
+        let (mut a, key, offer) = granted_candidate();
+        let mut round = PeerRound::default();
+        let freeze_vote = Vote {
+            key: key.clone(),
+            offer: offer.id,
+            stage: FREEZE,
+            value: 1,
+        };
+        assert!(a.vote(0, &freeze_vote, 2, &mut round).is_none());
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::FetchFrozen);
+        assert!(a.frozen);
+
+        round.events.clear();
+        let mut release = None;
+        for rank in 0..8 {
+            let done_vote = Vote {
+                key: key.clone(),
+                offer: offer.id,
+                stage: DONE,
+                value: 0,
+            };
+            if let Some(m) = a.vote(rank, &done_vote, 3, &mut round) {
+                release = Some(m);
+            }
+        }
+        assert!(!a.frozen);
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+        assert_eq!(
+            release,
+            Some(Message::Release(key, offer.id, Disposition::Abort))
+        );
     }
 }

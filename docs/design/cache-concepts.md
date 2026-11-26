@@ -21,24 +21,49 @@ Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
 Unknown retirement freezes the landing. A restarted holder or a conflicting
 close ends the business attempt with zero reused tokens.
 
-Wire revision 2 bounds the start of each member's last native read. Its local
-30-second monotonic submission window starts before the member votes READY.
-Workers check the same deadline at each batch, including after queue and
-destination-fence waits. The holder starts its own 30-second interval at
+Wire revision 3 extends cross-layout peer reads to holder Disk-tier pages while
+preserving revision 2's bounded submission window. When every member of a holder
+replica serves Disk pushes, its versioned descriptor (format version 2) advertises
+per-group exclusive Disk virtual block bounds alongside each member's push
+endpoint. A holder that cannot push Disk truncates lookups to its Device/Host
+prefix instead of returning a full miss; a holder that can push Disk answers
+lookups with any mix of Device, Host, and Disk pages, pinning every listed block
+across all tiers under its offer ticket. Each reader member plans one-sided
+READs for Device/Host pages and holder-pushed spans (tagged with the offer id)
+for Disk pages through `PeerReadPlan::plan`, running both concurrently without
+occupying local read-worker threads while waiting on Disk pushes. When a Disk
+push is cancelled and the holder does not confirm within a short grace window,
+the reader coordinates an early `FetchFrozen` fallback while retrying `Cancel`
+in the background on its push dispatcher; a late `Cancelled`/`Done` reply cleanly
+unfreezes the landing via `TargetRetired` and sends `RELEASE(Abort)`, whereas an
+RDMA write error or push worker panic reports `Unknown` retirement and leaves
+both endpoints frozen (`frozen_targets`, `frozen_blocks`, and `frozen_landings`
+metrics expose frozen landings). Closing or expiring an offer on the holder also
+cancels in-flight pushes and fences late pushes tagged with that offer id. Every
+reader's local 30-second monotonic submission window starts before it votes
+READY; workers check the same deadline at each READ batch and clamp Disk push
+budgets to the remaining window. The holder starts its own 30-second interval at
 GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
-Mixed wire revisions fall back to local prefill.
+Wire revision 3 and descriptor version 2 are incompatible with revision 2 /
+version 1; during a rolling upgrade, mixed-version pairs fall back to local
+prefill until both sides match.
 
 A deployment with a guaranteed upper bound on the time from the reader's
 final submission check through the last possible source-memory access can
 set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
 scheduling pauses after the check, native queues, reconnects, retries, DMA
-drain after process failure, and timer drift/margin. All ranks follow their
-holder leader's configured value. After the submission interval plus this
-bound, the holder initiates an ABORT and releases its own source references
-even if the reader disappeared. This never releases a reader's frozen target.
-If the backend has no verified bound, leave the setting unset: a granted
-source remains pinned pending explicit closure. A timeout for polling one
-Mooncake batch alone does not establish the bound. No heartbeats extend it.
+drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
+are enabled—push message delivery latency, holder push queue wait, and NVMe/RDMA
+execution time (because a holder anchors each push's deadline at message
+arrival). Deployments enabling Disk-tier v1 peer sharing must configure this
+bound so source pins are reclaimed if a reader disappears or freezes. All ranks
+follow their holder leader's configured value. After the submission interval plus
+this bound, the holder initiates an ABORT, cancels any pushes tagged with the
+offer, and releases its own source references even if the reader disappeared.
+This never releases a reader's frozen target. If the backend has no verified
+bound, leave the setting unset: a granted source remains pinned pending explicit
+closure. A timeout for polling one Mooncake batch alone does not establish the
+bound. No heartbeats extend it.
 
 After all reader members have retired their reads, a missing RELEASE reply
 can still force the request to recompute. Once its closing deadline passes,

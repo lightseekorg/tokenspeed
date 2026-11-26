@@ -1068,5 +1068,75 @@ TEST(DiskTierTest, HybridStateDiskOnlyResidencyAndHotDescendantVisibility) {
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
 }
 
+TEST(DiskTierTest, HybridPeerListAndPinKeepsDeviceStateWhenKvIsOnDisk) {
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 77);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+    // Evict every group from Host so the KV prefix lives exclusively on Disk.
+    cache.EvictFromHost(keys);
+    // Re-publish only the State checkpoint on Device at the same boundary:
+    // ListWithDisk has split_tokens == 0 (KV pages live on Disk) while the
+    // State checkpoint resides on Device.
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    // Drop Device KV blocks (group 0) while retaining the Device State block (group 1).
+    for (const auto& h : prompt.hashes) {
+        const CacheKey key{.group_id = 0, .content_hash = ContentHash{h}};
+        const auto location = cache.coordinator.Store().LocationOf(cache.device, 0, key);
+        ASSERT_TRUE(location);
+        ASSERT_TRUE(cache.coordinator.Evictor().EvictCachedBlockAlone(
+            0, *location, &CacheEvictor::DeviceEvictionStats::admission, /*write_back_segment=*/nullptr));
+    }
+
+    const cache::PeerLookup lookup{.lease = {.reader = "tp8-reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.tokens.size()));
+    ASSERT_EQ(answer.pages.size(), 3u);
+    auto find_page = [&](std::uint32_t group, std::int32_t slot) {
+        const auto it = std::ranges::find_if(answer.pages,
+                                             [&](const PeerPage& p) { return p.group_id == group && p.slot == slot; });
+        EXPECT_NE(it, answer.pages.end());
+        return it != answer.pages.end() ? *it : PeerPage{};
+    };
+    EXPECT_EQ(find_page(0u, 0).tier, CacheTier::kDisk);
+    EXPECT_EQ(find_page(0u, 1).tier, CacheTier::kDisk);
+    EXPECT_EQ(find_page(1u, kPeerStateSlot).tier, CacheTier::kDevice);
+
+    PeerConfig peer_cfg{.name = "holder",
+                        .incarnation = 1,
+                        .max_leases = 4,
+                        .soft_pin_us = 1000,
+                        .hard_pin_us = 10000,
+                        .lookup_timeout_us = 1000,
+                        .min_fetch_tokens = kGrain,
+                        .landing_tier = PeerLandingTier::kDevice,
+                        .max_host_landing_blocks = 0,
+                        .host_ready_timeout_us = 0,
+                        .versioned_shards = true};
+    PeerExports exports{peer_cfg};
+    exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
+    exports.Pin(cache.coordinator,
+                cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/0, nullptr);
+    EXPECT_TRUE(exports.Held(answer.lease));
+    EXPECT_EQ(exports.NumPinnedBlocks(), 3u);
+    EXPECT_FALSE(cache.coordinator.ClearCache()) << "Disk + Device pins hold blocks";
+
+    exports.Release(cache.coordinator, cache::PeerRelease{.lease = answer.lease}, /*now_us=*/0);
+    EXPECT_EQ(exports.NumPinnedBlocks(), 0u);
+    EXPECT_EQ(exports.NumLeases(), 0u);
+    EXPECT_TRUE(cache.coordinator.ClearCache());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

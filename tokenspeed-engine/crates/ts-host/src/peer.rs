@@ -259,11 +259,28 @@ pub fn start(
     let capabilities = mesh
         .all_gather(replica, &capability)
         .map_err(|e| e.to_string())?;
+    let disk_bounds = match &push_source {
+        Some((_, disk_layout, _, _)) => disk_layout
+            .groups
+            .iter()
+            .map(|group| {
+                let count = disk_layout
+                    .num_lcm_blocks
+                    .checked_mul(group.packing)?
+                    .checked_mul(group.shard_count)?
+                    .checked_add(1)?;
+                i64::try_from(count).ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("Disk virtual block bound overflow")?,
+        None => Vec::new(),
+    };
     let registered =
         if !capability.is_empty() && capabilities.iter().all(|other| other == &capability) {
             let member = Member {
                 geometry: local.clone(),
                 bounds: settings.host_bounds,
+                disk_bounds,
                 regions: settings
                     .regions
                     .iter()

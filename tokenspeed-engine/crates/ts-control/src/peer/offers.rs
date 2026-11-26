@@ -41,6 +41,7 @@ pub(super) const PINNED: u8 = 1;
 pub(super) const CLOSED: u8 = 2;
 pub(super) const READY: u8 = 3;
 pub(super) const DONE: u8 = 4;
+pub(super) const FREEZE: u8 = 5;
 
 pub(super) fn manifest(pages: &[PeerPageView]) -> Digest {
     let mut sorted = pages.to_vec();
@@ -183,16 +184,31 @@ impl Offers {
         };
         let mut event = p.lookup_event(&lease);
         // Soft offers reserve no source pages. PIN rechecks capacity and the exact manifest.
-        let answer = scheduler.answer_peer_lookup_bounded(&event, 0);
+        // If this holder cannot serve Disk pushes (no staging ring / disk bounds),
+        // truncate cleanly to its Device/Host prefix instead of returning a full miss.
+        let can_push_disk = layout.can_push_disk();
+        let answer = if can_push_disk {
+            scheduler.answer_peer_lookup_bounded(&event, 0)
+        } else {
+            scheduler.answer_peer_lookup_without_disk(&event, 0)
+        };
         let end = answer.num_tokens;
         if end <= 0
             || end > p.max_tokens
             || end as usize > p.tokens.len()
             || answer.pages.is_empty()
-            || answer
-                .pages
-                .iter()
-                .any(|p| !matches!(p.tier, PeerTier::Device | PeerTier::Host))
+            || answer.pages.iter().any(|page| match page.tier {
+                PeerTier::Device | PeerTier::Host => false,
+                PeerTier::Disk => {
+                    !can_push_disk
+                        || layout
+                            .members
+                            .first()
+                            .and_then(|m| m.disk_bounds.get(page.group_id as usize))
+                            .is_none_or(|&bound| !(1..bound).contains(&i64::from(page.block_id)))
+                }
+                _ => true,
+            })
         {
             return miss();
         }
