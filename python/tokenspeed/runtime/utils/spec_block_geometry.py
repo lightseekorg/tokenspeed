@@ -49,20 +49,20 @@ __all__ = [
 ]
 
 #: Speculative algorithms whose widths come from a checkpoint block size.
-BLOCK_SPEC_ALGORITHMS = ("DFLASH", "DSPARK")
+BLOCK_SPEC_ALGORITHMS = ("DFLASH", "DSPARK", "DFLY")
 
 BLOCK_SPEC_RULES = (
     "DSpark checkpoints store block_size (dspark_block_size) == "
-    "--speculative-num-steps; DFlash/DFlash2 checkpoints store block_size == "
-    "--speculative-num-steps + 1. --speculative-num-draft-tokens is "
-    "--speculative-num-steps + 1 for both."
+    "--speculative-num-steps; DFlash/DFlash2/DFly2 checkpoints store block_size "
+    "(or dfly_block_size) == --speculative-num-steps + 1. "
+    "--speculative-num-draft-tokens is --speculative-num-steps + 1 for all."
 )
 
-_BLOCK_SIZE_KEYS = ("dspark_block_size", "block_size")
-_NESTED_CONFIG_KEYS = ("dflash_config", "dspark_config")
+_BLOCK_SIZE_KEYS = ("dspark_block_size", "dfly_block_size", "block_size")
+_NESTED_CONFIG_KEYS = ("dflash_config", "dspark_config", "dfly_config")
 #: Rows the checkpoint's block_size counts beyond the drafted tokens.
-_STEP_OFFSET = {"DSPARK": 0, "DFLASH": 1}
-_SAMPLE_FROM_ANCHOR = {"DSPARK": True, "DFLASH": False}
+_STEP_OFFSET = {"DSPARK": 0, "DFLASH": 1, "DFLY": 1}
+_SAMPLE_FROM_ANCHOR = {"DSPARK": True, "DFLASH": False, "DFLY": False}
 
 
 def resolve_block_sample_from_anchor(algorithm: str, *configs: Any) -> bool:

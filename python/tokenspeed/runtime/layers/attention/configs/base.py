@@ -63,21 +63,24 @@ def resolve_speculative_num_tokens(
 
 def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     """A draft that proposes a whole block in one forward and writes its KV at
-    the target's cache locations (DFLASH / DSPARK)."""
-    return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
+    the target's cache locations (DFLASH / DSPARK / DFLY)."""
+    return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK", "DFLY"))
 
 
 def block_draft_is_causal(hf_config) -> bool:
     """Whether a block draft's queries attend causally within their block.
 
-    Only an explicit declaration makes a block causal: ``is_causal``, else
-    ``dflash_config.causal`` (Kimi-K3.1's DSpark draft). A draft declaring
-    neither (Kimi-K3 DSpark) attends the whole block; ``sliding_attention``
-    layers only bound how far back a query reads.
+    Only an explicit declaration makes a block causal: ``is_causal`` or
+    ``attn_causal`` (Hy4-flash DFly2), else ``dflash_config.causal`` (Kimi-K3.1's
+    DSpark draft). A draft declaring neither (Kimi-K3 DSpark) attends the whole
+    block; ``sliding_attention`` layers only bound how far back a query reads.
     """
     is_causal = getattr(hf_config, "is_causal", None)
     if is_causal is not None:
         return bool(is_causal)
+    attn_causal = getattr(hf_config, "attn_causal", None)
+    if attn_causal is not None:
+        return bool(attn_causal)
     dflash_config = getattr(hf_config, "dflash_config", None) or {}
     return bool(dflash_config.get("causal", False))
 

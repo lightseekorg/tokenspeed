@@ -40,10 +40,15 @@ from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
 # Architectures whose HF configs follow the Qwen-VL M-RoPE layout
 # (vision_config.spatial_merge_size, image/video/vision_start token ids, etc.).
 _MROPE_ARCHITECTURES = {
+    "HYV4FlashForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
+}
+
+_HY4_FLASH_ARCHITECTURES = {
+    "HYV4FlashForConditionalGeneration",
 }
 
 _QWEN3_OMNI_ARCHITECTURES = {
@@ -246,6 +251,9 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
 
     if any(arch in _QWEN3_OMNI_ARCHITECTURES for arch in architectures):
         return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
+
+    if any(arch in _HY4_FLASH_ARCHITECTURES for arch in architectures):
+        return _compute_hy4_flash_mrope_positions(hf_config, input_ids, mm_items)
 
     model_type = getattr(hf_config, "model_type", None)
     if model_type in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"):
@@ -479,3 +487,149 @@ def _cat_grids_or_single(grids):
     if len(grids) == 1:
         return grids[0]
     return torch.cat(grids, dim=0)
+
+
+def _hy4_flash_vision_position_ids(
+    start_position: int,
+    grid_t: int,
+    grid_h: int,
+    grid_w: int,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Build 3D M-RoPE positions for one Hy4-flash image or video span.
+
+    Every merged row carries one trailing newline token (``W + 1`` columns) and
+    each frame shifts all three axes by ``frame_idx * max(H, W + 1)``.
+    """
+    if grid_h % spatial_merge_size != 0 or grid_w % spatial_merge_size != 0:
+        raise ValueError(
+            "HYV4Flash vision grid height/width must be divisible by "
+            f"spatial_merge_size={spatial_merge_size}, got {(grid_t, grid_h, grid_w)}"
+        )
+    llm_grid_t = int(grid_t)
+    llm_grid_h = int(grid_h) // spatial_merge_size
+    llm_grid_w = int(grid_w) // spatial_merge_size
+    frame_stride = max(llm_grid_h, llm_grid_w + 1)
+    position_temporal = torch.arange(llm_grid_t, dtype=torch.long) * frame_stride
+    position_height = torch.arange(llm_grid_h, dtype=torch.long)
+    position_width = torch.arange(llm_grid_w + 1, dtype=torch.long)
+    t_grid, h_grid, w_grid = torch.meshgrid(
+        position_temporal, position_height, position_width, indexing="ij"
+    )
+    vision_position_ids = torch.stack(
+        [t_grid, h_grid + t_grid, w_grid + t_grid], dim=0
+    ).reshape(3, -1)
+    return vision_position_ids + start_position
+
+
+def _compute_hy4_flash_mrope_positions(
+    hf_config,
+    input_ids,
+    mm_items,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Hy4-flash 3D M-RoPE positions matching HYV4FlashModel.get_rope_index."""
+    seq_len = len(input_ids)
+    spatial_merge_size = int(hf_config.vision_config.spatial_merge_size)
+    image_token_id = int(hf_config.image_token_id)
+    video_token_id = int(hf_config.video_token_id)
+
+    # First try explicit placeholder offsets supplied on multimodal items.
+    segments: list[tuple[int, int, tuple[int, int, int]]] = []
+    use_offsets = bool(mm_items)
+    image_grids_fallback: list[torch.Tensor] = []
+    video_grids_fallback: list[torch.Tensor] = []
+
+    for item in mm_items or ():
+        model_specific = getattr(item, "model_specific_data", None) or {}
+        if "image_grid_thw" in model_specific:
+            grids = _as_grid_rows(model_specific["image_grid_thw"], "image_grid_thw")
+            image_grids_fallback.append(grids)
+        elif "video_grid_thw" in model_specific:
+            grids = _as_grid_rows(model_specific["video_grid_thw"], "video_grid_thw")
+            video_grids_fallback.append(grids)
+        else:
+            continue
+
+        offsets = getattr(item, "offsets", None)
+        if not offsets or len(offsets) != len(grids):
+            use_offsets = False
+            continue
+        for (start, end), row in zip(offsets, grids.tolist(), strict=True):
+            start_i, end_i = int(start), int(end)
+            if start_i < 0 or end_i < start_i or end_i >= seq_len:
+                raise ValueError(
+                    f"Invalid HYV4Flash media offset [{start_i}, {end_i}] for "
+                    f"input length {seq_len}"
+                )
+            segments.append((start_i, end_i, (int(row[0]), int(row[1]), int(row[2]))))
+
+    if not use_offsets:
+        segments = []
+        image_iter = iter(
+            torch.cat(image_grids_fallback, dim=0).tolist()
+            if image_grids_fallback
+            else ()
+        )
+        video_iter = iter(
+            torch.cat(video_grids_fallback, dim=0).tolist()
+            if video_grids_fallback
+            else ()
+        )
+        idx = 0
+        while idx < seq_len:
+            token = int(input_ids[idx])
+            if token == image_token_id or token == video_token_id:
+                start_i = idx
+                while idx < seq_len and int(input_ids[idx]) == token:
+                    idx += 1
+                end_i = idx - 1
+                grid_iter = image_iter if token == image_token_id else video_iter
+                try:
+                    t, h, w = next(grid_iter)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "HYV4Flash input_ids contain more vision placeholder spans "
+                        "than grid_thw entries"
+                    ) from exc
+                segments.append((start_i, end_i, (int(t), int(h), int(w))))
+            else:
+                idx += 1
+
+    segments.sort(key=lambda seg: seg[0])
+
+    positions = torch.empty((3, seq_len), dtype=torch.long)
+    cursor = 0
+    current_pos = 0
+    for start_i, end_i, (grid_t, grid_h, grid_w) in segments:
+        if start_i < cursor:
+            raise ValueError("HYV4Flash vision placeholder spans overlap")
+        if start_i > cursor:
+            text_len = start_i - cursor
+            text_pos = torch.arange(
+                current_pos, current_pos + text_len, dtype=torch.long
+            )
+            positions[:, cursor:start_i] = text_pos.unsqueeze(0).expand(3, -1)
+            current_pos += text_len
+
+        vision_pos = _hy4_flash_vision_position_ids(
+            current_pos, grid_t, grid_h, grid_w, spatial_merge_size
+        )
+        span_len = end_i - start_i + 1
+        if vision_pos.shape[1] != span_len:
+            raise ValueError(
+                f"HYV4Flash vision span length {span_len} disagrees with merged "
+                f"grid {(grid_t, grid_h, grid_w)} (expected {vision_pos.shape[1]})"
+            )
+        positions[:, start_i : end_i + 1] = vision_pos
+        current_pos = int(vision_pos.max().item()) + 1
+        cursor = end_i + 1
+
+    if cursor < seq_len:
+        text_len = seq_len - cursor
+        text_pos = torch.arange(current_pos, current_pos + text_len, dtype=torch.long)
+        positions[:, cursor:seq_len] = text_pos.unsqueeze(0).expand(3, -1)
+        current_pos += text_len
+
+    max_pos = int(positions.max().item()) if seq_len > 0 else -1
+    delta = torch.tensor([[max_pos + 1 - seq_len]], dtype=torch.long)
+    return positions, delta

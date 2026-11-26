@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     trtllm_sparse_mla_query_heads,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
+from tokenspeed_kernel.ops.attention.sink import apply_attention_sink
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
@@ -1952,13 +1953,20 @@ class DSABackend(PagedAttentionBackend):
                 "preserve the capped-score semantics before enabling this model."
             )
 
-    def _validate_dense_context(self, seq_lens: torch.Tensor, bs: int) -> None:
-        if seq_lens is None or bs <= 0:
-            return
-        active_seq_lens = seq_lens[:bs]
-        if active_seq_lens.numel() == 0:
-            return
-        max_seq_len = int(active_seq_lens.max().item())
+    def _validate_dense_context(
+        self,
+        seq_lens: torch.Tensor,
+        bs: int,
+        *,
+        max_seq_len: int | None = None,
+    ) -> None:
+        if max_seq_len is None:
+            if seq_lens is None or bs <= 0:
+                return
+            active_seq_lens = seq_lens[:bs]
+            if active_seq_lens.numel() == 0:
+                return
+            max_seq_len = int(active_seq_lens.max().item())
         if max_seq_len > self.index_topk:
             raise NotImplementedError(
                 "TokenSpeed DSA dense attention is exact only when every "
@@ -2004,6 +2012,8 @@ class DSABackend(PagedAttentionBackend):
         batch_size,
         causal,
         out: torch.Tensor | None = None,
+        window_left: int = -1,
+        query_start_offsets: torch.Tensor | None = None,
     ):
         self._validate_logit_cap(logits_soft_cap)
         if self.query_shard_metadata is not None:
@@ -2011,7 +2021,11 @@ class DSABackend(PagedAttentionBackend):
                 "a sharded DSA extend attends through forward_sparse_prefill; the "
                 "dense delegate sees whole-span metadata for shard rows"
             )
-        self._validate_dense_context(seq_lens, batch_size)
+        self._validate_dense_context(
+            seq_lens,
+            batch_size,
+            max_seq_len=int(max_kv_len) if max_kv_len is not None else None,
+        )
         return self._dense_backend.forward_extend_chunked(
             q,
             k,
@@ -2026,6 +2040,8 @@ class DSABackend(PagedAttentionBackend):
             batch_size=batch_size,
             causal=causal,
             out=out,
+            window_left=window_left,
+            query_start_offsets=query_start_offsets,
         )
 
     def forward_decode(
@@ -2042,6 +2058,7 @@ class DSABackend(PagedAttentionBackend):
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
         value_projection: ValueProjection | None = None,
+        sinks: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -2056,6 +2073,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_owned=topk_owned,
                 gathered_query=gathered_query,
                 value_projection=value_projection,
+                sinks=sinks,
             )
         if topk_owned or gathered_query is not None or value_projection is not None:
             raise ValueError(
@@ -2068,6 +2086,8 @@ class DSABackend(PagedAttentionBackend):
         if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
             self._validate_dense_context(metadata.seq_lens_k[num_extends:], bs)
+        if sinks is not None:
+            kwargs["sinks"] = sinks
         return self._dense_backend.forward_decode(
             q=q,
             k=k,
@@ -2089,6 +2109,7 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         max_seq_len: int,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend to preselected KV slots and merge DCP partials.
 
@@ -2135,6 +2156,7 @@ class DSABackend(PagedAttentionBackend):
             )
         if (
             self._row_shard_prefill
+            and sinks is None
             and heads == self.num_local_heads
             and q.shape[0] >= _ROW_SHARD_MIN_ROWS
         ):
@@ -2181,6 +2203,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_slots=topk_slots,
                 topk_lens=topk_lens,
                 max_seq_len=max_seq_len,
+                sinks=sinks,
             )
             if self.step_counter is not None:
                 self.step_counter.record_cache()
@@ -2215,6 +2238,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_slots=topk_slots,
                 topk_lens=topk_lens,
                 max_seq_len=max_seq_len,
+                sinks=sinks,
             )
             if self.step_counter is not None:
                 self.step_counter.record_cache()
@@ -2245,6 +2269,7 @@ class DSABackend(PagedAttentionBackend):
                     kv_cache=kv_cache,
                     topk_slots=topk_slots,
                     topk_lens=topk_lens,
+                    sinks=sinks,
                 )
                 if self.step_counter is not None:
                     self.step_counter.record_cache()
@@ -2261,6 +2286,7 @@ class DSABackend(PagedAttentionBackend):
                 live_heads = gathered_heads
             elif not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
+        want_lse = use_dcp or sinks is not None
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -2280,7 +2306,7 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=1.0,
-            return_lse=use_dcp,
+            return_lse=want_lse,
             solution=self.kernel_solution,
             kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
@@ -2295,9 +2321,12 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=sinks,
                 keep_all_heads=keep_all_heads,
             )
+        elif sinks is not None:
+            out, lse = out
+            apply_attention_sink(out, lse, sinks, inplace=True)
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
         # normal PD readiness hook. Publish the layer only after the dependent
@@ -2318,6 +2347,7 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         max_seq_len: int,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per request group, gather the latent history pages and attend the
         group's rows against them with the query's heads."""
@@ -2325,7 +2355,14 @@ class DSABackend(PagedAttentionBackend):
         if len(groups) == 1 and groups[0].query == slice(0, q_view.shape[0]):
             kv = self.gather_history_kv_pages(layer, token_to_kv_pool, groups[0])
             return self._prefill_rows(
-                layer, q_view, kv, topk_slots, topk_lens, kv_seq_lens, max_seq_len
+                layer,
+                q_view,
+                kv,
+                topk_slots,
+                topk_lens,
+                kv_seq_lens,
+                max_seq_len,
+                sinks=sinks,
             )
         out = self._prefill_output(q_view, layer)
         for group in groups:
@@ -2339,6 +2376,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_lens[rows],
                 None if kv_seq_lens is None else kv_seq_lens[rows],
                 max_seq_len,
+                sinks=sinks,
             )
         return out
 
@@ -2368,12 +2406,14 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor,
         kv_seq_lens: torch.Tensor | None,
         max_seq_len: int,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``dsa_prefill`` of rows against a gathered buffer ``kv``."""
         # This call mirrors the unsharded arm's: every kernel facade option
         # the unsharded call passes (the slot-order selection included) must
         # be passed here too.
-        return dsa_prefill(
+        result = dsa_prefill(
             q=q,
             kv_cache=kv,
             sparse_kv_cache=None,
@@ -2388,11 +2428,15 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=1.0,
-            return_lse=False,
+            return_lse=sinks is not None,
             solution=self.kernel_solution,
             kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
         )
+        if sinks is not None:
+            out, lse = result
+            return apply_attention_sink(out, lse, sinks, inplace=True)
+        return result
 
     def _forward_row_shard_sparse_prefill(
         self,
@@ -2476,6 +2520,7 @@ class DSABackend(PagedAttentionBackend):
         kv_cache: torch.Tensor,
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The head-sharded KVP arm with the qlayout lever: the same core and
         exchange as ``dsa_prefill`` plus ``combine_attention_partials``, bit
@@ -2505,7 +2550,7 @@ class DSABackend(PagedAttentionBackend):
             head_dim=self.kv_lora_rank,
             partial_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
-            sink=None,
+            sink=sinks,
         )
 
     def _forward_sharded_sparse_prefill(
@@ -2518,6 +2563,7 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         max_seq_len: int,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The gathered-buffer arm: per request group, gather the history and
         attend this rank's rows of the group against it."""
@@ -2554,6 +2600,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_lens[rows],
                 None if kv_seq_lens is None else kv_seq_lens[rows],
                 max_seq_len,
+                sinks=sinks,
             )
         return out
 
@@ -2588,6 +2635,7 @@ class DSABackend(PagedAttentionBackend):
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
         value_projection: ValueProjection | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sparse decode over ``topk_indices``: the whole selection as
         scheduler slots, or with ``topk_owned`` (a sharded cache only) this
@@ -2715,6 +2763,7 @@ class DSABackend(PagedAttentionBackend):
         topk_slots = topk_indices.view(num_tokens, -1)
         if (
             value_projection is not None
+            and sinks is None
             and not use_dcp
             and self.projects_decode_values(
                 layer,
@@ -2773,6 +2822,7 @@ class DSABackend(PagedAttentionBackend):
                     topk_lens=topk_lens,
                     q_len_per_req=q_len_per_req,
                     gathered_query=gathered_query,
+                    sinks=sinks,
                 )
                 return _projected(
                     out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
@@ -2785,6 +2835,7 @@ class DSABackend(PagedAttentionBackend):
                 )
             elif not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
+        want_lse = use_dcp or sinks is not None
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -2801,7 +2852,7 @@ class DSABackend(PagedAttentionBackend):
             kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=1.0,
-            return_lse=use_dcp,
+            return_lse=want_lse,
             solution=self._kvp_decode_solution if use_dcp else self.kernel_solution,
             kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
@@ -2809,6 +2860,10 @@ class DSABackend(PagedAttentionBackend):
         if use_dcp:
             local_output, local_lse = out
             if value_projection is not None and not keep_all_heads:
+                if sinks is not None:
+                    raise NotImplementedError(
+                        "DSA DCP projected-value decode does not support attention sinks"
+                    )
                 return combine_project_attention_partials(
                     local_output,
                     local_lse,
@@ -2821,11 +2876,14 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=sinks,
                 keep_all_heads=keep_all_heads,
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
+        elif sinks is not None:
+            out, lse = out
+            apply_attention_sink(out, lse, sinks, inplace=True)
         return _projected(
             out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
         )
@@ -2840,6 +2898,7 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor,
         q_len_per_req: int,
         gathered_query: torch.Tensor | None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The head-sharded KVP decode as :meth:`_forward_dcp_records_prefill`
         runs the prefill, bit for bit as ``dsa_decode`` plus
@@ -2887,7 +2946,7 @@ class DSABackend(PagedAttentionBackend):
             head_dim=self.kv_lora_rank,
             partial_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
-            sink=None,
+            sink=sinks,
         )
 
 

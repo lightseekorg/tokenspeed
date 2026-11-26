@@ -29,6 +29,10 @@ from typing import TYPE_CHECKING
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
+from tokenspeed.runtime.configs.hy4_flash_config import (
+    HYV4FlashConfig,
+    HYV4FlashTextConfig,
+)
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     is_qwen4_exp,
@@ -48,6 +52,9 @@ from tokenspeed.runtime.layers.attention.configs.dots3_note import (
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_kvp_history_prefill,
+)
+from tokenspeed.runtime.layers.attention.configs.hy4_flash import (
+    Hy4FlashAttentionConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
@@ -343,6 +350,7 @@ _INKLING_ARCHITECTURES = {
 }
 
 _DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
+_DFLY_DRAFT_ARCHITECTURES = frozenset({"HYV4FlashForCausalLMDFly"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,6 +377,7 @@ class _AttnSideProfile:
     is_qsa: bool
     is_inkling: bool
     is_dspark: bool
+    is_dfly: bool
     # The model's own profile, when it declares one; the facts above are then
     # all False and the profile answers for the model.
     model_profile: ModelProfile | None
@@ -400,6 +409,7 @@ def _resolve_attn_side(
 ) -> _AttnSideProfile:
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None) or []
+    is_dfly = any(a in _DFLY_DRAFT_ARCHITECTURES for a in architectures)
     if model_config.model_profile is not None:
         return _AttnSideProfile(
             architectures=tuple(architectures),
@@ -413,6 +423,7 @@ def _resolve_attn_side(
             is_qsa=False,
             is_inkling=False,
             is_dspark=False,
+            is_dfly=is_dfly,
             model_profile=model_config.model_profile,
         )
     text_config = getattr(hf_config, "text_config", hf_config)
@@ -436,6 +447,7 @@ def _resolve_attn_side(
         is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
         is_dspark=is_dspark,
+        is_dfly=is_dfly,
         model_profile=None,
     )
 
@@ -567,6 +579,8 @@ def _resolve_cache_family(
         return profile.model_profile.cache_family
     if config.component(Dots3NoteAttentionConfig) is not None:
         return "dots3_note"
+    if config.component(Hy4FlashAttentionConfig) is not None:
+        return "hy4_flash"
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     # PLE and QSA are cache consumers even in a view without GDN layers.
@@ -659,6 +673,14 @@ def create_paged_router(
         if backend_name not in (None, "dsa"):
             raise ValueError("dots3-note requires the DSA/SWA paged router")
         return create_dots3_note_router(config)
+    if isinstance(spec, Hy4FlashAttentionConfig):
+        from tokenspeed.runtime.layers.attention.backends.hy4_flash import (
+            create_hy4_flash_router,
+        )
+
+        if backend_name not in (None, "dsa"):
+            raise ValueError("Hy4-flash requires the DSA/SWA paged router")
+        return create_hy4_flash_router(config)
     name = backend_name if backend_name is not None else spec.backend_name
     if name == "hybrid_linear_attn":
         # The composite sentinel _apply_backend_overrides writes into
@@ -795,6 +817,8 @@ def _create_attn_config(
     else:
         if isinstance(model_config.hf_config, Dots3NoteConfig):
             config_cls = Dots3NoteAttentionConfig
+        elif isinstance(model_config.hf_config, (HYV4FlashConfig, HYV4FlashTextConfig)):
+            config_cls = Hy4FlashAttentionConfig
         elif is_deepseek_v41_config(model_config.hf_config):
             config_cls = DeepseekV41Config
         else:
@@ -1445,7 +1469,7 @@ def create_attn_components(
         softmax_attn = resolved_softmax
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
-        if draft is not None and not draft.is_dspark
+        if draft is not None and not draft.is_dspark and not draft.is_dfly
         else None
     )
     draft_softmax_attn = (

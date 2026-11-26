@@ -37,6 +37,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.dots3_note import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     Glm53FlashRecipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.hy4_flash import (
+    Hy4FlashRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
     InklingRecipe,
 )
@@ -175,6 +178,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
     "glm53_flash": Glm53FlashRecipe,
+    "hy4_flash": Hy4FlashRecipe,
     "deepseek_v41": DeepseekV41Recipe,
     "dots3_note": Dots3NoteRecipe,
 }

@@ -165,6 +165,43 @@ def _dsa_pool(
     )
 
 
+def _hy4_flash_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_hy4_flash import (
+        HybridHy4FlashTokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.hy4_flash import (
+        Hy4FlashPoolOptions,
+    )
+
+    options = spec.pool_options
+    if not isinstance(options, Hy4FlashPoolOptions):
+        raise TypeError("Hy4-flash cache spec is missing Hy4FlashPoolOptions")
+    softmax_attn = _softmax_config(config, spec.family, DSAConfig)
+    if options.index_head_dim != softmax_attn.index_head_dim:
+        raise ValueError("Hy4-flash cache spec and attention config disagree")
+    return HybridHy4FlashTokenToKVPool(
+        arena=arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        pool_options=options,
+        layer_types=spec.layer_types,
+        field_layer_offset=field_layer_offset,
+    )
+
+
 def _dots3_note_pool(
     spec: CachePoolSpec,
     config: AttnConfig,
@@ -328,6 +365,7 @@ _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "kimi_k3": _hybrid_kda_pool,
     "dsa": _dsa_pool,
     "dots3_note": _dots3_note_pool,
+    "hy4_flash": _hy4_flash_pool,
     "msa": _msa_pool,
     "glm53_flash": _glm53_flash_pool,
     "deepseek_v41": _deepseek_v41_pool,

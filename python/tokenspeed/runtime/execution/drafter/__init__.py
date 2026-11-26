@@ -49,7 +49,7 @@ __all__ = [
 
 #: Algorithms the in-tree resolution below serves.
 _IN_TREE_ALGORITHMS = frozenset(
-    {"EAGLE3", "EAGLE4", "MTP", "DFLASH", "DSPARK", "DUMMY"}
+    {"EAGLE3", "EAGLE4", "MTP", "DFLASH", "DSPARK", "DFLY", "DUMMY"}
 )
 
 
@@ -162,7 +162,7 @@ def validate_drafter_algorithm(name: str | None) -> None:
     known = registered_drafter_algorithms()
     if name not in known:
         raise ValueError(
-            f"unknown --speculative-algorithm {name!r}; available: " f"{sorted(known)}"
+            f"unknown --speculative-algorithm {name!r}; available: {sorted(known)}"
         )
 
 
@@ -240,6 +240,7 @@ def get_drafter_impl(
     # Imports are local: drafter modules pull in kernel ops and model code,
     # and this package init must stay importable from lightweight contexts.
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.execution.drafter.dfly import DFly
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
     from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
@@ -254,6 +255,7 @@ def get_drafter_impl(
         "MTP": Eagle,
         "DFLASH": DFlash,
         "DSPARK": DSpark,
+        "DFLY": DFly,
         "DUMMY": DummyDrafter,
     }
 

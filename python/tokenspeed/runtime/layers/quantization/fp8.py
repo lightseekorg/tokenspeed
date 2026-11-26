@@ -142,6 +142,23 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> list[str]:
         return []
 
+    def apply_checkpoint_name_replacements(
+        self, replacements: tuple[tuple[str, str], ...]
+    ) -> None:
+        def _rewrite(names: list[str]) -> list[str]:
+            rewritten: list[str] = []
+            for entry in names:
+                updated = entry
+                for old, new in replacements:
+                    updated = updated.replace(old, new)
+                rewritten.append(updated)
+            return rewritten
+
+        if self.ignored_layers:
+            self.ignored_layers = _rewrite(self.ignored_layers)
+        if self.exclude_modules:
+            self.exclude_modules = _rewrite(self.exclude_modules)
+
 
 class Mxfp8Config(Fp8Config):
     """Config class for MXFP8."""

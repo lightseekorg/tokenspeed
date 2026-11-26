@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.mla import (
     supports_mla_decode_query_blocks,
     supports_mla_decode_query_rows,
 )
+from tokenspeed_kernel.ops.attention.sink import apply_attention_sink
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     kvp_decode_visible_lengths,
 )
@@ -757,6 +758,7 @@ class MLAAttnBackend(MLAMetadataBackend):
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        sinks = kwargs.get("sinks")
         noncausal_block_size = (
             self.spec_num_tokens
             if self.block_decode_active and not self.draft_block_causal
@@ -769,9 +771,16 @@ class MLAAttnBackend(MLAMetadataBackend):
                     "MLA DCP decode supports neither sliding windows nor logit caps"
                 )
             return self._forward_dcp_decode(
-                q, layer, token_to_kv_pool, bs, q_len_per_req, num_extends
+                q,
+                layer,
+                token_to_kv_pool,
+                bs,
+                q_len_per_req,
+                num_extends,
+                sinks=sinks,
             )
 
+        want_lse = sinks is not None
         query_rows = False
         if self.block_decode_active:
             if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
@@ -791,7 +800,7 @@ class MLAAttnBackend(MLAMetadataBackend):
                 and layer.logit_cap == 0.0
                 and kwargs.get("value_weight") is None
                 and self.decode_kernel_plan is None
-                and self._takes_query_rows(q.dtype, q_len_per_req, return_lse=False)
+                and self._takes_query_rows(q.dtype, q_len_per_req, return_lse=want_lse)
             ):
                 # Every row of a request shares its KV reads, each row stopping
                 # at the length its entry was backed off to.
@@ -861,6 +870,10 @@ class MLAAttnBackend(MLAMetadataBackend):
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
+        if sinks is not None and value_weight is not None:
+            raise NotImplementedError(
+                "MLA projected-value decode does not support attention sinks"
+            )
         if query_rows:
             result = mla_decode_query_rows(
                 query,
@@ -870,6 +883,7 @@ class MLAAttnBackend(MLAMetadataBackend):
                 max_seqlen_k,
                 softmax_scale,
                 kv_lora_rank=self.kv_lora_rank,
+                return_lse=want_lse,
                 solution=self.kernel_solution,
             )
         elif value_weight is not None:
@@ -903,12 +917,22 @@ class MLAAttnBackend(MLAMetadataBackend):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 softmax_scale=softmax_scale,
                 logit_cap=layer.logit_cap,
+                return_lse=want_lse,
                 solution=self.kernel_solution,
                 plan=self.decode_kernel_plan,
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,
             )
-        output = self._unwrap_output(result)
+        if sinks is not None:
+            output, lse = result
+            apply_attention_sink(
+                output.reshape(-1, layer.tp_q_head_num, output.shape[-1]),
+                lse.reshape(-1, layer.tp_q_head_num),
+                sinks,
+                inplace=True,
+            )
+        else:
+            output = self._unwrap_output(result)
         if value_weight is not None:
             return output.reshape(-1, value_weight.shape[0] * value_weight.shape[2])
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -921,6 +945,8 @@ class MLAAttnBackend(MLAMetadataBackend):
         bs: int,
         q_len_per_req: int,
         num_extends: int,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend this rank's owned pages with every KVP rank's query heads,
         then merge the partials back onto the TP-local heads.
@@ -1010,7 +1036,7 @@ class MLAAttnBackend(MLAMetadataBackend):
             local_lse,
             group=self.kvp_group,
             rank=self.kvp_rank,
-            sink=None,
+            sink=sinks,
             keep_all_heads=False,
             lend_records=True,
         )
@@ -1029,7 +1055,14 @@ class MLAAttnBackend(MLAMetadataBackend):
     ) -> torch.Tensor:
         metadata = self.forward_prefill_metadata
         assert metadata is not None
+        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        sinks = kwargs.get("sinks")
+        want_lse = sinks is not None
         if metadata.use_absorbed_cached_extend:
+            if window_left >= 0:
+                raise NotImplementedError(
+                    "Absorbed MLA cached extend does not support sliding windows"
+                )
             assert metadata.page_table is not None
             assert metadata.cum_seq_lens_kv is not None
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1052,10 +1085,15 @@ class MLAAttnBackend(MLAMetadataBackend):
                 softmax_scale=layer.scaling,
                 is_causal=True,
                 logit_cap=layer.logit_cap,
+                return_lse=want_lse,
                 solution=self.kernel_solution,
                 plan=self.extend_kernel_plan,
             )
-            output = self._unwrap_output(result)
+            if sinks is not None:
+                output, lse = result
+                apply_attention_sink(output, lse, sinks, inplace=True)
+            else:
+                output = self._unwrap_output(result)
             return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         if metadata.max_extend_prefix_len > 0:
@@ -1079,9 +1117,15 @@ class MLAAttnBackend(MLAMetadataBackend):
             seq_lens_kv=metadata.extend_seq_lens,
             is_causal=True,
             logit_cap=layer.logit_cap,
+            return_lse=want_lse,
             solution=self.kernel_solution,
+            window_left=window_left,
         )
-        output = self._unwrap_output(result)
+        if sinks is not None:
+            output, lse = result
+            apply_attention_sink(output, lse, sinks, inplace=True)
+        else:
+            output = self._unwrap_output(result)
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend_chunked(
@@ -1100,6 +1144,8 @@ class MLAAttnBackend(MLAMetadataBackend):
         batch_size,
         causal,
         out: torch.Tensor | None = None,
+        window_left: int = -1,
+        query_start_offsets: torch.Tensor | None = None,
     ):
         if causal:
             step_counter = self.step_counter
@@ -1130,6 +1176,8 @@ class MLAAttnBackend(MLAMetadataBackend):
             return_lse=True,
             out=out,
             solution=self.kernel_solution,
+            window_left=window_left,
+            query_start_offsets=query_start_offsets,
         )
 
         if isinstance(result, tuple):
