@@ -216,6 +216,58 @@ struct Engine {
 struct Pending {
     engine: usize,
     tx: mpsc::UnboundedSender<StreamItem>,
+    usage: RequestUsage,
+}
+
+#[derive(Default)]
+struct RequestUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    spec_verify_ct: Option<i64>,
+    accept_draft_tokens: Option<f64>,
+}
+
+impl From<&OutputChunk> for RequestUsage {
+    fn from(chunk: &OutputChunk) -> Self {
+        Self {
+            prompt_tokens: chunk.prompt_tokens,
+            completion_tokens: chunk.completion_tokens,
+            cached_tokens: chunk.cached_tokens,
+            reasoning_tokens: chunk.reasoning_tokens,
+            spec_verify_ct: chunk.spec_verify_ct,
+            accept_draft_tokens: chunk.accept_draft_tokens,
+        }
+    }
+}
+
+impl RequestUsage {
+    fn abort_chunk(self) -> OutputChunk {
+        OutputChunk {
+            output_ids: Vec::new(),
+            finish_reason: Some("abort".to_owned()),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            output_token_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
+            finish_details: None,
+            spec_verify_ct: self.spec_verify_ct,
+            accept_draft_tokens: self.accept_draft_tokens,
+            input_token_logprobs: None,
+            input_top_logprobs: None,
+            output_top_logprobs: None,
+            request_timing: None,
+        }
+    }
+}
+
+enum AbortOutcome {
+    NotInFlight,
+    AlreadyDetached,
+    Detached(Pending),
 }
 
 /// A control operation awaiting every engine's reply.
@@ -351,6 +403,19 @@ impl Shared {
         Some(pending)
     }
 
+    async fn abort_and_detach(&self, rid: &str) -> Result<AbortOutcome> {
+        let (engine, tx) = match lock(&self.requests).get(rid) {
+            Some(pending) => (pending.engine, pending.tx.clone()),
+            None => return Ok(AbortOutcome::NotInFlight),
+        };
+        let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
+        self.send(engine, frames).await?;
+        Ok(match self.forget(rid, &tx) {
+            Some(pending) => AbortOutcome::Detached(pending),
+            None => AbortOutcome::AlreadyDetached,
+        })
+    }
+
     fn dispatch(&self, batch: BatchTokenIDOutSlim) {
         let slot = batch
             .engine_index
@@ -388,7 +453,7 @@ impl Shared {
         let mut discarded = Vec::new();
         let mut requests = lock(&self.requests);
         for (rid, chunk) in rows.by_ref() {
-            let Some(pending) = requests.get(&rid) else {
+            let Some(pending) = requests.get_mut(&rid) else {
                 // Cancelled while its output was in flight.
                 debug!(rid, "output for a request that is not in flight");
                 discarded.push(Ok(chunk));
@@ -397,6 +462,7 @@ impl Shared {
             // A closed receiver means the stream is being dropped; its drop
             // forgets the request.
             let finished = chunk.finish_reason.is_some();
+            pending.usage = RequestUsage::from(&chunk);
             if let Err(error) = pending.tx.send(Ok(chunk)) {
                 discarded.push(error.0);
             }
@@ -583,6 +649,10 @@ impl EngineClient {
             rx,
             done: false,
         };
+        let usage = RequestUsage {
+            prompt_tokens: request.input_ids.as_ref().map_or(0, Vec::len) as i64,
+            ..RequestUsage::default()
+        };
         {
             // Register before sending: outputs can arrive before `send`
             // returns.
@@ -593,7 +663,7 @@ impl EngineClient {
             if requests.contains_key(&rid) {
                 return Err(Error::DuplicateRequestId(rid));
             }
-            requests.insert(rid.clone(), Pending { engine, tx });
+            requests.insert(rid.clone(), Pending { engine, tx, usage });
             self.shared.engines[engine]
                 .in_flight
                 .fetch_add(1, Ordering::Relaxed);
@@ -656,17 +726,22 @@ impl EngineClient {
         self.shared.send(engine, frames).await
     }
 
-    /// Ask the engine to abort a request, leaving its local stream attached.
-    /// The engine may retire it without a terminal output. Returns `false`
-    /// if it is not in flight; `true` means only that the abort was sent.
-    /// Use [`Self::cancel`] to end the local stream as well.
+    /// Send the wire abort and end the local stream with an `"abort"` chunk
+    /// after any queued outputs. The chunk carries the latest reported usage,
+    /// or the submitted prompt length before the first output.
+    ///
+    /// Returns `true` if the abort was sent and `false` if no request was in
+    /// flight. A concurrent terminal result takes precedence if it arrives
+    /// before local detachment. A failed or interrupted send leaves any still
+    /// active stream attached for retry. Use a fresh id for each submission.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
-        let engine = match lock(&self.shared.requests).get(rid) {
-            Some(pending) => pending.engine,
-            None => return Ok(false),
-        };
-        let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
-        self.shared.send(engine, frames).await?;
+        match self.shared.abort_and_detach(rid).await? {
+            AbortOutcome::NotInFlight => return Ok(false),
+            AbortOutcome::AlreadyDetached => {}
+            AbortOutcome::Detached(pending) => {
+                let _ = pending.tx.send(Ok(pending.usage.abort_chunk()));
+            }
+        }
         Ok(true)
     }
 
@@ -687,13 +762,7 @@ impl EngineClient {
     /// [`Error::SendTimeout`] when sending exceeds the configured deadline.
     /// The stream remains attached for retry unless it ended independently.
     pub async fn cancel(&self, rid: &str) -> Result<bool> {
-        let (engine, tx) = match lock(&self.shared.requests).get(rid) {
-            Some(pending) => (pending.engine, pending.tx.clone()),
-            None => return Ok(false),
-        };
-        let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
-        self.shared.send(engine, frames).await?;
-        let Some(pending) = self.shared.forget(rid, &tx) else {
+        let AbortOutcome::Detached(pending) = self.shared.abort_and_detach(rid).await? else {
             return Ok(false);
         };
         let _ = pending.tx.send(Err(StreamError::Cancelled));

@@ -37,18 +37,13 @@ ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 
 ## Wire conformance
 
-The native frontend offers two distinct request operations. `abort(rid)`
-only sends the engine's abort and does not guarantee a terminal output.
-`cancel(rid)` also closes that client's output stream after a successful send:
-Rust receives `StreamError::Cancelled`; Python's `next_outputs()` receives
-`(rid, RequestCancelled)`, an `EngineError` subclass, after already queued
-chunks.
-
-A finish is preserved when it wins the race. A failed or interrupted cancel
-send leaves ownership attached for retry unless the stream ended independently.
-
-Cancellation changes no engine retirement fence or engine-reported load; use
-fresh request ids for subsequent submissions. See the
+The native frontend's `abort(rid)` sends the engine's abort and ends the
+local stream with a terminal chunk whose `finish_reason` is `"abort"`.
+`cancel(rid)` delivers `StreamError::Cancelled` in Rust and
+`(rid, RequestCancelled)` in Python's `next_outputs()`. Both deliver the
+terminal result after queued chunks and preserve a concurrent result that
+closed the stream first. Use fresh request ids for subsequent submissions.
+See the
 [request lifecycle contract](../docs/design/event-loop.md#request-identity-and-submission-failures).
 
 `tokenspeed-client` 0.2 makes `StreamError` non-exhaustive and adds `Cancelled`.
