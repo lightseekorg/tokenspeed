@@ -581,7 +581,7 @@ def test_prefill_slices_are_bit_identical(
     [(64, False, 4), (64, False, 0), (4, True, 4), (4, True, 0)],
     ids=["prefill-rank2", "prefill-rank0", "decode-rank2", "decode-rank0"],
 )
-def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes(
+def test_fp16_weight_moe_ep_filters_nonlocal_routes(
     num_tokens: int, decode: bool, expert_start: int
 ) -> None:
     """The aligner maps global EP routes to contiguous local weights.
