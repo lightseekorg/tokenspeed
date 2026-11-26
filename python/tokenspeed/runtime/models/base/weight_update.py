@@ -106,12 +106,9 @@ def weight_update_session(
                     )
                 model._weight_update_required_names = set(names)
                 model._weight_update_source_names = set()
-                redundant = model.weight_discard_redundant_checkpoint_names()
-                if names & redundant:
-                    raise ValueError(
-                        "Required checkpoint sources cannot also be aliases"
-                    )
-                model._weight_update_redundant_names = redundant
+                model.allow_redundant_checkpoint_names(
+                    model.weight_discard_redundant_checkpoint_names()
+                )
         yield
         # Target and draft can share storage. No model may derive from a
         # partially received version merely because it is first in this list.

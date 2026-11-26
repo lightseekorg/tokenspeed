@@ -552,6 +552,8 @@ class ModelRunner:
                 "--model-update-config (target runner only)"
             )
         device_module = torch.get_device_module(self.device)
+        managed_npu = self.device == "npu" and self.server_args.enable_memory_saver
+        preserve_update_error = False
         try:
             with weight_update_session(
                 models,
@@ -560,25 +562,29 @@ class ModelRunner:
                     "gloo", self.mapping.world_group
                 ),
             ):
-                try:
-                    result = self.model_update.update(
-                        models, version, snapshot=snapshot
-                    )
-                finally:
-                    if self.device == "npu" and self.server_args.enable_memory_saver:
-                        # Include queued NPU copy errors in the session's rank
-                        # agreement before any model derives post-load state.
-                        device_module.synchronize(self.gpu_id)
+                result = self.model_update.update(models, version, snapshot=snapshot)
+                if managed_npu:
+                    # Agree queued copy errors before deriving state on any rank.
+                    device_module.synchronize(self.gpu_id)
             device_module.synchronize(self.gpu_id)
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
+            preserve_update_error = managed_npu
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
         finally:
-            if self.device == "npu" and self.server_args.enable_memory_saver:
-                # A post-load hook can queue work even when it then fails.
-                device_module.synchronize(self.gpu_id)
-            device_module.empty_cache()
+            if preserve_update_error:
+                # A failed SDK call or post-load hook can leave work in flight.
+                try:
+                    device_module.synchronize(self.gpu_id)
+                except Exception:
+                    logger.exception("NPU synchronization after a failed weight update")
+            try:
+                device_module.empty_cache()
+            except Exception:
+                if not preserve_update_error:
+                    raise
+                logger.exception("NPU cache cleanup after a failed weight update")
 
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
@@ -621,6 +627,7 @@ class ModelRunner:
             )
             coordinated_restore = require_complete
             with ExitStack() as session:
+                ignored_disk_names: frozenset[str] = frozenset()
                 if coordinated_restore:
                     # A local preparation or copy error must reach peers before
                     # any rank enters a post-load collective.
@@ -634,6 +641,10 @@ class ModelRunner:
                             [self.model], require_complete=True, cpu_group=cpu_group
                         )
                     )
+                    ignored_disk_names = (
+                        self.model.weight_discard_ignored_disk_checkpoint_names()
+                    )
+                    self.model.allow_redundant_checkpoint_names(ignored_disk_names)
                 transformed = post_load_transformed_modules(self.model)
                 if transformed:
                     more = len(transformed) - 3
@@ -680,7 +691,9 @@ class ModelRunner:
                         "implemented for NPU"
                     )
 
-                shapes, problem = self._check_disk_reload(loader, model_path)
+                shapes, problem = self._check_disk_reload(
+                    loader, model_path, ignored_disk_names
+                )
                 if problem is not None:
                     if coordinated_restore:
                         raise ValueError(f"{problem}; nothing was written")
@@ -754,7 +767,7 @@ class ModelRunner:
         )
 
     def _check_disk_reload(
-        self, loader, model_path: str
+        self, loader, model_path: str, ignored_disk_names: frozenset[str]
     ) -> tuple[dict[str, tuple[int, ...]] | None, str | None]:
         """Check a safetensors checkpoint's headers before any tensor is loaded.
 
@@ -813,6 +826,7 @@ class ModelRunner:
             (name, shape, held[name])
             for name, shape in shapes.items()
             if name in held
+            and name not in ignored_disk_names
             and shape != held[name]
             and not (torch.Size(shape).numel() == 1 == torch.Size(held[name]).numel())
         ]

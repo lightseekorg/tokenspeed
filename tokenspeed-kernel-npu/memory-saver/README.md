@@ -10,7 +10,11 @@ are owned by the design document.
 ## Build and ABI
 
 Load the deployment's CANN toolkit environment. Build with CMake 3.18+ and a
-C++17 compiler against its `acl_rt`. The adapter requires saver ABI 3;
+C++17 compiler against its `acl_rt`. The adapter requires saver ABI 4;
+ABI 4 requires fail-closed HCCL registration handling. ABI 3 libraries, including
+older builds with the same filename, are rejected before allocator callbacks
+or HCCL operations. Rebuild the library and update any existing path override
+when upgrading the Python adapter.
 Ascend serving also needs a matching runtime/`ts-host` with protocol 3.
 
 ```bash

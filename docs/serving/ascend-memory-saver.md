@@ -71,7 +71,7 @@ export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
 Follow the [native build and host ABI instructions](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-kernel-npu/memory-saver/README.md#build-and-abi)
-before launch. Ascend requires saver ABI 3, protocol 3 and matching host/runtime modules;
+before launch. Ascend requires saver ABI 4, protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
 automatic, including with Memory Saver disabled.
 
@@ -148,6 +148,8 @@ Ascend updates require `flush_cache=true`, clearing L1/L2 and deleting the old
 L3 namespace before parameter writes. Publish immutable checkpoints of the same
 architecture at paths visible to every worker. Discard requires a complete
 checkpoint and a model loading contract that can verify complete replacement.
+For Qwen3, the disk loader ignores stored rotary frequencies and a head on a
+rank that does not own it. Every required local tensor must still arrive once.
 File selection and loading follow the existing checkpoint loader; Memory Saver
 does not introduce another format allowlist. The existing InstantTensor reader
 requires CUDA/NCCL and is unavailable on NPU. Do not modify files during reload.

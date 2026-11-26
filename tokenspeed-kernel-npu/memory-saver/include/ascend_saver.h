@@ -18,7 +18,9 @@
 extern "C" {
 #endif
 
-/* ABI v3. Bind the worker's NPU device before calling any mutating API.
+/* ABI v4 requires fail-closed HCCL registration handling.
+ * ABI v3 cannot identify this safety contract; rebuild old native libraries.
+ * Bind the worker's NPU device before calling any mutating API.
  * The caller must stop new launches/allocations and wait for all prior users
  * before pause/resume. Final free synchronizes the current device before
  * unmapping; the owner must still prevent new uses of the released storage.

@@ -21,7 +21,7 @@ enum class Tag { Weights, KV, Graph };
 enum class Policy { Backup, Discard };
 enum class Phase { Active, Pausing, Paused, Resuming, Releasing };
 constexpr uint64_t kHugePageReservation = 1;
-constexpr int kSaverAbiVersion = 3;
+constexpr int kSaverAbiVersion = 4;
 thread_local char last_error[2048] = {};
 
 const char *tag_name(Tag t) {
@@ -560,7 +560,7 @@ const char *saver_stats(void) {
     result = b.stats();
     return result.c_str();
   } catch (...) {
-    return "{\"abi_version\":3,\"stats_error\":\"cannot build statistics\"}";
+    return "{\"abi_version\":4,\"stats_error\":\"cannot build statistics\"}";
   }
 }
 } // extern C

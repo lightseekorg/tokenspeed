@@ -23,6 +23,8 @@
 import builtins
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -105,7 +107,7 @@ class CpuNativeLibrary:
         self.fault = False
         self.fail_pause = False
         self.blocks = []
-        self.saver_abi_version = CpuFunction(lambda: 3)
+        self.saver_abi_version = CpuFunction(lambda: 4)
         self.saver_has_callback_fault = CpuFunction(lambda: int(self.fault))
         self.saver_last_error = CpuFunction(lambda: b"injected native pause failure")
         self.saver_stats = CpuFunction(
@@ -838,3 +840,71 @@ def test_local_hccl_lifetime(monkeypatch, device_name, reuse):
             return
         assert saver.group is group
     assert saver.group is None
+
+
+@pytest.fixture(scope="module")
+def native_compiler():
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("native compatibility tests require a C++17 compiler")
+    return compiler
+
+
+@pytest.fixture(scope="module")
+def current_native_library(tmp_path_factory, native_compiler):
+    build = tmp_path_factory.mktemp("current-native")
+    library = build / "libascend_memory_saver.so"
+    native = Path(__file__).resolve().parents[2] / "tokenspeed-kernel-npu/memory-saver"
+    subprocess.run(
+        [
+            native_compiler,
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-pthread",
+            "-DSAVER_FAKE_ACL=1",
+            f"-I{native / 'include'}",
+            f"-I{native / 'tests'}",
+            str(native / "src/ascend_saver.cpp"),
+            str(native / "tests/fake_acl.cpp"),
+            "-o",
+            str(library),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return library
+
+
+def test_current_native_library_is_accepted(monkeypatch, current_native_library):
+    _, _, saver = saver_modules(monkeypatch)
+    backend = saver.NativeBackend(str(current_native_library))
+    backend.check_health()
+    assert backend.stats()["abi_version"] == 4
+    assert backend.stats()["segments"] == 0
+
+
+@pytest.mark.parametrize("version", [2, 3, 5, None])
+def test_override_rejects_incompatible_native_library(
+    monkeypatch, tmp_path, native_compiler, version
+):
+    _, _, saver = saver_modules(monkeypatch)
+    # Keep the production filename: a path/name check cannot detect a stale build.
+    library = tmp_path / "libascend_memory_saver.so"
+    source = tmp_path / "legacy.cpp"
+    definition = (
+        f'extern "C" int saver_abi_version() {{ return {version}; }}'
+        if version is not None
+        else 'extern "C" int legacy_library() { return 0; }'
+    )
+    source.write_text(definition)
+    subprocess.run(
+        [native_compiler, "-shared", "-fPIC", str(source), "-o", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setenv("TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY", str(library))
+    with pytest.raises(RuntimeError, match="requires native ABI 4"):
+        saver.NativeBackend(saver._library_path())

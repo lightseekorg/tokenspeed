@@ -74,12 +74,23 @@ class NativeBackend:
         self.library = ctypes.CDLL(library)
         self._trimmed_tags: set[str] = set()
         self._hccl_library: ctypes.CDLL | None = None
-        self.library.saver_abi_version.argtypes = []
-        self.library.saver_abi_version.restype = ctypes.c_int
+        try:
+            abi_version = self.library.saver_abi_version
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"Ascend memory saver requires native ABI 4; rebuild {library!r}"
+            ) from exc
+        abi_version.argtypes = []
+        abi_version.restype = ctypes.c_int
+        version = abi_version()
+        if version != 4:
+            raise RuntimeError(
+                "Ascend memory saver requires native ABI 4 with fail-closed HCCL "
+                f"registration; loaded ABI {version} from {library!r}. "
+                "Rebuild the native library from the same revision as the Python code"
+            )
         self.library.saver_has_callback_fault.argtypes = []
         self.library.saver_has_callback_fault.restype = ctypes.c_int
-        if self.library.saver_abi_version() != 3:
-            raise RuntimeError("Rebuild the Ascend memory saver library for ABI 3")
         for name in ("saver_pause", "saver_resume"):
             operation = getattr(self.library, name)
             operation.argtypes = [ctypes.c_char_p]

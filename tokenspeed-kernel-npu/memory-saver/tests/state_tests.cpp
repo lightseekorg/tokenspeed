@@ -146,7 +146,7 @@ void policy_roundtrips() {
            Policy{"acl_graph", graph_backup_malloc, true},
            Policy{"acl_graph", graph_discard_malloc, false}}) {
     reset();
-    REQUIRE(saver_abi_version() == 3);
+    REQUIRE(saver_abi_version() == 4);
     constexpr size_t n = 7000;
     void *ptr = policy.allocate(n, 0, nullptr); REQUIRE(ptr);
     REQUIRE(stat_has("\"aligned_bytes\":8192"));

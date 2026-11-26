@@ -377,6 +377,30 @@ def test_runner_turns_an_sdk_error_into_a_failed_result(sdk, monkeypatch):
     torch.cuda.empty_cache.assert_called_once_with()
 
 
+@pytest.mark.parametrize("sdk_fails", [False, True])
+def test_ascend_saver_preserves_first_mooncake_error(sdk, monkeypatch, sdk_fails):
+    runner = _runner(_model_update_args(enable_memory_saver=True))
+    runner.device = "npu"
+    backend = mock.Mock()
+    if sdk_fails:
+        sdk.fail_with = RuntimeError("SDK submission failed")
+        expected = "SDK submission failed"
+    else:
+        expected = "copy completion failed"
+    backend.synchronize.side_effect = (
+        [RuntimeError("cleanup sync failed")]
+        if sdk_fails
+        else [RuntimeError(expected), RuntimeError("cleanup sync failed")]
+    )
+    backend.empty_cache.side_effect = RuntimeError("cache cleanup failed")
+    monkeypatch.setattr(torch, "get_device_module", lambda _: backend)
+
+    assert runner.update_weights_from_mooncake(
+        4, [mock.MagicMock()], require_complete=False
+    ) == (False, expected)
+    backend.empty_cache.assert_called_once_with()
+
+
 def test_gpu_sdk_cleanup_failure_still_propagates(sdk, monkeypatch):
     runner = _runner(_model_update_args())
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
