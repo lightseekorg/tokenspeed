@@ -24,24 +24,69 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
 import torch
-from flashinfer.attention.prims_ts.mla_decode import BatchSparseMLADecodePagedTSWrapper
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.workspace import retain_for_capture
+
+if TYPE_CHECKING:
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchSparseMLADecodePagedTSWrapper,
+    )
+
+
+def _make_wrapper() -> BatchSparseMLADecodePagedTSWrapper:
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchSparseMLADecodePagedTSWrapper,
+    )
+
+    return BatchSparseMLADecodePagedTSWrapper()
 
 
 @dataclass
 class _SparsePlan:
-    wrapper: BatchSparseMLADecodePagedTSWrapper
+    wrapper: Any
     offsets: dict[int, torch.Tensor] = field(default_factory=dict)
     full_lengths: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
-# Scratch is per stream; captured plans live with their graphs, eager ones in an LRU.
+# Scratch is per stream; captured plans live with their graphs, warmed plans
+# live outside the eager LRU so serving traffic cannot evict a warmed bucket.
 _plans: OrderedDict[tuple, _SparsePlan] = OrderedDict()
+_warmed_plans: dict[tuple, _SparsePlan] = {}
 _captured_plans: WeakValueDictionary[tuple, _SparsePlan] = WeakValueDictionary()
+# Highest power-of-two capacity warmed per static launch configuration, so
+# repeated model layers do not re-run the warmup ladder.
+_warmed_buckets: dict[tuple, int] = {}
 _MAX_EAGER_PLANS = 64
+
+
+def _next_power_of_two(n: int) -> int:
+    return 1 << (max(1, n) - 1).bit_length()
+
+
+def _plan_key(
+    device_index: int | None,
+    cuda_stream: int,
+    dtype: torch.dtype,
+    heads: int,
+    topk: int,
+    batch_capacity: int,
+    query_width: int,
+    return_lse: bool,
+) -> tuple:
+    return (
+        device_index,
+        cuda_stream,
+        dtype,
+        heads,
+        topk,
+        batch_capacity,
+        query_width,
+        return_lse,
+    )
 
 
 def _get_plan(
@@ -54,12 +99,12 @@ def _get_plan(
 ) -> _SparsePlan:
     rows, heads, _ = q.shape
     if mode == "decode":
-        batch_capacity = 1 << (max(1, rows // query_width) - 1).bit_length()
+        batch_capacity = _next_power_of_two(max(1, rows // query_width))
     else:
         batch_capacity = 1
-        query_width = 1 << (max(1, rows) - 1).bit_length()
+        query_width = _next_power_of_two(rows)
     stream = torch.cuda.current_stream(q.device)
-    key = (
+    key = _plan_key(
         q.device.index,
         stream.cuda_stream,
         q.dtype,
@@ -70,13 +115,16 @@ def _get_plan(
         return_lse,
     )
     capturing = torch.cuda.is_current_stream_capturing()
+    warming = is_warming_up() and not capturing
     plan = _captured_plans.get(key)
+    if plan is None:
+        plan = _warmed_plans.get(key)
     if plan is None:
         plan = _plans.get(key)
     if plan is None:
         if capturing:
             raise RuntimeError("warm up Prims-TS DSA on the capture stream first")
-        wrapper = BatchSparseMLADecodePagedTSWrapper()
+        wrapper = _make_wrapper()
         wrapper.plan(
             q.device,
             batch_capacity,
@@ -95,9 +143,15 @@ def _get_plan(
             assume_valid_prefix=False,
         )
         plan = _SparsePlan(wrapper)
-        _plans[key] = plan
-        if len(_plans) > _MAX_EAGER_PLANS:
-            _plans.popitem(last=False)
+        if warming:
+            _warmed_plans[key] = plan
+        else:
+            _plans[key] = plan
+            if len(_plans) > _MAX_EAGER_PLANS:
+                _plans.popitem(last=False)
+    elif warming and key not in _warmed_plans and key not in _captured_plans:
+        _warmed_plans[key] = plan
+        _plans.pop(key, None)
     elif key in _plans:
         _plans.move_to_end(key)
     if rows not in plan.offsets:
@@ -115,7 +169,119 @@ def _get_plan(
         retain_for_capture(plan)
         _captured_plans[key] = plan
         _plans.pop(key, None)
+        _warmed_plans.pop(key, None)
     return plan
+
+
+def _run_plan(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    *,
+    mode: str,
+    query_width: int,
+    softmax_scale: float,
+    return_lse: bool,
+    output_3d: torch.Tensor,
+    lse: torch.Tensor | None,
+) -> None:
+    rows = q.shape[0]
+    plan = _get_plan(
+        q,
+        topk=topk_slots.shape[1],
+        mode=mode,
+        query_width=query_width,
+        return_lse=return_lse,
+    )
+    lengths = plan.full_lengths[rows] if topk_lens is None else topk_lens
+    plan.wrapper.run(
+        q,
+        kv_cache,
+        topk_slots,
+        lengths,
+        qo_indptr=plan.offsets[rows],
+        softmax_scale=softmax_scale,
+        output_scale=1.0,
+        kv_cache_scale=1.0,
+        out=output_3d,
+        lse=lse,
+        validate=False,
+    )
+
+
+def _warm_smaller_buckets(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    *,
+    mode: str,
+    query_width: int,
+    softmax_scale: float,
+    return_lse: bool,
+    output_3d: torch.Tensor,
+    lse: torch.Tensor | None,
+) -> tuple[tuple, int]:
+    """Plan and run every power-of-two bucket below this launch's bucket.
+
+    FlashInfer's Prims-TS wrapper selects and JIT-compiles different CuTe DSL
+    kernels across power-of-two ``max_q_len`` (prefill) and ``batch_capacity``
+    (decode) buckets. Startup warmup runs one launch at the peak token count,
+    so every strictly smaller bucket ``bucket < max_bucket`` satisfies
+    ``sub_rows < rows`` and reuses contiguous prefix slices of the caller's
+    buffers with no extra scratch allocations.
+    """
+    rows, heads, _ = q.shape
+    topk = topk_slots.shape[1]
+    stream = torch.cuda.current_stream(q.device)
+    if mode == "decode":
+        max_bucket = _next_power_of_two(max(1, rows // query_width))
+        fixed_width = query_width
+    else:
+        max_bucket = _next_power_of_two(rows)
+        fixed_width = 0
+    warm_key = (
+        q.device.index,
+        stream.cuda_stream,
+        mode,
+        q.dtype,
+        heads,
+        topk,
+        fixed_width,
+        return_lse,
+    )
+    prev = _warmed_buckets.get(warm_key, 0)
+    bucket = 1
+    while bucket < max_bucket:
+        batch_cap = bucket if mode == "decode" else 1
+        q_width = query_width if mode == "decode" else bucket
+        key = _plan_key(
+            q.device.index,
+            stream.cuda_stream,
+            q.dtype,
+            heads,
+            topk,
+            batch_cap,
+            q_width,
+            return_lse,
+        )
+        if bucket > prev or (key not in _warmed_plans and key not in _captured_plans):
+            sub_rows = bucket * query_width if mode == "decode" else bucket
+            _run_plan(
+                q[:sub_rows],
+                kv_cache,
+                topk_slots[:sub_rows],
+                None if topk_lens is None else topk_lens[:sub_rows],
+                mode=mode,
+                query_width=query_width,
+                softmax_scale=softmax_scale,
+                return_lse=return_lse,
+                output_3d=output_3d[:sub_rows],
+                lse=None if lse is None else lse[:sub_rows],
+            )
+        bucket <<= 1
+    return warm_key, max(prev, max_bucket)
 
 
 def sparse_attention(
@@ -148,14 +314,6 @@ def sparse_attention(
         and optionally LSE [tokens, heads]. No query or cache quantization occurs.
     """
     rows, heads, _ = q.shape
-    plan = _get_plan(
-        q,
-        topk=topk_slots.shape[1],
-        mode=mode,
-        query_width=query_width,
-        return_lse=return_lse,
-    )
-    lengths = plan.full_lengths[rows] if topk_lens is None else topk_lens
     output = (
         torch.empty((rows, heads, 512), device=q.device, dtype=torch.bfloat16)
         if out is None
@@ -166,17 +324,34 @@ def sparse_attention(
         if return_lse
         else None
     )
-    plan.wrapper.run(
+    output_3d = output.view(rows, heads, 512)
+    warm_state: tuple[tuple, int] | None = None
+    if is_warming_up() and not torch.cuda.is_current_stream_capturing():
+        warm_state = _warm_smaller_buckets(
+            q,
+            kv_cache,
+            topk_slots,
+            topk_lens,
+            mode=mode,
+            query_width=query_width,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            output_3d=output_3d,
+            lse=lse,
+        )
+    _run_plan(
         q,
         kv_cache,
         topk_slots,
-        lengths,
-        qo_indptr=plan.offsets[rows],
+        topk_lens,
+        mode=mode,
+        query_width=query_width,
         softmax_scale=softmax_scale,
-        output_scale=1.0,
-        kv_cache_scale=1.0,
-        out=output.view(rows, heads, 512),
+        return_lse=return_lse,
+        output_3d=output_3d,
         lse=lse,
-        validate=False,
     )
+    if warm_state is not None:
+        warm_key, max_bucket = warm_state
+        _warmed_buckets[warm_key] = max_bucket
     return (output, lse) if return_lse else output
