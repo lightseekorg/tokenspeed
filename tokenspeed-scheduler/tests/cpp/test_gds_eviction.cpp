@@ -1351,6 +1351,46 @@ protected:
     TierTransferManager transfers{cache};
 };
 
+TEST(GdsHostPlacement, RejectionsDoNotHideOtherBucketsOrCapacityInTheNextPlan) {
+    for (const bool allow_loss : {false, true}) {
+        SCOPED_TRACE(allow_loss);
+        auto specs = Specs();
+        specs[0].cache_blocks_per_lcm_block = 2;
+        specs[0].shard_count = 2;
+        BlockPool device{16, {2, 1}}, host{8, {2, 1}};
+        auto cache = MakeCoordinator(specs, kPage, device, false, &host, nullptr, nullptr, false, false, 0);
+        cache.ConfigureEviction(PrefixCacheEvictionConfig::Gds({0.25, 0}));
+        // Only one KV slot in bucket 1 is free. Neither bucket 0 nor State
+        // can use it, and all occupied slots have live owners.
+        auto kv_pin = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+        ASSERT_EQ(kv_pin.size(), 1u);
+        std::vector<CacheBlockRef> state_pins;
+        while (host.NumEmptyLcmBlocks()) state_pins.push_back(host.AcquireBlock(1));
+        const std::array<std::uint32_t, 6> groups{1, 1, 0, 0, 1, 0};
+        const std::array<std::int32_t, 6> buckets{0, 0, 0, 1, 0, 1};
+        const auto allocate = [&](auto group_ids, auto owners) {
+            return allow_loss ? cache.Host().AcquireHostBlocks(group_ids, owners)
+                              : cache.Host().AcquireHostCopies(group_ids, owners);
+        };
+        auto placed = allocate(std::span{groups}, std::span{buckets});
+        ASSERT_EQ(placed.blocks.size(), groups.size());
+        EXPECT_EQ(placed.stats.allocated, 1u);
+        EXPECT_EQ(placed.stats.unallocated, 5u);
+        for (std::size_t i = 0; i < groups.size(); ++i) EXPECT_EQ(bool(placed.blocks[i]), i == 3);
+        EXPECT_EQ(cache.GdsStats().host_copy_rejections, allow_loss ? 0u : 5u);
+        EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
+        EXPECT_DOUBLE_EQ(cache.GdsStats().host_watermark, 0);
+
+        // A refusal belongs to one plan: releasing an owner makes the same
+        // group/bucket demand succeed on the next call.
+        ASSERT_FALSE(state_pins.empty());
+        state_pins.pop_back();
+        auto retry = allocate(std::span{groups}.first(1), std::span{buckets}.first(1));
+        ASSERT_EQ(retry.stats.allocated, 1u);
+        EXPECT_TRUE(retry.blocks.front());
+    }
+}
+
 TEST_F(GdsWriteThrough, OptionalCopyCannotEvictAnotherPointsOnlyHostRoute) {
     Point old{16}, incoming{20};
     incoming.tokens[0] = 100;
@@ -1373,6 +1413,125 @@ TEST_F(GdsWriteThrough, OptionalCopyCannotEvictAnotherPointsOnlyHostRoute) {
     EXPECT_EQ(cache.Prober().ProbePrefix(old.hashes).host.num_common_tokens, 16);
     EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
     EXPECT_GT(cache.GdsStats().host_copy_rejections, 0u);
+}
+
+TEST(GdsHostPlacement, SuccessfulSegmentsAndRollbackPreserveDeviceHeldMixedTierState) {
+    for (const bool allow_loss : {false, true}) {
+        for (const bool prefix : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "allow_loss=" << allow_loss << " prefix=" << prefix);
+            auto specs = Specs();
+            specs.push_back(specs.back());
+            BlockPool device{64, {1, 1, 1}}, host{7, {1, 1, 1}};
+            auto cache = MakeCoordinator(specs, kPage, device, false, &host, nullptr, nullptr, false, false, 0);
+            cache.ConfigureEviction(PrefixCacheEvictionConfig::Gds({0.25, 0}));
+            const Point old{16};
+            Point other{20};
+            other.tokens[0] = 100;
+            other.Rehash();
+            PublishPoint(cache, old);
+            PublishPoint(cache, other);
+            const CacheKey required{.group_id = 1, .content_hash = old.Hash()};
+            std::vector<CacheKey> copies{required};
+            for (const auto& hash : old.hashes) copies.push_back({.group_id = 0, .content_hash = ContentHash{hash}});
+            for (const std::uint32_t group : {1u, 2u})
+                copies.push_back({.group_id = group, .content_hash = other.Hash()});
+            for (const auto& key : copies) {
+                auto block = host.AcquireBlock(key.group_id);
+                ASSERT_TRUE(block);
+                cache.Host().CacheHostBlock(block, key, std::nullopt);
+            }
+            auto& store = CacheCoordinatorTestAccess::Store(cache);
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
+                cache, required.group_id, *store.LocationOf(device, required.group_id, required),
+                &CacheEvictor::DeviceEvictionStats::admission, nullptr));
+            // State is split across tiers. A live Device State owner forbids
+            // logical loss even when Host placement is allowed to choose it.
+            auto held = cache.GroupPrefixIndex(2).Find(device, {.group_id = 2, .content_hash = old.Hash()});
+            ASSERT_TRUE(held);
+            ASSERT_TRUE(store.RecoveryDependencies().At(old.Hash()).ready);
+            ASSERT_FALSE(store.RecoveryDependencies().At(old.Hash()).device_ready);
+            const auto before = store.RecoveryDependencies().GetStats();
+            const std::array<std::uint32_t, 11> groups{};
+            const std::array<std::int32_t, 11> buckets{};
+            const std::array<std::size_t, 3> ends{2, 7, 11};
+            // Six copies are redundant. After two successful rows, a five-row
+            // segment must roll back. The final four fit unless prefix stops.
+            auto selected = PlanTieredHostAllocation(store, groups, buckets, ends, allow_loss, prefix);
+            std::vector<bool> expected(groups.size(), !prefix);
+            std::fill(expected.begin(), expected.begin() + 2, true);
+            std::fill(expected.begin() + 2, expected.begin() + 7, false);
+            EXPECT_EQ(selected.accepted, expected);
+            EXPECT_EQ(selected.accepted_segments, prefix ? 1u : 2u);
+            ASSERT_EQ(selected.plan->host_removals.size(), prefix ? 2u : 6u);
+            EXPECT_TRUE(selected.plan->device_removals.empty());
+            EXPECT_TRUE(selected.plan->losses.empty());
+            EXPECT_TRUE(selected.plan->fresh_rejections.empty());
+            EXPECT_DOUBLE_EQ(selected.plan->stats.watermark, 0);
+            EXPECT_DOUBLE_EQ(selected.plan->stats.host_watermark, 0);
+            EXPECT_EQ(selected.plan->stats.host_copy_rejections, allow_loss ? 0u : prefix ? 9u : 5u);
+            for (const auto& key : copies) EXPECT_TRUE(cache.Host().ContainsHostCachedBlock(key));
+            EXPECT_EQ(store.RecoveryDependencies().GetStats().route_updates, before.route_updates);
+
+            std::pmr::monotonic_buffer_resource arena;
+            auto victims = TieredVictims(selected.plan, &arena);
+            CacheCoordinatorTestAccess::CommitVictims(cache, victims);
+            EXPECT_TRUE(cache.Host().ContainsHostCachedBlock(required));
+            EXPECT_EQ(host.NumEmptyLcmBlocks(), prefix ? 2 : 6);
+            EXPECT_EQ(cache.Prober().ProbePrefix(old.hashes).host.num_common_tokens, 16);
+            EXPECT_EQ(cache.Prober().ProbePrefix(other.hashes).device.num_common_tokens, 20);
+            CheckIndexedRoute(cache, old);
+            CheckIndexedRoute(cache, other);
+            EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
+            EXPECT_EQ(cache.GdsStats().logical_rejections, 0u);
+        }
+    }
+}
+
+TEST(GdsHostPlacement, OptionalRowsRespectPackedParentsAndBucketsAfterRollback) {
+    auto specs = Specs();
+    specs[0].cache_blocks_per_lcm_block = 2;
+    specs[0].shard_count = 2;
+    BlockPool device{16, {2, 1}}, host{2, {2, 1}};
+    auto cache = MakeCoordinator(specs, kPage, device, false, &host, nullptr, nullptr, false, false, 0);
+    cache.ConfigureEviction(PrefixCacheEvictionConfig::Gds({0.25, 0}));
+    const Point point{16};
+    PublishPoint(cache, point);
+    const CacheKey state{.group_id = 1, .content_hash = point.Hash()};
+    {
+        const std::array<std::int32_t, 2> buckets{0, 1};
+        auto blocks = host.AcquireBlocksInBuckets(0, buckets);
+        ASSERT_EQ(blocks.size(), 2u);
+        for (std::size_t i = 0; i < blocks.size(); ++i)
+            cache.Host().CacheHostBlock(blocks[i], {.group_id = 0, .content_hash = ContentHash{point.hashes[i]}},
+                                        std::nullopt);
+        auto block = host.AcquireBlock(1);
+        ASSERT_TRUE(block);
+        cache.Host().CacheHostBlock(block, state, std::nullopt);
+    }
+    auto& store = CacheCoordinatorTestAccess::Store(cache);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(cache, 1, *store.LocationOf(device, 1, state),
+                                                           &CacheEvictor::DeviceEvictionStats::admission, nullptr));
+    const std::array<std::uint32_t, 3> groups{0, 1, 0};
+    const std::array<std::int32_t, 3> buckets{0, 0, 1};
+    // The first accepted KV row occupies half a parent. Removing the other
+    // duplicate cannot fund State, but can fund the last row's other bucket.
+    auto placed = cache.Host().AcquireHostCopies(groups, buckets);
+    ASSERT_EQ(placed.blocks.size(), 3u);
+    ASSERT_TRUE(placed.blocks[0]);
+    EXPECT_FALSE(placed.blocks[1]);
+    ASSERT_TRUE(placed.blocks[2]);
+    EXPECT_EQ(store.Groups()[0].Allocator().BucketOf(placed.blocks[0]->Location()), 0);
+    EXPECT_EQ(store.Groups()[0].Allocator().BucketOf(placed.blocks[2]->Location()), 1);
+    EXPECT_EQ(placed.blocks[0]->Location().lcm_block_id, placed.blocks[2]->Location().lcm_block_id);
+    EXPECT_EQ(placed.stats.allocated, 2u);
+    EXPECT_EQ(placed.stats.unallocated, 1u);
+    EXPECT_EQ(host.NumEmptyLcmBlocks(), 0);
+    EXPECT_TRUE(cache.Host().ContainsHostCachedBlock(state));
+    EXPECT_EQ(cache.Prober().ProbePrefix(point.hashes).host.num_common_tokens, 16);
+    CheckIndexedRoute(cache, point);
+    EXPECT_EQ(cache.GdsStats().host_copy_rejections, 1u);
+    EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
+    EXPECT_DOUBLE_EQ(cache.GdsStats().host_watermark, 0);
 }
 
 TEST_F(GdsWriteThrough, SourceRemainsPinnedUntilAckAndCopiesAreNotResubmitted) {

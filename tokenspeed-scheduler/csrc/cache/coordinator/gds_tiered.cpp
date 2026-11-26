@@ -26,6 +26,7 @@
 #include <chrono>
 #include <numeric>
 #include <limits>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -60,12 +61,13 @@ struct Coverage {
     std::array<std::vector<std::int64_t>, 2> users;
     std::array<std::vector<std::size_t>, 2> owners;
 };
+enum class CandidateScope { kHostOnly, kBothTiers };
 
 // Physical ordering proposes placements. Only Drop() authorizes logical loss.
 // Both tiers use the same route overlay, ownership census and GDS decisions.
 class Planner {
 public:
-    Planner(const CacheStore& store, const AdmissionCandidateConstraints* constraints)
+    Planner(const CacheStore& store, const AdmissionCandidateConstraints* constraints, CandidateScope candidate_scope)
         : store_{store},
           preview_{constraints ? constraints->publication.get() : nullptr},
           layout_{preview_ ? preview_->Leaves(store) : store.RecoveryDependencies().Leaves()},
@@ -81,7 +83,9 @@ public:
             baseline_.push_back(route.Available());
             held_.push_back(route.pending || (preview_ && preview_->Holds(points_[u].hash)));
         }
-        for (std::size_t tier = 0; tier < NumTiers(); ++tier) {
+        // Optional Host placement cannot remove Device copies or choose a
+        // logical victim. It needs all recovery routes, but only Host candidates.
+        for (std::size_t tier = candidate_scope == CandidateScope::kHostOnly ? 1 : 0; tier < NumTiers(); ++tier) {
             const auto& pool = Pool(tier);
             std::pmr::monotonic_buffer_resource scratch;
             const CacheEvictionCandidates::LocationSet empty{&scratch};
@@ -165,12 +169,16 @@ public:
     }
 
     bool AddHostRows(std::span<const std::uint32_t> groups, std::span<const std::int32_t> buckets, bool allow_loss) {
-        const Work before = work_;
-        const auto old_demand = demand_[1];
+        auto old_demand = demand_[1];
         for (std::size_t i = 0; i < groups.size(); ++i) ++demand_[1][groups[i]].blocks_by_bucket[buckets[i]];
+        if (Fits(1)) return true;
+        // Coverage depends on residency and survivors, not placement demand.
+        // Keep the unchanged coverage in the snapshot so rejection can reuse it.
+        Cover();
+        Work before = work_;
         if (FundHost(allow_loss)) return true;
-        work_ = before;
-        demand_[1] = old_demand;
+        work_ = std::move(before);
+        demand_[1] = std::move(old_demand);
         return false;
     }
 
@@ -464,6 +472,9 @@ private:
                 const auto p = components_[1][c].position;
                 if (p && coverage->users[1][*p] != 0) continue;
                 Remove(1, c);
+                // No selected surviving route uses this copy. Keep its coverage
+                // across successful rows while still updating the route overlay.
+                work_.coverage = coverage;
                 if (Fits(1)) return true;
             }
             // Replacing an eligible Host key with the same published Disk
@@ -472,19 +483,21 @@ private:
             // do not clone and resolve a full plan for every clean key.
             std::optional<std::size_t> clean;
             double least_cost = std::numeric_limits<double>::infinity();
-            for (std::size_t c = 0; c < components_[1].size(); ++c) {
-                const auto& component = components_[1][c];
-                if (work_.removed[1].contains(c) || !component.member.key ||
-                    !work_.view.Present(*component.member.key, CacheTier::kDisk))
-                    continue;
-                const double rank = store_.UsesGds()
-                                        ? store_.EvictionConfig().disk_block_costs[component.member.group] *
-                                              coverage->users[1][*component.position] *
-                                              Pool(1).Packing(component.member.group)
-                                        : 0;
-                if (!clean || rank < least_cost) {
-                    least_cost = rank;
-                    clean = c;
+            if (store_.DiskPool()) {
+                for (std::size_t c = 0; c < components_[1].size(); ++c) {
+                    const auto& component = components_[1][c];
+                    if (work_.removed[1].contains(c) || !component.member.key ||
+                        !work_.view.Present(*component.member.key, CacheTier::kDisk))
+                        continue;
+                    const double rank = store_.UsesGds()
+                                            ? store_.EvictionConfig().disk_block_costs[component.member.group] *
+                                                  coverage->users[1][*component.position] *
+                                                  Pool(1).Packing(component.member.group)
+                                            : 0;
+                    if (!clean || rank < least_cost) {
+                        least_cost = rank;
+                        clean = c;
+                    }
                 }
             }
             if (clean) {
@@ -653,7 +666,7 @@ std::optional<PlannedEviction> PlanTieredDeviceEviction(const CacheStore& store,
                                                         std::span<const BlockPlacementDemand> demands,
                                                         std::pmr::memory_resource* resource) {
     ProfileSpan profile_span{"Gds::TieredPlanAttempt"};
-    Planner planner{store, &constraints};
+    Planner planner{store, &constraints, CandidateScope::kBothTiers};
     if (!planner.FitDevice(demands)) return std::nullopt;
     auto result = TieredVictims(planner.Finish(), resource);
     return result;
@@ -663,7 +676,7 @@ std::optional<PlannedEviction> PlanTieredCompaction(const CacheStore& store,
                                                     const AdmissionCandidateConstraints& constraints,
                                                     const CacheKey& key, std::pmr::memory_resource* resource) {
     ProfileSpan profile_span{"Gds::TieredPlanAttempt"};
-    Planner planner{store, &constraints};
+    Planner planner{store, &constraints, CandidateScope::kBothTiers};
     if (!planner.ReleaseDeviceCopy(key)) return std::nullopt;
     return TieredVictims(planner.Finish(), resource);
 }
@@ -682,17 +695,25 @@ TieredHostAllocation PlanTieredHostAllocation(const CacheStore& store, std::span
         plan->stats.host_watermark = store.Checkpoints().HostWatermark();
         return {std::move(plan), std::vector<bool>(groups.size(), true), segment_ends.size()};
     }
-    Planner planner{store, nullptr};
+    Planner planner{store, nullptr, allow_logical_loss ? CandidateScope::kBothTiers : CandidateScope::kHostOnly};
     std::vector<bool> accepted(groups.size(), false);
+    // A failed single-row trial restores exactly the same Work and demand.
+    // Reuse that result only until another segment changes the plan.
+    std::set<std::pair<std::uint32_t, std::int32_t>> failed_rows;
     std::size_t first = 0, count = 0;
     for (auto end : segment_ends) {
         _assert(end >= first && end <= groups.size(), "Host segments cover rows in order");
-        if (planner.AddHostRows(groups.subspan(first, end - first), buckets.subspan(first, end - first),
-                                allow_logical_loss)) {
+        const auto row = end - first == 1 ? std::optional{std::pair{groups[first], buckets[first]}} : std::nullopt;
+        const bool rejected = row && failed_rows.contains(*row);
+        if (!rejected && planner.AddHostRows(groups.subspan(first, end - first), buckets.subspan(first, end - first),
+                                             allow_logical_loss)) {
             std::fill(accepted.begin() + first, accepted.begin() + end, true);
             ++count;
-        } else if (prefix)
-            break;
+            failed_rows.clear();
+        } else {
+            if (prefix) break;
+            if (row && !rejected) failed_rows.insert(*row);
+        }
         first = end;
     }
     auto plan = planner.Finish();
@@ -705,7 +726,7 @@ TieredHostAllocation PlanTieredHostAllocation(const CacheStore& store, std::span
 }
 void VisitGdsHostCleaningCandidates(const CacheStore& store, const std::function<bool(HostCleaningCandidate)>& visit) {
     ProfileSpan profile_span{"Gds::CleaningAttempt"};
-    Planner{store, nullptr}.VisitCleaningCandidates(visit);
+    Planner{store, nullptr, CandidateScope::kBothTiers}.VisitCleaningCandidates(visit);
 }
 
 }  // namespace tokenspeed

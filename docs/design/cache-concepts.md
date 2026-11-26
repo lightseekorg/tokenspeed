@@ -3664,6 +3664,27 @@ eligibility, heavy-path coordinates, coverage and selection remain plan-local.
 The no-Host planner retains its versioned heap and explicit block fallback.
 There is no persistent selection heap or constant-time pressure guarantee.
 
+Host placement builds coverage before a pressure trial's snapshot, so a
+rejected trial restores the same coverage rather than rebuilding it for the
+next demand. Demand alone does not change coverage; residency and survivor
+changes still invalidate it, except that removing a Host copy unused by every
+selected surviving route preserves that coverage. The route overlay still
+records the removal; subsequent rows reuse the unchanged selected paths.
+Device removal, logical loss and Disk-backed replacement retain their normal
+coverage invalidation. Free capacity needs no snapshot. Without a Disk
+pool, placement skips the clean-copy scan entirely. Within one Host plan, a
+failed single-block demand can be reused for the same group and ownership
+bucket until any segment succeeds. Other groups and buckets are still tried;
+multi-block failures are not reused as single-block failures. No refusal is
+remembered across plans, and rejection counters still count every refused row.
+
+Optional Host placement keeps the complete cross-tier recovery view but builds
+only Host physical candidates. It cannot remove Device copies or choose a
+logical victim, so it needs neither the Device candidate census nor the Device
+held-State scan. Plans that permit logical loss, Device admission, compaction
+and cleaning retain both tiers' candidates and held checks. This changes the
+metadata prepared by the same planner, not its placement or retention rules.
+
 Device pressure first tries eligible copy-only releases across the candidate
 census before migration or logical loss. Each release must preserve complete
 routes, including the single Device-prefix/Host-suffix split; a same-key Host

@@ -29,6 +29,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -1223,6 +1224,79 @@ TEST(DiskGdsTest, DiskAncestorProtectsHostStateAndReadArrivalDoesNotCountAsReuse
     ASSERT_EQ(before.size(), after.size());
     EXPECT_DOUBLE_EQ(before.front().stamp, after.front().stamp);
     EXPECT_DOUBLE_EQ(before.front().host_stamp, after.front().host_stamp);
+}
+
+TEST(DiskGdsTest, RejectedHostSegmentRestoresCoverageBeforeLaterSingleRows) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(1, 1);
+    const auto keys = cache.OnHostOnly(prompt);
+    ASSERT_EQ(keys.size(), 2u);
+    CopyToDisk(cache, std::span{keys}.first(1));
+    auto held = HoldFreeHost(cache);
+    const std::array<std::uint32_t, 5> groups{1, 1, 1, 1, 1};
+    const std::array<std::int32_t, 5> buckets{0, 0, 0, 0, 0};
+    const std::array<std::size_t, 4> ends{2, 3, 4, 5};
+    const auto& store = cache.coordinator.Store();
+    // Only the clean KV page can leave. The two-row segment tries that
+    // removal but cannot fit; one following row can use it, and no more can.
+    auto selected = PlanTieredHostAllocation(store, groups, buckets, ends, false, false);
+    EXPECT_EQ(selected.accepted, (std::vector<bool>{false, false, true, false, false}));
+    ASSERT_EQ(selected.plan->host_removals.size(), 1u);
+    EXPECT_EQ(selected.plan->host_removals.front().key, keys.front());
+    EXPECT_EQ(selected.plan->stats.host_clean_copies_released, 1u);
+    EXPECT_EQ(selected.plan->stats.host_copy_rejections, 4u);
+    EXPECT_TRUE(selected.plan->losses.empty());
+    EXPECT_TRUE(selected.plan->fresh_rejections.empty());
+    EXPECT_DOUBLE_EQ(selected.plan->stats.host_watermark, 0);
+    for (const auto& key : keys) EXPECT_TRUE(cache.OnHost(key));
+
+    std::pmr::monotonic_buffer_resource arena;
+    auto victims = TieredVictims(selected.plan, &arena);
+    CacheCoordinatorTestAccess::CommitVictims(cache.coordinator, victims);
+    EXPECT_FALSE(cache.OnHost(keys.front()));
+    EXPECT_TRUE(cache.OnHost(keys.back()));
+    EXPECT_EQ(cache.host.NumEmptyLcmBlocks(), 1);
+    EXPECT_TRUE(store.RecoveryDependencies().At(ContentHash{prompt.hashes.back()}).disk_recoverable);
+    EXPECT_EQ(store.GdsStats().logical_evictions, 0u);
+    EXPECT_DOUBLE_EQ(store.GdsStats().host_watermark, 0);
+}
+
+TEST(DiskGdsTest, OptionalRowsReclaimDeviceDuplicatesThenDiskCopiesWithoutLogicalLoss) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt old(1, 1), active(1, 2);
+    const auto old_keys = cache.OnHostOnly(old);
+    CopyToDisk(cache, std::span{old_keys}.first(1));
+    auto tables = cache.OnDevice(active);
+    const CacheKey duplicate{.group_id = 1, .content_hash = ContentHash{active.hashes.back()}};
+    {
+        auto block = cache.host.AcquireBlock(1);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, duplicate, std::nullopt);
+    }
+    auto held = HoldFreeHost(cache);
+    const std::array<std::uint32_t, 3> groups{1, 1, 1};
+    const std::array<std::int32_t, 3> buckets{};
+    auto placed = cache.coordinator.Host().AcquireHostCopies(groups, buckets);
+    ASSERT_EQ(placed.blocks.size(), groups.size());
+    EXPECT_TRUE(placed.blocks[0]);
+    EXPECT_TRUE(placed.blocks[1]);
+    EXPECT_FALSE(placed.blocks[2]);
+    EXPECT_FALSE(cache.OnHost(duplicate));
+    EXPECT_FALSE(cache.OnHost(old_keys.front()));
+    EXPECT_TRUE(cache.OnHost(old_keys.back()));
+    const auto& store = cache.coordinator.Store();
+    const auto& route = store.RecoveryDependencies().At(ContentHash{old.hashes.back()});
+    EXPECT_TRUE(route.disk_recoverable);
+    EXPECT_GT(route.disk_read_cost, 0);
+    EXPECT_TRUE(store.RecoveryDependencies().At(duplicate.content_hash).device_ready);
+    EXPECT_EQ(store.GdsStats().host_clean_copies_released, 1u);
+    EXPECT_EQ(store.GdsStats().host_copy_rejections, 1u);
+    EXPECT_EQ(store.GdsStats().logical_evictions, 0u);
+    EXPECT_EQ(store.GdsStats().logical_rejections, 0u);
+    EXPECT_DOUBLE_EQ(store.GdsStats().host_watermark, 0);
+    cache.coordinator.Free(tables);
 }
 
 TEST(DiskGdsTest, CleanStatePrecedesDirtyLossUnderBothPolicies) {
