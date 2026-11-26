@@ -112,7 +112,7 @@ fn peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
              cfg.peer_config = ts.PeerConfig(name='{name}', incarnation=1, max_leases=16, \
                soft_pin_us={soft_pin_us}, hard_pin_us=5_000_000, lookup_timeout_us=2_000_000, \
                min_fetch_tokens={PAGE}, landing_tier=ts.PeerLandingTier.Device, \
-               max_host_landing_blocks=0, host_ready_timeout_us=0)\n\
+               max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False)\n\
              result = ts.Scheduler(cfg)\n"
         );
         let g = PyDict::new(py);
@@ -986,7 +986,7 @@ fn compaction_peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
              cfg.peer_config = ts.PeerConfig(name='{name}', incarnation=1, max_leases=32,\n\
                soft_pin_us={soft_pin_us}, hard_pin_us=30_000_000, lookup_timeout_us=2_000_000,\n\
                min_fetch_tokens=8, landing_tier=ts.PeerLandingTier.Device,\n\
-               max_host_landing_blocks=0, host_ready_timeout_us=0)\n\
+               max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False)\n\
              result = ts.Scheduler(cfg)\n"
         );
         let g = PyDict::new(py);

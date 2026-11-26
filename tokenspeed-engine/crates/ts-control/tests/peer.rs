@@ -109,12 +109,12 @@ fn scheduler(
     };
     let tier = match landing {
         Landing::Device => {
-            "landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0, host_ready_timeout_us=0"
+            "landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False"
                 .to_owned()
         }
         Landing::Host => format!(
             "landing_tier=ts.PeerLandingTier.Host, max_host_landing_blocks={}, \
-             host_ready_timeout_us=1_000_000",
+             host_ready_timeout_us=1_000_000, versioned_shards=False",
             pages - 1
         ),
     };

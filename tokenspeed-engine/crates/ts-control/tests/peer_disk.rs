@@ -136,7 +136,7 @@ cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_le
                                 soft_pin_us=1_000_000, hard_pin_us=1_000_000,
                                 lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE},
                                 landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0,
-                                host_ready_timeout_us=0)
+                                host_ready_timeout_us=0, versioned_shards=False)
 result = ts.Scheduler(cfg)
 "#
         );
