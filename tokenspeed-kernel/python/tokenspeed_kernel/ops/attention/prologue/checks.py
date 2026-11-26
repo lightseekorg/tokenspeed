@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     KVShortConv,
     LatentKVCache,
     MLAExpandedKV,
+    MXFP4Scales,
     MXFP8Scales,
     RelativeHeadNorm,
     Rotary,
@@ -97,11 +98,12 @@ def _rotary_key(rotary: Rotary | None) -> tuple | None:
 def _cache_key(cache: HeadKVCache | LatentKVCache) -> tuple:
     if isinstance(cache, HeadKVCache):
         scales = cache.scales
-        planes = (
-            (_layout(scales.k), _layout(scales.v), scales.page_tokens)
-            if isinstance(scales, MXFP8Scales)
-            else type(scales)
-        )
+        if isinstance(scales, MXFP8Scales):
+            planes = (_layout(scales.k), _layout(scales.v), scales.page_tokens)
+        elif isinstance(scales, MXFP4Scales):
+            planes = (_layout(scales.k), _layout(scales.v))
+        else:
+            planes = type(scales)
         return (
             _layout(cache.k_cache),
             _layout(cache.v_cache),
@@ -433,6 +435,33 @@ def _check_mxfp8_scales(cache: HeadKVCache, num_kv_heads: int, head_dim: int) ->
         )
 
 
+def _check_mxfp4_scales(cache: HeadKVCache, head_dim: int) -> None:
+    if cache.k_cache.dtype != torch.uint8 or cache.k_cache.dim() != 4:
+        raise ValueError(
+            "MXFP4 caches are [pages, rows, heads, head_dim // 2] packed E2M1 bytes"
+        )
+    if head_dim % 32 or head_dim & (head_dim - 1):
+        raise ValueError(
+            f"MXFP4 caches store power-of-two heads of 32-channel blocks, not {head_dim}"
+        )
+    pages, rows, heads, _ = cache.k_cache.shape
+    shape = (pages, rows, heads, head_dim // 32)
+    if any(
+        plane.dtype != torch.uint8
+        or plane.shape != shape
+        or plane.stride()[1:] != (heads * head_dim // 32, head_dim // 32, 1)
+        or plane.stride(0) != data.stride(0)
+        for plane, data in (
+            (cache.scales.k, cache.k_cache),
+            (cache.scales.v, cache.v_cache),
+        )
+    ):
+        raise ValueError(
+            "MXFP4 scale planes are dense uint8 rows of one exponent per 32 "
+            "channels, paged with their E2M1 planes"
+        )
+
+
 def _check_gqa_request(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -454,12 +483,13 @@ def _check_gqa_request(
             f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] "
             "rows or [pages, rows, heads, head_dim] pages"
         )
-    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
+    num_kv_heads, head_dim = cache.geometry
+    width = cache.k_cache.shape[-1]
     if (
         cache.v_cache.shape != cache.k_cache.shape
         or cache.v_cache.dtype != cache.k_cache.dtype
         or any(
-            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(-2) != head_dim)
+            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(-2) != width)
             for x in (cache.k_cache, cache.v_cache)
         )
     ):
@@ -503,6 +533,8 @@ def _check_gqa_request(
     _check_slots(cache, num_tokens)
     if isinstance(cache.scales, MXFP8Scales):
         _check_mxfp8_scales(cache, num_kv_heads, head_dim)
+    if isinstance(cache.scales, MXFP4Scales):
+        _check_mxfp4_scales(cache, head_dim)
     if (
         cache.format is KVCacheFormat.FP8_PER_TENSOR
         and cache.k_cache.dtype != torch.float8_e4m3fn

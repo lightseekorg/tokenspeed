@@ -6,6 +6,7 @@ from collections.abc import Iterator
 
 import torch
 
+from tokenspeed.runtime.layers.attention.configs.base import mxfp4_row_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
@@ -322,6 +323,7 @@ def make_mha_memory_plan(
     layer_types: tuple[str, ...] = (),
     sliding_window_tokens: int | tuple[int | None, ...] | None = None,
     mxfp8: bool = False,
+    mxfp4: bool = False,
 ):
     """An MHA plan the way the recipe builds one: group, pack, bind."""
     if size % prefix_granularity:
@@ -341,6 +343,9 @@ def make_mha_memory_plan(
         else scatter_stored_dtype_name(dtype)
     )
     shape = (prefix_granularity, kv_heads, head_dim)
+    if mxfp4:
+        kv_dtype = cache_dtype_name(torch.uint8)
+        shape = (prefix_granularity, kv_heads, mxfp4_row_bytes(head_dim))
 
     def fields_for_layer(layer_id, group_id, occurrence):
         fields = (

@@ -82,3 +82,22 @@ def _ue8m0_word(exponent):
     # Four [ROWS, 4] exponent bytes as one little-endian int32 per row.
     word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
     return word.to(tl.int32)
+
+
+@triton.jit
+def _mxfp4_encode_rows(x, ROWS: tl.constexpr, D: tl.constexpr):
+    """Encode fp32 [ROWS, D] as OCP MXFP4 rows, one scale per 32 channels.
+
+    Each block's amax is floored at 6 * FLT_MIN and divided by 6 (round to
+    nearest); the scale is the power of two at or above it, at most 2**127.
+    Returns nibble-packed E2M1 codes uint8 [ROWS, D // 2] (even channel in
+    the low nibble) and the biased UE8M0 exponents int32 [ROWS, D // 32].
+    """
+    groups = tl.reshape(x, (ROWS, D // 32, 32))
+    amax = tl.max(tl.abs(groups), 2)
+    scaled_max = tl.div_rn(tl.maximum(amax, 6.0 * 1.1754943508222875e-38), 6.0)
+    exponent = tl.minimum(_ue8m0_exponent(scaled_max), 254)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    codes = _e2m1_encode(tl.div_rn(groups, scale[:, :, None])).to(tl.int32)
+    lo, hi = tl.split(tl.reshape(codes, (ROWS, D // 2, 2)))
+    return (lo | (hi << 4)).to(tl.uint8), exponent

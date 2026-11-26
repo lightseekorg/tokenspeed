@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     block_draft_is_causal,
     is_block_drafter,
     model_wide_kwargs,
+    mxfp4_row_bytes,
     resolve_cache_layer_types,
     resolve_dtype,
 )
@@ -111,6 +112,7 @@ class MHAConfig(SoftmaxAttnConfig):
                 is_draft,
                 kv_cache_dtype=resolve_dtype(kv_cache_dtype),
                 kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
+                kv_cache_mxfp4=kv_cache_dtype == "mxfp4",
                 draft_block_decode=draft_block_decode,
                 draft_block_causal=(
                     draft_block_decode and block_draft_is_causal(hf_config)
@@ -120,6 +122,13 @@ class MHAConfig(SoftmaxAttnConfig):
         )
 
     def cache_cell_size(self, config: AttnConfig) -> int:
+        if config.kv_cache_mxfp4:
+            # K and V: head_dim/2 E2M1 bytes plus one UE8M0 byte per 32.
+            return (
+                max(self.num_kv_heads // self.attn_tp_size, 1)
+                * mxfp4_row_bytes(self.head_dim)
+                * 2
+            )
         cell = (
             max(self.num_kv_heads // self.attn_tp_size, 1)
             * self.head_dim

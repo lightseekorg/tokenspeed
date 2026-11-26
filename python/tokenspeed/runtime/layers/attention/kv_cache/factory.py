@@ -35,7 +35,9 @@ def create_cache_arena(
     )
 
 
-def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
+def _mha_pool_class(
+    family: str, *, mxfp8: bool, mxfp4: bool = False
+) -> type[CachePool]:
     """The MHA-shaped pool for one family, in its plain or mxfp8 variant.
 
     All supported families take the same arguments; only the recurrent-state
@@ -63,6 +65,16 @@ def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
         "mamba2": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
     }
     plain, scaled = by_family[family]
+    if mxfp4:
+        if family != "mha":
+            raise NotImplementedError(
+                f"mxfp4 KV cache supports the mha family, not {family}"
+            )
+        from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+            MHATokenToKVPoolMXFP4,
+        )
+
+        return MHATokenToKVPoolMXFP4
     return scaled if mxfp8 else plain
 
 
@@ -230,7 +242,11 @@ def _mha_shaped_pool(
     )
 
     softmax_attn = _softmax_config(config, spec.family, MHAConfig)
-    pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
+    pool_cls = _mha_pool_class(
+        spec.family,
+        mxfp8=bool(config.kv_cache_mxfp8),
+        mxfp4=bool(config.kv_cache_mxfp4),
+    )
     # Only the hybrid pools route layers by label; a plain MHA pool has no
     # state layers to tell apart.
     hybrid_kwargs = (

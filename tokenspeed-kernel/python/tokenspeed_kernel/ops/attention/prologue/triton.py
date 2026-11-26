@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import _mxfp4_encode_rows
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
@@ -222,6 +223,28 @@ def _gqa_store_tile(
 _CACHE_ROW_ALIGN_BYTES = tl.constexpr(16)
 
 
+@triton.jit
+def _mxfp4_store_rows(
+    data_rows,
+    scale_rows,
+    x,
+    row_mask,
+    BLOCK_T: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Quantize fp32 rows [BLOCK_T, BLOCK] to MXFP4 and store the packed
+    E2M1 bytes and the UE8M0 exponents at their rows."""
+    packed, exponent = _mxfp4_encode_rows(x, BLOCK_T, BLOCK)
+    offs = tl.arange(0, BLOCK // 2)
+    tl.store(data_rows[:, None] + offs[None, :], packed, mask=row_mask[:, None])
+    groups = tl.arange(0, BLOCK // 32)
+    tl.store(
+        scale_rows[:, None] + groups[None, :],
+        exponent.to(tl.uint8),
+        mask=row_mask[:, None],
+    )
+
+
 # The KV cache pointers are not specialized: Triton keys a binary on whether a
 # tensor's storage fits in 2 GB, and the KV arena is sized after startup's
 # warm-up (a small probe arena, then the full one). Cache rows are addressed
@@ -233,6 +256,8 @@ _CACHE_ROW_ALIGN_BYTES = tl.constexpr(16)
         "positions_stride",
         "k_cache_ptr",
         "v_cache_ptr",
+        "k_scale_ptr",
+        "v_scale_ptr",
     ],
     do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
 )
@@ -248,6 +273,8 @@ def _gqa_prologue_kernel(
     positions_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     slots_ptr,
     num_tokens,
     num_rows,
@@ -268,6 +295,8 @@ def _gqa_prologue_kernel(
     cache_page_size,
     k_cache_stride_p,
     v_cache_stride_p,
+    scale_stride_s,
+    scale_stride_h,
     num_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
@@ -283,6 +312,7 @@ def _gqa_prologue_kernel(
     S2: tl.constexpr,
     RETURN_K: tl.constexpr,
     KV_SCALED: tl.constexpr,
+    KV_MXFP4: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
@@ -412,49 +442,108 @@ def _gqa_prologue_kernel(
             )
         write_mask = tokens < num_rows
         slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
-        # The cache pointers are not specialized, so the alignment of
-        # each cache row, which vectorizes its writes, is stated here; the
-        # request check refuses a cache whose base or row / head strides are
-        # not (prologue/checks.py, _misaligned), for every solution.
-        k_rows = tl.multiple_of(
-            k_cache_ptr
-            + (slot // cache_page_size) * k_cache_stride_p
-            + (slot % cache_page_size) * k_cache_stride_s
-            + kv_head * k_cache_stride_h,
-            _CACHE_ROW_ALIGN_BYTES,
-        )
-        _gqa_store_tile(
-            k_rows,
-            rows,
-            o1,
-            o2,
-            i1,
-            i2,
-            write_mask,
-            half_mask,
-            k_inv_scale,
-            head_dim,
-            2 * half_rotary,
-            BLOCK,
-            KV_SCALED,
-        )
-        offs = tl.arange(0, BLOCK)
-        mask = write_mask[:, None] & (offs < head_dim)[None, :]
-        value = tl.load(
-            v_ptr + (tokens * v_stride_t + kv_head * head_dim)[:, None] + offs[None, :],
-            mask=mask,
-        )
-        v_rows = tl.multiple_of(
-            v_cache_ptr
-            + (slot // cache_page_size) * v_cache_stride_p
-            + (slot % cache_page_size) * v_cache_stride_s
-            + kv_head * v_cache_stride_h,
-            _CACHE_ROW_ALIGN_BYTES,
-        )
-        dst = v_rows[:, None] + offs[None, :]
-        if KV_SCALED:
-            value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
-        tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
+        if KV_MXFP4:
+            # Whole rotated rows, rounded to the input dtype as an unfused
+            # cache write would hold them, then quantized per 32 channels.
+            if half_rotary == 0:
+                key = rows
+            elif IS_NEOX:
+                key = tl.reshape(
+                    tl.permute(tl.join(o1, o2), (0, 2, 1)), (BLOCK_T, BLOCK)
+                )
+            else:
+                key = tl.reshape(tl.join(o1, o2), (BLOCK_T, BLOCK))
+            dtype = k_ptr.dtype.element_ty
+            page = slot // cache_page_size
+            row = slot % cache_page_size
+            _mxfp4_store_rows(
+                tl.multiple_of(
+                    k_cache_ptr
+                    + page * k_cache_stride_p
+                    + row * k_cache_stride_s
+                    + kv_head * k_cache_stride_h,
+                    _CACHE_ROW_ALIGN_BYTES,
+                ),
+                k_scale_ptr
+                + page * k_cache_stride_p
+                + row * scale_stride_s
+                + kv_head * scale_stride_h,
+                key.to(dtype).to(tl.float32),
+                write_mask,
+                BLOCK_T,
+                BLOCK,
+            )
+            offs = tl.arange(0, BLOCK)
+            value = tl.load(
+                v_ptr
+                + (tokens * v_stride_t + kv_head * head_dim)[:, None]
+                + offs[None, :],
+                mask=write_mask[:, None],
+                other=0.0,
+            )
+            _mxfp4_store_rows(
+                tl.multiple_of(
+                    v_cache_ptr
+                    + page * v_cache_stride_p
+                    + row * v_cache_stride_s
+                    + kv_head * v_cache_stride_h,
+                    _CACHE_ROW_ALIGN_BYTES,
+                ),
+                v_scale_ptr
+                + page * v_cache_stride_p
+                + row * scale_stride_s
+                + kv_head * scale_stride_h,
+                value.to(tl.float32),
+                write_mask,
+                BLOCK_T,
+                BLOCK,
+            )
+        else:
+            # The cache pointers are not specialized, so the alignment of
+            # each cache row, which vectorizes its writes, is stated here; the
+            # request check refuses a cache whose base or row / head strides are
+            # not (prologue/checks.py, _misaligned), for every solution.
+            k_rows = tl.multiple_of(
+                k_cache_ptr
+                + (slot // cache_page_size) * k_cache_stride_p
+                + (slot % cache_page_size) * k_cache_stride_s
+                + kv_head * k_cache_stride_h,
+                _CACHE_ROW_ALIGN_BYTES,
+            )
+            _gqa_store_tile(
+                k_rows,
+                rows,
+                o1,
+                o2,
+                i1,
+                i2,
+                write_mask,
+                half_mask,
+                k_inv_scale,
+                head_dim,
+                2 * half_rotary,
+                BLOCK,
+                KV_SCALED,
+            )
+            offs = tl.arange(0, BLOCK)
+            mask = write_mask[:, None] & (offs < head_dim)[None, :]
+            value = tl.load(
+                v_ptr
+                + (tokens * v_stride_t + kv_head * head_dim)[:, None]
+                + offs[None, :],
+                mask=mask,
+            )
+            v_rows = tl.multiple_of(
+                v_cache_ptr
+                + (slot // cache_page_size) * v_cache_stride_p
+                + (slot % cache_page_size) * v_cache_stride_s
+                + kv_head * v_cache_stride_h,
+                _CACHE_ROW_ALIGN_BYTES,
+            )
+            dst = v_rows[:, None] + offs[None, :]
+            if KV_SCALED:
+                value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
+            tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
 
 
 def _block_tokens(num_tokens: int, block: int) -> int:
@@ -496,6 +585,64 @@ def triton_gqa_prologue(
     return_kv: bool,
     enable_pdl: bool,
 ) -> GQAPrologueOutput:
+    return _triton_gqa_prologue(
+        q, k, v, norm, rotary, cache, query_dtype, return_kv, enable_pdl
+    )
+
+
+@register_kernel(
+    "attention",
+    "gqa_prologue",
+    name="triton_mxfp4_gqa_prologue",
+    solution="triton",
+    features=frozenset({"materialized_qk_norm"}),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+    traits={
+        "has_norm": BOOLS,
+        "relative_norm": frozenset({False}),
+        "kv_conv": frozenset({"none"}),
+        "kv_format": frozenset({"mxfp4"}),
+        "kv_convert": frozenset({False}),
+        "mrope": BOOLS,
+        # Whole rows quantize in one block; a partially rotated row is not
+        # assembled.
+        "partial_rotary": frozenset({False}),
+        "return_kv": BOOLS,
+        "rope_style": ROPE_STYLES,
+    },
+)
+def triton_mxfp4_gqa_prologue(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    norm: HeadNorm | None,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    query_dtype: torch.dtype,
+    return_kv: bool,
+    enable_pdl: bool,
+) -> GQAPrologueOutput:
+    """The prologue with the MXFP4 quantization of its K/V rows fused into
+    the cache write: the bytes of the unfused prologue's rows quantized."""
+    return _triton_gqa_prologue(
+        q, k, v, norm, rotary, cache, query_dtype, return_kv, enable_pdl
+    )
+
+
+def _triton_gqa_prologue(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    norm: HeadNorm | None,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    query_dtype: torch.dtype,
+    return_kv: bool,
+    enable_pdl: bool,
+) -> GQAPrologueOutput:
     # A query to convert takes the copying path even when prepared.
     prepared = (
         current_platform().is_cdna4
@@ -504,7 +651,7 @@ def triton_gqa_prologue(
         and query_dtype == q.dtype
     )
     num_tokens = q.shape[0]
-    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
+    num_kv_heads, head_dim = cache.geometry
     num_q_heads = q.shape[1:].numel() // head_dim
     q_out = (
         q.flatten(1)
@@ -537,6 +684,7 @@ def triton_gqa_prologue(
         s0, s1, s2 = mrope.section if mrope_rows else (0, 0, 0)
         block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
         scales = cache.scales if cache.format is KVCacheFormat.FP8_PER_TENSOR else None
+        mx4 = cache.scales if cache.format is KVCacheFormat.MXFP4 else None
         kernel_launcher(
             _gqa_prologue_kernel,
             (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads),
@@ -552,6 +700,8 @@ def triton_gqa_prologue(
             positions,
             cache.k_cache,
             cache.v_cache,
+            cache.k_cache if mx4 is None else mx4.k,
+            cache.v_cache if mx4 is None else mx4.v,
             cache.slots,
             num_tokens,
             cache.slots.numel(),
@@ -572,6 +722,8 @@ def triton_gqa_prologue(
             cache.k_cache.shape[1] if cache.k_cache.ndim == 4 else 1,
             cache.k_cache.stride(0),
             cache.v_cache.stride(0),
+            0 if mx4 is None else mx4.k.stride(-3),
+            0 if mx4 is None else mx4.k.stride(-2),
             num_q_heads,
             head_dim,
             half_rotary,
@@ -587,6 +739,7 @@ def triton_gqa_prologue(
             S2=s2,
             RETURN_K=return_kv and not prepared,
             KV_SCALED=scales is not None,
+            KV_MXFP4=mx4 is not None,
             BLOCK_T=block_t,
             BLOCK=triton.next_power_of_2(head_dim),
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
