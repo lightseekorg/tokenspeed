@@ -40,6 +40,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache_test_access.h"
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -3894,7 +3895,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnIdenticalResendResumesAtTheSupers
 // so that prompt loads it back from there.
 TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputIsTheFirstVictim) {
     checkpoint_retention_requests_ = 0;  // plain LRU: this scenario ranks entries by use alone
-    device_pages_ = 17;
+    device_pages_ = 18;
     for (const auto policy :
          {SchedulerConfig::HostWritePolicy::kWriteBack, SchedulerConfig::HostWritePolicy::kWriteThrough}) {
         SCOPED_TRACE(static_cast<int>(policy));
@@ -3948,7 +3949,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputIsTheFirstVictim)
 // still takes the Device's copy as h's reclaim, and o and h still resume on
 // the Device, but the same prompt as h no longer resumes at 22.
 TEST_P(StateCheckpointPrefillHostShardSuite, TheHostDropsACheckpointALaterTurnExtends) {
-    device_pages_ = 17;
+    device_pages_ = 18;
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     std::vector<std::int32_t> o = MakeTokens(22, 3000);
@@ -4354,7 +4355,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputOfATwoChunkTurnIs
 // is no tail and stays.)
 TEST_F(StateCheckpointPrefillHostSuite, AHitUnmarksTheSupersededInputUntilTheHitterFinishes) {
     checkpoint_retention_requests_ = 0;  // plain LRU: this scenario ranks entries by use alone
-    device_pages_ = 17;
+    device_pages_ = 18;
     for (const bool resend_finishes : {false, true}) {
         SCOPED_TRACE(resend_finishes);
         Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -5103,25 +5104,25 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
             pinned[id][group] = handoff.remote_decode->BlockTables().at(group).at(0);
         }
         AckWriteBacks(handoff);
-        const std::vector<std::int32_t> s1_written_back{8, 24, 9, 10, 23, 22, 21, 44, 43};
+        const std::vector<std::int32_t> s1_written_back{9, 30, 10, 16, 29, 60, 59, 58, 57};
         EXPECT_EQ(written_back, std::string(id) == "a" ? std::vector<std::int32_t>{} : s1_written_back)
             << "b's prefill writes s1 back";
     }
     EXPECT_EQ(pinned["a"]["full"], (std::vector<std::int32_t>{1, 2, 3, 4, 41, 42}));
-    EXPECT_EQ(pinned["b"]["full"], (std::vector<std::int32_t>{43, 44, 63, 64, 25, 26}));
+    EXPECT_EQ(pinned["b"]["full"], (std::vector<std::int32_t>{25, 26, 27, 28, 61, 62}));
     EXPECT_EQ(scheduler_->PdTransferSize(), 2u);
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 4);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 3);
 
     ExecutionEvent failed;
     failed.With(pd::FailedEvent{"a"});
     scheduler_->Advance(std::move(failed));
     SendAbortEvent("b");
     EXPECT_EQ(scheduler_->PdTransferSize(), 2u) << "both ended, their transfers still stopping";
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 4) << "the pages wait for the transport";
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 3) << "the pages wait for the transport";
     SendTransferStopped("a");
     SendTransferStopped("b");
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 10) << "each frees its three State parents";
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 9) << "each frees its three State parents";
 
     for (const auto& [id, start] : {std::pair{"f1", 1000}, std::pair{"f2", 2000}}) {
         Submit(RequestWithTokens(id, MakeTokens(4, start)));
@@ -5137,22 +5138,25 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     ASSERT_EQ(store.op_ids.size(), 1u);
     EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
     EXPECT_EQ(store.group_ids[0], (std::vector<std::uint32_t>{1, 0, 2, 3, 0, 0, 0, 0, 0}));
-    EXPECT_EQ(store.src_pages[0], (std::vector<std::int32_t>{4, 62, 2, 18, 61, 60, 59, 58, 57}))
+    EXPECT_EQ(store.src_pages[0], (std::vector<std::int32_t>{17, 10, 6, 5, 9, 72, 71, 70, 69}))
         << "s2: its three checkpoints and six KV blocks";
     // Every State block is a parent of its own, so a page id names the
-    // parent whichever State group takes it.
+    // parent whichever group takes it; full packs four blocks per parent.
     std::set<std::int32_t> state_zeroed;
     for (const std::string& group : {"state0", "state1", "state2"}) {
         state_zeroed.insert(plan.pages_to_zero.at(group).begin(), plan.pages_to_zero.at(group).end());
     }
-    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 17}));
-    EXPECT_EQ(plan.pages_to_zero.at("full"), (std::vector<std::int32_t>{42, 26, 27, 28}))
-        << "the KV blocks after a's and b's prompts, then the free slots beside b's last page";
+    std::set<std::int32_t> zeroed_parents = state_zeroed;
+    for (const std::int32_t page : plan.pages_to_zero.at("full")) {
+        zeroed_parents.insert((page - 1) / 4 + 1);
+    }
+    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{2, 3, 4, 5, 6, 8, 9, 12, 13, 14, 17, 18}));
+    EXPECT_EQ(plan.pages_to_zero.at("full"), (std::vector<std::int32_t>{57, 58, 37, 38}))
+        << "f1 and f2 each open a fresh KV parent rather than packing into a's and b's cached parents";
     for (const std::string& id : {"a", "b"}) {
-        EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), pinned[id]["full"].back()), 1) << id;
         for (const std::string& group : {"state0", "state1", "state2"}) {
             EXPECT_EQ(pinned[id][group].at(0), 0) << id << " " << group;
-            EXPECT_TRUE(state_zeroed.contains(pinned[id][group].at(1))) << id << " " << group;
+            EXPECT_TRUE(zeroed_parents.contains(pinned[id][group].at(1))) << id << " " << group;
         }
     }
     EXPECT_TRUE(state_zeroed.contains(store.src_pages[0][0])) << "s2's group-1 checkpoint";
@@ -5605,15 +5609,25 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
     const WriteBackBatch& store = std::get<WriteBackBatch>(std::get<CacheOperation>(restore->Operations()[*store_at]));
     ASSERT_EQ(store.op_ids.size(), 1u);
     EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
-    // Some restored page is one the store reads.
-    std::set<std::pair<std::uint32_t, std::int32_t>> read;
+    // Some restored physical LCM parent is one the store reads (even if the
+    // freed parent rebound to another group).
+    std::set<std::int32_t> read_parents;
     for (std::size_t row = 0; row < store.src_pages[0].size(); ++row) {
-        read.emplace(store.group_ids[0][row], store.src_pages[0][row]);
+        const std::int32_t packing = store.group_ids[0][row] == 0 ? 4 : 1;
+        read_parents.insert((store.src_pages[0][row] - 1) / packing + 1);
     }
     const SnapshotRestoreBatch& restored = *FindRestore(*restore);
     bool reused = false;
     for (std::size_t row = 0; row < restored.dst_pages[0].size(); ++row) {
-        reused = reused || read.contains({restored.group_ids[0][row], restored.dst_pages[0][row]});
+        const std::int32_t packing = restored.group_ids[0][row] == 0 ? 4 : 1;
+        reused = reused || read_parents.contains((restored.dst_pages[0][row] - 1) / packing + 1);
+    }
+    for (const CacheOperation& op : ExtractCacheOpsOfKind<LoadBackBatch>(*restore)) {
+        const LoadBackBatch& load = std::get<LoadBackBatch>(op);
+        for (std::size_t row = 0; row < load.dst_pages[0].size(); ++row) {
+            const std::int32_t packing = load.group_ids[0][row] == 0 ? 4 : 1;
+            reused = reused || read_parents.contains((load.dst_pages[0][row] - 1) / packing + 1);
+        }
     }
     EXPECT_TRUE(reused);
 }
@@ -6009,6 +6023,594 @@ TEST_F(StateFoldSuite, ABlockThePublicationSwappedForAnEqualEntryIsNotFolded) {
     ExecutionPlan plan;
     ASSERT_TRUE(SchedulerTestAccess::RetractVictim(*scheduler_, "b", plan).has_value());
     EXPECT_TRUE(plan.state_folds.empty());
+}
+
+// Request-aware placement on hybrid full-attention + recurrent-state layouts
+// (one packed full-attention group with block_granularity == prefix_granularity
+// == 128 and packing 12 or 6, alongside three packing-1 state groups).
+class HybridFullAndStateRequestAwareSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kP = 128;
+
+    SchedulerConfig MakeHybridConfig(std::int32_t total_lcm_pages, std::int32_t full_packing,
+                                     std::int32_t full_shards = 1, bool disable_prefix_cache = false,
+                                     bool enable_host_and_snapshot = false, std::int32_t state_packing = 1) {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kP;
+        cfg.device_allocator.total_pages = total_lcm_pages + 1;
+        cfg.host_allocator.total_pages = enable_host_and_snapshot ? (total_lcm_pages + 1) * 2 : 0;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.disable_l2_cache = !enable_host_and_snapshot;
+        cfg.disable_prefix_cache = disable_prefix_cache;
+        cfg.max_scheduled_tokens = 2048;
+        cfg.max_batch_size = 16;
+        cfg.max_resident_requests = 16;
+        cfg.decode_input_tokens = 1;
+        cfg.overlap_schedule_depth = 0;
+        cfg.role = Role::kFused;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full",
+            .block_granularity = kP,
+            .total_pages = (total_lcm_pages + 1) * full_packing,
+            .cache_blocks_per_lcm_block = full_packing,
+            .attn_kind = AttnKind::kFull,
+            .shard_count = full_shards,
+        });
+        for (const std::string& id : {"state0", "state1", "state2"}) {
+            cfg.cache_groups.push_back(CacheGroupConfig{
+                .group_id = id,
+                .block_granularity = 0,
+                .total_pages = (total_lcm_pages + 1) * state_packing,
+                .cache_blocks_per_lcm_block = state_packing,
+                .attn_kind = AttnKind::kState,
+            });
+        }
+        if (enable_host_and_snapshot) {
+            SetTestSnapshotPool(cfg);
+            cfg.max_retracted_requests = 8;
+        } else {
+            cfg.snapshot_allocator.total_pages = 1;
+            cfg.max_retracted_requests = 0;
+        }
+        return WithHostPackingFromDevice(cfg);
+    }
+
+    SchedulerConfig MakeConfig() override { return MakeHybridConfig(/*total_lcm_pages=*/64, /*full_packing=*/12); }
+
+    static std::int32_t ParentOf(std::int32_t page, std::int32_t packing) { return (page - 1) / packing + 1; }
+
+    static std::set<std::int32_t> ParentsOf(const std::vector<std::int32_t>& pages, std::int32_t packing) {
+        std::set<std::int32_t> parents;
+        for (const std::int32_t page : pages) {
+            if (page > 0) {
+                parents.insert(ParentOf(page, packing));
+            }
+        }
+        return parents;
+    }
+
+    static std::vector<std::int32_t> RowOf(const ForwardBatch& batch, const std::string& group,
+                                           const std::string& req_id) {
+        const auto it = std::ranges::find(batch.request_ids, req_id);
+        ASSERT_TRUE_OR_RETURN(it != batch.request_ids.end(), {});
+        return batch.BlockTables().at(group).at(static_cast<std::size_t>(it - batch.request_ids.begin()));
+    }
+
+    static std::vector<std::int32_t> NonZeroRowOf(const ForwardBatch& batch, const std::string& group,
+                                                  const std::string& req_id) {
+        std::vector<std::int32_t> pages = RowOf(batch, group, req_id);
+        std::erase_if(pages, [](std::int32_t page) { return page <= 0; });
+        return pages;
+    }
+
+    void LandBatch(const ExecutionPlan& plan, std::int32_t& tok) {
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr) {
+            return;
+        }
+        ExecutionEvent results;
+        for (const std::string& id : batch->request_ids) {
+            results.With(forward::ExtendResult{.request_id = id, .tokens = {++tok}});
+        }
+        scheduler_->Advance(results);
+    }
+};
+
+TEST_F(HybridFullAndStateRequestAwareSuite, InterleavedDecodeIsolatesParentsAndReclaimsWholeParentsForState) {
+    for (const std::int32_t packing : {12, 6}) {
+        SCOPED_TRACE(::testing::Message() << "packing=" << packing);
+        config_ = MakeHybridConfig(/*total_lcm_pages=*/36, packing, /*full_shards=*/1, /*disable_prefix_cache=*/true);
+        scheduler_ = std::make_unique<Scheduler>(config_);
+
+        // Four concurrent requests start with a 1-page prompt and decode
+        // interleaved across three additional pages (4 blocks each <= packing).
+        const std::vector<std::string> ids{"r0", "r1", "r2", "r3"};
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            Submit(RequestSpec{.request_id = ids[i],
+                               .tokens = MakeTokens(kP, static_cast<std::int32_t>(1000 * (i + 1))),
+                               .max_new_tokens = 0});
+        }
+        std::map<std::string, std::vector<std::int32_t>> rows;
+        std::int32_t token_seed = 90000;
+        for (std::int32_t step = 0; step < 3 * kP; ++step) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr) << step;
+            ASSERT_EQ(batch->request_ids.size(), ids.size()) << step;
+            ExecutionEvent results;
+            for (const std::string& id : batch->request_ids) {
+                if (step + 1 == 3 * kP) {
+                    rows[id] = NonZeroRowOf(*batch, "full", id);
+                }
+                results.With(forward::ExtendResult{.request_id = id, .tokens = {++token_seed}});
+            }
+            scheduler_->Advance(results);
+        }
+
+        // Every request's 4+ KV blocks stay confined to a single dedicated LCM
+        // parent, pairwise disjoint across the four concurrent requests.
+        std::set<std::int32_t> all_parents;
+        for (const std::string& id : ids) {
+            const std::set<std::int32_t> parents = ParentsOf(rows.at(id), packing);
+            EXPECT_EQ(parents.size(), 1u) << id;
+            for (const std::int32_t parent : parents) {
+                EXPECT_TRUE(all_parents.insert(parent).second) << "shared parent " << parent << " on " << id;
+            }
+        }
+        const std::int32_t empty_before_finish = scheduler_->EmptyLcmBlocks();
+
+        // Finishing r0 and r1 immediately returns BOTH of their whole KV
+        // parents plus their 3 live State parents each (2 * (1 + 3) = 8).
+        ExecutionEvent finish;
+        finish.With(forward::Finish{.request_id = "r0"});
+        finish.With(forward::Finish{.request_id = "r1"});
+        scheduler_->Advance(finish);
+        const ExecutionPlan after_finish = PlanOnce();
+        ASSERT_NE(FindForwardBatch(after_finish), nullptr);
+        EXPECT_EQ(scheduler_->RequestTokenSize("r0"), -1);
+        EXPECT_EQ(scheduler_->RequestTokenSize("r1"), -1);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks(), empty_before_finish + 8);
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, TightCapacityReservesEmptyParentsForThreeStateGroupsWithoutStarvation) {
+    // 17 usable LCM parents: seed leaves 1 [cached | 11 holes] KV parent + 3
+    // pinned State parents (4 used, 13 empty). r1 holds 1 KV parent + 6 State
+    // parents (input + live per group = 7 used, leaving 6 empty). r2 then
+    // prefills needing 3 KV blocks + 6 State parents: empty == 6 ==
+    // reserved_empty_parents, so full must fall back to existing holes instead
+    // of stealing empty parents needed by state0/state1/state2.
+    config_ = MakeHybridConfig(/*total_lcm_pages=*/17, /*full_packing=*/12, /*full_shards=*/1,
+                               /*disable_prefix_cache=*/false);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(RequestSpec{.request_id = "seed", .tokens = MakeTokens(kP, 100), .max_new_tokens = 1});
+    const ExecutionPlan seed_plan = PlanOnce();
+    const ForwardBatch* seed_batch = FindForwardBatch(seed_plan);
+    ASSERT_NE(seed_batch, nullptr);
+    const std::int32_t seed_kv_parent = *ParentsOf(NonZeroRowOf(*seed_batch, "full", "seed"), 12).begin();
+    {
+        ExecutionEvent done;
+        done.With(forward::ExtendResult{.request_id = "seed", .tokens = {50001}});
+        done.With(forward::Finish{.request_id = "seed"});
+        scheduler_->Advance(done);
+    }
+    PlanOnce();
+    ASSERT_EQ(scheduler_->RequestTokenSize("seed"), -1);
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 13);
+
+    // Pin seed's 3 State checkpoints so r2 cannot satisfy its State demand by
+    // evicting seed; it must rely on the 6 remaining empty parents.
+    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
+    const std::vector<CacheKey> seed_keys =
+        scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(MakeTokens(kP + 1, 100)));
+    std::vector<CacheBlockRef> held_seed_state;
+    for (const CacheKey& key : seed_keys) {
+        if (key.group_id > 0) {
+            CacheBlockRef ref = coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Find(pool, key);
+            if (ref) {
+                held_seed_state.push_back(std::move(ref));
+            }
+        }
+    }
+    ASSERT_EQ(held_seed_state.size(), 3u);
+
+    // Admit r1 (takes 1 KV parent + 6 State parents -> 6 empty parents left).
+    Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(kP, 2000), .max_new_tokens = 16});
+    const ExecutionPlan p1 = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(p1)->request_ids, std::vector<std::string>{"r1"});
+    const std::int32_t r1_kv_parent = *ParentsOf(NonZeroRowOf(*FindForwardBatch(p1), "full", "r1"), 12).begin();
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 6);
+    SendForwardDone("r1", {50002});
+
+    // Admit r2 alongside r1: only 6 empty parents remain, exactly matching
+    // r2's 3 State groups (input + live each). Admission must succeed without
+    // stealing any of the 6 reserved empty parents.
+    Submit(RequestSpec{.request_id = "r2", .tokens = MakeTokens(3 * kP, 4000), .max_new_tokens = 16});
+    const ExecutionPlan p2 = PlanOnce();
+    const ForwardBatch* b2 = FindForwardBatch(p2);
+    ASSERT_NE(b2, nullptr);
+    EXPECT_EQ(std::ranges::count(b2->request_ids, "r2"), 1);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 0);
+    const std::set<std::int32_t> r2_parents = ParentsOf(NonZeroRowOf(*b2, "full", "r2"), 12);
+    EXPECT_FALSE(r2_parents.empty());
+    for (const std::int32_t parent : r2_parents) {
+        EXPECT_TRUE(parent == r1_kv_parent || parent == seed_kv_parent);
+    }
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, MidPageStateCheckpointHitPrivatizeTailClustersWithGrowthAndDecode) {
+    constexpr std::int32_t kPacking = 12;
+    config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, /*full_shards=*/1, /*disable_prefix_cache=*/false);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    // Seed finishes at 150 tokens (1 full page + 22-token tail), publishing
+    // natural State checkpoints and a Device KV tail at token 150.
+    const std::vector<std::int32_t> seed_tokens = MakeTokens(150, 1000);
+    Submit(RequestSpec{.request_id = "seed", .tokens = seed_tokens, .max_new_tokens = 1});
+    const ExecutionPlan seed_plan = PlanOnce();
+    const ForwardBatch* seed_batch = FindForwardBatch(seed_plan);
+    ASSERT_NE(seed_batch, nullptr);
+    const std::int32_t seed_parent = *ParentsOf(RowOf(*seed_batch, "full", "seed"), kPacking).begin();
+    {
+        ExecutionEvent done;
+        done.With(forward::ExtendResult{.request_id = "seed", .tokens = {60001}});
+        done.With(forward::Finish{.request_id = "seed"});
+        scheduler_->Advance(done);
+    }
+    PlanOnce();
+    ASSERT_EQ(scheduler_->RequestTokenSize("seed"), -1);
+
+    // Case A: prompt hits seed's 150-token tail and crosses page boundaries
+    // (+300 tokens -> 450 tokens = 4 pages). Privatized tail (slot 1) and newly
+    // acquired pages (slots 2, 3) cluster into one fresh parent != seed_parent.
+    std::vector<std::int32_t> cross_tokens = seed_tokens;
+    const std::vector<std::int32_t> cross_extra = MakeTokens(300, 10000);
+    cross_tokens.insert(cross_tokens.end(), cross_extra.begin(), cross_extra.end());
+
+    // Case B: prompt hits seed's 150-token tail and ends inside the SAME page
+    // (+10 tokens -> 160 tokens, so Round 1 calls privatize_slot and Acquire(0)).
+    std::vector<std::int32_t> same_page_tokens = seed_tokens;
+    const std::vector<std::int32_t> sp_extra = MakeTokens(10, 20000);
+    same_page_tokens.insert(same_page_tokens.end(), sp_extra.begin(), sp_extra.end());
+
+    // Case C: third concurrent request hitting the exact same seed prefix with
+    // another suffix stays isolated from both Case A and Case B.
+    std::vector<std::int32_t> peer_tokens = seed_tokens;
+    const std::vector<std::int32_t> peer_extra = MakeTokens(200, 30000);
+    peer_tokens.insert(peer_tokens.end(), peer_extra.begin(), peer_extra.end());
+
+    Submit(RequestSpec{.request_id = "cross", .tokens = cross_tokens, .max_new_tokens = 0});
+    Submit(RequestSpec{.request_id = "same_page", .tokens = same_page_tokens, .max_new_tokens = 0});
+    Submit(RequestSpec{.request_id = "peer", .tokens = peer_tokens, .max_new_tokens = 0});
+
+    const ExecutionPlan p1 = PlanOnce();
+    const ForwardBatch* b1 = FindForwardBatch(p1);
+    ASSERT_NE(b1, nullptr);
+    ASSERT_EQ(b1->request_ids.size(), 3u);
+
+    const std::vector<std::int32_t> cross_row = NonZeroRowOf(*b1, "full", "cross");
+    const std::vector<std::int32_t> sp_row = NonZeroRowOf(*b1, "full", "same_page");
+    const std::vector<std::int32_t> peer_row = NonZeroRowOf(*b1, "full", "peer");
+    ASSERT_GE(cross_row.size(), 4u);
+    ASSERT_EQ(sp_row.size(), 2u);
+    ASSERT_GE(peer_row.size(), 3u);
+
+    // Slot 0 is seed's shared cached page 0 in seed_parent.
+    EXPECT_EQ(ParentOf(cross_row[0], kPacking), seed_parent);
+    EXPECT_EQ(ParentOf(sp_row[0], kPacking), seed_parent);
+    EXPECT_EQ(ParentOf(peer_row[0], kPacking), seed_parent);
+
+    // Case A: privatized tail (slot 1) and subsequent pages (slots 2, 3) share
+    // one dedicated fresh parent != seed_parent.
+    const std::int32_t cross_parent = ParentOf(cross_row[1], kPacking);
+    EXPECT_NE(cross_parent, seed_parent);
+    for (std::size_t slot = 1; slot < cross_row.size(); ++slot) {
+        EXPECT_EQ(ParentOf(cross_row[slot], kPacking), cross_parent) << "cross slot " << slot;
+    }
+
+    // Case C: peer's privatized tail + new pages share their own distinct parent.
+    const std::int32_t peer_parent = ParentOf(peer_row[1], kPacking);
+    EXPECT_NE(peer_parent, seed_parent);
+    EXPECT_NE(peer_parent, cross_parent);
+    for (std::size_t slot = 1; slot < peer_row.size(); ++slot) {
+        EXPECT_EQ(ParentOf(peer_row[slot], kPacking), peer_parent) << "peer slot " << slot;
+    }
+
+    // Case B Round 1: privatized tail lands in its own fresh parent != seed/cross/peer.
+    const std::int32_t sp_parent = ParentOf(sp_row[1], kPacking);
+    EXPECT_NE(sp_parent, seed_parent);
+    EXPECT_NE(sp_parent, cross_parent);
+    EXPECT_NE(sp_parent, peer_parent);
+
+    // Finish cross & peer, then decode same_page past token 256 (into page 2):
+    // Round 2+ Acquire derives PreferredParent(table) == sp_parent and keeps
+    // page 2 in sp_parent.
+    {
+        ExecutionEvent results;
+        results.With(forward::ExtendResult{.request_id = "cross", .tokens = {60002}});
+        results.With(forward::Finish{.request_id = "cross"});
+        results.With(forward::ExtendResult{.request_id = "peer", .tokens = {60003}});
+        results.With(forward::Finish{.request_id = "peer"});
+        results.With(forward::ExtendResult{.request_id = "same_page", .tokens = {60004}});
+        scheduler_->Advance(results);
+    }
+    std::int32_t tok = 60010;
+    std::vector<std::int32_t> sp_after_cross;
+    for (std::int32_t step = 0; step < 100; ++step) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        sp_after_cross = RowOf(*batch, "full", "same_page");
+        SendForwardDone("same_page", {++tok});
+        if (sp_after_cross.size() >= 3u) {
+            break;
+        }
+    }
+    ASSERT_GE(sp_after_cross.size(), 3u);
+    EXPECT_EQ(ParentOf(sp_after_cross[1], kPacking), sp_parent);
+    EXPECT_EQ(ParentOf(sp_after_cross[2], kPacking), sp_parent);
+    EXPECT_TRUE(
+        CacheCoordinatorTestAccess::BoundaryTreeMismatches(SchedulerTestAccess::Coordinator(*scheduler_)).empty());
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, KvParallelShardedHybridBalancesShardsAndIsolatesRequests) {
+    constexpr std::int32_t kPacking = 12;
+    for (const std::int32_t shards : {2, 4}) {
+        SCOPED_TRACE(::testing::Message() << "shards=" << shards);
+        config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, shards, /*disable_prefix_cache=*/true);
+        scheduler_ = std::make_unique<Scheduler>(config_);
+
+        const std::vector<std::string> ids{"r0", "r1", "r2"};
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            Submit(RequestSpec{.request_id = ids[i],
+                               .tokens = MakeTokens(3 * kP, static_cast<std::int32_t>(5000 * (i + 1))),
+                               .max_new_tokens = 0});
+        }
+        std::map<std::string, std::vector<std::int32_t>> rows;
+        std::int32_t tok = 70000;
+        for (std::int32_t step = 0; step < 4 * kP; ++step) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            ASSERT_EQ(batch->request_ids.size(), ids.size());
+            ExecutionEvent results;
+            for (const std::string& id : batch->request_ids) {
+                if (step + 1 == 4 * kP) {
+                    rows[id] = RowOf(*batch, "full", id);
+                }
+                results.With(forward::ExtendResult{.request_id = id, .tokens = {++tok}});
+            }
+            scheduler_->Advance(results);
+        }
+
+        std::set<std::int32_t> all_parents;
+        for (const std::string& id : ids) {
+            const std::vector<std::int32_t>& row = rows.at(id);
+            ASSERT_GE(row.size(), 7u);
+            // All blocks of each request fit inside a single dedicated parent.
+            const std::set<std::int32_t> parents = ParentsOf(row, kPacking);
+            EXPECT_EQ(parents.size(), 1u) << id;
+            EXPECT_TRUE(all_parents.insert(*parents.begin()).second) << id;
+            // Shard load across KV-parallel buckets is balanced (diff <= 1).
+            std::vector<std::int32_t> counts(static_cast<std::size_t>(shards), 0);
+            for (const std::int32_t page : row) {
+                ++counts[static_cast<std::size_t>((page - 1) % shards)];
+            }
+            const auto [min_it, max_it] = std::ranges::minmax_element(counts);
+            EXPECT_LE(*max_it - *min_it, 1) << id;
+        }
+        EXPECT_TRUE(
+            CacheCoordinatorTestAccess::BoundaryTreeMismatches(SchedulerTestAccess::Coordinator(*scheduler_)).empty());
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, HybridRetractionRestorePacksDedicatedParentAndContinuesAffinity) {
+    constexpr std::int32_t kPacking = 6;
+    for (const bool with_l2 : {false, true}) {
+        SCOPED_TRACE(with_l2 ? "with_l2" : "snapshot_only");
+        // With L2 disabled, every KV block of victim retracts to the snapshot
+        // pool and restores fresh into one dedicated parent. With L2 enabled,
+        // completed prefix pages stay claimed in victim's original parent while
+        // the writable tail restores into a fresh dedicated parent != bg_parent
+        // and subsequent decode growth stays in that restored tail parent.
+        config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, /*full_shards=*/1,
+                                   /*disable_prefix_cache=*/!with_l2, /*enable_host_and_snapshot=*/true);
+        if (!with_l2) {
+            config_.disable_l2_cache = true;
+            config_.host_allocator.total_pages = 0;
+            config_ = WithHostPackingFromDevice(config_);
+        }
+        // debug_force_retraction_interval > 0 arms the oldest Decoding request:
+        // Plan 1: victim prefill; Plan 2: bg prefill; Plan 3: decode (both
+        // enter Decoding); Plan 4: retract oldest Decoding (victim) while bg
+        // stays live holding its partial KV parent.
+        config_.debug_force_retraction_interval = 4;
+        config_.debug_force_retraction_max_per_request = 1;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+
+        // Submit victim first with 2 full pages + 123 tokens (379 tokens -> 3
+        // KV blocks + optional copy-in <= packing 6): sits close enough to the
+        // 384-token boundary to cross into page 3 right after restore while bg
+        // still holds bg_parent.
+        Submit(RequestSpec{.request_id = "victim", .tokens = MakeTokens(2 * kP + 123, 5000), .max_new_tokens = 0});
+        std::int32_t tok = 80001;
+        const ExecutionPlan prefill_plan = PlanOnce();  // plan 1: victim prefill
+        AckWriteBacks(prefill_plan);
+        const std::vector<std::int32_t> initial_victim_row =
+            NonZeroRowOf(*FindForwardBatch(prefill_plan), "full", "victim");
+        const std::set<std::int32_t> initial_victim_parents = ParentsOf(initial_victim_row, kPacking);
+        ASSERT_EQ(initial_victim_parents.size(), 1u) << "non-page-aligned prompt + copy-in packs into one parent";
+        const std::int32_t initial_victim_parent = *initial_victim_parents.begin();
+        LandBatch(prefill_plan, tok);
+
+        // Submit bg second so it holds a partial KV parent (3 blocks in a
+        // packing-6 parent -> 3 free holes) separate from victim.
+        Submit(RequestSpec{.request_id = "bg", .tokens = MakeTokens(2 * kP, 100), .max_new_tokens = 0});
+        const ExecutionPlan bg_plan = PlanOnce();  // plan 2: bg prefill
+        AckWriteBacks(bg_plan);
+        const std::int32_t bg_parent =
+            *ParentsOf(NonZeroRowOf(*FindForwardBatch(bg_plan), "full", "bg"), kPacking).begin();
+        EXPECT_NE(bg_parent, initial_victim_parent);
+        LandBatch(bg_plan, tok);
+
+        const ExecutionPlan decode_plan = PlanOnce();  // plan 3: decode (victim enters Decoding)
+        AckWriteBacks(decode_plan);
+        LandBatch(decode_plan, tok);
+
+        const ExecutionPlan retract_plan = PlanOnce();  // plan 4: retract oldest Decoding (victim)
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        const SnapshotStoreBatch* store = FindSnapshotStore(retract_plan);
+        ASSERT_NE(store, nullptr);
+        ASSERT_EQ(store->request_ids, std::vector<std::string>{"victim"});
+        AckImageStores(retract_plan);
+        LandBatch(retract_plan, tok);
+
+        const ExecutionPlan readmit_plan = PlanOnce();  // plan 5: restore victim
+        const SnapshotRestoreBatch* restore = FindRestore(readmit_plan);
+        ASSERT_NE(restore, nullptr);
+        ASSERT_EQ(restore->request_ids, std::vector<std::string>{"victim"});
+        AckRestores(readmit_plan);
+        AckWriteBacks(readmit_plan);
+        LandBatch(readmit_plan, tok);
+
+        const ExecutionPlan resumed_plan = PlanOnce();  // plan 6: victim resumes
+        const ForwardBatch* resumed_batch = FindForwardBatch(resumed_plan);
+        ASSERT_NE(resumed_batch, nullptr);
+        ASSERT_NE(std::ranges::find(resumed_batch->request_ids, "victim"), resumed_batch->request_ids.end());
+        const std::vector<std::int32_t> restored_row = NonZeroRowOf(*resumed_batch, "full", "victim");
+        ASSERT_EQ(restored_row.size(), 3u);
+        const std::set<std::int32_t> victim_parents = ParentsOf(restored_row, kPacking);
+        EXPECT_FALSE(victim_parents.contains(bg_parent)) << "restore does not scatter into bg's partial parent";
+        const std::int32_t restored_tail_parent = ParentOf(restored_row.back(), kPacking);
+        if (!with_l2) {
+            EXPECT_EQ(victim_parents, (std::set<std::int32_t>{restored_tail_parent}))
+                << "snapshot-only restore packs entire KV history into one dedicated parent";
+        } else {
+            EXPECT_EQ(ParentOf(restored_row[0], kPacking), initial_victim_parent);
+            EXPECT_EQ(ParentOf(restored_row[1], kPacking), initial_victim_parent);
+            EXPECT_NE(restored_tail_parent, initial_victim_parent);
+            EXPECT_NE(restored_tail_parent, bg_parent);
+        }
+        AckWriteBacks(resumed_plan);
+        LandBatch(resumed_plan, tok);
+
+        // Continuing to decode victim past token 384 (page 3) stays in the
+        // restored tail parent (PreferredParent derived from live restored tail).
+        std::vector<std::int32_t> grown_row;
+        for (std::int32_t step = 0; step < 8; ++step) {
+            const ExecutionPlan plan = PlanOnce();
+            AckImageStores(plan);
+            if (FindRestore(plan) != nullptr) {
+                AckRestores(plan);
+            }
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch != nullptr && std::ranges::find(batch->request_ids, "victim") != batch->request_ids.end()) {
+                grown_row = NonZeroRowOf(*batch, "full", "victim");
+            }
+            LandBatch(plan, tok);
+            if (grown_row.size() > restored_row.size()) {
+                break;
+            }
+        }
+        ASSERT_GT(grown_row.size(), restored_row.size());
+        EXPECT_EQ(ParentOf(grown_row.back(), kPacking), restored_tail_parent);
+        EXPECT_EQ(ParentsOf(grown_row, kPacking), victim_parents);
+        EXPECT_TRUE(
+            CacheCoordinatorTestAccess::BoundaryTreeMismatches(SchedulerTestAccess::Coordinator(*scheduler_)).empty());
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, PackedStateGroupStaysCompactHoleFirstWhileFullIsolates) {
+    // Regression guard: even when a State group itself has packing > 1,
+    // State allocations remain compact hole-first while full-attention stays
+    // request-aware.
+    constexpr std::int32_t kFullPacking = 6;
+    constexpr std::int32_t kStatePacking = 4;
+    config_ = MakeHybridConfig(/*total_lcm_pages=*/16, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/true,
+                               /*enable_host_and_snapshot=*/false, kStatePacking);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(RequestSpec{.request_id = "r0", .tokens = MakeTokens(kP, 100), .max_new_tokens = 16});
+    Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(kP, 2000), .max_new_tokens = 16});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"r0", "r1"}));
+
+    // Full-attention isolates r0 and r1 into distinct parents.
+    const std::int32_t full_p0 = *ParentsOf(RowOf(*batch, "full", "r0"), kFullPacking).begin();
+    const std::int32_t full_p1 = *ParentsOf(RowOf(*batch, "full", "r1"), kFullPacking).begin();
+    EXPECT_NE(full_p0, full_p1);
+
+    // State groups pack r0 and r1's live state blocks into the same parent.
+    for (const std::string& group : {"state0", "state1", "state2"}) {
+        const std::vector<std::int32_t> s0 = RowOf(*batch, group, "r0");
+        const std::vector<std::int32_t> s1 = RowOf(*batch, group, "r1");
+        EXPECT_EQ(ParentOf(s0.at(1), kStatePacking), ParentOf(s1.at(1), kStatePacking)) << group;
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, PageAlignedClaimedRestoreOpensFreshParentForPrivateReserve) {
+    // Regression guard: when a request retracts right on a page boundary and
+    // restore claims its completed pages from the Device prefix index, the
+    // newly acquired decode reserve block must open a fresh parent instead of
+    // appending beside the claimed prefix parent.
+    constexpr std::int32_t kPacking = 6;
+    config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, /*full_shards=*/1, /*disable_prefix_cache=*/false,
+                               /*enable_host_and_snapshot=*/true);
+    config_.debug_force_retraction_interval = 4;
+    config_.debug_force_retraction_max_per_request = 1;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    // 255-token prompt + 1 decode step -> NumComputedTokens() == 256 (2 * kP)
+    // when Plan 4 retracts victim, so both imaged KV slots are claimable from
+    // the Device prefix index on restore and Acquire appends slot 2 for decode.
+    Submit(RequestSpec{.request_id = "victim", .tokens = MakeTokens(2 * kP - 1, 9000), .max_new_tokens = 0});
+    std::int32_t tok = 90001;
+    const ExecutionPlan p1 = PlanOnce();  // victim prefill (255 computed -> 256 tokens)
+    AckWriteBacks(p1);
+    const std::int32_t prefix_parent =
+        *ParentsOf(NonZeroRowOf(*FindForwardBatch(p1), "full", "victim"), kPacking).begin();
+    LandBatch(p1, tok);
+
+    Submit(RequestSpec{.request_id = "bg", .tokens = MakeTokens(2 * kP, 100), .max_new_tokens = 0});
+    const ExecutionPlan p2 = PlanOnce();  // bg prefill
+    AckWriteBacks(p2);
+    const std::int32_t bg_parent = *ParentsOf(NonZeroRowOf(*FindForwardBatch(p2), "full", "bg"), kPacking).begin();
+    LandBatch(p2, tok);
+
+    const ExecutionPlan p3 = PlanOnce();  // decode: victim computes token 256 (exact page boundary)
+    AckWriteBacks(p3);
+    LandBatch(p3, tok);
+
+    const ExecutionPlan p4 = PlanOnce();  // retract victim at 256 computed tokens
+    const SnapshotStoreBatch* store = FindSnapshotStore(p4);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->request_ids, std::vector<std::string>{"victim"});
+    AckImageStores(p4);
+    LandBatch(p4, tok);
+
+    const ExecutionPlan p5 = PlanOnce();  // restore victim (claims slots 0..1, acquires reserve slot 2)
+    const SnapshotRestoreBatch* restore = FindRestore(p5);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"victim"});
+    AckRestores(p5);
+    AckWriteBacks(p5);
+    LandBatch(p5, tok);
+
+    const ExecutionPlan p6 = PlanOnce();  // victim resumes
+    const ForwardBatch* resumed = FindForwardBatch(p6);
+    ASSERT_NE(resumed, nullptr);
+    const std::vector<std::int32_t> row = NonZeroRowOf(*resumed, "full", "victim");
+    ASSERT_EQ(row.size(), 3u);
+    EXPECT_EQ(ParentOf(row[0], kPacking), prefix_parent);
+    EXPECT_EQ(ParentOf(row[1], kPacking), prefix_parent);
+    EXPECT_NE(ParentOf(row[2], kPacking), prefix_parent)
+        << "private decode reserve must not append into the claimed Device prefix parent";
+    EXPECT_NE(ParentOf(row[2], kPacking), bg_parent);
 }
 
 }  // namespace tokenspeed::test

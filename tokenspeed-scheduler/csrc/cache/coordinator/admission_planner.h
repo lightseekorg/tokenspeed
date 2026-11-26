@@ -68,6 +68,10 @@ struct AdmissionPlan {
     // Per group, the copy-in blocks the admission reserves, in slot order
     // (AdmissionPlanner::copyInReservations). Empty without a copy-in point.
     std::vector<std::vector<CopyInReservation>> copy_ins;
+    // Per group, the planned placement demand with same_bucket_pairs folded
+    // into blocks_by_bucket, so commit can reserve empty parents for later
+    // groups without recomputing capacity.
+    std::vector<BlockPlacementDemand> block_demands;
 };
 
 // The table shape a restore rebuilds before its dense demand is placed: how
@@ -154,6 +158,7 @@ struct AdmissionCapacity {
 struct AdmissionDecisions {
     std::vector<VictimSet> victims;
     std::vector<std::vector<CopyInReservation>> copy_ins;
+    std::vector<BlockPlacementDemand> block_demands;
 };
 
 // Immutable request view. Each Plan call owns its working set and returns decisions.
@@ -196,11 +201,17 @@ public:
                 AssignPairBuckets(capacity.block_demands[i], selection.eviction_plan.HolesByBucket(i));
             auto next_pair = pair_buckets.begin();
             for (CopyInReservation& copy_in : capacity.copy_ins[i]) {
-                if (copy_in.bucket < 0) copy_in.bucket = *next_pair++;
+                if (copy_in.bucket < 0) {
+                    copy_in.bucket = *next_pair++;
+                    capacity.block_demands[i].blocks_by_bucket[static_cast<std::size_t>(copy_in.bucket)] += 2;
+                }
             }
+            capacity.block_demands[i].same_bucket_pairs = 0;
             _assert(next_pair == pair_buckets.end(), "every pair of the fit has a copy-in slot");
         }
-        return AdmissionDecisions{.victims = std::move(selection.victims), .copy_ins = std::move(capacity.copy_ins)};
+        return AdmissionDecisions{.victims = std::move(selection.victims),
+                                  .copy_ins = std::move(capacity.copy_ins),
+                                  .block_demands = std::move(capacity.block_demands)};
     }
 
     virtual ~AdmissionPlanner() = default;
@@ -1251,7 +1262,8 @@ std::optional<AdmissionPlan> planAdmissionWith(
     return AdmissionPlan{.prefix = std::move(prefix),
                          .member_resource = std::move(member_resource),
                          .victims = std::move(decisions->victims),
-                         .copy_ins = std::move(decisions->copy_ins)};
+                         .copy_ins = std::move(decisions->copy_ins),
+                         .block_demands = std::move(decisions->block_demands)};
 }
 
 inline std::optional<AdmissionPlan> planAdmission(

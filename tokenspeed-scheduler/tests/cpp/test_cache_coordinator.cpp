@@ -2186,9 +2186,9 @@ TEST(CacheCoordinatorAdmissionTest, UsesLocalSlotAfterEvictingAnotherWholeParent
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[2], 0)));
     ASSERT_EQ(tables[0].NumBlocks(), 3);
-    EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, newest_partial_parent);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, old_full_parent);
     EXPECT_EQ(tables[0].Blocks()[1]->Location().lcm_block_id, old_full_parent);
-    EXPECT_EQ(tables[0].Blocks()[2]->Location().lcm_block_id, old_full_parent);
+    EXPECT_EQ(tables[0].Blocks()[2]->Location().lcm_block_id, newest_partial_parent);
 }
 
 TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFreesRequiredParent) {
@@ -6924,7 +6924,7 @@ TEST(RetractionImageTest, ALoneRestoreDropsClaimsThatBindTooManyParents) {
         holes.clear();
         std::vector<BlockTable> later(2);
         ASSERT_TRUE(AdmitForTest(coordinator, later, /*num_tokens=*/12));
-        EXPECT_EQ(paged.BlockTablePageIds(later[0]), (std::vector<std::int32_t>{2, 4, 6, 8, 22, 24}));
+        EXPECT_EQ(paged.BlockTablePageIds(later[0]), (std::vector<std::int32_t>{24, 8, 22, 2, 4, 6}));
         EXPECT_EQ(single.BlockTablePageIds(later[1]), (std::vector<std::int32_t>{5, 6, 7, 8, 9, 10}));
         CacheFullBlocksForTest(coordinator, later, hashes);
         coordinator.Free(later);
@@ -6949,8 +6949,8 @@ TEST(RetractionImageTest, ALoneRestoreDropsClaimsThatBindTooManyParents) {
             continue;
         }
         ASSERT_TRUE(restore) << "a dense layout of the image needs eleven";
-        EXPECT_EQ(paged.BlockTablePageIds(restored[0]), (std::vector<std::int32_t>{1, 23, 24, 19, 20, 21, 22}));
-        EXPECT_EQ(single.BlockTablePageIds(restored[1]), (std::vector<std::int32_t>{9, 4, 8, 3, 7, 2, 6}));
+        EXPECT_EQ(paged.BlockTablePageIds(restored[0]), (std::vector<std::int32_t>{5, 6, 19, 20, 3, 4, 23}));
+        EXPECT_EQ(single.BlockTablePageIds(restored[1]), (std::vector<std::int32_t>{9, 1, 8, 11, 7, 4, 6}));
         EXPECT_TRUE(restore->new_page_ids[0].empty() && restore->new_page_ids[1].empty())
             << "the reserve fits the tails";
         EXPECT_EQ(coordinator.DeviceEvictions().restore.blocks, 16u) << "all the cache but page 0's old entries";
@@ -6968,7 +6968,7 @@ TEST(RetractionImageTest, ALoneRestoreDropsClaimsThatBindTooManyParents) {
             EXPECT_TRUE(restore->snapshot_pairs[g].key.content_hash.empty());
             EXPECT_EQ(restore->snapshot_pairs[g].destination, restored[g].Blocks()[6]);
         }
-        EXPECT_EQ(paged.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(0).Find(pool, Key(hashes[0], 0))), 2);
+        EXPECT_EQ(paged.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(0).Find(pool, Key(hashes[0], 0))), 24);
         EXPECT_EQ(single.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(1).Find(pool, Key(hashes[0], 1))), 5);
 
         // The ACK republishes every keyed row, as CompleteSnapshotRestore does.
@@ -6976,7 +6976,7 @@ TEST(RetractionImageTest, ALoneRestoreDropsClaimsThatBindTooManyParents) {
             coordinator.CacheDeviceBlock(row.destination, row.key, row.logical_block_index, row.boundary_kind,
                                          /*access_epoch=*/1);
         }
-        EXPECT_EQ(paged.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(0).Find(pool, Key(hashes[0], 0))), 2)
+        EXPECT_EQ(paged.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(0).Find(pool, Key(hashes[0], 0))), 24)
             << "the old entry stays the key's";
         EXPECT_EQ(single.ResolveCacheBlockId(*coordinator.GroupPrefixIndex(1).Find(pool, Key(hashes[0], 1))), 5);
         for (std::uint32_t g = 0; g < 2; ++g) {
@@ -7428,9 +7428,14 @@ protected:
             PromptPrefix{.prefix_hashes = {}, .tokens = prompt_, .max_tokens = 3});
     }
 
-    // An unrelated full page cached from the block a dense growth takes next;
-    // sets `location` to its block.
+    // An unrelated full page cached inside an existing group-0 hole (keeping
+    // any empty parents untouched for later State allocations); sets `location`
+    // to its block.
     void CacheUnrelatedPage(CacheBlockLocation& location) {
+        std::vector<CacheBlockRef> hold_empty;
+        while (pool_.NumEmptyLcmBlocks() > 0) {
+            hold_empty.push_back(pool_.AcquireBlock(1));
+        }
         std::vector<BlockTable> filler(2);
         ASSERT_TRUE(AdmitForTest(coordinator_, filler, coordinator_.Prober().ProbePrefix({}),
                                  GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
@@ -7663,9 +7668,17 @@ TEST_F(ShardedTailCopyPackingFourTest, OwnerKeepsWritingItsBlockWhenTheTailIsPub
     ASSERT_EQ(BucketOf(owner[0].Blocks()[0]), 0);
     ASSERT_EQ(BucketOf(prompt->copy_in_blocks[0].front()), 0);
     std::vector<BlockTable> other(2);
-    ASSERT_TRUE(AdmitForTest(coordinator_, other, coordinator_.Prober().ProbePrefix({}),
-                             GroupDemand{.extent = DenseGrowth{3}}, RequestProgress{},
-                             StateStep{StateStep::Kind::kKeep}));
+    {
+        // Keep the empty parents aside so `other` takes the bucket-1 hole in
+        // `owner`'s parent (testing cross-bucket tail publication dedup).
+        std::vector<CacheBlockRef> hold_empty;
+        while (pool_.NumEmptyLcmBlocks() > 0) {
+            hold_empty.push_back(pool_.AcquireBlock(1));
+        }
+        ASSERT_TRUE(AdmitForTest(coordinator_, other, coordinator_.Prober().ProbePrefix({}),
+                                 GroupDemand{.extent = DenseGrowth{3}}, RequestProgress{},
+                                 StateStep{StateStep::Kind::kKeep}));
+    }
     const CacheBlockLocation canonical = other[0].Blocks()[0]->Location();
     ASSERT_EQ(BucketOf(other[0].Blocks()[0]), 1);
     coordinator_.CacheCompletedBlocks(other, FinalTailAtThree(/*publish_state=*/false),
@@ -7727,14 +7740,22 @@ TEST_F(ShardedTailCopyPackingFourTest, OwnerCopiesInWhenItsAdmissionEvictsTheTai
 TEST_F(ShardedTailCopyPackingFourTest, APairsBucketFollowsTheVictimsTheFitChooses) {
     const std::vector<std::string> pages = ContentHashes({{5, 6, 7, 8}, {9, 10, 11, 12}});
     std::vector<CacheBlockLocation> cached;
-    for (std::size_t page = 0; page < pages.size(); ++page) {
-        std::vector<BlockTable> filler(2);
-        ASSERT_TRUE(AdmitForTest(coordinator_, filler, coordinator_.Prober().ProbePrefix({}),
-                                 GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
-                                 StateStep{StateStep::Kind::kKeep}));
-        cached.push_back(filler[0].Blocks()[0]->Location());
-        CacheFullBlocksForTest(coordinator_, filler, std::span<const std::string>(pages).subspan(page, 1));
-        coordinator_.Free(filler);
+    {
+        // Keep the two State parents aside while seeding both bucket-0 cached
+        // pages into the single group-0 parent.
+        std::vector<CacheBlockRef> hold_empty;
+        for (std::size_t page = 0; page < pages.size(); ++page) {
+            while (page > 0 && pool_.NumEmptyLcmBlocks() > 0) {
+                hold_empty.push_back(pool_.AcquireBlock(1));
+            }
+            std::vector<BlockTable> filler(2);
+            ASSERT_TRUE(AdmitForTest(coordinator_, filler, coordinator_.Prober().ProbePrefix({}),
+                                     GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
+                                     StateStep{StateStep::Kind::kKeep}));
+            cached.push_back(filler[0].Blocks()[0]->Location());
+            CacheFullBlocksForTest(coordinator_, filler, std::span<const std::string>(pages).subspan(page, 1));
+            coordinator_.Free(filler);
+        }
     }
     ASSERT_EQ(coordinator_.Allocator(0).BucketOf(cached[0]), 0);
     ASSERT_EQ(coordinator_.Allocator(0).BucketOf(cached[1]), 0);
@@ -7764,10 +7785,13 @@ protected:
 };
 
 TEST_F(ShardedTailCopyPackingTwoTest, ATailBlockAndItsCopyInBlockShareABucketOfTwoParents) {
-    // A parent of the group holds bucket 0's slot elsewhere: its bucket-1
-    // hole and an empty parent's bucket-1 slot hold the pair.
+    // A parent of the group holds bucket 0's slot elsewhere, and one empty
+    // parent is held so only one empty parent remains: the bucket-1 hole and
+    // that empty parent's bucket-1 slot hold the pair.
     const std::vector<CacheBlockRef> held = Resident(0);
-    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 2);
+    const CacheBlockRef hold_one = pool_.AcquireBlock(1);
+    ASSERT_TRUE(hold_one);
+    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 1);
     std::vector<BlockTable> owner(2);
     auto prompt = AdmitOwnerPrompt(owner, StateStep{StateStep::Kind::kKeep});
     ASSERT_TRUE(prompt);
@@ -7775,7 +7799,7 @@ TEST_F(ShardedTailCopyPackingTwoTest, ATailBlockAndItsCopyInBlockShareABucketOfT
     EXPECT_EQ(BucketOf(owner[0].Blocks()[0]), 1);
     EXPECT_EQ(BucketOf(copy_in), 1);
     EXPECT_NE(owner[0].Blocks()[0]->Location().lcm_block_id, copy_in->Location().lcm_block_id);
-    EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 1) << "one parent opened: bucket 1's hole held the other block";
+    EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 0) << "one parent opened: bucket 1's hole held the other block";
     coordinator_.Free(owner);
 }
 
@@ -14748,10 +14772,14 @@ TEST_F(ShardedWriteBackTransactionTest, MembersInAnotherBucketThanTheirDeviceCop
     }
     ASSERT_EQ(x_host_buckets, (std::vector<std::int32_t>{0, 1, 0, 1}));
     // Six bucket-0 slots held in three parents leave six bucket-1 slots, as
-    // many as Y's Full blocks.
+    // many as Y's Full blocks; pin any spare empty parents beyond Y's State
+    // demand so Y takes those bucket-1 holes rather than fresh parents.
     const std::size_t held_before = held_.size();
     for (CacheBlockRef& block : pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 6>{})) {
         held_.push_back(std::move(block));
+    }
+    while (pool_.NumEmptyLcmBlocks() > 6) {
+        held_.push_back(pool_.AcquireBlock(1));
     }
     std::vector<std::int32_t> y_tokens = MakeTokens(16);
     for (std::int32_t i = 0; i < 6; ++i) {
@@ -15763,12 +15791,19 @@ TEST(RetractionImageSplitTest, TheProbeCountsARowInTheBucketOfTheBlockItsPublica
     TierTransferManager transfers(coordinator);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     // Both compute the page. The publisher's block opens a parent at its
-    // bucket-0 slot; the victim's takes that parent's bucket-1 hole, which
-    // goes before a new parent.
+    // bucket-0 slot; keep remaining empty parents occupied while admitting the
+    // victim so the victim's block lands in bucket 1 for cross-bucket dedupe.
     std::vector<BlockTable> publisher(1);
     ASSERT_TRUE(AdmitForTest(coordinator, publisher, /*num_tokens=*/2));
     std::vector<BlockTable> victim(1);
-    ASSERT_TRUE(AdmitForTest(coordinator, victim, /*num_tokens=*/2));
+    {
+        // Hold the bucket-1 hole in publisher's parent untouched, fill all
+        // remaining empty parents whole so victim lands in that bucket-1 hole.
+        CacheBlockRef reserve_hole = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1}).front();
+        std::vector<CacheBlockRef> hold_empty = pool.AcquireBlocks(0, pool.NumEmptyLcmBlocks() * 2);
+        reserve_hole.reset();
+        ASSERT_TRUE(AdmitForTest(coordinator, victim, /*num_tokens=*/2));
+    }
     ASSERT_EQ(allocator.BucketOf(publisher[0].Blocks()[0]->Location()), 0);
     ASSERT_EQ(allocator.BucketOf(victim[0].Blocks()[0]->Location()), 1);
     const std::vector<std::string> page = ContentHashes({{1, 2}});

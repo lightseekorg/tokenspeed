@@ -86,19 +86,45 @@ A fourth quantity lives outside the logical world entirely:
 
 `BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
 the free child-slot count **per bucket** for each cache group, and per-bucket
-ordered sets of partially filled LCM blocks. C++ group ids are dense scheduler
-indices, so the scheduler supplies the complete packing vector when it
-constructs each pool. The per-group placement records form a vector indexed by
-group id, and each `GroupAvailability` stores immutable slots-per-parent
-geometry. The coordinator registers each group's shard count in every pool it
-owns — Device, Host L2, and the snapshot pool alike — before allocation, so a
-block's bucket means the same owner on every tier; an ordinary standalone pool
-fixes a single bucket on first use. Registration cannot change the geometry
-after it is fixed, including after all blocks are freed. The pool updates its
-per-bucket free-slot counts and bucket indexes together on every occupancy
-transition. A parent with zero occupants is unbound, so its capacity belongs
-to the global empty-parent FIFO rather than any group. An allocated block
-never moves, with one exception: a lone request's compaction
+occupancy-indexed intrusive lists of partially filled LCM blocks (each
+occupancy level in `[1, packing - 1]` is an O(1) LIFO doubly-linked list paired
+with a bitmask for O(1) densest/sparsest lookup; intrusive links live inline on
+each parent for up to four shard buckets and grow lazily for wider sharding).
+C++ group ids are dense scheduler indices, so the scheduler supplies the
+complete packing vector when it constructs each pool. The per-group placement
+records form a vector indexed by group id, and each `GroupAvailability` stores
+immutable slots-per-parent geometry. The coordinator registers each group's
+shard count in every pool it owns — Device, Host L2, and the snapshot pool
+alike — before allocation, so a block's bucket means the same owner on every
+tier; an ordinary standalone pool fixes a single bucket on first use.
+Registration cannot change the geometry after it is fixed, including after all
+blocks are freed. The pool updates its per-bucket free-slot counts and bucket
+indexes together on every occupancy transition. A parent with zero occupants is
+unbound, so its capacity belongs to the global empty-parent FIFO rather than
+any group.
+
+For packed Device groups (`packing > 1`, non-State), admission and restore
+apply **request-aware placement** (`ParentAffinity`) so concurrent requests do
+not interleave their pages across the same LCM parents and block whole-parent
+reclamation when one request finishes. `GroupAllocator::PreferredParent`
+derives the affinity parent directly from the request's live `BlockTable` tail
+without storing extra per-request or per-parent state (rejecting shared blocks
+with `use_count > 2`, while admission and restore also disable tail-parent
+reuse on unprivatized prefix hits and claimed Device prefix tails even when
+`use_count == 2` so private growth never packs into cached prefix parents). Each
+allocation step tries: (1) a free slot in `preferred_parent` (respecting
+KV-parallel `min_load` bucket balance); (2) the next empty FIFO parent while
+`NumEmptyLcmBlocks() > reserved_empty_parents`, switching `preferred_parent`
+to that newly opened parent for subsequent blocks of the same request; and
+(3) fallback to the densest partial parent (hole-first) once empty parents
+reach the reserve floor. `reserved_empty_parents` reserves the exact empty
+parents later groups in the same admission step require (computed from the
+planner's `BlockPlacementDemand` and current per-bucket holes), so an earlier
+packed KV group never consumes empty parents needed by a later `packing = 1`
+group (such as State checkpoints). `State` groups, `packing == 1` groups, and
+compact Host/snapshot tiers bypass affinity and remain hole-first.
+
+An allocated block never moves, with one exception: a lone request's compaction
 (`LoneRequestAdmission::Compact`, `scheduler.md` §1.4) gathers the
 request's own blocks of a packed group into fewer of its parents, naming
 the free slot each one takes (`AcquireBlockAt`, the one placement that

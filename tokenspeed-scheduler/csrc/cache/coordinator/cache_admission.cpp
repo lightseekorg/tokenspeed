@@ -54,7 +54,8 @@ struct PairedBlocks {
 
 PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const GroupAllocator& allocator,
                             const BlockTable& table, std::span<const CopyInReservation> copy_ins,
-                            std::int32_t first_slot, std::vector<CacheBlockRef>& reserved) {
+                            std::int32_t first_slot, std::vector<CacheBlockRef>& reserved,
+                            std::optional<ParentAffinity> affinity) {
     PairedBlocks paired{.first_slot = table.NumBlocks()};
     std::vector<std::int32_t> buckets;
     for (const CopyInReservation& copy_in : copy_ins) {
@@ -74,7 +75,9 @@ PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const Group
     for (const CopyInReservation& copy_in : copy_ins) {
         buckets.push_back(copy_in.bucket);
     }
-    std::vector<CacheBlockRef> acquired = pool.AcquireBlocksInBuckets(group_id, buckets);
+    std::vector<CacheBlockRef> acquired = affinity
+                                              ? pool.AcquireBlocksInBucketsWithAffinity(group_id, buckets, *affinity)
+                                              : pool.AcquireBlocksInBuckets(group_id, buckets);
     FatalCheck(acquired.size() == buckets.size(), "admission plan no longer fits the block pool");
     auto next = std::make_move_iterator(acquired.begin());
     paired.blocks.assign(next, next + static_cast<std::ptrdiff_t>(num_paired));
@@ -83,6 +86,22 @@ PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const Group
         reserved[static_cast<std::size_t>(copy_in.slot - first_slot)] = *next++;
     }
     return paired;
+}
+
+// Empty LCM parents later groups (j > group_index) still need in this
+// admission under hole-first accounting. Earlier groups keep at least this many
+// empty parents untouched before falling back to their own bound-parent holes.
+std::int64_t reservedEmptyParentsForLaterGroups(const BlockPool& pool, std::span<const CacheGroup> groups,
+                                                std::span<const BlockPlacementDemand> block_demands,
+                                                std::size_t group_index) {
+    std::int64_t reserved = 0;
+    for (std::size_t j = group_index + 1; j < groups.size(); ++j) {
+        const std::uint32_t gid = groups[j].Id();
+        _assert(block_demands[j].same_bucket_pairs == 0, "pair buckets are folded into blocks_by_bucket at plan time");
+        reserved += ParentsNeededForBuckets(block_demands[j].blocks_by_bucket, pool.FreeSlotsByBucket(gid),
+                                            block_demands[j].any_bucket_blocks, pool.Packing(gid));
+    }
+    return reserved;
 }
 
 }  // namespace
@@ -242,11 +261,11 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
     // Gives a hitter's table a private block in `slot`: a copy of the shared
     // block there (copy-on-write), or a fresh one where the slot was a hole,
     // zeroed unless the peer's landing fills it.
-    const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot,
-                                    std::int32_t available_tokens) {
+    const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
+                                    ParentAffinity affinity) {
         GroupAllocator& allocator = store_.Groups()[i].Allocator();
         const CacheBlockRef replaced = allocator.SwapInFreshBlock(store_.DevicePool(), table, slot, available_tokens,
-                                                                  /*destination=*/std::nullopt);
+                                                                  /*destination=*/std::nullopt, affinity);
         const std::int32_t destination = allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]);
         if (replaced) {
             result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced), destination);
@@ -356,8 +375,13 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             }
             held.clear();  // the unused ones go back
         }
+        const std::int64_t reserved_for_later =
+            GroupIsState(i)
+                ? 0
+                : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), plan.block_demands, i);
         // A first admission's table ends in the tail's blocks: shared full
         // pages, then this request's own copies.
+        bool privatized_tail = false;
         if (!GroupIsState(i) && device_tail_tokens > 0 && table.NumBlocks() > 0) {
             const TailSlots slots =
                 tailSlots(store_.Geometry()[i], store_.PrefixGranularity(), acquired_prefix.device.num_common_tokens);
@@ -365,8 +389,13 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             // A sliding group's tail blocks below its window stay holes.
             const std::int32_t first =
                 slots.first + store_.FirstTailBlockNeeded(static_cast<std::int32_t>(i), device_tail_tokens);
+            std::optional<std::int32_t> tail_parent;
             for (std::int32_t slot = first; slot < slots.past_end; ++slot) {
-                privatize_slot(i, table, slot, slots.available_tokens);
+                privatize_slot(
+                    i, table, slot, slots.available_tokens,
+                    ParentAffinity{.preferred_parent = tail_parent, .reserved_empty_parents = reserved_for_later});
+                tail_parent = table.Blocks()[static_cast<std::size_t>(slot)]->Location().lcm_block_id;
+                privatized_tail = true;
             }
         }
         if (GroupIsState(i)) {
@@ -424,7 +453,10 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             }
             continue;
         }
-        if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
+        const bool had_device_hit = acquired_prefix.device.num_common_tokens > 0;
+        const bool had_host_hit =
+            !acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty();
+        if (had_host_hit) {
             const std::int32_t available = host_tail_tokens > 0
                                                ? tailSlots(store_.Geometry()[i], store_.PrefixGranularity(),
                                                            acquired_prefix.host.num_common_tokens)
@@ -432,23 +464,33 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
                                                : 0;
             // A Host tail's blocks land on fresh destinations (one load row
             // each); a sliding group's tail blocks below its window stay holes.
-            store_.Groups()[i].Allocator().AppendHostExtension(store_.DevicePool(), table,
-                                                               std::move(acquired_prefix.host.per_group[i].blocks),
-                                                               result.load_pairs, available);
+            store_.Groups()[i].Allocator().AppendHostExtension(
+                store_.DevicePool(), table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs,
+                available,
+                ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = reserved_for_later});
         }
+        // A privatized Device tail already sits in this request's own parent;
+        // an unprivatized prefix hit ends on a shared prefix block, so private
+        // growth opens a fresh parent instead of appending beside the prefix.
+        const bool allow_tail_parent = (!had_device_hit && !had_host_hit) || (privatized_tail && !had_host_hit);
         // The copy-in blocks this admission reserves, each with the block it
         // serves (acquireCopyIns), the paired ones placed by the growth.
         PairedBlocks paired{.first_slot = demand.table->NumBlocks()};
         if (copy_in_point) {
             const CacheStore::BlockRange slots = store_.CopyInSlots(i, copy_in_point->tokens);
             result.copy_in_blocks[i].resize(static_cast<std::size_t>(slots.past_end - slots.first));
+            const ParentAffinity copy_in_affinity{
+                .preferred_parent = allow_tail_parent ? GroupAllocator::PreferredParent(*demand.table) : std::nullopt,
+                .reserved_empty_parents = reserved_for_later,
+            };
             paired = acquireCopyIns(store_.DevicePool(), store_.Groups()[i].Id(), store_.Groups()[i].Allocator(),
-                                    *demand.table, plan.copy_ins[i], slots.first, result.copy_in_blocks[i]);
+                                    *demand.table, plan.copy_ins[i], slots.first, result.copy_in_blocks[i],
+                                    copy_in_affinity);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired = store_.Groups()[i].Allocator().Acquire(
             store_.DevicePool(), *demand.table, store_.Geometry()[i].PlanAcquire(*demand.table, demand),
-            paired.first_slot, std::move(paired.blocks));
+            paired.first_slot, std::move(paired.blocks), reserved_for_later, allow_tail_parent);
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         // Only a dense table's slots are block-aligned to the prompt the way
         // landed_whole assumes.
@@ -623,7 +665,15 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
         GroupAllocator& allocator = store_.Groups()[i].Allocator();
         BlockTable& table = *demands[i].table;
         const ImageTable& shape = image.tables[i];
-        FatalCheck(allocator.AcquireShape(store_.DevicePool(), table, shape, std::move(claimed[i])),
+        const std::int64_t reserved_for_later =
+            GroupIsState(i)
+                ? 0
+                : reservedEmptyParentsForLaterGroups(store_.DevicePool(), store_.Groups(), candidate->block_demands, i);
+        const std::optional<ParentAffinity> shape_affinity =
+            GroupIsState(i) ? std::nullopt
+                            : std::optional<ParentAffinity>{ParentAffinity{
+                                  .preferred_parent = std::nullopt, .reserved_empty_parents = reserved_for_later}};
+        FatalCheck(allocator.AcquireShape(store_.DevicePool(), table, shape, std::move(claimed[i]), shape_affinity),
                    "restore plan no longer fits the block pool");
         for (const ImageSlot& slot : shape.slots) {
             const CacheBlockRef& destination = table.Blocks()[static_cast<std::size_t>(slot.slot_index)];
@@ -654,21 +704,33 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
         if (GroupIsState(i)) {
             continue;  // the imaged two slots are the whole table
         }
+        // When the image ends on a page boundary whose tail block was claimed
+        // from the Device prefix index, that parent may hold another request's
+        // cached prefix, so private reserve/copy-in blocks open a fresh parent
+        // rather than appending beside it (consistent with commitAdmission).
+        const bool tail_is_claimed = !table.Blocks().empty() && table.Blocks().back() &&
+                                     store_.Groups()[i].Index().Contains(table.Blocks().back());
+        const bool allow_tail_parent = !tail_is_claimed;
         // The copy-in blocks, each with the rebuilt or grown block it serves
         // (acquireCopyIns), before the reserve's other blocks.
         PairedBlocks paired{.first_slot = table.NumBlocks()};
         if (copy_in_point) {
             const CacheStore::BlockRange slots = store_.CopyInSlots(i, copy_in_point->tokens);
             result.copy_in_blocks[i].resize(static_cast<std::size_t>(slots.past_end - slots.first));
+            const ParentAffinity copy_in_affinity{
+                .preferred_parent = allow_tail_parent ? GroupAllocator::PreferredParent(table) : std::nullopt,
+                .reserved_empty_parents = reserved_for_later,
+            };
             paired = acquireCopyIns(store_.DevicePool(), store_.Groups()[i].Id(), allocator, table,
-                                    candidate->copy_ins[i], slots.first, result.copy_in_blocks[i]);
+                                    candidate->copy_ins[i], slots.first, result.copy_in_blocks[i], copy_in_affinity);
         }
         // Only the reserve appended beyond the imaged shape is fresh, unfilled
         // Device memory for the plan to zero.
         const std::int32_t first_new_block = table.NumBlocks();
-        FatalCheck(allocator.Acquire(store_.DevicePool(), table, store_.Geometry()[i].PlanAcquire(table, demands[i]),
-                                     paired.first_slot, std::move(paired.blocks)),
-                   "restore plan no longer fits the block pool");
+        FatalCheck(
+            allocator.Acquire(store_.DevicePool(), table, store_.Geometry()[i].PlanAcquire(table, demands[i]),
+                              paired.first_slot, std::move(paired.blocks), reserved_for_later, allow_tail_parent),
+            "restore plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {
             result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));

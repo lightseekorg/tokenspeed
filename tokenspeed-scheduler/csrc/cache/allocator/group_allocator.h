@@ -154,6 +154,24 @@ public:
         }
     }
 
+    // Preferred LCM parent for a request's next append: the parent of its live
+    // tail block, unless that slot is null or shared by another live request
+    // (two tables plus the prefix index => use_count >= 3; an in-flight async
+    // write-back on a newly published tail block also raises use_count to 3
+    // and conservatively opens a fresh parent). Because the table holds a live
+    // CacheBlockRef, the returned parent is guaranteed still bound to this
+    // group without a generation counter.
+    static std::optional<std::int32_t> PreferredParent(const BlockTable& table) noexcept {
+        if (table.Blocks().empty()) {
+            return std::nullopt;
+        }
+        const CacheBlockRef& tail = table.Blocks().back();
+        if (!tail || tail.use_count() > 2) {
+            return std::nullopt;
+        }
+        return tail->Location().lcm_block_id;
+    }
+
     // Executes a GroupGeometry plan: acquires plan.num_blocks fresh blocks,
     // places them (dense append or sparse suffix), and stores the planned
     // bookkeeping. A dense append may be handed `placed`: blocks the caller
@@ -161,10 +179,13 @@ public:
     // [first_placed_slot, first_placed_slot + placed.size()) of the appended
     // run, so that every bucket-exact block is acquired before the plan's
     // other blocks take any hole (the order the admission planner's fit
-    // assumes). Returns false when the pool is short of the other blocks,
-    // without mutating the table; the placed blocks go back then.
+    // assumes). `reserved_empty_parents` reserves empty parents for later
+    // groups in the same admission; `allow_tail_parent` controls whether the
+    // table's current tail parent is reused before opening a fresh one.
+    // Returns false when the pool is short of the other blocks, without
+    // mutating the table; the placed blocks go back then.
     bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan, std::int32_t first_placed_slot,
-                 std::vector<CacheBlockRef> placed) const {
+                 std::vector<CacheBlockRef> placed, std::int64_t reserved_empty_parents, bool allow_tail_parent) const {
         const std::int32_t old_num_blocks = table.NumBlocks();
         // A dense append's run starts at the table's end; a sparse suffix's
         // after its head blocks, at the suffix's first slot.
@@ -184,7 +205,15 @@ public:
                     ++loads[static_cast<std::size_t>(block->Location().slot_index % shard_count_)];
                 }
             }
-            block_refs = pool.AcquireBlocks(group_id_, num_others, loads);
+            std::optional<std::int32_t> preferred = allow_tail_parent ? PreferredParent(table) : std::nullopt;
+            if (!preferred && !placed.empty() && placed.back()) {
+                preferred = placed.back()->Location().lcm_block_id;
+            }
+            const ParentAffinity affinity{
+                .preferred_parent = preferred,
+                .reserved_empty_parents = reserved_empty_parents,
+            };
+            block_refs = pool.AcquireBlocksWithAffinity(group_id_, num_others, loads, affinity);
             if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;
             }
@@ -231,8 +260,8 @@ public:
     // without mutation when the pool cannot place the bucket demand. One
     // bucket degenerates to ordinary placement, so the shard count stays a
     // parameter of one path.
-    bool AcquireShape(BlockPool& pool, BlockTable& table, const ImageTable& shape,
-                      std::vector<CacheBlockRef> claimed) const {
+    bool AcquireShape(BlockPool& pool, BlockTable& table, const ImageTable& shape, std::vector<CacheBlockRef> claimed,
+                      std::optional<ParentAffinity> affinity) const {
         _assert(table.NumBlocks() == 0, "AcquireShape requires a fresh (empty) table");
         _assert(claimed.size() == shape.slots.size(), "claimed blocks must parallel the recorded slots");
         std::vector<std::int32_t> buckets;
@@ -245,7 +274,9 @@ public:
                 buckets.push_back(BucketOf(slot.block->Location()));
             }
         }
-        std::vector<CacheBlockRef> fresh = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        std::vector<CacheBlockRef> fresh = affinity
+                                               ? pool.AcquireBlocksInBucketsWithAffinity(group_id_, buckets, *affinity)
+                                               : pool.AcquireBlocksInBuckets(group_id_, buckets);
         if (fresh.size() != buckets.size()) {
             return false;
         }
@@ -269,20 +300,24 @@ public:
     // With a destination the fresh block is that free slot of a parent bound to
     // this group (a lone request's compaction moving its own block; the caller
     // keeps a copied block's bucket, and may change an unwritten block's);
-    // without one the pool places it.
+    // without one the pool places it, respecting `affinity` when supplied.
     CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
-                                   std::optional<CacheBlockLocation> destination) const {
+                                   std::optional<CacheBlockLocation> destination,
+                                   std::optional<ParentAffinity> affinity) const {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
         _assert(available_tokens >= 0, "tail capacity must be non-negative");
+        _assert(!destination || !affinity, "an explicit destination cannot carry parent affinity");
         const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
         std::vector<CacheBlockRef> fresh;
         if (destination) {
             fresh.push_back(pool.AcquireBlockAt(group_id_, *destination));
         } else if (current) {
             const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
-            fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
+            fresh = affinity ? pool.AcquireBlocksInBucketsWithAffinity(group_id_, bucket, *affinity)
+                             : pool.AcquireBlocksInBuckets(group_id_, bucket);
         } else {
-            fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+            fresh = affinity ? pool.AcquireBlocksWithAffinity(group_id_, 1, BucketLoads(table), *affinity)
+                             : pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
         }
         FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
         CacheBlockRef replaced = table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(fresh.front()));
@@ -308,7 +343,8 @@ public:
     // tail_available_tokens is the capacity left in the last appended block
     // when the Host hit ends inside it (0 on a block boundary).
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
-                             std::vector<BlockTransfer>& load_pairs, std::int32_t tail_available_tokens) const {
+                             std::vector<BlockTransfer>& load_pairs, std::int32_t tail_available_tokens,
+                             std::optional<ParentAffinity> affinity) const {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
         _assert(tail_available_tokens >= 0, "tail capacity must be non-negative");
         std::vector<std::int32_t> buckets;
@@ -318,7 +354,9 @@ public:
             }
         }
         table.reserve(table.blocks_.size() + host_block_refs.size());
-        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        std::vector<CacheBlockRef> destination_refs =
+            affinity ? pool.AcquireBlocksInBucketsWithAffinity(group_id_, buckets, *affinity)
+                     : pool.AcquireBlocksInBuckets(group_id_, buckets);
         FatalCheck(destination_refs.size() == buckets.size(), "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
         for (CacheBlockRef& host_block_ref : host_block_refs) {

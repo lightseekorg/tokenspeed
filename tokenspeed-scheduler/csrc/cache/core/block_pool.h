@@ -21,6 +21,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -29,7 +31,6 @@
 #include <memory_resource>
 #include <new>
 #include <optional>
-#include <set>
 #include <span>
 #include <tuple>
 #include <utility>
@@ -134,6 +135,17 @@ inline std::int64_t ParentsNeededForBucketsAndPairs(const BlockPlacementDemand& 
     return ParentsNeededForBuckets(scratch, holes_by_bucket, block_demand.any_bucket_blocks, packing);
 }
 
+// Request-aware placement preference for a single BlockPool acquire call.
+// When supplied, the pool prefers free slots in `preferred_parent`, then opens
+// an empty parent ahead of existing holes while strictly more than
+// `reserved_empty_parents` empty parents remain (preserving whole parents for
+// later groups in the same admission), and falls back to existing holes once
+// the empty-parent count reaches that reserve.
+struct ParentAffinity {
+    std::optional<std::int32_t> preferred_parent;
+    std::int64_t reserved_empty_parents{0};
+};
+
 // Physical LCM placement only. It deliberately has no cache key, LRU node,
 // CacheBlock pointer, or ownership count.
 class BlockPool {
@@ -184,9 +196,10 @@ public:
     std::int32_t MinimumParentOccupancy(std::uint32_t group_id) const noexcept {
         const GroupAvailability& group = placement(group_id);
         std::int32_t minimum = group.packing;
-        for (const auto& parents : group.parents_by_bucket) {
-            if (!parents.empty()) {
-                minimum = std::min(minimum, -parents.rbegin()->first);
+        for (const OccupancyBuckets& parents : group.parents_by_bucket) {
+            const std::int32_t occ = parents.MinOccupied();
+            if (occ > 0) {
+                minimum = std::min(minimum, occ);
             }
         }
         return minimum;
@@ -210,11 +223,18 @@ public:
                 "shard_count must be positive and divide parent packing");
         GroupAvailability& group = placement(group_id);
         _assert(group.packing == packing, "cache group packing changed after construction");
+        const auto buckets = static_cast<std::size_t>(shard_count);
         if (group.parents_by_bucket.empty()) {
-            group.parents_by_bucket.resize(static_cast<std::size_t>(shard_count));
-            group.free_slots_by_bucket.assign(static_cast<std::size_t>(shard_count), 0);
+            group.parents_by_bucket.resize(buckets);
+            for (OccupancyBuckets& bucket_index : group.parents_by_bucket) {
+                bucket_index.Init(packing);
+            }
+            group.free_slots_by_bucket.assign(buckets, 0);
+            if (packing > 1 && buckets > kInlineLinkBuckets) {
+                wide_link_buckets_ = std::max(wide_link_buckets_, buckets);
+            }
         } else {
-            _assert(group.packing == packing && group.parents_by_bucket.size() == static_cast<std::size_t>(shard_count),
+            _assert(group.packing == packing && group.parents_by_bucket.size() == buckets,
                     "cache group geometry changed after registration");
         }
     }
@@ -233,22 +253,24 @@ public:
 
     std::vector<CacheBlockRef> AcquireBlocks(std::uint32_t group_id, std::int32_t num,
                                              std::span<const std::int32_t> bucket_loads) {
-        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
-        if (num <= 0) {
-            return {};
-        }
+        return acquireBlocksChecked(group_id, num, bucket_loads, std::nullopt);
+    }
 
-        if (bucket_loads.size() > 1) {
-            _assert(placement(group_id).parents_by_bucket.size() == bucket_loads.size(),
-                    "allocation loads must match the registered shard_count");
-            for (std::int32_t load : bucket_loads) {
-                _assert(load >= 0, "allocation bucket loads must be non-negative");
-            }
+    // Request-aware block acquisition for packed groups (packing > 1): tries
+    // free slots in `affinity.preferred_parent` (honoring `min_load` bucket
+    // balance when `bucket_loads` has multiple entries), then opens an empty
+    // FIFO parent and switches `preferred_parent` to it while strictly more
+    // than `affinity.reserved_empty_parents` empty parents remain, and falls
+    // back to the densest partial parent once empty parents reach the reserve.
+    // All or nothing on insufficient capacity. `packing == 1` bypasses affinity.
+    std::vector<CacheBlockRef> AcquireBlocksWithAffinity(std::uint32_t group_id, std::int32_t num,
+                                                         std::span<const std::int32_t> bucket_loads,
+                                                         ParentAffinity affinity) {
+        _assert(affinity.reserved_empty_parents >= 0, "reserved empty parents must be non-negative");
+        if (placement(group_id).packing == 1) {
+            return acquireBlocksChecked(group_id, num, bucket_loads, std::nullopt);
         }
-        if (availableBlocks(group_id, cache_blocks_per_lcm_block) < static_cast<std::size_t>(num)) {
-            return {};
-        }
-        return acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, num, bucket_loads);
+        return acquireBlocksChecked(group_id, num, bucket_loads, affinity);
     }
 
     // One block per entry of `buckets`, each in the named bucket (slot %
@@ -257,35 +279,31 @@ public:
     // their owner under page-cyclic sharding. All or nothing: the exact
     // capacity check (ParentsNeededForBuckets) precedes every mutation, so a
     // failed call leaves the indices, occupancy and FIFO untouched. Each block
-    // takes the head of its bucket's partial-parent index -- the most
-    // occupied parent, lowest id, lowest free slot, as ordinary placement
-    // does -- or, when that bucket has no hole, the FIFO's next empty parent
-    // at the bucket's own slot; the opened parent's other slots then serve
-    // the remaining buckets. Deterministic on every mirrored rank. With one
-    // bucket this is ordinary placement with the shard count as a parameter.
+    // takes the head of its bucket's partial-parent index -- the most recently
+    // touched parent at the highest occupancy level, at its lowest free slot in
+    // that bucket, as ordinary placement does -- or, when that bucket has no
+    // hole, the FIFO's next empty parent at the bucket's own slot; the opened
+    // parent's other slots then serve the remaining buckets. Deterministic on
+    // every mirrored rank. With one bucket this is ordinary placement with the
+    // shard count as a parameter.
     std::vector<CacheBlockRef> AcquireBlocksInBuckets(std::uint32_t group_id, std::span<const std::int32_t> buckets) {
-        const auto packing = placement(group_id).packing;
-        if (buckets.empty()) {
-            return {};
+        return acquireBlocksInBuckets(group_id, buckets, std::nullopt);
+    }
+
+    // Bucket-exact acquisition with request-aware `affinity`: for each bucket
+    // entry, prefers `affinity.preferred_parent`, else opens an empty FIFO
+    // parent (updating `preferred_parent` for the rest of the call) while
+    // strictly more than `affinity.reserved_empty_parents` empty parents
+    // remain, else falls back to the bucket's densest partial parent. All or
+    // nothing on insufficient capacity; `packing == 1` bypasses affinity.
+    std::vector<CacheBlockRef> AcquireBlocksInBucketsWithAffinity(std::uint32_t group_id,
+                                                                  std::span<const std::int32_t> buckets,
+                                                                  ParentAffinity affinity) {
+        _assert(affinity.reserved_empty_parents >= 0, "reserved empty parents must be non-negative");
+        if (placement(group_id).packing == 1) {
+            return acquireBlocksInBuckets(group_id, buckets, std::nullopt);
         }
-        GroupAvailability& group = prepareAvailability(group_id, packing);
-        std::vector<std::int64_t> blocks_by_bucket(group.parents_by_bucket.size(), 0);
-        for (const std::int32_t bucket : buckets) {
-            _assert(bucket >= 0 && static_cast<std::size_t>(bucket) < blocks_by_bucket.size(),
-                    "requested bucket is outside the registered shard count");
-            ++blocks_by_bucket[static_cast<std::size_t>(bucket)];
-        }
-        if (ParentsNeededForBuckets(blocks_by_bucket, group.free_slots_by_bucket, /*any_bucket_blocks=*/0, packing) >
-            static_cast<std::int64_t>(free_parent_ids_.size())) {
-            return {};
-        }
-        std::vector<CacheBlockRef> out;
-        out.reserve(buckets.size());
-        for (const std::int32_t bucket : buckets) {
-            out.push_back(
-                createBlockRef(group_id, packing, nextLocationInBucket(group, static_cast<std::size_t>(bucket))));
-        }
-        return out;
+        return acquireBlocksInBuckets(group_id, buckets, affinity);
     }
 
     // One block at a given free child slot of a parent already bound to this
@@ -309,7 +327,7 @@ public:
         }
         const auto take = static_cast<std::int32_t>(
             std::min(static_cast<std::size_t>(max_num), availableBlocks(group_id, cache_blocks_per_lcm_block)));
-        return take > 0 ? acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, take, {})
+        return take > 0 ? acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, take, {}, std::nullopt)
                         : std::vector<CacheBlockRef>{};
     }
 
@@ -386,14 +404,106 @@ public:
     }
 
 private:
-    using ParentOrder = std::pair<std::int32_t, std::int32_t>;  // -occupancy, parent ID
+    static constexpr std::int32_t kInlineOccupancySlots = 64;
+    static constexpr std::size_t kInlineLinkBuckets = 4;
+    static constexpr std::size_t kInlineLoadBuckets = 8;
+
+    // Intrusive doubly-linked list node stored directly on each LcmBlock per
+    // shard bucket, using 1-based parent IDs (0 = null) so all index updates
+    // are O(1) with zero heap allocation.
+    struct BucketLink {
+        std::int32_t prev{0};
+        std::int32_t next{0};
+    };
+
+    // Per-bucket partial-parent index bucketed by occupied_count in [1, packing - 1].
+    // Bit (occ - 1) in the occupancy mask is set iff heads[occ - 1] != 0, so
+    // finding the densest or sparsest partial parent is O(1) via bit scan.
+    struct OccupancyBuckets {
+        static constexpr std::size_t kWordBits = 64;
+        static_assert(kInlineOccupancySlots == static_cast<std::int32_t>(kWordBits));
+
+        std::vector<std::int32_t> heads;
+        std::uint64_t inline_mask{0};
+        std::vector<std::uint64_t> wide_mask;
+
+        void Init(std::int32_t packing) {
+            if (packing <= 1) {
+                return;
+            }
+            const auto num_occ = static_cast<std::size_t>(packing - 1);
+            heads.assign(num_occ, 0);
+            inline_mask = 0;
+            if (num_occ > kWordBits) {
+                const std::size_t words = num_occ / kWordBits + (num_occ % kWordBits != 0 ? 1 : 0);
+                wide_mask.assign(words, 0);
+            } else {
+                wide_mask.clear();
+            }
+        }
+
+        std::int32_t Head(std::int32_t occupied_count) const noexcept {
+            _assert(occupied_count >= 1 && static_cast<std::size_t>(occupied_count) <= heads.size(),
+                    "occupancy bucket out of range");
+            return heads[static_cast<std::size_t>(occupied_count - 1)];
+        }
+
+        void SetNonEmpty(std::size_t idx) noexcept {
+            if (wide_mask.empty()) {
+                inline_mask |= (std::uint64_t{1} << idx);
+            } else {
+                wide_mask[idx / kWordBits] |= (std::uint64_t{1} << (idx % kWordBits));
+            }
+        }
+
+        void ClearNonEmpty(std::size_t idx) noexcept {
+            if (wide_mask.empty()) {
+                inline_mask &= ~(std::uint64_t{1} << idx);
+            } else {
+                wide_mask[idx / kWordBits] &= ~(std::uint64_t{1} << (idx % kWordBits));
+            }
+        }
+
+        std::int32_t MaxOccupied() const noexcept {
+            if (wide_mask.empty()) {
+                if (inline_mask == 0) {
+                    return 0;
+                }
+                return static_cast<std::int32_t>(kWordBits - static_cast<std::size_t>(std::countl_zero(inline_mask)));
+            }
+            for (std::size_t word = wide_mask.size(); word-- > 0;) {
+                if (wide_mask[word] != 0) {
+                    return static_cast<std::int32_t>(
+                        word * kWordBits + (kWordBits - static_cast<std::size_t>(std::countl_zero(wide_mask[word]))));
+                }
+            }
+            return 0;
+        }
+
+        std::int32_t MinOccupied() const noexcept {
+            if (wide_mask.empty()) {
+                if (inline_mask == 0) {
+                    return 0;
+                }
+                return static_cast<std::int32_t>(std::countr_zero(inline_mask) + 1);
+            }
+            for (std::size_t word = 0; word < wide_mask.size(); ++word) {
+                if (wide_mask[word] != 0) {
+                    return static_cast<std::int32_t>(word * kWordBits +
+                                                     static_cast<std::size_t>(std::countr_zero(wide_mask[word])) + 1);
+                }
+            }
+            return 0;
+        }
+    };
+
     struct GroupAvailability {
         std::int32_t packing{0};
         // Holes in bound parents, per bucket (slot % shard_count); empty
         // parents remain pool-wide. The group total is derived from this, so
         // the two cannot disagree.
         std::vector<std::int64_t> free_slots_by_bucket;
-        std::vector<std::set<ParentOrder>> parents_by_bucket;
+        std::vector<OccupancyBuckets> parents_by_bucket;
 
         std::size_t FreeSlots() const noexcept {
             std::int64_t total = 0;
@@ -403,7 +513,6 @@ private:
             return static_cast<std::size_t>(total);
         }
     };
-    static constexpr std::int32_t kInlineOccupancySlots = 64;
     struct LcmBlock {
         std::optional<std::uint32_t> bound_group;
         std::uint32_t occupied_count{0};
@@ -420,6 +529,11 @@ private:
         // Only the lowest free slot per bucket is needed, not a list of all holes.
         // The packing is the sentinel for a bucket with no free slot.
         std::vector<std::int32_t> first_free_slots;
+        // Intrusive doubly-linked list links for OccupancyBuckets (up to 4
+        // shards inline; wider sharding allocates wide_links on first bind).
+        std::array<BucketLink, kInlineLinkBuckets> inline_links{};
+        std::unique_ptr<BucketLink[]> wide_links;
+        std::size_t wide_links_capacity{0};
 
         bool SlotOccupied(std::size_t slot) const noexcept {
             const std::uint64_t word =
@@ -431,6 +545,9 @@ private:
                 slots <= kInlineOccupancySlots ? occupancy : wide_occupancy[slot / kInlineOccupancySlots];
             const std::uint64_t bit = std::uint64_t{1} << (slot % kInlineOccupancySlots);
             word = occupied ? (word | bit) : (word & ~bit);
+        }
+        BucketLink& Link(std::size_t bucket, std::size_t num_buckets) noexcept {
+            return num_buckets <= kInlineLinkBuckets ? inline_links[bucket] : wide_links[bucket];
         }
     };
 
@@ -449,28 +566,56 @@ private:
         return group.FreeSlots() + free_parent_ids_.size() * static_cast<std::size_t>(packing);
     }
 
-    static void removeAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) {
+    void removeAvailability(GroupAvailability& group, LcmBlock& parent, std::int32_t id) noexcept {
         if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
-        for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
+        const std::size_t buckets = group.parents_by_bucket.size();
+        const std::size_t idx = static_cast<std::size_t>(parent.occupied_count - 1);
+        for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
-                const auto erased =
-                    group.parents_by_bucket[bucket].erase({-static_cast<std::int32_t>(parent.occupied_count), id});
-                FatalCheck(erased == 1, "partial LCM parent missing from its bucket index");
+                OccupancyBuckets& index = group.parents_by_bucket[bucket];
+                BucketLink& link = parent.Link(bucket, buckets);
+                const std::int32_t prev = link.prev;
+                const std::int32_t next = link.next;
+                if (prev != 0) {
+                    lcm_blocks_[static_cast<std::size_t>(prev - 1)].Link(bucket, buckets).next = next;
+                } else {
+                    FatalCheck(index.heads[idx] == id, "partial LCM parent missing from its bucket index");
+                    index.heads[idx] = next;
+                    if (next == 0) {
+                        index.ClearNonEmpty(idx);
+                    }
+                }
+                if (next != 0) {
+                    lcm_blocks_[static_cast<std::size_t>(next - 1)].Link(bucket, buckets).prev = prev;
+                }
+                link = {};
             }
         }
     }
 
-    static void addAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) {
+    void addAvailability(GroupAvailability& group, LcmBlock& parent, std::int32_t id) noexcept {
         if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
-        for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
+        const std::size_t buckets = group.parents_by_bucket.size();
+        const std::size_t idx = static_cast<std::size_t>(parent.occupied_count - 1);
+        for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
-                const auto [_, inserted] =
-                    group.parents_by_bucket[bucket].emplace(-static_cast<std::int32_t>(parent.occupied_count), id);
-                FatalCheck(inserted, "partial LCM parent already present in its bucket index");
+                OccupancyBuckets& index = group.parents_by_bucket[bucket];
+                BucketLink& link = parent.Link(bucket, buckets);
+                const std::int32_t old_head = index.heads[idx];
+                FatalCheck(link.prev == 0 && link.next == 0 && old_head != id,
+                           "partial LCM parent already present in its bucket index");
+                link.prev = 0;
+                link.next = old_head;
+                if (old_head != 0) {
+                    lcm_blocks_[static_cast<std::size_t>(old_head - 1)].Link(bucket, buckets).prev = id;
+                } else {
+                    index.SetNonEmpty(idx);
+                }
+                index.heads[idx] = id;
             }
         }
     }
@@ -484,21 +629,20 @@ private:
     }
 
     CacheBlockLocation nextLocation(const GroupAvailability& group, std::span<const std::int64_t> loads) const {
-        // Ordinary allocation orders by parent occupancy, parent ID, then slot.
-        // Balanced allocation puts request load and bucket ID before that order.
-        // Holes first, so a request's blocks can land one per parent beside
-        // cached pages; what that leaves a request alone is undone by its
-        // compaction (LoneRequestAdmission::Compact), never here.
+        // Ordinary allocation orders by parent occupancy (most occupied first),
+        // bucket list head, then slot. Balanced allocation puts request load
+        // and bucket ID before that order.
         using Priority = std::tuple<std::int64_t, std::size_t, std::int32_t, std::int32_t, std::int32_t>;
         std::optional<Priority> best;
         CacheBlockLocation location;
         for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
-            if (group.parents_by_bucket[bucket].empty()) {
+            const std::int32_t occ = group.parents_by_bucket[bucket].MaxOccupied();
+            if (occ == 0) {
                 continue;
             }
-            const auto [occupied, id] = *group.parents_by_bucket[bucket].begin();
+            const std::int32_t id = group.parents_by_bucket[bucket].Head(occ);
             const auto slot = lcmBlock(id).first_free_slots[bucket];
-            const Priority priority{loads.empty() ? 0 : loads[bucket], loads.empty() ? 0 : bucket, occupied, id, slot};
+            const Priority priority{loads.empty() ? 0 : loads[bucket], loads.empty() ? 0 : bucket, -occ, id, slot};
             if (!best || priority < *best) {
                 best = priority;
                 location = CacheBlockLocation{id, slot};
@@ -517,30 +661,146 @@ private:
     // Placement confined to one bucket: the bucket's own partial-parent
     // index head, else the FIFO's next empty parent at the bucket's slot.
     CacheBlockLocation nextLocationInBucket(const GroupAvailability& group, std::size_t bucket) const {
-        const std::set<ParentOrder>& parents = group.parents_by_bucket[bucket];
-        if (!parents.empty()) {
-            const auto [occupied, id] = *parents.begin();
+        const OccupancyBuckets& parents = group.parents_by_bucket[bucket];
+        const std::int32_t occ = parents.MaxOccupied();
+        if (occ > 0) {
+            const std::int32_t id = parents.Head(occ);
             return CacheBlockLocation{id, lcmBlock(id).first_free_slots[bucket]};
         }
         FatalCheck(!free_parent_ids_.empty(), "prechecked bucket capacity was exhausted");
         return CacheBlockLocation{free_parent_ids_.front(), static_cast<std::int32_t>(bucket)};
     }
 
+    std::vector<CacheBlockRef> acquireBlocksChecked(std::uint32_t group_id, std::int32_t num,
+                                                    std::span<const std::int32_t> bucket_loads,
+                                                    std::optional<ParentAffinity> affinity) {
+        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
+        if (num <= 0) {
+            return {};
+        }
+
+        if (bucket_loads.size() > 1) {
+            _assert(placement(group_id).parents_by_bucket.size() == bucket_loads.size(),
+                    "allocation loads must match the registered shard_count");
+            for (std::int32_t load : bucket_loads) {
+                _assert(load >= 0, "allocation bucket loads must be non-negative");
+            }
+        }
+        if (availableBlocks(group_id, cache_blocks_per_lcm_block) < static_cast<std::size_t>(num)) {
+            return {};
+        }
+        return acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, num, bucket_loads, affinity);
+    }
+
+    std::vector<CacheBlockRef> acquireBlocksInBuckets(std::uint32_t group_id, std::span<const std::int32_t> buckets,
+                                                      std::optional<ParentAffinity> affinity) {
+        const auto packing = placement(group_id).packing;
+        if (buckets.empty()) {
+            return {};
+        }
+        GroupAvailability& group = prepareAvailability(group_id, packing);
+        const std::size_t num_buckets = group.parents_by_bucket.size();
+        std::array<std::int64_t, kInlineLoadBuckets> inline_counts{};
+        std::vector<std::int64_t> wide_counts;
+        std::span<std::int64_t> blocks_by_bucket;
+        if (num_buckets <= kInlineLoadBuckets) {
+            blocks_by_bucket = std::span<std::int64_t>{inline_counts.data(), num_buckets};
+        } else {
+            wide_counts.assign(num_buckets, 0);
+            blocks_by_bucket = wide_counts;
+        }
+        for (const std::int32_t bucket : buckets) {
+            _assert(bucket >= 0 && static_cast<std::size_t>(bucket) < blocks_by_bucket.size(),
+                    "requested bucket is outside the registered shard count");
+            ++blocks_by_bucket[static_cast<std::size_t>(bucket)];
+        }
+        if (ParentsNeededForBuckets(blocks_by_bucket, group.free_slots_by_bucket, /*any_bucket_blocks=*/0, packing) >
+            static_cast<std::int64_t>(free_parent_ids_.size())) {
+            return {};
+        }
+        std::optional<std::int32_t> preferred_parent = affinity ? affinity->preferred_parent : std::nullopt;
+        const auto pick_in_bucket = [&](std::size_t bucket) -> CacheBlockLocation {
+            if (affinity) {
+                if (preferred_parent) {
+                    _assert(*preferred_parent > 0 && *preferred_parent <= NumLcmBlocks(),
+                            "preferred parent id out of range");
+                    const LcmBlock& parent = lcmBlock(*preferred_parent);
+                    if (parent.bound_group == group_id && parent.first_free_slots[bucket] < packing) {
+                        return CacheBlockLocation{*preferred_parent, parent.first_free_slots[bucket]};
+                    }
+                }
+                if (static_cast<std::int64_t>(free_parent_ids_.size()) > affinity->reserved_empty_parents) {
+                    preferred_parent = free_parent_ids_.front();
+                    return CacheBlockLocation{*preferred_parent, static_cast<std::int32_t>(bucket)};
+                }
+            }
+            return nextLocationInBucket(group, bucket);
+        };
+        std::vector<CacheBlockRef> out;
+        out.reserve(buckets.size());
+        for (const std::int32_t bucket : buckets) {
+            out.push_back(createBlockRef(group_id, packing, pick_in_bucket(static_cast<std::size_t>(bucket))));
+        }
+        return out;
+    }
+
     std::vector<CacheBlockRef> acquireAvailableBlocks(std::uint32_t group_id, std::int32_t packing, std::int32_t count,
-                                                      std::span<const std::int32_t> bucket_loads) {
+                                                      std::span<const std::int32_t> bucket_loads,
+                                                      std::optional<ParentAffinity> affinity) {
         const bool balanced = bucket_loads.size() > 1;
         GroupAvailability& group = prepareAvailability(group_id, packing);
-        std::vector<std::int64_t> loads;
+        std::array<std::int64_t, kInlineLoadBuckets> inline_loads{};
+        std::vector<std::int64_t> wide_loads;
+        std::span<std::int64_t> loads;
         if (balanced) {
-            loads.assign(bucket_loads.begin(), bucket_loads.end());
+            if (bucket_loads.size() <= kInlineLoadBuckets) {
+                for (std::size_t b = 0; b < bucket_loads.size(); ++b) {
+                    inline_loads[b] = bucket_loads[b];
+                }
+                loads = std::span<std::int64_t>{inline_loads.data(), bucket_loads.size()};
+            } else {
+                wide_loads.assign(bucket_loads.begin(), bucket_loads.end());
+                loads = wide_loads;
+            }
         }
-        // Capacity-first selection can consume every compatible hole, then
-        // every empty parent. The exact capacity check precedes all mutations,
-        // so a second, pool-sized shadow allocator is unnecessary.
+        std::optional<std::int32_t> preferred_parent = affinity ? affinity->preferred_parent : std::nullopt;
+        const auto pick_location = [&]() -> CacheBlockLocation {
+            if (affinity) {
+                const auto min_it = balanced ? std::ranges::min_element(loads) : loads.end();
+                if (preferred_parent) {
+                    _assert(*preferred_parent > 0 && *preferred_parent <= NumLcmBlocks(),
+                            "preferred parent id out of range");
+                    const LcmBlock& parent = lcmBlock(*preferred_parent);
+                    if (parent.bound_group == group_id) {
+                        if (!balanced) {
+                            const std::int32_t slot = *std::ranges::min_element(parent.first_free_slots);
+                            if (slot < packing) {
+                                return CacheBlockLocation{*preferred_parent, slot};
+                            }
+                        } else {
+                            const std::int64_t min_load = *min_it;
+                            for (std::size_t bucket = 0; bucket < loads.size(); ++bucket) {
+                                if (loads[bucket] == min_load && parent.first_free_slots[bucket] < packing) {
+                                    return CacheBlockLocation{*preferred_parent, parent.first_free_slots[bucket]};
+                                }
+                            }
+                        }
+                    }
+                }
+                if (static_cast<std::int64_t>(free_parent_ids_.size()) > affinity->reserved_empty_parents) {
+                    preferred_parent = free_parent_ids_.front();
+                    const auto slot = balanced ? static_cast<std::int32_t>(min_it - loads.begin()) : 0;
+                    return CacheBlockLocation{*preferred_parent, slot};
+                }
+            }
+            return nextLocation(group, loads);
+        };
+        // Exact capacity checking precedes all mutations, so a second,
+        // pool-sized shadow allocator is unnecessary.
         std::vector<CacheBlockRef> out;
         out.reserve(static_cast<std::size_t>(count));
         for (std::int32_t i = 0; i < count; ++i) {
-            const CacheBlockLocation location = nextLocation(group, loads);
+            const CacheBlockLocation location = pick_location();
             out.push_back(createBlockRef(group_id, packing, location));
             if (balanced) {
                 ++loads[static_cast<std::size_t>(location.slot_index) % loads.size()];
@@ -562,17 +822,24 @@ private:
 
     CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
         using Control = internal_cache_block_ref::CacheBlockControl;
+        const std::size_t buckets = placement(group_id).parents_by_bucket.size();
         if (slots_per_parent > kInlineOccupancySlots) [[unlikely]] {
             LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
             if (parent.wide_occupancy == nullptr) {
                 allocateWideOccupancy(parent, wide_occupancy_words_);
             }
         }
+        if (slots_per_parent > 1 && buckets > kInlineLinkBuckets) [[unlikely]] {
+            LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            if (parent.wide_links_capacity < buckets) {
+                allocateWideLinks(parent, std::max(buckets, wide_link_buckets_));
+            }
+        }
         void* storage = control_memory_.allocate(sizeof(Control), alignof(Control));
         auto* control = new (storage) Control(*this, location);
-        // Allocate a wide parent's occupancy words and the control before
-        // mutating the pool, then commit the location before publishing its
-        // RAII owner: CacheBlock destruction releases this location and
+        // Allocate a wide parent's occupancy words, wide links and the control
+        // before mutating the pool, then commit the location before publishing
+        // its RAII owner: CacheBlock destruction releases this location and
         // therefore requires it to be occupied.
         occupy(group_id, slots_per_parent, location);
         return CacheBlockRef{*control};
@@ -581,6 +848,12 @@ private:
     // Out of line so the allocation stays out of the inlined acquire loops.
     [[gnu::cold, gnu::noinline]] static void allocateWideOccupancy(LcmBlock& parent, std::size_t words) {
         parent.wide_occupancy = std::make_unique<std::uint64_t[]>(words);
+    }
+
+    [[gnu::cold, gnu::noinline]] static void allocateWideLinks(LcmBlock& parent, std::size_t buckets) {
+        FatalCheck(parent.occupied_count == 0, "cannot reallocate wide links while parent is occupied");
+        parent.wide_links = std::make_unique<BucketLink[]>(buckets);
+        parent.wide_links_capacity = buckets;
     }
 
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
@@ -593,6 +866,8 @@ private:
             FatalCheck(parent.slots == 0 && parent.occupancy == 0, "empty LCM parent must not retain child slots");
             FatalCheck(slots_per_parent <= kInlineOccupancySlots || parent.wide_occupancy != nullptr,
                        "a wide LCM parent binds without its occupancy words");
+            FatalCheck(slots_per_parent == 1 || buckets <= kInlineLinkBuckets || parent.wide_links_capacity >= buckets,
+                       "a wide-bucket LCM parent binds without its link storage");
             parent.slots = slots_per_parent;
             if (slots_per_parent > 1) {
                 parent.first_free_slots.resize(buckets);
@@ -657,6 +932,8 @@ private:
     std::vector<GroupAvailability> group_availability_;
     // Words of a wide parent's occupancy bits; 0 when every packing fits inline.
     std::size_t wide_occupancy_words_{0};
+    // Bucket count of a wide-sharded parent's intrusive links; 0 when all fit inline.
+    std::size_t wide_link_buckets_{0};
 };
 
 }  // namespace tokenspeed
