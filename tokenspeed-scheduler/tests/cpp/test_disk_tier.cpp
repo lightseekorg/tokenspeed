@@ -1189,6 +1189,112 @@ TEST(DiskTierTest, HybridPeerListWithoutDiskKeepsDeviceStateWhenKvIsOnHost) {
     EXPECT_EQ(exported.blocks[2].tier, CacheTier::kDevice);
 }
 
+TEST(DiskTierTest, ShardedDiskPrefetchPreservesDiskBlockOwnerBucket) {
+    // Reproduces KVP8 (shard_count = 8) local SSD prefetch where Disk blocks
+    // reside in arbitrary owner buckets `(j + 3) % 8 != logical_block % 8`.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 8, .block_granularity = kGrain, .shard_count = 8},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0, .shard_count = 1},
+    };
+    DiskTierCache cache(specs, /*disk_parents=*/16);
+    const Prompt prompt(/*pages=*/5, /*seed=*/91);
+
+    // Publish on Device first to register boundary tree nodes, then place each
+    // Host KV block in bucket `(j + 3) % 8` so none matches `logical_block % 8`.
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    std::vector<CacheKey> keys = cache.DeviceKeys(prompt);
+    ASSERT_EQ(keys.size(), 6u);  // 5 KV pages + 1 State checkpoint
+    std::int32_t kv_idx = 0;
+    for (const CacheKey& key : keys) {
+        const std::int32_t bucket = key.group_id == 0 ? ((kv_idx++ + 3) % 8) : 0;
+        CacheBlockRef block = cache.coordinator.Host().AcquireHostBlock(key.group_id, bucket);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_TRUE(cache.coordinator.ClearDeviceCache());
+
+    // Clean Host -> Disk (Disk preserves each Host block's owner bucket).
+    const DiskOperation write = cache.Clean(keys);
+    ASSERT_EQ(write.group_ids.size(), 6u);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    cache.EvictFromHost(keys);
+
+    // Prefetch Disk -> Host: every row must pair equal-owner Host and Disk blocks.
+    StorageLease read = cache.disks.StartRead(prompt.Prefix());
+    ASSERT_TRUE(read);
+    const auto ops = cache.disks.TakeCommands();
+    ASSERT_EQ(ops.size(), 1u);
+    const DiskOperation& op = ops[0];
+    ASSERT_EQ(op.group_ids.size(), 6u);
+    for (std::size_t row = 0; row < op.group_ids.size(); ++row) {
+        if (op.group_ids[row] == 0u) {
+            EXPECT_EQ((op.host_blocks[row] - 1) % 8, (op.disk_blocks[row] - 1) % 8)
+                << "row " << row << " paired Host and Disk blocks from different KVP8 owners";
+        }
+    }
+    cache.disks.Complete(cache::DiskDone{.op_id = op.op_id, .success = true});
+    for (const CacheKey& key : keys) {
+        EXPECT_TRUE(cache.OnHost(key));
+    }
+}
+
+TEST(DiskTierTest, ShardedDiskPrefetchMixedTiersPreservesOwners) {
+    // Pages 0..1 stay on Host, pages 2..4 live only on Disk with shifted KVP8
+    // owner buckets `(j + 5) % 8`; Disk prefetch must skip pages already on Host
+    // and allocate Host destinations in each Disk block's own bucket.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 8, .block_granularity = kGrain, .shard_count = 8},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0, .shard_count = 1},
+    };
+    DiskTierCache cache(specs, /*disk_parents=*/16);
+    const Prompt prompt(/*pages=*/5, /*seed=*/97);
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    std::vector<CacheKey> keys = cache.DeviceKeys(prompt);
+    ASSERT_EQ(keys.size(), 6u);
+    std::int32_t kv_idx = 0;
+    for (const CacheKey& key : keys) {
+        const std::int32_t bucket = key.group_id == 0 ? ((kv_idx++ + 5) % 8) : 0;
+        CacheBlockRef block = cache.coordinator.Host().AcquireHostBlock(key.group_id, bucket);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_TRUE(cache.coordinator.ClearDeviceCache());
+    const DiskOperation write = cache.Clean(keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    // Evict only pages 2..4 + State from Host; keep pages 0..1 on Host.
+    std::vector<CacheKey> tail_keys(keys.begin() + 2, keys.end());
+    cache.EvictFromHost(tail_keys);
+
+    StorageLease read = cache.disks.StartRead(prompt.Prefix());
+    ASSERT_TRUE(read);
+    const auto ops = cache.disks.TakeCommands();
+    ASSERT_EQ(ops.size(), 1u);
+    const DiskOperation& op = ops[0];
+    ASSERT_EQ(op.group_ids.size(), 4u);  // only the 3 Disk KV tail pages + State
+    for (std::size_t row = 0; row < op.group_ids.size(); ++row) {
+        if (op.group_ids[row] == 0u) {
+            EXPECT_EQ((op.host_blocks[row] - 1) % 8, (op.disk_blocks[row] - 1) % 8);
+        }
+    }
+    cache.disks.Complete(cache::DiskDone{.op_id = op.op_id, .success = true});
+    for (const CacheKey& key : keys) {
+        EXPECT_TRUE(cache.OnHost(key));
+    }
+}
 
 }  // namespace
 }  // namespace tokenspeed::test

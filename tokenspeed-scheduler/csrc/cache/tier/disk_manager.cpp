@@ -105,9 +105,13 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     DiskOperation op{.kind = ticket.kind, .op_id = id};
     for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
         const auto group = static_cast<std::int32_t>(ticket.keys[i].group_id);
+        const GroupAllocator& allocator = coordinator_.Allocator(group);
+        _assert(allocator.BucketOf(ticket.host_blocks[i]->Location()) ==
+                    allocator.BucketOf(ticket.disk_blocks[i]->Location()),
+                "a Disk operation pairs blocks of different owners");
         op.group_ids.push_back(ticket.keys[i].group_id);
-        op.host_blocks.push_back(coordinator_.Allocator(group).ResolveCacheBlockId(*ticket.host_blocks[i]));
-        op.disk_blocks.push_back(coordinator_.Allocator(group).ResolveCacheBlockId(*ticket.disk_blocks[i]));
+        op.host_blocks.push_back(allocator.ResolveCacheBlockId(*ticket.host_blocks[i]));
+        op.disk_blocks.push_back(allocator.ResolveCacheBlockId(*ticket.disk_blocks[i]));
     }
     return op;
 }
@@ -129,8 +133,8 @@ DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const Pro
     // key the boundary needs and the Host lacks is then one the Disk holds.
     const std::size_t available_blocks = limit - held;
     const auto max_op_blocks = static_cast<std::size_t>(config_.max_blocks_per_operation);
-    StorageReservation reservation =
-        coordinator_.Storage().ReserveStoragePrefix(prompt, hits, std::min(available_blocks, max_op_blocks));
+    StorageReservation reservation = coordinator_.Storage().ReserveStoragePrefix(
+        prompt, hits, std::min(available_blocks, max_op_blocks), coordinator_.Store().DiskPool());
     if (reservation.keys.empty() || reservation.num_tokens <= local_tokens) {
         // If Host-block credits were partially consumed by other in-flight
         // operations, let the caller retry once credits return.

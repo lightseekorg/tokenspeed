@@ -83,8 +83,11 @@ public:
     // storage `hits` (with the Host) extend the Device-only hit to, under the
     // Host-suffix rule, whose missing keys get Host blocks within max_blocks
     // (warm Host hits counted). Empty when no boundary fits.
+    // When `source_pool` is non-null (local Disk tier), each missing key's Host
+    // destination is allocated in the same sharded owner bucket as its source
+    // block in `*source_pool` so every rank reads only its own local Disk file.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                            std::size_t max_blocks);
+                                            std::size_t max_blocks, const BlockPool* source_pool = nullptr);
     // Longest boundary that `hits` (with Device and Host) can resume under the
     // Host-suffix rule, without allocating blocks or spending Host credits.
     std::int32_t ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const;
@@ -102,7 +105,8 @@ public:
 
 private:
     StorageReservation reserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                            std::size_t available, std::size_t limit, bool* exact_retry);
+                                            std::size_t available, std::size_t limit, bool* exact_retry,
+                                            const BlockPool* source_pool = nullptr);
     // The complete dependency set selected by a matcher, with each key's
     // absolute logical block index (including holes before an SWA window);
     // floor_tokens is the tier's floor, where a token-spanned group's hits

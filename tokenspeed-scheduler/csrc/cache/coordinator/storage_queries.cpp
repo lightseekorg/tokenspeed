@@ -204,18 +204,19 @@ StorageQuery StorageQueries::MissingStorageKeys(const PromptPrefix& prompt, std:
 }
 
 StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                                        std::size_t max_blocks) {
-    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr);
+                                                        std::size_t max_blocks, const BlockPool* source_pool) {
+    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, source_pool);
 }
 
 StorageReservation StorageQueries::ReserveExactStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                                              std::size_t available, std::size_t limit, bool& retry) {
     retry = false;
-    return reserveStoragePrefix(prompt, hits, available, limit, &retry);
+    return reserveStoragePrefix(prompt, hits, available, limit, &retry, nullptr);
 }
 
 StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                                        std::size_t max_blocks, std::size_t limit, bool* exact_retry) {
+                                                        std::size_t max_blocks, std::size_t limit, bool* exact_retry,
+                                                        const BlockPool* source_pool) {
     const std::unordered_set<CacheKey, CacheKeyHash> remote(hits.begin(), hits.end());
     // The Device-only probe: the reservation matches the Host suffix (Host and
     // remote) above its boundary again, under the same Host-suffix rule as
@@ -253,7 +254,14 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
                 result.keys.push_back(key);
                 result.logical_blocks.push_back(logical_block);
                 groups.push_back(key.group_id);
-                buckets.push_back(logical_block % store_.Groups()[key.group_id].Spec().shard_count);
+                std::int32_t bucket = logical_block % store_.Groups()[key.group_id].Spec().shard_count;
+                if (source_pool != nullptr) {
+                    const std::optional<CacheBlockLocation> source_loc =
+                        store_.LocationOf(*source_pool, key.group_id, key);
+                    _assert(source_loc.has_value(), "a storage reservation hit must exist in its source pool");
+                    bucket = store_.Groups()[key.group_id].Allocator().BucketOf(*source_loc);
+                }
+                buckets.push_back(bucket);
             }
         };
         // Protect warm dependencies only while allocating destinations. They
