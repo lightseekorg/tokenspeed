@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -152,7 +153,8 @@ void Run(int batch_size, int released_prefix_slots, int repeats) {
         op.request_pool_index = i;
         op.input_length = 4;
 
-        Require(full.Acquire(pool, full_tables[i], AcquirePlan{.num_blocks = kFullColumns - i % 4}, 0, {}, 0, true),
+        Require(full.Acquire(pool, full_tables[i], AcquirePlan{.num_blocks = kFullColumns - i % 4}, 0, {},
+                             ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 0}),
                 "full table setup failed");
         op.block_tables.emplace("full", ForwardBlockTable{full, full_tables[i], 0});
         if (i % 16 != 15) {
@@ -160,7 +162,9 @@ void Run(int batch_size, int released_prefix_slots, int repeats) {
             const int retained = 2 + i % 4;
             const AcquirePlan plan{
                 .num_blocks = retained, .suffix_start = released, .table_blocks_after = released + retained};
-            Require(window.Acquire(pool, window_tables[i], plan, 0, {}, 0, true), "sliding table setup failed");
+            Require(window.Acquire(pool, window_tables[i], plan, 0, {},
+                                   ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 0}),
+                    "sliding table setup failed");
             Require(window_tables[i].ReclaimedPrefixBlocks() == released, "wrong released prefix length");
             op.block_tables.emplace("window", ForwardBlockTable{window, window_tables[i], 0});
         }
