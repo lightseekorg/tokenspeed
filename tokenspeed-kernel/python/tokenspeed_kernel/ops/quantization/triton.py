@@ -1230,15 +1230,19 @@ def mxfp4_quantize(
     out: Optional[torch.Tensor] = None,
     scales: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a BF16/FP16 tensor to packed MXFP4.
+    """Quantize a BF16/FP16/FP32 tensor to packed MXFP4.
 
     The last dimension is quantized in groups of 32 values. The returned data
     packs two E2M1 values per byte and returns one uint8 E8M0 scale per group.
+    The kernel computes in FP32, so an FP32 input (for example block-FP8
+    weights dequantized with their FP32 scales) is quantized without first
+    rounding it to 16 bits.
     """
     assert x.dtype in (
         torch.bfloat16,
         torch.float16,
-    ), f"mxfp4_quantize input must be bf16/fp16, got {x.dtype}"
+        torch.float32,
+    ), f"mxfp4_quantize input must be bf16/fp16/fp32, got {x.dtype}"
     M, N, x_row_stride = _flatten_to_2d(x)
     if N % 32 != 0:
         raise ValueError("mxfp4_quantize requires the last dimension divisible by 32")
@@ -1279,7 +1283,9 @@ def mxfp4_quantize(
     name="triton_quantize_mxfp4",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
     traits={
         "scale_size": frozenset({32}),
         "scale_layout": frozenset({"linear"}),

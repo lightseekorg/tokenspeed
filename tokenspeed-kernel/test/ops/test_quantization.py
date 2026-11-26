@@ -371,6 +371,38 @@ def test_quantize_mxfp4_dynamic_scales(
 
 
 @pytest.mark.parametrize("solution", ["triton"])
+def test_quantize_mxfp4_fp32_input_matches_exact_bf16_input(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    """FP32 input takes the same FP32 path as BF16: values exact in BF16 give
+    the same codes and scales, and FP32-only mantissa bits round once."""
+    require("quantization", "mxfp4", solution, torch.float32, "x")
+    generator = torch.Generator(device="cpu").manual_seed(20261126)
+    x16 = torch.randn((64, 256), generator=generator).to(torch.bfloat16).to(device)
+    out16, scale16 = quantize_mxfp4(x16, scale_layout="linear", solution=solution)
+    out32, scale32 = quantize_mxfp4(
+        x16.to(torch.float32), scale_layout="linear", solution=solution
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out16.cpu(), out32.cpu())
+    assert torch.equal(scale16.cpu(), scale32.cpu())
+
+    # A value just above an E2M1 midpoint in FP32 but on it after BF16
+    # rounding: FP32 input rounds up (2.5 + eps -> 3), BF16 ties to even (2).
+    x = torch.zeros((1, 32), dtype=torch.float32)
+    x[0, 0] = 4.0  # scale 2**0 for the block
+    x[0, 1] = 2.5 + 2.0**-12
+    out, scale = quantize_mxfp4(
+        x.to(device), scale_layout="linear", solution=solution
+    )
+    torch.cuda.synchronize()
+    assert scale.cpu()[0, 0].item() == 127
+    assert _dequantize_mxfp4(out.cpu(), scale.cpu())[0, 1].item() == 3.0
+
+
+@pytest.mark.parametrize("solution", ["triton"])
 def test_quantize_mxfp4_scale_bytes_for_small_and_large_blocks(
     device: str,
     solution: str,
