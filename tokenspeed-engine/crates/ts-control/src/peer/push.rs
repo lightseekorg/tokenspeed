@@ -523,21 +523,44 @@ struct FencedJobs {
     clean: HashSet<JobKey>,
     order: VecDeque<JobKey>,
     unknown: HashSet<JobKey>,
+    /// Keys cancelled after `unknown_overflowed` became true: fenced against
+    /// late `Push`es without ever entering `clean` (so repeat `Cancel`s stay
+    /// `Unknown` and never downgrade to `Cancelled`).
+    overflow_cancelled: HashSet<JobKey>,
+    overflow_order: VecDeque<JobKey>,
     unknown_overflowed: bool,
 }
 
 impl FencedJobs {
     fn contains(&self, key: &JobKey) -> bool {
-        self.unknown.contains(key) || self.clean.contains(key)
+        self.unknown.contains(key)
+            || self.clean.contains(key)
+            || self.overflow_cancelled.contains(key)
     }
 
     fn unknown(&self, key: &JobKey) -> bool {
         self.unknown.contains(key) || (self.unknown_overflowed && !self.clean.contains(key))
     }
 
+    fn insert_overflow_cancelled(&mut self, key: JobKey) {
+        if self.unknown.contains(&key)
+            || self.clean.contains(&key)
+            || !self.overflow_cancelled.insert(key.clone())
+        {
+            return;
+        }
+        self.overflow_order.push_back(key);
+        while self.overflow_order.len() > MAX_FENCED_JOBS {
+            if let Some(oldest) = self.overflow_order.pop_front() {
+                self.overflow_cancelled.remove(&oldest);
+            }
+        }
+    }
+
     fn insert(&mut self, key: JobKey, unknown: bool) {
         if unknown {
             self.clean.remove(&key);
+            self.overflow_cancelled.remove(&key);
             if self.unknown.contains(&key) {
                 return;
             }
@@ -551,6 +574,7 @@ impl FencedJobs {
         if self.unknown.contains(&key) || !self.clean.insert(key.clone()) {
             return;
         }
+        self.overflow_cancelled.remove(&key);
         self.order.push_back(key);
         while self.order.len() > MAX_FENCED_JOBS {
             if let Some(oldest) = self.order.pop_front() {
@@ -687,10 +711,86 @@ struct HolderState {
     active_offers: Mutex<HashSet<(u64, u64)>>,
 }
 
+/// Bounded FIFO push queue supporting O(Q) removal of cancelled queued items
+/// without head-of-line blocking behind long-running worker jobs.
+struct PushQueueInner {
+    items: VecDeque<QueuedPush>,
+    closed: bool,
+}
+
+struct PushQueue {
+    inner: Mutex<PushQueueInner>,
+    available: Condvar,
+}
+
+impl PushQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PushQueueInner {
+                items: VecDeque::new(),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn try_push(&self, item: QueuedPush) -> Option<(QueuedPush, bool)> {
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Some((item, true));
+        }
+        if inner.items.len() >= MAX_QUEUED_PUSHES {
+            return Some((item, false));
+        }
+        inner.items.push_back(item);
+        self.available.notify_one();
+        None
+    }
+
+    fn pop(&self) -> Option<QueuedPush> {
+        let mut inner = self.inner.lock();
+        loop {
+            if let Some(item) = inner.items.pop_front() {
+                return Some(item);
+            }
+            if inner.closed {
+                return None;
+            }
+            self.available.wait(&mut inner);
+        }
+    }
+
+    /// Removes and returns all queued pushes matching `pred` so the caller can
+    /// drop their `JobGuard`s outside the queue lock.
+    fn drain_matching(&self, mut pred: impl FnMut(&QueuedPush) -> bool) -> Vec<QueuedPush> {
+        let mut inner = self.inner.lock();
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < inner.items.len() {
+            if pred(&inner.items[i]) {
+                if let Some(item) = inner.items.remove(i) {
+                    removed.push(item);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        removed
+    }
+
+    fn close(&self) -> Vec<QueuedPush> {
+        let mut inner = self.inner.lock();
+        inner.closed = true;
+        let remaining: Vec<_> = inner.items.drain(..).collect();
+        self.available.notify_all();
+        remaining
+    }
+}
+
 /// The holder's half: a bounded worker pool serving Disk pushes.
 struct Holder {
     state: Arc<HolderState>,
-    queue: Mutex<Option<mpsc::SyncSender<QueuedPush>>>,
+    queue: Arc<PushQueue>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
@@ -722,15 +822,14 @@ impl Holder {
             active_offers: Mutex::new(HashSet::new()),
         });
         let worker_count = slots.clamp(1, MAX_PUSH_WORKERS);
-        let (tx, rx) = mpsc::sync_channel::<QueuedPush>(MAX_QUEUED_PUSHES);
-        let rx = Arc::new(Mutex::new(rx));
+        let queue = Arc::new(PushQueue::new());
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
-            let (state, rx) = (state.clone(), rx.clone());
+            let (state, queue) = (state.clone(), queue.clone());
             let worker = thread::Builder::new()
                 .name(format!("ts-peer-push-job-{index}"))
                 .spawn(move || loop {
-                    let Ok(mut queued) = rx.lock().recv() else {
+                    let Some(mut queued) = queue.pop() else {
                         return;
                     };
                     let started = Instant::now();
@@ -775,7 +874,7 @@ impl Holder {
         }
         Ok(Self {
             state,
-            queue: Mutex::new(Some(tx)),
+            queue,
             workers: Mutex::new(workers),
         })
     }
@@ -809,35 +908,77 @@ impl Holder {
             return;
         }
         let running = Arc::new(Running::new(offer));
-        {
+        enum Reject {
+            InFlightDuplicate,
+            FencedUnknown,
+            Clean,
+        }
+        let reject = {
             let mut running_map = self.state.running.lock();
-            let offer_unauthorized = match offer {
-                Some(pair) => !self.state.active_offers.lock().contains(&pair),
-                None => false,
-            };
-            if offer_unauthorized
-                || running_map.contains_key(&key)
-                || self.state.fenced.lock().contains(&key)
-            {
-                tracing::warn!(
-                    job = key.job,
-                    ?offer,
-                    reader = key.reply_to,
-                    "rejecting duplicate, fenced, or unauthorized-offer peer push"
-                );
-                if let Some(sockets) = sockets.upgrade() {
-                    send(
-                        &sockets,
-                        &key.reply_to,
-                        &Message::Done {
-                            job: key.job,
-                            ok: false,
-                        },
+            if running_map.contains_key(&key) {
+                Some(Reject::InFlightDuplicate)
+            } else {
+                let fenced = self.state.fenced.lock();
+                if fenced.unknown(&key) {
+                    Some(Reject::FencedUnknown)
+                } else {
+                    let offer_unauthorized = match offer {
+                        Some(pair) => !self.state.active_offers.lock().contains(&pair),
+                        None => false,
+                    };
+                    if offer_unauthorized || fenced.contains(&key) {
+                        Some(Reject::Clean)
+                    } else {
+                        running_map.insert(key.clone(), running.clone());
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(reason) = reject {
+            match reason {
+                Reject::InFlightDuplicate => {
+                    // Never send `Done { ok: false }` for an active job: the
+                    // reader would treat it as cleanly retired and could reuse
+                    // destination memory while the worker is still writing.
+                    tracing::warn!(
+                        job = key.job,
+                        ?offer,
+                        reader = key.reply_to,
+                        "dropping duplicate peer push for in-flight job"
                     );
                 }
-                return;
+                Reject::FencedUnknown => {
+                    tracing::warn!(
+                        job = key.job,
+                        ?offer,
+                        reader = key.reply_to,
+                        "rejecting peer push for job with unknown retirement"
+                    );
+                    if let Some(sockets) = sockets.upgrade() {
+                        send(&sockets, &key.reply_to, &Message::Unknown { job: key.job });
+                    }
+                }
+                Reject::Clean => {
+                    tracing::warn!(
+                        job = key.job,
+                        ?offer,
+                        reader = key.reply_to,
+                        "rejecting fenced or unauthorized-offer peer push"
+                    );
+                    if let Some(sockets) = sockets.upgrade() {
+                        send(
+                            &sockets,
+                            &key.reply_to,
+                            &Message::Done {
+                                job: key.job,
+                                ok: false,
+                            },
+                        );
+                    }
+                }
             }
-            running_map.insert(key.clone(), running.clone());
+            return;
         }
         let guard = JobGuard {
             state: self.state.clone(),
@@ -853,18 +994,15 @@ impl Holder {
             budget: budget.min(MAX_PUSH_BUDGET),
             items,
         };
-        let queue = self.queue.lock();
-        if let Some(tx) = queue.as_ref() {
-            if let Err(rejected) = tx.try_send(queued) {
-                match rejected {
-                    mpsc::TrySendError::Full(_) => {
-                        tracing::warn!("peer push queue full; rejecting");
-                    }
-                    mpsc::TrySendError::Disconnected(_) => {
-                        tracing::warn!("peer push queue closed; rejecting");
-                    }
-                }
+        // Drop any rejected `QueuedPush` (and its `JobGuard`) AFTER releasing
+        // the queue lock to avoid nested lock acquisition under `queue.inner`.
+        if let Some((rejected, closed)) = self.queue.try_push(queued) {
+            if closed {
+                tracing::warn!("peer push queue closed; rejecting");
+            } else {
+                tracing::warn!("peer push queue full; rejecting");
             }
+            drop(rejected);
         }
     }
 
@@ -878,14 +1016,22 @@ impl Holder {
                 let mut fenced = self.state.fenced.lock();
                 fenced_unknown = fenced.unknown(&key);
                 if !fenced.contains(&key) {
-                    fenced.insert(key.clone(), false);
+                    if fenced_unknown {
+                        fenced.insert_overflow_cancelled(key.clone());
+                    } else {
+                        fenced.insert(key.clone(), false);
+                    }
                 }
                 None
             }
         };
         match running {
             Some(running) => {
-                let immediate = running.cancel(key.reply_to);
+                let immediate = running.cancel(key.reply_to.clone());
+                // Evict any still-queued copy immediately so it replies
+                // `Cancelled` without waiting behind preceding NVMe jobs.
+                let evicted = self.queue.drain_matching(|q| q.guard.key == key);
+                drop(evicted);
                 self.state.slots.wake_all();
                 if let Some((reply_to, unknown)) = immediate {
                     let msg = if unknown {
@@ -918,39 +1064,49 @@ impl Holder {
             .insert((incarnation, offer_id));
     }
 
-    /// Revokes authorization for `(incarnation, offer_id)` and signals all
-    /// queued/active jobs tagged with it to stop. Returns `true` only once zero
-    /// jobs for that offer remain in `running` (so Disk block pins may be released).
+    /// Revokes authorization for `(incarnation, offer_id)`, evicts still-queued
+    /// pushes immediately, and signals active workers tagged with it to stop.
+    /// Returns `true` only once zero jobs for that offer remain in `running`
+    /// (so Disk block pins may be released safely).
     fn cancel_offer(&self, incarnation: u64, offer_id: u64) -> bool {
         if offer_id == 0 {
             return true;
         }
         let pair = (incarnation, offer_id);
-        let drained = {
+        {
             let running_map = self.state.running.lock();
             self.state.active_offers.lock().remove(&pair);
-            let mut active = false;
             for running in running_map.values() {
                 if running.offer == Some(pair) {
                     running.cancelled.store(true, Ordering::Release);
-                    active = true;
                 }
             }
-            !active
-        };
+        }
+        // Evict queued jobs for this offer outside locks so their `JobGuard`s
+        // retire immediately without waiting behind unrelated queued pushes.
+        let evicted = self
+            .queue
+            .drain_matching(|q| q.guard.running.offer == Some(pair));
+        drop(evicted);
         self.state.slots.wake_all();
-        drained
+        !self
+            .state
+            .running
+            .lock()
+            .values()
+            .any(|running| running.offer == Some(pair))
     }
 
     /// Cancels all active jobs, closes the queue, and joins every worker.
     fn shutdown(&self) {
-        self.queue.lock().take();
+        let remaining = self.queue.close();
         {
             let running_map = self.state.running.lock();
             for running in running_map.values() {
                 running.cancelled.store(true, Ordering::Release);
             }
         }
+        drop(remaining);
         self.state.slots.wake_all();
         for worker in self.workers.lock().drain(..) {
             let _ = worker.join();
@@ -1022,7 +1178,20 @@ impl HolderState {
         let (done, completions) = mpsc::channel::<(usize, usize, bool)>();
         let mut next = 0;
         let mut written = 0;
-        let mut inflight: HashMap<usize, (SlotGuard<'_>, JobId)> = HashMap::new();
+        struct InflightRead<'a> {
+            _slot: SlotGuard<'a>,
+            executor: &'a ts_disk::Executor,
+            job_id: JobId,
+            completed: bool,
+        }
+        impl Drop for InflightRead<'_> {
+            fn drop(&mut self) {
+                if !self.completed && std::thread::panicking() {
+                    self.executor.cancel(self.job_id);
+                }
+            }
+        }
+        let mut inflight: HashMap<usize, InflightRead<'_>> = HashMap::new();
         let mut cancelled_reads = false;
         let mut ok = true;
         let mut write_failed = false;
@@ -1057,7 +1226,15 @@ impl HolderState {
                 );
                 match submitted {
                     Ok(job_id) => {
-                        inflight.insert(slot_idx, (slot_guard, job_id));
+                        inflight.insert(
+                            slot_idx,
+                            InflightRead {
+                                _slot: slot_guard,
+                                executor: &self.source.executor,
+                                job_id,
+                                completed: false,
+                            },
+                        );
                         next += 1;
                     }
                     Err(_) => {
@@ -1068,8 +1245,8 @@ impl HolderState {
             }
             if stopped(ok) && !cancelled_reads {
                 cancelled_reads = true;
-                for &(_, job_id) in inflight.values() {
-                    self.source.executor.cancel(job_id);
+                for entry in inflight.values() {
+                    self.source.executor.cancel(entry.job_id);
                 }
             }
             if inflight.is_empty() {
@@ -1086,8 +1263,9 @@ impl HolderState {
                         );
                         // The kernel may still write into these staging slots;
                         // leak their SlotGuards so no future push reuses them.
-                        for (_, (slot_guard, _)) in inflight.drain() {
-                            std::mem::forget(slot_guard);
+                        for (_, mut entry) in inflight.drain() {
+                            entry.completed = true;
+                            std::mem::forget(entry);
                         }
                         ok = false;
                         break;
@@ -1096,9 +1274,11 @@ impl HolderState {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            let Some((_slot_guard, _job_id)) = inflight.remove(&slot_idx) else {
+            let Some(mut entry) = inflight.remove(&slot_idx) else {
                 continue;
             };
+            entry.completed = true;
+            let _slot_guard = entry;
             ok &= read;
             if !stopped(ok) {
                 let base = (ring + slot_idx * self.source.slot_bytes) as u64;
@@ -1189,6 +1369,7 @@ struct NewPushGroup {
     group_id: u64,
     requests: Vec<(u64, String, u16, Message)>,
     budget: Duration,
+    submit_until: Instant,
     sealed: Arc<AtomicBool>,
     cancelling: Arc<AtomicBool>,
     finish: Box<dyn FnOnce(PushOutcome) + Send>,
@@ -1273,14 +1454,37 @@ fn drain_new_groups(
     job_to_group: &mut HashMap<u64, u64>,
 ) {
     for new in new_groups_rx.try_iter() {
-        let now = Instant::now();
         let mut pending = HashMap::with_capacity(new.requests.len());
         let mut abort_reason = None;
-        for (job, host, port, request) in new.requests {
+        let mut wait_deadline = Instant::now() + new.budget.saturating_add(Duration::from_secs(1));
+        for (job, host, port, mut request) in new.requests {
             if new.sealed.load(Ordering::SeqCst) {
                 abort_reason = Some("peer push sealed during submission".to_owned());
                 break;
             }
+            // Re-check the local submission window and re-clamp budget_us at
+            // actual wire-send time so dispatcher queueing delay can never push
+            // a request past `submit_until` or inflate the holder's deadline.
+            let now = Instant::now();
+            let Some(remaining) = new.submit_until.checked_duration_since(now) else {
+                abort_reason = Some("peer push submission window elapsed".to_owned());
+                break;
+            };
+            let clamped = new.budget.min(remaining).min(MAX_PUSH_BUDGET);
+            let budget_us = u64::try_from(clamped.as_micros()).unwrap_or(u64::MAX);
+            if budget_us == 0 {
+                abort_reason = Some("peer push budget is zero".to_owned());
+                break;
+            }
+            if let Message::Push {
+                budget_us: wire_budget,
+                ..
+            } = &mut request
+            {
+                *wire_budget = budget_us;
+            }
+            let target_deadline = now + clamped.saturating_add(Duration::from_secs(1));
+            wait_deadline = wait_deadline.min(target_deadline);
             match sockets.send(&host, port, request.frames()) {
                 Ok(()) => {
                     pending.insert(job, (host, port));
@@ -1292,15 +1496,14 @@ fn drain_new_groups(
                 }
             }
         }
+        let now = Instant::now();
         let mut group = PushGroup {
             pending,
             sealed: new.sealed,
             cancelling: new.cancelling,
             abort_reason,
             unknown_reason: None,
-            phase: GroupPhase::Waiting {
-                wait_deadline: now + new.budget.saturating_add(Duration::from_secs(1)),
-            },
+            phase: GroupPhase::Waiting { wait_deadline },
             finish: Some(new.finish),
         };
         if group.pending.is_empty() {
@@ -1837,6 +2040,7 @@ impl PagePusher for PushEndpoint {
             group_id,
             requests,
             budget: effective_budget,
+            submit_until,
             sealed,
             cancelling,
             finish,
@@ -3015,5 +3219,210 @@ mod tests {
             matches!(zero_out, PushOutcome::Aborted(_)),
             "sub-microsecond budget must abort, got {zero_out:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_inflight_push_is_silent_unknown_stays_unknown_and_queued_cancel_evicts_immediately(
+    ) {
+        use std::{path::PathBuf, sync::atomic::AtomicUsize};
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        // 1. P1-2: After `unknown_overflowed`, cancelling an unrecognized job
+        //    must NEVER insert it into `clean` (repeat cancels must stay Unknown).
+        let mut fenced = FencedJobs {
+            unknown_overflowed: true,
+            ..FencedJobs::default()
+        };
+        let ghost = JobKey {
+            reply_to: "10.0.0.9:7200".into(),
+            job: 999,
+        };
+        assert!(fenced.unknown(&ghost));
+        fenced.insert_overflow_cancelled(ghost.clone());
+        assert!(fenced.contains(&ghost));
+        assert!(
+            fenced.unknown(&ghost),
+            "overflow_cancelled key must remain unknown on repeat cancel"
+        );
+        // Clean completions after overflow remain cleanly classified.
+        let clean_key = JobKey {
+            reply_to: "10.0.0.9:7200".into(),
+            job: 1000,
+        };
+        fenced.insert(clean_key.clone(), false);
+        assert!(fenced.contains(&clean_key) && !fenced.unknown(&clean_key));
+
+        // 2. P1-1 & P2-1: Single-slot (1-worker) holder proves:
+        //    - duplicate in-flight Push receives NO reply until the active job finishes;
+        //    - queued Push behind a blocked worker is evicted immediately by Cancel
+        //      and by `cancel_offer` without waiting for the blocked worker;
+        //    - duplicate Push for a job that retired Unknown receives `Unknown`.
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-audit-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (2 * BLOCK) as u64).unwrap();
+        let ring = Arc::new(Memory::map(BLOCK).unwrap()); // 1 slot -> 1 worker
+        let mut seed = Memory::map(BLOCK).unwrap();
+        seed.write_at(0, &[0x5A; BLOCK]);
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[(ring.address(), ring.size()), (seed.address(), seed.size())],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = mpsc::channel();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: 0,
+                        address: seed.address(),
+                        len: BLOCK,
+                    }],
+                },
+                move |r| {
+                    let _ = tx.send(r.outcome);
+                },
+            )
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        struct HoldWriter {
+            hold: (std::sync::Mutex<bool>, std::sync::Condvar),
+            fail: AtomicBool,
+            entered: AtomicUsize,
+        }
+        impl PageWriter for HoldWriter {
+            fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let held = self.hold.0.lock().unwrap();
+                let _held = self.hold.1.wait_while(held, |b| *b).unwrap();
+                if self.fail.load(Ordering::Acquire) {
+                    return Err("forced write fault".into());
+                }
+                Ok(())
+            }
+        }
+        let writer = Arc::new(HoldWriter {
+            hold: (std::sync::Mutex::new(true), std::sync::Condvar::new()),
+            fail: AtomicBool::new(false),
+            entered: AtomicUsize::new(0),
+        });
+        let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 301).unwrap();
+        holder
+            .serve(PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: writer.clone(),
+                ring,
+                slot_bytes: BLOCK,
+            })
+            .unwrap();
+        holder.activate_offer(500, 1);
+        holder.activate_offer(500, 2);
+
+        let (rtx, rrx) = mpsc::channel::<Vec<Bytes>>();
+        let raw_reader = Sockets::start_at("127.0.0.1", 0, rtx).unwrap();
+        let reply_ep = format!("127.0.0.1:{}", raw_reader.port());
+        let (h_host, h_port) = split_endpoint(holder.name()).unwrap();
+        let items = vec![PushItem {
+            group: 0,
+            block: 1,
+            spans: vec![PushSpan {
+                offset: 0,
+                address: 2048,
+                length: 64,
+            }],
+        }];
+
+        // Send job 1 (occupies the single worker and blocks inside HoldWriter).
+        let p1 = Message::Push {
+            job: 1,
+            offer: Some((500, 1)),
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: items.clone(),
+        };
+        raw_reader.send(h_host, h_port, p1.frames()).unwrap();
+        let wait = Instant::now();
+        while writer.entered.load(Ordering::Acquire) < 1 {
+            assert!(wait.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Send duplicate in-flight job 1 -> must NOT produce Done{ok:false}!
+        raw_reader.send(h_host, h_port, p1.frames()).unwrap();
+        assert!(
+            rrx.recv_timeout(Duration::from_millis(120)).is_err(),
+            "duplicate in-flight Push must not send any premature reply"
+        );
+
+        // Queue job 2 (offer 2) behind blocked job 1, then cancel_offer(500, 2):
+        // must evict job 2 IMMEDIATELY and report drained=true while job 1 is still blocked!
+        let p2 = Message::Push {
+            job: 2,
+            offer: Some((500, 2)),
+            reply_to: reply_ep.clone(),
+            session: "s".into(),
+            budget_us: 10_000_000,
+            items: items.clone(),
+        };
+        raw_reader.send(h_host, h_port, p2.frames()).unwrap();
+        let wait_q = Instant::now();
+        while holder.active_push_jobs() < 2 {
+            assert!(wait_q.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            holder.cancel_offer(500, 2),
+            "queued-only offer must drain immediately without waiting behind blocked worker"
+        );
+        let msg2 = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(msg2, Some(Message::Done { job: 2, ok: false }));
+
+        // Now fail job 1 with RDMA write error -> Unknown retirement.
+        writer.fail.store(true, Ordering::Release);
+        *writer.hold.0.lock().unwrap() = false;
+        writer.hold.1.notify_all();
+        let msg1 = Message::decode(&rrx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(msg1, Some(Message::Unknown { job: 1 }));
+
+        // Replaying job 1 after Unknown retirement must answer Unknown (never Done{ok:false}).
+        raw_reader.send(h_host, h_port, p1.frames()).unwrap();
+        let replay = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(replay, Some(Message::Unknown { job: 1 }));
     }
 }

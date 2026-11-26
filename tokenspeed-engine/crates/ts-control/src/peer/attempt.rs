@@ -399,6 +399,12 @@ impl Attempt {
             return Some(Message::Pin(v.key.clone(), self.offer.clone()?));
         }
         if self.votes.contains(&Some(2)) {
+            // All members reported retirement and at least one is Unknown.
+            // The scheduler already retains the permanently frozen target pages
+            // via FetchFrozen; mark this Rust Attempt finished so prompt/hash
+            // memory and the 4096-attempt table slot are reclaimed without
+            // emitting TargetRetired or Release.
+            self.phase = Phase::Finished;
             return None;
         }
         if self.frozen {
@@ -644,6 +650,8 @@ mod verification {
                 assert!(round.landed.is_empty());
                 if values.contains(&2) {
                     assert!(release.is_none());
+                    assert!(a.finished());
+                    assert!(a.take_pending_release(i64::MAX).is_none());
                     assert!(round
                         .events
                         .iter()

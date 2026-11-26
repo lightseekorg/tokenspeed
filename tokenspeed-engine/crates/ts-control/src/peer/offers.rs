@@ -133,7 +133,6 @@ impl Offers {
         &mut self,
         now: i64,
         retirement_bound_ms: u32,
-        s: &mut Scheduler,
         pusher: &dyn PagePusher,
     ) -> Vec<Vote> {
         let due: Vec<_> = self
@@ -148,7 +147,7 @@ impl Offers {
             .collect();
         let mut votes = Vec::new();
         for (key, id, d) in due {
-            let (_, vote) = self.close(&key, id, d, s, pusher, now);
+            let (_, vote) = self.close(&key, id, d, pusher, now);
             votes.extend(vote);
         }
         self.records
@@ -360,7 +359,6 @@ impl Offers {
         k: &Key,
         id: u64,
         d: Disposition,
-        s: &mut Scheduler,
         pusher: &dyn PagePusher,
         now: i64,
     ) -> (Option<Message>, Option<Vote>) {
@@ -395,31 +393,23 @@ impl Offers {
         }
         r.phase = Phase::Closing(d);
         r.votes.fill(None);
-        // Fence new Disk pushes and cancel any in-flight pushes for this offer
-        // BEFORE releasing scheduler pins. Keep Disk blocks pinned (vote 0)
-        // until every in-flight NVMe read and RDMA write for this offer has
-        // truly drained. Keep `r.until` identical across all ranks; when any
-        // rank votes 0, `vote()` shortens `r.until` uniformly for a fast retry.
+        // Revoke push authorization and cancel/drain any in-flight Disk pushes
+        // BEFORE releasing scheduler pins. Do NOT call `close_peer_offer` here:
+        // on mirrored TP/KVP schedulers, all members must unpin in lockstep on
+        // the exact same round once every member votes `CLOSED = 1` (drained).
         let drained = pusher.cancel_offer(k.holder.incarnation, id);
         r.until = now.saturating_add(1_000_000);
-        let ok = drained
-            && (!r.held
-                || s.close_peer_offer(&r.checkpoint.lease, now)
-                    .unwrap_or(false));
-        if ok {
-            r.held = false;
-        }
         (
             None,
             Some(Vote {
                 key: k.clone(),
                 offer: id,
                 stage: CLOSED,
-                value: ok as u8,
+                value: drained as u8,
             }),
         )
     }
-    pub fn vote(&mut self, rank: usize, v: &Vote, now: i64) -> Option<Message> {
+    pub fn vote(&mut self, rank: usize, v: &Vote, s: &mut Scheduler, now: i64) -> Option<Message> {
         let r = self.records.get_mut(&v.key)?;
         if r.offer.id != v.offer
             || !matches!(
@@ -449,14 +439,24 @@ impl Offers {
                 Some(Message::Grant(v.key.clone(), r.offer.clone(), ok))
             }
             Phase::Closing(d) if ok => {
+                // Unanimous drain consensus: every member has zero in-flight
+                // Disk pushes for this offer. Release scheduler pins in lockstep
+                // on the exact same round across all mirrored members.
+                if r.held {
+                    let closed = s
+                        .close_peer_offer(&r.checkpoint.lease, now)
+                        .unwrap_or(false);
+                    debug_assert!(closed);
+                    r.held = false;
+                }
                 r.phase = Phase::Closed(d);
                 r.until = now.saturating_add(60_000_000);
                 Some(Message::Ack(v.key.clone(), v.offer, d, Closure::Closed))
             }
             Phase::Closing(_) => {
-                // At least one member is still draining Disk pushes or retrying
-                // scheduler unpin; pull the collective retry deadline in uniformly
-                // on every member using shared round time `now`.
+                // At least one member is still draining Disk pushes; keep pins
+                // held uniformly on all members and pull the collective retry
+                // deadline in using shared round time `now`.
                 r.until = r.until.min(now.saturating_add(50_000));
                 None
             }

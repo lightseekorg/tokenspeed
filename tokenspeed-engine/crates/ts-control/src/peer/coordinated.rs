@@ -432,7 +432,7 @@ impl Control {
                     self.send(Message::Ack(k.clone(), *id, *d, Closure::Stale));
                     return;
                 }
-                let (reply, v) = self.offers.close(k, *id, *d, s, self.pusher.as_ref(), now);
+                let (reply, v) = self.offers.close(k, *id, *d, self.pusher.as_ref(), now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -489,7 +489,7 @@ impl Control {
         for (i, r) in reports.iter().enumerate() {
             for v in &r.votes {
                 let reply = match v.stage {
-                    PINNED | CLOSED => self.offers.vote(i, v, now),
+                    PINNED | CLOSED => self.offers.vote(i, v, s, now),
                     READY | DONE | FREEZE => self
                         .attempts
                         .get_mut(&v.key.lease)
@@ -505,7 +505,6 @@ impl Control {
                             key,
                             offer.id,
                             Disposition::Abort,
-                            s,
                             self.pusher.as_ref(),
                             now,
                         );
@@ -550,7 +549,7 @@ impl Control {
         }
         let expired = self
             .offers
-            .expire(now, retirement_bound_ms, s, self.pusher.as_ref());
+            .expire(now, retirement_bound_ms, self.pusher.as_ref());
         self.votes.extend(expired);
         round.events.append(&mut self.missing);
         Ok(())
