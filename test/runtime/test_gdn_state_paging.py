@@ -1378,12 +1378,24 @@ class TestPrefillStateGuardPagesGPUTest:
 
     def _gdn(self):
         """GDN: (heads, make_backend(conv, ssm), per-token inputs, kwargs)."""
+        from tokenspeed_kernel.ops.attention.gdn import flashinfer as flashinfer_gdn
+        from tokenspeed_kernel.platform import ArchVersion, current_platform
+
         from tokenspeed.runtime.layers.attention.backends.state.gdn import (
             GdnAttnBackend,
         )
 
         torch = self.torch
         heads = 16
+        # Of the GDN chunk-prefill kernels only FlashInfer's (NVIDIA SM90 to
+        # SM10.7 with CUDA 13) stores in-forward checkpoints; the Triton scan
+        # that runs elsewhere, e.g. on ROCm, does not.
+        platform = current_platform()
+        self.checkpoint_kernel_available = (
+            platform.is_nvidia
+            and ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 7)
+            and flashinfer_gdn.is_supported(128, torch.bfloat16, heads, heads)
+        )
 
         def make(conv, ssm):
             backend = GdnAttnBackend(
@@ -1435,6 +1447,9 @@ class TestPrefillStateGuardPagesGPUTest:
 
         torch = self.torch
         heads = 4
+        # Both KDA solutions store in-forward checkpoints once their
+        # prerequisites above pass.
+        self.checkpoint_kernel_available = True
         spec = MHAConfig(
             num_attention_heads=heads, num_kv_heads=heads, head_dim=128, attn_tp_size=1
         )
@@ -1520,8 +1535,15 @@ class TestPrefillStateGuardPagesGPUTest:
         """
         torch = self.torch
         backend = make(*slabs)
-        # Every family under test stores in-forward checkpoints once its
-        # prerequisites pass, so a backend that stops advertising it fails.
+        # A platform without a kernel that stores in-forward checkpoints for
+        # this family has nothing to check. Where one runs, a backend that
+        # stops advertising them fails.
+        if (
+            checkpoint
+            and not self.checkpoint_kernel_available
+            and not backend.stores_in_forward_state_checkpoints
+        ):
+            pytest.skip("no chunk-prefill kernel stores in-forward checkpoints here")
         assert not checkpoint or backend.stores_in_forward_state_checkpoints
         bs = len(rows)
         lens_cpu = torch.tensor(lens, dtype=torch.int32)
