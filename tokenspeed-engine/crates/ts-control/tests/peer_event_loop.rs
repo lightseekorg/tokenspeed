@@ -973,13 +973,13 @@ fn compaction_peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
              cfg.prefix_granularity = 8; cfg.max_scheduled_tokens = 64\n\
              cfg.max_batch_size = 64; cfg.max_resident_requests = 64\n\
              cfg.max_retracted_requests = 0; cfg.decode_input_tokens = 1\n\
-             cfg.num_device_pages = 29; cfg.num_snapshot_pages = 1; cfg.disable_l2_cache = True\n\
+             cfg.num_device_pages = 33; cfg.num_snapshot_pages = 1; cfg.disable_l2_cache = True\n\
              cfg.cache_groups = [\n\
                ts.CacheGroupConfig(group_id='full_attention', block_granularity=8,\n\
-                 total_pages=58, attn_kind=ts.AttnKind.Full,\n\
+                 total_pages=66, attn_kind=ts.AttnKind.Full,\n\
                  cache_blocks_per_lcm_block=2, transfer_policy=ts.CacheTransferPolicy.FullSuffix),\n\
                ts.CacheGroupConfig(group_id='sliding', block_granularity=8,\n\
-                 total_pages=29, attn_kind=ts.AttnKind.SlidingWindow,\n\
+                 total_pages=33, attn_kind=ts.AttnKind.SlidingWindow,\n\
                  sliding_window_tokens=64, cache_blocks_per_lcm_block=1,\n\
                  transfer_policy=ts.CacheTransferPolicy.FullSuffix),\n\
              ]\n\
@@ -1110,10 +1110,12 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         stop.clone(),
     );
 
-    // 1. Fragment the pool with eight 1-page prompts submitted in one round so
-    //    each full_attention parent holds [cached page | hole] alongside eight
-    //    cached sliding parents.
-    let a_tokens: Vec<Vec<i32>> = (0..8)
+    // 1. Fragment the pool with twelve 1-page prompts submitted in one round so
+    //    each full_attention parent holds [cached page | hole] alongside twelve
+    //    cached sliding parents, leaving exactly eight empty parents (matching
+    //    R chunk 1's sliding reserve so request-aware placement spills all of
+    //    R's history blocks into the twelve cached holes).
+    let a_tokens: Vec<Vec<i32>> = (0..12)
         .map(|k| (100 + 50 * k..100 + 50 * k + 8).collect())
         .collect();
     fe0.receive_hook.arm();
@@ -1122,7 +1124,7 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         fe0.push(add_req(&format!("a{k}"), toks.clone(), 1));
     }
     fe0.receive_hook.release();
-    for k in 0..8 {
+    for k in 0..12 {
         fe0.wait_finished(&format!("a{k}"));
     }
 
@@ -1184,20 +1186,22 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         let _ = recv_answer();
     };
 
-    // 2. Hard-pin a1..a7 (leaving a0 unpinned so chunk 1 of R can take a0's
-    //    sliding parent and fill the eight full_attention holes).
+    // 2. Hard-pin a0..a11: chunk 1 of R takes the eight empty parents for its
+    //    sliding group and fills all twelve full_attention holes; chunk 2 then
+    //    blocks on the pinned sliding parents.
     let a_prompts: Vec<Prompt> = a_tokens
         .iter()
         .map(|toks| make_compaction_lookup_prompt(toks))
         .collect();
-    let mut leases: Vec<Option<PeerLeaseView>> = (0..8)
-        .map(|k| (k >= 1).then(|| pin_prompt(10 + k as u64, &a_prompts[k])))
+    let mut leases: Vec<Option<PeerLeaseView>> = (0..12)
+        .map(|k| Some(pin_prompt(10 + k as u64, &a_prompts[k])))
         .collect();
 
-    // 3. Submit the 126-token lone request R. Chunk 1 (64 tokens) runs and
-    //    completes; chunk 2 blocks on a1..a7, so lone-request recovery
-    //    publishes chunk 1's eight full pages first without forwarding.
-    let r_tokens: Vec<i32> = (3000..3126).collect();
+    // 3. Submit the 86-token lone request R (11 history blocks + 1 copy-in = 12
+    //    history blocks; chunk 2 needs 4 sliding parents). Chunk 1 (64 tokens)
+    //    runs and completes; chunk 2 blocks on a0..a11, so lone-request
+    //    recovery publishes chunk 1's eight full pages first without forwarding.
+    let r_tokens: Vec<i32> = (3000..3086).collect();
     let r_page0_prompt = make_compaction_lookup_prompt(&r_tokens[..8]);
     fe0.push(add_req("R", r_tokens.clone(), 1));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1216,15 +1220,16 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
         thread::sleep(Duration::from_millis(5));
     }
 
-    // 4. Arm h0.execute and release one kept parent (a1) plus one vacatable
-    //    parent (a7), keeping a2..a6 pinned. Lone-request compaction copies
-    //    R's published full_attention block out of a7's parent into a1's
-    //    cleared slot (emitting pages_to_copy), while the chunk-2 retry still
-    //    fails for lack of sliding parents (forward == None, so in_flight
-    //    stays empty while copies_confirmed_at is set).
+    // 4. Arm h0.execute and release one kept parent (a2) plus one vacatable
+    //    parent holding a published chunk-1 page (a9), keeping the remaining
+    //    ten leases pinned. Lone-request compaction copies R's published
+    //    full_attention block out of a9's parent into a2's cleared slot
+    //    (emitting pages_to_copy), while the chunk-2 retry still fails for lack
+    //    of sliding parents (needs 4, only 3 available; forward == None, so
+    //    in_flight stays empty while copies_confirmed_at is set).
     assert_eq!(h0.copy_only_plans.load(Ordering::SeqCst), 0);
     h0.execute.arm();
-    for k in [1usize, 7] {
+    for k in [2usize, 9] {
         release_lease(leases[k].take().unwrap());
     }
     h0.execute.wait_entered();
@@ -1288,10 +1293,11 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
     assert_eq!(recv_answer().0, 8);
     fe1.wait_finished("r1-while-copies");
 
-    // 7. Release a2..a6 so R dispatches and completes chunk 2's forward,
-    //    clearing copies_confirmed_at. Afterwards gate() unlocks again.
-    for lease in leases[2..=6].iter_mut() {
-        release_lease(lease.take().unwrap());
+    // 7. Release all remaining pinned leases so R dispatches and completes
+    //    chunk 2's forward, clearing copies_confirmed_at. Afterwards gate()
+    //    unlocks again.
+    for lease in leases.into_iter().flatten() {
+        release_lease(lease);
     }
     fe0.wait_finished("R");
 
