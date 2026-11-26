@@ -147,16 +147,20 @@ def test_recipe_prices_residents_without_growing_execution_workspace():
         max_resident_requests=5,
         pd_disaggregation_enabled=True,
     )
-    # Batch-indexed scratch stays sized by max_bs. KDA keeps its retained
-    # records in request slots across rounds, so each extra resident adds its
-    # slot's records and nothing else.
-    extra_slots = RequestSlotLayout(5).capacity - RequestSlotLayout(2).capacity
+    # Batch-indexed scratch stays sized by max_bs, and so do KDA's retained
+    # records: they live in execution slots (decode permits on a decode
+    # node), which an extra resident waiting for KV or a permit does not
+    # hold. Extra residents add no workspace byte.
+    assert expanded.workspace_bytes() == small.workspace_bytes()
     slot_bytes = kda_request_slot_bytes(
         expanded.attn_config, expanded.groups(), draft_token_num=1
     )
-    assert expanded.workspace_bytes() - small.workspace_bytes() == (
-        extra_slots * slot_bytes
-    )
+    assert slot_bytes > 0
+    retained_bytes = RequestSlotLayout(2).capacity * slot_bytes
+    assert small.workspace_bytes() > retained_bytes
+    # Before, each extra resident priced one more slot of records.
+    extra_slots = RequestSlotLayout(5).capacity - RequestSlotLayout(2).capacity
+    assert extra_slots * slot_bytes > 0
     groups = expanded.groups()
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         capacity_model,

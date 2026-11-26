@@ -403,10 +403,12 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(
     )
     layers, groups, batch, heads, dim = 34, 3, 16, 8, 128
     conv_channels = 3 * heads * dim
-    # 24 resident requests plus the two reserved request slots each hold FP32
-    # U/K/decay records per layer, plus one INT32 accepted count every layer
-    # shares.
-    slots = 26
+    # The 16 execution slots plus the null and graph-padding rows each hold
+    # FP32 U/K/decay records per layer, plus one INT32 accepted count every
+    # layer shares. The 8 resident requests past max_bs hold none; the
+    # request-keyed KPool tail still has a row for each of the 26.
+    slots = 18
+    assert recipe.pool_options().num_request_slots == 26
     expected = (
         layers * batch * width * conv_channels * 2
         + slots * (layers * 3 * heads * capacity * dim * 4 + 4)

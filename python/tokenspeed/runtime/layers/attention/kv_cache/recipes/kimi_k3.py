@@ -497,7 +497,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """Request-slot KDA history and verify staging, plus DSA prefill gathers."""
+        """Execution-slot KDA history and verify staging, plus DSA prefill gathers."""
         history = 0
         if dsa_kvp_history_prefill(self.attn_config):
             history = dsa_history_gather_workspace_bytes(

@@ -379,9 +379,19 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize(
-    ("backend_name", "heads"), [("cutedsl_kda", 8), ("cutedsl_kda", 96), ("cudnn", 8)]
+    ("backend_name", "heads", "request_rows"),
+    [
+        ("cutedsl_kda", 8, True),
+        ("cutedsl_kda", 96, True),
+        ("cudnn", 8, True),
+        # As KDA serves: its prefill metadata carries no request rows, and the
+        # executor stages each row's execution slot on its own.
+        ("cutedsl_kda", 8, False),
+    ],
 )
-def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, heads):
+def test_outer_graph_replays_lengths_pages_and_states(
+    batch_size, backend_name, heads, request_rows
+):
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -423,6 +433,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     # gathers with it and then clears it.
     length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
     backend._replay_length = length
+    # InputBuffers.execution_slots_buf, as the executor binds it for max_bs 8:
+    # each row's execution slot, the padding slot 9 past the batch. The
+    # captured gather reads it in place.
+    execution_slots = torch.full((8,), 9, device="cuda", dtype=torch.int64)
+    backend._record_slots = execution_slots
     backend._state_layer_ids = lambda: [0]
     backend.__dict__.update(
         is_draft=False,
@@ -484,12 +499,24 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         )
         return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
-    def reset(metadata):
+    def row_slots(count, page_shift):
+        """Each row's execution slot. With request rows in the metadata it is
+        the row's request row, as on a fused role; without them, a slot no
+        request row names, which only the staged vector carries."""
+        slots = (2 * torch.arange(count, device="cuda") + page_shift) % 8 + 1
+        return slots if request_rows else 9 - slots
+
+    def stage(slots):
+        execution_slots.fill_(9)
+        execution_slots[: slots.numel()].copy_(slots)
+
+    def reset(metadata, slots):
         conv.copy_(initial_conv)
         states.copy_(initial_states)
         length.fill_(3)
         shared = metadata.state_in_blocks_by_group["state"] == 8
-        length[metadata.req_pool_indices[shared].long()] = 0
+        length[slots[shared]] = 0
+        stage(slots)
 
     def assert_scan_close(actual, expected):
         if backend_name == "cutedsl_kda":
@@ -513,10 +540,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         return MambaForwardMetadata(
             query_start_loc=bounds,
             req_pool_indices=(
-                2 * torch.arange(len(prefixes), device="cuda") + page_shift
-            )
-            % 8
-            + 1,
+                row_slots(len(prefixes), page_shift) if request_rows else None
+            ),
             scan_query_start_loc=bounds.long(),
             query_start_loc_int64=bounds.long(),
             extend_seq_lens_cpu=lengths,
@@ -588,6 +613,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
 
     def dummy(bucket, bs):
         backend.forward_metadata = live_metadata([bucket // bs] * bs, [0] * bs, 2)
+        stage(row_slots(bs, 2))
         return SimpleNamespace(
             bs=bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -611,10 +637,14 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         "query_start_loc": fixed.query_start_loc,
         "scan_query_start_loc": fixed.scan_query_start_loc,
         "query_start_loc_int64": fixed.query_start_loc_int64,
-        "request_slots": fixed.req_pool_indices,
         "state_in": fixed.state_in_blocks_by_group["state"],
         "state_out": fixed.state_out_blocks_by_group["state"],
     }
+    if request_rows:
+        retained["request_slots"] = fixed.req_pool_indices
+    else:
+        # Nothing restages request rows before a replay.
+        assert fixed.req_pool_indices is None
     addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
@@ -624,9 +654,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
-        reset(source)
+        slots = row_slots(len(lengths), 2 + index % 2)
+        reset(source, slots)
         expected_lengths = length.clone()
-        expected_lengths[source.req_pool_indices.long()] = 0
+        expected_lengths[slots] = 0
         from test.runtime.kda_torch_reference import kda_prefill_reference
 
         expected_conv, expected_states = initial_conv.clone(), initial_states.clone()
@@ -646,7 +677,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
                 else torch.zeros_like(initial_conv[0])
             )
             if prefix:
-                slot = int(source.req_pool_indices[row])
+                slot = int(slots[row])
                 for step in range(int(length[slot, 0])):
                     initial = (
                         initial * decay[slot, :, step, None, :]
@@ -683,7 +714,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         backend.forward_metadata = prepare_capacity_prefill_metadata(
             source, bucket, None, checkpoints=None
         )
-        reset(source)
+        reset(source, slots)
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(fresh_eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -694,7 +725,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         # does not admit, such as MIXED batches).
         for metadata in (backend.forward_metadata, source):
             backend.forward_metadata = metadata
-            reset(source)
+            reset(source, slots)
             ordinary.replay(valid_rows=sum(lengths))
             assert_scan_close(ordinary_output[: sum(lengths)], expected)
             assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -704,7 +735,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
-        reset(source)
+        reset(source, slots)
         eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -713,7 +744,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
-        reset(source)
+        reset(source, slots)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()

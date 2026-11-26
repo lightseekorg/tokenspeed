@@ -190,12 +190,12 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
         ),
     )
 
-    # Four batch rows stage QKV. Twelve resident requests and the two
-    # reserved request slots each hold sixteen (the default capacity) FP32
-    # U/K/decay records per layer, plus one INT32 accepted count every layer
-    # shares.
+    # Four batch rows stage QKV. The four execution slots and the two
+    # reserved rows (null and graph padding) each hold sixteen (the default
+    # capacity) FP32 U/K/decay records per layer, plus one INT32 accepted
+    # count every layer shares; the eight extra resident requests hold none.
     qkv_bytes = 69 * 4 * 8 * 4608 * 2
-    retained_bytes = 14 * (69 * 12 * 16 * 128 * 3 * 4 + 4)
+    retained_bytes = 6 * (69 * 12 * 16 * 128 * 3 * 4 + 4)
     descriptor_bytes = 69 * (12 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
     record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
@@ -391,8 +391,13 @@ def test_token_limit_retains_kda_working_set(limit, kvp_size):
 
 
 @pytest.mark.parametrize("capacity", [4, 8, 24])
-def test_kda_history_capacity_sizes_each_request_slot(capacity):
-    """--kda-history-capacity sets the records a request slot keeps per layer."""
+def test_kda_history_capacity_sizes_each_execution_slot(capacity):
+    """--kda-history-capacity sets the records an execution slot keeps per
+    layer; resident requests beyond max_bs keep none."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_request_slot_bytes,
+    )
+
     recipe = kimi_recipe(
         speculative_num_draft_tokens=4,
         max_resident_requests=7,
@@ -403,8 +408,62 @@ def test_kda_history_capacity_sizes_each_request_slot(capacity):
         max_resident_requests=6,
         kda_history_capacity=capacity,
     )
-    assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * 3 * 12 * capacity * 128 * 4 + 4
+    assert recipe.workspace_bytes() == smaller.workspace_bytes()
+    assert kda_request_slot_bytes(
+        recipe.attn_config, recipe.groups(), draft_token_num=4
+    ) == (69 * 3 * 12 * capacity * 128 * 4 + 4)
+
+
+@pytest.mark.parametrize(
+    "tp_size,heads,slot_bytes,saved_bytes",
+    [
+        # 69 layers x heads x 16 records (the default capacity) x (V + 2K =
+        # 384) x 4 B, plus the 4-byte shared count.
+        (8, 12, 20_348_932, 1_302_331_648),  # 19.4 MiB, 1.21 GiB
+        (1, 96, 162_791_428, 10_418_651_392),  # 155.3 MiB, 9.70 GiB
+    ],
+    ids=["tp8", "tp1"],
+)
+def test_extra_decode_slots_add_no_retained_workspace(
+    tp_size, heads, slot_bytes, saved_bytes
+):
+    """A decode node's 64 extra resident slots wait for KV or a decode permit
+    and hold no KDA records: the retained workspace is priced for the
+    max_bs execution slots alone, which the KV cache gets back."""
+    from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_request_slot_bytes,
+    )
+
+    max_bs, extra = 64, 64
+
+    def recipe_for(residents):
+        recipe = kimi_recipe(
+            tp_size=tp_size,
+            max_bs=max_bs,
+            max_resident_requests=residents,
+            pd_enabled=residents > max_bs,
+            speculative_algorithm="EAGLE3",
+            speculative_num_draft_tokens=4,
+        )
+        if residents > max_bs:
+            recipe.server_args.disaggregation_mode = "decode"
+        return recipe
+
+    colocated, decode = recipe_for(max_bs), recipe_for(max_bs + extra)
+    linear = decode.attn_config.components[1]
+    assert linear.temporal_state_shape[0] == heads
+    per_slot = kda_request_slot_bytes(
+        decode.attn_config, decode.groups(), draft_token_num=4
+    )
+    assert per_slot == slot_bytes
+    assert decode.workspace_bytes() == colocated.workspace_bytes()
+    # Pricing every resident slot, as before, would have reserved the extra
+    # slots' records on top.
+    resident_rows = RequestSlotLayout(decode.attn_config.max_resident_requests)
+    execution_rows = RequestSlotLayout(decode.attn_config.max_bs)
+    assert (resident_rows.capacity - execution_rows.capacity) * per_slot == (
+        saved_bytes
     )
 
 
@@ -428,6 +487,10 @@ def test_default_kda_history_capacity_refuses_a_window_wider_than_16():
 def test_kimi_checkpoint_is_independent_of_request_history(
     width, history_capacity, capacity
 ):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_request_slot_bytes,
+    )
+
     recipe = kimi_recipe(
         speculative_num_draft_tokens=width,
         max_resident_requests=7,
@@ -446,16 +509,17 @@ def test_kimi_checkpoint_is_independent_of_request_history(
         "conv_state",
         "recurrent_state",
     }
-    # Increasing residency by one adds the FP32 records of that request's
-    # slot and the count every layer shares.
+    # Records live in execution slots, so residency adds none; each
+    # execution slot holds the FP32 records and the count every layer shares.
     smaller = kimi_recipe(
         speculative_num_draft_tokens=width,
         max_resident_requests=6,
         kda_history_capacity=history_capacity,
     )
-    assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * 3 * 12 * capacity * 128 * 4 + 4
-    )
+    assert recipe.workspace_bytes() == smaller.workspace_bytes()
+    assert kda_request_slot_bytes(
+        recipe.attn_config, schema, draft_token_num=width
+    ) == (69 * 3 * 12 * capacity * 128 * 4 + 4)
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.groups() == schema
     assert recipe.workspace_bytes() == 0

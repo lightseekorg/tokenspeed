@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA checkpoint fields and request-slot decode workspace."""
+"""KDA checkpoint fields and execution-slot decode workspace."""
 
 import torch
 
@@ -71,7 +71,7 @@ def kda_state_fields(
     Returns:
         The BF16 convolution state and the dense recurrent state of one
         scheduler-owned state block. Accepted decode records and their count
-        live in the request-slot workspace (``kda_verify_workspace_bytes``).
+        live in the execution-slot workspace (``kda_verify_workspace_bytes``).
     """
     return (
         CacheFieldSpec(
@@ -92,12 +92,12 @@ def kda_state_fields(
 
 
 def kda_history_capacity(config: AttnConfig, draft_token_num: int) -> int:
-    """Retained updates a request slot keeps per layer, counting the verify window.
+    """Retained updates an execution slot keeps per layer, counting the verify window.
 
     ``--kda-history-capacity`` (``LinearAttnConfig.kda_history_capacity``)
     sets it; the default is ``KDA_DEFAULT_HISTORY_CAPACITY`` (16). It must be
     at least ``draft_token_num``, so a verify window wider than 16 needs the
-    option. A smaller capacity shrinks the request-slot workspace but folds
+    option. A smaller capacity shrinks the execution-slot workspace but folds
     the accepted records into the dense state more often: at the window
     itself, every round that accepts any.
 
@@ -159,11 +159,13 @@ def kda_request_slot_bytes(
     *,
     draft_token_num: int,
 ) -> int:
-    """Return one request slot's retained KDA records over every KDA layer.
+    """Return one execution slot's retained KDA records over every KDA layer.
 
-    A request keeps its records in its slot across rounds, scheduled or not,
-    so every resident slot (``max_resident_requests``, including a decode
-    role's extra slots) holds them.
+    A request keeps its records in its execution slot (a PD decode node's
+    decode permit, the request row on every other role) while it holds the
+    slot; a retraction folds them into its dense page before releasing it.
+    Only ``max_bs`` execution slots exist, so a decode role's extra resident
+    slots, which wait without one, hold no records.
 
     Args:
         config: Target attention configuration with model dimensions.
@@ -197,14 +199,17 @@ def kda_verify_workspace_bytes(
 
     Args:
         config: Target attention configuration with model dimensions,
-            activation dtype, maximum batch size and resident request limit.
+            activation dtype and maximum batch size. The resident request
+            limit does not enter: records are kept per execution slot.
         groups: Cache declarations containing the target's KDA state fields.
         draft_token_num: Effective verify width per request. Use 1 for
             ordinary single-token decode.
 
     Returns:
-        Bytes for each request slot's retained FP32 correction, key and decay
-        records and INT32 accepted count; plus per-batch QKV, commit
+        Bytes for each execution slot's retained FP32 correction, key and
+        decay records and INT32 accepted count, over
+        ``RequestSlotLayout(max_bs).capacity`` rows (the null row and the
+        CUDA-graph padding row included); plus per-batch QKV, commit
         descriptors, routing arrays and generation/position stamps used by
         verify and decode.
     """
@@ -214,7 +219,7 @@ def kda_verify_workspace_bytes(
 
     linear = config.component(LinearAttnConfig)
     num_layers = _kda_layer_count(groups)
-    num_slots = RequestSlotLayout(config.max_resident_requests).capacity
+    num_slots = RequestSlotLayout(config.max_bs).capacity
     retained_bytes = num_slots * kda_request_slot_bytes(
         config, groups, draft_token_num=draft_token_num
     )

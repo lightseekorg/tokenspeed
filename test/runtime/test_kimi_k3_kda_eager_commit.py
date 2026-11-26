@@ -131,6 +131,14 @@ class _Harness:
         # REQUEST_ENDED_INCOMPLETE by a commit that could not complete a state.
         self.request_ends = torch.zeros(config.max_bs, dtype=torch.int32, device=DEV)
         self.backend.bind_request_stop_flags(self.stopped, self.request_ends)
+        # The executor's per-row slot vectors, adjacent as in InputBuffers so
+        # one upload stages a forward's rows (stage_rows): each row's
+        # execution slot, the padding slot past the batch, then each row's
+        # request row. The backend keys records by the first.
+        self.row_slots = torch.zeros(2 * max_bs, dtype=torch.int64, device=DEV)
+        self.row_slots[:max_bs].fill_(RequestSlotLayout(max_bs).padding)
+        self.execution_slots = self.row_slots[:max_bs]
+        self.backend.bind_execution_slots(self.execution_slots)
         # The persistent decode buffers exist from construction, as at the
         # wrapper (the verify refresh below writes into them).
         self.backend.init_cuda_graph_state(config.max_bs)
@@ -166,7 +174,30 @@ class _Harness:
             "beta_raw": rnd(bs * self.width, self.H),
         }
 
-    def prepare_metadata(self, rpis, pages, seq_lens):
+    def stage_rows(self, rpis, execution_slots=None):
+        """Stage a forward's execution slots and request rows in one upload.
+
+        A row's execution slot defaults to its request row, as on every role
+        but a PD decode node, where it is the row's decode permit. Returns the
+        device request rows.
+        """
+        max_bs = self.config.max_bs
+        slots = list(rpis if execution_slots is None else execution_slots)
+        if (
+            len(slots) != len(rpis)
+            or len(set(slots)) != len(slots)
+            or not all(1 <= slot <= max_bs for slot in slots)
+        ):
+            raise ValueError(f"execution slots {slots} are not distinct in 1..max_bs")
+        staged = torch.full(
+            (max_bs + len(rpis),), RequestSlotLayout(max_bs).padding, dtype=torch.int64
+        )
+        staged[: len(slots)] = torch.tensor(slots, dtype=torch.int64)
+        staged[max_bs:] = torch.tensor(rpis, dtype=torch.int64)
+        self.row_slots[: staged.numel()].copy_(staged)
+        return self.row_slots[max_bs : max_bs + len(rpis)]
+
+    def prepare_metadata(self, rpis, pages, seq_lens, *, execution_slots=None):
         bs = len(rpis)
         tables = {
             group_id: np.asarray(
@@ -178,7 +209,7 @@ class _Harness:
         self.backend.refresh_decode_metadata(
             bs,
             bs,
-            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            self.stage_rows(rpis, execution_slots),
             torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
             block_tables=delivered,
@@ -221,9 +252,9 @@ class _Harness:
             )
         return outputs
 
-    def round(self, rpis, pages, seq_lens, seed, accepted):
+    def round(self, rpis, pages, seq_lens, seed, accepted, *, execution_slots=None):
         bs = len(rpis)
-        self.prepare_metadata(rpis, pages, seq_lens)
+        self.prepare_metadata(rpis, pages, seq_lens, execution_slots=execution_slots)
         self.forward(self.inputs(bs, seed), bs)
         self.backend.commit_verified_state(
             torch.tensor(accepted, dtype=torch.int32, device=DEV), accepted_path=None
@@ -1008,7 +1039,7 @@ def test_commit_plan_queued_table_updates_keep_each_round_pages(batch):
         usable_pages=24,
     )
     group_ids = harness.backend._replay_group_ids
-    request_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEV)
+    request_indices = harness.stage_rows(list(range(1, batch + 1)))
     seq_lens = torch.full((batch,), 64 + T, dtype=torch.int32, device=DEV)
     accepted = torch.arange(batch, dtype=torch.int32, device=DEV) % (T + 2)
     rounds = []
@@ -1212,7 +1243,7 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
         actual.backend.refresh_decode_metadata(
             batch,
             live,
-            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            actual.stage_rows(rpis),
             torch.tensor(lengths, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
             for_graph_replay=captured,
@@ -1400,8 +1431,12 @@ def test_mixed_decode_commit_matches_separate_forwards(
     draft_tokens, same_page, checkpoint
 ):
     # With ``checkpoint`` the extend row also stores its state 128 tokens in,
-    # into a third block, as an EXTEND forward of it alone does.
+    # into a third block, as an EXTEND forward of it alone does. The rows'
+    # execution slots differ from their request rows (1 and 2): the extend
+    # row's records and the decode row's, which follow the extend rows in the
+    # bound slots, are keyed by execution slot.
     actual = _Harness(draft_tokens=draft_tokens, seed=941)
+    extend_slot, decode_slot = 6, 4
     width, prompt = actual.width, 200 if checkpoint else 3
     pages = {group: [2 + 2 * i, 3 + 2 * i] for i, group in enumerate(_STATE_GROUPS)}
     stores = {group: 8 + i for i, group in enumerate(_STATE_GROUPS)}
@@ -1410,11 +1445,11 @@ def test_mixed_decode_commit_matches_separate_forwards(
     }
     source_snapshots = {}
     if same_page:
-        _seed_retained_history(actual, slot=1, length=3)
+        _seed_retained_history(actual, slot=extend_slot, length=3)
     for layer in actual.layer_ids:
         source = sources[actual.pool.state_group_by_layer[layer]]
         actual.pool.get_component(layer, "recurrent_state")[source].fill_(0.1)
-        source_snapshots[layer] = _logical_state(actual, layer, [source], [1])
+        source_snapshots[layer] = _logical_state(actual, layer, [source], [extend_slot])
     inputs = {
         name: value[: prompt + width]
         for name, value in actual.inputs(prompt + width, 943).items()
@@ -1447,7 +1482,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
         harness.backend.init_forward_metadata(
             bs,
             1,
-            torch.arange(1, bs + 1, device=DEV, dtype=torch.int32),
+            harness.stage_rows([1, 2][:bs], [extend_slot, decode_slot][:bs]),
             lengths,
             ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
             block_tables=_tables_for(harness.contract, tables, DEV),
@@ -1505,7 +1540,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
         {group: [source] for group, source in sources.items()},
         {name: value[:prompt] for name, value in inputs.items()},
         [prompt],
-        slots=[1],
+        slots=[extend_slot],
         prefill=True,
     )
     decode_outputs, decode_states = _reference_round(
@@ -1513,7 +1548,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
         {group: ids[1:] for group, ids in pages.items()},
         {name: value[prompt:] for name, value in inputs.items()},
         [count],
-        slots=[2],
+        slots=[decode_slot],
         prefill=False,
     )
     checkpoint_states = None
@@ -1523,7 +1558,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
             {group: [source] for group, source in sources.items()},
             {name: value[:128] for name, value in inputs.items()},
             [128],
-            slots=[1],
+            slots=[extend_slot],
             prefill=True,
         )
     stored_before = {
@@ -1536,14 +1571,19 @@ def test_mixed_decode_commit_matches_separate_forwards(
     metadata(actual, mixed=True)
     # Every layer's gather reads the extend row's count, which clears once
     # the last layer's gather has read it.
-    assert actual.backend._replay_length[1].item() == (3 if same_page else 0)
+    counts = actual.backend._replay_length
+    assert counts[extend_slot].item() == (3 if same_page else 0)
     actual_outputs = forward(actual, inputs, batch=2, mode=ForwardMode.MIXED)
-    assert actual.backend._replay_length[1].item() == 0
+    assert counts[extend_slot].item() == 0
     actual.backend.commit_state_after_acceptance(
         torch.tensor([1, count], device=DEV, dtype=torch.int32),
         num_extends=1,
         accepted_path=None,
     )
+    # The decode row's commit counts its acceptance in its own execution
+    # slot; the request rows' slots keep none.
+    assert counts[decode_slot].item() == count
+    assert counts[[1, 2]].flatten().tolist() == [0, 0]
     for layer, output, prefill, decode in zip(
         actual.layer_ids, actual_outputs, prompt_outputs, decode_outputs, strict=True
     ):
@@ -1570,7 +1610,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
             rtol=0,
         )
         torch.testing.assert_close(
-            _logical_state(actual, layer, ids, [1, 2]),
+            _logical_state(actual, layer, ids, [extend_slot, decode_slot]),
             torch.cat((prompt_states[layer][0], decode_states[layer][0])),
             atol=2e-6,
             rtol=2e-5,
@@ -1578,15 +1618,162 @@ def test_mixed_decode_commit_matches_separate_forwards(
         if not same_page:
             source = sources[actual.pool.state_group_by_layer[layer]]
             torch.testing.assert_close(
-                _logical_state(actual, layer, [source], [1]),
+                _logical_state(actual, layer, [source], [extend_slot]),
                 source_snapshots[layer],
                 atol=0,
                 rtol=0,
             )
 
 
+@pytest.mark.parametrize("draft_tokens", [None, T])
+def test_decode_capture_after_an_interrupted_mixed_forward_reads_rows_from_zero(
+    draft_tokens,
+):
+    """A mixed forward that raises before its commit leaves its metadata
+    behind. Decode graphs captured next, below max_bs and at it, bind their
+    verify to the execution slots from row 0, and their replays commit the
+    staged slots as an eager decode does."""
+    actual = _Harness(draft_tokens=draft_tokens, seed=953, usable_pages=40)
+    eager = _Harness(draft_tokens=draft_tokens, seed=953, usable_pages=40)
+    backend = actual.backend
+    width, max_bs = actual.width, actual.config.max_bs
+    for harness in (actual, eager):
+        for layer in harness.layer_ids:
+            harness.pool.get_component(layer, "recurrent_state")[1:].fill_(0.1)
+    # Bind layer descriptors before capture, as serving warmup does.
+    warm_pages = {
+        group: [2 + index * 2 + row for row in range(2)]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    actual.prepare_metadata([1, 2], warm_pages, [8 + width] * 2)
+    actual.forward(actual.inputs(2, 954), 2)
+
+    # Two extend rows and one decode row; the forward raises before its
+    # commit, so the mixed metadata stays published.
+    extends, prompt = 2, 3
+    mixed_pages = {
+        group: [30 + index * 3 + row for row in range(extends + 1)]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    new_cpu = torch.full((extends,), prompt, dtype=torch.int32)
+    prefix_cpu = torch.zeros(extends, dtype=torch.int32)
+    backend.init_forward_metadata(
+        extends + 1,
+        extends,
+        actual.stage_rows([5, 6, 7]),
+        torch.tensor([prompt] * extends + [8 + width], dtype=torch.int32, device=DEV),
+        ForwardMode.MIXED,
+        block_tables=_tables_for(
+            actual.contract,
+            {
+                group: np.asarray([[0, page] for page in ids], dtype=np.int32)
+                for group, ids in mixed_pages.items()
+            },
+            DEV,
+        ),
+        extend_seq_lens=new_cpu.to(DEV),
+        extend_seq_lens_cpu=new_cpu,
+        extend_prefix_lens=prefix_cpu.to(DEV),
+        extend_prefix_lens_cpu=prefix_cpu,
+        extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+        extend_prompt_lens_cpu=prefix_cpu + new_cpu,
+        extend_with_prefix=False,
+        extend_state_checkpoint_lens_cpu=torch.zeros(extends, dtype=torch.int32),
+        query_shard=None,
+    )
+    assert backend._mixed_forward_metadata.num_extends == extends
+
+    stable_inputs = actual.inputs(max_bs, 955)
+    stable_inputs["g_raw"] = stable_inputs["mixed_qkv"][:, : actual.key_dim]
+    stream = torch.cuda.Stream()
+    graphs = {}
+    for batch in (4, max_bs):
+        backend.init_forward_metadata_capture_cuda_graph(
+            batch,
+            torch.arange(1, batch + 1, dtype=torch.int32, device=DEV),
+            torch.full((batch,), 8 + width, dtype=torch.int32, device=DEV),
+            ForwardMode.DECODE,
+        )
+        assert backend._mixed_forward_metadata is None
+        capture_inputs = {
+            name: value[: batch * width] for name, value in stable_inputs.items()
+        }
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            actual.forward(capture_inputs, batch)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = actual.forward(capture_inputs, batch)
+        graphs[batch] = graph, outputs
+    # Every verify history, captured or eager, reads the bound execution
+    # slots from row 0.
+    assert backend._retained_histories
+    for (_, _, first_row), history in backend._retained_histories.items():
+        assert first_row == 0
+        assert history.record_slots.data_ptr() == actual.execution_slots.data_ptr()
+
+    # Replay each graph over execution slots that differ from the request
+    # rows; slots past the live rows read the padding slot.
+    rounds = (
+        (4, [1, 2, 3], [7, 2, 5]),
+        (max_bs, list(range(1, max_bs + 1)), [3, 8, 1, 6, 2, 7, 4, 5]),
+    )
+    for round_index, (batch, rpis, slots) in enumerate(rounds):
+        live = len(rpis)
+        for harness in (actual, eager):
+            harness.backend._replay_length.zero_()
+            for slot in slots:
+                _seed_retained_history(harness, slot=slot, length=1 + slot % 3)
+        pages = {
+            group: [2 + index * max_bs + row for row in range(live)]
+            for index, group in enumerate(_STATE_GROUPS)
+        }
+        lengths = [8 + width] * live
+        tables = {
+            group: np.asarray([[0, page] for page in ids], dtype=np.int32)
+            for group, ids in pages.items()
+        }
+        inputs = actual.inputs(batch, 960 + round_index)
+        inputs["g_raw"] = inputs["mixed_qkv"][:, : actual.key_dim]
+        accepted = torch.tensor(
+            [1 + row % width for row in range(live)], dtype=torch.int32, device=DEV
+        )
+        backend.refresh_decode_metadata(
+            batch,
+            live,
+            actual.stage_rows(rpis, slots),
+            torch.tensor(lengths, dtype=torch.int32, device=DEV),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=_tables_for(actual.contract, tables, DEV),
+        )
+        for name, value in inputs.items():
+            stable_inputs[name][: batch * width].copy_(value)
+        graph, outputs = graphs[batch]
+        graph.replay()
+        backend.commit_verified_state(accepted, accepted_path=None)
+
+        eager.prepare_metadata(rpis, pages, lengths, execution_slots=slots)
+        eager_outputs = eager.forward(
+            {name: value[: live * width] for name, value in inputs.items()}, live
+        )
+        eager.backend.commit_verified_state(accepted, accepted_path=None)
+        torch.cuda.synchronize()
+        for output, reference in zip(outputs, eager_outputs, strict=True):
+            torch.testing.assert_close(
+                output.reshape(-1, KEY_DIM)[: live * width],
+                reference.reshape(-1, KEY_DIM),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        assert torch.equal(backend._replay_length, eager.backend._replay_length)
+        _assert_committed_pages_equal(actual, eager, pages, slots)
+
+
 def _logical_state(harness, layer, pages, slots, counts=None):
-    """Reconstruct each dense page using its request slot's accepted updates.
+    """Reconstruct each dense page using its execution slot's accepted updates.
 
     ``counts`` are the slots' INT32 [slots, 1] counts to apply, by default the
     accepted counts every layer shares.
@@ -1681,70 +1868,108 @@ def _seed_retained_history(harness, *, slot, length):
 
 
 def test_a_fold_completes_the_listed_pages_and_leaves_the_rest():
-    """``fold_deferred_state`` folds each listed slot's accepted records into
-    the page a retraction's plan lists for the slot in that layer's group,
-    and clears the count. A listed slot without records, restored and not
-    yet decoding, keeps its page; no page any group lists changes otherwise.
-    (The State groups share page memory, each page id held by one group at a
-    time, so a layer's view shows another group's listed page change.)"""
+    """``fold_deferred_state`` folds the accepted records of each listed
+    victim's execution slot (its rows' third column; the request row in the
+    first is not a record row) into the page a retraction's plan lists for
+    it in that layer's group, and clears the count. A listed slot without
+    records, restored and not yet decoding, keeps its page, and so does a
+    victim that held no execution slot (-1), whose request row has records
+    of its own; no page any group lists changes otherwise. (The State groups
+    share page memory, each page id held by one group at a time, so a
+    layer's view shows another group's listed page change.)"""
     harness = _Harness(draft_tokens=T, seed=1501)
     pool = harness.pool
     _seed_retained_history(harness, slot=3, length=5)
+    # Records in row 6, the request row of the victim without a slot.
+    _seed_retained_history(harness, slot=6, length=2)
+    # (request row, page, execution slot): request rows past max_bs, as on a
+    # decode node with extra resident slots.
     folds = {
-        group_id: [(3, 2 + 2 * group), (1, 3 + 2 * group)]
+        group_id: [(9, 2 + 2 * group, 3), (11, 3 + 2 * group, 1)]
         for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    unslotted = {
+        group_id: (6, 10 + group, -1) for group, group_id in enumerate(_STATE_GROUPS)
     }
     expected, before = {}, {}
     for layer in harness.layer_ids:
         listed = folds[pool.state_group_by_layer[layer]]
         expected[layer] = _logical_state(
-            harness, layer, [page for _, page in listed], [slot for slot, _ in listed]
+            harness,
+            layer,
+            [page for _, page, _ in listed],
+            [slot for _, _, slot in listed],
         )
         before[layer] = pool.get_component(layer, "recurrent_state").clone()
 
     harness.backend.fold_deferred_state(
         {
-            group_id: torch.tensor(pairs, dtype=torch.int32)
-            for group_id, pairs in folds.items()
+            group_id: torch.tensor(rows + [unslotted[group_id]], dtype=torch.int32)
+            for group_id, rows in folds.items()
         },
         stream=torch.cuda.current_stream(),
     )
 
-    listed = {page for pairs in folds.values() for _, page in pairs}
+    listed = {page for rows in folds.values() for _, page, _ in rows}
     for layer in harness.layer_ids:
-        pages = [page for _, page in folds[pool.state_group_by_layer[layer]]]
+        pages = [page for _, page, _ in folds[pool.state_group_by_layer[layer]]]
         dense = pool.get_component(layer, "recurrent_state")
         torch.testing.assert_close(
             dense[pages].float(), expected[layer], atol=2e-6, rtol=2e-5
         )
         others = [page for page in range(dense.shape[0]) if page not in listed]
         torch.testing.assert_close(dense[others], before[layer][others], atol=0, rtol=0)
-    # Every layer folded from the count before one launch cleared it.
-    assert harness.backend._replay_length[[3, 1]].flatten().tolist() == [0, 0]
+    # Every layer folded from the count before one launch cleared it; the
+    # unslotted victim's row keeps its count.
+    counts = harness.backend._replay_length
+    assert counts[[3, 1, 6]].flatten().tolist() == [0, 0, 2]
+    # A plan whose every victim held no execution slot launches nothing.
+    harness.backend.fold_deferred_state(
+        {
+            group_id: torch.tensor([row], dtype=torch.int32)
+            for group_id, row in unslotted.items()
+        },
+        stream=torch.cuda.current_stream(),
+    )
+    assert counts[6].item() == 2
 
 
-def test_a_landed_slot_folds_nothing_its_previous_owner_left():
+def test_a_fresh_execution_slot_folds_nothing_its_previous_owner_left():
     """A request ended on the host leaves its accepted records counted in its
-    slot. A PD landing gives the slot to a request whose prompt ran on
-    another node, and a retraction may fold that request before its first
-    forward. The landing's reset leaves the fold nothing to apply, so no
-    page changes: neither the landed request's own nor one the previous
-    owner wrote, which another request may hold by now."""
+    execution slot. Request-row events -- a PD landing, a rebind, a restore
+    -- touch no execution slot, so they leave those counts alone. The
+    request's first forward on the slot is fresh, and its reset leaves a
+    later fold of the slot nothing to apply, so no page changes: neither the
+    new owner's own nor one the previous owner wrote, which another request
+    may hold by now."""
     harness = _Harness(draft_tokens=T, seed=1503)
     pool = harness.pool
     _seed_retained_history(harness, slot=3, length=5)
+    _seed_retained_history(harness, slot=2, length=4)
     before = {
         layer: pool.get_component(layer, "recurrent_state").clone()
         for layer in harness.layer_ids
     }
     stream = torch.cuda.current_stream()
+    counts = harness.backend._replay_length
 
+    # Request rows 3 and 2 get new owners and row 2 a restore: records are
+    # not keyed by request row.
     harness.backend.reset_request_workspace(
+        torch.tensor([3, 2], device=DEV), stream=stream
+    )
+    harness.backend.import_slot_state(
+        2, torch.empty(0, dtype=torch.uint8), stream, admission_id=7
+    )
+    assert counts[[3, 2]].flatten().tolist() == [5, 4]
+
+    harness.backend.reset_execution_workspace(
         torch.tensor([3], device=DEV), stream=stream
     )
+    assert counts[[3, 2]].flatten().tolist() == [0, 4]
     harness.backend.fold_deferred_state(
         {
-            group_id: torch.tensor([[3, 2 + group]], dtype=torch.int32)
+            group_id: torch.tensor([[12, 2 + group, 3]], dtype=torch.int32)
             for group, group_id in enumerate(_STATE_GROUPS)
         },
         stream=stream,
@@ -1831,8 +2056,10 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     same_page, mamba_ssm_dtype
 ):
     """Every layer's gather applies the records the row's count covers, and
-    the count clears once, after the last layer's gather has read it."""
+    the count clears once, after the last layer's gather has read it. Both
+    are keyed by the row's execution slot (5), not its request row (1)."""
     harness = _Harness(draft_tokens=4, mamba_ssm_dtype=mamba_ssm_dtype)
+    slot = 5
     layer = harness.layer_ids[0]
     source, destination = 2, 2 if same_page else 3
     pool = harness.pool
@@ -1841,9 +2068,12 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     # A distinct source is a published dense checkpoint. A continuation on
     # its own live page can still have records in the request's slot.
     if same_page:
-        _seed_retained_history(harness, slot=1, length=3)
+        _seed_retained_history(harness, slot=slot, length=3)
+    # The request row's own record row holds records of no one's.
+    _seed_retained_history(harness, slot=1, length=2)
     expected = {
-        each: _logical_state(harness, each, [source], [1]) for each in harness.layer_ids
+        each: _logical_state(harness, each, [source], [slot])
+        for each in harness.layer_ids
     }
     snapshots = {
         name: pool.get_component(layer, name)[source].clone()
@@ -1855,7 +2085,7 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     harness.backend.init_forward_metadata(
         1,
         1,
-        torch.tensor([1], device=DEV, dtype=torch.int32),
+        harness.stage_rows([1], [slot]),
         (prefix + new_tokens).to(DEV),
         ForwardMode.EXTEND,
         block_tables=_tables_for(harness.contract, tables, DEV),
@@ -1870,12 +2100,13 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
         query_shard=None,
     )
     count = 3 if same_page else 0
-    assert harness.backend._replay_length[1].item() == count
+    counts = harness.backend._replay_length
+    assert counts[slot].item() == count
     reads = torch.tensor([source], device=DEV, dtype=torch.int32)
     writes = torch.tensor([destination], device=DEV, dtype=torch.int32)
     # Layers gather in model order; the count holds until the last one.
     for each in harness.layer_ids:
-        assert harness.backend._replay_length[1].item() == count, each
+        assert counts[slot].item() == count, each
         conv, recurrent = harness.backend._state_components(each)
         gathered, _ = harness.backend._prepare_prefill_state_inputs(
             each, conv, recurrent, reads, writes, dtype=torch.float32
@@ -1890,7 +2121,8 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     torch.testing.assert_close(
         recurrent[destination], final[0].to(recurrent.dtype), atol=0, rtol=0
     )
-    assert harness.backend._replay_length[1].item() == 0
+    assert counts[slot].item() == 0
+    assert counts[1].item() == 2
     if not same_page:
         for name, snapshot in snapshots.items():
             torch.testing.assert_close(
@@ -1941,6 +2173,9 @@ def test_materializing_a_checkpoint_rounds_only_after_all_accepted_updates(
 
 
 def test_retained_workspace_matches_recipe_and_rebind_invalidates_history():
+    """Records and counts take one row per execution slot, max_bs + 2 rows
+    however many requests stay resident: request row 13 runs on execution
+    slot 3."""
     harness = _Harness(draft_tokens=4, max_resident_requests=13)
     recipe = _kimi_recipe(
         max_bs=8, max_resident_requests=13, speculative_num_draft_tokens=4
@@ -1948,25 +2183,35 @@ def test_retained_workspace_matches_recipe_and_rebind_invalidates_history():
     assert (
         harness.backend.preallocate_verify_workspace(8, 4) == recipe.workspace_bytes()
     )
+    assert (
+        recipe.workspace_bytes()
+        == _kimi_recipe(
+            max_bs=8, max_resident_requests=8, speculative_num_draft_tokens=4
+        ).workspace_bytes()
+    )
+    slot = [3]
     assert harness.backend._retained_qkv.shape == (69, 32, CONV_DIM)
     # Each group holds its own page: the last round commits every layer.
     pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
     page = pages[harness.pool.state_group_by_layer[harness.layer_ids[0]]]
     harness.layer_ids = harness.layer_ids[:1]
-    harness.prepare_metadata([13], pages, [12])
+    harness.prepare_metadata([13], pages, [12], execution_slots=slot)
     harness.forward(harness.inputs(1, 1301), 1)
-    old_history = harness.backend._retained_histories[harness.layer_ids[0], 1]
+    old_history = harness.backend._retained_histories[harness.layer_ids[0], 1, 0]
     arena_storage = harness.pool.arena.buffer.untyped_storage().data_ptr()
     assert old_history.length.dtype == torch.int32
-    assert old_history.length.numel() == harness.config.max_resident_requests + 2
+    assert old_history.length.numel() == harness.config.max_bs + 2
     assert old_history.length.untyped_storage().data_ptr() != arena_storage
+    assert old_history.record_slots.data_ptr() == harness.execution_slots.data_ptr()
     for records in (old_history.correction, old_history.key, old_history.decay):
         assert records.untyped_storage().data_ptr() != arena_storage
-        assert records.shape == (harness.config.max_resident_requests + 2, H, 16, D)
+        assert records.shape == (harness.config.max_bs + 2, H, 16, D)
         assert records.dtype == torch.float32
-    harness.prepare_metadata([13], pages, [13])
+    harness.prepare_metadata([13], pages, [13], execution_slots=slot)
     harness.forward(harness.inputs(1, 1302), 1)
-    assert harness.backend._retained_histories[harness.layer_ids[0], 1] is old_history
+    assert harness.backend._retained_histories[harness.layer_ids[0], 1, 0] is (
+        old_history
+    )
     # Rebind while the cached history still refers to the old pool.
     old_arena = harness.pool.arena.buffer.clone()
     replacement = _make_kimi_pool(DEV, usable_pages=26)
@@ -1982,16 +2227,17 @@ def test_retained_workspace_matches_recipe_and_rebind_invalidates_history():
     inputs = harness.inputs(1, 1303)
     inputs["g_raw"] = inputs["mixed_qkv"][:, : harness.key_dim]
     layer = harness.layer_ids[0]
-    expected = _reference_committed_states(harness, pages, inputs, [3], [13])
+    expected = _reference_committed_states(harness, pages, inputs, [3], slot)
     # Every layer verifies the round its commit publishes.
     harness.layer_ids = list(harness.backend._state_layer_ids())
-    harness.prepare_metadata([13], pages, [12])
+    harness.prepare_metadata([13], pages, [12], execution_slots=slot)
     harness.forward(inputs, 1)
     harness.backend.commit_verified_state(
         torch.tensor([3], device=DEV, dtype=torch.int32), accepted_path=None
     )
+    assert harness.backend._replay_length[slot].item() == 3
     torch.testing.assert_close(
-        _logical_state(harness, layer, page, [13]),
+        _logical_state(harness, layer, page, slot),
         expected[layer][0],
         atol=2e-6,
         rtol=2e-5,
@@ -2006,6 +2252,93 @@ def test_retained_workspace_matches_recipe_and_rebind_invalidates_history():
     # Rebuilding graph metadata must also release the cached history views.
     harness.backend.init_cuda_graph_state(8)
     assert not harness.backend._retained_histories
+
+
+def test_permuted_execution_slots_commit_like_request_row_slots():
+    """Records follow execution slots; stop flags follow request rows.
+
+    A decode node runs requests from rows past ``max_bs`` (13 residents,
+    ``max_bs`` 8) on permuted execution slots, reordering its batch every
+    round; a reference runs the same requests with execution slot equal to
+    request row. Every round commits identical pages and counts. A stop flag
+    set at an execution slot's index ends no request; the one set at the
+    ending request's row folds its records and clears its slot's count.
+    """
+    permuted = _Harness(draft_tokens=T, seed=1901, max_resident_requests=13)
+    reference = _Harness(draft_tokens=T, seed=1901)
+    rows = permuted.config.max_bs + 2
+    assert permuted.backend._retained_records.shape[0] == rows
+    assert permuted.backend._replay_length.shape == (rows, 1)
+    permuted.params = reference.params
+    permuted.pool.arena.buffer.copy_(reference.pool.arena.buffer)
+    # Request row -> (execution slot, reference row).
+    requests = {13: (2, 1), 9: (7, 2), 11: (5, 3)}
+    pages = {
+        request: {
+            group: 2 + 3 * index + position for index, group in enumerate(_STATE_GROUPS)
+        }
+        for position, request in enumerate(requests)
+    }
+    lengths = dict.fromkeys(requests, 8 + T)
+    orders = ([13, 9, 11], [11, 13, 9], [9, 11, 13], [13, 11, 9])
+    for round_index, order in enumerate(orders):
+        ending = round_index == len(orders) - 1
+        if round_index == 1:
+            # Row 2 is request 13's execution slot, no request's row.
+            permuted.stopped[2] = True
+        if ending:
+            permuted.stopped[2] = False
+            permuted.stopped[13] = True
+            reference.stopped[requests[13][1]] = True
+        accepted = [1 + (round_index + index) % T for index in range(len(order))]
+        inputs = reference.inputs(len(order), 1910 + round_index)
+        inputs["g_raw"] = inputs["mixed_qkv"][:, : reference.key_dim]
+        round_pages = {
+            group: [pages[request][group] for request in order]
+            for group in _STATE_GROUPS
+        }
+        seq_lens = [lengths[request] for request in order]
+        slots = [requests[request][0] for request in order]
+        reference_rows = [requests[request][1] for request in order]
+        for harness, request_rows, execution_slots in (
+            (permuted, order, slots),
+            (reference, reference_rows, None),
+        ):
+            harness.prepare_metadata(
+                request_rows, round_pages, seq_lens, execution_slots=execution_slots
+            )
+            harness.forward(inputs, len(order))
+            harness.backend.commit_verified_state(
+                torch.tensor(accepted, dtype=torch.int32, device=DEV),
+                accepted_path=None,
+            )
+        for layer in permuted.layer_ids:
+            for component in _CHECKPOINT_COMPONENTS:
+                torch.testing.assert_close(
+                    permuted.pool.get_component(layer, component),
+                    reference.pool.get_component(layer, component),
+                    atol=0,
+                    rtol=0,
+                )
+        counts = permuted.backend._replay_length[slots].flatten().tolist()
+        assert counts == (
+            reference.backend._replay_length[reference_rows].flatten().tolist()
+        )
+        assert all(count > 0 for count in counts[1:])
+        assert (counts[0] == 0) == ending
+        for layer in permuted.layer_ids[:2]:
+            ids = round_pages[permuted.pool.state_group_by_layer[layer]]
+            torch.testing.assert_close(
+                _logical_state(permuted, layer, ids, slots),
+                _logical_state(reference, layer, ids, reference_rows),
+                atol=0,
+                rtol=0,
+            )
+        for request, accept in zip(order, accepted, strict=True):
+            lengths[request] += max(1, accept)
+    # Neither the null row nor the padding row ever counted a record.
+    assert not permuted.backend._replay_length[[0, rows - 1]].any()
+    assert not permuted.request_ends.any()
 
 
 @pytest.mark.parametrize(
@@ -2062,7 +2395,7 @@ def test_retained_source_live_capacity_boundary(initial_length, same_page):
     actual.backend.refresh_decode_metadata(
         batch,
         batch,
-        torch.tensor(slots, device=DEV, dtype=torch.int32),
+        actual.stage_rows(slots),
         torch.full((batch,), 20, device=DEV, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         block_tables=_tables_for(actual.contract, tables, DEV),

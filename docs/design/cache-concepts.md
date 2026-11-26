@@ -509,7 +509,7 @@ prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
 KDA keeps its FP32 decode records and their accepted count, one for all its
-layers, in the active request slot, outside the LCM arena. The live State
+layers, in the request's execution slot, outside the LCM arena. The live State
 block holds only the dense base and the convolution state, exactly as without
 retained history; the scheduler and the cache see nothing else. Prefill writes complete
 checkpoints. The decode commit of the forward that ends a request (the
@@ -657,11 +657,16 @@ axis in each layout, preserving its separate Q/K/V channel segments.
 
 KDA uses retained history for ordinary decode and speculative verification.
 Each KDA State page holds the convolution window and a dense recurrent base,
-and nothing else. Each resident request has a stable slot outside the LCM
-arena. For each KDA layer, the slot holds FP32 corrections (U), normalized
-keys (K) and per-token decays; one INT32 count, which every layer shares,
-counts the updates accepted since the dense base of the request's input page.
-Batch reordering changes the mapping from batch rows to request slots.
+and nothing else. Each executing request has a stable execution slot outside
+the LCM arena: the decode permit on a PD decode node, the request row on every
+other role (`ForwardBatch.execution_slots`, see
+[Scheduler: execution slots](scheduler.md#execution-slots)). For each KDA
+layer, the slot holds FP32 corrections (U), normalized keys (K) and per-token
+decays; one INT32 count, which every layer shares, counts the updates accepted
+since the dense base of the request's input page. Batch reordering changes
+the mapping from batch rows to execution slots. The decode commit still reads
+each row's end-of-request flag (`RuntimeStates.stopped`) by its request row,
+which on a decode node differs from its execution slot.
 
 Verify replays the accepted updates in order to reconstruct the current
 state. It appends candidates after that accepted prefix. Commit updates the
@@ -670,15 +675,19 @@ read plus the accepted count; it is the count's only writer in a decode round
 and writes it once, in a second launch after every layer has read it. For
 example, after four candidates and two acceptances, the next verify starts
 writing at index two. Generation stamps identify candidates from the current
-round. Eager execution and CUDA graphs use the same page and request-slot
-routing.
+round. Eager execution and CUDA graphs use the same page and execution-slot
+routing: the backend reads the executor's bound execution-slot vector
+(`bind_execution_slots`), and rows past a batch, CUDA-graph padding included,
+read the padding slot `max_bs + 1`, whose count stays zero. Row 0 is never an
+execution slot and also counts zero.
 
 Each layer has room for `--kda-history-capacity` records per slot, 16 by
 default; it must be at least the effective verify width, so a window wider
 than 16 requires setting it. A verify reads at most the capacity minus its
-width in accepted records. A smaller capacity shrinks the request-slot
-workspace but folds more often. Every
-resident slot holds them, a decode role's extra slots included. When a whole
+width in accepted records. A smaller capacity shrinks the execution-slot
+workspace but folds more often. Only execution slots hold them: a decode
+role's extra resident slots wait for KV or for a decode permit without one
+and keep no records. When a whole
 candidate window will no longer fit, the accepted updates are folded into the
 dense base before the slot is reused, even for a request whose own window is
 shorter. A change of live page likewise starts from a copy of the dense base.
@@ -703,19 +712,39 @@ behind it. A decode commit only advances the count, except in the forward
 that ends the request, which folds the records into the live block; a
 retraction folds them before its image is stored (above). A published or imaged block is therefore a
 self-contained dense checkpoint, and prefill to decode transfer carries it
-unchanged. A recycled slot may still count records of an owner whose end the
-device did not see, so the runtime clears the count whenever a slot gets a
-new owner (`reset_request_workspace`): at its first forward
-(`RuntimeStates.bind_stop_criteria`) and, on a PD decode node, already at the
-landing of a prompt computed elsewhere, which a retraction may fold before
-any forward (`ModelExecutor.reset_remote_prefill_cache_lengths`). A restore
-starts the slot at zero itself (`import_slot_state`).
+unchanged.
 
-The cache recipes reserve the record and count storage by resident request
-capacity, including the reserved slots in `RequestSlotLayout`. They budget
-original QKV, routing and generation stamps separately by verify batch size.
-Adding LCM pages increases the space for dense checkpoints while the record
-budget stays fixed. Prefill-only engines allocate no decode records.
+The scheduler releases an execution slot only when no GPU work of its owner
+is in flight, and it may hand the slot to another request in the same plan.
+The slot's lifecycle is:
+
+- **Acquire.** A request's first forward on a slot is fresh
+  (`ForwardBatch.execution_slot_fresh`). The slot may still count records of
+  an owner whose end the device did not see (an abort, a finish decided on
+  the host), so the executor clears the fresh slots' counts on the execution
+  stream before the forward (`reset_execution_workspace`).
+- **Retraction.** The plan's state folds name the execution slot the victim
+  held, captured before the retraction released it. `fold_deferred_state`
+  folds the slot's records into the victim's live block and clears its count,
+  on the execution stream ahead of the plan's fresh resets and forward, so a
+  new owner in the same plan starts from zero. A victim without a slot (-1)
+  has no records and reaches no kernel.
+- **Finish.** The commit of the forward that ends a request folds and clears;
+  any other finish leaves records that the next owner's fresh reset clears.
+- **Request rows.** A PD landing, a request-row rebind and a restore touch no
+  KDA state: records are not keyed by request row and never enter a
+  retraction image (`workspace_slot_state`). A restored request starts fresh
+  on whichever slot it gets.
+
+The cache recipes reserve the record and count storage by execution capacity:
+`RequestSlotLayout(max_bs).capacity` rows, the null and graph-padding rows
+included, whatever the resident request capacity. A decode role's extra
+resident slots therefore add no retained bytes; with 64 extra slots at a
+4-token window this keeps about 1.2 GiB per GPU at Kimi-K3 TP8 and about
+9.7 GiB at TP1 for the KV cache. The recipes budget original QKV, routing and
+generation stamps separately by verify batch size. Adding LCM pages increases
+the space for dense checkpoints while the record budget stays fixed.
+Prefill-only engines allocate no decode records.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 
@@ -2625,12 +2654,12 @@ The separate max_resident_requests sizes its request pool. A D role adds
 disaggregation-decode-extra-slots per attention DP rank to that pool so
 requests can receive KV while the model executes a full batch. Concurrent
 group sizing prices resident states, tails and protected windows against
-the resident capacity; execution scratch and checkpoint retention keep the
-execution bound. Neither value reserves enough history cache for that many
-maximum-length requests. Aggregate prompt and decode growth must
-still fit the recipe's reported token capacity. When that dynamic pool is
-overcommitted, admission can fail even though the batch still has a free
-sequence slot.
+the resident capacity; execution scratch, checkpoint retention and KDA
+retained history keep the execution bound. Neither value reserves enough
+history cache for that many maximum-length requests. Aggregate prompt and
+decode growth must still fit the recipe's reported token capacity. When that
+dynamic pool is overcommitted, admission can fail even though the batch still
+has a free sequence slot.
 
 When admission fails for capacity and no prefill can progress, the scheduler
 retracts a resident victim and grants the freed pages to the blocked request

@@ -57,6 +57,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _KDAHarness,
     _logical_checkpoint,
     _naive_kda_scan,
+    _stage_execution_slots,
     _stub_contract,
     _StubContractPool,
     _to_slab_layout,
@@ -235,6 +236,14 @@ class _ScheduledKDA:
             list(batch.request_pool_indices), dtype=torch.int32, device="cuda"
         )
         seq_lens = torch.tensor([end], dtype=torch.int32, device="cuda")
+        # The plan's execution slots key the records, as the executor stages
+        # them, and a request's first forward on its slot clears the slot.
+        _stage_execution_slots(self.kernel.backend, batch.execution_slots)
+        if batch.execution_slot_fresh[0]:
+            self.kernel.backend.reset_execution_workspace(
+                torch.tensor(list(batch.execution_slots), device="cuda"),
+                stream=torch.cuda.current_stream(),
+            )
         if is_prefill:
             lengths_cpu = torch.tensor([end - begin], dtype=torch.int32)
             prefixes_cpu = torch.tensor([begin], dtype=torch.int32)
@@ -298,7 +307,7 @@ class _ScheduledKDA:
                         self.kernel.backend,
                         layer,
                         state_block,
-                        batch.request_pool_indices[0],
+                        batch.execution_slots[0],
                     )
                     if component == "recurrent_state"
                     else self.pool.get_component(layer, component)[state_block].clone()
