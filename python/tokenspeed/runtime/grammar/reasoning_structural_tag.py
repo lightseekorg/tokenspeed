@@ -119,14 +119,48 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
     return tag.model_dump_json(by_alias=True)
 
 
+def _structural_tag_for_longcat(
+    content_format: Any, *, prompt_opens_reasoning: bool
+) -> str:
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        OptionalFormat,
+        SequenceFormat,
+        StructuralTag,
+        TagFormat,
+    )
+
+    # Use the standard tag primitives: usage accounting must not depend on
+    # the native LongCat tool-protocol extension being installed.
+    reasoning = TagFormat(
+        begin="" if prompt_opens_reasoning else "<longcat_think>",
+        content=AnyTextFormat(),
+        end="</longcat_think>",
+    )
+    tag = StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                (
+                    reasoning
+                    if prompt_opens_reasoning
+                    else OptionalFormat(content=reasoning)
+                ),
+                content_format,
+            ]
+        )
+    )
+    return tag.model_dump_json(by_alias=True)
+
+
 def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
     """Return the strings that open and close the reasoning block.
 
     For example ``("<think>", "</think>")``. They are read from xgrammar's
-    builtin template in ``"auto"`` mode, where the block is optional and
-    keeps its opener. Returns ``None`` when the parser has no mapping or the
-    template has another layout.
+    builtin template in ``"auto"`` mode, or the model-specific layout.
+    Returns ``None`` when neither supplies a pair of markers.
     """
+    if reasoning_parser == "longcat_xml":
+        return ("<longcat_think>", "</longcat_think>")
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
     if model is None:
         return None
@@ -165,9 +199,13 @@ def structural_tag_for_reasoning_response(
     ``"enabled"`` mode). If not, the reply may open the block itself or
     answer directly (``"auto"``).
 
-    Returns ``None`` if ``reasoning_parser`` has no xgrammar mapping —
+    Returns ``None`` if ``reasoning_parser`` has no supported layout —
     the caller should leave the user's constraint unchanged in that case.
     """
+    if reasoning_parser == "longcat_xml":
+        return _structural_tag_for_longcat(
+            content_format, prompt_opens_reasoning=prompt_opens_reasoning
+        )
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
     if reasoning_parser == "inkling2":

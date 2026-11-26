@@ -1257,6 +1257,16 @@ on both paths: the capturable path's host node runs it inside the forward
 and advances the matchers there; the eager path runs it before the forward
 and the commit advances them.
 
+The engine's `--reasoning-parser longcat_xml` enables token-id usage accounting
+between `<longcat_think>` and `</longcat_think>`, including when the prompt
+already opened the block. Prompt tokens and delimiters are excluded; committed
+thinking tokens still count when generation ends before the closing tag.
+Accounting remains enabled with `--grammar-backend none`. Both delimiters
+must be individual tokenizer tokens. Frontend parser configuration alone does
+not enable the engine counter. JSON-schema requests use standard structural
+tags to defer the constraint until after thinking; this does not require or
+implement the native LongCat tool-protocol grammar.
+
 ## Request-token history seeds
 
 The control plane owns each request's committed token list. `HistoryRows`
