@@ -357,7 +357,8 @@ bool Scheduler::PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::P
 }
 
 bool Scheduler::ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us) {
-    if (!peer_offer_tickets_ || !peer_offer_tickets_->Held(lease)) return false;
+    // Absence is a completed close, including a retry after local release.
+    if (!peer_offer_tickets_ || !peer_offer_tickets_->Held(lease)) return true;
     peer_offer_tickets_->Release(coordinator_, cache::PeerRelease{.lease = lease, .demote = false}, now_us);
     return true;
 }

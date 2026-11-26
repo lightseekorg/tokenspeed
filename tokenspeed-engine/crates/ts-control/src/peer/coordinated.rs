@@ -38,6 +38,7 @@ use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, 
 
 pub(super) struct Report {
     legacy: Vec<u8>,
+    retirement_bound_ms: u32,
     proposals: Vec<(i64, Message, Message)>,
     messages: Vec<Message>,
     votes: Vec<Vote>,
@@ -54,6 +55,7 @@ impl Report {
     fn encode(self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(&self.legacy);
+        w.u32(self.retirement_bound_ms);
         w.count(self.proposals.len());
         for (issued_at, q, a) in self.proposals {
             w.i64(issued_at);
@@ -76,6 +78,7 @@ impl Report {
     fn decode(b: &[u8]) -> Option<Self> {
         let mut r = Reader::new(b);
         let legacy = r.bytes()?.to_vec();
+        let retirement_bound_ms = r.u32()?;
         let proposals = (0..r.count()?)
             .map(|_| Some((r.i64()?, msg(&mut r)?, msg(&mut r)?)))
             .collect::<Option<Vec<_>>>()?;
@@ -94,6 +97,7 @@ impl Report {
             .collect::<Option<Vec<_>>>()?;
         r.finish(Self {
             legacy,
+            retirement_bound_ms,
             proposals,
             messages,
             votes,
@@ -115,6 +119,7 @@ pub(super) struct Control {
     signaled: mpsc::Receiver<Instant>,
     missing: Vec<PeerEventView>,
     admission: bool,
+    retirement_bound_ms: u32,
     pub meter: Option<Arc<ts_metrics::PeerMetrics>>,
 }
 impl Control {
@@ -125,6 +130,7 @@ impl Control {
         incarnation: u64,
         ch: Option<VersionedChannel>,
         device_pin_gate: Arc<super::servicer::DevicePinGate>,
+        retirement_bound_ms: u32,
     ) -> (Self, PeerFence) {
         let (tx, signaled) = mpsc::channel();
         (
@@ -146,6 +152,7 @@ impl Control {
                 signaled,
                 missing: Vec::new(),
                 admission: true,
+                retirement_bound_ms,
                 meter: None,
             },
             PeerFence(tx),
@@ -155,9 +162,14 @@ impl Control {
         self.layout.members.len() == 8
     }
     pub fn len(&self) -> usize {
-        self.attempts.len() + usize::from(self.offers.active())
+        self.attempts.len() + self.offers.active_count()
     }
     pub fn invalidate(&mut self) {
+        if self.admission {
+            tracing::warn!(
+                "weight generation changed; restart to resume cross-layout peer sharing"
+            );
+        }
         self.admission = false;
         self.known.clear();
         for a in self.attempts.values_mut() {
@@ -170,10 +182,9 @@ impl Control {
         };
         let to = match &m {
             Message::LayoutReq(..) | Message::LayoutReply(..) => return,
-            Message::Lookup(k, ..)
-            | Message::Pin(k, ..)
-            | Message::Reading(k, ..)
-            | Message::Release(k, ..) => &k.holder.name,
+            Message::Lookup(k, ..) | Message::Pin(k, ..) | Message::Release(k, ..) => {
+                &k.holder.name
+            }
             Message::Offered(k, ..) | Message::Grant(k, ..) | Message::Ack(k, ..) => &k.reader.name,
         };
         if let Err(e) = ch.net.versioned(to, &m) {
@@ -234,6 +245,7 @@ impl Control {
             .unwrap_or_default();
         Report {
             legacy,
+            retirement_bound_ms: self.retirement_bound_ms,
             messages,
             votes: std::mem::take(&mut self.votes),
             proposals: std::mem::take(&mut self.proposals),
@@ -365,6 +377,7 @@ impl Control {
             return Err(PeerError::Report);
         }
         let first = &mut reports[0];
+        let retirement_bound_ms = first.retirement_bound_ms;
         let now = round.now_us;
         for (issued_at, q, a) in first.proposals.drain(..) {
             if self.rank == 0 {
@@ -430,7 +443,8 @@ impl Control {
             self.send(m);
         }
         self.attempts.retain(|_, a| !a.finished());
-        self.offers.expire(now);
+        self.votes
+            .extend(self.offers.expire(now, retirement_bound_ms, s));
         round.events.append(&mut self.missing);
         Ok(())
     }

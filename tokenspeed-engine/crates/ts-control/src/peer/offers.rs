@@ -66,6 +66,34 @@ enum Phase {
     Closed(Disposition),
 }
 
+impl Phase {
+    fn cleanup(
+        self,
+        now: i64,
+        until: i64,
+        retirement_bound_ms: u32,
+        votes: &[Option<u8>],
+    ) -> Option<Disposition> {
+        match self {
+            Self::Preparing if now >= until => Some(Disposition::Abort),
+            Self::Granted
+                if retirement_bound_ms > 0
+                    && now >= until.saturating_add(i64::from(retirement_bound_ms) * 1_000) =>
+            {
+                Some(Disposition::Abort)
+            }
+            Self::Closing(d)
+                if now >= until
+                    && votes.iter().all(Option::is_some)
+                    && votes.contains(&Some(0)) =>
+            {
+                Some(d)
+            }
+            _ => None,
+        }
+    }
+}
+
 struct Record {
     offer: Offer,
     query: Digest,
@@ -90,17 +118,34 @@ impl Offers {
             records: HashMap::new(),
         }
     }
-    pub fn active(&self) -> bool {
+    pub fn active_count(&self) -> usize {
         self.records
             .values()
-            .any(|r| !matches!(r.phase, Phase::Soft | Phase::Closed(_)))
+            .filter(|r| !matches!(r.phase, Phase::Soft | Phase::Closed(_)))
+            .count()
     }
     pub fn has(&self, key: &Key) -> bool {
         self.records.contains_key(key)
     }
-    pub fn expire(&mut self, now: i64) {
+    pub fn expire(&mut self, now: i64, retirement_bound_ms: u32, s: &mut Scheduler) -> Vec<Vote> {
+        let due: Vec<_> = self
+            .records
+            .iter()
+            .filter_map(|(k, r)| {
+                let disposition = r
+                    .phase
+                    .cleanup(now, r.until, retirement_bound_ms, &r.votes)?;
+                Some((k.clone(), r.offer.id, disposition))
+            })
+            .collect();
+        let mut votes = Vec::new();
+        for (key, id, d) in due {
+            let (_, vote) = self.close(&key, id, d, s, now);
+            votes.extend(vote);
+        }
         self.records
             .retain(|_, r| !matches!(r.phase, Phase::Soft | Phase::Closed(_)) || r.until > now);
+        votes
     }
 
     pub fn lookup(
@@ -261,6 +306,7 @@ impl Offers {
         match r.phase {
             Phase::Soft if r.until > now => {
                 r.phase = Phase::Preparing;
+                r.until = now.saturating_add(2_000_000);
                 r.held = self.device_pin_gate.allows(&r.checkpoint.pages)
                     && s.pin_peer_offer(&r.checkpoint, now).unwrap_or(false);
                 (
@@ -306,13 +352,17 @@ impl Offers {
             Phase::Closing(prev) | Phase::Closed(prev) if prev != d => {
                 return ack(Closure::Conflict)
             }
-            Phase::Closing(_) => return (None, None),
+            Phase::Closing(_) if r.phase.cleanup(now, r.until, 0, &r.votes).is_none() => {
+                return (None, None)
+            }
+            Phase::Closing(_) => (),
             Phase::Closed(_) => return ack(Closure::Closed),
             Phase::Granted => (),
             _ if d == Disposition::Complete => return ack(Closure::Conflict),
             _ => (),
         }
         r.phase = Phase::Closing(d);
+        r.until = now.saturating_add(1_000_000);
         r.votes.fill(None);
         let ok = !r.held
             || s.close_peer_offer(&r.checkpoint.lease, now)
@@ -353,6 +403,9 @@ impl Offers {
             Phase::Preparing => {
                 if ok {
                     r.phase = Phase::Granted;
+                    // Every reader starts its submit window before its READY
+                    // vote, hence before this grant even if delivery is delayed.
+                    r.until = now.saturating_add(super::v1::SUBMIT_WINDOW.as_micros() as i64);
                 }
                 Some(Message::Grant(v.key.clone(), r.offer.clone(), ok))
             }
@@ -363,5 +416,34 @@ impl Offers {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod verification {
+    use super::*;
+    #[test]
+    fn orphan_close_respects_the_backend_bound_and_preserves_failed_close_votes() {
+        let cutoff = 30_000_000;
+        let votes = [Some(1), None];
+        assert_eq!(Phase::Granted.cleanup(i64::MAX, cutoff, 0, &votes), None);
+        assert_eq!(
+            Phase::Granted.cleanup(cutoff + 9_999, cutoff, 10, &votes),
+            None
+        );
+        assert_eq!(
+            Phase::Granted.cleanup(cutoff + 10_000, cutoff, 10, &votes),
+            Some(Disposition::Abort)
+        );
+        assert_eq!(
+            Phase::Preparing.cleanup(cutoff, cutoff, 0, &votes),
+            Some(Disposition::Abort)
+        );
+        let phase = Phase::Closing(Disposition::Complete);
+        assert_eq!(phase.cleanup(cutoff, cutoff, 0, &votes), None);
+        assert_eq!(
+            phase.cleanup(cutoff, cutoff, 0, &[Some(1), Some(0)]),
+            Some(Disposition::Complete)
+        );
     }
 }

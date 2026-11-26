@@ -170,6 +170,7 @@ impl Peer {
         name: String,
         incarnation: u64,
         channel: Option<super::VersionedChannel>,
+        retirement_bound_ms: u32,
     ) {
         let (control, fence) = super::coordinated::Control::new(
             layout,
@@ -178,6 +179,7 @@ impl Peer {
             incarnation,
             channel,
             self.device_pin_gate.clone(),
+            retirement_bound_ms,
         );
         if control.reader() {
             self.fence = fence;

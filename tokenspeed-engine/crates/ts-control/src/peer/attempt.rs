@@ -63,6 +63,7 @@ pub(super) struct Attempt {
     published: bool,
     deadline: i64,
     retry: i64,
+    submit_until: std::time::Instant,
     retire_wait: bool,
     invalid: bool,
     frozen: bool,
@@ -96,6 +97,7 @@ impl Attempt {
             published: false,
             deadline,
             retry: 0,
+            submit_until: std::time::Instant::now() + super::v1::SUBMIT_WINDOW,
             retire_wait: false,
             invalid: false,
             frozen: false,
@@ -252,11 +254,10 @@ impl Attempt {
     pub fn invalidate(&mut self) {
         self.invalid = true;
     }
-    fn seal(&mut self, now: i64) {
+    fn seal(&mut self) {
         if self.phase != Phase::Reading {
             self.phase = Phase::Reading;
             self.votes = [None; 8];
-            self.retry = now.saturating_add(200_000);
         }
         self.retire_wait = true;
         if let Some(job) = &self.job {
@@ -323,7 +324,7 @@ impl Attempt {
         }
         *entry = Some(v.value);
         if v.stage == DONE && v.value == 2 {
-            self.seal(now);
+            self.seal();
             self.freeze(round);
         }
         if self.votes.iter().any(Option::is_none) {
@@ -331,7 +332,7 @@ impl Attempt {
         }
         if self.phase == Phase::Planning {
             if self.votes.contains(&Some(0)) || !self.votes.contains(&Some(2)) {
-                self.seal(now);
+                self.seal();
                 return None;
             }
             self.phase = Phase::Pin;
@@ -365,12 +366,11 @@ impl Attempt {
             return None;
         }
         if !ok {
-            self.seal(now);
+            self.seal();
             return None;
         }
         self.phase = Phase::Reading;
         self.deadline = now.saturating_add(30_000_000);
-        self.retry = now.saturating_add(200_000);
         None
     }
     pub fn ack(&mut self, k: &Key, id: u64, d: Disposition, c: Closure, round: &mut PeerRound) {
@@ -380,8 +380,14 @@ impl Attempt {
         {
             return;
         }
-        if !matches!(c, Closure::Closed | Closure::Gone) {
-            return;
+        match c {
+            Closure::Unknown => return,
+            Closure::Stale | Closure::Conflict => {
+                // All local submissions have retired before Closing. The peer
+                // cannot confirm this close. Finish locally without a hit.
+                tracing::warn!(lease = k.lease, offer = id, ?c, "peer rejected release");
+            }
+            Closure::Closed | Closure::Gone => {}
         }
         self.finish(
             !self.invalid && c == Closure::Closed && d == Disposition::Complete,
@@ -397,11 +403,11 @@ impl Attempt {
         round: &mut PeerRound,
     ) -> (Option<Vote>, Option<Message>) {
         if self.invalid && matches!(self.phase, Phase::Planning | Phase::Pin | Phase::Reading) {
-            self.seal(now);
+            self.seal();
         }
         if self.phase == Phase::Reading {
             if now >= self.deadline || self.invalid {
-                self.seal(now);
+                self.seal();
                 self.freeze(round);
             }
             let mut vote = None;
@@ -409,7 +415,8 @@ impl Attempt {
                 if self.fenced && self.job.is_none() && !self.retire_wait {
                     if let Some(b) = self.batches.take() {
                         let metrics = meter.map(|(m, rank)| (m, self.lookup.holder.as_str(), rank));
-                        self.job = reads.and_then(|w| w.submit_member_observed(b, metrics));
+                        self.job = reads
+                            .and_then(|w| w.submit_member_observed(b, self.submit_until, metrics));
                     }
                 }
                 let result = if let Some(j) = &self.job {
@@ -438,16 +445,7 @@ impl Attempt {
                     });
                 }
             }
-            let renew = if now >= self.retry {
-                self.retry = now.saturating_add(200_000);
-                Some(Message::Reading(
-                    self.key.clone().unwrap(),
-                    self.offer.as_ref().unwrap().id,
-                ))
-            } else {
-                None
-            };
-            return (vote, renew);
+            return (vote, None);
         }
         if let Phase::Closing(d) = self.phase {
             if now >= self.deadline {
@@ -466,7 +464,7 @@ impl Attempt {
             }
         } else if now >= self.deadline {
             match self.phase {
-                Phase::Pin | Phase::Planning => self.seal(now),
+                Phase::Pin | Phase::Planning => self.seal(),
                 Phase::Discovery | Phase::Query | Phase::Offered => {
                     self.finish(false, round);
                     self.phase = Phase::Finished;
@@ -598,6 +596,20 @@ mod verification {
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rejected_release_ends_only_local_cleanup() {
+        for closure in [Closure::Stale, Closure::Conflict] {
+            let (mut a, key, offer) = granted_candidate();
+            let _ = a.close(Disposition::Complete, 10);
+            let mut round = PeerRound::default();
+            a.ack(&key, offer.id, Disposition::Complete, closure, &mut round);
+            assert!(a.finished());
+            assert!(round.landed.is_empty());
+            assert_eq!(round.events.len(), 1);
+            assert_eq!(round.events[0].num_tokens, 0);
         }
     }
 

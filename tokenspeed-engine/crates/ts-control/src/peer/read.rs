@@ -30,7 +30,7 @@ use std::{
         mpsc, Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -126,6 +126,7 @@ impl MemberRead {
 }
 
 struct MemberJob {
+    submit_until: Instant,
     batches: Vec<(String, Spans, Option<ts_metrics::QueuedPeerRead>)>,
     sealed: Arc<AtomicBool>,
     done: mpsc::Sender<ReadRetirement>,
@@ -134,7 +135,7 @@ struct MemberJob {
 impl MemberJob {
     fn run(self, reader: &dyn PageReader) {
         for (session, spans, observation) in self.batches {
-            if self.sealed.load(Ordering::SeqCst) {
+            if self.sealed.load(Ordering::SeqCst) || Instant::now() >= self.submit_until {
                 let _ = self.done.send(ReadRetirement::Aborted);
                 return;
             }
@@ -275,12 +276,13 @@ impl Reads {
     /// Every queue entry owns exactly one completion sender regardless of the
     /// number of holder sessions. None means nothing was queued.
     pub fn submit_member(&self, batches: Vec<(String, Spans)>) -> Option<MemberRead> {
-        self.submit_member_observed(batches, None)
+        self.submit_member_observed(batches, Instant::now() + super::v1::SUBMIT_WINDOW, None)
     }
 
     pub(super) fn submit_member_observed(
         &self,
         batches: Vec<(String, Spans)>,
+        submit_until: Instant,
         metrics: Option<(&Arc<ts_metrics::PeerMetrics>, &str, usize)>,
     ) -> Option<MemberRead> {
         let (done, result) = mpsc::channel();
@@ -297,6 +299,7 @@ impl Reads {
         self.jobs
             .as_ref()?
             .send(Work::Member(MemberJob {
+                submit_until,
                 batches,
                 sealed: sealed.clone(),
                 done,
@@ -610,6 +613,22 @@ mod tests {
             ReadRetirement::Aborted
         );
         assert!(incoming.try_recv().is_err());
+    }
+
+    #[test]
+    fn expired_queue_entry_skips_native_submission() {
+        let reads = Reads::start(Arc::new(Failing), Arc::new(NoPushes), NonZeroUsize::MIN).unwrap();
+        let job = reads
+            .submit_member_observed(
+                vec![("unreachable".into(), read_job("r", "unused", 16).spans)],
+                Instant::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Aborted
+        );
     }
 
     #[test]

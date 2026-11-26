@@ -267,6 +267,7 @@ def test_host_landings_take_a_share_of_the_host_blocks():
         answer_timeout_ms=50,
         min_fetch_tokens=256,
         num_host_blocks=100,
+        versioned_shards=False,
     )
     host = peer_scheduler_config(landing_tier="host", **common)
     assert host.landing_tier == ts.PeerLandingTier.Host

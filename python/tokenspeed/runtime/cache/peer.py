@@ -99,7 +99,7 @@ def peer_scheduler_config(
     min_fetch_tokens: int,
     landing_tier: str,
     num_host_blocks: int,
-    versioned_shards: bool = False,
+    versioned_shards: bool,
 ) -> PeerConfig:
     """The scheduler's peer sharing limits.
 

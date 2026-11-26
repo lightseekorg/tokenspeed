@@ -363,7 +363,20 @@ pub fn start(
     )
     .map_err(|error| error.to_string())?;
     if let Some(layout) = registered {
-        peer.enable_versioned(layout, name, incarnation, channel);
+        let retirement_bound_ms = match std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS") {
+            Ok(s) => s
+                .parse::<std::num::NonZeroU32>()
+                .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
+                .get(),
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(e) => return Err(e.to_string()),
+        };
+        if replica.index() == 0 && retirement_bound_ms == 0 {
+            tracing::warn!(
+                "peer READ retirement bound unset; orphaned grants require explicit recovery"
+            );
+        }
+        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
     }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {

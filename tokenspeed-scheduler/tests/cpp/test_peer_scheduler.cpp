@@ -297,7 +297,7 @@ TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock
     Send(holder_, cache::PeerTick{.now_us = 100'000'000});
     EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, held);
     EXPECT_TRUE(holder_.ClosePeerOffer(pin.lease, 100'000'001));
-    EXPECT_FALSE(holder_.ClosePeerOffer(pin.lease, 100'000'002));
+    EXPECT_TRUE(holder_.ClosePeerOffer(pin.lease, 100'000'002));
     EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, 0u);
 }
 
@@ -318,6 +318,35 @@ TEST_P(PeerSchedulerTest, LookupBoundCanExcludeAPublishedTailCheckpoint) {
     const auto bounded = servicer_.Lookup(query).num_tokens;
     EXPECT_EQ(wide, static_cast<int>(published.size()));
     EXPECT_LT(bounded, wide);
+}
+
+TEST(VersionedPeerLanding, MatchingRetirementReturnsFrozenPagesToTheDevicePool) {
+    for (const bool frozen : {false, true}) {
+        auto cfg = PeerConfigFor("reader");
+        cfg.peer_config->versioned_shards = true;
+        Scheduler reader{cfg};
+        const auto available = reader.CacheGroupAvailablePages("full_attention");
+        reader.SubmitRequests(
+            {RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = MakeAlignedTokens(8, kP)}});
+        Plan(reader);
+        auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 1u);
+        const auto lease = lookups.front().lease;
+        Send(reader, cache::PeerLookupAnswered{.lease = lease, .num_tokens = 4 * kP});
+        ASSERT_EQ(Plan(reader).peer_fetches.size(), 1u);
+        auto other = lease;
+        ++other.id;
+        Send(reader, cache::PeerFetchDone{.request_id = "r", .lease = other});
+        EXPECT_EQ(reader.GetPeerStats().landing_requests, 1u);
+        Send(reader, cache::PeerFetchDone{.request_id = "r", .lease = lease, .frozen = frozen});
+        EXPECT_EQ(reader.GetPeerStats().landing_requests, 0u);
+        if (frozen) {
+            reader.RetirePeerTarget(other);
+            EXPECT_LT(reader.CacheGroupAvailablePages("full_attention"), available);
+            reader.RetirePeerTarget(lease);
+        }
+        EXPECT_EQ(reader.CacheGroupAvailablePages("full_attention"), available);
+    }
 }
 
 TEST(DevicePeerChoice, TimelyLongHitAfterFourSecondRoundUsesReaderDevicePages) {
