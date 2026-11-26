@@ -257,10 +257,10 @@ impl Control {
             Message::LayoutReply(id, g, sid, d, wire) => {
                 if !self.admission
                     || *sid != self.layout.semantic
-                    || !self
+                    || self
                         .attempts
                         .get(id)
-                        .is_some_and(|a| a.lookup.holder == g.name)
+                        .is_none_or(|a| a.lookup.holder != g.name)
                 {
                     return;
                 }

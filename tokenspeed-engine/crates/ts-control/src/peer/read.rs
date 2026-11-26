@@ -160,7 +160,7 @@ impl MemberJob {
 }
 
 enum Work {
-    Legacy(ReadJob, Option<ts_metrics::QueuedPeerRead>),
+    Legacy(Box<ReadJob>, Option<ts_metrics::QueuedPeerRead>),
     Member(MemberJob),
 }
 
@@ -311,7 +311,7 @@ impl Reads {
         observation: Option<ts_metrics::QueuedPeerRead>,
     ) {
         if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(Work::Legacy(job, observation));
+            let _ = jobs.send(Work::Legacy(Box::new(job), observation));
         }
     }
 
