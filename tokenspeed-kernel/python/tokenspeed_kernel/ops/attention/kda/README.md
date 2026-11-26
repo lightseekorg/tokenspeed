@@ -17,21 +17,16 @@ selected when `2 * requests * heads > SM count`; smaller workloads retain the
 ordinary decomposed scan. FP32 initial and final states are
 separate; the runtime retains its LCM gather/writeback and checkpoint policy.
 Live device boundaries build the scan plan (`build_kda_prefill_plan`) for
-both eager execution and capacity-based CUDA graphs. One Triton launch fills
-the ordinary scan's longest-first sequence order and 16-token chunk prefix
-and, when the persistent scan applies, its task lists, so the ordinary
-launch skips FlashInfer's own metadata kernel. A caller that scans the same
-batch in several layers builds the plan once and passes each launch its own
-`plan_layer`: the plan holds one handoff-flag row per layer, zeroed by the
-plan launch, and `refresh_kda_prefill_plan` rebuilds a retained plan in
-place before a graph replay. A call without a plan builds one for itself.
-Inputs beyond the live total follow the runtime's zero-padding contract:
-native scans may load a full tile at the tail. Persistent planning
-distributes 32-token chunks over resident workers, with at most one exact
-FP32 handoff per request/head chain. Scratch belongs to the plan, each
-invocation or its graph pool; only compiled code is cached. The FlashInfer
-adapter owns the pinned native launch ABI, avoiding the public wrapper's
-in-place state updates and persistent GPU scratch.
+both eager execution and capacity-based CUDA graphs. Layers that scan the same
+batch share one plan, each launch reading its own `plan_layer` handoff-flag
+row; `refresh_kda_prefill_plan` rebuilds a retained plan in place before a
+replay, and a call without a plan builds its own. Inputs beyond the live total
+follow the runtime's zero-padding contract: native scans may load a full tile
+at the tail. Persistent planning distributes 32-token chunks over resident
+workers, with at most one exact FP32 handoff per request/head chain. Scratch
+belongs to the plan, each invocation or its graph pool; only compiled code is
+cached. The FlashInfer adapter owns the pinned native launch ABI, avoiding the
+public wrapper's in-place state updates and persistent GPU scratch.
 
 ## Verify and publication
 

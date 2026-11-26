@@ -426,6 +426,30 @@ def kda_paged_prefill(
     return result
 
 
+def kda_prefill_takes_plan(dtype: torch.dtype, *, solution: str | None) -> bool:
+    """Whether the prefill kernel selected for ``solution`` reads a shared plan.
+
+    This initialization-time probe selects as ``kda_paged_prefill`` does for
+    ``dtype`` activations, without allocating or launching. When it holds, a
+    caller that scans one batch in several layers builds the plan once
+    (``build_kda_prefill_plan``) and passes each launch its own ``plan_layer``.
+    """
+    if solution == "fla":
+        solution = "triton"
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_paged_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    return spec is not None and True in spec.traits.get("prefill_plan", ())
+
+
 def kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -925,6 +949,7 @@ __all__ = [
     "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",
     "build_kda_prefill_plan",
+    "kda_prefill_takes_plan",
     "refresh_kda_prefill_plan",
     "kda_recurrent_layout",
     "kda_paged_prefill",

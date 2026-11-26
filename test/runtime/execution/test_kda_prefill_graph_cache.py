@@ -68,6 +68,7 @@ def configure_prefill(backend, heads=8):
     backend.kda_backend = "cutedsl_kda"
     backend._prefill_metadata = {}
     backend._prefill_metadata_pool = None
+    backend._prefill_takes_plan = True
     backend._prefill_plan_rows = {0: 0}
     backend._prefill_plan_heads = heads
 
@@ -490,13 +491,6 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         shared = metadata.state_in_blocks_by_group["state"] == 8
         length[metadata.req_pool_indices[shared].long()] = 0
 
-    def replan(metadata):
-        # A plan serves one forward; the runtime re-plans before each.
-        if metadata.prefill_scan_plan is not None:
-            backend._prefill_scan_plan(
-                metadata.scan_query_start_loc, metadata.prefill_scan_plan
-            )
-
     def assert_scan_close(actual, expected):
         if backend_name == "cutedsl_kda":
             # The independent history reconstruction can differ by FP32 FMA rounding.
@@ -527,7 +521,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
             scan_query_start_loc=scan_bounds,
             query_start_loc_int64=scan_bounds,
             # As init_forward_metadata: one plan for every layer's scan.
-            prefill_scan_plan=backend._prefill_scan_plan(scan_bounds, None),
+            prefill_scan_plan=backend._build_prefill_scan_plan(scan_bounds),
             extend_seq_lens_cpu=lengths,
             cu_extend_seq_lens_cpu=host,
             state_in_blocks_by_group={
@@ -707,7 +701,6 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         # does not admit, such as MIXED batches).
         for metadata in (backend.forward_metadata, source):
             backend.forward_metadata = metadata
-            replan(metadata)
             reset(source)
             ordinary.replay(valid_rows=sum(lengths))
             assert_scan_close(ordinary_output[: sum(lengths)], expected)
@@ -727,7 +720,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
-        replan(fixed)
+        # Each forward prepares its own metadata, refreshing the retained plan.
+        backend.forward_metadata = source
+        backend.prepare_prefill_metadata(
+            bucket, batch_size, ctx.forward_mode, capture=False
+        )
         reset(source)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {

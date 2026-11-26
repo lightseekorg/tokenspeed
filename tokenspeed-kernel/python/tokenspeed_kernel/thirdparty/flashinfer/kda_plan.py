@@ -30,7 +30,7 @@ _ORDINARY_CHUNK = tl.constexpr(16)
 
 
 @triton.jit
-def _persistent_kda_schedule(
+def _persistent_kda_plan(
     boundaries,
     cu32,
     chunk_prefix,
@@ -40,8 +40,10 @@ def _persistent_kda_schedule(
     lengths,
     sources,
     destinations,
+    flags,
     num_sequences,
     num_workers,
+    num_flags,
     HEADS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -61,6 +63,9 @@ def _persistent_kda_schedule(
         )
         total += tl.sum(chunks)
         longest = tl.maximum(longest, tl.max(chunks))
+    for flag_begin in range(0, num_flags, BLOCK):
+        entries = flag_begin + lanes
+        tl.store(flags + entries, 0, entries < num_flags)
     tl.debug_barrier()
 
     num_chains = num_sequences.to(tl.int64) * HEADS
@@ -176,6 +181,8 @@ def _kda_prefill_plan(
     lanes = tl.arange(0, BLOCK)
     # Ordinary CuTe: stable longest-first sequence order and 16-token chunk
     # prefix, as FlashInfer's packed metadata kernel would build per launch.
+    # Each sequence's rank counts the sequences ahead of it: quadratic in the
+    # batch's sequences, which one CTA covers in a few tiles per 128.
     ordinary_total = tl.full((), 0, tl.int32)
     tl.store(cu_chunks, 0)
     for seq_begin in range(0, num_sequences, BLOCK):
@@ -201,11 +208,8 @@ def _kda_prefill_plan(
             )
             rank += tl.sum(before.to(tl.int32), axis=1)
         tl.store(sequence_order + rank, rows.to(tl.int32), live)
-    for flag_begin in range(0, num_flags, BLOCK):
-        entries = flag_begin + lanes
-        tl.store(flags + entries, 0, entries < num_flags)
     if PERSISTENT:
-        _persistent_kda_schedule(
+        _persistent_kda_plan(
             boundaries,
             cu32,
             chunk_prefix,
@@ -215,8 +219,10 @@ def _kda_prefill_plan(
             lengths,
             sources,
             destinations,
+            flags,
             num_sequences,
             num_workers,
+            num_flags,
             HEADS,
             BLOCK,
         )

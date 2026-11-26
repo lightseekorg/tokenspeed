@@ -586,9 +586,14 @@ class CapacityPrefillBackend(MambaAttnBackend):
             retained,
             checkpoints=self._checkpoint_layout(token_capacity),
         )
-        target.prefill_scan_plan = self._prefill_scan_plan(
-            target.scan_query_start_loc, target.prefill_scan_plan
-        )
+        if retained is None:
+            target.prefill_scan_plan = self._build_prefill_scan_plan(
+                target.scan_query_start_loc
+            )
+        else:
+            self._refresh_prefill_scan_plan(
+                target.scan_query_start_loc, retained.prefill_scan_plan
+            )
         if capture:
             # Only startup grows retained storage; serving never captures.
             self._prefill_metadata[key] = target

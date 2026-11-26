@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     build_kda_prefill_plan,
     kda_paged_prefill,
+    kda_prefill_takes_plan,
     refresh_kda_prefill_plan,
 )
 from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import _kda_prefill_plan
@@ -333,6 +334,13 @@ def test_plan_orders_sequences_and_counts_chunks(native_cuda):
         chunks = torch.cat((torch.zeros(1, dtype=torch.int64), (lengths + 15) // 16))
         assert plan.sequence_order.tolist() == order
         assert plan.cu_chunks.tolist() == chunks.cumsum(0).tolist()
+
+
+def test_only_plan_taking_prefill_kernels_get_a_shared_plan(native_cuda):
+    """Callers share a plan exactly when the selected kernel declares one."""
+    assert kda_prefill_takes_plan(torch.bfloat16, solution="cutedsl_kda")
+    assert not kda_prefill_takes_plan(torch.bfloat16, solution="cudnn")
+    assert not kda_prefill_takes_plan(torch.bfloat16, solution="fla")
 
 
 @pytest.mark.parametrize("heads", [12, 96])

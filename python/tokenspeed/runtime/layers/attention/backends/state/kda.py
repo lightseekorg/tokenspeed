@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_materialize_retained_pages,
     kda_materialize_retained_state,
     kda_paged_prefill,
+    kda_prefill_takes_plan,
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
@@ -227,8 +228,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # by the executor (bind_request_stop_flags).
         self._request_stopped: torch.Tensor | None = None
         self._request_ends: torch.Tensor | None = None
-        # Each recurrent layer's row in a forward's CuTe prefill plan, and the
-        # local heads the plan schedules; set when a cache pool is bound.
+        # Whether the prefill kernel reads a forward's shared plan, each
+        # recurrent layer's row in it, and the local heads it schedules; set
+        # when a cache pool is bound.
+        self._prefill_takes_plan = False
         self._prefill_plan_rows: dict[int, int] = {}
         self._prefill_plan_heads = 0
         self._reset_replay_state()
@@ -367,6 +370,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
             for row, layer_id in enumerate(sorted(cache_pool.state_group_by_layer))
         }
         self._prefill_plan_heads = shape["num_heads"]
+        self._prefill_takes_plan = kda_prefill_takes_plan(
+            self.dtype,
+            solution=None if self.kda_backend == "auto" else self.kda_backend,
+        )
         self._batched_replay_kernel = resolve_kda_batched_retained_commit(
             self.dtype, recurrent_layout=self.kda_recurrent_layout, **shape
         )
@@ -1297,17 +1304,21 @@ class KdaAttnBackend(CapacityPrefillBackend):
         return query_start_loc.to(torch.int64)
 
     @override
-    def _prefill_scan_plan(
-        self, scan_query_start_loc: torch.Tensor, retained: KdaPrefillPlan | None
+    def _build_prefill_scan_plan(
+        self, scan_query_start_loc: torch.Tensor
     ) -> KdaPrefillPlan | None:
-        """Schedule the CuTe prefill of every layer once per forward."""
-        if self.kda_backend != "cutedsl_kda":
+        """Schedule every layer's prefill scan once per forward."""
+        if not self._prefill_takes_plan:
             return None
-        if retained is not None:
-            refresh_kda_prefill_plan(scan_query_start_loc, retained)
-            return retained
         return build_kda_prefill_plan(
             scan_query_start_loc,
             heads=self._prefill_plan_heads,
             layers=len(self._prefill_plan_rows),
         )
+
+    @override
+    def _refresh_prefill_scan_plan(
+        self, scan_query_start_loc: torch.Tensor, plan: KdaPrefillPlan | None
+    ) -> None:
+        if self._prefill_takes_plan:
+            refresh_kda_prefill_plan(scan_query_start_loc, plan)

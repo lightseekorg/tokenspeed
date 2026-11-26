@@ -223,8 +223,8 @@ class MambaForwardMetadata:
     # Request slots for families with off-page replay records.
     req_pool_indices: torch.Tensor | None = None
     # Launch schedules every layer's prefill scan reads, built once per forward
-    # from scan_query_start_loc (``_prefill_scan_plan``); None for scans that
-    # plan inside each launch.
+    # from scan_query_start_loc (``_build_prefill_scan_plan``); None for scans
+    # that plan inside each launch.
     prefill_scan_plan: Any = None
 
     @property
@@ -1139,7 +1139,7 @@ class MambaAttnBackend(AttentionBackend):
             prefill_scan_plan=(
                 None
                 if split_mixed
-                else self._prefill_scan_plan(scan_query_start_loc, None)
+                else self._build_prefill_scan_plan(scan_query_start_loc)
             ),
         )
 
@@ -1253,8 +1253,8 @@ class MambaAttnBackend(AttentionBackend):
             scan_state_checkpoints=scan_state_checkpoints,
             scan_checkpoint_rows=scan_checkpoint_rows,
             prefill_scan_plan=(
-                self._prefill_scan_plan(
-                    full_metadata.scan_query_start_loc[: num_extends + 1], None
+                self._build_prefill_scan_plan(
+                    full_metadata.scan_query_start_loc[: num_extends + 1]
                 )
                 if num_extends
                 else None
@@ -2649,18 +2649,15 @@ class MambaAttnBackend(AttentionBackend):
         """Return the device boundary tensor consumed by prefill scans."""
         return query_start_loc
 
-    def _prefill_scan_plan(
-        self, scan_query_start_loc: torch.Tensor, retained: Any
-    ) -> Any:
+    def _build_prefill_scan_plan(self, scan_query_start_loc: torch.Tensor) -> Any:
         """Plan this forward's prefill scans once for all layers.
 
-        Args:
-            scan_query_start_loc: The forward's scan boundaries.
-            retained: A plan a captured shape keeps; refreshed in place and
-                returned. None builds a plan owned by this forward.
-
-        Returns:
-            The plan ``_prefill_scan`` reads, or None when the scan plans
-            inside each launch (GDN).
+        Returns the plan ``_prefill_scan`` reads, owned by this forward, or
+        None when the scan plans inside each launch (GDN).
         """
         return None
+
+    def _refresh_prefill_scan_plan(
+        self, scan_query_start_loc: torch.Tensor, plan: Any
+    ) -> None:
+        """Rebuild a captured shape's retained plan in place before its replay."""
