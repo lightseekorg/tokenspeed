@@ -30,6 +30,7 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
     ParallelLMHead,
+    VocabParallelEmbedding,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
@@ -2338,3 +2339,133 @@ def test_packed_key_argmax_reduces_through_a_prepared_word_max(monkeypatch, redu
 
     ids = VocabParallelArgmax((0, 1), 8)(torch.zeros((2, 4)))
     assert ids.tolist() == ([107, 103] if reduced else [207, 203])
+
+
+def _make_sharded_vocab_heads(
+    weights: torch.Tensor,
+    base_vocab: int,
+    head_type: type[VocabParallelEmbedding] = ParallelLMHead,
+    *,
+    tp_size: int = 2,
+) -> list[VocabParallelEmbedding]:
+    group = tuple(range(tp_size))
+    heads: list[VocabParallelEmbedding] = []
+    for rank in range(tp_size):
+        head = head_type(
+            weights.shape[0],
+            weights.shape[1],
+            org_num_embeddings=base_vocab,
+            tp_rank=rank,
+            tp_size=tp_size,
+            tp_group=group,
+            params_dtype=weights.dtype,
+        )
+        shard = head.shard_indices
+        with torch.no_grad():
+            head.weight.fill_(99)  # Padding rows must never win a selection.
+            head.weight[: shard.num_org_elements].copy_(
+                weights[shard.org_vocab_start_index : shard.org_vocab_end_index]
+            )
+            first = shard.num_org_elements_padded
+            head.weight[first : first + shard.num_added_elements].copy_(
+                weights[shard.added_vocab_start_index : shard.added_vocab_end_index]
+            )
+        heads.append(head)
+    return heads
+
+
+@pytest.mark.parametrize(
+    ("base", "added", "winner", "greedy", "dp_head", "head_type"),
+    [
+        (67, 39, 105, False, False, ParallelLMHead),
+        (64, 64, 64, True, False, VocabParallelEmbedding),
+        (67, 39, 105, False, True, ParallelLMHead),
+    ],
+)
+@torch.no_grad()
+def test_vocab_parallel_added_tokens_restore_global_order(
+    monkeypatch, base, added, winner, greedy, dp_head, head_type
+):
+    """Gathered logits preserve global ID order across base and added vocab regions."""
+    vocab = base + added
+    weights = torch.zeros(vocab, 8, dtype=torch.bfloat16)
+    weights[:, 0] = torch.arange(vocab, dtype=torch.bfloat16) / vocab
+    weights[winner, 0] = 3.0
+    weights[2, 1] = 3.0
+    hidden = torch.zeros(2, 8, dtype=torch.bfloat16)
+    hidden[0, 0] = hidden[1, 1] = 1.0
+    peer, head = _make_sharded_vocab_heads(weights, base, head_type)
+    proc = LogitsProcessor(
+        SimpleNamespace(vocab_size=vocab),
+        tp_rank=1,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=2,
+        do_argmax=greedy,
+        skip_all_gather=dp_head,
+        dp_lm_head_tp=dp_head,
+    )
+    proc.prepare_communication(head)
+    proc._all_gather_state = None
+
+    def gather(output, local, group):
+        torch.testing.assert_close(local, hidden @ head.weight.T)
+        output.copy_(torch.cat((hidden @ peer.weight.T, local)))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", gather)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    result = proc(None, hidden, head, metadata)
+    torch.testing.assert_close(result.next_token_logits, hidden @ weights.T)
+    if greedy:
+        torch.testing.assert_close(result.next_token_ids, torch.tensor([winner, 2]))
+
+
+@pytest.mark.parametrize(("base", "added", "tp"), [(1023, 0, 2), (2045, 1, 4)])
+def test_sampled_vocab_shard_gate_agrees_across_all_ranks(base, added, tp):
+    """All TP ranks must make the same decision on vocab-sharded sampling."""
+    vocab = base + added
+    group = tuple(range(tp))
+    for rank in range(tp):
+        proc = LogitsProcessor(
+            SimpleNamespace(vocab_size=vocab),
+            tp_rank=rank,
+            tp_size=tp,
+            tp_group=group,
+            attn_tp_size=tp,
+            dp_lm_head_tp=False,
+        )
+        head = ParallelLMHead(
+            vocab,
+            2,
+            org_num_embeddings=base,
+            params_dtype=torch.bfloat16,
+            tp_rank=rank,
+            tp_size=tp,
+            tp_group=group,
+        )
+        kept = proc.keep_sampled_logits_vocab_sharded(
+            head, lambda dtype, columns, size: columns >= 128
+        )
+        assert kept == (added == 0)
+        if kept:
+            shard = proc.sampled_vocab_shard(
+                torch.empty(1, head.num_embeddings_per_partition), head
+            )
+            assert shard.vocab_start == rank * 512
+            assert shard.columns == (512 if rank == 0 else 511)
+
+
+@pytest.mark.parametrize("rows", [0, 3])
+@pytest.mark.parametrize(
+    ("base", "added", "tp"), [(67, 0, 2), (67, 39, 2), (2045, 1, 4)]
+)
+def test_unpad_gathered_logits_matches_dense_reference(rows, base, added, tp):
+    """unpad_gathered_logits removes base and added padding for every TP geometry."""
+    vocab = base + added
+    weights = torch.randn(vocab, 4, dtype=torch.float32)
+    hidden = torch.randn(rows, 4, dtype=torch.float32)
+    heads = _make_sharded_vocab_heads(weights, base, ParallelLMHead, tp_size=tp)
+    gathered = torch.cat([hidden @ h.weight.T for h in heads], dim=1)
+    expected = hidden @ weights.T
+    for head in heads:
+        torch.testing.assert_close(head.unpad_gathered_logits(gathered), expected)

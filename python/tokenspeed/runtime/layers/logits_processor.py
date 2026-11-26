@@ -500,7 +500,6 @@ class LogitsProcessor(nn.Module):
         # vocabulary shard).
         if not isinstance(lm_head, VocabParallelEmbedding):
             return False
-        shard = lm_head.shard_indices
         weight = lm_head.weight
         if (
             self.tp_size <= 1
@@ -508,6 +507,7 @@ class LogitsProcessor(nn.Module):
             or self.dp_lm_head_tp
             or self.dp_sampling_enabled
             or self.do_argmax
+            or lm_head.num_added_embeddings
             # A quantized head's method; a dense head's (Inkling2's FP32
             # output) only chooses the GEMM's output precision.
             or (
@@ -517,16 +517,16 @@ class LogitsProcessor(nn.Module):
             or self.config.vocab_size > 2**24
         ):
             return False
-        columns = int(shard.num_org_elements)
+        # Every rank must choose the same sampling collective, including the
+        # last rank when its physical shard contains padding.
+        columns = lm_head.num_embeddings_per_partition
         vocab_size = self.config.vocab_size
         # The real vocabulary ends in the last shard; the head's padding
         # rows past it are never sampled (the gathered rows drop them).
         last = vocab_size - columns * (self.tp_size - 1)
         if (
-            int(shard.num_added_elements) != 0
-            or int(shard.num_org_elements_padded) != columns
-            or not 0 < last <= columns
-            or int(shard.org_vocab_start_index) != columns * self.tp_rank
+            not 0 < last <= columns
+            or vocab_size > lm_head.org_vocab_size
             or weight.dtype not in (torch.bfloat16, torch.float16)
             or not supports(self.sampled_shard_dtype(lm_head), last, self.tp_size)
         ):
@@ -794,7 +794,15 @@ class LogitsProcessor(nn.Module):
         replacement reprobes only when its shard width, device or the
         sampling gate changes.
         """
-        enabled = self.do_argmax and self._dist_argmax_eligible()
+        # With added tokens, rank * shard width is not a global token ID offset.
+        enabled = (
+            self.do_argmax
+            and self._dist_argmax_eligible()
+            and not (
+                isinstance(lm_head, VocabParallelEmbedding)
+                and lm_head.num_added_embeddings
+            )
+        )
         geometry = (
             (lm_head.num_embeddings_per_partition, lm_head.weight.device)
             if enabled
@@ -1534,6 +1542,8 @@ class LogitsProcessor(nn.Module):
                 logits, lm_head, require_full_vocab=require_full_vocab
             )
 
+        if isinstance(lm_head, VocabParallelEmbedding) and lm_head.num_added_embeddings:
+            logits = lm_head.unpad_gathered_logits(logits)
         logits = self._vocab_logits(logits[:, : self.config.vocab_size])
 
         if self.final_logit_softcapping:
