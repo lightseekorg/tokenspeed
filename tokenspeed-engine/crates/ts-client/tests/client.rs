@@ -366,17 +366,20 @@ async fn abort_closes_a_silent_stream_after_queued_outputs() {
         })
         .await
         .unwrap();
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
+    engines[0].output("r", 2, None).await;
     collect(client.generate(request("barrier", Some(1))).await.unwrap()).await;
     assert_eq!(client.in_flight(), [1]);
     assert!(client.abort("r").await.unwrap());
     assert_eq!(client.in_flight(), [0]);
     assert!(!client.abort("r").await.unwrap());
-    for _ in 0..2 {
-        assert!(matches!(
-            engines[0].next_received().await,
-            EngineRequest::Add(_)
-        ));
-    }
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
     assert_eq!(
         engines[0].next_received().await,
         EngineRequest::Abort(vec!["r".into()])
@@ -385,12 +388,16 @@ async fn abort_closes_a_silent_stream_after_queued_outputs() {
     assert_eq!(first.output_ids, [1]);
     assert_eq!(first.finish_reason, None);
     assert_eq!(first.output_token_logprobs, [-0.1]);
+    let latest = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(latest.output_ids, [2]);
+    assert_eq!(latest.finish_reason, None);
     let terminal = next(&mut stream).await.unwrap().unwrap();
     assert_eq!(terminal.finish_reason.as_deref(), Some("abort"));
-    assert_eq!(terminal.prompt_tokens, first.prompt_tokens);
-    assert_eq!(terminal.completion_tokens, first.completion_tokens);
-    assert_eq!(terminal.cached_tokens, first.cached_tokens);
-    assert_eq!(terminal.reasoning_tokens, first.reasoning_tokens);
+    assert_eq!(terminal.prompt_tokens, latest.prompt_tokens);
+    assert_eq!(terminal.completion_tokens, latest.completion_tokens);
+    assert_eq!(terminal.cached_tokens, latest.cached_tokens);
+    assert_eq!(terminal.reasoning_tokens, latest.reasoning_tokens);
+    assert_eq!(terminal.spec_verify_ct, latest.spec_verify_ct);
     assert!(terminal.output_ids.is_empty());
     assert!(terminal.output_token_logprobs.is_empty());
     assert!(terminal.output_token_cumulative_probs.is_empty());

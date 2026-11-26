@@ -216,34 +216,16 @@ struct Engine {
 struct Pending {
     engine: usize,
     tx: mpsc::UnboundedSender<StreamItem>,
-    usage: RequestUsage,
-}
-
-#[derive(Default)]
-struct RequestUsage {
+    // Counts from the latest output, used when the client ends the stream.
     prompt_tokens: i64,
     completion_tokens: i64,
     cached_tokens: i64,
     reasoning_tokens: i64,
     spec_verify_ct: Option<i64>,
-    accept_draft_tokens: Option<f64>,
 }
 
-impl From<&OutputChunk> for RequestUsage {
-    fn from(chunk: &OutputChunk) -> Self {
-        Self {
-            prompt_tokens: chunk.prompt_tokens,
-            completion_tokens: chunk.completion_tokens,
-            cached_tokens: chunk.cached_tokens,
-            reasoning_tokens: chunk.reasoning_tokens,
-            spec_verify_ct: chunk.spec_verify_ct,
-            accept_draft_tokens: chunk.accept_draft_tokens,
-        }
-    }
-}
-
-impl RequestUsage {
-    fn abort_chunk(self) -> OutputChunk {
+impl Pending {
+    fn abort_chunk(&self) -> OutputChunk {
         OutputChunk {
             output_ids: Vec::new(),
             finish_reason: Some("abort".to_owned()),
@@ -255,19 +237,13 @@ impl RequestUsage {
             output_token_cumulative_probs: Vec::new(),
             finish_details: None,
             spec_verify_ct: self.spec_verify_ct,
-            accept_draft_tokens: self.accept_draft_tokens,
+            accept_draft_tokens: None,
             input_token_logprobs: None,
             input_top_logprobs: None,
             output_top_logprobs: None,
             request_timing: None,
         }
     }
-}
-
-enum AbortOutcome {
-    NotInFlight,
-    AlreadyDetached,
-    Detached(Pending),
 }
 
 /// A control operation awaiting every engine's reply.
@@ -403,17 +379,15 @@ impl Shared {
         Some(pending)
     }
 
-    async fn abort_and_detach(&self, rid: &str) -> Result<AbortOutcome> {
+    /// Send the abort and return the original sender for matching the request.
+    async fn send_abort(&self, rid: &str) -> Result<Option<mpsc::UnboundedSender<StreamItem>>> {
         let (engine, tx) = match lock(&self.requests).get(rid) {
             Some(pending) => (pending.engine, pending.tx.clone()),
-            None => return Ok(AbortOutcome::NotInFlight),
+            None => return Ok(None),
         };
         let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
         self.send(engine, frames).await?;
-        Ok(match self.forget(rid, &tx) {
-            Some(pending) => AbortOutcome::Detached(pending),
-            None => AbortOutcome::AlreadyDetached,
-        })
+        Ok(Some(tx))
     }
 
     fn dispatch(&self, batch: BatchTokenIDOutSlim) {
@@ -462,7 +436,11 @@ impl Shared {
             // A closed receiver means the stream is being dropped; its drop
             // forgets the request.
             let finished = chunk.finish_reason.is_some();
-            pending.usage = RequestUsage::from(&chunk);
+            pending.prompt_tokens = chunk.prompt_tokens;
+            pending.completion_tokens = chunk.completion_tokens;
+            pending.cached_tokens = chunk.cached_tokens;
+            pending.reasoning_tokens = chunk.reasoning_tokens;
+            pending.spec_verify_ct = chunk.spec_verify_ct;
             if let Err(error) = pending.tx.send(Ok(chunk)) {
                 discarded.push(error.0);
             }
@@ -610,8 +588,8 @@ impl EngineClient {
     }
 
     /// This client's attached request streams per engine, in index order.
-    /// Local cancellation decreases this count before engine resources
-    /// necessarily retire; use engine load reports to observe remote state.
+    /// `abort` and `cancel` decrease this count when they detach a stream.
+    /// Engine load reports track the engine's own requests and resources.
     pub fn in_flight(&self) -> Vec<usize> {
         self.shared
             .engines
@@ -649,9 +627,14 @@ impl EngineClient {
             rx,
             done: false,
         };
-        let usage = RequestUsage {
+        let pending = Pending {
+            engine,
+            tx,
             prompt_tokens: request.input_ids.as_ref().map_or(0, Vec::len) as i64,
-            ..RequestUsage::default()
+            completion_tokens: 0,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            spec_verify_ct: None,
         };
         {
             // Register before sending: outputs can arrive before `send`
@@ -663,7 +646,7 @@ impl EngineClient {
             if requests.contains_key(&rid) {
                 return Err(Error::DuplicateRequestId(rid));
             }
-            requests.insert(rid.clone(), Pending { engine, tx, usage });
+            requests.insert(rid.clone(), pending);
             self.shared.engines[engine]
                 .in_flight
                 .fetch_add(1, Ordering::Relaxed);
@@ -727,20 +710,20 @@ impl EngineClient {
     }
 
     /// Send the wire abort and end the local stream with an `"abort"` chunk
-    /// after any queued outputs. The chunk carries the latest reported usage,
-    /// or the submitted prompt length before the first output.
+    /// after any queued outputs. The chunk carries the latest reported token
+    /// counts and verify rounds. Before the first output, it uses the submitted
+    /// prompt length.
     ///
     /// Returns `true` if the abort was sent and `false` if no request was in
     /// flight. A concurrent terminal result takes precedence if it arrives
     /// before local detachment. A failed or interrupted send leaves any still
     /// active stream attached for retry. Use a fresh id for each submission.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
-        match self.shared.abort_and_detach(rid).await? {
-            AbortOutcome::NotInFlight => return Ok(false),
-            AbortOutcome::AlreadyDetached => {}
-            AbortOutcome::Detached(pending) => {
-                let _ = pending.tx.send(Ok(pending.usage.abort_chunk()));
-            }
+        let Some(tx) = self.shared.send_abort(rid).await? else {
+            return Ok(false);
+        };
+        if let Some(pending) = self.shared.forget(rid, &tx) {
+            let _ = pending.tx.send(Ok(pending.abort_chunk()));
         }
         Ok(true)
     }
@@ -762,7 +745,10 @@ impl EngineClient {
     /// [`Error::SendTimeout`] when sending exceeds the configured deadline.
     /// The stream remains attached for retry unless it ended independently.
     pub async fn cancel(&self, rid: &str) -> Result<bool> {
-        let AbortOutcome::Detached(pending) = self.shared.abort_and_detach(rid).await? else {
+        let Some(tx) = self.shared.send_abort(rid).await? else {
+            return Ok(false);
+        };
+        let Some(pending) = self.shared.forget(rid, &tx) else {
             return Ok(false);
         };
         let _ = pending.tx.send(Err(StreamError::Cancelled));

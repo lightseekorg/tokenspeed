@@ -303,8 +303,7 @@ impl Frontend {
     }
 
     /// This frontend's attached request streams per engine, in index order.
-    /// Local cancellation decreases this count without proving retirement
-    /// of engine resources.
+    /// `abort` and `cancel` decrease this count when they detach a stream.
     fn in_flight(&self) -> Vec<usize> {
         self.client.in_flight()
     }

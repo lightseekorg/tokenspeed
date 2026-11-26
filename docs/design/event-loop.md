@@ -114,11 +114,12 @@ The native frontend's `abort(rid)` and `cancel(rid)` send the ordinary wire
 abort. After a successful send, the frontend detaches the original local
 stream if it is still attached and releases its in-flight count. After any
 queued outputs, `abort` delivers an empty token chunk with `finish_reason`
-set to `"abort"` and the latest reported usage. Before the first output, it
-uses the submitted input ID count for prompt usage. `cancel` delivers
-`StreamError::Cancelled`, exposed by Python's `next_outputs` as a
-`(rid, RequestCancelled)` exception value. The engine owns its own load
-reports and releases slots, cache, and transfer resources at retirement.
+set to `"abort"` and the latest reported token counts and verify rounds.
+Before the first output, it uses the submitted input ID count for prompt
+usage. `cancel` delivers `StreamError::Cancelled`, exposed by Python's
+`next_outputs` as a `(rid, RequestCancelled)` exception value. The engine owns
+its own load reports and releases slots, cache, and transfer resources at
+retirement.
 
 `abort` returns `true` when it sends the wire abort. `cancel` returns `true`
 when it detaches the local stream. A finish, stream error or another
