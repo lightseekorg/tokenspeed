@@ -26,6 +26,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
+from unittest.mock import sentinel
 
 import numpy as np
 import pytest
@@ -101,12 +102,20 @@ class CpuMemorySaver:
                 tensor.copy_(self.snapshots.pop(tensor.data_ptr()))
 
 
+def _set_adapter_build(monkeypatch, backend):
+    # The adapter only checks presence. Driver probes must see the real build.
+    version = SimpleNamespace(
+        cuda=sentinel.cuda_build if backend == "cuda" else None,
+        hip=sentinel.hip_build if backend == "hip" else None,
+    )
+    monkeypatch.setattr(
+        adapter, "torch", SimpleNamespace(version=version, cuda=torch.cuda)
+    )
+
+
 @pytest.fixture(params=["cuda", "hip"])
 def memory(monkeypatch, request):
-    monkeypatch.setattr(
-        torch.version, "cuda", "13.0" if request.param == "cuda" else None
-    )
-    monkeypatch.setattr(torch.version, "hip", "7.0" if request.param == "hip" else None)
+    _set_adapter_build(monkeypatch, request.param)
     monkeypatch.setattr(adapter, "_non_expandable_allocation", nullcontext)
     allocations = []
     saver = CpuMemorySaver(allocations)
@@ -191,8 +200,7 @@ def test_disabled_adapter_initializes_communication_immediately(memory):
 
 
 def test_enabled_gpu_saver_refuses_a_cpu_torch_build(monkeypatch):
-    monkeypatch.setattr(torch.version, "cuda", None)
-    monkeypatch.setattr(torch.version, "hip", None)
+    _set_adapter_build(monkeypatch, "cpu")
     with pytest.raises(RuntimeError, match="requires a CUDA or ROCm PyTorch build"):
         adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
