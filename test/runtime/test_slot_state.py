@@ -71,6 +71,9 @@ from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
 from tokenspeed.runtime.layers.attention.backends.base import (  # noqa: E402
     AttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.hy4_flash import (  # noqa: E402
+    Hy4FlashDSABackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import (  # noqa: E402
     DSABackend,
 )
@@ -81,6 +84,10 @@ from tokenspeed.runtime.layers.attention.backends.specific.inkling import (  # n
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (  # noqa: E402
     HybridGlm53FlashTokenToKVPool,
     _KPoolTailWorkspace,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_hy4_flash import (  # noqa: E402
+    HybridHy4FlashTokenToKVPool,
+    _Hy4KPoolTailWorkspace,
 )
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackend,
@@ -233,6 +240,27 @@ def _kpool_pool() -> HybridGlm53FlashTokenToKVPool:
 
 def _dsa(pool, *, is_draft: bool) -> DSABackend:
     backend = DSABackend.__new__(DSABackend)
+    backend._init_pool_binding()
+    backend.cache_pool = pool
+    backend.is_draft = is_draft
+    backend.kpool_runtime = object()
+    backend._dense_backend = _Leaf()
+    return backend
+
+
+def _hy4_kpool_pool() -> HybridHy4FlashTokenToKVPool:
+    pool = HybridHy4FlashTokenToKVPool.__new__(HybridHy4FlashTokenToKVPool)
+    pool._hy4_kpool_tail_workspace = _Hy4KPoolTailWorkspace(
+        options=None,
+        token_keys=torch.zeros((2, POOL_ROWS, 4, HIDDEN), dtype=torch.bfloat16),
+        group_pos0=torch.zeros((POOL_ROWS, 3), dtype=torch.int64),
+        row_by_layer={0: 0, 1: 1},
+    )
+    return pool
+
+
+def _hy4_dsa(pool, *, is_draft: bool) -> Hy4FlashDSABackend:
+    backend = Hy4FlashDSABackend.__new__(Hy4FlashDSABackend)
     backend._init_pool_binding()
     backend.cache_pool = pool
     backend.is_draft = is_draft
@@ -426,6 +454,14 @@ def test_dsa_kpool_tail_round_trip_once_per_arena():
     pool = _kpool_pool()
     target = _dsa(pool, is_draft=False)
     draft = _dsa(pool, is_draft=True)
+    assert draft.slot_state_bytes() == 0, "the shared tail is imaged by the target"
+    _round_trip(target, src_slot=2, dst_slot=5)
+
+
+def test_hy4_flash_kpool_tail_round_trip_once_per_arena():
+    pool = _hy4_kpool_pool()
+    target = _hy4_dsa(pool, is_draft=False)
+    draft = _hy4_dsa(pool, is_draft=True)
     assert draft.slot_state_bytes() == 0, "the shared tail is imaged by the target"
     _round_trip(target, src_slot=2, dst_slot=5)
 
@@ -736,6 +772,9 @@ def test_backend_slot_state_is_complete():
     pool = _kpool_pool()
     target = _dsa(pool, is_draft=False)
     _assert_slot_state_complete(pool, exporter=target, slot_domains={POOL_ROWS})
+    hy4_pool = _hy4_kpool_pool()
+    hy4_target = _hy4_dsa(hy4_pool, is_draft=False)
+    _assert_slot_state_complete(hy4_pool, exporter=hy4_target, slot_domains={POOL_ROWS})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs KDA GPU registration")

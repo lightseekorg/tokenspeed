@@ -1820,6 +1820,92 @@ Use the gateway dependencies pinned by this checkout and the original
 checkpoint chat template. Check raw generation, parsed chat/tool APIs,
 numerical parity and performance independently before deployment.
 
+## Hy4-flash
+
+[Hy4-flash](https://huggingface.co/tencent/Hy4-flash-FP8) (`HYV4FlashForConditionalGeneration`)
+is a 42-layer multimodal LatentMoE model built on a 4-stream implicit
+hyper-connection (iHC) residual backbone, 3-gram Engram memory on layers 1, 11,
+21, and 31 (`engram_layer_ids = [2, 12, 22, 32]`, 1-based), a hybrid 12-layer
+32-head Compressed-DSA (4:1 gated key pooling, top-2048) and 30-layer 64-head
+SWA-MLA (`sliding_window=512`) attention schedule with gated MLA and learnable
+attention sinks, a 27-layer AnyRes vision tower with 3D interleaved M-RoPE, a
+BF16-stored LM head upcast to FP32 at runtime, and an embedded 5-layer DFly2
+speculative draft model sharing KV caches and top-k indices from target DSA
+layers `[25, 29, 33, 37, 41]`.
+
+### NVIDIA H20 (SM90)
+
+The FP8 checkpoint (`tencent/Hy4-flash-FP8`) quantizes routed experts and
+attention projections (`q_b_proj`, `o_proj`, `linear_gate`) in layers 1–41 with
+`128x128` block FP8 scales, while keeping layer 0, vision projections,
+embeddings, routers, norms, and `lm_head` unquantized. Leave
+`--attention-backend` unset so TokenSpeed selects the `hy4_flash` hybrid
+DSA/SWA backend automatically. Pass `--engram-host-table` to keep the 4-layer
+Engram embedding tables in pinned host memory when GPU HBM is tight. The
+example below ran on two H20 GPUs with `TP=2` and `EP=2`. For other GPU
+topologies, choose `--tensor-parallel-size` and `--ep-size` for the deployment.
+
+```bash
+tokenspeed serve tencent/Hy4-flash-FP8 \
+  --served-model-name hy4-flash \
+  --tensor-parallel-size 2 \
+  --ep-size 2 \
+  --dtype bfloat16 \
+  --engram-host-table \
+  --max-model-len 32768 \
+  --max-num-seqs 32 \
+  --chunked-prefill-size 8192 \
+  --max-cudagraph-capture-size 32 \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --gpu-memory-utilization 0.88 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+To enable the embedded 5-layer DFly2 drafter from the same checkpoint, add
+`--speculative-algorithm DFLY` (the checkpoint's `block_size=6` automatically
+resolves to 5 drafted tokens + 1 anchor; to shorten the draft width explicitly,
+pass both `--speculative-num-steps <k>` and `--speculative-num-draft-tokens <k+1>`):
+
+```bash
+tokenspeed serve tencent/Hy4-flash-FP8 \
+  --served-model-name hy4-flash \
+  --tensor-parallel-size 2 \
+  --ep-size 2 \
+  --dtype bfloat16 \
+  --engram-host-table \
+  --max-model-len 32768 \
+  --max-num-seqs 32 \
+  --chunked-prefill-size 8192 \
+  --max-cudagraph-capture-size 32 \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --gpu-memory-utilization 0.88 \
+  --speculative-algorithm DFLY \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Notes:
+
+- Pass `--enable-speculative-sampling` with `--sampling-backend flashinfer` (or
+  `triton` with `--speculative-rejection-sample-method block`) for sampled
+  (non-greedy) requests under `DFLY`; greedy verification works with the
+  default backend.
+- With a tensor-parallel LM head, DFly uses global token IDs for both greedy
+  proposals and speculative sampling, excluding padding rows from selection.
+- `--engram-host-table` places the Engram lookup tables in host RAM while
+  keeping BF16 numerics bit-identical to GPU-sharded tables. Omit it if HBM
+  headroom is sufficient for GPU-sharded Engram tables.
+- Multimodal vision inference (`HYV4FlashVisionTower` + 3D interleaved M-RoPE)
+  is implemented in the Python runtime; serving image/video chat-completions
+  through the bundled Rust `tokenspeed-smg` HTTP gateway additionally requires
+  a gateway build whose multimodal preprocessor supports Hy4-flash image/video
+  placeholders.
+
 ## Tuning order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.
