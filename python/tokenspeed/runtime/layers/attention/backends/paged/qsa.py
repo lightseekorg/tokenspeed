@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import dataclasses
-from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -51,6 +50,7 @@ from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
     extend_lengths,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
+    QSADraftRows,
     QSALayout,
     QSASelection,
     decode_query_lengths,
@@ -232,12 +232,13 @@ class QSAAttnBackend(MHAAttnBackend):
             force_uniform=ctx.draft_narrowing is not None,
         )
         sparse_metadata = None
-        selection = ctx.attn_backend.sparse_topk.qsa_selection
+        share = ctx.attn_backend.sparse_topk
+        selection = share.qsa_selection
         if selection is not None:
             if not isinstance(selection, QSASelection):
                 raise RuntimeError("invalid QSA logical selection memo")
             rows = q.shape[0]
-            layout = ctx.attn_backend.sparse_topk.qsa_metadata
+            layout = share.qsa_metadata
             if not isinstance(layout, QSALayout):
                 raise RuntimeError("QSA selection requires the current row layout")
             selected_blocks = selection.selected_blocks
@@ -250,17 +251,26 @@ class QSAAttnBackend(MHAAttnBackend):
                 gather_ids = ctx.gather_ids
                 if gather_ids is None or gather_ids.shape != (rows,):
                     raise RuntimeError("QSA draft requires one gather index per query")
-                # PrimTS can retain the gathered views in its prepared plan.
-                # During capture the graph pool owns the replay's copies.
-                region = (
-                    nullcontext()
-                    if q.is_cuda and torch.cuda.is_current_stream_capturing()
-                    else self._qsa_workspace.allocation_region()
-                )
-                with region:
-                    selected_blocks = selected_blocks.index_select(0, gather_ids)
-                    request_indices = request_indices.index_select(0, gather_ids)
-                    query_positions = query_positions.index_select(0, gather_ids)
+                # The plan reads the current tensors each run. Keep the
+                # gathers in the forward's allocator and share the row layout.
+                draft_rows = share.qsa_draft_rows
+                if draft_rows is None:
+                    draft_rows = QSADraftRows(
+                        selection,
+                        selected_blocks.index_select(0, gather_ids),
+                        request_indices.index_select(0, gather_ids),
+                        query_positions.index_select(0, gather_ids),
+                    )
+                elif draft_rows.selection is not selection:
+                    draft_rows = dataclasses.replace(
+                        draft_rows,
+                        selection=selection,
+                        selected_blocks=selected_blocks.index_select(0, gather_ids),
+                    )
+                share.qsa_draft_rows = draft_rows
+                selected_blocks = draft_rows.selected_blocks
+                request_indices = draft_rows.request_indices
+                query_positions = draft_rows.query_positions
             elif selection.selected_slots.shape[0] != rows:
                 raise RuntimeError("QSA selection must have one row per query")
             if (

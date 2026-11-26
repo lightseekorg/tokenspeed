@@ -665,9 +665,8 @@ def test_gated_residual_workspace_survives_sleep_and_lazy_allocation():
 def _check_bf16_prims_qsa_workspace_on_cuda():
     from test.runtime.cache_pool_test_utils import make_qsa_pool_for_layers
 
-    from tokenspeed_kernel.ops.attention.qsa import (
-        QSASparseMetadata,
-        qsa_sparse_attention,
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
     )
     from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
     from tokenspeed_kernel.workspace import capture_session
@@ -762,10 +761,8 @@ def _check_bf16_prims_qsa_workspace_on_cuda():
             seq_lens = (accepted_positions + 1).to(torch.int32)
             slots = verify_slots.index_select(0, gather_ids)
             write_slots = requests[:1]
-            router.sparse_topk.qsa_selection = QSASelection(
-                verify_slots, blocks, block_size
-            )
-            router.sparse_topk.qsa_metadata = QSALayout(
+            selection = QSASelection(verify_slots, blocks, block_size)
+            layout = QSALayout(
                 seq_lens=seq_lens,
                 logical_positions=positions,
                 request_indices=verify_requests,
@@ -791,6 +788,8 @@ def _check_bf16_prims_qsa_workspace_on_cuda():
             )
 
         def forward():
+            router.sparse_topk.qsa_selection = selection
+            router.sparse_topk.qsa_metadata = layout
             return backend.forward_decode(
                 q,
                 None,
@@ -805,38 +804,30 @@ def _check_bf16_prims_qsa_workspace_on_cuda():
 
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            eager = forward().cpu()
+            before = forward().cpu()
             # A real plan proves that draft step zero selected PrimTS.
             runner = backend._qsa_workspace.runners[q.device]
-            expected_blocks = torch.where(
-                block_ids < (seq_lens[:, None] // block_size), block_ids, -1
+            # Keep the first gather live so the second eager forward uses
+            # different addresses while hitting the same plan geometry.
+            previous_rows = router.sparse_topk.qsa_draft_rows
+            router.sparse_topk.clear_qsa()
+            gather_ids.copy_(requests * verify_width + (accepted + 1) % verify_width)
+            seq_lens.copy_(positions.index_select(0, gather_ids) + 1)
+            slots.copy_(verify_slots.index_select(0, gather_ids))
+            expected = forward().cpu()
+            reference = torch_qsa_selected_attention(
+                q[:1].cpu(),
+                k.cpu(),
+                v.cpu(),
+                slots[:1].cpu(),
+                layer.scaling,
+                1.0,
+                1.0,
             )
-            expected = qsa_sparse_attention(
-                q,
-                k,
-                v,
-                slots,
-                scale=layer.scaling,
-                max_seqlen_q=1,
-                metadata_capacity_rows=None,
-                k_scale=None,
-                v_scale=None,
-                sparse_metadata=QSASparseMetadata(
-                    expected_blocks,
-                    page_table,
-                    requests,
-                    accepted_positions,
-                    tuple(range(rows + 1)),
-                    page_size,
-                    block_size,
-                    backend._qsa_workspace,
-                    seq_lens=seq_lens,
-                ),
-                override=None,
-                solution="flashinfer_prims",
-            ).cpu()
-            del expected_blocks
-        torch.testing.assert_close(eager, expected, atol=0, rtol=0)
+            router.sparse_topk.clear_qsa()
+            del previous_rows
+        assert not torch.equal(before, expected)
+        torch.testing.assert_close(expected[:1], reference, atol=4e-3, rtol=1e-2)
         assert runner._workspace.numel() > previous_capacity
         previous_capacity = runner._workspace.numel()
         graph = torch.cuda.CUDAGraph()
@@ -844,6 +835,7 @@ def _check_bf16_prims_qsa_workspace_on_cuda():
             graph, pool=None, stream=stream, tag="cuda_graph"
         ):
             captured = forward()
+            router.sparse_topk.clear_qsa()
         graphs.append((graph, captured, expected))
         plan = next(
             plan
@@ -851,7 +843,17 @@ def _check_bf16_prims_qsa_workspace_on_cuda():
             if plan.qo_indptr.numel() == rows + 1
         )
         retained.extend(
-            (q, slots, blocks, page_table, plan.qo_indptr, runner._workspace)
+            (
+                q,
+                slots,
+                blocks,
+                page_table,
+                gather_ids,
+                verify_requests,
+                positions,
+                plan.qo_indptr,
+                runner._workspace,
+            )
         )
         for _ in range(2):
             torch.cuda.synchronize()

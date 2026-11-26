@@ -1723,6 +1723,9 @@ and KV-recording override, while QSA keeps its original context and narrows
 the selected physical slots and logical metadata with the same `gather_ids`
 as the queries. The sparse reader sees one row per request and the published
 accepted KV lengths, so kernels using logical blocks can serve step zero.
+The backend memoizes the gathered row layout per forward and the gathered
+blocks per indexer selection. The draft drops these temporary tensors after
+the model forward. Captured gathers are rebuilt on replay in the graph pool.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
@@ -1744,9 +1747,10 @@ The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
 Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
-Plan offsets, shared scratch and the accepted-row metadata retained by eager
-plans use the CPU-backed named workspace region. Their addresses survive memory
-release and resume. Captured gathers are rebuilt on replay in the graph pool.
+Plan offsets and shared scratch use the CPU-backed named workspace region on
+a plan miss. Their addresses survive memory release and resume. PrimTS reads
+the current logical candidates and row layout on each run. The adapter drops
+the initial metadata inputs retained by FlashInfer's single-query plan.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
 CuTe kernel read invalid candidates from the zero-initialized slot 1 of the

@@ -473,7 +473,7 @@ def _evict_up_weights_first_tactic(
 def _up_k_tactic(
     hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
 ) -> int:
-    # A rank of 64 has a single packed TMA slab and must use a K64 tile.
+    # Ranks up to 64 fit in one packed TMA slab and use a K64 tile.
     if lowrank <= 64 or _legacy_up_tactic(
         hc_count, hidden_size, lowrank, token_tile, split_k
     ):

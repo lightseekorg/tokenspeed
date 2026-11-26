@@ -242,6 +242,7 @@ def test_interleaved_supported_model_dimensions():
     "g,h,r,rows,capture_rows,inject,dtype",
     [
         (4, 2048, 256, 1, 3, True, torch.bfloat16),
+        (4, 2048, 8, 1, 3, True, torch.bfloat16),
         (4, 768, 72, 9, 11, False, torch.float16),
         (4, 1024, 512, 17, 19, True, torch.bfloat16),
         (9, 64, 64, 1, 3, True, torch.bfloat16),

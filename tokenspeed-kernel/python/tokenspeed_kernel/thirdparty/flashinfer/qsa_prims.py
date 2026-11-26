@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from weakref import WeakValueDictionary
 
@@ -272,7 +272,8 @@ class _PrimTSQSARunner:
         plan = self._captured_plans.get(key)
         if plan is None:
             plan = plans.get(key)
-        if plan is None:
+        new_plan = plan is None
+        if new_plan:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("warm up the PrimTS QSA geometry before capture")
             offsets = _group_offsets(metadata.query_start_loc, group_size)
@@ -283,36 +284,36 @@ class _PrimTSQSARunner:
             )
             with metadata.workspace.allocation_region():
                 qo_indptr = host_indptr.to(self._device, non_blocking=True)
-            max_kv = metadata.block_table.shape[1] * page_size
-            # Completed current blocks compete for top-k; only a partial tail is appended.
-            size = get_q_token_kv_block_sparse_workspace_size(
-                q,
-                k,
-                metadata.block_table,
-                block_topk=topk,
-                max_seq_len_kv=max_kv,
-                out_dtype=q.dtype,
-                qo_indptr=qo_indptr,
-                group_size=group_size,
-                kv_block_size=metadata.block_size,
-                split_kv=False,
-                share_pattern_across_kv_heads=True,
-                count_current_block_in_topk=True,
-            )
-            if self._workspace is None or size > self._workspace.numel():
-                # Older plans retain their allocation, including plans owned
-                # by graphs. Growing eager scratch never changes their addresses.
-                with metadata.workspace.allocation_region():
+                max_kv = metadata.block_table.shape[1] * page_size
+                # Completed current blocks compete for top-k. Only a partial tail is appended.
+                size = get_q_token_kv_block_sparse_workspace_size(
+                    q,
+                    k,
+                    metadata.block_table,
+                    block_topk=topk,
+                    max_seq_len_kv=max_kv,
+                    out_dtype=q.dtype,
+                    qo_indptr=qo_indptr,
+                    group_size=group_size,
+                    kv_block_size=metadata.block_size,
+                    split_kv=False,
+                    share_pattern_across_kv_heads=True,
+                    count_current_block_in_topk=True,
+                )
+                grow_workspace = (
+                    self._workspace is None or size > self._workspace.numel()
+                )
+                if grow_workspace:
+                    # Older plans keep their scratch, including graph-owned plans.
                     self._workspace = torch.zeros(
                         1 << (size - 1).bit_length(),
                         dtype=torch.uint8,
                         device=self._device,
                     )
-            else:
-                # Initialize the new geometry's sections. Cached nonsplit
-                # plans remain safe: run rewrites every workspace value read
-                # by attention, including on replay after another geometry.
-                # Reload warmup can reuse workspace allocated in inference mode.
+            if not grow_workspace:
+                # Initialize the new geometry. Every run rewrites what it reads,
+                # so cached plans can share scratch. Reload warmup may reuse an
+                # inference tensor outside its original inference-mode scope.
                 with torch.inference_mode():
                     self._workspace.zero_()
             wrapper = QTokenKvBlockSparsePagedTSWrapper()
@@ -337,12 +338,7 @@ class _PrimTSQSARunner:
                 kv_dtype=k.dtype,
                 out_dtype=q.dtype,
             )
-            # Bound eager geometries per layer, not across every layer and
-            # graph batch. Captures own their plans outside this LRU.
-            if len(plans) >= 64:
-                plans.popitem(last=False)
             plan = _PrimTSQSAPlan(wrapper, qo_indptr)
-            plans[key] = plan
         elif key in plans:
             plans.move_to_end(key)
         if torch.cuda.is_current_stream_capturing():
@@ -351,7 +347,7 @@ class _PrimTSQSARunner:
             plans.pop(key, None)
             if not plans:
                 del self._plans[binding]
-        return plan.wrapper.run(
+        output = plan.wrapper.run(
             q,
             (k, v),
             metadata.block_table,
@@ -363,6 +359,24 @@ class _PrimTSQSARunner:
             v_scale=v_scale,
             out=torch.empty_like(q),
         )
+        if new_plan:
+            if group_size == 1:
+                # FlashInfer 0.7.5 keeps the first inputs as defaults. Its
+                # outer plan tests the tuple and always passes live tensors.
+                prepared = plan.wrapper._prepared_plan
+                attention = prepared._attention_plan
+                plan.wrapper._prepared_plan = replace(
+                    prepared,
+                    _attention_plan=replace(
+                        attention, _direct_q1_inputs=(None, None, None, None)
+                    ),
+                )
+            # Bound eager geometries per layer. Captures own their plans
+            # outside this LRU.
+            if len(plans) >= 64:
+                plans.popitem(last=False)
+            plans[key] = plan
+        return output
 
 
 def _get_runner(workspace: QSAWorkspace, device: torch.device) -> _PrimTSQSARunner:
