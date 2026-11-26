@@ -30,6 +30,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
@@ -131,6 +132,11 @@ struct PeerHit {
     std::vector<std::uint8_t> checkpoint;  // Original holder answer, for an exact re-PIN.
 };
 
+// How far a waiting prompt's lookup at a shared L2 pool has come: not handed
+// out yet; handed out, its answer not applied yet; settled, that is answered
+// or never needed.
+enum class SharedL2LookupState { kNotAsked, kAsked, kSettled };
+
 struct AdmissionResources {
     TokenContainer* token_container;
     std::int32_t prefix_granularity;
@@ -156,6 +162,16 @@ struct AdmissionResources {
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
+    // With a shared L2 pool: the prompt's lookup. It is handed out once, and
+    // the prompt is admitted only once the lookup is settled, so a prefix
+    // the pool holds is not recomputed. shared_l2_hit_blocks pins the proxy
+    // Host entries the answer mirrored until this state goes: admission
+    // consumes it (the load-back it starts holds its sources itself), or the
+    // request leaves. shared_l2_kv_tokens is how far the answer said the
+    // pool's KV reaches: past the hit, a junction the first chunk is cut at.
+    SharedL2LookupState shared_l2_lookup_state{SharedL2LookupState::kNotAsked};
+    std::vector<CacheBlockRef> shared_l2_hit_blocks;
+    std::int32_t shared_l2_kv_tokens{0};
 };
 
 // Eligible for ordinary admission. A pending L3 dependency is Prefetching.

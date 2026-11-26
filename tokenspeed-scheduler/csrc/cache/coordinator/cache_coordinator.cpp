@@ -376,6 +376,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                     *store_.HostPool(), std::span{group_keys[i]}.subspan(begin_block), out.per_group[i].blocks,
                     access_epoch, SessionForAccess(access_epoch));
             }
+            recordDeviceHits(std::span{group_keys[i]}.subspan(begin_block), out.per_group[i].blocks);
         }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
@@ -388,6 +389,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                                                              tail_match.blocks, access_epoch,
                                                              SessionForAccess(access_epoch));
                 }
+                recordDeviceHits(probe.tail->group_keys[i], tail_match.blocks);
             }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                            std::make_move_iterator(tail_match.blocks.begin()),
@@ -409,6 +411,17 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         }
     }
     return out;
+}
+
+void CacheCoordinator::recordDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks) {
+    if (!collects_device_hits_) {
+        return;
+    }
+    for (std::size_t j = 0; j < blocks.size(); ++j) {
+        if (blocks[j]) {
+            device_hits_.push_back(keys[j]);
+        }
+    }
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
@@ -459,6 +472,15 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
         }
     }
     return out;
+}
+
+CoordinatorMatch CacheCoordinator::PinHostPrefix(PrefixProbe&& probe) {
+    _assert(host_.HasPool(), "PinHostPrefix requires a host pool");
+    _assert(probe.device.num_common_tokens == 0, "a Host-only coordinator's probe hits no Device entry");
+    const std::uint64_t access_epoch = history_.IssueAccessEpoch();
+    AcquiredPrefix acquired = acquirePrefix(std::move(probe), access_epoch);
+    history_.RecordAdmission(access_epoch);
+    return std::move(acquired.host);
 }
 
 CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& probe) {
@@ -731,6 +753,34 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     publication.reset();
     recordCheckpoints(completed, access_epoch);
     recordPublishedTail(completed);
+}
+
+void CacheCoordinator::CacheWrittenHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                                              std::span<const CompletedPages> checkpoints,
+                                              std::span<const std::uint64_t> access_epochs) {
+    _assert(blocks.size() == keys.size(), "a Host publication names a key for every block");
+    _assert(checkpoints.size() == access_epochs.size(),
+            "a Host publication names an access epoch for every checkpoint");
+    // Held while the blocks register under the checkpoints' nodes.
+    std::vector<BoundaryTree::Hold> publications;
+    publications.reserve(checkpoints.size());
+    for (const CompletedPages& completed : checkpoints) {
+        publications.push_back(store_.Boundaries().LinkPublication(completed));
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        host_.CacheHostBlock(blocks[i], keys[i], /*inherited_metadata=*/std::nullopt);
+    }
+    // A boundary nothing registered under leaves again.
+    publications.clear();
+    for (std::size_t i = 0; i < checkpoints.size(); ++i) {
+        const CompletedPages& completed = checkpoints[i];
+        recordCheckpoints(completed, access_epochs[i]);
+        if (completed.tail) {
+            host_.CacheHostTail(
+                completed.prefix_hashes.empty() ? ContentHash{} : ContentHash{completed.prefix_hashes.back()},
+                *completed.tail);
+        }
+    }
 }
 
 template <CacheTier Tier>

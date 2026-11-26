@@ -89,6 +89,7 @@ use crate::{
     peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
+    shared_l2::{Pool, PoolClient, PoolError},
 };
 
 /// Fold what an output-processor call produced into the round's results.
@@ -501,6 +502,9 @@ pub enum LoopError {
     /// agree on its reports.
     #[error(transparent)]
     Disk(#[from] DiskError),
+    /// The shared L2 pool's client or its owner failed.
+    #[error(transparent)]
+    SharedL2(#[from] PoolError),
     /// The replica could not agree on its peer sharing reports.
     #[error(transparent)]
     Peer(#[from] PeerError),
@@ -616,6 +620,9 @@ pub struct Subsystems {
     pub disk: Option<DiskTier>,
     /// The Disk tier's metrics, on a rank that reports them.
     pub disk_metrics: Option<DiskMetrics>,
+    /// With a shared L2 pool as the Host tier, this rank's client of the
+    /// pool's owner. `None` without one.
+    pub shared_l2: Option<Box<dyn PoolClient + Send>>,
     /// With peer prefix sharing, this rank's part of it: started over the
     /// loop's scheduler, which its endpoint serves between rounds. `None`
     /// without.
@@ -656,6 +663,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The Disk tier: this rank's executor and the replica's agreement.
     disk: Option<DiskTier>,
     disk_metrics: Option<DiskMetrics>,
+    /// The shared L2 pool: this rank's client and the writes in flight there.
+    shared_l2: Option<Pool>,
     peer: Option<Peer>,
     /// The peer clock the replica agreed on this round.
     peer_now_us: i64,
@@ -765,6 +774,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             l3_metrics: subsystems.l3_metrics,
             disk: subsystems.disk,
             disk_metrics: subsystems.disk_metrics,
+            shared_l2: subsystems.shared_l2.map(Pool::new),
             peer: subsystems.peer,
             peer_now_us: 0,
             scheduler: scheduler.lock_arc(),
@@ -893,6 +903,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             || self.cache_ops.open() != 0
             || self.replay_retirements_pending()
             || self.outputs.num_running() != 0
+            || self
+                .shared_l2
+                .as_ref()
+                .is_some_and(|shared_l2| shared_l2.open_writes() != 0)
         {
             return false;
         }
@@ -1045,13 +1059,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
         let storage = self.storage_round(&storage_reports, forward_allowed)?;
-        let ready = if self.cache_ops.open() > 0 {
+        let mut ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
                 .acknowledged(polled, &mut self.ranks.mesh, &self.ranks.replica)?
         } else {
             Vec::new()
         };
+        // A shared L2 pool's finished writes are acknowledgments too: polled
+        // in every round, frozen or not.
+        if let Some(shared_l2) = self.shared_l2.as_mut() {
+            ready.extend(shared_l2.poll_writes()?);
+        }
         if storage.tick.is_some() || !ready.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
@@ -1082,6 +1101,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             if let Some(disk) = &self.disk {
                 busy |= disk.submit(&plan)?;
+            }
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                busy |= shared_l2.dispatch(&plan, self.in_flight.len())?;
             }
             let cache_ops = plan.cache_ops();
             self.cache_ops.dispatched(&cache_ops);
@@ -1139,6 +1161,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 });
             }
         } else {
+            busy |= self.shared_l2_round()?;
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
                 &mut stop,
@@ -1223,8 +1246,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed. Returns whether the data plane or the L3
-    /// executor got work.
+    /// in-flight depth committed. Returns whether the data plane, the L3
+    /// executor or a shared L2 pool's client got work.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
@@ -1262,6 +1285,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             (Some(l3), _) => l3.submit(&plan)?,
             (None, Some(disk)) => disk.submit(&plan)?,
             (None, None) => false,
+        };
+        // So do a plan's shared L2 ops, on the pool's client; its writes once
+        // the forwards in flight landed.
+        let shared_l2_work = match self.shared_l2.as_mut() {
+            Some(shared_l2) => shared_l2.dispatch(&plan, self.in_flight.len())?,
+            None => false,
         };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
@@ -1405,7 +1434,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             0
         };
         self.commit_down_to(depth, events, outputs, released)?;
-        Ok(device_work || storage_work)
+        Ok(device_work || storage_work || shared_l2_work)
     }
 
     /// Export a round's snapshot on both serving and paused paths. The
@@ -1551,6 +1580,30 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let due = controller.note_round(forwarded);
             self.controls.enqueue_internal(due);
         }
+    }
+
+    /// With a shared L2 pool, the waiting prompts not looked up yet ask the
+    /// pool in one request, and the round waits for its answers: a prompt is
+    /// in no plan before its answer, so that a prefix the pool holds is not
+    /// recomputed. An answer is no event of the head's batch: the proxy
+    /// blocks it creates go back to the pool's client. Returns whether any
+    /// prompt was asked about.
+    fn shared_l2_round(&mut self) -> Result<bool, LoopError> {
+        let Some(shared_l2) = self.shared_l2.as_mut() else {
+            return Ok(false);
+        };
+        let lookups = self.scheduler.start_shared_l2_lookups();
+        if lookups.is_empty() {
+            return Ok(false);
+        }
+        let _span = profile::span("EventLoop::shared_l2_round");
+        let answers = shared_l2.lookup(&lookups)?;
+        let proxy_blocks = self
+            .scheduler
+            .apply_shared_l2_answers(&answers)
+            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        shared_l2.map_proxy_blocks(&proxy_blocks);
+        Ok(true)
     }
 
     /// The round's storage input to the scheduler. With L3 or the Disk
@@ -2848,6 +2901,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
     /// Act on a control operation as it arrives.
     fn control(&mut self, request: ControlRequest) -> Result<(), LoopError> {
+        // A shared L2 pool has no weight version: its pages would be read
+        // back under weights or a forward that did not compute them. Such an
+        // operation is refused here, before it drains or flushes anything.
+        if self.shared_l2.is_some()
+            && (control::is_weight_load(&request)
+                || matches!(request, ControlRequest::ReloadForward(_)))
+        {
+            let refusal = "a shared L2 pool holds KV of the weights and forward the server \
+                           started with; restart the ranks and clear the pool instead"
+                .to_owned();
+            tracing::info!(
+                op = request.tag(),
+                message = refusal,
+                "refused with a shared L2 pool"
+            );
+            self.controls
+                .reply(control::gated_reply(&request, false, refusal));
+            return Ok(());
+        }
         // A disaggregated release cannot drain while a pause withholds
         // requests that would still need their transfers, nor a release run
         // while a rebalance's steps would land on unmapped weights.
@@ -3462,6 +3534,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .is_some_and(|at| self.forwards_completed >= at)
             {
                 self.copies_confirmed_at = None;
+            }
+            if let Some(shared_l2) = self.shared_l2.as_mut() {
+                shared_l2.forward_landed()?;
             }
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;

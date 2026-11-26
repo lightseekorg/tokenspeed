@@ -300,6 +300,29 @@ TEST(CheckpointTree, LeavingCheckpointsReleaseSharedPrefixPages) {
     EXPECT_EQ(tree.PrefixSegments(), 0u);
 }
 
+TEST(CheckpointTree, CheckpointOfReturnsACheckpointAsItWasObserved) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
+    const Checkpoint aligned{Sequence(8)}, inside_page{Sequence(11)}, first_page{Sequence(3)};
+    RecordFor(tree, aligned, kOnDevice, 5);
+    RecordFor(tree, inside_page, kOnDevice, 6);
+    RecordFor(tree, first_page, kOnHost, 7);
+    for (const Checkpoint* point : {&aligned, &inside_page, &first_page}) {
+        const std::optional<CheckpointTree::Checkpoint> checkpoint = tree.CheckpointOf(point->Hash());
+        ASSERT_TRUE(checkpoint.has_value());
+        EXPECT_EQ(checkpoint->tokens, point->tokens);
+        EXPECT_EQ(checkpoint->prefix_hashes, point->hashes);
+        EXPECT_EQ(checkpoint->tail, point->tail);
+    }
+    EXPECT_EQ(tree.CheckpointOf(aligned.Hash())->access_epoch, 5u);
+    EXPECT_EQ(tree.CheckpointOf(inside_page.Hash())->access_epoch, 6u);
+    // Another tree observes the same checkpoint from it.
+    CheckpointTree other{kPage, /*leaf_distance=*/0};
+    const CheckpointTree::Checkpoint checkpoint = *tree.CheckpointOf(inside_page.Hash());
+    EXPECT_TRUE(other.Observe(checkpoint.tokens, checkpoint.prefix_hashes, checkpoint.tail, checkpoint.access_epoch));
+    EXPECT_TRUE(other.Contains(inside_page.Hash()));
+    EXPECT_FALSE(tree.CheckpointOf(Checkpoint{Sequence(16)}.Hash()).has_value());
+}
+
 std::vector<CacheGroupSpec> StateSpecs() {
     return {CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
             CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};

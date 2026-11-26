@@ -64,7 +64,7 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
-from tokenspeed_engine.scheduler import Scheduler
+from tokenspeed_engine.scheduler import Scheduler, SharedL2Config
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
@@ -1375,6 +1375,7 @@ class HostBootstrap:
         host_spans,
         metrics_relay_endpoint: str | None,
         peer_outbox,
+        shared_l2_handle,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
@@ -1481,6 +1482,7 @@ class HostBootstrap:
                 peer_outbox=(
                     peer_outbox if server_args.peer_prefix_port is not None else None
                 ),
+                shared_l2_handle=shared_l2_handle,
             )
             # The L3 tier the host runs over the shared Host pool; None
             # without a storage backend.
@@ -1547,10 +1549,21 @@ class HostBootstrap:
                 )
             specs = device.specs
             geometry = specs.cache_geometry
+            # With --shared-l2-config, the config of the pool the device
+            # build joined; else None.
+            shared_l2_client_config = device.shared_l2_client_config
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
                 storage_config=storage_config,
+                shared_l2_config=(
+                    SharedL2Config(
+                        max_writes_in_flight=shared_l2_client_config.max_writes_in_flight,
+                        max_keys_per_write=shared_l2_client_config.max_keys_per_write,
+                    )
+                    if shared_l2_client_config is not None
+                    else None
+                ),
                 num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
                 disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -1563,7 +1576,7 @@ class HostBootstrap:
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
-                    enable_kvstore=server_args.enable_kvstore,
+                    has_host_tier=server_args.has_host_tier,
                     disaggregation_mode=server_args.disaggregation_mode,
                     draft_model_path_use_base=server_args.draft_model_path_use_base,
                     draft_model_config=draft_model_config,
@@ -1939,6 +1952,7 @@ def bootstrap(
     weight_update_commit_protocol: int = 0,
     host_spans=None,
     peer_outbox=None,
+    shared_l2_handle=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
@@ -1948,6 +1962,9 @@ def bootstrap(
     (``engine/profiler.py``); an older host binary passes none. With peer
     prefix sharing, ``peer_outbox`` is where the data plane tells the host a
     plan's landings may be read (``cache/peer.py``); an older host binary
+    passes none. With a shared L2 pool, ``shared_l2_handle`` is the host's
+    shared L2 handle, where the rank starts its client of the pool's owner and
+    hands over its loads (``cache/shared_l2/rank.py``); an older host binary
     passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
@@ -1966,6 +1983,11 @@ def bootstrap(
             "--peer-prefix-port requires a ts-host binary with peer prefix "
             "sharing; rebuild tokenspeed-engine together with this runtime"
         )
+    if server_args.shared_l2_config is not None and shared_l2_handle is None:
+        raise RuntimeError(
+            "--shared-l2-config requires a ts-host binary with the shared L2 "
+            "pool client; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(
             server_args, port_args, connection, metrics_relay_endpoint
@@ -1978,6 +2000,7 @@ def bootstrap(
         host_spans,
         metrics_relay_endpoint,
         peer_outbox,
+        shared_l2_handle,
     )
 
 

@@ -18,11 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The tests start the interpreter the scheduler module is built against.
+//! The tests, the crate's unit tests among them, start the interpreter the
+//! scheduler module is built against.
 
 fn main() {
     if let Ok(lib_dir) = std::env::var("DEP_TS_SCHEDULER_PYTHON_LIB_DIR") {
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{lib_dir}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
     }
     let home = std::env::var("DEP_TS_SCHEDULER_PYTHON_HOME").expect("set by ts-scheduler");
     println!("cargo:rustc-env=TS_CONTROL_TEST_PYTHONHOME={home}");

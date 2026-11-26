@@ -543,6 +543,7 @@ fn spawn_rank(
                 l3: None,
                 disk: None,
                 disk_metrics: None,
+                shared_l2: None,
                 peer,
             },
         );

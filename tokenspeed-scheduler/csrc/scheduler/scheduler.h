@@ -41,6 +41,7 @@
 #include "cache/tier/disk_manager.h"
 #include "cache/tier/peer_exports.h"
 #include "cache/tier/peer_host_landings.h"
+#include "cache/tier/shared_l2_proxy.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -160,6 +161,24 @@ public:
     // Above this pressure hold new prompts back when delay is enabled.
     // Resident chunks must be able to consume their own reservations.
     static constexpr float kPrefillWatermark = 0.9F;
+
+    // With a shared L2 pool (SchedulerConfig::shared_l2_config) a waiting
+    // prompt is admitted only once its lookup is answered. Before a plan the
+    // runtime starts the lookups, asks the pool's owner about all of them in
+    // one request, waits for its reply and applies the answers.
+    //
+    // The waiting prompts' lookups not handed out yet, each once. A prompt
+    // whose Device prefix already covers what it may reuse asks nothing.
+    std::vector<SharedL2Lookup> StartSharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier, each for the
+    // request it names; returns the proxy blocks created, each with the pool
+    // page a load-back from it reads. An answer the scheduler cannot take --
+    // one whose request has no lookup that waits for it, that lies outside
+    // its prompt, or that does not name, under a ticket, a bucket and a page
+    // for each key of the rank's cache groups and a tail inside a page --
+    // throws std::invalid_argument, and the runtime stops serving: nothing of
+    // that answer is kept, and the answers after it are not applied.
+    std::vector<SharedL2ProxyBlock> ApplySharedL2Answers(const std::vector<SharedL2Answer>& answers);
 
     void Advance(const ExecutionEvent& event);
     KvEventBatch DrainKvEventBatch();
@@ -692,6 +711,7 @@ private:
     bool ownsStorageLease(const StorageLease& lease) const;
     bool peerHostLandingsPending() const { return peer_host_landings_ && peer_host_landings_->NumLandings() > 0; }
     std::int32_t cacheablePrefixTokens(const Request& request) const;
+    void handleEvent(const cache::SharedL2WriteDone& event);
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
@@ -995,6 +1015,8 @@ private:
     std::unique_ptr<StorageTransferManager> storage_transfers_;
     // The Disk tier's prefetches and cleaning writes; null without one.
     std::unique_ptr<DiskTransferManager> disk_transfers_;
+    // The rank's proxy of its shared L2 pool; null without one.
+    std::unique_ptr<SharedL2Proxy> shared_l2_proxy_;
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
     std::unique_ptr<PeerExports> peer_exports_;

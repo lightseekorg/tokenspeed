@@ -621,11 +621,14 @@ private:
             // Host, so linking it touches its parent alone. A node started
             // without a known parent may have both: its subtree's checkpoint
             // boundaries count in every new ancestor, and its Host presence in
-            // the parent.
+            // the parent. Most carry none: a chain whose blocks arrived before
+            // its publication (a shared L2 pool's commit) links one root per
+            // page, and walking every ancestor for each would be quadratic.
             if (!inserted) {
                 const bool notify = config_.num_state_groups > 0 && config_.has_disk_tier &&
                                     static_cast<bool>(lower_tier_entries_observer_);
-                for (Node* ancestor = parent; ancestor != nullptr; ancestor = ancestor->parent) {
+                for (Node* ancestor = node.HasCheckpointBoundaryInSubtree() ? parent : nullptr; ancestor != nullptr;
+                     ancestor = ancestor->parent) {
                     const bool was_maybe_disk_only = notify && ancestor->MaybeStateDiskOnly();
                     for (const std::size_t tier : kTiers) {
                         ancestor->checkpoint_boundaries_in_subtree[tier] += node.checkpoint_boundaries_in_subtree[tier];
