@@ -1223,7 +1223,11 @@ TEST(BlockPoolRequestAwareTest, WidePackingAndWideShardsWithAffinityMaintainIntr
                 pref = held_g0[rng() % held_g0.size()]->Location().lcm_block_id;
             }
             auto blocks = pool.AcquireBlocksInBucketsWithAffinity(
-                0, buckets, ParentAffinity{.preferred_parent = pref, .reserved_empty_parents = rng() % 3});
+                0, buckets,
+                ParentAffinity{
+                    .preferred_parent = pref,
+                    .reserved_empty_parents = static_cast<std::int64_t>(rng() % 3),
+                });
             for (CacheBlockRef& block : blocks) {
                 held_g0.push_back(std::move(block));
             }

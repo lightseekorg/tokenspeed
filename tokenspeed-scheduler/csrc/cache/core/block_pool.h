@@ -895,21 +895,20 @@ private:
         }
         GroupAvailability& group = placement(group_id);
         const std::size_t buckets = group.parents_by_bucket.size();
+        FatalCheck(buckets > 0, "packed LCM group must have at least one bucket");
         if (parent.occupied_count == 0) {
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
                        "empty LCM placement must consume the next free parent");
             FatalCheck(parent.slots == 0 && parent.occupancy == 0, "empty LCM parent must not retain child slots");
             FatalCheck(slots_per_parent <= kInlineOccupancySlots || parent.wide_occupancy != nullptr,
                        "a wide LCM parent binds without its occupancy words");
-            FatalCheck(slots_per_parent == 1 ||
-                           (buckets <= link_stride_ && bucket_links_.size() == lcm_blocks_.size() * link_stride_),
+            FatalCheck(slots_per_parent > 1 && buckets <= link_stride_ &&
+                           bucket_links_.size() == lcm_blocks_.size() * link_stride_,
                        "a packed LCM parent binds without its link storage");
             parent.slots = slots_per_parent;
-            if (slots_per_parent > 1) {
-                parent.first_free_slots.resize(buckets);
-                for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
-                    parent.first_free_slots[bucket] = static_cast<std::int32_t>(bucket);
-                }
+            parent.first_free_slots.resize(buckets);
+            for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
+                parent.first_free_slots[bucket] = static_cast<std::int32_t>(bucket);
             }
             free_parent_ids_.pop_front();
             parent.bound_group = group_id;
