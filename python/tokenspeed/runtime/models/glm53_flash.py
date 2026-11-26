@@ -446,26 +446,46 @@ class Glm53FlashMoE(MoEBlock):
             routed_scaling_factor=config.routed_scaling_factor,
             output_format=experts.topk_output_format,
         )
+        # Gluon Petit dispatches and combines this rank's rows itself and
+        # returns them complete, so the shared expert runs rank-local (TP1,
+        # replicated weights) beside it and no MoE collective follows.
+        owns_ep_communication = experts.plan["a2a_backend"] == "gluon_petit"
+        shared_tp = (
+            (0, 1, None)
+            if owns_ep_communication
+            else (
+                mapping.moe.tp_ep_rank,
+                mapping.moe.tp_ep_size,
+                mapping.moe.tp_ep_group,
+            )
+        )
         shared_experts = GatedMLP.tensor_parallel(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             activation=gated_activation(config.hidden_act, config.swiglu_limit),
-            tp_rank=mapping.moe.tp_ep_rank,
-            tp_size=mapping.moe.tp_ep_size,
-            tp_group=mapping.moe.tp_ep_group,
+            tp_rank=shared_tp[0],
+            tp_size=shared_tp[1],
+            tp_group=shared_tp[2],
             reduce_results=False,
             fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
         )
+        # Under Gluon Petit the shared expert stays on the main stream unless
+        # TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in, as for DeepSeek
+        # V4.1 (deepseek_v41_moe.shared_expert_stream); other backends keep
+        # forking it onto ``alt_stream`` under graph capture.
+        from tokenspeed.runtime.models.deepseek_v41_moe import shared_expert_stream
+
         super().__init__(
             gate,
             topk,
             experts,
             shared_experts,
-            alt_stream,
+            shared_expert_stream(alt_stream, use_gluon_petit=owns_ep_communication),
             fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
         )
+        self.owns_ep_communication = owns_ep_communication
 
 
 class _Glm53FlashMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -1274,6 +1294,10 @@ class Glm53FlashDecoderLayer(nn.Module):
                 config.mlp_layer_types[layer_id - 1] == "sparse" if layer_id else False
             )
         )
+        # Gluon Petit's MoE moves its rows itself: no CommManager MoE leg.
+        self.petit_moe = self.is_moe_layer and getattr(
+            self.mlp, "owns_ep_communication", False
+        )
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
@@ -1374,20 +1398,25 @@ class Glm53FlashDecoderLayer(nn.Module):
                 norm_eps=None,
             )
             hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            if self.is_moe_layer:
+            if self.petit_moe:
                 hidden_states = self.mlp(
-                    hidden_states,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
+                    hidden_states, num_global_tokens, max_num_tokens_per_gpu
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
-            hidden_states, _ = self.comm_manager.post_mlp_comm(
-                hidden_states,
-                residual_streams,
-                ctx,
-            )
+                hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
+                if self.is_moe_layer:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        num_global_tokens,
+                        max_num_tokens_per_gpu,
+                    )
+                else:
+                    hidden_states = self.mlp(hidden_states)
+                hidden_states, _ = self.comm_manager.post_mlp_comm(
+                    hidden_states,
+                    residual_streams,
+                    ctx,
+                )
             hidden_states = mhc_post(hidden_states, residual_streams, post, comb)
             return hidden_states, None
 
@@ -1417,6 +1446,11 @@ class Glm53FlashDecoderLayer(nn.Module):
             residual,
             ctx,
         )
+        if self.petit_moe:
+            hidden_states = self.mlp(
+                hidden_states, num_global_tokens, max_num_tokens_per_gpu
+            )
+            return hidden_states, residual
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         if self.is_moe_layer:
             hidden_states = self.mlp(

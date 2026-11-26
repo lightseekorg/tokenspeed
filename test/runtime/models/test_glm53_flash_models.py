@@ -689,3 +689,52 @@ def test_nextn_fused_qkv_fp8_scale_uses_block_row_offset() -> None:
     )
 
     assert calls == [(scale, loaded_scale, 12)]
+
+
+class _PetitPlanMoELayer(glm53_flash.MoELayer):
+    """The MoE layer a Gluon Petit server builds, as far as the GLM block reads
+    it: the plan names Petit's all-to-all (no Petit kernel is selected here)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.plan = {**self.plan, "a2a_backend": "gluon_petit"}
+
+
+@pytest.mark.parametrize("petit", [False, True], ids=["default", "petit"])
+@pytest.mark.parametrize("aux_switch", [None, "1"], ids=["switch-unset", "switch-on"])
+def test_moe_block_runs_shared_expert_rank_local_only_under_petit(
+    monkeypatch, petit, aux_switch
+) -> None:
+    mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    if aux_switch is None:
+        monkeypatch.delenv("TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM", aux_switch)
+    if petit:
+        monkeypatch.setattr(glm53_flash, "MoELayer", _PetitPlanMoELayer)
+    shared_tp = []
+    tensor_parallel = glm53_flash.GatedMLP.tensor_parallel
+
+    def record(*args, **kwargs):
+        shared_tp.append((kwargs["tp_rank"], kwargs["tp_size"], kwargs["tp_group"]))
+        return tensor_parallel(*args, **kwargs)
+
+    monkeypatch.setattr(glm53_flash.GatedMLP, "tensor_parallel", record)
+    aux = object()
+
+    block = Glm53FlashMoE(_tiny_text_config(), mapping, alt_stream=aux)
+
+    assert block.owns_ep_communication is petit
+    if petit:
+        # Rank-local (TP1) shared expert beside Petit; main stream unless the
+        # DeepSeek V4.1 switch opts in to the auxiliary stream.
+        assert shared_tp == [(0, 1, None)]
+        assert block.stream_fork.aux_stream is (aux if aux_switch else None)
+    else:
+        # Every other backend: the MoE TP x EP group and the aux stream,
+        # whatever the switch says.
+        moe = mapping.moe
+        assert shared_tp == [(moe.tp_ep_rank, moe.tp_ep_size, moe.tp_ep_group)]
+        assert block.stream_fork.aux_stream is aux
