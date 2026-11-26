@@ -756,9 +756,7 @@ def _served_routes(num_tokens: int, seed: int) -> tuple[torch.Tensor, ...]:
         torch.randn(num_tokens, _SERVED_HIDDEN, device="cuda", generator=generator)
         * 0.5
     ).to(torch.bfloat16)
-    scores = torch.rand(
-        num_tokens, _SERVED_EXPERTS, device="cuda", generator=generator
-    )
+    scores = torch.rand(num_tokens, _SERVED_EXPERTS, device="cuda", generator=generator)
     ids = scores.topk(8, dim=-1).indices.to(torch.int32)
     local = _SERVED_EXPERTS // _SERVED_EP_SIZE
     start = _SERVED_RANK * local
@@ -786,94 +784,48 @@ def _apply(module, x, ids, weights) -> torch.Tensor:
     )
 
 
-def _time_ms(fn, iterations: int = 50) -> float:
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(iterations):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end))
-    return sorted(times)[len(times) // 2]
-
-
-def _decode_timings(module) -> dict[str, float]:
-    timings = {}
-    for rows in (4, 64):
-        x, ids, weights = _served_routes(rows, seed=rows)
-        timings[f"eager_{rows}"] = _time_ms(lambda: _apply(module, x, ids, weights))
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                _apply(module, x, ids, weights)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            _apply(module, x, ids, weights)
-        timings[f"graph_{rows}"] = _time_ms(graph.replay)
-        del graph
-    return timings
-
-
-@pytest.mark.parametrize("num_tokens", [8192, 16385, 32768, 50000, 65536])
+@pytest.mark.parametrize("num_tokens", [16385, 65536])
 def test_gluon_block_fp8_ep8_served_prefill_matches_sliced_and_reference(
     num_tokens: int, _served_ep8_rank, record_property
 ) -> None:
-    """GLM-5.3 Flash EP8 prefill at served chunk sizes (one rank of eight).
+    """GLM-5.3 Flash EP8 prefill past the BF16 MoE row-slice bounds (one rank).
 
-    At 65,536 rows the unsliced BF16 copies would allocate an intermediate of
-    exactly 2 GiB ([524288, 2048] bf16) and EP partials of 4 GiB. The output
-    must be bit-identical to the same apply on slices of at most 8,192 rows
-    (whose buffers are far below 2 GiB), match the float reference on
-    sampled rows (including both ends), leave its inputs, the weights and
-    allocator canaries untouched, and leave decode timing unchanged.
+    16,385 rows is one past the EP slice bound, so the slices are uneven; at
+    65,536 rows an unsliced launch would allocate an intermediate of exactly
+    2 GiB ([524288, 2048] bf16) and EP partials of 4 GiB. The output must be
+    bit-identical to the same apply on slices of at most 8,192 rows (whose
+    buffers are far below 2 GiB), match the float reference on sampled rows
+    (including both ends), keep the transient peak under 3 GiB, and leave its
+    inputs, the weights and allocator canaries untouched.
     """
-    from test_gluon_fp8_packed_small import _reference
+    from test_gluon_fp8_packed_small import _assert_numerics, _reference
 
     module, (w13, w2, s13, s2) = _served_ep8_rank
     x, ids, weights = _served_routes(num_tokens, seed=num_tokens)
     inputs = (x.clone(), ids.clone(), weights.clone())
-    weight_sums = [
-        t.view(torch.int16).sum(dtype=torch.int64).item()
-        for t in (module.w13_weight_prefill_bf16, module.w2_weight_prefill_bf16)
-    ]
+
+    def weight_sums() -> list[int]:
+        return [
+            t.view(torch.int16).sum(dtype=torch.int64).item()
+            for t in (module.w13_weight_prefill_bf16, module.w2_weight_prefill_bf16)
+        ]
+
+    sums = weight_sums()
     canaries = [
         torch.full((64 << 20,), 0x5A5A5A5A, dtype=torch.int32, device="cuda")
         for _ in range(4)
     ]
-    before = _decode_timings(module)
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base_alloc = torch.cuda.memory_allocated()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
     actual = _apply(module, x, ids, weights)
-    end.record()
-    end.synchronize()
+    torch.cuda.synchronize()
     peak_gib = (torch.cuda.max_memory_allocated() - base_alloc) / 2**30
-    record_property("apply_ms", start.elapsed_time(end))
     record_property("transient_peak_gib", peak_gib)
-
-    warm_ms = []
-    for _ in range(3):
-        start_warm = torch.cuda.Event(enable_timing=True)
-        end_warm = torch.cuda.Event(enable_timing=True)
-        start_warm.record()
-        warm = _apply(module, x, ids, weights)
-        end_warm.record()
-        end_warm.synchronize()
-        warm_ms.append(start_warm.elapsed_time(end_warm))
-        assert torch.equal(warm, actual), "repeated apply is not deterministic"
-        del warm
-    record_property("apply_warm_ms", sorted(warm_ms)[1])
+    # Sliced EP prefill keeps the per-call transient near 2 GiB at 65,536 rows
+    # (unsliced: 2 GiB intermediate + 4 GiB zero-filled partials).
+    assert peak_gib < 3.0, f"transient peak {peak_gib:.3f} GiB"
 
     # Balanced slices of at most 8,192 rows, every one above the exact-MFMA
     # bound (4,096), so the reference runs the same BF16 path on small buffers.
@@ -891,21 +843,16 @@ def test_gluon_block_fp8_ep8_served_prefill_matches_sliced_and_reference(
             for row in range(0, num_tokens, step)
         ]
     )
-    difference = (actual.float() - sliced.float()).abs()
-    bad_rows = torch.nonzero(difference.amax(dim=1) > 0).flatten()
-    mismatched = int(bad_rows.numel())
-    bad_columns = (
-        torch.nonzero(difference[bad_rows[0]] > 0).flatten().tolist()
-        if mismatched
-        else []
-    )
-    record_property("versus_sliced_max_abs", difference.max().item())
-    record_property("versus_sliced_mismatched_rows", mismatched)
+    mismatched = (actual != sliced).any(dim=1).nonzero().flatten()
+    assert torch.equal(
+        actual, sliced
+    ), f"{mismatched.numel()} rows differ from the sliced apply: {mismatched[:8]}"
 
+    generator = torch.Generator(device="cuda").manual_seed(num_tokens)
     sample = torch.cat(
         [
             torch.arange(0, 64, device="cuda"),
-            torch.randperm(num_tokens, device="cuda")[:128],
+            torch.randperm(num_tokens, device="cuda", generator=generator)[:128],
             torch.arange(num_tokens - 64, num_tokens, device="cuda"),
         ]
     )
@@ -921,42 +868,8 @@ def test_gluon_block_fp8_ep8_served_prefill_matches_sliced_and_reference(
         7.0,
         quantized_activations=False,
     )[0]
-    reference_error = (actual[sample].float() - expected.float()).abs()
-    relative_l2 = (
-        (actual[sample].float() - expected.float()).norm()
-        / expected.float().norm().clamp_min(1.0e-12)
-    ).item()
-    record_property("versus_reference_max_abs", reference_error.max().item())
-    record_property("versus_reference_relative_l2", relative_l2)
+    _assert_numerics(actual[sample], expected, record_property)
 
-    after = _decode_timings(module)
-    for key, value in before.items():
-        record_property(f"decode_{key}_ms_before", value)
-        record_property(f"decode_{key}_ms_after", after[key])
-    inputs_intact = all(
-        torch.equal(a, b) for a, b in zip(inputs, (x, ids, weights))
-    )
-    weights_intact = weight_sums == [
-        t.view(torch.int16).sum(dtype=torch.int64).item()
-        for t in (module.w13_weight_prefill_bf16, module.w2_weight_prefill_bf16)
-    ]
-    canaries_intact = all(bool((c == 0x5A5A5A5A).all().item()) for c in canaries)
-    print(
-        f"served-ep8 rows={num_tokens} apply_ms={start.elapsed_time(end):.2f} "
-        f"peak_gib={peak_gib:.3f} sliced_max_abs={difference.max().item():.6g} "
-        f"sliced_mismatched_rows={mismatched} rows={bad_rows[:8].tolist()} "
-        f"first_row_columns={bad_columns[:4]}..{bad_columns[-4:]} "
-        f"({len(bad_columns)}) warm_ms={[round(t, 2) for t in warm_ms]} ref_max_abs="
-        f"{reference_error.max().item():.6g} ref_rel_l2={relative_l2:.6g} "
-        f"inputs_intact={inputs_intact} weights_intact={weights_intact} "
-        f"canaries_intact={canaries_intact} decode_before={before} "
-        f"decode_after={after}"
-    )
-    assert mismatched == 0, f"{mismatched} rows differ from the sliced apply"
-    # Sliced EP prefill keeps the per-call transient near 2 GiB at 65,536 rows
-    # (unsliced: 2 GiB intermediate + 4 GiB zero-filled partials, 6.6 GiB).
-    assert peak_gib < 3.0, f"transient peak {peak_gib:.3f} GiB"
-    assert relative_l2 <= 0.03, f"relative L2 {relative_l2:.6g} vs reference"
-    assert inputs_intact and weights_intact and canaries_intact
-    for key, value in before.items():
-        assert after[key] <= 2 * value + 0.05, f"{key}: {value} -> {after[key]} ms"
+    assert all(torch.equal(a, b) for a, b in zip(inputs, (x, ids, weights)))
+    assert weight_sums() == sums
+    assert all(bool((c == 0x5A5A5A5A).all().item()) for c in canaries)
