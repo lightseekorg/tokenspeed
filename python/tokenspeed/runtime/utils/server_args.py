@@ -638,6 +638,9 @@ class ServerArgs:
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
+    # "mxfp4": requantize block-FP8 routed experts to MXFP4 at load (target
+    # and draft). "none" serves the checkpoint's expert format.
+    moe_requant_experts: str = "none"
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -4451,6 +4454,18 @@ class ServerArgs:
             "MoE on flashinfer_cutlass, for target and draft models. On by "
             "default; the fused reduction is not run-to-run reproducible. Forced "
             "off by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--moe-requant-experts",
+            type=str,
+            default=ServerArgs.moe_requant_experts,
+            choices=["none", "mxfp4"],
+            help="Requantize the checkpoint's block-FP8 routed experts (target "
+            "and draft) to MXFP4 at load: FP32 dequantization with the "
+            "checkpoint block scales, then E2M1 values with one E8M0 scale per "
+            "32 values along K (the Triton MXFP4 quantizer's rounding). The "
+            "result is identical for every TP/EP layout. Every other weight "
+            "keeps the checkpoint format; 'none' (default) changes nothing.",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",

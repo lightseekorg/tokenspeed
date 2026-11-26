@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.models.gpt_oss import GptOssDecoderLayer
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -617,3 +618,84 @@ def test_petit_capacity_is_none_without_petit(petit_args) -> None:
     assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) is None
     petit_args.all2all_backend = "gluon_petit"
     assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == 1024
+
+
+@pytest.mark.parametrize(
+    "quant_config,error",
+    [
+        (
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]),
+            None,
+        ),
+        (
+            Mxfp4Config(ignored_layers=[], is_checkpoint_mxfp4_serialized=True),
+            "requires block-FP8 routed experts",
+        ),
+    ],
+    ids=["block-fp8", "mxfp4-checkpoint"],
+)
+def test_petit_serves_block_fp8_experts_requantized_to_mxfp4(
+    petit_args, quant_config, error
+) -> None:
+    """--moe-requant-experts mxfp4 (GLM-5.3 Flash): a block-FP8 layer is
+    planned as MXFP4 with MXFP4 activations, Petit admits it (with GLM's
+    explicit SiLU alpha 1.0), and its weights are created as the FP8 staging
+    the checkpoint loads into; any other expert format is refused."""
+    with (
+        mock.patch.dict(
+            expert_module.global_server_args_dict,
+            mapping=petit_args.mapping,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
+            moe_mxfp4_fp8_activation=False,
+            moe_requant_experts="mxfp4",
+        ),
+        mock.patch.object(
+            expert_module,
+            "current_platform",
+            return_value=SimpleNamespace(is_cdna4=True),
+        ),
+        mock.patch.object(
+            expert_module,
+            "get_all2all_backend",
+            return_value=All2AllBackend.GLUON_PETIT,
+        ),
+        mock.patch.object(
+            expert_module, "get_moe_backend", return_value=MoeBackend.GLUON_PETIT
+        ),
+        mock.patch.object(
+            expert_module,
+            "kernel_moe_plan",
+            return_value={"solution": "gluon"},
+        ) as plan,
+        mock.patch.object(expert_module, "create_layer_weights") as weights,
+    ):
+        with pytest.raises(ValueError, match=error) if error else nullcontext():
+            layer = MoELayer(
+                top_k=8,
+                num_experts=288,
+                hidden_size=4096,
+                intermediate_size=2048,
+                quant_config=quant_config,
+                layer_index=0,
+                tp_rank=0,
+                tp_size=1,
+                ep_rank=0,
+                ep_size=8,
+                activation="swiglu",
+                activation_alpha=1.0,
+                swiglu_limit=10.0,
+            )
+    if error:
+        plan.assert_not_called()
+        weights.assert_not_called()
+        return
+    assert plan.call_args.args[0] == "mxfp4"
+    assert plan.call_args.kwargs["internal_activation_dtype"] == "mxfp4"
+    assert plan.call_args.kwargs["fp8_scale_block_shape"] is None
+    assert plan.call_args.kwargs["a2a_backend"] == "gluon_petit"
+    assert weights.call_args.args[2:4] == ("fp8", quant_config)
+    assert layer._requant_block_shape == (128, 128)
+    assert isinstance(layer.quant_config, Mxfp4Config)
+    assert layer.quant_config.use_dynamic_mxfp4_activations

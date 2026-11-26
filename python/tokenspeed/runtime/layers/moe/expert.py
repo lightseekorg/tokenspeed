@@ -86,6 +86,15 @@ def _moe_quant_config(quant_config, prefix: str):
     return quant_config.get_moe_quant_config(prefix)
 
 
+def _requant_mxfp4_config() -> Mxfp4Config:
+    """The MoE config of experts requantized from block FP8 at load."""
+    return Mxfp4Config(
+        is_checkpoint_mxfp4_serialized=True,
+        use_dynamic_mxfp4_activations=True,
+        quant_method="mxfp4",
+    )
+
+
 def moe_expert_weight_dtype(quant_config, prefix: str) -> str:
     """The stored weight format of the routed experts of the MoE layer at
     ``prefix`` ("unquant", "fp8", "mxfp4", ...), as that layer resolves it."""
@@ -256,6 +265,30 @@ class MoELayer(torch.nn.Module):
         if moe_quant_config is not None:
             self.quant_config = moe_quant_config
             self._quant_kind = self.quant_config.moe_weight_dtype(self.prefix)
+        # --moe-requant-experts mxfp4: block-FP8 checkpoint experts load into
+        # FP8 staging (``_staging_quant_config``) and are requantized to MXFP4
+        # before the backend processes them; the plan is the MXFP4 one.
+        self._requant_block_shape: tuple[int, int] | None = None
+        self._staging_quant_config = None
+        if global_server_args_dict.get("moe_requant_experts", "none") == "mxfp4":
+            block = getattr(self.quant_config, "weight_block_size", None)
+            if self._quant_kind != "fp8" or not block:
+                raise ValueError(
+                    "--moe-requant-experts mxfp4 requires block-FP8 routed "
+                    f"experts; {self.prefix!s} stores them as {self._quant_kind!s}"
+                )
+            self._requant_block_shape = tuple(block)
+            # The FP8 loader slices block scales at ceil(ispp / block) rows.
+            self._apply_trtllm_ispp_padding(
+                self._requant_block_shape[0],
+                "FP8 block scales tile it",
+                every_backend=True,
+            )
+            self._staging_quant_config = self.quant_config
+            # MXFP4 activations too, as Gluon Petit always quantizes them: TP
+            # and Petit EP then differ only in parallelism and kernels.
+            self.quant_config = _requant_mxfp4_config()
+            self._quant_kind = "mxfp4"
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
@@ -370,6 +403,7 @@ class MoELayer(torch.nn.Module):
                     isinstance(self.quant_config, Mxfp4Config)
                     and self.quant_config.is_checkpoint_mxfp4_serialized
                 )
+                or self._requant_block_shape is not None
                 or (
                     isinstance(self.quant_config, CompressedTensorsConfig)
                     and self.quant_config.quant_format == "mxfp4-pack-quantized"
@@ -645,14 +679,27 @@ class MoELayer(torch.nn.Module):
                 num_local_experts=partition.count,
             )
 
-        create_layer_weights(
-            self._storage_spec,
-            self,
-            self._quant_kind,
-            self.quant_config,
-            with_bias=with_bias,
-            solution=self.plan["solution"],
-        )
+        if self._requant_block_shape is not None:
+            # create_fp8_block_scale_inverses reads layer.quant_config.
+            self.quant_config = self._staging_quant_config
+            create_layer_weights(
+                self._storage_spec,
+                self,
+                "fp8",
+                self._staging_quant_config,
+                with_bias=with_bias,
+                solution=self.plan["solution"],
+            )
+            self.quant_config = _requant_mxfp4_config()
+        else:
+            create_layer_weights(
+                self._storage_spec,
+                self,
+                self._quant_kind,
+                self.quant_config,
+                with_bias=with_bias,
+                solution=self.plan["solution"],
+            )
         self._weights_processed = False
         self._moe_backend_state: object | None = None
 
@@ -702,6 +749,12 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
+        if self._requant_block_shape is not None:
+            from tokenspeed.runtime.layers.quantization.fp8_block_to_mxfp4 import (
+                requantize_moe_layer,
+            )
+
+            requantize_moe_layer(module, self._requant_block_shape)
         prepared = kernel_moe_process_weights(
             self.plan, module, communication_initializer=initialize_communication
         )
