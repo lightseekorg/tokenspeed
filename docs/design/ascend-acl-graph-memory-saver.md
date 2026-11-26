@@ -101,7 +101,7 @@ Python atexit, where PTA normally performs this cleanup.
 Atlas A3 workers with the saver enabled and local peers bind the saver to the
 node-local HCCL group before profiling device memory or allocating model
 storage. Saver-owned ranges detach before the group is destroyed.
-Build and ABI details belong to the [native README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/866357c48048459d69522e311d56b8e1f6dfaed7/native/README.md).
+Build and ABI details belong to the [native README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/631cb80fe0aa9fe7ef8fb5311f12d0293db97169/native/README.md).
 
 The runtime and native host in this change provide the complete protocol 3
 transition interface. Ascend uses `acl_graph`; its communicator-owned HCCL

@@ -268,6 +268,27 @@ class Qwen3ForCausalLM(BaseCausalLM):
             else frozenset()
         )
 
+    def weight_discard_ignored_disk_checkpoint_names(self) -> frozenset[str]:
+        # Rotary frequencies are derived on startup. Checkpoints can store
+        # them on the backbone or on each attention layer.
+        prefixes = ["model"]
+        prefixes.extend(
+            f"model.layers.{layer_id}.self_attn"
+            for layer_id in range(len(self.model.layers))
+        )
+        names = {
+            f"{prefix}.{name}"
+            for prefix in prefixes
+            for name in self.get_skip_weight_names()
+        }
+        if "Embedding" in self.config.name_or_path:
+            names = {name.removeprefix("model.") for name in names}
+        # Qwen3 builds its decoder and embedding on every rank, but only
+        # the last pipeline rank owns the output head.
+        if not self.mapping.is_last_pp_rank:
+            names.add("lm_head.weight")
+        return frozenset(names)
+
     def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
         return tuple(self.buffers())
 

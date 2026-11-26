@@ -322,12 +322,19 @@ def test_ascend_complete_disk_reload_converges_load_errors_before_commit(
 
 @pytest.mark.parametrize("file_format", ["safetensors", "bin", "pt"])
 @pytest.mark.parametrize("missing_source", [False, True])
+@pytest.mark.parametrize("embedding", [False, True])
 def test_ascend_disk_discard_requires_a_complete_stream(
-    tmp_path, monkeypatch, file_format, missing_source
+    tmp_path, monkeypatch, file_format, missing_source, embedding
 ):
     model = make_qwen3_model(tied=True)
     source = qwen3_checkpoint()
-    model.load_weights(source.items())
+    if embedding:
+        model.config.name_or_path = "Qwen3-Embedding"
+        model.load_weights(
+            (name.removeprefix("model."), weight) for name, weight in source.items()
+        )
+    else:
+        model.load_weights(source.items())
     handle, runner, state = _saver_handle(
         model, tmp_path, "discard", monkeypatch, device="npu"
     )
@@ -337,8 +344,14 @@ def test_ascend_disk_discard_requires_a_complete_stream(
     )
     state.resume(lambda: None)
     update = {name: value * 2 for name, value in source.items()}
+    update["model.rotary_emb.inv_freq"] = torch.ones(4)
+    update["model.layers.0.self_attn.rotary_emb.inv_freq"] = torch.ones(4)
     if missing_source:
         del update[_Q_PROJ]
+    if embedding:
+        update = {
+            name.removeprefix("model."): weight for name, weight in update.items()
+        }
     checkpoint_path = tmp_path / "update"
     _write_qwen3_checkpoint(checkpoint_path, update, file_format)
     ok, message = handle.update_weights(
@@ -364,6 +377,60 @@ def test_ascend_disk_discard_requires_a_complete_stream(
             model.model.embed_tokens.weight, source["model.embed_tokens.weight"] * 2
         )
         assert [parameter.data_ptr() for parameter in model.parameters()] == addresses
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_ascend_disk_discard_accepts_the_full_pipeline_checkpoint(
+    tmp_path, monkeypatch, rank
+):
+    # Qwen3's loader owns all decoder parameters on both ranks, but only
+    # the final rank builds an untied head.
+    model = make_qwen3_model(
+        tied=False, mapping=Mapping(rank=rank, world_size=2, pp_size=2)
+    )
+    source = qwen3_checkpoint()
+    source["lm_head.weight"] = source["model.embed_tokens.weight"] * 2
+    checkpoint = tmp_path / "update"
+    _write_qwen3_checkpoint(checkpoint, source, "safetensors")
+    _, runner, _ = _saver_handle(
+        model, checkpoint, "discard", monkeypatch, device="npu"
+    )
+    ok, message = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(checkpoint))
+    )
+    assert ok, message
+    torch.testing.assert_close(model.model.norm.weight, source["model.norm.weight"])
+    if rank == 1:
+        torch.testing.assert_close(model.lm_head.weight[:64], source["lm_head.weight"])
+
+
+@pytest.mark.parametrize(
+    ("name", "duplicate", "error"),
+    [
+        ("model.rotary_emb.inv_freq", True, "duplicate"),
+        (_Q_PROJ, True, "duplicate"),
+        ("model.layers.1.self_attn.rotary_emb.inv_freq", False, "unexpected"),
+        ("model.layers.0.typo.bias", False, "unexpected"),
+    ],
+)
+def test_ascend_disk_discard_rejects_duplicate_or_unknown_sources(
+    tmp_path, monkeypatch, name, duplicate, error
+):
+    model = make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    source["model.rotary_emb.inv_freq"] = torch.ones(4)
+    _, runner, _ = _saver_handle(model, tmp_path, "discard", monkeypatch, device="npu")
+    checkpoint = tmp_path / "update"
+    _write_qwen3_checkpoint(checkpoint, source, "safetensors")
+    save_file(
+        {name: source[name] if duplicate else torch.ones(4)},
+        str(checkpoint / "extra.safetensors"),
+    )
+    ok, message = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(checkpoint))
+    )
+    assert not ok
+    assert f"{error} checkpoint weight {name!r}" in message
 
 
 @pytest.mark.parametrize(

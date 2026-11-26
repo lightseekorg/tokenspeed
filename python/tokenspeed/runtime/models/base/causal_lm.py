@@ -552,6 +552,19 @@ class BaseCausalLM(nn.Module):
         """Optional checkpoint aliases that do not own independent storage."""
         return frozenset()
 
+    def weight_discard_ignored_disk_checkpoint_names(self) -> frozenset[str]:
+        """Names a full disk checkpoint may carry without a local writer."""
+        return frozenset()
+
+    def allow_redundant_checkpoint_names(self, names: frozenset[str]) -> None:
+        """Allow extra source names to occur once without writing a parameter."""
+        required = self._weight_update_required_names
+        if required is None:
+            raise RuntimeError("Checkpoint aliases require a complete weight update")
+        if required & names:
+            raise ValueError("Required checkpoint sources cannot also be aliases")
+        self._weight_update_redundant_names |= names
+
     def _record_weight_update_sources(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:

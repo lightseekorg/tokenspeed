@@ -63,7 +63,7 @@ TOKENSPEED_TVM_FFI_VERSION=0.1.13.post3 bash test/ci_system/install_triton_ascen
 
 # Build the pinned saver source against the configured CANN toolkit.
 python -m pip install --no-deps \
-  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@866357c48048459d69522e311d56b8e1f6dfaed7"
+  "torch-npu-memory-saver @ git+https://github.com/yanlonghu/torch_npu_memory_saver.git@631cb80fe0aa9fe7ef8fb5311f12d0293db97169"
 TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
   -e ./tokenspeed-kernel/python ./tokenspeed-engine -e './python[ascend-memory-saver]'
 export TORCH_DEVICE_BACKEND_AUTOLOAD=1
@@ -72,9 +72,9 @@ export TORCH_HCCL_ZERO_COPY=0
 export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-The pinned saver source installs version `0.1.4` and its matching ABI 3
+The pinned saver source installs version `0.1.5` and its matching ABI 4
 allocator. Install it before the TokenSpeed `ascend-memory-saver` extra.
-See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/866357c48048459d69522e311d56b8e1f6dfaed7/README.md)
+See the [saver README](https://github.com/yanlonghu/torch_npu_memory_saver/blob/631cb80fe0aa9fe7ef8fb5311f12d0293db97169/README.md)
 for compiler and CMake requirements.
 Ascend requires protocol 3 and matching host/runtime modules;
 an older host is rejected before model initialization. NPU exit protection is
@@ -152,6 +152,8 @@ Ascend updates require `flush_cache=true`, clearing L1/L2 and deleting the old
 L3 namespace before parameter writes. Publish immutable checkpoints of the same
 architecture at paths visible to every worker. Discard requires a complete
 checkpoint and a model loading contract that can verify complete replacement.
+For Qwen3, the disk loader ignores stored rotary frequencies and a head on a
+rank that does not own it. Every required local tensor must still arrive once.
 File selection and loading follow the existing checkpoint loader; Memory Saver
 does not introduce another format allowlist. The existing InstantTensor reader
 requires CUDA/NCCL and is unavailable on NPU. Do not modify files during reload.
