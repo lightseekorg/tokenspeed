@@ -128,9 +128,6 @@ public:
         ProfileSpan profile_span{"Planner::FitDevice"};
         demand_[0].assign(demand.begin(), demand.end());
         if (Fits(0)) return true;
-        const Work initial = work_;
-        while (Drop(0, true))
-            if (Fits(0)) return true;
         // Deep suffixes avoid turning a cheap Device release into a copy of
         // the whole prefix. Existing candidate order resolves equal depths.
         std::vector<std::size_t> order(components_[0].size());
@@ -140,6 +137,12 @@ public:
         for (const auto& c : components_[0])
             ranks.emplace_back(!c.demoted, -Depth(c.member.key), !store_.GroupIsState(c.member.group));
         std::ranges::stable_sort(order, [&](auto a, auto b) { return ranks[a] < ranks[b]; });
+        if (ReleaseSafeDeviceCopies(order)) return true;
+        // A later failed migration must not discard the safe releases already
+        // found. Logical loss, including demotion, starts only after this pass.
+        const Work initial = work_;
+        while (Drop(0, true))
+            if (Fits(0)) return true;
         for (auto c : order) {
             if (work_.removed[0].contains(c)) continue;
             Work before = work_;
@@ -271,6 +274,33 @@ public:
     }
 
 private:
+    bool ReleaseSafeDeviceCopies(std::span<const std::size_t> order) {
+        ProfileSpan profile_span{"Planner::ReleaseSafeDeviceCopies"};
+        // With no lower-tier residency/promises and no broken point, every
+        // indexed key is required on Device. Only unindexed orphans can leave.
+        const bool only_device_routes =
+            !preview_ && store_.RecoveryDependencies().GetStats().broken == 0 && store_.PendingHostKeys().empty() &&
+            std::ranges::all_of(store_.Groups(), [&](const auto& group) {
+                return (!store_.HostPool() || group.Index().NumEntries(*store_.HostPool()) == 0) &&
+                       (!store_.DiskPool() || group.Index().NumEntries(*store_.DiskPool()) == 0);
+            });
+        CacheEvictionPlan capacity{Pool(0), store_.Groups()};
+        std::size_t next = 0;
+        return capacity.SelectUntilFits(demand_[0], [&] {
+            while (next < order.size()) {
+                const auto c = order[next++];
+                const auto& component = components_[0][c];
+                if (only_device_routes && component.position) continue;
+                if (component.member.key && !work_.view.TryRemoveDeviceCopy(*component.member.key)) continue;
+                work_.removed[0].insert(c);
+                work_.coverage.reset();
+                capacity.Remove(component.member.group, component.member.location);
+                return true;
+            }
+            return false;
+        });
+    }
+
     bool FitDeviceWithoutMigration() {
         CacheEvictionPlan capacity{Pool(0), store_.Groups()};
         for (const auto& component : components_[0]) capacity.Remove(component.member.group, component.member.location);

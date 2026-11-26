@@ -24,6 +24,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <tuple>
 #include <unordered_set>
 
 #include "cache/coordinator/admission_planner.h"
@@ -1237,6 +1238,43 @@ TEST_F(GdsWriteBack, PhysicalFallbackAccountsForSharedLossesAndPreservesProtecte
     EXPECT_FALSE(transfers.StartEvictionStores());
 }
 
+TEST_F(GdsWriteBack, PhysicalFallbackRetainsInitialSafeDeviceReleases) {
+    Point a{32}, b{16};
+    b.tokens[0] = 100;
+    b.Rehash();
+    Publish(a);
+    Publish(b);
+    auto held_state = cache.GroupPrefixIndex(1).Find(device, {.group_id = 1, .content_hash = a.Hash()});
+    ASSERT_TRUE(held_state);
+    std::vector<CacheBlockRef> host_pins;
+    const auto publish_host = [&](const CacheKey& key) {
+        auto block = host.AcquireBlock(key.group_id);
+        cache.Host().CacheHostBlock(block, key, std::nullopt);
+        host_pins.push_back(std::move(block));
+    };
+    for (const auto& hash : b.hashes) publish_host({.group_id = 0, .content_hash = ContentHash{hash}});
+    publish_host({.group_id = 1, .content_hash = b.Hash()});
+    while (host.NumEmptyLcmBlocks()) host_pins.push_back(host.AcquireBlock(0));
+    Fill();
+
+    // B's five Device copies are safe. A's held State prevents ordinary
+    // ranking, so one more unit requires the exceptional physical fallback.
+    auto plan = Plan(6);
+    ASSERT_TRUE(plan);
+    const auto& result = *plan->gds->tiered;
+    EXPECT_EQ(result.losses, std::vector<ContentHash>{a.Hash()});
+    EXPECT_EQ(result.stats.fallback_blocks, 1u);
+    EXPECT_TRUE(result.host_copies.empty());
+    EXPECT_TRUE(result.host_removals.empty());
+    EXPECT_TRUE(result.fresh_rejections.empty());
+    CacheCoordinatorTestAccess::CommitVictims(cache, *plan);
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 6);
+    EXPECT_EQ(cache.Prober().ProbePrefix(b.hashes).host.num_common_tokens, 16);
+    EXPECT_FALSE(CacheCoordinatorTestAccess::Store(cache).RecoveryDependencies().At(a.Hash()).Available());
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0);
+    EXPECT_DOUBLE_EQ(cache.GdsStats().host_watermark, 0);
+}
+
 TEST(GdsCapacityCompleteness, EveryFeasibleLegacyAdmissionAlsoFitsGds) {
     for (bool write_back : {false, true}) {
         for (int hold_mask = 0; hold_mask < 8; ++hold_mask) {
@@ -1381,6 +1419,79 @@ TEST(CheckpointMaterialization, TailResumeAndExtraOutputFailureKeepTheSameTarget
     EXPECT_FALSE(budget_cut.NeedsExtraOutput());
 }
 
+class GdsSafeDeviceCopies : public testing::TestWithParam<std::tuple<bool, bool, bool>> {};
+
+TEST_P(GdsSafeDeviceCopies, ReclaimsExistingRouteBeforeMigrationOrLogicalLoss) {
+    const auto [write_back, full_host, fresh] = GetParam();
+    BlockPool device{64, {1, 1}}, host{64, {1, 1}};
+    auto cache = MakeCoordinator(Specs(), kPage, device, false, &host, nullptr, nullptr, false, write_back, 0);
+    cache.ConfigureEviction(PrefixCacheEvictionConfig::Gds({0.25, 0}));
+    Point a{32}, b{16};
+    b.tokens[0] = 100;
+    b.Rehash();
+    PublishPoint(cache, a);
+    PublishPoint(cache, b);
+    if (!fresh)
+        for (const auto* point : {&a, &b}) {
+            auto used = CacheCoordinatorTestAccess::MatchPromptPrefix(
+                cache, PromptPrefix{.prefix_hashes = point->hashes,
+                                    .tokens = point->tokens,
+                                    .max_tokens = static_cast<std::int32_t>(point->tokens.size())});
+            ASSERT_EQ(used.device.num_common_tokens, point->tokens.size());
+        }
+
+    std::vector<CacheBlockRef> host_pins;
+    const auto publish_host = [&](const CacheKey& key) {
+        auto block = host.AcquireBlock(key.group_id);
+        cache.Host().CacheHostBlock(block, key, std::nullopt);
+        if (full_host) host_pins.push_back(std::move(block));
+    };
+    for (const auto& hash : b.hashes) publish_host({.group_id = 0, .content_hash = ContentHash{hash}});
+    const CacheKey b_state{.group_id = 1, .content_hash = b.Hash()};
+    publish_host(b_state);
+    // A's same-key copy is insufficient: the later Host history is missing.
+    // The deeper candidate must be rejected before finding B's complete route.
+    const CacheKey a_history{.group_id = 0, .content_hash = ContentHash{a.hashes[5]}};
+    publish_host(a_history);
+    if (full_host)
+        while (host.NumEmptyLcmBlocks()) host_pins.push_back(host.AcquireBlock(0));
+    auto& store = CacheCoordinatorTestAccess::Store(cache);
+    RecoveryIndex::View trial{store.RecoveryDependencies()};
+    const RecoveryIndex::View::Change unsafe{a_history, CacheTier::kDevice, false};
+    trial.Apply(std::span{&unsafe, 1});
+    ASSERT_FALSE(trial.At(a.Hash()).Available());
+
+    std::vector<CacheBlockRef> device_pins;
+    while (device.NumEmptyLcmBlocks()) device_pins.push_back(device.AcquireBlock(0));
+    std::pmr::monotonic_buffer_resource arena;
+    AdmissionCandidateConstraints constraints{&arena};
+    std::array<BlockPlacementDemand, 2> demand{};
+    for (auto& group : demand) group.blocks_by_bucket = {0};
+    demand[1].any_bucket_blocks = 1;
+    auto plan = PlanTieredDeviceEviction(store, constraints, demand, &arena);
+    ASSERT_TRUE(plan);
+    const auto& result = *plan->gds->tiered;
+    EXPECT_TRUE(result.losses.empty());
+    EXPECT_TRUE(result.host_copies.empty());
+    EXPECT_TRUE(result.host_removals.empty());
+    EXPECT_TRUE(result.fresh_rejections.empty());
+    ASSERT_EQ(result.device_removals.size(), 1u);
+    EXPECT_EQ(result.device_removals[0].key, b_state);
+    CacheCoordinatorTestAccess::CommitVictims(cache, *plan);
+    EXPECT_EQ(cache.Prober().ProbePrefix(a.hashes).device.num_common_tokens, 32);
+    EXPECT_EQ(cache.Prober().ProbePrefix(b.hashes).host.num_common_tokens, 16);
+    EXPECT_FALSE(store.Groups()[1].Index().Contains(device, b_state));
+    EXPECT_TRUE(store.Groups()[1].Index().Contains(host, b_state));
+    EXPECT_GE(device.NumEmptyLcmBlocks(), 1);
+    EXPECT_DOUBLE_EQ(cache.GdsWatermark(), 0);
+    EXPECT_DOUBLE_EQ(cache.GdsStats().host_watermark, 0);
+    EXPECT_EQ(cache.GdsStats().logical_rejections, 0u);
+    EXPECT_EQ(cache.GdsStats().logical_evictions, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(TierModes, GdsSafeDeviceCopies,
+                         testing::Combine(testing::Bool(), testing::Bool(), testing::Bool()));
+
 TEST(GdsCost, ValidatesExplicitCoefficientsAndWidensTokenArithmetic) {
     EXPECT_THROW(PrefixCacheEvictionConfig::Parse("gds", std::nullopt), std::invalid_argument);
     EXPECT_THROW(PrefixCacheEvictionConfig::Gds({0, 1}), std::invalid_argument);
@@ -1404,6 +1515,8 @@ TEST_F(GdsWriteBack, RouteOverlayRepairsSharedHistoryAndRollsBackByValue) {
         view.Apply(std::span{&event, 1});
     };
     const CacheKey shared{.group_id = 0, .content_hash = ContentHash{left.hashes[0]}};
+    EXPECT_FALSE(view.TryRemoveDeviceCopy(shared));
+    for (const Point* point : {&ancestor, &left, &right}) EXPECT_TRUE(view.At(point->Hash()).device_ready);
     change(shared, CacheTier::kDevice, false);
     for (const Point* point : {&ancestor, &left, &right}) {
         EXPECT_FALSE(view.At(point->Hash()).Available());
@@ -1413,7 +1526,7 @@ TEST_F(GdsWriteBack, RouteOverlayRepairsSharedHistoryAndRollsBackByValue) {
     for (const Point* point : {&ancestor, &left, &right}) EXPECT_TRUE(view.At(point->Hash()).device_ready);
     const CacheKey state{.group_id = 1, .content_hash = left.Hash()};
     change(state, CacheTier::kHost, true);
-    change(state, CacheTier::kDevice, false);
+    EXPECT_TRUE(view.TryRemoveDeviceCopy(state));
     EXPECT_TRUE(view.At(left.Hash()).ready);
     EXPECT_FALSE(view.At(left.Hash()).device_ready);
     EXPECT_TRUE(view.At(right.Hash()).device_ready);
@@ -1421,6 +1534,12 @@ TEST_F(GdsWriteBack, RouteOverlayRepairsSharedHistoryAndRollsBackByValue) {
     change(state, CacheTier::kHost, false);
     EXPECT_FALSE(view.At(left.Hash()).Available());
     EXPECT_TRUE(saved.At(left.Hash()).ready);
+    // Already broken routes do not veto an unrelated safe release.
+    const CacheKey right_state{.group_id = 1, .content_hash = right.Hash()};
+    change(right_state, CacheTier::kHost, true);
+    EXPECT_TRUE(view.TryRemoveDeviceCopy(right_state));
+    EXPECT_TRUE(view.At(right.Hash()).ready);
+    EXPECT_FALSE(view.At(left.Hash()).Available());
     view = saved;
     EXPECT_TRUE(view.At(left.Hash()).ready);
     EXPECT_FALSE(view.At(left.Hash()).device_ready);
@@ -1458,6 +1577,61 @@ TEST_F(GdsWriteBack, BatchedOverlayChangesKeepExactTailRoutesAndCopyAlternatives
     view.Apply(replace);
     EXPECT_TRUE(view.At(point.Hash()).ready);
     EXPECT_TRUE(store.RecoveryDependencies().At(point.Hash()).device_ready);
+}
+
+TEST(PersistentRecovery, SafeDeviceRemovalMatchesIndependentTrialOverlay) {
+    auto specs = Specs();
+    specs.push_back(CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                   .sliding_window = 9,
+                                   .sink_tokens = 2,
+                                   .cache_blocks_per_lcm_block = 1,
+                                   .block_granularity = 2});
+    BlockPool device{256, {1, 1, 1}}, host{256, {1, 1, 1}};
+    auto cache = MakeCoordinator(specs, kPage, device, false, &host, nullptr, nullptr, false, true, 0);
+    cache.ConfigureEviction(PrefixCacheEvictionConfig::Gds({0.25, 0}));
+    std::array<Point, 5> points{Point{16}, Point{19}, Point{32}, Point{27}, Point{19}};
+    points.back().tokens[9] = 100;
+    points.back().Rehash();
+    for (const auto& point : points) PublishPoint(cache, point);
+    const auto& index = CacheCoordinatorTestAccess::Store(cache).RecoveryDependencies();
+    auto leaves = index.Leaves();
+    std::mt19937 random{143};
+    const auto paths = [](const auto& ranges) {
+        std::vector<std::pair<CacheKey, CacheKey>> result;
+        for (const auto& range : ranges) result.emplace_back(range.first, range.last);
+        return result;
+    };
+    for (int repeat = 0; repeat < 24; ++repeat) {
+        SCOPED_TRACE(repeat);
+        RecoveryIndex::View actual{index};
+        std::vector<RecoveryIndex::View::Change> replicas;
+        for (const auto& leaf : leaves)
+            if (repeat == 0 || random() % 2) replicas.push_back({leaf.key, CacheTier::kHost, true});
+        actual.Apply(replicas);
+        std::ranges::shuffle(leaves, random);
+        for (const auto& leaf : leaves) {
+            SCOPED_TRACE(leaf.key.content_hash.ToString());
+            auto expected = actual;
+            const RecoveryIndex::View::Change removal{leaf.key, CacheTier::kDevice, false};
+            expected.Apply(std::span{&removal, 1});
+            const bool safe = std::ranges::all_of(points, [&](const auto& point) {
+                return !actual.At(point.Hash()).Available() || expected.At(point.Hash()).Available();
+            });
+            if (!safe) expected = actual;
+            ASSERT_EQ(actual.TryRemoveDeviceCopy(leaf.key), safe);
+            for (const auto& point : points) {
+                const auto& want = expected.At(point.Hash());
+                const auto& got = actual.At(point.Hash());
+                EXPECT_EQ(got.ready, want.ready);
+                EXPECT_EQ(got.device_ready, want.device_ready);
+                EXPECT_EQ(got.pending, want.pending);
+                EXPECT_EQ(paths(got.device_paths), paths(want.device_paths));
+                EXPECT_EQ(paths(got.host_paths), paths(want.host_paths));
+            }
+            for (const auto& key : leaves)
+                EXPECT_EQ(actual.Present(key.key, CacheTier::kDevice), expected.Present(key.key, CacheTier::kDevice));
+        }
+    }
 }
 
 }  // namespace

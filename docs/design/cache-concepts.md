@@ -3664,13 +3664,25 @@ eligibility, heavy-path coordinates, coverage and selection remain plan-local.
 The no-Host planner retains its versioned heap and explicit block fallback.
 There is no persistent selection heap or constant-time pressure guarantee.
 
-Necessary preservation is attempted before reclaiming Device addresses, but
-failure to preserve cache content is not itself an admission failure. If the
-joint heuristic stalls, discard its tentative Host victims and reservations,
-then retry without migration. Ordinary Device losses use Device scores. If
-held State or shared dependencies leave no eligible whole unit, reclaim the
-complete eligible Device census through the same physical ownership and
-protected-input constraints. Record every route actually lost by that fallback;
+Device pressure first tries eligible copy-only releases across the candidate
+census before migration or logical loss. Each release must preserve complete
+routes, including the single Device-prefix/Host-suffix split; a same-key Host
+copy does not prove safety. This pass creates no Host demand and advances no
+watermark. It checks only routes watching the candidate's leaf, stops at the
+first broken route, and changes the shadow only after every affected route
+passes. Required keys without backups fail before route resolution. One
+physical capacity shadow tracks relief incrementally; trials neither clone
+the growing plan nor scan unrelated checkpoints. LRU and no-pressure admission
+are unchanged.
+
+Remaining preservation trials may reserve Host capacity. Failure to preserve
+cache content is not itself an admission failure or fresh rejection: the
+latter requires a separate logical score comparison. If the joint heuristic
+stalls, retain the initial safe Device releases, discard its later tentative
+Host victims and reservations, then retry without migration. Ordinary Device
+losses use Device scores. If held State or shared dependencies leave no eligible
+whole unit, reclaim the complete eligible Device census through the same
+physical ownership and protected-input constraints. Record every route actually lost by that fallback;
 a held State does not pin otherwise unowned history. Only actual insufficient
 group/bucket capacity may fail this retry. Exceptional block fallback has no
 finite single-unit exclusive score and does not advance either watermark.

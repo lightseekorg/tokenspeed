@@ -405,6 +405,64 @@ void RecoveryIndex::View::Apply(std::span<const Change> changes) {
     }
 }
 
+bool RecoveryIndex::View::TryRemoveDeviceCopy(const CacheKey& key) {
+    ProfileSpan profile_span{"RecoveryIndex::View::TryRemoveDeviceCopy"};
+    const auto found = state_->index->ranges.find(Impl::RangeKey{key, 0});
+    if (found == state_->index->ranges.end()) return true;
+    const auto leaf = found->second.lock();
+    const auto& counts = state_->Counts(*leaf);
+    if (counts[kDevice] == 0) return true;
+    const bool backed = counts[kHostDiskPending] != 0;
+    // Most pressure candidates have no backup. Follow a single parent chain
+    // to the first live consumer without allocating a trial's working sets.
+    if (!backed)
+        for (const auto* node = leaf.get(); node; node = node->parents.size() == 1 ? node->parents.front() : nullptr)
+            for (const auto* record : node->watchers)
+                if (At(record->hash).Available()) return false;
+
+    std::vector<const Impl::Node*> nodes{leaf.get()};
+    std::unordered_set<const Impl::Node*> ancestors{leaf.get()};
+    for (std::size_t i = 0; i < nodes.size(); ++i)
+        for (const auto* parent : nodes[i]->parents)
+            if (ancestors.insert(parent).second) nodes.push_back(parent);
+
+    std::vector<const Impl::Record*> affected;
+    std::unordered_set<const Impl::Record*> seen;
+    std::vector<Entry> routes;
+    for (const auto* node : nodes) {
+        for (const auto* record : node->watchers) {
+            if (!At(record->hash).Available()) continue;
+            // Every watching point requires this key. No backup means a
+            // definite loss; stop before walking the rest of its consumers.
+            if (!backed) return false;
+            if (!seen.insert(record).second) continue;
+            auto route = state_->index->Resolve(
+                *record, false,
+                [&](const Impl::Node& node, auto first, auto end, auto column, bool copy) {
+                    const auto missing = state_->Missing(node, first, end, column, copy);
+                    // Pretend just this leaf is absent, without modifying counts.
+                    // A same-key Host copy can still fail the legal suffix split.
+                    return column == kDevice && first <= leaf->first && leaf->first < end && ancestors.contains(&node)
+                               ? std::min(missing, leaf->first)
+                               : missing;
+                },
+                [&](const Impl::Node& node) -> const tokenspeed::Counts& { return state_->Counts(node); });
+            if (!route.Available()) return false;
+            affected.push_back(record);
+            routes.push_back(std::move(route));
+        }
+    }
+    // Device removal changes only its own count column. Each shared ancestor
+    // contains this leaf once; Host/Disk unions and unrelated routes stay put.
+    for (const auto* node : nodes) {
+        auto values = state_->Counts(*node);
+        --values[kDevice];
+        state_->counts[node] = values;
+    }
+    for (std::size_t i = 0; i < affected.size(); ++i) state_->routes[affected[i]->hash] = std::move(routes[i]);
+    return true;
+}
+
 const RecoveryIndex::Entry& RecoveryIndex::View::At(const ContentHash& hash) const {
     const auto found = state_->routes.find(hash);
     return found == state_->routes.end() ? state_->index->records.at(hash)->entry : found->second;

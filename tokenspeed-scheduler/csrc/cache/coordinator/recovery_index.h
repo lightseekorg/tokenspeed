@@ -101,6 +101,9 @@ public:
         // Update only routes watching changed ranges. Unchanged routes are read
         // directly from the resident index; queries never mutate the view.
         void Apply(std::span<const Change> changes);
+        // Remove only if all previously available routes remain available.
+        // Check affected routes without copying or changing the view on failure.
+        bool TryRemoveDeviceCopy(const CacheKey& key);
         const Entry& At(const ContentHash& hash) const;
         Entry Resolve(const ContentHash& hash, bool allow_device_copy) const;
         bool Present(const CacheKey& key, CacheTier tier) const;

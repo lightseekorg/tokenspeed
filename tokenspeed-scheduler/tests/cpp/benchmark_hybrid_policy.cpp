@@ -35,21 +35,25 @@ using namespace tokenspeed;
 
 // Compare read-only admission plans on an unchanged populated checkpoint chain.
 // "blocked" has no reclaimable Host capacity; it measures migration/loss trials,
-// not a populated large Host cache or a complete scheduler round.
+// not a populated large Host cache or a complete scheduler round. "mirrored"
+// and "partial" have published Host copies of all or half the checkpoints.
 int main(int argc, char** argv) {
     if (argc != 6) {
-        std::cerr << "usage: hybrid_policy_benchmark lru|gds none|blocked|free points iterations kv_blocks\n";
+        std::cerr << "usage: hybrid_policy_benchmark lru|gds none|blocked|free|mirrored|partial points iterations "
+                     "kv_blocks\n";
         return 2;
     }
     const std::string policy = argv[1], host_mode = argv[2];
     const int points = std::stoi(argv[3]), iterations = std::stoi(argv[4]), kv_blocks = std::stoi(argv[5]);
     if ((policy != "lru" && policy != "gds") ||
-        (host_mode != "none" && host_mode != "blocked" && host_mode != "free") || points < 2 || points > 100000 ||
-        iterations <= 0 || iterations > 100000 || kv_blocks < 1 || kv_blocks > 100000)
+        (host_mode != "none" && host_mode != "blocked" && host_mode != "free" && host_mode != "mirrored" &&
+         host_mode != "partial") ||
+        points < 2 || points > 100000 || iterations <= 0 || iterations > 100000 || kv_blocks < 1 || kv_blocks > 100000)
         return 2;
     const bool write_back = host_mode != "none";
     constexpr std::int32_t page = 4;
-    BlockPool device{points * 4 + 32, {1, 1}}, host{16, {1, 1}};
+    const int host_points = host_mode == "mirrored" ? points : host_mode == "partial" ? points / 2 : 0;
+    BlockPool device{points * 4 + 32, {1, 1}}, host{host_points * 2 + 16, {1, 1}};
     const std::array specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = page},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
@@ -79,6 +83,12 @@ int main(int argc, char** argv) {
             admission->access_epoch);
         cache.Free(tables);
     }
+    for (int i = 0; i < host_points; ++i)
+        for (std::uint32_t group = 0; group < specs.size(); ++group) {
+            auto block = host.AcquireBlock(group);
+            cache.Host().CacheHostBlock(block, {.group_id = group, .content_hash = ContentHash{hashes[i]}},
+                                        std::nullopt);
+        }
     std::vector<CacheBlockRef> device_pins, host_pins;
     while (device.NumEmptyLcmBlocks()) device_pins.push_back(device.AcquireBlock(0));
     if (host_mode == "blocked")

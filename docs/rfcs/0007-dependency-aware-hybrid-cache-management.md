@@ -125,6 +125,7 @@ After (GDS)
        +-> capacity pressure: preview placement and rank logical losses
              -> verify survivors and reserve required Host capacity
              -> commit removals and transfers -> ACK publishes completed copies
+  Device placement: safe copies -> migration or logical losses if still short
   Host placement: safe duplicates -> Disk-clean copies -> dirty logical losses
   Cleaning: current Host-policy order -> dependency-ordered writes
   Disk prefetch: credits -> required Host reservation -> read -> re-probe
@@ -567,9 +568,23 @@ it does not reserve capacity for its next read. Future Disk space and pending
 cleaning cannot fund this transaction. No live owner or promised destination
 may be revoked. Shared KV stays when another survivor needs it.
 
-Device placement tries explicit demotions first, then deeper copies to avoid
-unnecessary suffix copies. Host placement uses free space, dead/orphan or safe
-Device-covered copies, then safe Disk-clean copies, before logical losses.
+Device pressure considers eligible copy-only releases before migration or
+logical loss, stopping when demand fits or the eligible census is exhausted.
+A release is safe only if every previously usable recovery point still has a
+legal route through existing residency or destination-backed pending copies;
+it creates no new Host demand. A same-key Host copy alone is insufficient:
+the remaining history, windows, whole tail and State groups must still satisfy
+the shared resolver. If these releases fund the real demand, commit them
+without migration, logical loss, fresh rejection or watermark advancement.
+Within this pass, use explicit demotion and then depth as deterministic
+placement priorities; the logical point's GDS score does not price removal of
+a redundant copy. Host reads remain unpriced in this revision.
+
+Only when that pass cannot fund demand may the planner consider migration or
+logical loss. Remaining explicit demotions retain priority, then deeper
+copies avoid unnecessary suffix copies. Host placement uses free space,
+dead/orphan or safe Device-covered copies, then safe Disk-clean copies, before
+logical losses.
 Clean means the same namespace/key is already published on Disk. Validate
 the affected routes, whole-tail/State closure and holds before removing it.
 Real group/bucket and paired-demand `Fits` checks govern both tiers; numerical
@@ -577,7 +592,7 @@ relief alone cannot prove fit. The clean-before-dirty classification also
 applies to LRU, whose existing planner, dirty ordering and settlement remain
 unchanged.
 
-For Device demand, try preservation first: a proposed release creates W_H;
+For remaining Device demand, try preservation: a proposed release creates W_H;
 Host funds it with safe capacity, then compares H_H of eligible resident
 losses and cancellation of incoming migrations (`cancel_H`). After each
 choice, refresh routes, sharing and scores, and recheck both demands. If the
@@ -585,9 +600,29 @@ preservation trial fails, roll it back and select ordinary Device losses by
 H_D. Host-only demand starts at the Host step. The two domains never compare
 raw scores against each other.
 
-For example, Device needs five units. A failed preservation trial leads to
-an ordinary Device loss C with H_D=4 and relief 3. Preserving the next two-unit
-release A needs two Host units. If Host loss B has H_H=12 and cancelling A
+Preservation failure means a tentative physical release cannot retain its
+required routes through allowed copies and feasible Host placement. It rolls
+back the trial; it is not fresh retention rejection. Fresh rejection happens
+only when the later logical comparison selects an unused point under design
+3's strict-score rule. A failed individual trial cannot bypass the initial
+copy-only pass, including by causing a Host logical loss during migration.
+
+Use the resident range index to check only routes affected by a trial release.
+Stop at the first broken route and change the shadow only after all affected
+routes pass; a required key with no backup can fail before resolving routes.
+Update the physical capacity shadow incrementally. Do not clone the growing
+plan or scan unrelated checkpoints for each candidate in this pass. The
+ordinary no-pressure admission and LRU planner remain unchanged.
+
+For example, A exists only on Device while B has a complete Host route.
+Even if the physical order visits A first, release B's eligible Device copy
+before proposing a copy of A or dropping either point. B remains reusable
+from Host and neither watermark advances.
+
+If safe releases are exhausted and Device still needs five units, a failed
+preservation trial leads to an ordinary Device loss C with H_D=4 and relief 3.
+Preserving the next two-unit release A needs two Host units. If Host loss B
+has H_H=12 and cancelling A
 has H_H=14, both relieving two eligible units in the required bucket, choose
 B and reserve A. Commit `Lambda_D=max(old,4)` and `Lambda_H=max(old,12)`;
 A's migration adds no watermark update. The comparison never pits 4 against
@@ -681,9 +716,10 @@ watermark.
 With the same residency, ownership and geometry, GDS must fund any demand
 that the legacy eligible Device census can fund.
 
-A failed preservation heuristic is not an admission failure. Discard its
-Host victims and reservations, then retry Device logical loss without
-migration. Ordinary choices use H_D and update Lambda_D only on commit.
+A failed preservation heuristic is not an admission failure. Keep the initial
+safe Device releases, discard later tentative Host victims and reservations,
+then retry Device logical loss without migration. Ordinary choices use H_D
+and update Lambda_D only on commit.
 If whole units cannot fund demand, exhaust the same physically eligible
 Device census as the legacy allocator, respecting ownership, protected input
 and real group/bucket `Fits`. Record every recovery route lost by this
