@@ -4065,6 +4065,40 @@ def test_glm53_flash_block_fp8_plan_selects_gluon_at_ep1_and_ep8(
     assert plan["apply_kernel_name"] == expected
 
 
+@pytest.mark.parametrize("clamped", [True, False])
+def test_glm53_flash_tp8_mxfp4_plan_keeps_the_swiglu_clamp(
+    mi350_platform: PlatformInfo, clamped: bool
+) -> None:
+    """GLM-5.3 Flash TP8 with block-FP8 experts requantized to MXFP4 (ispp 256)
+    and dynamic MXFP4 activations. The clamped SwiGLU selects the Triton
+    kernel, which declares and applies the limit; the gfx950 Gluon A4W4
+    kernel (``activation_clamped={False}``) still takes the unclamped plan."""
+    triton_name = "triton_mxfp4_precomputed_moe_apply"
+    a4w4_name = "gluon_mxfp4_a4w4_moe_apply_gfx950"
+    registry = KernelRegistry.get()
+    plan = _moe_fp8_channel_plan(
+        mi350_platform,
+        weight_dtype="mxfp4",
+        activation="swiglu",
+        activation_clamped=clamped,
+        ispp=256,
+        hidden=4096,
+        num_experts=288,
+        top_k=8,
+        internal_activation_dtype="mxfp4",
+    )
+    if clamped:
+        assert plan["apply_kernel_name"] == triton_name
+        assert True in registry.get_by_name(triton_name).traits["activation_clamped"]
+        if registry.get_by_name(a4w4_name) is not None:
+            a4w4_traits = registry.get_by_name(a4w4_name).traits
+            assert a4w4_traits["activation_clamped"] == frozenset({False})
+    elif registry.get_by_name(a4w4_name) is not None:
+        assert plan["apply_kernel_name"] == a4w4_name
+    else:
+        assert plan["apply_kernel_name"] == triton_name
+
+
 def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
     """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
     return _moe_fp8_channel_plan(

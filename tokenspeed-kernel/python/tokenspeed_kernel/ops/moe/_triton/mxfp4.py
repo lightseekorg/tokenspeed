@@ -202,14 +202,20 @@ def _validate(
             raise ValueError("Triton MoE does not support expert bias")
         if layout != "concatenated":
             raise ValueError("Triton MoE requires concatenated gate/up weights")
+        # Standard SwiGLU only (alpha 1, beta 0), optionally clamped: a limit
+        # clamps gate above and up to +-limit before SiLU(gate) * up, as
+        # GLM-5.3 Flash's experts do.
         swiglu_arg = getattr(w, "swiglu_arg", None)
-        if swiglu_arg is not None and (
-            getattr(swiglu_arg, "alpha", None) not in {None, 1.0}
-            or getattr(swiglu_arg, "limit", None) is not None
-        ):
+        if getattr(swiglu_arg, "alpha", None) not in {None, 1.0}:
             raise ValueError("Triton MoE supports only standard SwiGLU")
         if getattr(w, "swiglu_beta", None) not in {None, 0.0}:
             raise ValueError("Triton MoE supports only standard SwiGLU")
+        limit = getattr(swiglu_arg, "limit", None)
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("SwiGLU limit must be positive")
+            if activation == "situ":
+                raise ValueError("SiTU MoE does not take a SwiGLU limit")
         if activation == "situ":
             situ_beta = getattr(w, "activation_situ_beta", None)
             situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
@@ -515,6 +521,12 @@ def _stage1_kernel(
                 output_dtype: tl.constexpr = (
                     tl.bfloat16 if OUTPUT_DTYPE == "bf16" else tl.float16
                 )
+                if HAS_LIMIT:
+                    # Clamped SwiGLU (SiLU only; SiTU refuses a limit). Rounding
+                    # is monotone, so clamping before the cast to the input
+                    # dtype equals clamping the rounded gate/up.
+                    gate_acc = tl.minimum(gate_acc, swiglu_limit)
+                    up_acc = tl.clamp(up_acc, -swiglu_limit, swiglu_limit)
                 gate = gate_acc.to(output_dtype)
                 up = up_acc.to(output_dtype)
                 if ACTIVATION == "situ":
@@ -754,7 +766,9 @@ def _moe(
         situ_beta = float(getattr(w, "activation_situ_beta", 1.0) or 1.0)
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
         swiglu_alpha = 1.0
-        swiglu_limit = None
+        swiglu_limit = getattr(getattr(w, "swiglu_arg", None), "limit", None)
+        if swiglu_limit is not None:
+            swiglu_limit = float(swiglu_limit)
         swiglu_beta = 0.0
         interleaved = False
 

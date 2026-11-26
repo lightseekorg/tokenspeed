@@ -958,6 +958,8 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"silu", "situ", "swiglu"}),
+        # Both activation paths apply a SwiGLU limit (swiglu_arg.limit).
+        "activation_clamped": frozenset({False, True}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False, True}),
         "supports_ep": frozenset({False, True}),
@@ -990,7 +992,11 @@ def triton_mxfp4_precomputed_moe_apply(
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
         x: Contiguous FP16/BF16 hidden states `[tokens, hidden]`.
         w: Module holding linear packed E2M1 `w13_weight`/`w2_weight` and
-            E8M0 `w13_weight_scale`/`w2_weight_scale` tensors.
+            E8M0 `w13_weight_scale`/`w2_weight_scale` tensors. A positive
+            `swiglu_arg.limit` clamps gate to `<= limit` and up to
+            `[-limit, limit]` before SiLU(gate) * up on both activation
+            paths (with MXFP4 activations, before the intermediate is
+            requantized); SiTU refuses a limit.
         router_logits: Unused because routing must be precomputed.
         topk_weights: Route weights `[tokens, top_k]`.
         topk_ids: Global expert ids `[tokens, top_k]`. Experts outside this
