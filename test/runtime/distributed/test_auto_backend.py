@@ -516,7 +516,10 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
 def routing(backend, monkeypatch):
     """The fixture backend with a controllable multicast verdict; ``mapping``
     None makes every group node-local."""
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    monkeypatch.setattr(fabric, "_multicast_map", [True, True])
     return backend
 
 
@@ -592,6 +595,30 @@ def test_auto_routes_keep_the_performance_defaults(routing, monkeypatch):
     assert routing.route(Collective.ALL_REDUCE, ROWS, GROUP) is Route.TIERED
     assert routing.route(Collective.REDUCE_SCATTER, ROWS, GROUP) is Route.NCCL
     assert routing.route(Collective.TOKEN_REDUCE_SCATTER, ROWS, GROUP) is Route.MULTIMEM
+
+
+@pytest.mark.parametrize(
+    "collective",
+    [
+        Collective.ALL_GATHER,
+        Collective.TOKEN_ALL_GATHER,
+        Collective.TOKEN_REDUCE_SCATTER,
+    ],
+)
+@pytest.mark.parametrize("multicast_map", [[False, False], [True, False], None])
+def test_unavailable_multicast_routes_nvidia_gathers_and_rsag_to_nccl(
+    backend, monkeypatch, collective, multicast_map
+):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    _switches(monkeypatch, force=False, invariant=False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_nvidia=True, is_amd=False, is_cdna4=False),
+    )
+    monkeypatch.setattr(fabric, "_multicast_map", multicast_map)
+    assert backend.route(collective, ROWS, GROUP) is Route.NCCL
 
 
 def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkeypatch):

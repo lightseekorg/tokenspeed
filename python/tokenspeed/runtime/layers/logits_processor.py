@@ -622,23 +622,30 @@ class LogitsProcessor(nn.Module):
     def _tp_group_multicast_reachable(self) -> bool:
         """Whether the gather's symmetric buffer can map multicast here.
 
-        Topology now only admits: an NVLink domain can span hosts, so a
-        host-spread group is asked of the fabric rather than refused outright,
-        and without fabric the rendezvous hangs rather than failing over. The
-        rank count cannot stand in for the topology test -- a strided group can
-        be smaller than one host's device count while living on two.
+        Checks both NVLS multicast availability (``group_has_multicast``) and
+        cross-host fabric reachability (``group_has_fabric``). A host or VM
+        without NVLS multicast (or with ``TORCH_SYMM_MEM_DISABLE_MULTICAST=1``)
+        returns ``multicast_ptr=0`` from ``symm_mem.rendezvous``, while a
+        host-spread group without fabric hangs inside the rendezvous. The rank
+        count cannot stand in for the topology test -- a strided group can be
+        smaller than one host's device count while living on two.
 
-        The world fabric map is gathered during distributed initialization, so
-        the group verdict is a local lookup with no dispatch-time collective.
+        The world fabric and multicast maps are gathered during distributed
+        initialization, so the group verdict is a local lookup with no
+        dispatch-time collective.
         """
         if self.tp_group is None:
             return False
 
         from tokenspeed_kernel.ops.communication.fabric import (
             group_has_fabric,
+            group_has_multicast,
         )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if not group_has_multicast(self.tp_group):
+            return False
 
         mapping = global_server_args_dict.get("mapping")
         nprocs_per_node = getattr(mapping, "nprocs_per_node", None)

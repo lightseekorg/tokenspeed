@@ -192,7 +192,9 @@ def test_the_probe_is_skipped_only_within_one_host_window(
         return ranks
 
     saved = fabric._host_map
+    saved_mc = fabric._multicast_map
     fabric._host_map = [rank // per_host for rank in range(max(ranks) + 1)]
+    fabric._multicast_map = [True] * (max(ranks) + 1)
     try:
         with (
             mock.patch.object(tail.dist, "is_initialized", return_value=True),
@@ -210,6 +212,7 @@ def test_the_probe_is_skipped_only_within_one_host_window(
             assert tail.multicast_reachable(asked) is not probed
     finally:
         fabric._host_map = saved
+        fabric._multicast_map = saved_mc
     assert bool(seen) is probed
     if probed:
         assert seen == [ranks]
@@ -230,7 +233,9 @@ def test_the_world_group_is_tested_like_any_other(per_host, probed) -> None:
 
     seen: list[list[int]] = []
     saved = fabric._host_map
+    saved_mc = fabric._multicast_map
     fabric._host_map = [rank // per_host for rank in range(8)]
+    fabric._multicast_map = [True] * 8
     try:
         # Uninitialised, ``dist.group.WORLD`` is None, so a gate that forwards
         # None unchanged is indistinguishable from one that resolves the world
@@ -255,6 +260,7 @@ def test_the_world_group_is_tested_like_any_other(per_host, probed) -> None:
             ranks_of.assert_called_once_with(world)
     finally:
         fabric._host_map = saved
+        fabric._multicast_map = saved_mc
     assert bool(seen) is probed
 
 
@@ -341,12 +347,16 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
         # checked and not only what it decodes: a call site packing a constant
         # leaves every decoded host identical and nothing else would see it.
         assert local[1].item() == 100, "the host id never reached the payload"
+        assert local[2].item() == 1, "the multicast bit never reached the payload"
         gathered[0].copy_(local)
         for rank, slot in enumerate(gathered[1:], start=1):
-            slot.copy_(torch.tensor([1, 100 + rank // 2], dtype=torch.int64))
+            slot.copy_(
+                torch.tensor([1, 100 + rank // 2, int(rank != 3)], dtype=torch.int64)
+            )
 
     fabric._fabric_map = None
     fabric._host_map = None
+    fabric._multicast_map = None
     try:
         with (
             mock.patch.object(
@@ -359,6 +369,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
                 fabric.torch.distributed, "all_gather", side_effect=two_hosts
             ),
             mock.patch.object(fabric, "fabric_allocation_supported", return_value=True),
+            mock.patch.object(fabric, "multicast_supported", return_value=True),
             mock.patch.object(
                 fabric, "host_identity", return_value=100
             ) as host_identity,
@@ -370,9 +381,12 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
             host_identity.assert_called_once_with()
             assert fabric.group_host_span([0, 1]) == 1
             assert fabric.group_host_span([0, 2]) == 2
+            assert fabric.group_has_multicast([0, 1, 2]) is True
+            assert fabric.group_has_multicast([0, 3]) is False
     finally:
         fabric._fabric_map = None
         fabric._host_map = None
+        fabric._multicast_map = None
 
 
 def test_the_host_id_is_stable_across_processes() -> None:
@@ -472,3 +486,105 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
                 fabric.group_has_fabric([0, 1])
     finally:
         fabric._fabric_map = saved
+
+
+@pytest.mark.parametrize(
+    "host_map,fabric_map,multicast_map,ranks,expected",
+    [
+        # Node-local group where NVLS multicast is unavailable (multicast_ptr=0):
+        # must decline.
+        ([0, 0, 0, 0], [True] * 4, [False] * 4, [0, 1, 2, 3], False),
+        # Cross-host MNNVL group where fabric handles work (1) but NVLS multicast
+        # is unavailable (0): must decline.
+        ([0, 0, 1, 1], [True] * 4, [False] * 4, [0, 1, 2, 3], False),
+        # One rank lacking multicast declines the whole group.
+        ([0, 0, 0, 0], [True] * 4, [True, True, False, True], [0, 1, 2, 3], False),
+        # An ungathered multicast map fails closed rather than guessing locally.
+        ([0, 0, 0, 0], [True] * 4, None, [0, 1, 2, 3], False),
+        # Healthy node-local NVLS group admits.
+        ([0, 0, 0, 0], [False] * 4, [True] * 4, [0, 1, 2, 3], True),
+        # Healthy cross-host MNNVL + NVLS group admits.
+        ([0, 0, 1, 1], [True] * 4, [True] * 4, [0, 1, 2, 3], True),
+    ],
+)
+def test_multicast_reachable_requires_nvls_multicast_support(
+    monkeypatch, host_map, fabric_map, multicast_map, ranks, expected
+) -> None:
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_host_map", host_map)
+    monkeypatch.setattr(fabric, "_fabric_map", fabric_map)
+    monkeypatch.setattr(fabric, "_multicast_map", multicast_map)
+
+    with (
+        mock.patch.object(
+            fabric.torch.distributed, "is_initialized", return_value=True
+        ),
+        mock.patch.object(
+            fabric.torch.distributed, "get_process_group_ranks", return_value=ranks
+        ),
+    ):
+        assert fabric.multicast_reachable(mock.Mock()) is expected
+
+
+def test_group_has_multicast_fails_closed_when_map_not_gathered(monkeypatch) -> None:
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_multicast_map", None)
+    monkeypatch.setattr(
+        fabric,
+        "multicast_supported",
+        lambda _dev: pytest.fail("must not fall back to local device probe"),
+    )
+    assert fabric.group_has_multicast([0, 1]) is False
+
+
+def test_multicast_supported_delegates_to_torch_symmetric_memory(monkeypatch) -> None:
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+    from torch._C._autograd import DeviceType
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    seen: list[tuple[object, int]] = []
+
+    def fake_has_multicast(device_type, device_index: int) -> bool:
+        seen.append((device_type, device_index))
+        return device_index == 0
+
+    monkeypatch.setattr(
+        _SymmetricMemory, "has_multicast_support", staticmethod(fake_has_multicast)
+    )
+    assert fabric.multicast_supported(0) is True
+    assert fabric.multicast_supported(1) is False
+    assert seen == [(DeviceType.CUDA, 0), (DeviceType.CUDA, 1)]
+
+
+def test_nvidia_create_rsag_state_rejects_zero_multicast_ptr(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import tokenspeed_kernel.ops.communication.triton as triton_comm
+
+    group = torch.distributed.ProcessGroup(0, 4)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(triton_comm, "_get_available_gpu_memory", lambda _dev: 0.0)
+    monkeypatch.setattr(
+        triton_comm.symm_mem,
+        "empty",
+        lambda shape, dtype, device: torch.empty(shape, dtype=dtype),
+    )
+    monkeypatch.setattr(
+        triton_comm.symm_mem,
+        "rendezvous",
+        lambda buf, group: SimpleNamespace(
+            multicast_ptr=0, signal_pad_size=1024 * 1024
+        ),
+    )
+    with pytest.raises(RuntimeError, match="multicast_ptr=0"):
+        triton_comm.nvidia_create_rsag_state(
+            group=group,
+            rank_in_group=0,
+            max_tokens=16,
+            hidden_size=64,
+            device=torch.device("cpu"),
+        )

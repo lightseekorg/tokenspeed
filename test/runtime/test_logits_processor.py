@@ -385,6 +385,7 @@ def _set_fabric(monkeypatch, supported: bool) -> None:
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
+    monkeypatch.setattr(fabric, "_multicast_map", [True] * 16)
     monkeypatch.setattr(LogitsProcessor, "_LOGITS_AG_STATES", {})
 
 
@@ -468,6 +469,36 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
         dp_lm_head_tp=False,
     )
     assert not processor._tp_group_multicast_reachable()
+
+
+@pytest.mark.parametrize("tp_group", [(0, 1, 2, 3), tuple(range(8))])
+@pytest.mark.parametrize("multicast_map", [[False] * 8, None])
+def test_tp_logits_all_gather_skips_when_nvls_multicast_unavailable(
+    monkeypatch, tp_group, multicast_map
+):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    _set_fabric(monkeypatch, True)
+    monkeypatch.setattr(fabric, "_multicast_map", multicast_map)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=len(tp_group),
+        tp_group=tp_group,
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    lm_head = SimpleNamespace(
+        weight=torch.ones((8, 2), dtype=torch.float32), num_embeddings_per_partition=8
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("must not create RSAG state without multicast"),
+    )
+
+    assert not processor._tp_group_multicast_reachable()
+    assert processor._init_all_gather_state(lm_head, 1) is None
 
 
 def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkeypatch):

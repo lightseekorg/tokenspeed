@@ -42,8 +42,12 @@ class TestAutoBackendTopology:
         backend._trtllm_ar.lamport_all_gather.return_value = None
         # No group prepared a one-hop exchange.
         backend._small_exchanges = {}
-        # A host-spread group's rsag routing keys on the fabric probe, so pin
-        # both the probe and the local device count the tests assume.
+        # A host-spread group's rsag routing keys on the fabric probe, and
+        # NVIDIA multicast routing keys on the gathered multicast map; pin
+        # _multicast_map and the local device count the tests assume.
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(fabric, "_multicast_map", [True] * 16)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
         return backend
 
@@ -163,6 +167,61 @@ class TestAutoBackendTopology:
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_node_local_token_ops_use_rsag(self, backend, method):
+        tensor = Mock()
+        scattered = [1] * 4
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, (0, 1, 2, 3), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._rsag, method).assert_called_once_with(
+            tensor, (0, 1, 2, 3), scattered
+        )
+        getattr(backend._nccl, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    @pytest.mark.parametrize("group", [(0, 1, 2, 3), tuple(range(8))])
+    @pytest.mark.parametrize("multicast_map", [[False] * 8, None])
+    def test_nvidia_token_ops_without_multicast_use_nccl(
+        self, backend, monkeypatch, method, group, multicast_map
+    ):
+        """When NVLS multicast is unavailable or ungathered, route RSAG to NCCL even with fabric."""
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto_module
+
+        self._set_fabric(monkeypatch, True)
+        monkeypatch.setattr(
+            auto_module,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=True, is_amd=False, is_cdna4=False),
+        )
+        monkeypatch.setattr(fabric, "_multicast_map", multicast_map)
+        tensor = Mock()
+        scattered = [1] * len(group)
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(tensor, group, scattered)
+
+        assert result == "nccl-result"
+        getattr(backend._nccl, method).assert_called_once_with(tensor, group, scattered)
+        getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_amd_node_local_token_ops_keep_rsag_without_nvidia_multicast(
+        self, backend, monkeypatch, method
+    ):
+        """AMD RSAG uses unicast peer pointers, not NVIDIA NVLS multicast."""
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto_module
+
+        monkeypatch.setattr(
+            auto_module,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=False, is_amd=True, is_cdna4=False),
+        )
+        monkeypatch.setattr(fabric, "_multicast_map", [False] * 4)
         tensor = Mock()
         scattered = [1] * 4
         getattr(backend._rsag, method).return_value = "rsag-result"
@@ -347,9 +406,16 @@ def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     original_tensor = torch.tensor
     original_empty_like = torch.empty_like
     monkeypatch.setattr(fabric, "_fabric_map", None)
+    monkeypatch.setattr(fabric, "_host_map", None)
+    monkeypatch.setattr(fabric, "_multicast_map", None)
+    monkeypatch.setattr(
+        fabric, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
+    )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
     monkeypatch.setattr(fabric, "fabric_allocation_supported", lambda device: True)
+    monkeypatch.setattr(fabric, "multicast_supported", lambda device: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.delenv("TORCH_SYMM_MEM_DISABLE_MULTICAST", raising=False)
     calls = []
 
     def fake_all_gather(outputs, local, group):
@@ -364,6 +430,8 @@ def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     assert fabric.gather_fabric_map() == [True, False, True, True]
     assert fabric.group_has_fabric((0, 2, 3))
     assert not fabric.group_has_fabric((0, 1))
+    assert fabric.group_has_multicast((0, 2, 3))
+    assert not fabric.group_has_multicast((0, 1))
     assert calls == [torch.distributed.group.WORLD]
 
 

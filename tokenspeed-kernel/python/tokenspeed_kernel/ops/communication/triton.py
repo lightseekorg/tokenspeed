@@ -1103,6 +1103,11 @@ def nvidia_create_rsag_state(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     handle = symm_mem.rendezvous(comm_buff, group=group)
+    if not handle.multicast_ptr:
+        raise RuntimeError(
+            "Triton RSAG requires a non-zero NVLS multicast address "
+            "(symm_mem.rendezvous returned multicast_ptr=0)"
+        )
     # Torch 2.9 has a fixed signal pad. Verify its actual capacity before
     # launching the same kernels; never silently run past the allocation.
     if handle.signal_pad_size < pad_bytes:

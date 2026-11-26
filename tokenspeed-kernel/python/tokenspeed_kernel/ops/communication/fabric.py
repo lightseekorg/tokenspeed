@@ -45,9 +45,11 @@ __all__ = [
     "fabric_allocation_supported",
     "gather_fabric_map",
     "group_has_fabric",
+    "group_has_multicast",
     "group_host_span",
     "host_identity",
     "multicast_reachable",
+    "multicast_supported",
 ]
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 _probe_cache: dict[int, bool] = {}
 _fabric_map: list[bool] | None = None
 _host_map: list[int] | None = None
+_multicast_map: list[bool] | None = None
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -188,6 +191,25 @@ def fabric_allocation_supported(device_index: int) -> bool:
     return cached
 
 
+def multicast_supported(device_index: int) -> bool:
+    """Return True iff PyTorch symmetric-memory NVLS multicast is available on ``device_index``.
+
+    Delegates to PyTorch's ``_SymmetricMemory.has_multicast_support``, which
+    checks both ``CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED`` and
+    ``TORCH_SYMM_MEM_DISABLE_MULTICAST`` directly.
+    """
+    try:
+        from torch._C._autograd import DeviceType
+        from torch._C._distributed_c10d import _SymmetricMemory
+        from torch.distributed import _symmetric_memory  # noqa: F401
+
+        return bool(
+            _SymmetricMemory.has_multicast_support(DeviceType.CUDA, device_index)
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
 def host_identity() -> int:
     """An id every rank on one host computes identically, and no other host does.
 
@@ -227,7 +249,7 @@ def gather_fabric_map() -> list[bool]:
     the ones that entered would wait out the NCCL timeout. The caller it
     replaced read a server argument, which was uniform; this reads the machine.
     """
-    global _fabric_map, _host_map
+    global _fabric_map, _host_map, _multicast_map
 
     if _fabric_map is not None:
         return _fabric_map
@@ -237,11 +259,16 @@ def gather_fabric_map() -> list[bool]:
         # No fabric to map, so every rank is its own host and every span declines.
         _fabric_map = [False] * world_size
         _host_map = list(range(world_size))
+        _multicast_map = [False] * world_size
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
     local = torch.tensor(
-        [int(fabric_allocation_supported(device.index)), host_identity()],
+        [
+            int(fabric_allocation_supported(device.index)),
+            host_identity(),
+            int(multicast_supported(device.index)),
+        ],
         dtype=torch.int64,
         device=device,
     )
@@ -249,8 +276,10 @@ def gather_fabric_map() -> list[bool]:
     torch.distributed.all_gather(gathered, local, group=torch.distributed.group.WORLD)
     _fabric_map = [bool(value[0].item()) for value in gathered]
     _host_map = [int(value[1].item()) for value in gathered]
+    _multicast_map = [bool(value[2].item()) for value in gathered]
     logger.info(
         f"fabric allocation available on {sum(_fabric_map)!s}/{len(_fabric_map)!s} "
+        f"ranks, NVLS multicast on {sum(_multicast_map)!s}/{len(_multicast_map)!s} "
         f"ranks across {len(set(_host_map))!s} hosts",
     )
     return _fabric_map
@@ -272,6 +301,19 @@ def group_has_fabric(ranks: Sequence[int]) -> bool:
             "distributed initialization before any reachability gate"
         )
     return all(_fabric_map[rank] for rank in ranks)
+
+
+def group_has_multicast(ranks: Sequence[int]) -> bool:
+    """Return whether every rank in ``ranks`` reported NVLS multicast support.
+
+    Reads the world map gathered by :func:`gather_fabric_map` with no
+    dispatch-time collective. Returns ``False`` when the map was never
+    gathered, matching :func:`multicast_reachable`'s fail-closed contract so
+    ranks cannot disagree and split between symmetric memory and NCCL.
+    """
+    if _multicast_map is None:
+        return False
+    return all(_multicast_map[rank] for rank in ranks)
 
 
 def group_host_span(ranks: Sequence[int]) -> int | None:
@@ -296,8 +338,11 @@ def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
 
     ``symm_mem`` importing is not enough: a cross-host group without fabric or
     IMEX still reports multicast support locally and then hangs inside the
-    rendezvous instead of letting the caller fall back. The host-span test is
-    at group granularity: a node-local subgroup of a multi-host job never
+    rendezvous instead of letting the caller fall back, while a host or VM
+    without NVLS multicast (``CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED == 0``
+    or ``TORCH_SYMM_MEM_DISABLE_MULTICAST=1``) completes the rendezvous with
+    valid unicast peer pointers and ``multicast_ptr == 0``. The host-span test
+    is at group granularity: a node-local subgroup of a multi-host job never
     needs fabric, and probing one would decline a group that works over plain
     NVLink on a machine with no fabric at all.
 
@@ -305,11 +350,12 @@ def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
     the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
     and starts on a multiple of three while still living on two hosts. What
     decides it is which host each rank sits on, which the world map records
-    beside the fabric verdict. Nothing is divided out of the visible device
-    count here: a job running fewer workers than a host has GPUs puts two hosts
-    inside one such window, and the group would skip the fabric test entirely.
+    beside the fabric and multicast verdicts. Nothing is divided out of the
+    visible device count here: a job running fewer workers than a host has GPUs
+    puts two hosts inside one such window, and the group would skip the fabric
+    test entirely.
 
-    Both terms come from the map gathered at distributed initialization, so
+    All terms come from the map gathered at distributed initialization, so
     every rank makes the same local decision, and a map never gathered declines
     rather than guessing at placement.
     """
@@ -318,6 +364,8 @@ def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
     ranks = torch.distributed.get_process_group_ranks(group)
     span = group_host_span(ranks)
     if span is None:
+        return False
+    if not group_has_multicast(ranks):
         return False
     if span <= 1:
         return True
