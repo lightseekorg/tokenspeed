@@ -256,9 +256,12 @@ rust::Vec<rust::String> ToRustStrings(const std::vector<std::string>& values) {
 }  // namespace
 
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events) {
-    // Advance peer_now_us_ first (without expiring) so events answered against
-    // the pre-tick state (Pin, Release, LookupAnswered) stamp against now_us
-    // and promote/deliver before PeerExports::Expire sweeps stale leases.
+    // Advance peer_now_us_ first (without expiring) so holder events answered
+    // against the pre-tick state (Lookup, Pin, Release) stamp against now_us
+    // and promote/release before PeerExports::Expire sweeps stale leases.
+    // Expire then runs before reader events (LookupAnswered, FetchDone) so
+    // coordinated lookup waits past their deadline still time out before stale
+    // answers are delivered, while FetchDone stamps against now_us.
     tokenspeed::ExecutionEvent execution_event;
     execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = false});
     for (const PeerEventView& event : events) {
@@ -273,19 +276,42 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                     .pages = FromView(rust::Slice<const PeerPageView>(event.pages.data(), event.pages.size()))});
                 break;
             case PeerEventKind::Release:
-                execution_event.With(tokenspeed::cache::PeerRelease{.lease = FromView(event.lease), .demote = event.demote});
+                execution_event.With(
+                    tokenspeed::cache::PeerRelease{.lease = FromView(event.lease), .demote = event.demote});
                 break;
             case PeerEventKind::LookupAnswered:
-                execution_event.With(
-                    tokenspeed::cache::PeerLookupAnswered{.lease = FromView(event.lease), .num_tokens = event.num_tokens});
-                break;
             case PeerEventKind::FetchDone:
-                execution_event.With(tokenspeed::cache::PeerFetchDone{.request_id = std::string(event.request_id),
-                                                                      .num_tokens = event.num_tokens});
                 break;
         }
     }
     execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = true});
+    for (const PeerEventView& event : events) {
+        switch (event.kind) {
+            case PeerEventKind::Lookup:
+            case PeerEventKind::Pin:
+            case PeerEventKind::Release:
+                break;
+            case PeerEventKind::LookupAnswered: {
+                unsigned tiers = 0;
+                for (const auto& page : event.pages) {
+                    tiers |= 1u << static_cast<unsigned>(FromView(page.tier));
+                }
+                execution_event.With(tokenspeed::cache::PeerLookupAnswered{
+                    .lease = FromView(event.lease),
+                    .num_tokens = event.num_tokens,
+                    .source_mask = tiers,
+                    .checkpoint = {event.checkpoint.begin(), event.checkpoint.end()}});
+                break;
+            }
+            case PeerEventKind::FetchDone:
+                execution_event.With(tokenspeed::cache::PeerFetchDone{.request_id = std::string(event.request_id),
+                                                                      .num_tokens = event.num_tokens,
+                                                                      .dispatch_us = event.dispatch_us,
+                                                                      .writable_us = event.writable_us,
+                                                                      .terminal_us = event.terminal_us});
+                break;
+        }
+    }
     scheduler.Advance(execution_event);
 }
 
@@ -340,7 +366,8 @@ PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler) {
                          .looking_requests = stats.looking_requests,
                          .landing_requests = stats.landing_requests,
                          .landed_tokens = stats.landed_tokens,
-                         .failed_landings = stats.failed_landings};
+                         .failed_landings = stats.failed_landings,
+                         .unused_host_landings = stats.unused_host_landings};
 }
 
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,
@@ -695,6 +722,7 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
         .prompt_tokens = stats.prefix_hits.prompt_tokens,
         .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
         .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .peer_hit_tokens = stats.prefix_hits.peer_hit_tokens,
         .l3_hit_tokens = stats.storage_query_hit_tokens,
     };
 }
@@ -1033,15 +1061,63 @@ void set_profile_span_sink(bool installed) {
     tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
 }
 
-rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan) {
-    rust::Vec<PeerFetchView> out;
-    for (const tokenspeed::PeerFetchOperation& fetch : plan.peer_fetches) {
-        out.push_back(PeerFetchView{.request_id = rust::String(fetch.request_id),
+static PeerFetchView FetchView(const tokenspeed::PeerFetchOperation& fetch) {
+    return PeerFetchView{.request_id = rust::String(fetch.request_id),
                                     .lease = ToView(fetch.lease),
                                     .holder = rust::String(fetch.holder),
                                     .begin_tokens = fetch.begin_tokens,
                                     .end_tokens = fetch.end_tokens,
-                                    .destinations = ToView(fetch.destinations)});
+                                    .destinations = ToView(fetch.destinations),
+                                    .checkpoint = ToRustVec(fetch.checkpoint),
+                                    .prefix_hashes = ToRustStrings(fetch.prefix_hashes),
+                                    .tokens = ToRustVec(fetch.tokens)};
+}
+
+bool release_peer_pin(const std::shared_ptr<tokenspeed::PeerPinRelease>& handle) { return handle && handle->Release(); }
+
+std::shared_ptr<tokenspeed::PeerPinRelease> peer_release_handle(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
+    return scheduler.PeerReleaseHandle(FromView(lease));
+}
+
+bool enable_async_host_peer(tokenspeed::Scheduler& scheduler) { return scheduler.EnableAsyncHostPeer(); }
+bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive) { return scheduler.EnableAsyncDevicePeer(adaptive); }
+
+rust::Vec<PeerFetchView> reserve_peer_host(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int32_t tokens, bool& retry) {
+    rust::Vec<PeerFetchView> out;
+    if (auto fetch = scheduler.ReservePeerHost(FromView(lease), tokens, retry)) out.push_back(FetchView(*fetch));
+    return out;
+}
+
+bool apply_peer_export(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us) {
+    switch (event.kind) {
+        case PeerEventKind::Lookup: return scheduler.ApplyPeerExport(LookupFromView(event), now_us);
+        case PeerEventKind::Pin: {
+            std::optional<tokenspeed::cache::PeerLookup> checkpoint;
+            if (event.max_tokens > 0) checkpoint.emplace(LookupFromView(event));
+            scheduler.ApplyPeerExport(tokenspeed::cache::PeerPin{
+            .lease = FromView(event.lease), .num_tokens = event.num_tokens,
+            .pages = FromView(rust::Slice<const PeerPageView>(event.pages.data(), event.pages.size()))}, now_us, checkpoint ? &*checkpoint : nullptr);
+            return scheduler.PeerLeaseHeld(FromView(event.lease));
+        }
+        case PeerEventKind::Release: {
+            const bool held = scheduler.PeerLeaseHeld(FromView(event.lease));
+            scheduler.ApplyPeerExport(tokenspeed::cache::PeerRelease{
+            .lease = FromView(event.lease), .demote = event.demote}, now_us); return held;
+        }
+        default: throw std::invalid_argument("expected holder event");
+    }
+}
+
+rust::Vec<PeerLocalChoice> plan_peer_local_choices(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<PeerLocalChoice> out;
+    for (const auto& [id, reason] : plan.peer_local_choices) out.push_back({rust::String(id), rust::String(reason)});
+    return out;
+}
+
+rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<PeerFetchView> out;
+    for (const tokenspeed::PeerFetchOperation& fetch : plan.peer_fetches) {
+        out.push_back(FetchView(fetch));
     }
     return out;
 }

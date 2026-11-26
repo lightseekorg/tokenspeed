@@ -218,6 +218,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
+            table_layout=config.ple_table_layout,
             enable_hot_cache=config.enable_ple_hot_cache,
             prefix=table_prefix,
         )

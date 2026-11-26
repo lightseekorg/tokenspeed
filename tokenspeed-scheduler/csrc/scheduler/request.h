@@ -46,6 +46,20 @@ class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap);
 
+    // Cleared on the first actual prefill admission after a successful adaptive READ.
+    struct PeerDispatchSample {
+        std::int64_t fence_wait_us;
+        std::int64_t release_us;
+        std::size_t batch_class;
+    };
+    std::optional<PeerDispatchSample> peer_dispatch_sample;
+    // For Device landings the first actual model operation determines how much KV was reused.
+    struct PeerPrefixHit {
+        std::int32_t local, host, end;
+    };
+    std::optional<PeerPrefixHit> pending_peer_hit;
+    // Last reason a hinted reader kept local admission available. Emitted only when it takes it.
+    const char* peer_local_reason{nullptr};
     const std::string& Id() const { return id_; }
     std::uint64_t AdmissionId() const { return admission_id_; }
     std::uint64_t NextRestoreSequence() {

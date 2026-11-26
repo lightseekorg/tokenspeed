@@ -229,6 +229,8 @@ pub struct PeerUsage {
     pub actual: Option<u64>,
     /// Last authoritative peer lifecycle result observed by this request.
     pub disposition: &'static str,
+    /// Scheduler choice at local admission, when observed.
+    pub local_reason: Option<String>,
     /// Time of the first lookup dispatch.
     pub lookup_at: Option<std::time::Instant>,
     /// Time at which a successful lookup advanced to admission.

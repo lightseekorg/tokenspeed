@@ -969,14 +969,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
-        // A peer servicer answers from the scheduler between rounds, and the
-        // loop releases it only while it waits on the device, an idle frontend,
-        // or (when no forward or copy batch is queued on the device) an
-        // attention-DP collective or idle forward. A loop waiting on a transfer
-        // -- a prefill engine on its PD sends, a landing on its reads -- does
-        // none of those and spins through empty rounds, so it hands the
-        // scheduler to a waiting servicer once per round; with none waiting
-        // this costs one atomic read.
+        // Hand off to a waiting peer servicer even in rounds with no device,
+        // transfer, collective, or frontend wait. With no waiter this costs
+        // one atomic read.
         ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
@@ -1296,11 +1291,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        // Never unlock `self.scheduler` here: `next_execution_plan` above may
-        // already have relocated compacted Device blocks (`pages_to_copy`) or
-        // published overlapping prefill pages into `PrefixCacheIndex` before
-        // `data_plane.execute` submits their GPU work.
-        let dp = self.dp_round(forward.as_ref(), stop, false)?;
+        // Keep `self.scheduler` locked for coordinated peers and whenever
+        // `pages_to_copy` may still be pending on the device; an autonomous
+        // single-member peer can safely use the scheduler during the DP
+        // collective when no device copy batch is unconfirmed.
+        let dp_unlock = self.peer.as_ref().is_some_and(Peer::autonomous)
+            && !has_device_copies
+            && self.copies_confirmed_at.is_none();
+        let dp = self.dp_round(forward.as_ref(), stop, dp_unlock)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
             // Padding for a peer is not a local request batch.
             forward = None;
@@ -1371,15 +1369,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut queued = false;
         let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
         if device_work {
-            let executed =
-                if idle_forward && !has_device_copies && self.copies_confirmed_at.is_none() {
-                    let data_plane = &mut self.data_plane;
-                    ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                        data_plane.execute(plan, &dispatch)
-                    })?
-                } else {
-                    self.data_plane.execute(plan, &dispatch)?
-                };
+            let copies_clear = !has_device_copies && self.copies_confirmed_at.is_none();
+            let executed = if copies_clear
+                && (idle_forward || self.peer.as_ref().is_some_and(Peer::autonomous))
+            {
+                let data_plane = &mut self.data_plane;
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    data_plane.execute(plan, &dispatch)
+                })?
+            } else {
+                self.data_plane.execute(plan, &dispatch)?
+            };
             if let Some(pending) = executed {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
@@ -1493,6 +1493,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     peer.end_lookup(&rid, outcome);
                 }
             }
+            for reason in request.peer_local_reasons {
+                metrics.peer.decision(&reason);
+            }
             for (expected, actual, outcome) in request.peer_usage {
                 metrics.peer.usage(expected, actual, outcome);
             }
@@ -1527,11 +1530,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     delta.device_hit_tokens + delta.host_hit_tokens,
                 );
             }
-            metrics.record_prefix_hits(
+            metrics.record_prefix_hits_with_peer(
                 delta.prompt_tokens,
                 delta.device_hit_tokens,
                 delta.host_hit_tokens,
                 delta.l3_hit_tokens,
+                delta.peer_hit_tokens,
             );
         }
 
@@ -3081,6 +3085,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     usage.disposition = result;
                     if result == "admission" {
                         usage.admission_at = Some(Instant::now());
+                    } else if result == "landing" {
+                        usage.admission_at = None;
                     } else if let Some(start) = usage.lookup_at.take() {
                         metrics.peer.stage(
                             "lookup_to_ready",
@@ -3117,6 +3123,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let fetches = plan.peer_fetches();
             let lookups = self.scheduler.take_peer_lookups();
             if let Some(metrics) = &self.metrics {
+                for choice in plan.peer_local_choices() {
+                    if let Some(usage) = self.outputs.peer_usage(&choice.request_id) {
+                        usage.local_reason = Some(choice.reason);
+                    }
+                }
                 let now = Instant::now();
                 for lookup in &lookups {
                     if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
@@ -3218,7 +3229,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = if allow_unlock && self.in_flight.is_empty() {
+        let rows = if allow_unlock
+            && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::autonomous))
+        {
             let mesh = &mut self.ranks.mesh;
             ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
         } else {
@@ -3355,7 +3368,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         };
         let _span = profile::span("EventLoop::poll_transfers");
-        let polled = transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)?;
+        // Decode may be waiting for KV from a Prefill that needs a lookup
+        // from this same Decode. Only the transport participates in this poll.
+        let polled = ArcMutexGuard::unlocked(&mut self.scheduler, || {
+            transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)
+        })?;
         for event in polled {
             tracing::debug!(?event, "transfer event");
             match event {
@@ -3748,6 +3765,7 @@ fn prefix_hit_delta(
     let last = std::mem::replace(previous, hits);
     ts_scheduler::PrefixHitView {
         prompt_tokens: hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+        peer_hit_tokens: hits.peer_hit_tokens.saturating_sub(last.peer_hit_tokens),
         device_hit_tokens: hits
             .device_hit_tokens
             .saturating_sub(last.device_hit_tokens),
@@ -3767,6 +3785,7 @@ mod tests {
             prompt_tokens: 48,
             device_hit_tokens: 16,
             host_hit_tokens: 8,
+            peer_hit_tokens: 12,
             l3_hit_tokens: 4,
         };
         assert_eq!(prefix_hit_delta(&mut previous, hits), hits);

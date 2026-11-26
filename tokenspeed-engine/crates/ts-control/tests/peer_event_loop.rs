@@ -51,8 +51,9 @@ use ts_control::{
         net::{Inbound, PeerNet},
         push::{PagePusher, PushItem},
         read::Arena,
+        servicer::empty_event,
         wire::{Prompt, Reply, Request},
-        Peer, PeerListener, PeerSettings,
+        Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_pd::LandedRequest;
@@ -565,12 +566,15 @@ fn unlocked_gate_idle_forward_and_overlap_complete_answer_peer() {
     );
     let p0 = Peer::start(
         peer_settings(&holder_name),
+        PeerProgress::Coordinated,
         0,
         vec![rank_geometry(0)],
         Some(pl),
         s0.clone(),
-        Arc::new(Arena::new(200_000)),
-        Arc::new(NoPushes),
+        PeerTransfers {
+            reader: Arc::new(Arena::new(200_000)),
+            pusher: Arc::new(NoPushes),
+        },
     )
     .unwrap();
     let (fe0, fe1, h0, h1, stop) = (
@@ -760,22 +764,28 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
     let geoms = vec![rank_geometry(0), rank_geometry(50_000)];
     let p0 = Peer::start(
         peer_settings(&holder_name),
+        PeerProgress::Coordinated,
         0,
         geoms.clone(),
         Some(pl),
         s0.clone(),
-        Arc::new(arena.clone()),
-        Arc::new(NoPushes),
+        PeerTransfers {
+            reader: Arc::new(arena.clone()),
+            pusher: Arc::new(NoPushes),
+        },
     )
     .unwrap();
     let p1 = Peer::start(
         peer_settings(&holder_name),
+        PeerProgress::Coordinated,
         1,
         geoms,
         None,
         s1.clone(),
-        Arc::new(arena),
-        Arc::new(NoPushes),
+        PeerTransfers {
+            reader: Arc::new(arena),
+            pusher: Arc::new(NoPushes),
+        },
     )
     .unwrap();
     let (fe0, h0, h1, stop) = (
@@ -928,10 +938,7 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
         prefix_hashes: p.prefix_hashes,
         tokens: p.tokens,
         max_tokens: p.max_tokens,
-        num_tokens: 0,
-        pages: Vec::new(),
-        demote: false,
-        request_id: String::new(),
+        ..empty_event()
     };
     let ans = sched.answer_peer_lookup_bounded(&lev, 0);
     assert_eq!(ans.num_tokens, 3 * PAGE);
@@ -940,26 +947,16 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
     let pev = PeerEventView {
         kind: PeerEventKind::Pin,
         lease: lease.clone(),
-        prefix_hashes: Vec::new(),
-        tokens: Vec::new(),
-        max_tokens: 0,
         num_tokens: ans.num_tokens,
         pages: ans.pages,
-        demote: false,
-        request_id: String::new(),
+        ..empty_event()
     };
     sched.advance_peer(t0 + 100_000, &[pev]).unwrap();
     assert!(sched.peer_lease_held(&lease) && !sched.clear_cache());
     let rev = PeerEventView {
         kind: PeerEventKind::Release,
         lease: lease.clone(),
-        prefix_hashes: Vec::new(),
-        tokens: Vec::new(),
-        max_tokens: 0,
-        num_tokens: 0,
-        pages: Vec::new(),
-        demote: false,
-        request_id: String::new(),
+        ..empty_event()
     };
     sched.advance_peer(t0 + 150_000, &[rev]).unwrap();
     assert!(!sched.peer_lease_held(&lease) && sched.clear_cache());
@@ -1066,12 +1063,15 @@ fn copies_confirmed_at_holds_gate_and_idle_forward_locked_until_confirming_forwa
     );
     let p0 = Peer::start(
         peer_settings(&holder_name),
+        PeerProgress::Coordinated,
         0,
         vec![compaction_rank_geometry(0)],
         Some(pl),
         s0.clone(),
-        Arc::new(Arena::new(200_000)),
-        Arc::new(NoPushes),
+        PeerTransfers {
+            reader: Arc::new(Arena::new(200_000)),
+            pusher: Arc::new(NoPushes),
+        },
     )
     .unwrap();
     let (fe0, fe1, h0, h1, stop) = (

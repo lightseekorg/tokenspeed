@@ -63,19 +63,24 @@ std::vector<const CacheBlockRef*> PeerHostLandings::HeldHostBlockRefs() const {
 std::optional<PeerHostLandings::Started> PeerHostLandings::Start(const PromptPrefix& prompt,
                                                                  const std::string& request_id,
                                                                  const PeerLeaseId& lease, const std::string& holder,
-                                                                 std::int32_t local_tokens) {
+                                                                 std::int32_t local_tokens, bool* retry) {
     FatalCheck(!by_request_.contains(request_id), "a request lands into Host once at a time");
     const std::size_t held = NumHeldHostBlocks();
     const auto limit = static_cast<std::size_t>(max_host_blocks_);
-    if (held >= limit) return std::nullopt;
+    if (retry) *retry = false;
     // The holder answered the boundary whole, so every key it needs stands in
     // as a Host hit: the reservation then gives the keys the Host lacks above
     // the Device's hit blocks, under the same Host-suffix rule as admission.
     const StorageQuery boundary =
         coordinator_.Storage().SharedPrefixKeys(prompt, std::numeric_limits<std::size_t>::max());
     if (boundary.max_tokens != prompt.max_tokens) return std::nullopt;
-    StorageReservation reservation = coordinator_.Storage().ReserveStoragePrefix(prompt, boundary.keys, limit - held);
-    if (reservation.keys.empty() || reservation.num_tokens != prompt.max_tokens) return std::nullopt;
+    bool shortage = false;
+    StorageReservation reservation = coordinator_.Storage().ReserveExactStoragePrefix(
+        prompt, boundary.keys, limit - std::min(held, limit), limit, shortage);
+    if (reservation.keys.empty()) {
+        if (retry) *retry = shortage;
+        return std::nullopt;
+    }
 
     PeerFetchOperation fetch{.request_id = request_id,
                              .lease = lease,

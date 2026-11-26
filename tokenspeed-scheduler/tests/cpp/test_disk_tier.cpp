@@ -535,7 +535,7 @@ TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
     exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
     exports.Pin(cache.coordinator,
                 cache::PeerPin{.lease = lookup.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
-                /*now_us=*/1);
+                /*now_us=*/1, nullptr);
     EXPECT_TRUE(exports.Held(lookup.lease));
     EXPECT_EQ(cache.coordinator.Disk().NumPinnedDiskCachedBlocks(), 2);
     exports.Release(cache.coordinator, cache::PeerRelease{.lease = lookup.lease, .demote = false}, /*now_us=*/2);
