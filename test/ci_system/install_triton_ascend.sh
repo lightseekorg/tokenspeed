@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# tokenspeed-kernel/python's setup.py selects its dependency set from this
+# variable; on an Ascend host no CUDA/ROCm is detectable, so default to npu.
+export TOKENSPEED_KERNEL_BACKEND="${TOKENSPEED_KERNEL_BACKEND:-npu}"
+
 TOKENSPEED_CANN_ROOT="${TOKENSPEED_CANN_ROOT:-/usr/local/Ascend/cann-9.0.0}"
 TOKENSPEED_TVM_FFI_VERSION="${TOKENSPEED_TVM_FFI_VERSION:-0.1.13.post3}"
 TOKENSPEED_TRITON_ASCEND_VERSION="${TOKENSPEED_TRITON_ASCEND_VERSION:-3.2.1}"
@@ -56,13 +60,22 @@ python -m pip install --no-deps -e "${TOKENSPEED_REPO_ROOT}/tokenspeed-kernel-np
 
 # Install the remaining in-repo runtime packages editable so runtime tests run
 # against this checkout. --no-deps keeps the pinned PyPI versions above intact.
-for _pkg in tokenspeed-scheduler tokenspeed-engine tokenspeed-kernel python; do
+for _pkg in tokenspeed-scheduler tokenspeed-engine tokenspeed-kernel/python python; do
     _pkg_dir="${TOKENSPEED_REPO_ROOT}/${_pkg}"
     if [[ ! -d "${_pkg_dir}" ]]; then
         echo "Missing in-repo package directory: ${_pkg_dir}" >&2
         exit 1
     fi
-    python -m pip install --no-deps -e "${_pkg_dir}"
+    # tokenspeed-kernel's setup.py shells out to `python -m pip` to install its
+    # npu backend requirements. pip's isolated build env strips the venv
+    # site-packages from that subprocess, so the nested pip cannot import
+    # itself. Its build requirements (setuptools/wheel/apache-tvm-ffi) are
+    # already installed above, so build it in place instead.
+    _build_iso_flag=()
+    if [[ "${_pkg}" == "tokenspeed-kernel/python" ]]; then
+        _build_iso_flag=(--no-build-isolation)
+    fi
+    python -m pip install --no-deps "${_build_iso_flag[@]}" -e "${_pkg_dir}"
 done
 
 # tokenspeed-smg / tokenspeed-mooncake / tokenspeed-smg-grpc-proto /
