@@ -52,18 +52,24 @@ pub fn validate_row(
     if tail.is_nan() || tail > 1e-4 || (k as i64 == vocab_size && tail != f32::NEG_INFINITY) {
         return Err(invalid("invalid tail log mass"));
     }
+    let mut head_ids = [0i32; 128];
     for j in 0..k {
         let id = int(2 + j);
         let value = float(2 + k + j);
-        if id < 0 || i64::from(id) >= vocab_size || (0..j).any(|i| int(2 + i) == id) {
+        if id < 0 || i64::from(id) >= vocab_size {
             return Err(invalid("head IDs must be distinct vocabulary IDs"));
         }
+        head_ids[j] = id;
         if !value.is_finite() || value > 0.0 {
             return Err(invalid("head logprobs must be finite and nonpositive"));
         }
         if id == token && (f64::from(value) - logprob).abs() > 1e-6 {
             return Err(invalid("head and sampled logprobs disagree"));
         }
+    }
+    head_ids[..k].sort_unstable();
+    if head_ids[..k].windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid("head IDs must be distinct vocabulary IDs"));
     }
     if tail > 0.0 {
         row[4..8].copy_from_slice(&0f32.to_le_bytes());
@@ -118,6 +124,17 @@ mod tests {
             let mut packed = row(3, -1.0, &[(3, -0.5), (id, -2.0)]);
             assert!(validate_row(&mut packed, 3, -0.5, 2, 8).is_err());
         }
+    }
+
+    #[test]
+    fn head_validation_handles_unsorted_ids_and_a_distant_duplicate_at_max_k() {
+        let mut head: Vec<_> = (0..128).rev().map(|id| (id, -0.5)).collect();
+        let original = row(17, -1.0, &head);
+        let mut packed = original.clone();
+        validate_row(&mut packed, 17, -0.5, 128, 256).unwrap();
+        assert_eq!(packed, original);
+        head[127].0 = head[0].0;
+        assert!(validate_row(&mut row(17, -1.0, &head), 17, -0.5, 128, 256).is_err());
     }
 
     #[test]

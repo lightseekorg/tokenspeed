@@ -37,6 +37,34 @@ class FullVocabScores:
     logprobs: torch.Tensor
     log_tail: torch.Tensor
     form: str
+    vocab_block: int
+    kernel_name: str
+
+    def sampled_logprobs(
+        self, tokens: torch.Tensor, *, prediction_rows: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Gather scalar scores without copying full vocabulary rows for a tree."""
+        target = tokens.long().clamp(0, self.shifted.shape[1] - 1)
+        if prediction_rows is None:
+            selected = self.shifted.gather(1, target[:, None]).squeeze(1)
+            log_z = self.log_z
+        else:
+            selected = self.shifted[prediction_rows, target]
+            log_z = self.log_z.index_select(0, prediction_rows)
+        return selected - log_z if self.form == "direct" else -(log_z - selected)
+
+    def rows(self, rows: slice) -> FullVocabScores:
+        """View the same normalizer in one part of a mixed forward."""
+        return FullVocabScores(
+            self.shifted[rows],
+            self.log_z[rows],
+            self.ids[rows],
+            self.logprobs[rows],
+            self.log_tail[rows],
+            self.form,
+            self.vocab_block,
+            self.kernel_name,
+        )
 
     def pack(
         self, tokens: torch.Tensor, *, prediction_rows: torch.Tensor | None
@@ -49,12 +77,13 @@ class FullVocabScores:
 
         Returns:
             Int32 rows [sampled ID, tail bits, K IDs, K logprob bits] and FP32
-            sampled logprobs sharing the head's normalizer. The caller removes
-            unaccepted positions and graph padding before publishing rows.
+            sampled logprobs sharing the head's normalizer. Both are views of
+            one [rows, 3 + 2*K] int32 allocation, whose private final word is the
+            sampled logprob's bits. The caller removes unaccepted positions and
+            graph padding before publishing rows.
         """
-        shifted, log_z, ids, head, tail = (
+        shifted, ids, head, tail = (
             self.shifted,
-            self.log_z,
             self.ids,
             self.logprobs,
             self.log_tail,
@@ -68,25 +97,24 @@ class FullVocabScores:
                 raise ValueError(
                     "accepted path must contain one prediction row per output slot"
                 )
-            shifted, log_z, ids, head, tail = (
-                value.index_select(0, prediction_rows)
-                for value in (shifted, log_z, ids, head, tail)
+            ids, head, tail = (
+                value.index_select(0, prediction_rows) for value in (ids, head, tail)
             )
         # Unaccepted slots can contain sentinels. Keep their original ID in
         # the packed row; clamp only the gather address to avoid a device fault.
-        target = tokens.long().clamp(0, shifted.shape[1] - 1)
-        selected = shifted.gather(1, target[:, None]).squeeze(1)
-        sampled = selected - log_z if self.form == "direct" else -(log_z - selected)
+        sampled = self.sampled_logprobs(tokens, prediction_rows=prediction_rows)
+        # The private final word shares one pinned D2H with the binary row.
         packed = torch.cat(
             (
                 tokens.to(torch.int32)[:, None],
                 tail.contiguous().view(torch.int32)[:, None],
                 ids.to(torch.int32),
                 head.contiguous().view(torch.int32),
+                sampled.contiguous().view(torch.int32)[:, None],
             ),
             dim=1,
         )
-        return packed, sampled
+        return packed[:, :-1], packed[:, -1].view(torch.float32)
 
 
 class FullVocabTopK:
@@ -154,4 +182,13 @@ class FullVocabTopK:
         # Removing the common offset avoids cancellation between large log sums.
         tail_logits = shifted.scatter(1, ids, -torch.inf)
         tail = torch.logsumexp(tail_logits, dim=-1) - log_z
-        return FullVocabScores(shifted, log_z, ids, head, tail, self.form)
+        return FullVocabScores(
+            shifted,
+            log_z,
+            ids,
+            head,
+            tail,
+            self.form,
+            self.vocab_block,
+            self.plan.kernel.name,
+        )

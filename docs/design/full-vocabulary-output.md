@@ -8,7 +8,8 @@ order are required. Pipeline parallelism, sharded sampling, synthetic acceptance
 and synthetic harness output tokens are rejected.
 
 The request sets `return_full_vocab_topk=true`, `return_logprob=true`,
-`top_logprobs_num=K` and `stream=false`. Admission requires the configured width
+`top_logprobs_num=K`. Binary rows follow the selected token streaming cadence,
+including a non-streaming request's forced refresh. Admission requires the configured width
 and an unmodified temperature-one, full-vocabulary distribution. Grammar,
 penalties and sampling truncation are rejected. The ordinary top-logprob path
 keeps its existing limits and semantics.
@@ -28,7 +29,10 @@ sufficient evidence of bitwise agreement.
 This work runs on the same eager/graph path and uses a fixed K for the deployment.
 The graph's padded outputs are sliced to the live batch. Verification maps the
 accepted tree path to target prediction rows; chain verification uses its
-existing prediction order. The CPU commit selects accepted tokens, applies stop
+existing prediction order. Sampled scoring can reuse the original normalizer only when its block width,
+subtraction form and selected provider match, and no grammar mask changed the
+rows. Tree scalar gathers index the original logits directly instead of copying
+whole vocabulary rows. The CPU commit selects accepted tokens, applies stop
 trimming, validates each retained row and overrides sampled logprobs only for
 requests asking for full-vocabulary output. Ordinary co-batched requests retain
 their existing sampled-logprob values. Enabling the launch option adds scoring
@@ -47,6 +51,17 @@ tail float32 bits, K head IDs, and K head float32 logprob bits. The output wire
 tail `output_full_vocab_topk` contains contiguous bytes per request. It is
 independent of JSON top-logprob lists. The client receives owned bytes alongside
 the same emitted tokens and sampled logprobs.
+
+On the device, each row has one private extra word holding the sampled score's
+FP32 bits. The binary columns and sampled scores share one pinned, asynchronous
+D2H copy. The result owns that host allocation until its completion query copies
+it; no reusable host slot can be overwritten while a result is in flight. The
+existing copy event covers this transfer, with no extra host wait. Python exports
+buffer views and Rust owns one flat byte vector. Commit copies only retained rows
+to request storage and validates in place, rolling back a bad row. Each emitted
+chunk takes ownership of those unsent bytes; the request does not retain or copy
+already delivered binary history. ID uniqueness
+uses a fixed stack array and sorting rather than pairwise comparisons.
 
 P/D status metadata carries an owned first-token row together with its sampled
 logprob. Decode includes it before its own rows. The engine does not publish to

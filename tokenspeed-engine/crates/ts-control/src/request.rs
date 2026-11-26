@@ -295,7 +295,7 @@ pub struct RequestState {
     pub output_token_cumulative_probs: Vec<f64>,
     /// Their top-k alternatives' logprobs and ids, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
-    /// Binary full-vocabulary rows, in committed output-token order.
+    /// Unsent binary full-vocabulary rows, moved into each streamed output.
     pub output_full_vocab_topk: Vec<u8>,
     /// Zero for ordinary requests; otherwise the launch-time head width.
     pub full_vocab_top_k: usize,

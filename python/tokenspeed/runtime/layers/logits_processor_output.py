@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.sampling.full_vocab import FullVocabScores
+
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
@@ -70,6 +72,8 @@ class LogitsProcessorOutput:
     # Flat output-token order, including verify-window padding until commit.
     full_vocab_topk: torch.Tensor | None = None
     full_vocab_logprobs: torch.Tensor | None = None
+    # Original-logit scores reusable by samplers scoring that same distribution.
+    logprob_scores: FullVocabScores | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logprobs of the prompt rows the forward's ``InputLogprobPlan``

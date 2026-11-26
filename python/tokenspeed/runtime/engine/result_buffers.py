@@ -63,6 +63,11 @@ def completed_result(
             (result_buffer(values), result_buffer(ids)) if values is not None else None
         )
 
+    if results.full_vocab_topk is not None and (
+        results.full_vocab_logprobs is None
+        or results.full_vocab_logprobs.shape != results.full_vocab_topk.shape[:1]
+    ):
+        raise ValueError("binary rows and sampled logprobs have different lengths")
     logprobs = None
     if (
         results.input_token_logprobs is not None
@@ -75,17 +80,11 @@ def completed_result(
             top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
             top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
             (
-                list(
-                    zip(
-                        results.full_vocab_logprobs.tolist(),
-                        (
-                            row.tobytes()
-                            for row in result_buffer(results.full_vocab_topk).astype(
-                                "<i4", copy=False
-                            )
-                        ),
-                        strict=True,
-                    )
+                (
+                    result_buffer(results.full_vocab_logprobs),
+                    result_buffer(results.full_vocab_topk)
+                    .astype("<i4", copy=False)
+                    .view(np.uint8),
                 )
                 if results.full_vocab_topk is not None
                 else None

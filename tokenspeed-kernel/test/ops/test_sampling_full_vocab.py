@@ -89,3 +89,28 @@ def test_full_vocab_packs_tree_prediction_rows_in_accepted_order():
     assert torch.equal(packed[:, 0], tokens.to(torch.int32))
     assert torch.equal(packed[:, 2:4], scores.ids[prediction_rows].to(torch.int32))
     assert torch.equal(packed[:, 1], scores.log_tail[prediction_rows].view(torch.int32))
+
+
+@pytest.mark.parametrize("form", ["direct", "negative-cross-entropy"])
+def test_shared_scores_and_tree_gathers_preserve_selected_bits(form):
+    from tokenspeed_kernel.ops.sampling import blockwise_logprobs
+
+    logits = torch.arange(96, dtype=torch.float32).reshape(6, 16) % 13
+    scorer = FullVocabTopK(k=4, vocab_block=8, form=form, solution="torch")
+    scores = scorer.prepare(logits)
+    tokens = torch.tensor([0, 1, 2, 3, 4, 5])
+    expected = blockwise_logprobs(
+        logits, tokens, vocab_block=8, form=form, solution="torch"
+    )
+    actual = scores.sampled_logprobs(tokens, prediction_rows=None)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    for part in (slice(0, 2), slice(2, None)):
+        value = scores.rows(part).sampled_logprobs(tokens[part], prediction_rows=None)
+        assert torch.equal(value.view(torch.int32), expected[part].view(torch.int32))
+    path = torch.tensor([0, 2, 2, 3, 5, 5])
+    expected = blockwise_logprobs(
+        logits[path], tokens, vocab_block=8, form=form, solution="torch"
+    )
+    packed, actual = scores.pack(tokens, prediction_rows=path)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(packed[:, 0], tokens.int())

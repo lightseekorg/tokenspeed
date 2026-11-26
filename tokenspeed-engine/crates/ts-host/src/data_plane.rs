@@ -1048,7 +1048,7 @@ type Completed = (
         Option<Py<PyAny>>,
         Option<TopLogprobBuffers>,
         Option<TopLogprobBuffers>,
-        Option<Vec<(f64, Vec<u8>)>>,
+        Option<TopLogprobBuffers>,
     )>,
     Option<Py<PyAny>>,
     Option<Vec<i32>>,
@@ -1088,7 +1088,9 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         input_token_logprobs: input_token_logprobs.map(floats).transpose()?,
         input_top_logprobs: input_top_logprobs.map(top).transpose()?,
         output_top_logprobs: output_top_logprobs.map(top).transpose()?,
-        full_vocab_topk,
+        full_vocab_topk: full_vocab_topk
+            .map(|(values, rows)| result_buffers::full_vocab_topk(values.bind(py), rows.bind(py)))
+            .transpose()?,
     })
 }
 

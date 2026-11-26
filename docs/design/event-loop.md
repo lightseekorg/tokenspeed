@@ -95,12 +95,13 @@ EPD encode-mode metric ownership and units are documented in
 
 A request may set `return_full_vocab_topk` and select the server's fixed
 `--full-vocab-top-k` width through `top_logprobs_num`. Ingress requires
-non-streaming sampled logprobs, a blockwise normalizer and the unmodified
+sampled logprobs, a blockwise normalizer and the unmodified
 full-vocabulary temperature-one distribution; pipeline parallelism is refused.
 This does not change the semantics of ordinary requests in the same batch.
 
-The forward reports one `(sampled_logprob, packed_row)` per output-token slot,
-including verification padding. The existing commit loop selects accepted
+The forward reports sampled logprobs and a flat binary matrix in output-token
+order, including verification padding. One pinned D2H allocation owns both;
+the existing copy event lands it before Rust copies the exported buffer views. The existing commit loop selects accepted
 positions, validates rows and appends only emitted tokens, stopping at the
 same condition as token output. The request owns the packed bytes, which the
 transport sends as `output_full_vocab_topk` (MessagePack binary). Public

@@ -1849,6 +1849,8 @@ class ModelExecutor:
                     "full-vocabulary logits must match the forward output layout"
                 )
             full_scores = self.full_vocab_topk.prepare(logits_output.next_token_logits)
+            if sampling_info.vocab_mask is None:
+                logits_output.logprob_scores = full_scores
         output_tokens, accept_lengths = sample_with_diagnostics(
             logits_output,
             sampling_info,
@@ -1974,6 +1976,11 @@ class ModelExecutor:
                 next_token_logits=None if logits is None else logits[prefill],
                 next_token_ids=None if token_ids is None else token_ids[prefill],
                 vocab_shard=None if shard is None else shard.rows(prefill),
+                logprob_scores=(
+                    None
+                    if logits_output.logprob_scores is None
+                    else logits_output.logprob_scores.rows(prefill)
+                ),
             )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
@@ -2010,6 +2017,11 @@ class ModelExecutor:
                     None if token_ids is None else token_ids[decode_outputs]
                 ),
                 vocab_shard=None if shard is None else shard.rows(decode_outputs),
+                logprob_scores=(
+                    None
+                    if logits_output.logprob_scores is None
+                    else logits_output.logprob_scores.rows(decode_outputs)
+                ),
             )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,

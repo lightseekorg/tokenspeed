@@ -476,7 +476,6 @@ struct RequestView {
     return_logprob: bool,
     top_logprobs_num: i64,
     full_vocab_topk: bool,
-    stream: bool,
     has_token_ids_logprob: bool,
     logprob_start_len: i64,
     /// The budget the request asked for, before it is clamped.
@@ -502,7 +501,6 @@ fn request_view(request: &TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         return_logprob: request.return_logprob,
         top_logprobs_num: request.top_logprobs_num,
         full_vocab_topk: request.return_full_vocab_topk,
-        stream: request.stream,
         has_token_ids_logprob: request
             .token_ids_logprob
             .as_ref()
@@ -541,14 +539,13 @@ fn refusal(
     if request.full_vocab_topk {
         let k = limits.logprobs.full_vocab_top_k;
         if !request.return_logprob
-            || request.stream
             || !(1..=128).contains(&k)
             || !limits.logprobs.blockwise_logprob_order
             || request.top_logprobs_num != k as i64
             || k as i64 > limits.vocab_size
             || limits.logprobs.pipeline_parallel
         {
-            return Some("binary full-vocabulary top-k requires non-streaming output logprobs, no pipeline, and top_logprobs_num equal to --full-vocab-top-k".to_owned());
+            return Some("binary full-vocabulary top-k requires output logprobs, no pipeline, and top_logprobs_num equal to --full-vocab-top-k".to_owned());
         }
         if request.logprob_start_len >= 0 && request.logprob_start_len < input_len as i64 - 1 {
             return Some("binary full-vocabulary top-k reports output positions only".to_owned());
@@ -1225,7 +1222,7 @@ mod tests {
 
     #[test]
     fn binary_topk_admission_uses_the_normalizer_capability() {
-        for blockwise in [false, true] {
+        for (blockwise, stream) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut limits = limits();
             limits.enable_output_logprobs = true;
             limits.logprobs.full_vocab_top_k = 2;
@@ -1236,7 +1233,7 @@ mod tests {
                 return_full_vocab_topk: true,
                 return_logprob: true,
                 top_logprobs_num: 2,
-                stream: false,
+                stream,
                 ..request("binary", vec![1, 2], SamplingParams::default())
             };
             let admitted = admit(request, &limits).unwrap();

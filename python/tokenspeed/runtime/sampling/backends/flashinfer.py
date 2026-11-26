@@ -679,7 +679,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             self.maybe_broadcast(sampled)
             if self.config.enable_output_logprobs:
                 logits_output.next_token_logprobs = gather_token_logprobs(
-                    logits, sampled, logprob_order=self.config.logprob_order
+                    logits,
+                    sampled,
+                    logprob_order=self.config.logprob_order,
+                    scores=logits_output.logprob_scores,
                 )
             return sampled, lengths
 
@@ -739,7 +742,10 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs(
-                logits, sampled, logprob_order=self.config.logprob_order
+                logits,
+                sampled,
+                logprob_order=self.config.logprob_order,
+                scores=logits_output.logprob_scores,
             )
 
         return sampled, lengths
@@ -1010,7 +1016,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             # predictions to full-batch shape; the non-DP writer requires
             # matching logits/token row counts.
             logprobs_local = gather_token_logprobs(
-                logits, predict, logprob_order=self.config.logprob_order
+                logits,
+                predict,
+                logprob_order=self.config.logprob_order,
+                scores=logits_output.logprob_scores,
             ).view(bs, num_tokens_per_req)
 
         if dp_sampling:
@@ -1044,7 +1053,10 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs and not dp_sampling:
             logits_output.next_token_logprobs = gather_token_logprobs(
-                logits, predict, logprob_order=self.config.logprob_order
+                logits,
+                predict,
+                logprob_order=self.config.logprob_order,
+                scores=logits_output.logprob_scores,
             )
 
         return predict, accept_length
@@ -1169,11 +1181,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
         self.broadcast_verify_outputs()
         if self.config.enable_output_logprobs:
-            path_logits = logits.index_select(
-                0, packed_accepted_path_rows(indices, query_start_loc)
-            )
+            prediction_rows = packed_accepted_path_rows(indices, query_start_loc)
             logits_output.next_token_logprobs = gather_token_logprobs(
-                path_logits, predict, logprob_order=self.config.logprob_order
+                logits,
+                predict,
+                logprob_order=self.config.logprob_order,
+                scores=logits_output.logprob_scores,
+                prediction_rows=prediction_rows,
             )
         return predict, lengths
 
@@ -1208,9 +1222,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         self.broadcast_verify_outputs()
         if self.config.enable_output_logprobs:
             # predict is packed along the path; score it against the path's own rows.
-            path_logits = logits.index_select(0, accepted_path_rows(path))
+            prediction_rows = accepted_path_rows(path)
             logits_output.next_token_logprobs = gather_token_logprobs(
-                path_logits, predict, logprob_order=self.config.logprob_order
+                logits,
+                predict,
+                logprob_order=self.config.logprob_order,
+                scores=logits_output.logprob_scores,
+                prediction_rows=prediction_rows,
             )
         return predict, accept_length
 

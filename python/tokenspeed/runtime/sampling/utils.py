@@ -20,11 +20,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel.ops.sampling import blockwise_logprobs
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.sampling.full_vocab import FullVocabScores
 
 logger = get_colorful_logger(__name__)
 
@@ -84,6 +91,8 @@ def gather_token_logprobs(
     tokens: torch.Tensor,
     *,
     logprob_order: str,
+    scores: FullVocabScores | None = None,
+    prediction_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return each row's log probability of ``tokens`` in the launch's order.
 
@@ -94,6 +103,9 @@ def gather_token_logprobs(
             fixed 32768-wide blocks and negative cross-entropy;
             "blockwise-direct" uses the same blocks and direct subtraction.
             Suffix either with "-16384" to select 16384-wide blocks.
+        scores: Original-logit normalizer, reused only for the same reduction
+            provider and order. Omit when a grammar mask changed the logits.
+        prediction_rows: Prediction-row mapping for tree/packed verification.
 
     Returns:
         ``[rows]`` fp32 log probabilities.
@@ -101,6 +113,21 @@ def gather_token_logprobs(
     Raises:
         ValueError: If ``logprob_order`` is unknown.
     """
+    if scores is not None and BLOCKWISE_LOGPROB_ORDERS.get(logprob_order) == (
+        scores.vocab_block,
+        scores.form,
+    ):
+        # A pinned export provider must not change ordinary co-batched scores.
+        kernel = select_kernel(
+            "sampling",
+            "block_sumexp",
+            format_signature(shifted=dense_tensor_format(torch.float32)),
+            features=frozenset({"batch_invariant"}),
+        )
+        if kernel.name == scores.kernel_name:
+            return scores.sampled_logprobs(tokens, prediction_rows=prediction_rows)
+    if prediction_rows is not None:
+        logits = logits.index_select(0, prediction_rows)
     if logprob_order in BLOCKWISE_LOGPROB_ORDERS:
         vocab_block, form = BLOCKWISE_LOGPROB_ORDERS[logprob_order]
         return blockwise_logprobs(
