@@ -422,6 +422,9 @@ def test_distributed_petit_reference(profile_name):
         ("balanced", [16] * ws),
         ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws]),
         ("partial_scales", [256] * ws),
+        # For both DSv4.1 profiles, 640 tokens take the 4-warp 64-row stage-1 tile
+        # (Flash 480-1,007 tokens, DSpark 352-703).
+        ("stage1_m64_w4", [640] * ws),
         ("capacity", [1024] + [1] * (ws - 1)),
     ):
         count = counts[rank]

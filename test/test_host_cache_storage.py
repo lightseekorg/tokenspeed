@@ -27,6 +27,7 @@ from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
     compute_host_lcm_block_bytes,
+    host_block_capacity,
     validate_host_group_packing,
 )
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -44,11 +45,14 @@ def _cpu_pinned_allocation(monkeypatch):
     def empty(*args, **kwargs):
         # Pinned allocation needs a CUDA device; storage behavior uses real
         # CPU tensors so these tests do not acquire a serving GPU.
-        if kwargs.get("pin_memory", False):
-            kwargs["pin_memory"] = False
+        if kwargs.pop("pin_memory", False):
+            tensor = allocate(*args, **kwargs)
+            tensor.is_pinned = lambda: True
+            return tensor
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
 
 
 def _kv(group_id, *, rows_per_page=1, entry_stride_tokens=1):
@@ -111,9 +115,39 @@ def _payload_layout(groups):
     return layout, tuple(spec for spec, _ in groups)
 
 
+@pytest.mark.parametrize("null_address", [False, True])
+def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
+    tensor = torch.zeros(192, dtype=torch.uint8)
+    if null_address:
+        monkeypatch.setattr(tensor, "data_ptr", lambda: 0)
+        monkeypatch.setattr(tensor, "is_pinned", lambda: True)
+    else:
+        monkeypatch.setattr(tensor, "is_pinned", lambda: False)
+
+    def allocate(size, *, dtype, pin_memory):
+        assert size == tensor.numel() and dtype == tensor.dtype and pin_memory
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    with pytest.raises(RuntimeError, match="Failed to allocate 192 pinned CPU bytes"):
+        HostCacheStorage(
+            _layout(),
+            group_specs=_SPECS,
+            num_host_lcm_blocks=2,
+            block_alignment=1,
+            align_host_buffer=False,
+        )
+
+
 def test_block_offsets_follow_group_packing_without_overlap():
     layout = _layout()
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
 
     # The 80-byte State rounds the parent up to three whole KV pages.
     assert storage.host_lcm_block_bytes == 96
@@ -124,10 +158,83 @@ def test_block_offsets_follow_group_packing_without_overlap():
     assert storage.host_block_offset(1, 2) == storage.host_lcm_block_bytes
 
 
+def test_direct_io_alignment_pads_every_block_after_its_fields():
+    field = lambda name, size: CacheField(name, 0, 0, size, size)
+    layout = CacheTransferLayout(
+        num_lcm_blocks=2,
+        groups=(
+            CacheGroupLayout("full", 1, (field("k", 3000), field("v", 3000))),
+            CacheGroupLayout("state", 1, (field("state", 10000),)),
+        ),
+        buffers=(object(),),
+        consumers=(("k", "v"), ("state",)),
+    )
+    storage = HostCacheStorage(
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=3,
+        block_alignment=4096,
+        align_host_buffer=True,
+    )
+
+    assert storage.host_cache_block_bytes == (8192, 12288)
+    # The fields keep their packed offsets; the padding follows them.
+    assert storage.host_field_offsets == ((0, 3000), (0,))
+    assert storage.host_lcm_block_bytes % 4096 == 0
+    # Every block starts on the alignment, so each moves in one direct I/O.
+    for group_index, packing in enumerate(storage.group_packing):
+        for block_id in range(1, 3 * packing + 1):
+            assert (
+                storage.host_buffer.data_ptr()
+                + storage.host_block_offset(group_index, block_id)
+            ) % 4096 == 0
+    with pytest.raises(ValueError, match="block_alignment"):
+        HostCacheStorage(
+            layout,
+            group_specs=_SPECS,
+            num_host_lcm_blocks=1,
+            block_alignment=0,
+            align_host_buffer=False,
+        )
+
+
+@pytest.mark.parametrize("block_alignment", [3, 8192])
+def test_aligned_buffer_rejects_incompatible_block_alignment(block_alignment):
+    with pytest.raises(ValueError, match="block_alignment .* must divide"):
+        HostCacheStorage(
+            _layout(),
+            group_specs=_SPECS,
+            num_host_lcm_blocks=2,
+            block_alignment=block_alignment,
+            align_host_buffer=True,
+        )
+
+
+def test_the_host_block_capacity_is_the_densest_groups_blocks():
+    # Three 32-byte KV pages per 96-byte parent beside one 80-byte State.
+    storage = HostCacheStorage(
+        _layout(),
+        group_specs=_SPECS,
+        num_host_lcm_blocks=5,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
+    assert storage.group_packing == (3, 1)
+    assert host_block_capacity(storage, (1, 1)) == 15
+    # A group sharded over two owners counts two virtual blocks a slot.
+    assert host_block_capacity(storage, (2, 1)) == 30
+
+
 @pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 7), (1, 3)])
 def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
     layout = _layout()
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
 
     with pytest.raises(IndexError):
         storage.host_block_offset(group_index, block_id)
@@ -159,7 +266,13 @@ def test_host_fields_are_packed_without_padding():
         consumers=(("full.k", "full.v"), ("state.ssm", "state.conv")),
     )
 
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=1)
+    storage = HostCacheStorage(
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=1,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
 
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
@@ -178,7 +291,13 @@ def test_host_storage_does_not_retain_device_buffers():
     buffer = DeviceBuffer()
     reference = weakref.ref(buffer)
     layout = dataclasses.replace(_layout(), buffers=(buffer,))
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
     del layout, buffer
     gc.collect()
     assert reference() is None
@@ -198,7 +317,11 @@ def test_shared_host_storage_packs_payloads_independently_of_device_strides():
         consumers=(("kv",), ("ssm",), ("aux",)),
     )
     storage = HostCacheStorage(
-        layout, group_specs=(*_SPECS, _kv("aux")), num_host_lcm_blocks=2
+        layout,
+        group_specs=(*_SPECS, _kv("aux")),
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
     )
 
     # Three 32-byte KV pages make the 96-byte parent: 19 aux payloads fit it.
@@ -232,7 +355,13 @@ _QWEN38_GROUPS = (
 
 def test_parent_packs_whole_kv_pages_beside_a_larger_state_checkpoint():
     layout, specs = _payload_layout(_QWEN38_GROUPS)
-    storage = HostCacheStorage(layout, group_specs=specs, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout,
+        group_specs=specs,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
+    )
 
     # The State checkpoint is 8.63 full-attention pages: 8 pages leave a 7.3%
     # gap in every full-attention parent. The parent rounds up to 9 pages,
@@ -241,8 +370,11 @@ def test_parent_packs_whole_kv_pages_beside_a_larger_state_checkpoint():
     parent = 9 * 3_407_872
     assert storage.host_lcm_block_bytes == parent == 144 * 212_992 == 30_670_848
     assert storage.group_packing == (9, 1, 1, 144, 2_251, 166)
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == parent
-    assert compute_host_group_packing(layout, group_specs=specs) == (
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == parent
+    )
+    assert compute_host_group_packing(layout, group_specs=specs, block_alignment=1) == (
         storage.group_packing
     )
     assert storage.host_buffer_bytes == 2 * parent
@@ -289,10 +421,13 @@ def _glm53_flash_groups(*, first_state, other_state):
 def test_parent_rounds_up_only_when_that_lowers_host_bytes_per_token(groups, parent):
     layout, specs = _payload_layout(groups)
 
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == parent
-    assert compute_host_group_packing(layout, group_specs=specs) == tuple(
-        parent // payload for _, payload in groups
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == parent
     )
+    assert compute_host_group_packing(
+        layout, group_specs=specs, block_alignment=1
+    ) == tuple(parent // payload for _, payload in groups)
 
 
 @pytest.mark.parametrize(
@@ -318,7 +453,10 @@ def test_parent_rounds_to_the_kv_group_with_the_most_host_bytes_per_token(
 ):
     layout, specs = _payload_layout(groups)
 
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == parent
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == parent
+    )
 
 
 def test_a_replayable_group_neither_picks_nor_prices_the_rounding():
@@ -332,7 +470,10 @@ def test_a_replayable_group_neither_picks_nor_prices_the_rounding():
     )
     layout, specs = _payload_layout(groups)
 
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == 9_000
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == 9_000
+    )
 
 
 def test_a_replayable_window_as_the_largest_payload_rounds_like_a_state_checkpoint():
@@ -348,8 +489,16 @@ def test_a_replayable_window_as_the_largest_payload_rounds_like_a_state_checkpoi
     )
     layout, specs = _payload_layout(groups)
 
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == 20 * 68_352
-    assert compute_host_group_packing(layout, group_specs=specs) == (1, 20, 60, 55)
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == 20 * 68_352
+    )
+    assert compute_host_group_packing(layout, group_specs=specs, block_alignment=1) == (
+        1,
+        20,
+        60,
+        55,
+    )
 
 
 @pytest.mark.parametrize(
@@ -403,10 +552,13 @@ def test_parent_stays_the_largest_payload(groups):
     layout, specs = _payload_layout(groups)
     largest = max(payload for _, payload in groups)
 
-    assert compute_host_lcm_block_bytes(layout, group_specs=specs) == largest
-    assert compute_host_group_packing(layout, group_specs=specs) == tuple(
-        largest // payload for _, payload in groups
+    assert (
+        compute_host_lcm_block_bytes(layout, group_specs=specs, block_alignment=1)
+        == largest
     )
+    assert compute_host_group_packing(
+        layout, group_specs=specs, block_alignment=1
+    ) == tuple(largest // payload for _, payload in groups)
 
 
 def _check_host_packing_agreement(rank, rendezvous, peer_packing):

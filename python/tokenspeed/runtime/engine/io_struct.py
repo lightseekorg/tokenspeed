@@ -40,6 +40,7 @@ import msgspec
 import numpy as np
 import torch
 
+from tokenspeed.runtime.engine.request_timing import RequestTiming
 from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -152,6 +153,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # The replica the router expects to hold this prompt's prefix (peer prefix
     # sharing); a hint the holder confirms.
     peer_holder: str | None = None
+    # Router estimate of additional usable peer tokens beyond the local prefix.
+    peer_expected_tokens: int | None = None
     # array_like declaration order is the wire contract; append new fields here.
 
 
@@ -223,6 +226,11 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Cumulative reasoning tokens per request, excluding structural markers.
     # Appended wire tail: older producers omit it and decode as [].
     reasoning_tokens: list[int] = []
+    # Rank-wide token counts; None means an older producer did not report them.
+    num_resident_tokens: int | None = None
+    num_waiting_uncached_tokens: int | None = None
+    # Request timing metadata: only terminal rows carry a map. Older producers omit it.
+    request_timing: list[RequestTiming | None] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

@@ -42,7 +42,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_recurrent_state_dtype,
-    kda_replay_supported,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -408,25 +407,17 @@ class Glm53FlashRecipe(CacheRecipe):
             state_group_ids=state_group_ids,
         )
 
-    @cached_property
-    def replay_kda(self) -> bool:
-        """Cache the replay capability for this recipe's fixed configuration."""
-        return kda_replay_supported(self.attn_config)
-
     @override
     def workspace_bytes(self) -> int:
-        """Shared KPool tails plus the target's KDA verification staging."""
+        """Shared KPool tails, request-slot KDA history and verify staging."""
         tail_bytes = self.pool_options().workspace_bytes
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
-        if self.server_args.disaggregation_mode == "prefill" or (
-            width == 1 and not self.replay_kda
-        ):
+        if self.server_args.disaggregation_mode == "prefill":
             return tail_bytes
         return tail_bytes + kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
             draft_token_num=width,
-            replay_kda=self.replay_kda,
         )
 
     @override

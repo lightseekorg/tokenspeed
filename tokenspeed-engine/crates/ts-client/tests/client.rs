@@ -68,6 +68,29 @@ async fn connect(num_engines: u16, routing: Routing) -> (EngineClient, Vec<FakeE
     (client.await.unwrap().unwrap(), engines)
 }
 
+async fn connect_silent(num_engines: u16) -> (EngineClient, Vec<FakeEngine>) {
+    let handshake = ipc_address("silent-handshake");
+    let listener = ClientListener::bind(config(
+        &handshake,
+        num_engines,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    ))
+    .await
+    .unwrap();
+    let engines = (0..num_engines)
+        .map(|index| {
+            common::start_as(
+                &handshake,
+                index,
+                i64::from(index),
+                i64::from(num_engines),
+                Role::SilentScheduler,
+            )
+        })
+        .collect();
+    (listener.accept().await.unwrap(), engines)
+}
+
 /// A request; `max_new_tokens = None` keeps it running until aborted.
 fn request(rid: &str, max_new_tokens: Option<i64>) -> TokenizedGenerateReqInput {
     let sampling_params = SamplingParams {
@@ -128,6 +151,8 @@ async fn streams_tokens_until_finished() {
     assert_eq!(snapshots[0].0, 0);
     assert_eq!(snapshots[0].1.kv_used_pages, 7);
     assert_eq!(snapshots[0].1.kv_active_pages, 0);
+    assert_eq!(snapshots[0].1.num_resident_tokens, Some(0));
+    assert_eq!(snapshots[0].1.num_waiting_uncached_tokens, Some(0));
     assert!(client.fresh_loads(Duration::ZERO).is_empty());
 }
 
@@ -265,7 +290,7 @@ async fn a_pinned_decode_request_goes_to_its_rank_not_the_rooms() {
 }
 
 #[tokio::test]
-async fn abort_finishes_the_stream() {
+async fn abort_preserves_an_engines_terminal_output() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     let mut stream = client.generate(request("r1", None)).await.unwrap();
     assert_eq!(next(&mut stream).await.unwrap().unwrap().output_ids, [1]);
@@ -275,6 +300,337 @@ async fn abort_finishes_the_stream() {
     assert!(next(&mut stream).await.is_none());
     assert!(!client.abort("r1").await.unwrap());
     assert_eq!(client.in_flight(), [0]);
+}
+
+#[tokio::test]
+async fn cancel_closes_a_silent_abort_stream_and_preserves_survivors_and_controls() {
+    let (client, mut engines) = connect_silent(2).await;
+    let mut cancelled = client.generate(request("cancelled", None)).await.unwrap();
+    let mut survivor = client.generate(request("survivor", None)).await.unwrap();
+    assert_eq!(next(&mut cancelled).await.unwrap().unwrap().output_ids, [1]);
+    assert_eq!(
+        next(&mut survivor).await.unwrap().unwrap().output_ids,
+        [1001]
+    );
+    assert!(client.cancel("cancelled").await.unwrap());
+    assert_eq!(
+        next(&mut cancelled).await,
+        Some(Err(StreamError::Cancelled))
+    );
+    assert_eq!(next(&mut cancelled).await, None);
+    assert_eq!(client.in_flight(), [0, 1]);
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
+    assert_eq!(
+        engines[0].next_received().await,
+        EngineRequest::Abort(vec!["cancelled".into()])
+    );
+    assert!(!client.cancel("cancelled").await.unwrap());
+    assert!(!client.cancel("unknown").await.unwrap());
+
+    // Outputs already in transit may arrive after local closure.
+    engines[0].output("cancelled", 2, None).await;
+    engines[0].output("cancelled", 3, Some("length")).await;
+    engines[1].output("survivor", 2, None).await;
+    assert_eq!(
+        next(&mut survivor).await.unwrap().unwrap().output_ids,
+        [1002]
+    );
+    assert_eq!(client.in_flight(), [0, 1]);
+    let replies = client
+        .control(ControlRequest::IsSchedulerPaused(
+            IsSchedulerPausedReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replies.len(), 2);
+    engines[1].output("survivor", 3, Some("length")).await;
+    let last = next(&mut survivor).await.unwrap().unwrap();
+    assert_eq!(last.output_ids, [1003]);
+    assert_eq!(last.finish_reason.as_deref(), Some("length"));
+    assert_eq!(next(&mut survivor).await, None);
+    assert_eq!(client.in_flight(), [0, 0]);
+}
+
+#[tokio::test]
+async fn abort_keeps_a_silent_stream_attached_until_explicit_cancel() {
+    let (client, mut engines) = connect_silent(1).await;
+    let mut stream = client.generate(request("r", None)).await.unwrap();
+    next(&mut stream).await.unwrap().unwrap();
+    assert!(client.abort("r").await.unwrap());
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
+    assert_eq!(
+        engines[0].next_received().await,
+        EngineRequest::Abort(vec!["r".into()])
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.in_flight(), [1]);
+    assert!(client.cancel("r").await.unwrap());
+    assert_eq!(next(&mut stream).await, Some(Err(StreamError::Cancelled)));
+    assert_eq!(next(&mut stream).await, None);
+}
+
+#[tokio::test]
+async fn concurrent_cancels_produce_one_result_after_queued_outputs() {
+    let (client, _engines) = connect_silent(1).await;
+    let mut stream = client.generate(request("r", None)).await.unwrap();
+    // A real output is queued before cancellation, but need not be consumed.
+    collect(client.generate(request("barrier", Some(1))).await.unwrap()).await;
+    let (a, b) = tokio::join!(client.cancel("r"), client.cancel("r"));
+    assert_ne!(a.unwrap(), b.unwrap());
+    assert_eq!(next(&mut stream).await.unwrap().unwrap().output_ids, [1]);
+    let mut cancellations = 0;
+    while let Some(item) = next(&mut stream).await {
+        match item {
+            Ok(chunk) => assert_eq!(chunk.finish_reason, None),
+            Err(StreamError::Cancelled) => cancellations += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(cancellations, 1);
+    assert_eq!(client.in_flight(), [0]);
+}
+
+#[tokio::test]
+async fn dropping_send_futures_preserves_their_respective_owners() {
+    use std::{
+        future::{poll_fn, Future},
+        task::Poll,
+    };
+
+    let (client, engines) = connect_silent(2).await;
+    let mut stream = client.generate(request("r", None)).await.unwrap();
+    next(&mut stream).await.unwrap().unwrap();
+    engines[0].pause_input(true).await;
+
+    // Hold the actual socket's send queue with a message larger than its
+    // buffer. No fake send result or scheduling sleep determines the race.
+    let large = TokenizedGenerateReqInput {
+        data_parallel_rank: Some(0),
+        input_ids: Some(vec![i32::MAX; 1_000_000]),
+        ..request("interrupted", None)
+    };
+    let mut submission = Box::pin(client.generate(large));
+    assert!(poll_fn(|cx| Poll::Ready(submission.as_mut().poll(cx)))
+        .await
+        .is_pending());
+    assert_eq!(client.in_flight(), [2, 0]);
+    let mut cancel = Box::pin(client.cancel("r"));
+    assert!(poll_fn(|cx| Poll::Ready(cancel.as_mut().poll(cx)))
+        .await
+        .is_pending());
+    drop(cancel);
+    assert_eq!(client.in_flight(), [2, 0]);
+    drop(submission);
+    assert_eq!(client.in_flight(), [1, 0]);
+    engines[0].pause_input(false).await;
+
+    // A cancelled send may have partially reached the engine. Its stream
+    // remains attached, and a genuine terminal output still belongs to it.
+    engines[0].output("r", 2, Some("length")).await;
+    assert_eq!(
+        collect(stream).await[0].finish_reason.as_deref(),
+        Some("length")
+    );
+    let survivor = TokenizedGenerateReqInput {
+        data_parallel_rank: Some(1),
+        ..request("survivor", Some(2))
+    };
+    assert_eq!(
+        tokens(&collect(client.generate(survivor).await.unwrap()).await),
+        [1001, 1002]
+    );
+    assert_eq!(client.in_flight(), [0, 0]);
+}
+
+#[tokio::test]
+async fn a_finish_during_cancel_send_preserves_a_later_local_owner() {
+    use std::{
+        future::{poll_fn, Future},
+        task::Poll,
+    };
+
+    let (client, engines) = connect_silent(2).await;
+    let mut old = client.generate(request("r", None)).await.unwrap();
+    next(&mut old).await.unwrap().unwrap();
+    engines[0].pause_input(true).await;
+    let mut blocker = Box::pin(client.generate(TokenizedGenerateReqInput {
+        data_parallel_rank: Some(0),
+        input_ids: Some(vec![i32::MAX; 1_000_000]),
+        ..request("blocker", None)
+    }));
+    assert!(poll_fn(|cx| Poll::Ready(blocker.as_mut().poll(cx)))
+        .await
+        .is_pending());
+    let mut cancel = Box::pin(client.cancel("r"));
+    assert!(poll_fn(|cx| Poll::Ready(cancel.as_mut().poll(cx)))
+        .await
+        .is_pending());
+
+    // Output completion wins while cancel still owns its original channel.
+    engines[0].output("r", 2, Some("length")).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.in_flight()[0] != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Deliberate reuse tests local cleanup only. Put the replacement on a
+    // different engine so the old wire abort cannot name its remote owner.
+    let mut replacement = Box::pin(client.generate(TokenizedGenerateReqInput {
+        data_parallel_rank: Some(1),
+        ..request("r", None)
+    }));
+    let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
+    assert_eq!(client.in_flight(), [1, 1]);
+    drop(old); // The cancellation snapshot still keeps the old sender alive.
+    assert_eq!(client.in_flight(), [1, 1]);
+    drop(blocker);
+    engines[0].pause_input(false).await;
+    assert!(!cancel.await.unwrap());
+    let mut later = match first_poll {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => replacement.await.unwrap(),
+    };
+    assert_eq!(next(&mut later).await.unwrap().unwrap().output_ids, [1001]);
+    assert_eq!(client.in_flight(), [0, 1]);
+    engines[1].output("r", 2, Some("length")).await;
+    assert_eq!(collect(later).await[0].output_ids, [1002]);
+    assert_eq!(client.in_flight(), [0, 0]);
+}
+
+#[tokio::test]
+async fn finish_and_cancel_have_exactly_one_terminal_result() {
+    let (client, engines) = connect_silent(1).await;
+    for i in 0..20 {
+        let rid = format!("race-{i}");
+        let mut stream = client.generate(request(&rid, None)).await.unwrap();
+        next(&mut stream).await.unwrap().unwrap();
+        let (cancelled, ()) = tokio::join!(
+            client.cancel(&rid),
+            engines[0].output(&rid, 2, Some("length"))
+        );
+        let terminal = next(&mut stream).await.unwrap();
+        if cancelled.unwrap() {
+            assert_eq!(terminal, Err(StreamError::Cancelled));
+        } else {
+            assert_eq!(terminal.unwrap().finish_reason.as_deref(), Some("length"));
+        }
+        assert_eq!(next(&mut stream).await, None);
+        assert!(!client.cancel(&rid).await.unwrap());
+    }
+    assert_eq!(client.in_flight(), [0]);
+}
+
+#[tokio::test]
+async fn old_stream_cleanup_cannot_remove_a_later_admission() {
+    let (client, mut engines) = connect_silent(1).await;
+    let old = client.generate(request("r", None)).await.unwrap();
+    assert!(client.cancel("r").await.unwrap());
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
+    assert_eq!(
+        engines[0].next_received().await,
+        EngineRequest::Abort(vec!["r".into()])
+    );
+    // The test engine has retired the old request. Deliberately reuse its id
+    // to test local ownership; real callers must use fresh wire ids.
+    let mut later = client.generate(request("r", None)).await.unwrap();
+    next(&mut later).await.unwrap().unwrap();
+    drop(old); // Its queued cancellation has not been consumed.
+    assert_eq!(client.in_flight(), [1]);
+    engines[0].output("r", 2, Some("length")).await;
+    assert_eq!(
+        next(&mut later)
+            .await
+            .unwrap()
+            .unwrap()
+            .finish_reason
+            .as_deref(),
+        Some("length")
+    );
+    assert_eq!(next(&mut later).await, None);
+
+    // A finish received by dispatch also precedes the consumer seeing it.
+    let finished = client.generate(request("finished", Some(1))).await.unwrap();
+    let barrier = client.generate(request("barrier", Some(1))).await.unwrap();
+    collect(barrier).await;
+    assert!(!client.cancel("finished").await.unwrap());
+    let mut replacement = client.generate(request("finished", None)).await.unwrap();
+    next(&mut replacement).await.unwrap().unwrap();
+    drop(finished);
+    assert_eq!(client.in_flight(), [1]);
+    engines[0].output("finished", 2, Some("length")).await;
+    assert_eq!(collect(replacement).await[0].output_ids, [2]);
+}
+
+#[tokio::test]
+async fn send_failure_retains_cancel_ownership_and_cleans_failed_submissions() {
+    let (client, engines) = connect_silent(2).await;
+    let mut stream = client.generate(request("r", None)).await.unwrap();
+    let mut survivor = client.generate(request("survivor", None)).await.unwrap();
+    next(&mut stream).await.unwrap().unwrap();
+    next(&mut survivor).await.unwrap().unwrap();
+    engines[0].disconnect_input().await;
+    // Wait for ZMQ's peer bookkeeping, using actual failed sends as evidence.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0.. {
+            let probe = TokenizedGenerateReqInput {
+                data_parallel_rank: Some(0),
+                ..request(&format!("probe-{i}"), None)
+            };
+            if client.generate(probe).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        client.cancel("r").await,
+        Err(Error::Zmq(_)) | Err(Error::SendTimeout { .. })
+    ));
+    assert_eq!(client.in_flight(), [1, 1]);
+    assert!(matches!(
+        client
+            .generate(TokenizedGenerateReqInput {
+                data_parallel_rank: Some(1),
+                ..request("r", None)
+            })
+            .await,
+        Err(Error::DuplicateRequestId(_))
+    ));
+    // The failed cancel did not replace a stream result or lose its owner.
+    engines[0].output("r", 2, Some("length")).await;
+    assert_eq!(
+        next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap()
+            .finish_reason
+            .as_deref(),
+        Some("length")
+    );
+    assert_eq!(next(&mut stream).await, None);
+    engines[1].output("survivor", 2, Some("length")).await;
+    assert_eq!(collect(survivor).await[0].output_ids, [1002]);
+    assert_eq!(client.in_flight(), [0, 0]);
 }
 
 #[tokio::test]
@@ -292,8 +648,8 @@ async fn dropping_a_stream_aborts_the_request() {
         EngineRequest::Abort(vec!["r1".to_owned()])
     );
     assert_eq!(client.in_flight(), [0]);
-    // The id is free again.
-    collect(client.generate(request("r1", Some(1))).await.unwrap()).await;
+    // A later submission uses a fresh wire id.
+    collect(client.generate(request("r2", Some(1))).await.unwrap()).await;
 }
 
 #[tokio::test]
@@ -497,4 +853,40 @@ async fn a_scheduler_takes_no_encode_requests() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     let error = client.encode(encode_request("item-0")).await.unwrap_err();
     assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
+}
+
+#[test]
+fn consuming_output_rows_preserves_request_timing_and_legacy_missing_values() {
+    use ts_wire::BatchTokenIDOutSlim;
+    let hex = include_str!("../../ts-wire/tests/fixtures/output_slim_timing.hex");
+    let frames = hex
+        .lines()
+        .map(|line| {
+            bytes::Bytes::from(
+                (0..line.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+                    .collect::<Vec<u8>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut batch: BatchTokenIDOutSlim = ts_wire::decode_frames(&frames).unwrap();
+    let timing = batch.request_timing[0].take().unwrap();
+    batch.request_timing.clear();
+    let legacy = OutputChunk::from_batch(batch.clone())
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert!(legacy
+        .iter()
+        .all(|(_, chunk)| chunk.request_timing.is_none()));
+    batch.request_timing = vec![None, Some(timing.clone())];
+    let borrowed = batch
+        .requests()
+        .unwrap()
+        .map(|row| (row.rid.to_owned(), OutputChunk::from(&row)))
+        .collect::<Vec<_>>();
+    let consumed = OutputChunk::from_batch(batch).unwrap().collect::<Vec<_>>();
+    assert_eq!(consumed, borrowed);
+    assert_eq!(consumed[1].1.request_timing, Some(timing));
+    assert_eq!(consumed[0].1.request_timing, None);
 }

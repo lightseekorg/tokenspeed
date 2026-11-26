@@ -269,16 +269,28 @@ def test_spawned_host_inherits_engine_log_level(
         proc.join(timeout=10)
 
 
-def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "inherited_preload, expected_preload",
+    [
+        ("", "libm.so.6"),
+        ("libm.so.6", "libm.so.6"),
+        ("libm.so.6:libc.so.6", "libm.so.6:libc.so.6"),
+    ],
+)
+def test_spawned_host_inherits_start_context_environment(
+    tmp_path, monkeypatch, inherited_preload, expected_preload
+):
     from contextlib import contextmanager
 
     key = "TS_TEST_LAUNCH_CONTEXT"
     monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LD_PRELOAD", inherited_preload)
 
     @contextmanager
     def configure_child():
         with monkeypatch.context() as scoped:
             scoped.setenv(key, "configured")
+            scoped.setenv("LD_PRELOAD", f"libm.so.6:{inherited_preload}")
             yield
 
     binary = _fake_host(
@@ -286,7 +298,8 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
         """
         import os
         connection.recv()
-        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT")})
+        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT"),
+                         "preload": os.environ.get("LD_PRELOAD")})
         time.sleep(600)
         """,
     )
@@ -296,8 +309,11 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
     try:
         (ready,) = receive_ready_messages([reader], [proc])
         assert ready["context"] == "configured"
+        assert ready["preload"] == expected_preload
         assert key not in os.environ
+        assert os.environ["LD_PRELOAD"] == inherited_preload
     finally:
+        reader.close()
         proc.terminate()
         proc.join(timeout=10)
 
@@ -552,7 +568,7 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle) -> HostDataPlane:
+def _data_plane(handle: DeviceHandle, *, defer_recurrent_state=False) -> HostDataPlane:
     """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
@@ -572,6 +588,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         attn_tp_cpu_group=None,
         epd_publisher=None,
         starting=False,
+        defer_recurrent_state=defer_recurrent_state,
     )
 
 
@@ -608,9 +625,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     assert pending is not None
     completed = plane.complete(pending)
     assert completed[2].tolist() == [-0.5]
+    # The stand-in executor reports no request ends.
     assert completed[:2] + completed[3:] == (
         [100],
         [1],
+        None,
         None,
         None,
         None,
@@ -645,7 +664,8 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
     )
 
-    *_, logprobs, returned_cumulative_probs = plane.complete(pending)
+    *_, logprobs, returned_cumulative_probs, request_ends = plane.complete(pending)
+    assert request_ends is None
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:

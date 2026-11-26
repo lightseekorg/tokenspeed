@@ -58,6 +58,7 @@ class DFlash2(DFlash):
     candidate_topk: VocabParallelTopK | None = None
     # The walk samples each step from the selector's q and records it.
     supports_speculative_sampling = True
+    records_sparse_draft_q = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -293,10 +294,10 @@ class DFlash2(DFlash):
             table_rows = self.input_buffers.state_write_req_pool_indices_buf[:bs]
             tables = draft_q
         pools = self._walk_pools
-        # The draft noise offset base is valid_cache_length * N, the
-        # convention the step drafters' DraftProposalSampler uses; the kernel
-        # adds DRAFT_SAMPLE_OFFSET_SALT + step. The frontier grows every
-        # round, so no two rounds of a request share a draw.
+        # The sparse walk keys its noise by the pre-round valid cache length
+        # times the draft width, plus DRAFT_SAMPLE_OFFSET_SALT + step. The step
+        # sampler uses this base for the batch stream and the post-round
+        # committed frontier for the per-request stream.
         dflash2_sample_path(
             candidate_ids,
             scores,

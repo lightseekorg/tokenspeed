@@ -76,8 +76,13 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     + [("gluon_petit", a2a) for a2a in ("none", "agrs", "flashinfer", "gluon_petit")],
 )
 @pytest.mark.parametrize("fabric_available", [False, True])
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 def test_attn_dp_replicates_dense_weights_and_selects_transport(
-    monkeypatch, backend: str, fabric_available: bool, moe_backend: str
+    monkeypatch,
+    backend: str,
+    fabric_available: bool,
+    moe_backend: str,
+    weights_dtype: torch.dtype,
 ) -> None:
     mega_moe = moe_backend in {"mega_moe", "gluon_petit"}
     expected_a2a = "gluon_petit" if moe_backend == "gluon_petit" else "none"
@@ -89,6 +94,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": expected_a2a}
+            self.topk_weights_dtype = weights_dtype
             self.sorted_route_rows = frozenset()
 
     monkeypatch.setattr(
@@ -101,6 +107,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
+        use_cutedsl=False,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
         decode_chain=False,
@@ -191,6 +198,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.down_proj.tp_size == 1
     assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
+    assert layer.topk.topk_config.topk_weights_dtype == weights_dtype
     assert layer.comm is None
     assert layer.native_latent_moe is None
 
@@ -374,12 +382,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             received = latent.reshape(-1, width)
         torch.testing.assert_close(local_ids, ids[rank, :rows])
         torch.testing.assert_close(local_weights, weights[rank, :rows])
-        return received, ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
+        return received, ids.reshape(-1, 2), weights.reshape(-1, 2)
 
-    def combine(partial, local_tokens, max_tokens, combine_offset):
+    def combine(partial):
         events.append("combine")
-        assert local_tokens == rows and max_tokens == capacity
-        assert combine_offset == 1234
         torch.testing.assert_close(partial, latent.reshape(-1, width) * (rank + 1))
         return latent[rank, :rows] * 3
 
@@ -418,6 +424,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_hidden=width,
         top_k=2,
         topk=topk,
+        expert_dispatch_info=None,
         experts=SimpleNamespace(
             plan={"weight_dtype": "nvfp4" if nvfp4 else "unquant"},
             w13_input_scale_quant=quant_scale,
@@ -487,10 +494,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             "join",
         ]
     else:
-        expected_events = ["fork", *expected_events, "branch"]
         if rows:
-            expected_events.append("shared")
-        expected_events.extend(["branch_done", "join"])
+            before_bmm = expected_events.index("experts")
+            expected_events[before_bmm:before_bmm] = ["branch", "shared", "branch_done"]
+        expected_events = ["fork", *expected_events, "join"]
     if rows:
         expected_events.append("up")
     assert events == expected_events
@@ -624,14 +631,17 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     up = Kimi3LatentProjection(4, 8, params_dtype=torch.bfloat16, solution="torch")
     up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
-        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
+        execution_plan=SimpleNamespace(use_mega_moe=True, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
+        expert_dispatch_info=None,
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(
-            plan={"weight_dtype": weight_dtype}, w13_input_scale_quant=torch.ones(1)
+            plan={"weight_dtype": weight_dtype},
+            w13_input_scale_quant=torch.ones(1),
+            input_buffers=lambda num_tokens, max_tokens: (*payload, ids, weights),
         ),
         moe_alltoall=None,
         _routed_experts=routed,
@@ -663,11 +673,12 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
             "record_gather",
             "join_gather",
             "join",
+            "join",
             "experts",
             "reduce",
         ]
     else:
-        assert events == ["experts"]
+        assert events == ["join", "experts"]
     routed.assert_called_once()
     call = routed.call_args
     expert_input = call.args[0][0] if weight_dtype == "nvfp4" else call.args[0]

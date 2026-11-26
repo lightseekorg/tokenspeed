@@ -79,6 +79,7 @@ def wire(monkeypatch):
             StorageGetOp=ts.Cache.StorageGetOp,
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
+            DiskOp=ts.Cache.DiskOp,
         ),
     )
 
@@ -200,7 +201,13 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
 
 
 @pytest.mark.parametrize(
-    "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
+    "kind",
+    [
+        "WriteBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateCommitDoneEvent",
+    ],
 )
 def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()
@@ -231,7 +238,11 @@ def _config(**overrides):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)
@@ -317,3 +328,13 @@ def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     ]
     assert prepared.storage[0].op_id == original.op_id
     assert prepared.storage[1].op_id > original.op_id
+
+
+@pytest.mark.parametrize("cap", [None, 0, 1, 64, 2**31 - 1])
+def test_make_config_preserves_optional_forced_cap_exactly(cap):
+    # Validation belongs to ServerArgs/native scheduler. This adapter must not
+    # turn the invalid explicit zero into the valid unlimited None value.
+    config = _config(
+        debug_force_retraction_interval=3, debug_force_retraction_max_per_request=cap
+    )
+    assert config.debug_force_retraction_max_per_request == cap

@@ -23,9 +23,48 @@
 from typing import Type
 
 import cutlass
+import cutlass.cute as cute
 from cutlass import Float32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+
+@dsl_user_op
+def cvt_e4m3x2_bf16x2(packed: cutlass.Int16, *, loc=None, ip=None) -> cutlass.Int32:
+    """Convert two E4M3 bytes to packed BF16; requires PTX 9.2/SM100+."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [packed.ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def convert_e4m3_bf16(src: cute.Tensor, dst: cute.Tensor, *, native: cutlass.Constexpr):
+    """Convert equal-sized dense register tensors, explicitly selecting native PTX.
+
+    Native conversion consumes adjacent FP8 pairs and preserves all finite
+    values, including subnormals and signed zero, without an FP32 temporary.
+    The FP32 conversion supports compilers predating PTX 9.2.
+    """
+    if cutlass.const_expr(native):
+        packed_src = cute.recast_tensor(src, cutlass.Int16)
+        packed_dst = cute.recast_tensor(dst, cutlass.Int32)
+        for i in cutlass.range_constexpr(cute.size(packed_src)):
+            # Keep the pair in a 16-bit operand: widening it first emits
+            # redundant sign-extension permutations for every FP8 pair.
+            packed_dst[i] = cvt_e4m3x2_bf16x2(packed_src[i])
+    else:
+        values = src.load().to(cutlass.Float32).to(cutlass.BFloat16)
+        dst.store(values.reshape(dst.shape))
 
 
 @dsl_user_op

@@ -152,8 +152,17 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
 
         def autotune(self, *, keep_loaded_tactics):
             assert not keep_loaded_tactics
+            events.append(("autotune", self.generation))
             if has_draft and not prefill_only:
-                self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
+                # Two requests, so the rebound DFlash warm-up stays distinct.
+                self.warmup_decode_path(batch_sizes=(2,), graph_phase=False)
+
+        def warm_kernels(self):
+            events.append(("warm_kernels", self.generation))
+            if has_draft and not prefill_only:
+                # ModelExecutor._warm_kernels runs its forwards under no_grad.
+                with torch.no_grad():
+                    self.warmup_decode_path(batch_sizes=(2,), graph_phase=False)
 
         def release_graphs(self):
             events.append(("release", self.generation))
@@ -177,7 +186,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     def build(*args, **kwargs):
         pool_generation[0] += 1
         return SimpleNamespace(
-            attn_backend=None,
+            # The scheduler's group configs read which groups defer decode state.
+            attn_backend=SimpleNamespace(deferred_decode_state_groups=frozenset),
             draft_attn_backend=None,
             token_to_kv_pool=SimpleNamespace(
                 name=f"target{pool_generation[0]}",
@@ -215,7 +225,10 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         device,
         "current_platform",
         lambda: SimpleNamespace(
-            is_nvidia=False, is_cdna4=False, restore_stack_limit=nullcontext
+            is_nvidia=False,
+            is_amd=True,
+            is_cdna4=False,
+            restore_stack_limit=nullcontext,
         ),
     )
     monkeypatch.setattr(
@@ -251,6 +264,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         device.build_device_side(
             server_args=args,
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=declares_padded_replay,
@@ -278,15 +292,22 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         rebind_index = events.index(("rebind", 1, "target2", "draft2"))
         assert probe_index < rebind_index
         if has_draft and not prefill_only:
-            assert events.index(("warmup", 0, (1,), False)) < probe_index
+            assert events.index(("warmup", 0, (2,), False)) < probe_index
         if expected_rewarm:
             assert rebind_index < events.index(rebound_warmup)
         if warmup_fails:
             assert ("capture", 1, None) not in events
         else:
             assert events[-1] == ("capture", 1, None)
+            # The probe boot tunes; kernels warm again, tuning nothing, on the
+            # final pools after the rebind and before the serving capture.
+            warms = [e for e in events if e[0] in ("autotune", "warm_kernels")]
+            assert warms == [("autotune", 0), ("warm_kernels", 1)]
+            assert rebind_index < events.index(("warm_kernels", 1))
     else:
         assert events[-1] == ("capture", 0, None)
+        warms = [e for e in events if e[0] in ("autotune", "warm_kernels")]
+        assert warms == [("autotune", 0)]
 
 
 def _peer(trace=None):
@@ -318,6 +339,15 @@ def _handle(trace, **kwargs):
                 ("candidates", idx, list(ids))
             ),
             mark_remote_cache_ready=lambda slot: trace.append(("ready", slot)),
+            attn_backend=SimpleNamespace(
+                fold_deferred_state=lambda folds, *, stream: trace.append(
+                    (
+                        "fold",
+                        {group: pairs.tolist() for group, pairs in folds.items()},
+                        stream,
+                    )
+                )
+            ),
         ),
         **kwargs,
     )
@@ -331,23 +361,35 @@ def _plan(
     remote_decode=None,
     remote_prefill=None,
     has_peer_fetches=False,
+    state_commit_fence=None,
+    state_folds=None,
 ):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
     plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
     the real plan's shape: every cache group listed, empty or not, with the
-    given pages under ``"kv"``. ``pages_to_copy`` is the
-    ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
-    copies = {
-        group_id: np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
-        for group_id, pairs in (pages_to_copy or {}).items()
-    }
+    given pages under ``"kv"``. ``pages_to_copy`` and ``state_folds`` are the
+    ``*_arrays()`` views: ``[n, 2]`` int32 arrays per group id, read-only as
+    the binding's are."""
+
+    def arrays(pairs_by_group):
+        out = {}
+        for group_id, pairs in (pairs_by_group or {}).items():
+            view = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+            view.setflags(write=False)
+            out[group_id] = view
+        return out
+
+    copies = arrays(pages_to_copy)
+    folds = arrays(state_folds)
     return SimpleNamespace(
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=lambda: copies,
+        state_folds_arrays=lambda: folds,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
         has_peer_fetches=has_peer_fetches,
+        state_commit_fence=state_commit_fence,
     )
 
 
@@ -706,8 +748,12 @@ class _PeerOutbox:
         self._trace.append("reads_ready")
 
 
-def _peer_handle(trace):
-    handle = _handle(trace, peer_outbox=_PeerOutbox(trace))
+def _peer_handle(trace, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        peer_outbox=_PeerOutbox(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.copy_cache_pages = lambda pairs: trace.append("copy")
     executor.zero_cache_pages = lambda pages: trace.append("zero")
@@ -754,6 +800,32 @@ def test_peer_reads_start_behind_the_plans_device_work(wire_ops, forwards):
     ]
 
 
+def test_peer_reads_start_behind_the_loads_of_the_local_hit(wire_ops):
+    """A landing that extends a local Host hit: the reader's first forward
+    runs in a later plan, which does not wait for this plan's loads, so the
+    READs -- whose end releases the request -- start behind them."""
+    trace: list = []
+    handle = _peer_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+
+    _execute(
+        handle,
+        _plan(cache=[_LoadBackOp("load")], has_peer_fetches=True),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
+        "wait_fence",
+        "wait_fence",
+        "reads_ready",
+    ]
+
+
 def test_a_plan_without_peer_landings_reports_none(wire_ops):
     """Only a plan with landings has a fence: the host counts one report
     per such plan, in order."""
@@ -788,12 +860,13 @@ def test_a_failed_page_copy_fails_the_plan(wire_ops):
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
     """A retraction's image rides ``execute`` with no operation of its own:
-    the snapshot store goes to ``submit_write_backs`` (whose stream-ordered
-    lane fences the default stream the zeroing runs on) ahead of the
-    zeroing, the restore to ``submit_load_backs`` behind it. The binding's
-    batches arrive at the executor as one per-request op each -- the unit it
-    exports/imports a slot for -- carrying the victim's slot on the store and
-    the new slot on the restore."""
+    the victims' live pages are completed first, on the execution stream the
+    stores order behind; the snapshot store goes to ``submit_write_backs``
+    (whose stream-ordered lane fences the default stream the zeroing runs
+    on) ahead of the zeroing, the restore to ``submit_load_backs`` behind it.
+    The binding's batches arrive at the executor as one per-request op each
+    -- the unit it exports/imports a slot for -- carrying the victim's slot on
+    the store and the new slot on the restore."""
     trace: list = []
     plan = _plan(
         pages_to_zero=[9],
@@ -802,6 +875,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
             _SnapshotBatch([(7, 3, 0), (8, 5, 1)]),
             _RestoreBatch([(9, 4, 2)]),
         ],
+        state_folds={"state": [(3, 30), (5, 50)]},
     )
 
     def submit_write_backs(ops, *, prerequisite_stream, fence_stream):
@@ -824,11 +898,19 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
     _execute(handle, plan, None)
 
     kinds = [entry[0] for entry in trace]
-    assert kinds == ["write_backs", "zero", "default waits", "load_backs"]
+    assert kinds == [
+        "fold",
+        "write_backs",
+        "zero",
+        "default waits",
+        "load_backs",
+    ]
+    # The victims' live pages, before anything of the plan reads them.
+    assert trace[0] == ("fold", {"state": [[3, 30], [5, 50]]}, "execution-stream")
     # Stores precede the zeroing, and the fence they record lands on the
     # stream the zeroing runs on.
-    stores = trace[0][1]
-    assert trace[0][2] is handle._executor.default_stream
+    stores = trace[1][1]
+    assert trace[1][2] is handle._executor.default_stream
     assert [type(op).__name__ for op in stores] == [
         "_WriteBackOp",
         "SnapshotOp",
@@ -848,7 +930,59 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         (9, 4, 2)
     ]
     assert trace[-1][2] is handle._executor.default_stream
-    assert trace[2] == ("default waits", "execution-stream")
+    assert trace[3] == ("default waits", "execution-stream")
+
+
+def test_a_peer_pins_the_retracted_endpoints_only_behind_their_commit(wire_ops):
+    """With peers, the plan carries a state commit fence: its ACK waits on an
+    event recorded on the execution stream right behind the victims' commit,
+    so it lands only once every endpoint the retractions published holds its
+    committed state. The handle keeps the fence's ACK itself, beside the Host
+    cache's."""
+    trace: list = []
+    committed = False
+
+    class _Event:
+        def record(self, stream):
+            trace.append(("commit recorded", stream))
+
+        def query(self):
+            return committed
+
+    plan = _plan(
+        cache=[_SnapshotBatch([(7, 3, 0)])],
+        state_commit_fence=11,
+        state_folds={"state": [(3, 30)]},
+    )
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append("stores")
+            ),
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
+            ),
+            poll_results=lambda: [],
+        ),
+    )
+    handle._executor.device_module = SimpleNamespace(Event=_Event)
+
+    _execute(handle, plan, None)
+
+    assert trace[:3] == [
+        ("fold", {"state": [[3, 30]]}, "execution-stream"),
+        ("commit recorded", "execution-stream"),
+        "stores",
+    ]
+    assert handle.poll_cache_results() == []
+    committed = True
+    [ack] = handle.poll_cache_results()
+    assert scheduler_utils_module.cache_event_to_payload(ack) == {
+        "kind": "StateCommitDoneEvent",
+        "op_id": 11,
+    }
+    assert handle.poll_cache_results() == []
 
 
 def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
@@ -860,15 +994,19 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     whose fence the forward's prologue inherits, so the export reads the
     victim's bytes even when this very plan's batch reuses the slot."""
     trace: list = []
-    plan = _plan(pages_to_zero=[2], cache=[_SnapshotBatch([(1, 6, 0)])])
+    plan = _plan(
+        pages_to_zero=[2],
+        cache=[_SnapshotBatch([(1, 6, 0)])],
+        state_folds={"state": [(6, 60)]},
+    )
     handle = _handle(
         trace,
         host_cache_executor=SimpleNamespace(
             submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
                 trace.append(("store", [op.request_pool_index for op in ops]))
             ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: (
-                trace.append("load_backs")
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
             ),
         ),
     )
@@ -882,11 +1020,30 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     _execute(handle, plan, planned)
 
     assert trace == [
+        ("fold", {"state": [[6, 60]]}, "execution-stream"),
         ("store", [6]),
         "zero",
         ("default waits", "execution-stream"),
         "load_backs",
         ("forward", [6]),
+    ]
+
+
+def test_a_refused_images_folds_run_with_no_cache_op():
+    """A retraction whose image the scheduler refuses after publishing aborts
+    its victim, which stores nothing, but the endpoint it published stays
+    readable: the plan still lists the victim's live pages, and the handle
+    folds them behind any pending draft round, with no cache op, zeroing or
+    forward to carry them."""
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.complete_pending_drafting = lambda: trace.append("settle")
+
+    _execute(handle, _plan(state_folds={"state": [(6, 60)], "state2": [(6, 61)]}), None)
+
+    assert trace == [
+        "settle",
+        ("fold", {"state": [[6, 60]], "state2": [[6, 61]]}, "execution-stream"),
     ]
 
 
@@ -961,9 +1118,12 @@ def test_shutdown_cache_closes_the_host_cache():
     assert trace == ["l2_shutdown"]
 
 
-def test_cache_polling_without_kvstore_refuses_loudly():
-    with pytest.raises(RuntimeError, match="enable-kvstore"):
-        _handle([]).poll_cache_results()
+def test_device_without_a_host_cache_polls_idle_and_rejects_host_cache_ops(wire_ops):
+    handle = _handle([])
+    assert handle.poll_cache_results() == []
+    plan = _plan(cache=[_WriteBackOp("store")])
+    with pytest.raises(RuntimeError, match="require a Host cache executor"):
+        _execute(handle, plan, None)
 
 
 # ----------------------------------------------------------------------
@@ -1010,17 +1170,42 @@ def _decode_peer(trace):
     return _Peer()
 
 
-def _receiving_handle(trace, *, prepare=None):
-    handle = _handle(trace, kv_transfer=_decode_peer(trace))
+def _receiving_handle(trace, *, prepare=None, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        kv_transfer=_decode_peer(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.prepare_remote_cache_slots = prepare or (
         lambda slots: trace.append(("prepare", slots))
     )
     executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
-    executor.zero_cache_pages = lambda pages: SimpleNamespace(
-        synchronize=lambda: trace.append("wait_zeroing")
-    )
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+
+    class _Event:
+        def record(self, stream) -> None:
+            trace.append(("record", stream))
+
+        def synchronize(self) -> None:
+            trace.append("wait_fence")
+
+    executor.device_module = SimpleNamespace(Event=_Event)
     return handle
+
+
+def _l2_with_load_stream(trace):
+    """A Host L2 executor that records its submissions and names its load
+    stream."""
+    return SimpleNamespace(
+        submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+            trace.append("write_backs")
+        ),
+        submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+            "load_backs"
+        ),
+        load_stream="load-stream",
+    )
 
 
 def _remote_prefill():
@@ -1028,27 +1213,195 @@ def _remote_prefill():
 
 
 @pytest.mark.parametrize("forwards", [True, False])
-def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
-    """The zeroing fence the pull waits on is ordered behind the step in
-    flight; the round's forward is launched first so that wait never delays
-    its launch. A round without a batch still pulls."""
+@pytest.mark.parametrize("zeroes", [True, False])
+def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards, zeroes):
+    """The landing fence the pull waits on is recorded on the default stream
+    behind the zeroing and the forwards in flight, whether or not the plan
+    zeroes anything; the round's forward is launched first so that wait never
+    delays its launch. A round without a batch still pulls."""
     trace: list = []
     handle = _receiving_handle(trace)
     remote_prefill = _remote_prefill()
 
     _execute(
         handle,
-        _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+        _plan(pages_to_zero=[5] if zeroes else [], remote_prefill=remote_prefill),
         _planned(num_extends=0) if forwards else None,
     )
 
     assert trace == [
+        *(["zero"] if zeroes else []),
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
         ("prepare", [3]),
         "reset",
         *(["forward"] if forwards else []),
-        "wait_zeroing",
+        "wait_fence",
         ("pull", remote_prefill),
     ]
+
+
+def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
+    """A D admission's Host hit loads below its landing. The landed request's
+    first forward runs in a later plan, whose layerwise load waits name only
+    that plan's loads, so the pull -- whose end releases the request -- waits
+    for this plan's loads, and for the stores reading the victims it
+    regranted."""
+    trace: list = []
+    store, load = _WriteBackOp("store"), _LoadBackOp("load")
+    handle = _receiving_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+    remote_prefill = _remote_prefill()
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], cache=[store, load], remote_prefill=remote_prefill),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        "zero",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
+        ("prepare", [3]),
+        "reset",
+        "wait_fence",
+        "wait_fence",
+        ("pull", remote_prefill),
+    ]
+
+
+class _PendingDeviceWork:
+    """GPU work with the dependencies captured when it was submitted."""
+
+    def __init__(self, dependencies, action):
+        self.dependencies = dependencies
+        self.action = action
+        self.completed = False
+
+    def complete(self):
+        if self.completed:
+            return
+        for dependency in self.dependencies:
+            dependency.complete()
+        if self.action is not None:
+            self.action()
+        self.completed = True
+
+
+class _OrderedDeviceStream:
+    def __init__(self):
+        self.work = None
+
+    def submit(self, action):
+        dependencies = () if self.work is None else (self.work,)
+        self.work = _PendingDeviceWork(dependencies, action)
+        return self.work
+
+    def wait_stream(self, stream):
+        dependencies = tuple(
+            work for work in (self.work, stream.work) if work is not None
+        )
+        self.work = _PendingDeviceWork(dependencies, None)
+
+
+class _RecordedDeviceEvent:
+    def __init__(self):
+        self.work = None
+
+    def record(self, stream):
+        self.work = stream.work
+
+    def synchronize(self):
+        if self.work is not None:
+            self.work.complete()
+
+
+class _LandingFenceDeviceModule:
+    Event = _RecordedDeviceEvent
+
+
+class _LandingFenceDevice:
+    """Substitute GPU queues and model work while driving the real handle.
+
+    Completing the forward follows its actual stream dependencies; a wait
+    on the entire load makes it observe the loaded bytes. The landing must
+    observe them regardless of whether a forward ran in the plan.
+    """
+
+    mode = "decode"
+
+    def __init__(self):
+        self.device = "cpu"
+        self.device_module = _LandingFenceDeviceModule()
+        self.default_stream = _OrderedDeviceStream()
+        self.execution_stream = _OrderedDeviceStream()
+        self.load_stream = _OrderedDeviceStream()
+        self.loaded = False
+        self.forward_saw_load = None
+        self.landing_saw_load = None
+
+    def complete_pending_drafting(self):
+        pass
+
+    def submit_write_backs(self, ops, *, prerequisite_stream, fence_stream):
+        pass
+
+    def submit_load_backs(self, ops, *, prerequisite_stream):
+        self.load_stream.wait_stream(prerequisite_stream)
+        self.load_stream.submit(self._load)
+
+    def _load(self):
+        self.loaded = True
+
+    def execute_forward_op(self, *args, **kwargs):
+        # ModelExecutor's forward prologue orders model work after this stream.
+        self.execution_stream.wait_stream(self.default_stream)
+        self.execution_stream.submit(self._forward).complete()
+
+    def _forward(self):
+        self.forward_saw_load = self.loaded
+
+    def prepare_remote_cache_slots(self, slots):
+        pass
+
+    def reset_remote_prefill_cache_lengths(self, op):
+        self.execution_stream.wait_stream(self.default_stream)
+
+    def execute(self, op):
+        self.landing_saw_load = self.loaded
+
+    def reads_ready(self):
+        self.landing_saw_load = self.loaded
+
+
+@pytest.mark.parametrize("landing", ["pd", "peer"])
+@pytest.mark.parametrize("forwards", [True, False])
+def test_landing_waits_for_host_load_without_delaying_current_forward(
+    wire_ops, landing, forwards
+):
+    device = _LandingFenceDevice()
+    handle = DeviceHandle(
+        device,
+        host_cache_executor=device,
+        kv_transfer=device if landing == "pd" else None,
+        peer_outbox=device if landing == "peer" else None,
+    )
+    _execute(
+        handle,
+        _plan(
+            cache=[_LoadBackOp("load")],
+            remote_prefill=_remote_prefill() if landing == "pd" else None,
+            has_peer_fetches=landing == "peer",
+        ),
+        _planned(num_extends=0) if forwards else None,
+    )
+
+    assert device.forward_saw_load is (False if forwards else None)
+    assert device.landing_saw_load is True
 
 
 def test_a_failed_slot_preparation_never_triggers_the_pull():
@@ -1487,9 +1840,13 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             self.pages_to_zero = {}
             self.remote_decode = None
             self.remote_prefill = None
+            self.state_commit_fence = None
             self.reads = 0
 
         def pages_to_copy_arrays(self):
+            return {}
+
+        def state_folds_arrays(self):
             return {}
 
         @property
@@ -1573,6 +1930,8 @@ class _SleepExecutor:
         self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
+        self.model_runner = None
+        self.draft_model_runner = None
 
     def complete_pending_drafting(self) -> None:
         # No drafter.

@@ -40,6 +40,12 @@ if not (is_cdna4() or is_cdna5()):
     )
 
 from ops.test_attention_dsa import _pack_index_k_cache  # noqa: E402
+from tokenspeed_kernel.ops.attention.dsa import (  # noqa: E402
+    dsa_decode,
+    dsa_decode_projected_value,
+    dsa_decode_projected_value_supported,
+)
+from tokenspeed_kernel.ops.attention.mla import mla_project_value  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
     attention as gfx950_dsa_backend,
 )
@@ -1254,6 +1260,59 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
         kth = torch.topk(logits[row, :row_len], topk).values[-1]
         if int((logits[row, :row_len] == kth).sum()) == 1:
             torch.testing.assert_close(selections[row], oneblock_selections[row])
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
+def test_dsa_decode_topk_multi_cta_selects_the_exact_set_of_verify_rows() -> None:
+    # 8 verify rows of 131072 keys in 1M-wide logits: 17 to 64 tiles a row, each
+    # listing at most 64 threshold-prefix keys, so the last CTA loads them at once.
+    page_size = 64
+    topk = 2048
+    rows = q_len_per_req = 8
+    cols = 1 << 20
+    max_pages = cols // page_size
+    seq_len = 131072
+    gen = _generator("cuda", seq_len + rows)
+    # Distinct normal quantiles, so each row's top-k set is unique.
+    order = torch.stack(
+        [torch.randperm(cols, device="cuda", generator=gen) for _ in range(rows)]
+    )
+    logits = torch.special.ndtri((order.double() + 0.5) / cols).float()
+    row_lens = [seq_len - (q_len_per_req - 1) + offset for offset in range(rows)]
+    for row, row_len in enumerate(row_lens):
+        logits[row, row_len:] = float("inf")
+    block_table = torch.randperm(max_pages, device="cuda", generator=gen).int()[None]
+    seq_lens = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
+    out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    plan = dsa_topk_backend._dsa_topk_plan(
+        rows, cols, topk, torch.device("cuda"), is_decode=True
+    )
+    assert plan.kind == "multi-cta"
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+    selections = _check_decode_topk_selection(
+        logits,
+        row_lens,
+        out,
+        lens_out,
+        torch.argsort(block_table.long(), dim=1),
+        q_len_per_req,
+        page_size,
+        topk,
+    )
+    for row, row_len in enumerate(row_lens):
+        expected = torch.topk(logits[row, :row_len], topk).indices
+        assert torch.equal(selections[row], torch.sort(expected).values)
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
@@ -2504,6 +2563,111 @@ def test_dsa_dense_split_variants_compile_during_warmup() -> None:
         for tokens in (20, 32, 64, 128, 1):
             out, ref = run(tokens)
             torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+def _projected_value_supported(tokens: int, *, gated: bool) -> bool:
+    """Whether the projected decode serves ``tokens`` rows of Kimi-K3.1's
+    12-head FP8 decode at TP8 over a 2048-slot selection."""
+    return dsa_decode_projected_value_supported(
+        tokens=tokens,
+        heads=12,
+        topk=2048,
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        value_head_dim=128,
+        q_len_per_req=1,
+        gated=gated,
+    )
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the projected DSA decode is gfx950's")
+@pytest.mark.parametrize(
+    ("tokens", "gated"), ((1, True), (8, True), (31, True), (8, False))
+)
+def test_dsa_decode_projected_value_matches_decode_then_projection(
+    tokens: int, gated: bool
+) -> None:
+    device = "cuda"
+    num_heads = 12
+    num_slots = 4096
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    value_head_dim = 128
+    generator = _generator(device, 1400 + tokens)
+    assert _projected_value_supported(tokens, gated=gated)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+        scale=0.7,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+        scale=0.7,
+    ).to(torch.float8_e4m3fn)
+    topk_lens = torch.tensor(
+        [(topk, 1500, 33, 0)[row % 4] for row in range(tokens)],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    for row, length in enumerate(topk_lens.tolist()):
+        topk_slots[row, :length] = torch.randperm(
+            num_slots, device=device, generator=generator
+        )[:length]
+    # The projected decode reads W_UV only as this K-major view of a
+    # contiguous [heads, value, rank] weight.
+    value_weight = _randn_bf16(
+        (num_heads, value_head_dim, kv_lora_rank),
+        device=device,
+        generator=generator,
+        scale=0.05,
+    ).transpose(1, 2)
+    gate = (
+        _randn_bf16(
+            (tokens, num_heads * value_head_dim),
+            device=device,
+            generator=generator,
+            scale=1.0,
+        )
+        if gated
+        else None
+    )
+    common_kwargs = {
+        "q": q,
+        "kv_cache": kv_cache,
+        "topk_slots": topk_slots,
+        "topk_lens": topk_lens,
+        "max_seqlen_k": num_slots,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "softmax_scale": 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim),
+        "page_size": 64,
+        "slot_order": "selection",
+    }
+
+    latent = dsa_decode(sparse_kv_cache=None, **common_kwargs)
+    expected = mla_project_value(latent, value_weight, gate=gate)
+    out = torch.full_like(expected, float("nan"))
+    dsa_decode_projected_value(
+        value_weight=value_weight, gate=gate, out=out, **common_kwargs
+    )
+
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the projected DSA decode is gfx950's")
+def test_dsa_decode_projected_value_refuses_rows_off_its_split_schedule() -> None:
+    # 32 rows take 16 key splits; the projected reduction repeats the 32-split one.
+    assert not _projected_value_supported(32, gated=True)
 
 
 def _reference_lse(

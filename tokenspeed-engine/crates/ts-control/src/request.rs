@@ -218,9 +218,45 @@ impl ReasoningTokens {
     }
 }
 
+/// Remote interval confirmed for this request and its first committed use.
+#[derive(Clone, Debug, Default)]
+pub struct PeerUsage {
+    /// Prediction absent for older clients.
+    pub expected: Option<u64>,
+    /// Landing interval beyond the reader's local prefix.
+    pub window: Option<(i32, i32)>,
+    /// First successful prefill commit resolves this exactly once.
+    pub actual: Option<u64>,
+    /// Last authoritative peer lifecycle result observed by this request.
+    pub disposition: &'static str,
+    /// Time of the first lookup dispatch.
+    pub lookup_at: Option<std::time::Instant>,
+    /// Time at which a successful lookup advanced to admission.
+    pub admission_at: Option<std::time::Instant>,
+}
+
+/// Actual nonempty output blocks on this engine, independent of forward timing.
+/// Present only after a metrics-enabled request emits its first token block.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamOutputTiming {
+    pub first_output: f64,
+    pub last_output: f64,
+    pub first_chunk_tokens: usize,
+    pub output_tokens: usize,
+}
+
+impl StreamOutputTiming {
+    pub fn e2e_tpot(&self, finished: f64) -> Option<f64> {
+        let subsequent = self.output_tokens - self.first_chunk_tokens;
+        (subsequent > 0).then(|| (finished - self.first_output).max(0.0) / subsequent as f64)
+    }
+}
+
 /// One admitted request.
 #[derive(Debug, Clone)]
 pub struct RequestState {
+    /// Present on requests dispatched with a peer hint.
+    pub peer_usage: Option<PeerUsage>,
     /// Prompt token ids.
     pub prompt_ids: Vec<i32>,
     /// Prompt length.
@@ -298,12 +334,17 @@ pub struct RequestState {
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
-    /// When its first output token existed (wall-clock seconds), 0 until
-    /// then. Unlike `timings`, this is collected whenever the rank reports
-    /// engine metrics.
+    /// When this role's first output token existed (wall-clock seconds), 0
+    /// until then. On a decode role this is normally the first local decode
+    /// output; a remote prefill's bootstrap token alone does not stamp it,
+    /// except when that token ends the request. Unlike `timings`, this is
+    /// collected whenever the rank reports engine metrics.
     pub first_token_time: f64,
+    pub(crate) stream_output_timing: Option<StreamOutputTiming>,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
+    /// Boundaries returned once on the final response; independent of logging.
+    pub(crate) request_timing: crate::request_timing::RequestTimingState,
     /// Sampled PD timings, consumed at the first output or terminal release.
     pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
@@ -371,6 +412,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            peer_usage: None,
             session_id: None,
             spec_verify_ct: 0,
             decode_reserve: None,
@@ -383,7 +425,9 @@ impl RequestState {
             decode_ready_at: None,
             created_time: 0.0,
             first_token_time: 0.0,
+            stream_output_timing: None,
             timings: None,
+            request_timing: crate::request_timing::RequestTimingState::default(),
             ttft: None,
             grammar: None,
             admission: 0,

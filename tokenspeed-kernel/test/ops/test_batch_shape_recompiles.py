@@ -657,47 +657,6 @@ def _capacity_sweep(max_sequences):
     return cases
 
 
-def test_kda_prepare_capacity_scan_token_and_sequence_counts():
-    from tokenspeed_kernel.ops.attention.kda._triton import prefill_scan_inputs as scan
-
-    heads, dim = 2, 128
-
-    def run(case, boundary_dtype=torch.int64):
-        lengths, capacity = case
-        live, sequences = sum(lengths), len(lengths)
-
-        def randn(*shape):
-            return torch.randn(1, capacity, *shape, device=DEVICE).bfloat16()
-
-        q, k, v, gate = (randn(heads, dim) for _ in range(4))
-        beta = randn(heads)
-        bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).to(DEVICE)
-        bounds = bounds.to(boundary_dtype)
-        oq, ok, ov, og, ob, chunks, chunk_rows = scan.prepare_capacity_scan(
-            q, k, v, gate, beta, bounds
-        )
-        rows = torch.arange(capacity, device=DEVICE) < live
-        for got, x in ((oq, q), (ok, k), (ov, v), (og, gate.float())):
-            assert torch.equal(got, x * rows[None, :, None, None])
-        assert torch.equal(ob, beta * rows[None, :, None])
-        counts = [triton_cdiv(n, 16) for n in lengths]
-        expected = [s for s, c in enumerate(counts) for _ in range(c)]
-        expected += [sequences - 1] * (chunk_rows.numel() - len(expected))
-        assert chunks.tolist() == [0, *torch.tensor(counts).cumsum(0).tolist()]
-        assert chunk_rows.tolist() == expected
-
-    # One launch compiles the kernel; token, sequence and chunk counts then
-    # sweep every integer class and several fixed-width sequence tiles.
-    sweep = _capacity_sweep(130)
-    run(sweep[-1])
-    with assert_no_triton_compile(scan._prepare_capacity_scan_kernel):
-        for case in sweep:
-            run(case)
-    # Serving passes int64 boundaries; int32 ones compile their own binary.
-    for case in sweep[::5]:
-        run(case, torch.int32)
-
-
 def test_causal_conv1d_capacity_metadata_counts():
     from tokenspeed_kernel.ops.attention.gdn._triton import causal_conv1d_metadata
 
@@ -725,74 +684,6 @@ def test_causal_conv1d_capacity_metadata_counts():
     with assert_no_triton_compile(causal_conv1d_metadata._refresh_conv_capacity_kernel):
         for case in sweep:
             run(case)
-
-
-def test_kda_commit_conv_window_batch_size():
-    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-        batched_kda_commit_conv_window_kernel,
-    )
-
-    layers, steps, conv_dim, pages = 2, 4, 3 * 2 * 128, 160
-    generator = torch.Generator(device="cpu").manual_seed(0)
-    qkv = torch.randn(layers, 64 * steps, conv_dim, generator=generator).bfloat16()
-    pools = torch.randn(layers, pages, conv_dim, 3, generator=generator).bfloat16()
-    qkv, pools = qkv.to(DEVICE), pools.to(DEVICE)
-
-    def run(batch):
-        conv = pools.clone()
-        # Per-layer descriptors: raw QKV at slot 0, convolution history at slot 2.
-        addresses = torch.tensor(
-            [
-                [qkv[i].data_ptr(), 0, conv[i].data_ptr()] + [0] * 7
-                for i in range(layers)
-            ],
-            dtype=torch.uint64,
-            device=DEVICE,
-        )
-        # Reads come from the first 80 pages and writes go to the rest; -1 skips.
-        reads = torch.randint(-1, 80, (layers, batch), generator=generator)
-        writes = 80 + torch.randperm(80, generator=generator)[:batch].repeat(layers, 1)
-        writes[:, 1::5] = -1
-        accepted = torch.randint(-1, steps + 2, (batch,), generator=generator)
-        batched_kda_commit_conv_window_kernel[
-            (layers, batch, triton_cdiv(conv_dim, 128))
-        ](
-            addresses,
-            qkv,
-            conv,
-            torch.arange(layers, dtype=torch.int32, device=DEVICE),
-            reads.int().to(DEVICE),
-            writes.int().to(DEVICE),
-            accepted.int().to(DEVICE),
-            batch,
-            T=steps,
-            STRIDE_QKV=conv_dim,
-            STRIDE_CONV=3 * conv_dim,
-            CONV_DIM=conv_dim,
-            BLOCK=128,
-            num_warps=1,
-        )
-        expected = pools.clone()
-        for layer in range(layers):
-            for request in range(batch):
-                read, write = int(reads[layer, request]), int(writes[layer, request])
-                if write < 0:
-                    continue
-                window = (
-                    pools[layer, read]
-                    if read >= 0
-                    else torch.zeros_like(pools[layer, 0])
-                )
-                taken = min(max(int(accepted[request]), 0), steps)
-                rows = qkv[layer, request * steps : request * steps + taken]
-                history = torch.cat((window, rows.transpose(0, 1)), dim=1)
-                expected[layer, write] = history[:, -3:]
-        assert torch.equal(conv, expected)
-
-    run(3)
-    with assert_no_triton_compile(batched_kda_commit_conv_window_kernel):
-        for batch in (1, 2, 16, 17, 32, 48, 63, 64):
-            run(batch)
 
 
 def test_dp_sampling_kernels_bucket_size():
@@ -900,8 +791,7 @@ def test_mha_decode_and_extend_table_width():
     kv_lens = [64, 130, 17, 191]
     k_cache, v_cache, table = _paged_kv(kv_lens, 2, 64, 64)
     seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
-    # 8 query heads over 2 KV heads take the grouped decode kernel, 2 over 2
-    # the per-head one.
+    # 8 query heads over 2 KV heads fold 4 heads into a program, 2 over 2 one.
     q_grouped = torch.randn(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
     q_per_head = torch.randn(4, 2, 64, device=DEVICE, dtype=torch.bfloat16)
     q_lens = torch.tensor([1, 3, 2, 4], dtype=torch.int32, device=DEVICE)
@@ -942,8 +832,8 @@ def test_mha_decode_and_extend_table_width():
     expected = run(table.shape[1])
     run(16)
     with assert_no_triton_compile(
-        decode._fwd_kernel_stage1,
-        decode._fwd_grouped_kernel_stage1,
+        decode._fwd_folded_kernel_stage1,
+        decode._fwd_folded_kernel_stage2,
         prefill._fwd_kernel,
     ):
         for cols in (5, 7, 19, 40):

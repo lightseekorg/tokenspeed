@@ -415,6 +415,7 @@ class TestDummyGroupTablesTest:
 
     def _bare(self, backend, pool):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg.attn_backend = backend
         pg.token_to_kv_pool = pool
         pg.config = SimpleNamespace(
@@ -735,6 +736,7 @@ class TestDummyGroupTablesTest:
             group_packing={str(sp.group_id): 1 for sp in specs},
         )
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg.attn_backend = _backend()
         pg.token_to_kv_pool = _fake_pool(specs=tuple(specs), runtime_contract=contract)
         pg.config = SimpleNamespace(
@@ -1289,6 +1291,7 @@ class TestNarrowingPrefillGraphTest:
 
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg._narrowing = model
         pg.decoder_buckets = decoder_buckets
         pg.dp_size = 1

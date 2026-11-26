@@ -32,6 +32,8 @@ from tokenspeed_kernel.ops.communication.peer_weights import (
     PreparedExpertWeights,
 )
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import run_eager
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,16 +101,21 @@ class MoEPeerWeights:
     def prefetch_first(self) -> None:
         if self._first_layer is None:
             raise RuntimeError("Finalize peer weights before execution")
-        self.store.prefetch(self._first_layer)
+        run_eager(lambda: self.store.prefetch(self._first_layer))
 
     def acquire(self, layer: int) -> None:
-        self.store.acquire(layer)
+        # Stable views are bound at finalize; only the stream ordering and
+        # host-side staging state must run again between graph segments.
+        run_eager(lambda: self.store.acquire(layer))
 
     def release(self, layer: int) -> None:
-        self.store.release(layer)
-        next_layer = self._layers[layer].next_layer
-        if next_layer is not None:
-            self.store.prefetch(next_layer)
+        def release_and_prefetch() -> None:
+            self.store.release(layer)
+            next_layer = self._layers[layer].next_layer
+            if next_layer is not None:
+                self.store.prefetch(next_layer)
+
+        run_eager(release_and_prefetch)
 
     @contextmanager
     def read(self, layer: int):

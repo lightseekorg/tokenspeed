@@ -49,6 +49,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (  # noqa: 
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (  # noqa: E402
     gluon_moe_sorting,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (  # noqa: E402
+    B_LAYOUT_GDOT128,
+    B_LAYOUT_MFMA16,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (  # noqa: E402
     invoke_gluon_mxfp4_moe_stage2_1x2,
 )
@@ -1134,6 +1138,113 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         torch.testing.assert_close(captured, expected, atol=2e-3, rtol=8e-2)
 
 
+@pytest.mark.parametrize("routing", ["round_robin", "hot_experts"])
+@pytest.mark.parametrize(
+    ("path", "num_tokens"),
+    [
+        ("plain", 1),
+        ("dedup", 4),
+        # The Kimi-K3.1 verify width.
+        ("sorted", 8),
+        # Above 2,048 rows the prefill package reduces its routes in FP32 in a
+        # fixed order. At or below it, BF16 atomic adds make the result vary run
+        # to run, even within one layout.
+        ("prefill", 2049),
+        ("prefill_e2m1", 2064),
+    ],
+)
+def test_tp_situ_n16_plan_matches_gdot128_gfx950(
+    path: str,
+    num_tokens: int,
+    routing: str,
+) -> None:
+    """A plan asking for N16 expert banks computes bit-identically to gdot128.
+
+    Both plans load the same weights. Decode rows and the prefill package are
+    covered, the latter from BF16 rows and from pre-quantized E2M1 rows.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+    num_experts, latent_size, intermediate_size, top_k = 64, 3584, 384, 16
+
+    def load(expert_layout):
+        generator = torch.Generator(device="cuda").manual_seed(1234 + num_tokens)
+        module, _ = _make_mxfp4_module(
+            num_experts=num_experts,
+            latent_size=latent_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            generator=generator,
+        )
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=1,
+            ispp=intermediate_size,
+            internal_activation_dtype="input",
+            expert_layout=expert_layout,
+            solution="gluon",
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+            features=frozenset(),
+        )
+        kernel_moe_process_weights(plan, module)
+        return plan, module
+
+    gdot128_plan, gdot128 = load("gdot128")
+    n16_plan, n16 = load("n16")
+    # The N16 plan runs the apply that reads N16 banks, not the default one.
+    assert (
+        n16_plan["apply_kernel_name"]
+        == "gluon_mxfp4_a8w4_situ_precomputed_n16_moe_apply"
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(31 + num_tokens)
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        latent_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    if routing == "round_robin":
+        topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+    else:
+        # Every token on the same experts: the most rows per expert.
+        topk_ids = torch.arange(top_k, dtype=torch.int32, device="cuda").repeat(
+            num_tokens, 1
+        )
+        topk_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", generator=generator), dim=-1
+        )
+    router_logits = torch.zeros(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    x = hidden_states
+    if path == "prefill_e2m1":
+        x = moe._quantize_mxfp4_activation(hidden_states)
+
+    def apply(plan, module):
+        return kernel_moe_apply(
+            plan,
+            x,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
+    expected = apply(gdot128_plan, gdot128)
+    actual = apply(n16_plan, n16)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "num_experts", "top_k", "block_m", "use_minimum_route_chunks"),
     [
@@ -1362,7 +1473,9 @@ def test_stage1_quantized_output_scale_panels_gfx950(
             output_quantized=True,
             out_scale=out_scale,
             output_k=output_k,
+            b_layout=B_LAYOUT_MFMA16.value,
             num_warps=max(1, block_m // 32),
+            wide_tile=False,
         )
     if error:
         kernel.__getitem__.assert_not_called()
@@ -1651,10 +1764,11 @@ def test_stage2_logical_k_ignores_padding_gfx950(
             block_m=block_m,
             sort_block_m=sort_block_m,
             b_preshuffled=True,
-            b_gdot128=b_gdot128,
+            b_layout=(B_LAYOUT_GDOT128 if b_gdot128 else B_LAYOUT_MFMA16).value,
             force_reduce=force_reduce,
             input_sorted=input_sorted,
             a_format=a_format,
+            wide_tile=False,
         )
 
     result = run()
@@ -1764,10 +1878,11 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
                         block_m=32,
                         sort_block_m=32,
                         b_preshuffled=False,
-                        b_gdot128=False,
+                        b_layout=B_LAYOUT_MFMA16.value,
                         force_reduce=True,
                         input_sorted=False,
                         a_format="e2m1",
+                        wide_tile=False,
                     )
                 )
             initialized, uninitialized = outputs

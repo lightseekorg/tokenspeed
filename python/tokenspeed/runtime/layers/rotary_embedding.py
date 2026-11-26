@@ -22,7 +22,6 @@
 """Rotary Positional Embeddings."""
 
 import dataclasses
-import itertools
 import logging
 import math
 from collections.abc import Callable
@@ -106,6 +105,11 @@ class RotaryEmbedding(torch.nn.Module):
         cache = self._compute_cos_sin_cache()
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    @property
+    def position_capacity(self) -> int:
+        """Exclusive upper bound for raw positions passed to the attention prologue."""
+        return self.cos_sin_cache.shape[0]
 
     def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -524,6 +528,11 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         )
         self.register_buffer("cos_sin_cache", rope_cache, persistent=False)
 
+    @property
+    def position_capacity(self) -> int:
+        # Long positions index past the short-context prefix of the packed buffer.
+        return self.max_position_embeddings
+
     def _compute_inv_freq(self, rescale_factors: list[float]) -> torch.Tensor:
         rescale_factors = torch.tensor(rescale_factors, dtype=torch.float32)
         inv_freq = 1.0 / (
@@ -560,6 +569,17 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         return Rotary(self.cos_sin_cache, positions + offset, RopeStyle.NEOX, None)
 
 
+def _effective_yarn_cache_limit(
+    checkpoint_positions: int, factor: float, limit: int | None
+) -> int | None:
+    if limit is None:
+        return None
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("cache_position_limit must be a positive integer")
+    # A limit that leaves every row in place shares the full table's cache key.
+    return limit if limit < checkpoint_positions * factor else None
+
+
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
@@ -585,6 +605,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         device: str | None = None,
         ramp_device: str,
         frequency_device: str,
+        cache_position_limit: int | None = None,
     ) -> None:
         """
         Args:
@@ -594,7 +615,12 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             ramp_device: Device that computes the YaRN linear ramp mask.
             frequency_device: Device that computes the powers, divisions and
                 interpolation. The ramp is transferred here before combining.
+            cache_position_limit: Maximum number of table rows to materialize.
+                The checkpoint context still determines the YaRN frequencies.
         """
+        self.cache_position_limit = _effective_yarn_cache_limit(
+            max_position_embeddings, scaling_factor, cache_position_limit
+        )
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
@@ -655,8 +681,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
+        extent = self.max_position_embeddings * self.scaling_factor
+        if self.cache_position_limit is not None:
+            extent = min(extent, self.cache_position_limit)
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor,
+            extent,
             device=self.device,
             dtype=torch.float32,
         )
@@ -1024,203 +1053,6 @@ class MRotaryEmbedding(RotaryEmbedding):
             mrope_position_deltas = max_position_ids + 1 - s
             return position_ids, mrope_position_deltas
 
-    @staticmethod
-    def get_rope_index_glm4v(
-        input_ids: torch.Tensor,
-        hf_config: Any,
-        image_grid_thw: list[list[int]] | torch.Tensor,
-        video_grid_thw: list[list[int]] | torch.Tensor,
-        attention_mask: torch.Tensor,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get mrope input positions and delta value for GLM4V."""
-        image_token_id = hf_config.image_token_id
-        video_start_token_id = hf_config.video_start_token_id
-        video_end_token_id = hf_config.video_end_token_id
-        spatial_merge_size = hf_config.vision_config.spatial_merge_size
-
-        mrope_position_deltas = []
-        if input_ids is not None and (
-            image_grid_thw is not None or video_grid_thw is not None
-        ):
-            total_input_ids = input_ids
-            if attention_mask is None:
-                attention_mask = torch.ones_like(total_input_ids)
-            position_ids = torch.ones(
-                3,
-                input_ids.shape[0],
-                input_ids.shape[1],
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            image_index, video_index = 0, 0
-            video_group_index = 0
-            attention_mask = attention_mask.to(total_input_ids.device)
-            for i, input_ids in enumerate(total_input_ids):
-                input_ids = input_ids[attention_mask[i] == 1]
-                input_tokens = input_ids.tolist()
-
-                input_token_type = []
-                video_check_flg = False
-                for token in input_tokens:
-                    if token == video_start_token_id:
-                        video_check_flg = True
-                    elif token == video_end_token_id:
-                        video_check_flg = False
-
-                    if token == image_token_id and not video_check_flg:
-                        input_token_type.append("image")
-                    elif token == image_token_id and video_check_flg:
-                        input_token_type.append("video")
-                    else:
-                        input_token_type.append("text")
-
-                input_type_group = []
-                for key, group in itertools.groupby(
-                    enumerate(input_token_type), lambda x: x[1]
-                ):
-                    group = list(group)
-                    start_index = group[0][0]
-                    end_index = group[-1][0] + 1
-                    input_type_group.append((key, start_index, end_index))
-
-                llm_pos_ids_list = []
-                video_frame_num = 1
-                for modality_type, start_idx, end_idx in input_type_group:
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
-
-                    if modality_type == "image":
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
-                        llm_grid_t, llm_grid_h, llm_grid_w = (
-                            t.item(),
-                            h.item() // spatial_merge_size,
-                            w.item() // spatial_merge_size,
-                        )
-
-                        t_index = (
-                            torch.arange(llm_grid_t)
-                            .view(-1, 1)
-                            .expand(-1, llm_grid_h * llm_grid_w)
-                            .flatten()
-                        )
-                        h_index = (
-                            torch.arange(llm_grid_h)
-                            .view(1, -1, 1)
-                            .expand(llm_grid_t, -1, llm_grid_w)
-                            .flatten()
-                        )
-                        w_index = (
-                            torch.arange(llm_grid_w)
-                            .view(1, 1, -1)
-                            .expand(llm_grid_t, llm_grid_h, -1)
-                            .flatten()
-                        )
-                        llm_pos_ids_list.append(
-                            torch.stack([t_index, h_index, w_index]) + st_idx
-                        )
-
-                        image_index += 1
-                        video_frame_num = 1
-
-                    elif modality_type == "video":
-                        t, h, w = (
-                            video_frame_num,
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-
-                        llm_grid_t, llm_grid_h, llm_grid_w = (
-                            t,
-                            h.item() // spatial_merge_size,
-                            w.item() // spatial_merge_size,
-                        )
-
-                        for t_idx in range(llm_grid_t):
-                            t_index = (
-                                torch.tensor(t_idx)
-                                .view(-1, 1)
-                                .expand(-1, llm_grid_h * llm_grid_w)
-                                .flatten()
-                            )
-
-                            h_index = (
-                                torch.arange(llm_grid_h)
-                                .view(1, -1, 1)
-                                .expand(1, -1, llm_grid_w)
-                                .flatten()
-                            )
-                            w_index = (
-                                torch.arange(llm_grid_w)
-                                .view(1, 1, -1)
-                                .expand(1, llm_grid_h, -1)
-                                .flatten()
-                            )
-                            llm_pos_ids_list.append(
-                                torch.stack([t_index, h_index, w_index]) + st_idx
-                            )
-
-                        video_group_index += 1
-
-                        if video_group_index >= video_grid_thw[video_index][0]:
-                            video_index += 1
-                            video_group_index = 0
-
-                        video_frame_num += 1
-
-                    else:
-                        text_len = end_idx - start_idx
-                        llm_pos_ids_list.append(
-                            torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                        )
-
-                        video_frame_num = 1
-
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
-                    position_ids.device
-                )
-                mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
-                )
-            mrope_position_deltas = torch.tensor(
-                mrope_position_deltas, device=input_ids.device
-            ).unsqueeze(1)
-            return position_ids, mrope_position_deltas
-        else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = (
-                    position_ids.unsqueeze(0)
-                    .expand(3, -1, -1)
-                    .to(attention_mask.device)
-                )
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True
-                )[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
-
 
 @dataclasses.dataclass(frozen=True)
 class RopeScaling:
@@ -1271,16 +1103,18 @@ class RopeScaling:
         ),
     }
 
+    @staticmethod
+    def type_from_dict(raw: dict[str, Any]) -> str:
+        if "rope_type" in raw:
+            return raw["rope_type"]
+        if "type" in raw:
+            return raw["type"]
+        raise ValueError("Unknown RoPE scaling type")
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RopeScaling":
         """Parse and validate a checkpoint's ``rope_scaling`` dict."""
-        if "rope_type" in raw:
-            rope_type = raw["rope_type"]
-        elif "type" in raw:
-            rope_type = raw["type"]
-        else:
-            raise ValueError("Unknown RoPE scaling type")
-
+        rope_type = cls.type_from_dict(raw)
         known = {f.name for f in dataclasses.fields(cls)} - {"rope_type"}
         scaling = cls(
             rope_type=rope_type, **{k: v for k, v in raw.items() if k in known}
@@ -1308,6 +1142,7 @@ class _RopeCommonArgs:
     base: int
     is_neox_style: bool
     dtype: torch.dtype
+    cache_position_limit: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1428,6 +1263,7 @@ def _build_deepseek_yarn(
         args.dtype,
         ramp_device=yarn.ramp_device,
         frequency_device=yarn.frequency_device,
+        cache_position_limit=args.cache_position_limit,
         extrapolation_factor=scaling.extrapolation_factor,
         attn_factor=scaling.attn_factor,
         beta_fast=scaling.beta_fast,
@@ -1480,7 +1316,22 @@ def get_rope(
     rope_scaling: dict[str, Any] | None = None,
     dtype: torch.dtype | None = None,
     partial_rotary_factor: float = 1.0,
+    *,
+    cache_position_limit: int | None = None,
 ) -> RotaryEmbedding:
+    """Reuse a RoPE table, optionally capping the rows built for DeepSeek YaRN."""
+    scaling = None
+    if cache_position_limit is not None:
+        scaling = (
+            RopeScaling.from_dict(rope_scaling) if rope_scaling is not None else None
+        )
+        if scaling is None or scaling.rope_type != "deepseek_yarn":
+            raise ValueError("cache_position_limit is only supported for deepseek_yarn")
+        cache_position_limit = _effective_yarn_cache_limit(
+            scaling.original_max_position_embeddings,
+            scaling.factor,
+            cache_position_limit,
+        )
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
@@ -1509,6 +1360,7 @@ def get_rope(
         dtype,
         yarn_ramp_mask_device,
         yarn_frequency_device,
+        cache_position_limit,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1518,13 +1370,19 @@ def get_rope(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
-        scaling = RopeScaling.from_dict(rope_scaling)
+        scaling = scaling or RopeScaling.from_dict(rope_scaling)
         builder = _ROPE_BUILDERS.get(scaling.rope_type)
         if builder is None:
             raise ValueError(f"Unknown RoPE scaling type {scaling.rope_type}")
         rotary_emb = builder(
             _RopeCommonArgs(
-                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                cache_position_limit,
             ),
             scaling,
             _YarnDevices(yarn_ramp_mask_device, yarn_frequency_device),

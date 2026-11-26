@@ -22,9 +22,10 @@
 //! through the bootstrap server, and the KV crosses over RDMA.
 //!
 //! Needs an RDMA device and `TS_MOONCAKE_LIBRARY` naming
-//! `libtokenspeed_transfer_engine.so`; without the variable the tests return
-//! at once. Each side's arena is one 4 KiB buffer holding a one-group cache
-//! of two fields in two planes; the tests stand in for the forward thread,
+//! `libtokenspeed_transfer_engine.so`; without the variable most tests return
+//! at once. The basic landing case also runs with the CPU transfer fixture.
+//! Each side's arena is one 4 KiB buffer holding a one-group cache of two
+//! fields in two planes; the tests stand in for the forward thread,
 //! staging the plans' remote streams and handing them over.
 
 use bytes::Bytes;
@@ -35,6 +36,8 @@ use std::{
 };
 use ts_pd::{BootstrapInfo, PdEvent, RemotePrefill, StatusMessage, TransferPeer, TransferPoll};
 
+#[path = "../src/tests_support.rs"]
+mod native;
 mod support;
 use support::*;
 
@@ -44,10 +47,9 @@ fn library() -> Option<PathBuf> {
 
 #[test]
 fn a_request_bootstraps_transfers_and_lands() {
-    let Some(library) = library() else {
-        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
-        return;
-    };
+    let library = library();
+    let fixture = library.is_none().then(native::NativeLibrary::new);
+    let library = library.unwrap_or_else(|| fixture.as_ref().unwrap().path().to_owned());
     let source = pattern();
     let destination = vec![0u8; BYTES];
     let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
@@ -75,8 +77,16 @@ fn a_request_bootstraps_transfers_and_lands() {
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Succeeded(rid.to_owned())
     );
+    let before = (std::time::SystemTime::now(), Instant::now());
+    let event = next_event(&mut pair.decode, &mut mesh, &group);
+    let PdEvent::RemotePrefillDone(done) = &event else {
+        panic!("expected landed KV")
+    };
+    let kv_ready_at = done.kv_ready_at;
+    assert!(kv_ready_at.0 >= before.0 && kv_ready_at.0 <= std::time::SystemTime::now());
+    assert!(kv_ready_at.1 >= before.1 && kv_ready_at.1 <= Instant::now());
     assert_eq!(
-        next_event(&mut pair.decode, &mut mesh, &group),
+        event,
         PdEvent::RemotePrefillDone(RemotePrefill {
             rid: rid.to_owned(),
             bootstrap_token: 777,
@@ -84,6 +94,7 @@ fn a_request_bootstraps_transfers_and_lands() {
             bootstrap_logprob: Some(-0.5),
             spec_candidate_ids: Some(vec![1, 2, 3]),
             request_pool_index: 3,
+            kv_ready_at,
         })
     );
     assert!(landed(&destination, &source));

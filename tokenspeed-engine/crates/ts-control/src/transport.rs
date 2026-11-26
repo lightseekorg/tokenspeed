@@ -378,6 +378,7 @@ pub fn output_batch(
     let n = outputs.len();
     let mut batch = BatchTokenIDOutSlim {
         rids: Some(Vec::with_capacity(n)),
+        request_timing: Vec::with_capacity(n),
         output_ids: Vec::with_capacity(n),
         finished_reasons: Vec::with_capacity(n),
         prompt_tokens: Vec::with_capacity(n),
@@ -393,6 +394,8 @@ pub fn output_batch(
         kv_active_pages: load.kv_active_pages,
         kv_total_pages: load.kv_total_pages,
         kv_used_pages: load.kv_used_pages,
+        num_resident_tokens: Some(load.num_resident_tokens),
+        num_waiting_uncached_tokens: Some(load.num_waiting_uncached_tokens),
         finish_reason_details: Vec::with_capacity(n),
         spec_verify_ct: Vec::new(),
         accept_draft_tokens: Vec::new(),
@@ -404,6 +407,7 @@ pub fn output_batch(
         output_top_logprobs_idx: Vec::with_capacity(n),
     };
     for output in outputs {
+        batch.request_timing.push(output.request_timing);
         batch.rids.as_mut().expect("set above").push(output.rid);
         // The logprob ids are the tokens the logprobs belong to.
         let logprob_ids = if output.output_logprobs.is_empty() {
@@ -448,6 +452,9 @@ pub fn output_batch(
         if column.iter().all(Vec::is_empty) {
             column.clear();
         }
+    }
+    if batch.request_timing.iter().all(Option::is_none) {
+        batch.request_timing.clear();
     }
     frame_column(&mut batch.input_token_logprobs_val);
     frame_column(&mut batch.input_token_logprobs_idx);
@@ -805,6 +812,7 @@ mod tests {
         let (mut transport, _requests, mut outputs) = transport(2);
         let output = StreamedOutput {
             rid: "r0".to_owned(),
+            request_timing: None,
             output_ids: vec![7, 8],
             finish_reason: None,
             prompt_tokens: 4,
@@ -824,6 +832,8 @@ mod tests {
             kv_active_pages: 5,
             kv_total_pages: 64,
             kv_used_pages: 9,
+            num_resident_tokens: 5_000_000_000,
+            num_waiting_uncached_tokens: 3_000_000_000,
         };
         transport.send(vec![output.clone()], load);
         let [EngineOutput::Batch(batch)] = <[_; 1]>::try_from(sent(&mut outputs)).unwrap() else {
@@ -831,6 +841,8 @@ mod tests {
         };
         assert_eq!(*batch, output_batch(vec![output], 2, load));
         assert_eq!(batch.reasoning_tokens, [1]);
+        assert_eq!(batch.num_resident_tokens, Some(5_000_000_000));
+        assert_eq!(batch.num_waiting_uncached_tokens, Some(3_000_000_000));
         assert_eq!(
             (batch.engine_index, batch.num_waiting, batch.kv_used_pages),
             (2, 3, 9)

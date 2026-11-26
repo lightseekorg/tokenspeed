@@ -56,6 +56,20 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 
 logger = logging.getLogger(__name__)
 
+# NextN-only weights that live on the draft model, not its decoder layer.
+_NEXTN_SPEC_WEIGHT_NAMES = (
+    "shared_head.norm",
+    "eh_proj",
+    "enorm",
+    "hnorm",
+)
+
+_STACKED_PARAMS_MAPPING = (
+    # (param_name, shard_name, shard_id)
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+)
+
 
 class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     """Decoder layer that injects the draft attention and narrows residuals.
@@ -81,6 +95,9 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
 
 
 class DeepseekModelNextN(nn.Module):
+    # The draft's decoder layer; a backbone variant swaps in its own.
+    decoder_cls: type[nn.Module] = DeepseekV3DraftDecoderLayer
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -104,7 +121,7 @@ class DeepseekModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.alt_stream = torch.cuda.Stream()
-        self.decoder = DeepseekV3DraftDecoderLayer(
+        self.decoder = self.decoder_cls(
             config,
             0,
             mapping=self.mapping,
@@ -157,7 +174,190 @@ class DeepseekModelNextN(nn.Module):
         return hidden_states, None
 
 
-class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+class DeepseekNextNWeights:
+    """Loads a DeepSeek-layout NextN layer into a single-layer draft."""
+
+    def _nextn_layer_prefix(self, name: str) -> str | None:
+        if not hasattr(self.config, "num_nextn_predict_layers"):
+            raise ValueError("num_nextn_predict_layers is not in the config")
+        if self.config.num_nextn_predict_layers != 1:
+            raise ValueError("Only 1 nextn layer is supported")
+
+        if self.config.num_nextn_predict_layers == self.config.num_hidden_layers:
+            prefix = "model.layers.0"
+            return prefix if name.startswith(prefix) else None
+
+        if not name.startswith("model.layers."):
+            return None
+        name_parts = name.split(".")
+        if len(name_parts) < 3:
+            return None
+        try:
+            layer_id = int(name_parts[2])
+        except ValueError:
+            return None
+        if layer_id < self.config.num_hidden_layers:
+            return None
+        return f"model.layers.{layer_id}"
+
+    def _map_checkpoint_name(self, raw_name: str) -> str | None:
+        nextn_layer_prefix = self._nextn_layer_prefix(raw_name)
+        if nextn_layer_prefix is None:
+            return None
+        # Use shared head and embed weights from target model
+        if "shared_head.head" in raw_name or "embed_tokens" in raw_name:
+            return None
+        if "rotary_emb.inv_freq" in raw_name:
+            return None
+
+        if any(weight_name in raw_name for weight_name in _NEXTN_SPEC_WEIGHT_NAMES):
+            return raw_name.replace(nextn_layer_prefix, "model")
+        return raw_name.replace(nextn_layer_prefix, "model.decoder")
+
+    def _nextn_param(
+        self, params_dict: dict[str, nn.Parameter], name: str
+    ) -> nn.Parameter | None:
+        """The parameter a plain checkpoint tensor loads into; None skips it."""
+        return params_dict[name]
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
+        cached_a_proj = self._pending_a_proj
+
+        params_dict = dict(self.named_parameters())
+        # MoE expert weights, scales, and activation scales are handled
+        # by the checkpoint loader.
+        moe_loader = build_moe_checkpoint_loader(
+            params_dict=params_dict,
+            expert_schema=ExpertCheckpointSchema(
+                gate_proj_name="gate_proj",
+                down_proj_name="down_proj",
+                up_proj_name="up_proj",
+            ),
+            num_experts=self.config.n_routed_experts,
+            ep_rank=self.mapping.moe.ep_rank,
+            ep_size=self.mapping.moe.ep_size,
+        )
+        for raw_name, loaded_weight in weights:
+            name = self._map_checkpoint_name(raw_name)
+            if name is None:
+                continue
+            for param_name, weight_name, shard_id in _STACKED_PARAMS_MAPPING:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since moe_loader handles the experts below,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below by moe_loader
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if ("mlp.experts." in name) and name not in params_dict:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if moe_loader.matches(name):
+                    moe_loader.load(name, loaded_weight)
+                    continue
+
+                if fuse_qkv_a_proj and (
+                    "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                ):
+                    cached_a_proj[name] = loaded_weight
+                    q_a_proj_name = (
+                        name
+                        if "q_a_proj" in name
+                        else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                    )
+                    kv_a_proj_name = (
+                        name
+                        if "kv_a_proj_with_mqa" in name
+                        else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                    )
+
+                    # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                    if (
+                        q_a_proj_name in cached_a_proj
+                        and kv_a_proj_name in cached_a_proj
+                    ):
+
+                        q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                        kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                        fused_weight = torch.cat(
+                            [q_a_proj_weight, kv_a_proj_weight], dim=0
+                        )
+
+                        if "q_a_proj" in name:
+                            param_name = name.replace(
+                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                            )
+                        else:
+                            param_name = name.replace(
+                                "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
+                            )
+                        param = params_dict[param_name]
+
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, fused_weight)
+                        cached_a_proj.pop(q_a_proj_name)
+                        cached_a_proj.pop(kv_a_proj_name)
+                else:
+                    # Experts this rank owns were consumed by ``moe_loader``
+                    # above; under ep_size > 1 the remaining expert weights
+                    # belong to other ranks.
+                    if ".mlp.experts." in name:
+                        continue
+                    param = self._nextn_param(params_dict, name)
+                    if param is None:
+                        continue
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+        self.post_load_weights()
+
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_a_proj.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_a_proj.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
+
+        Raises:
+            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
+                pair was streamed without the other, so the fused projection
+                still holds the previous weights.
+        """
+        if self._pending_a_proj:
+            unpaired = sorted(self._pending_a_proj)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed {unpaired} without "
+                "the partner tensor the fused q/kv a-projection needs"
+            )
+        super().end_weight_update()
+
+
+class DeepseekV3ForCausalLMNextN(DeepseekNextNWeights, DeepseekV3ForCausalLM):
 
     def __init__(
         self,
@@ -264,187 +464,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             return int(name_list[2]) >= self.config.num_hidden_layers
         except ValueError:
             return False
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = self._pending_a_proj
-
-        nextn_spec_weight_names = [
-            "shared_head.norm",
-            "eh_proj",
-            "enorm",
-            "hnorm",
-        ]
-
-        params_dict = dict(self.named_parameters())
-        # MoE expert weights, scales, and activation scales are handled
-        # by the checkpoint loader.
-        moe_loader = build_moe_checkpoint_loader(
-            params_dict=params_dict,
-            expert_schema=ExpertCheckpointSchema(
-                gate_proj_name="gate_proj",
-                down_proj_name="down_proj",
-                up_proj_name="up_proj",
-            ),
-            num_experts=self.config.n_routed_experts,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
-        )
-        for name, loaded_weight in weights:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                if num_nextn_layers != 1:
-                    raise ValueError("Only 1 nextn layer is supported")
-                nextn_layer_prefix = "model.layers.0"
-                if num_nextn_layers != self.config.num_hidden_layers:
-                    if name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            nextn_layer_prefix = "model.layers." + str(name_list[2])
-                        else:
-                            continue
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
-
-            # Use shared head and embed weights from target model
-            if "shared_head.head" in name or "embed_tokens" in name:
-                continue
-
-            is_decoder = True
-            # For nextn specific weights
-            for weight_name in nextn_spec_weight_names:
-                if weight_name in name:
-                    name = name.replace(nextn_layer_prefix, "model")
-                    is_decoder = False
-                    break
-            # For decoder layer weights
-            if is_decoder:
-                name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since moe_loader handles the experts below,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below by moe_loader
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
-                    continue
-
-                if fuse_qkv_a_proj and (
-                    "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                ):
-                    cached_a_proj[name] = loaded_weight
-                    q_a_proj_name = (
-                        name
-                        if "q_a_proj" in name
-                        else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                    )
-                    kv_a_proj_name = (
-                        name
-                        if "kv_a_proj_with_mqa" in name
-                        else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                    )
-
-                    # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                    if (
-                        q_a_proj_name in cached_a_proj
-                        and kv_a_proj_name in cached_a_proj
-                    ):
-
-                        q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                        kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                        fused_weight = torch.cat(
-                            [q_a_proj_weight, kv_a_proj_weight], dim=0
-                        )
-
-                        if "q_a_proj" in name:
-                            param_name = name.replace(
-                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                            )
-                        else:
-                            param_name = name.replace(
-                                "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                            )
-                        param = params_dict[param_name]
-
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, fused_weight)
-                        cached_a_proj.pop(q_a_proj_name)
-                        cached_a_proj.pop(kv_a_proj_name)
-                else:
-                    # Experts this rank owns were consumed by ``moe_loader``
-                    # above; under ep_size > 1 the remaining expert weights
-                    # belong to other ranks.
-                    if ".mlp.experts." in name:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-        self.post_load_weights()
-
-    def begin_weight_update(self) -> None:
-        super().begin_weight_update()
-        self._pending_a_proj.clear()
-
-    def abort_weight_update(self) -> None:
-        super().abort_weight_update()
-        self._pending_a_proj.clear()
-
-    def end_weight_update(self) -> None:
-        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
-
-        Raises:
-            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
-                pair was streamed without the other, so the fused projection
-                still holds the previous weights.
-        """
-        if self._pending_a_proj:
-            unpaired = sorted(self._pending_a_proj)
-            self.abort_weight_update()
-            raise RuntimeError(
-                f"{type(self).__name__}: the update streamed {unpaired} without "
-                "the partner tensor the fused q/kv a-projection needs"
-            )
-        super().end_weight_update()
 
     def post_load_weights(self):
         absorb_mla_kv_b_proj(self.model.decoder.self_attn)

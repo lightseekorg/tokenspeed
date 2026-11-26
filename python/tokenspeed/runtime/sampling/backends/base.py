@@ -433,7 +433,9 @@ class SamplingBackend(ABC):
 
         Args:
             dtype: The shard logits' dtype, as the processor hands them over.
-            columns: Vocabulary columns per shard.
+            columns: Real vocabulary columns of the narrowest shard: every
+                shard's, or the last one's where the vocabulary ends inside
+                the padded head.
             tp_size: Ranks the vocabulary is sharded over.
         """
         from tokenspeed_kernel.ops.sampling import (
@@ -490,6 +492,11 @@ class SamplingBackend(ABC):
             f"{type(self).__name__} reads whole rows only; it has no "
             "vocab-shard sampling to warm"
         )
+
+    def reads_sparse_draft_q(self) -> bool:
+        """Whether ``verify`` reads DFlash2's sparse ``RuntimeStates.future_draft_q``
+        rather than the dense ``RuntimeStates.draft_probs`` rows."""
+        return False
 
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits

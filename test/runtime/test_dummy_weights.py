@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Dummy loading gives integer parameters valid values before post-processing
-reads them, tells an EAGLE3 draft its embedding is initialized, and derives a
-wrapped text model's weights."""
+"""Dummy loading gives every parameter its value before post-processing reads
+it, tells an EAGLE3 draft its embedding is initialized, and derives a wrapped
+text model's weights."""
 
 from __future__ import annotations
 
@@ -79,6 +79,61 @@ def test_the_dummy_loader_fills_integers_before_post_processing(monkeypatch):
         device_config=SimpleNamespace(device="cpu"),
     )
     assert len(seen) == 1 and torch.all(seen[0] == 0)
+
+
+class _DerivedCopy(nn.Module):
+    """A model whose post-processing derives a copy of its weight.
+
+    The copy stands in for a prepared GEMV weight.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # NaN stands in for uninitialized memory.
+        self.weight = nn.Parameter(
+            torch.full((4, 4), float("nan")), requires_grad=False
+        )
+        self.prepared: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, module: nn.Module) -> None:
+        self.prepared = self.weight.detach().t().contiguous()
+
+
+def test_the_dummy_loader_derives_copies_from_the_final_weights(monkeypatch):
+    model = _DerivedCopy()
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: model)
+    loader.DummyModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(dtype=torch.float32),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert not torch.isnan(model.weight).any()
+    assert torch.equal(model.prepared, model.weight.t())
+
+
+def test_a_dummy_initializer_sets_its_parameter_before_post_processing(
+    monkeypatch,
+):
+    seen = []
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scale = nn.Parameter(
+                torch.full((4,), float("nan")), requires_grad=False
+            )
+            self.scale.dummy_initializer = lambda param, generator: param.data.fill_(
+                1.0
+            )
+
+        def post_load_weights(self) -> None:
+            seen.append(self.scale.clone())
+
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: _Model())
+    loader.DummyModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(dtype=torch.float32),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert len(seen) == 1 and torch.all(seen[0] == 1.0)
 
 
 def test_the_dummy_loader_marks_the_draft_embedding_initialized(monkeypatch):

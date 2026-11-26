@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -35,8 +36,16 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_mix,
     pad_gated_residual_projection_weight,
     prepare_gated_residual_up_weight,
+    set_gated_residual_workspace_region,
 )
 from torch import nn
+
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+
+def register_workspace_region(adapter: TorchMemorySaverAdapter) -> None:
+    """Keep fused HC workspaces, including ones grown later, in ``adapter``'s workspace region."""
+    set_gated_residual_workspace_region(partial(adapter.named_region, "workspace"))
 
 
 @dataclass(frozen=True)

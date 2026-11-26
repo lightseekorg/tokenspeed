@@ -49,6 +49,19 @@ void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     }
 }
 
+void Scheduler::handleEvent(const pd::DestinationReadyEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr) {
+        return;
+    }
+    // Whatever the prompt's state, its final result no longer parks it; one
+    // already parked sends its KV.
+    request->MarkDestinationReady();
+    if (request->Is<fsm::PrefillAwaitingDestination>()) {
+        request->Apply(fsm::DestinationReadyEvent{});
+    }
+}
+
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
@@ -400,7 +413,13 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
             profile_span.emplace("Scheduler::handlePrefillResult");
         }
         request->NoteResultLanded();
-        request->Apply(fsm::ExtendResultEvent{event.tokens});
+        // Under early decode allocation an admitted prompt has its
+        // destination; under deferred it has one once
+        // pd::DestinationReadyEvent arrived.
+        const bool await_destination =
+            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
+            !request->DestinationReady();
+        request->Apply(fsm::ExtendResultEvent{event.tokens, await_destination});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
@@ -439,11 +458,13 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
             retracted->image.FollowPublished(published);
         }
     }
-    if (storage_transfers_ && storage_allowed_) {
+    if ((storage_transfers_ || disk_transfers_) && storage_allowed_) {
         std::vector<CacheKey> keys;
         keys.reserve(published.size());
         for (const auto& entry : published) keys.push_back(entry.key);
-        storage_transfers_->QueueBackups(keys);
+        if (storage_transfers_) storage_transfers_->QueueBackups(keys);
+        // What the write-back brought to Host is dirty there until cleaned.
+        if (disk_transfers_) disk_transfers_->QueueCleaning(keys);
     }
 }
 
@@ -481,6 +502,11 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
     }
     // Otherwise the row and the blob slot return with the ticket: the request
     // that would have used them is gone.
+}
+
+void Scheduler::handleEvent(const cache::StateCommitDone& event) {
+    // Every replica member committed the endpoints; a duplicate ACK finds none.
+    state_commit_fences_.erase(event.op_id);
 }
 
 }  // namespace tokenspeed

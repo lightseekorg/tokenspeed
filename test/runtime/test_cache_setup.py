@@ -153,8 +153,10 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     uses_paged_state_verify, expected_bytes
 ):
     backend = Mock(spec=AttentionBackend)
+    backend.preallocate_prefill_workspace.return_value = 0
     backend.preallocate_verify_workspace.return_value = 128
     draft_backend = Mock(spec=AttentionBackend)
+    draft_backend.preallocate_prefill_workspace.return_value = 0
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
         config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
@@ -554,6 +556,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         speculative_eagle_topk=topk,
         speculative_draft_tree=topk > 1,
         enable_replay_ssm=replay_enabled,
+        enable_deferred_gdn_state=False,
         mamba_ssm_dtype="float32",
     )
 
@@ -676,8 +679,11 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         )
         return
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
-    # conv states; the commit holds two int64 ids per request per layer.
-    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
+    # conv states; the commit holds two int64 ids per request per layer, and
+    # each layer also keeps an int64 destination element stride.
+    assert ple_bytes == (
+        8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 + 2 * 8 if ple_enabled else 0
+    )
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
@@ -844,9 +850,10 @@ def test_qwen4_exp_ple_verify_workspace_accepts_uneven_page_strides() -> None:
     assert len(strides) > 1
     # Raised while the commit tables took every layer's stride from the first.
     # Eight verify rows of the int64[2] context and three 9 KiB PLE states,
-    # plus two int64 commit row ids per request and layer.
+    # plus two int64 commit row ids per request and layer; each layer also
+    # keeps an int64 destination element stride.
     assert backend.preallocate_verify_workspace(2, 3) == (
-        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8
+        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8 + 3 * 8
     )
 
 
@@ -891,7 +898,14 @@ def test_qwen4_exp_ple_commit_writes_each_layer_at_its_page_stride() -> None:
     for field_id, rows in scratch.items():
         field = arena.field(field_id)
         for page, row in ((2, 1), (5, 7)):
-            torch.testing.assert_close(field[page], rows[row], rtol=0, atol=0)
+            if field_id == context_id:
+                expected = rows[row]
+            else:
+                channels, history = rows.shape[1:]
+                base = row // 4 * 4
+                inputs = rows[base + 1 : row + 1].flatten(1)[:, :channels].T
+                expected = torch.cat((rows[base], inputs), dim=1)[:, -history:]
+            torch.testing.assert_close(field[page], expected, rtol=0, atol=0)
             field[page].view(torch.uint8).fill_(0x5A)
     assert torch.equal(arena.buffer, poisoned)
 
@@ -1991,10 +2005,19 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
     from tokenspeed.runtime.execution import device, factory
+    from tokenspeed.runtime.layers.attention import utils as attention_utils
 
     _receive_pool_env(monkeypatch, 16, 256)
     _fake_around_the_budget(monkeypatch, lambda: 60 << 30)
+    groups = ProcessGroupManager()
+    groups.register_process_group(
+        "gloo",
+        (0,),
+        torch.distributed.ProcessGroupGloo(torch.distributed.HashStore(), 0, 1),
+    )
+    monkeypatch.setattr(attention_utils, "pg_manager", groups)
     target = SimpleNamespace(
         model=object(),
         prepare_multimodal_runtime=lambda: None,
@@ -2013,18 +2036,14 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
         device="cuda",
-        mapping=SimpleNamespace(
-            world_size=1,
-            world_group=None,
-            is_first_pp_rank=True,
-            attn=SimpleNamespace(has_kvp=False),
-        ),
+        # Budget each rank locally; collective reductions are tested separately.
+        mapping=Mapping(rank=0, world_size=1),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
             server_args=server_args,
             model_config=SimpleNamespace(
-                is_multimodal=True, is_multimodal_active=active
+                is_multimodal=True, is_multimodal_active=active, dtype=torch.bfloat16
             ),
             draft_model_config=None,
             gpu_id=0,

@@ -61,6 +61,7 @@ class MoEConfig:
     SCALE_LOAD_MODE: gl.constexpr
     X_SCALE_VIA_LDS: gl.constexpr
     W_SCALE_VIA_LDS: gl.constexpr
+    W_SCALE_N16_GATE_UP: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
     BLOCK_M_PRESHUFFLED: gl.constexpr
     BLOCK_N_PRESHUFFLED: gl.constexpr
@@ -118,6 +119,8 @@ class MoEConfig:
         W_PREFETCH=True,
         X_SCALE_VIA_LDS=None,
         W_SCALE_VIA_LDS=None,
+        *,
+        W_SCALE_N16_GATE_UP,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -148,6 +151,11 @@ class MoEConfig:
         _scale_via_lds = X_SCALE_VIA_LDS or W_SCALE_VIA_LDS
         self.X_SCALE_VIA_LDS = gl.constexpr(X_SCALE_VIA_LDS)
         self.W_SCALE_VIA_LDS = gl.constexpr(W_SCALE_VIA_LDS)
+        # W13 e8m0 scales in the N16 gate/up panel order (n16_weights.py), read
+        # through issue_local_load_unswizzle_n16_gate_up.
+        if W_SCALE_N16_GATE_UP and not W_SCALE_VIA_LDS:
+            raise ValueError("N16 gate/up W scales are read through LDS only")
+        self.W_SCALE_N16_GATE_UP = gl.constexpr(W_SCALE_N16_GATE_UP)
         self.PRESHUFFLE_FACTOR = gl.constexpr(_SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_M_PRESHUFFLED = gl.constexpr(BLOCK_M // _SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // _SCALE_PRESHUFFLE_FACTOR)
@@ -544,6 +552,32 @@ class AsyncCopyDescriptor:
         return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_2d, layout)
 
     @gluon.jit
+    def issue_local_load_unswizzle_n16_gate_up(
+        self,
+        idx,
+        buffer,
+        layout: gl.constexpr,
+        BLOCK_NONK_PS: gl.constexpr,
+        BLOCK_NONK: gl.constexpr,
+        BLOCK_K_SCALE: gl.constexpr,
+    ):
+        """Read W13 scales stored in the N16 gate/up panel order.
+
+        An N16 W13 scale panel holds the same 32 rows as a CDNA4 panel of the
+        gate/up-interleaved rows (gate rows j and their up rows), but its
+        innermost byte pairs gate j with up j, where CDNA4 pairs rows n and
+        n + 16. Logical row 2 * j + gate_or_up is therefore the panel's
+        (row, gate/up) axes in that order; the K-group axes are as in
+        ``issue_local_load_unswizzle``.
+        """
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        slot = buffer.index(idx % NUM_BUFFERS)
+        slot_7d = slot.reshape((BLOCK_NONK_PS, BLOCK_K_SCALE // 8, 4, 16, 2, 2, 1))
+        slot_perm = slot_7d.permute((0, 3, 5, 1, 4, 2, 6))
+        slot_2d = slot_perm.reshape((BLOCK_NONK, BLOCK_K_SCALE))
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(slot_2d, layout)
+
+    @gluon.jit
     def issue_local_load_unswizzle_sub(
         self,
         idx,
@@ -910,14 +944,26 @@ class MoEPipelinedProgram:
                 )
             if cfg.WITH_W_MX_SCALE:
                 if cfg.W_SCALE_VIA_LDS:
-                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
-                        self.w_scale_buffer,
-                        cfg.layout_w_scale,
-                        cfg.BLOCK_N_PRESHUFFLED,
-                        cfg.BLOCK_N,
-                        BLOCK_K_SCALE,
-                    )
+                    if cfg.W_SCALE_N16_GATE_UP:
+                        scale_w = (
+                            self.w_scale_desc.issue_local_load_unswizzle_n16_gate_up(
+                                mfma_idx,
+                                self.w_scale_buffer,
+                                cfg.layout_w_scale,
+                                cfg.BLOCK_N_PRESHUFFLED,
+                                cfg.BLOCK_N,
+                                BLOCK_K_SCALE,
+                            )
+                        )
+                    else:
+                        scale_w = self.w_scale_desc.issue_local_load_unswizzle(
+                            mfma_idx,
+                            self.w_scale_buffer,
+                            cfg.layout_w_scale,
+                            cfg.BLOCK_N_PRESHUFFLED,
+                            cfg.BLOCK_N,
+                            BLOCK_K_SCALE,
+                        )
                 else:
                     scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx)
             else:
@@ -962,14 +1008,26 @@ class MoEPipelinedProgram:
 
             if cfg.WITH_W_MX_SCALE:
                 if cfg.W_SCALE_VIA_LDS:
-                    scale_w = self.w_scale_desc.issue_local_load_unswizzle(
-                        mfma_idx,
-                        self.w_scale_buffer,
-                        cfg.layout_w_scale,
-                        cfg.BLOCK_N_PRESHUFFLED,
-                        cfg.BLOCK_N,
-                        BLOCK_K_SCALE,
-                    )
+                    if cfg.W_SCALE_N16_GATE_UP:
+                        scale_w = (
+                            self.w_scale_desc.issue_local_load_unswizzle_n16_gate_up(
+                                mfma_idx,
+                                self.w_scale_buffer,
+                                cfg.layout_w_scale,
+                                cfg.BLOCK_N_PRESHUFFLED,
+                                cfg.BLOCK_N,
+                                BLOCK_K_SCALE,
+                            )
+                        )
+                    else:
+                        scale_w = self.w_scale_desc.issue_local_load_unswizzle(
+                            mfma_idx,
+                            self.w_scale_buffer,
+                            cfg.layout_w_scale,
+                            cfg.BLOCK_N_PRESHUFFLED,
+                            cfg.BLOCK_N,
+                            BLOCK_K_SCALE,
+                        )
                 else:
                     scale_w = _load_scale_tile_via_gl_load(self.w_scale_desc, mfma_idx)
             else:
@@ -2681,4 +2739,53 @@ def _make_preshuffled_w_full_offsets(
     )
     TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
     base_off_b = w_base_offset + pid_n * TILE_BYTES
+    return offsets_b, base_off_b
+
+
+@gluon.jit
+def _make_n16_gate_up_w_full_offsets(
+    w_base_offset,
+    pid_n,
+    row_group_bytes,
+    LOAD_W_COPY_LAYOUT: gl.constexpr,
+    BLOCK_N_LAYOUT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K_W: gl.constexpr,
+):
+    """N16 W13 source offsets that fill LDS exactly like the gdot128 copy.
+
+    Returns the same ``[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16]`` tile as
+    ``_make_preshuffled_w_full_offsets``: logical gate/up-interleaved row
+    ``n = 2 * j + gate_or_up`` in 16-row units, each unit 1 KB per 64-byte K
+    chunk as [K quarter][row][16 bytes]. N16 stores the same 1 KB blocks, but
+    per 16 rows of gate or of up (``n16_weights.py``), every 64-byte K chunk
+    of a 16-row block contiguous (``row_group_bytes`` = 16 * packed K bytes
+    apart). A unit's row pairs therefore come from the gate and up blocks of
+    rows ``j``, 128 bytes per K quarter each, and every 16-byte vector stays
+    whole. One K step of ``BLOCK_K_W`` bytes moves every source by
+    ``16 * BLOCK_K_W``, so the descriptor's K stride is 16.
+    """
+    gl.static_assert(BLOCK_N % 32 == 0, "N16 W13 tiles cover whole gate/up pairs")
+    offs_wn = gl.arange(
+        0, BLOCK_N_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
+    )
+    offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT))
+    unit = gl.expand_dims(offs_wn, 1)
+    k_chunk = gl.expand_dims(offs_wk // 1024, 0)
+    k_quarter = gl.expand_dims((offs_wk // 256) % 4, 0)
+    row = gl.expand_dims((offs_wk // 16) % 16, 0)
+    byte = gl.expand_dims(offs_wk % 16, 0)
+    # Logical row unit * 16 + row of this tile: gate_or_up = row % 2 and
+    # j = unit * 8 + row // 2 (the tile start is a multiple of 32 rows).
+    block = 2 * (unit // 2) + row % 2
+    row_in_block = (unit % 2) * 8 + row // 2
+    offsets_b = (
+        block * row_group_bytes
+        + k_chunk * 1024
+        + k_quarter * 256
+        + row_in_block * 16
+        + byte
+    )
+    BLOCKS_PER_TILE: gl.constexpr = BLOCK_N // 16
+    base_off_b = w_base_offset + pid_n * BLOCKS_PER_TILE * row_group_bytes
     return offsets_b, base_off_b

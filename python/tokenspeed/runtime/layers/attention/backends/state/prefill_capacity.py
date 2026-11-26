@@ -252,12 +252,15 @@ def _checkpoint_slots(
         raise ValueError("the checkpoint scratch holds fewer states than the shape")
     slots = capacity.num_sequences
     empty = torch.empty(0, dtype=torch.int64)
+    token_index = torch.full(
+        (slots,), capacity.token_capacity, dtype=torch.int64, device=device
+    )
     checkpoints = InForwardStateCheckpoints(
         rows=empty,
         offsets=empty,
-        token_index=torch.full(
-            (slots,), capacity.token_capacity, dtype=torch.int64, device=device
-        ),
+        device_rows=token_index[:0],
+        device_offsets=token_index[:0],
+        token_index=token_index,
         blocks_by_group={
             group: torch.full((slots,), -1, dtype=torch.int32, device=device)
             for group in layout.group_ids
@@ -280,9 +283,9 @@ def _refresh_checkpoint_slots(
     ``length // interval`` states per sequence, none for an unused request
     slot (which scans one row). A live checkpoint takes the scan row of its
     offset; the slots past the live ones keep an in-range token index (the
-    bucket end) and block ``-1``, which the masked writers skip. Device
-    tensors keep their addresses; one pinned upload carries the scan counts
-    and rows.
+    bucket end) and block ``-1``, which the masked writers skip. Captured
+    token, block and scan tensors keep their addresses; one pinned upload
+    carries the scan counts and rows.
 
     Args:
         target: Capacity metadata holding slots from ``_checkpoint_slots``.
@@ -331,6 +334,10 @@ def _refresh_checkpoint_slots(
         slots,
         rows=empty if live is None else live.rows,
         offsets=empty if live is None else live.offsets,
+        # These mirrors describe the live rows, just like their host copies;
+        # the recurrent graph consumes only the fixed token/block slots above.
+        device_rows=slots.token_index[:0] if live is None else live.device_rows,
+        device_offsets=slots.token_index[:0] if live is None else live.device_offsets,
     )
 
 
@@ -426,6 +433,9 @@ def _refresh_capacity_metadata(target, source):
             device=old.device,
             out=old[actual_bs + 1 :],
         )
+    if target.req_pool_indices is not None:
+        target.req_pool_indices[:actual_bs].copy_(source.req_pool_indices)
+        target.req_pool_indices[actual_bs:].zero_()
     target.extend_seq_lens_cpu[:actual_bs].copy_(source.extend_seq_lens_cpu)
     target.extend_seq_lens_cpu[actual_bs:].fill_(1)
     refresh_causal_conv1d_capacity_metadata(

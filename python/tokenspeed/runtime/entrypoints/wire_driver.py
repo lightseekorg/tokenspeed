@@ -40,6 +40,7 @@ import threading
 import time
 import uuid
 
+import msgspec
 from tokenspeed_engine import FrontendListener
 
 from tokenspeed.runtime.engine import zmq_wire
@@ -47,6 +48,7 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackEncoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.request_timing import RequestTiming
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 # How long one message may wait for an engine's socket.
@@ -98,6 +100,8 @@ class Completion:
     # With speculative decoding: verify rounds, and accepted tokens per round.
     spec_verify_ct: int | None = None
     accept_draft_tokens: float | None = None
+    # Backend timing supplied by the terminal chunk, when supported.
+    request_timing: RequestTiming | None = None
 
     def add(self, chunk: dict) -> None:
         cumulative_probs = chunk["output_token_cumulative_probs"]
@@ -121,6 +125,9 @@ class Completion:
             self.input_token_logprobs = chunk["input_token_logprobs"]
         self.spec_verify_ct = chunk["spec_verify_ct"]
         self.accept_draft_tokens = chunk["accept_draft_tokens"]
+        timing = chunk.get("request_timing")
+        if timing is not None:
+            self.request_timing = msgspec.convert(timing, type=RequestTiming)
 
 
 class WireDriver:

@@ -23,14 +23,22 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
 from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
+
+# Fewest 1024-column programs per row before a finalize row takes one program.
+_FINALIZE_ROW_PROGRAM_MIN_COLUMNS = 3
+# Fewest column-grid programs per SM before a finalize row takes one program.
+_FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM = 6
 
 __all__ = [
     "add3",
@@ -214,6 +222,11 @@ def _moe_finalize_gate_add_kernel(
     tl.store(out_ptr + row_offset + ccols, result.to(tl.bfloat16), mask=cmask)
 
 
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def moe_finalize_gate_add(
     gemm2_out: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
@@ -273,9 +286,18 @@ def moe_finalize_gate_add(
     expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(-1).contiguous()
     BLOCK = triton.next_power_of_2(hidden_dim)
     num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
-    chunk = min(BLOCK, 1024)
+    columns = triton.cdiv(hidden_dim, 1024)
+    floor = _FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM * _sm_count(
+        hidden_states.device.index
+    )
+    if columns >= _FINALIZE_ROW_PROGRAM_MIN_COLUMNS and num_tokens * columns >= floor:
+        chunk = BLOCK
+    else:
+        chunk = min(BLOCK, 1024)
     enable_pdl = pdl_enabled()
-    _moe_finalize_gate_add_kernel[(num_tokens, triton.cdiv(hidden_dim, chunk))](
+    kernel_launcher(
+        _moe_finalize_gate_add_kernel, (num_tokens, triton.cdiv(hidden_dim, chunk))
+    )(
         gemm2_out,
         expanded_idx_to_permuted_idx,
         expert_weights,
@@ -293,6 +315,18 @@ def moe_finalize_gate_add(
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out
+
+
+def _finalize_warmup_variants(
+    args: Mapping[str, Any],
+) -> tuple[dict[str, tuple[int, ...]], ...]:
+    # Either layout's launch prepares both the column and the row programs.
+    return ({"CHUNK": tuple(sorted({min(args["BLOCK"], 1024), args["BLOCK"]}))},)
+
+
+register_triton_warmup(
+    _moe_finalize_gate_add_kernel, variants=_finalize_warmup_variants
+)
 
 
 @triton.jit
@@ -1193,25 +1227,27 @@ def _rmsnorm_gated_kernel(
     BLOCK_H: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
-    idx = token * num_heads * head_dim + offs_h[:, None] * head_dim + offs_d[None, :]
+    idx = offs_h[:, None] * head_dim + offs_d[None, :]
+    x_row = x_ptr + token * (num_heads * head_dim)
+    out_row = out_ptr + token * (num_heads * head_dim)
+    gate_row = gate_ptr + token * gate_stride
     w = tl.load(weight_ptr + offs_d).to(tl.float32)
-    gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
-    g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    g = tl.load(gate_row + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     if ENABLE_PDL:
         # Release the next kernel at once; its own wait orders it after this one.
         tl.extra.cuda.gdc_launch_dependents()
         # Gate and norm weight are independent of the KDA primary. Delay only
         # the attention-output read until every primary CTA has completed.
         tl.extra.cuda.gdc_wait()
-    x = tl.load(x_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    x = tl.load(x_row + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
-    tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
+    tl.store(out_row + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
 def rmsnorm_gated_sigmoid(
@@ -2016,6 +2052,17 @@ def _mul_rn_f32(left, right):
 
 
 @triton.jit
+def tanh_softcap_value(x, inv_cap, cap):
+    """:func:`tanh_softcap` of FP32 ``x`` in registers, the kernel's steps:
+    ``inv_cap`` and ``cap`` are :func:`tanh_softcap_scalars`."""
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    return _mul_rn_f32(y, cap)
+
+
+@triton.jit
 def _tanh_softcap_kernel(
     x_ptr,
     out_ptr,
@@ -2029,11 +2076,7 @@ def _tanh_softcap_kernel(
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < n_cols
     x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
-    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
-    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
-    y = _mul_rn_f32(x, inv_cap)
-    y = libdevice.tanh(y)
-    y = _mul_rn_f32(y, cap)
+    y = tanh_softcap_value(x, inv_cap, cap)
     tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
 
 

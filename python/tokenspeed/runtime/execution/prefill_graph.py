@@ -90,7 +90,7 @@ from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LIVE_SLOT,
@@ -1360,8 +1360,9 @@ class PrefillGraph:
                 },
                 block_table_spans=lambda: spans,
             )
-            cache_metadata = CacheBatchMetadata.from_forward_op(
+            cache_metadata = build_managed_cache_metadata(
                 dummy_forward_op,
+                memory_saver_adapter=self.memory_saver_adapter,
                 device=self.config.device,
                 contract=self.token_to_kv_pool.arena.runtime_contract,
                 num_requests=bs,
@@ -1386,25 +1387,26 @@ class PrefillGraph:
             query_shard=query_shard,
             **extra_metadata_kwargs,
         )
-        self.attn_backend.init_forward_metadata(
-            bs=bs,
-            num_extends=bs,
-            req_pool_indices=ib.req_pool_indices_buf[:bs],
-            seq_lens=ib.seq_lens_buf[:bs],
-            forward_mode=ForwardMode.EXTEND,
-            **extend_kwargs,
-        )
-        if draft_attn_backend is not None:
-            prepare_draft_extend_metadata(
-                draft_attn_backend,
-                self.drafter,
-                padded_bs=bs,
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.init_forward_metadata(
+                bs=bs,
                 num_extends=bs,
                 req_pool_indices=ib.req_pool_indices_buf[:bs],
                 seq_lens=ib.seq_lens_buf[:bs],
                 forward_mode=ForwardMode.EXTEND,
                 **extend_kwargs,
             )
+            if draft_attn_backend is not None:
+                prepare_draft_extend_metadata(
+                    draft_attn_backend,
+                    self.drafter,
+                    padded_bs=bs,
+                    num_extends=bs,
+                    req_pool_indices=ib.req_pool_indices_buf[:bs],
+                    seq_lens=ib.seq_lens_buf[:bs],
+                    forward_mode=ForwardMode.EXTEND,
+                    **extend_kwargs,
+                )
         return ctx
 
     # ------------------------------------------------------------------
