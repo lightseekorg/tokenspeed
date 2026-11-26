@@ -80,6 +80,7 @@ struct Execution {
     logprobs: Option<LogprobPlan>,
     history: Option<HistorySeeds>,
     retirement_id: Option<u64>,
+    coordinate_cache: bool,
 }
 
 /// EPD: one landed item as the data plane's `epd_publish` takes it: the
@@ -476,6 +477,7 @@ impl DataPlane for PythonDataPlane {
             logprobs: dispatch.logprobs.cloned(),
             history: dispatch.history.cloned(),
             retirement_id: dispatch.retirement_id,
+            coordinate_cache: dispatch.coordinate_cache,
         })))?;
         if idle_forward {
             // An idle forward leaves nothing to commit, so no later call
@@ -816,6 +818,7 @@ fn run(
                 logprobs,
                 history,
                 retirement_id,
+                coordinate_cache,
             } = *execution;
             if let Some(queued_at) = queued_at {
                 let batches = plan.forward_batches();
@@ -861,7 +864,21 @@ fn run(
                 )
             });
             let history = history.map(|seeds| (seeds.slots, seeds.prefix_lengths, seeds.tokens));
-            let launched = if let Some(retirement_id) = retirement_id {
+            let launched = if coordinate_cache {
+                plane.call_method1(
+                    "execute",
+                    (
+                        plan,
+                        dp,
+                        ngram,
+                        grammar_advance,
+                        logprobs,
+                        history,
+                        retirement_id,
+                        true,
+                    ),
+                )
+            } else if let Some(retirement_id) = retirement_id {
                 plane.call_method1(
                     "execute",
                     (

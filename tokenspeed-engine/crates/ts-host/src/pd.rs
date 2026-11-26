@@ -373,7 +373,17 @@ pub fn start(
             if !epd.is_none() {
                 return Err(refuse_epd());
             }
+            let state_shards = peer.getattr("state_shards")?;
             let (peer, decode_outbox) = py.detach(|| DecodePeer::start(config)).map_err(failed)?;
+            let group =
+                state_shards.call_method1("exchange", (peer.session_id(), peer.cache_id()))?;
+            if !group.is_none() {
+                let installed =
+                    peer.install_state_shards(group.cast::<PyBytes>()?.as_bytes().to_vec());
+                state_shards
+                    .call_method1("confirm", (installed.as_ref().err().map(String::as_str),))?;
+                installed.map_err(PyRuntimeError::new_err)?;
+            }
             tracing::info!(
                 port = peer.port(),
                 session = peer.session_id(),

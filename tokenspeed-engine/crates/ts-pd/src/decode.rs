@@ -476,6 +476,8 @@ struct Shared {
     arena_base: u64,
     /// The contract's wire bytes, as registered.
     layout_wire: Vec<u8>,
+    /// Immutable group of additional physical state owners for this registration.
+    state_shards: std::sync::OnceLock<bytes::Bytes>,
     layout: Contract,
     tp_size: i64,
     tp_rank: i64,
@@ -532,7 +534,7 @@ impl Shared {
         let cache_id = state.cache_id.clone();
         // Built under the incarnation lock: the frames name the current
         // cache and session, both replaced together on a wake.
-        let frames = wire::registration_frames(
+        let mut frames = wire::registration_frames(
             &self.local_ip,
             self.transport.sockets.port(),
             &self.transport.session_id(),
@@ -543,6 +545,9 @@ impl Shared {
             self.tp_rank,
             id,
         );
+        if let Some(group) = self.state_shards.get() {
+            frames.push(group.clone());
+        }
         state.registering.insert(id, Registering::default());
         let deadline = Instant::now() + REGISTRATION_TIMEOUT;
         let mut resend_at = Instant::now();
@@ -889,7 +894,8 @@ impl Shared {
     /// failed one is cooling down for `retry_after`, or the transport cannot
     /// fence remote writers (the pages then stay pinned, as logged).
     fn start_revocation(self: &Arc<Self>, now: Instant, retry_after: Duration) {
-        if !self.transport.deregistration_fences_writes() {
+        // Revoking one engine cannot fence writes to another owner's allocation.
+        if self.state_shards.get().is_some() || !self.transport.deregistration_fences_writes() {
             return;
         }
         {
@@ -1080,6 +1086,11 @@ impl DecodeOutbox {
     /// A sleep releases the cache: deregister it from the transfer engine,
     /// refused while a tracked request's KV may still land.
     pub fn release_registration(&self) -> Result<(), String> {
+        if self.shared.state_shards.get().is_some() {
+            return Err(
+                "distributed state requires a coordinated transfer-group shutdown".to_owned(),
+            );
+        }
         // Held through the release: a revocation installs its engine under it.
         let state = self.shared.state();
         if state.revoking {
@@ -1114,6 +1125,9 @@ impl DecodeOutbox {
     /// identity. The next request registers this incarnation even when the
     /// engine reuses an earlier transport address.
     pub fn restore_registration(&self) -> Result<(), String> {
+        if self.shared.state_shards.get().is_some() {
+            return Err("distributed state requires a fresh transfer group".to_owned());
+        }
         let cache_id = crate::new_instance_id()
             .map_err(StartError::CacheIdentity)
             .map_err(|error| error.to_string())?;
@@ -1148,6 +1162,14 @@ impl DecodeOutbox {
             let Some(room) = self.shared.state().rooms_by_rid.get(rid).copied() else {
                 continue;
             };
+            if self.shared.state_shards.get().is_some()
+                && (rows.extend_prefix_lens[index] != 0 || rows.state_prefix_cached[index])
+            {
+                self.shared
+                    .state()
+                    .fail(room, "distributed state requires a cold Decode destination");
+                continue;
+            }
             let manifest = build_manifest(
                 &rows.tables,
                 layout,
@@ -1280,6 +1302,7 @@ impl DecodePeer {
             engine_rank: config.peer.engine_rank,
             arena_base: config.arena_base,
             layout_wire: config.layout,
+            state_shards: Default::default(),
             layout,
             tp_size: config.tp_size,
             tp_rank: config.tp_rank,
@@ -1375,6 +1398,28 @@ impl DecodePeer {
     /// The current cache incarnation, independent of its transfer address.
     pub fn cache_id(&self) -> String {
         self.shared.state().cache_id.clone()
+    }
+
+    /// Bind a full group's live session identities before the scheduler accepts rooms.
+    pub fn install_state_shards(&self, raw: Vec<u8>) -> Result<(), String> {
+        if self.shared.tp_size != 1 {
+            return Err("distributed state requires attention TP1 at Decode".to_owned());
+        }
+        let state = self.shared.state();
+        if state.revoking || !state.tracked.is_empty() || !state.connections.is_empty() {
+            return Err("distributed state must be installed before any room connects".to_owned());
+        }
+        let group = crate::state_shards::Group::parse(
+            &raw,
+            &state.cache_id,
+            &self.session_id(),
+            &self.shared.layout,
+        )?;
+        group.check_local(self.shared.engine_rank, &self.shared.transport.regions)?;
+        self.shared
+            .state_shards
+            .set(raw.into())
+            .map_err(|_| "distributed state already registered".to_owned())
     }
 
     /// Dropping a lost address's sender lets its worker drain terminal rooms

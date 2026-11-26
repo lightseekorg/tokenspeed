@@ -361,6 +361,8 @@ pub trait DataPlane {
 pub struct Dispatch<'a> {
     /// Completion fence for replay handled before this plan's cache work.
     pub retirement_id: Option<u64>,
+    /// Coordinate distributed cache pages before this plan publishes or restores them.
+    pub coordinate_cache: bool,
     /// The model batch, if one runs.
     pub forward: Option<&'a ForwardBatchView>,
     /// With attention DP, every rank's batch this round.
@@ -527,6 +529,8 @@ pub struct LoopConfig {
     pub kv_total_pages: i64,
     /// Effective token capacity of the usable KV pool.
     pub kv_token_capacity: i64,
+    /// The cache has owners outside a scheduler replica.
+    pub requires_cache_coordination: bool,
     /// Predecessors Engram reads per token; 0 for a model without Engram.
     pub ngram_context_len: usize,
     /// The model reads each request's committed token history, which the
@@ -1119,19 +1123,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // The storage tick disabled forward planning: scheduler aborts arise
             // only in that build, and frozen rounds reset the no-progress streak.
             self.record_scheduler_metrics(None, &cache_ops, 0);
-            let device_work = plan.needs_device() || retirement_id.is_some();
+            let mut coordinate_cache = self.cache_round_needed(&plan, &cache_ops);
+            let dp = self.dp_round(None, &mut stop, &mut coordinate_cache)?;
+            let device_work = plan.needs_device() || retirement_id.is_some() || coordinate_cache;
             busy |= device_work;
             if device_work {
                 self.data_plane.execute(
                     plan,
                     &Dispatch {
                         retirement_id,
+                        coordinate_cache,
                         ..Dispatch::default()
                     },
                 )?;
             }
             let mut forwarded = false;
-            if let Some(dp) = self.dp_round(None, &mut stop)? {
+            if let Some(dp) = dp {
                 if dp.idle_forward && memory_resident {
                     during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
                         self.data_plane.idle_forward(&dp)
@@ -1303,7 +1310,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        let dp = self.dp_round(forward.as_ref(), stop)?;
+        let mut coordinate_cache = self.cache_round_needed(&plan, &cache_ops);
+        let dp = self.dp_round(forward.as_ref(), stop, &mut coordinate_cache)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
             // Padding for a peer is not a local request batch.
             forward = None;
@@ -1343,6 +1351,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let dispatch = Dispatch {
             retirement_id,
+            coordinate_cache,
             forward: forward.as_ref(),
             dp: dp.as_ref(),
             ngram: ngram.as_ref(),
@@ -1371,7 +1380,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
-        let device_work = plan.needs_device() || idle_forward || retirement_id.is_some();
+        let device_work =
+            plan.needs_device() || idle_forward || retirement_id.is_some() || coordinate_cache;
         if device_work {
             let pending = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
                 self.data_plane.execute(plan, &dispatch)
@@ -3153,12 +3163,28 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
+    fn cache_round_needed(
+        &self,
+        plan: &ExecutionPlan,
+        cache_ops: &[ts_scheduler::CacheOpView],
+    ) -> bool {
+        self.config.requires_cache_coordination
+            && (plan.remote_prefill().is_some()
+                || cache_ops.iter().any(|op| {
+                    matches!(
+                        op.kind,
+                        CacheOpKind::SnapshotStore | CacheOpKind::SnapshotRestore
+                    )
+                }))
+    }
+
     /// With attention DP, every rank's batch this round, and whether any
     /// rank is stopping.
     fn dp_round(
         &mut self,
         forward: Option<&ForwardBatchView>,
         stop: &mut bool,
+        coordinate_cache: &mut bool,
     ) -> Result<Option<DpRound>, LoopError> {
         let (num_tokens, batch_size, num_extends) = match forward {
             Some(batch) => {
@@ -3197,14 +3223,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             num_tokens,
             batch_size,
             num_extends,
-            i64::from(*stop),
+            i64::from(*stop) | (i64::from(*coordinate_cache) << 1),
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
         let rows = during_peer_wait(self.peer.as_ref(), &mut self.scheduler, || {
             self.ranks.mesh.all_gather_i64(world, &row)
         })?;
-        *stop = rows.iter().any(|row| row[3] != 0);
+        // Share the existing flags word, including on ranks with no local plan.
+        *stop = rows.iter().any(|row| row[3] & 1 != 0);
+        *coordinate_cache = rows.iter().any(|row| row[3] & 2 != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;
         self.dp_wants_prefill = rows.iter().map(|row| row[4] != 0).collect();

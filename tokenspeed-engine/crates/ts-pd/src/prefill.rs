@@ -91,6 +91,7 @@ struct Registration {
     layout: Arc<Contract>,
     /// The route this rank planned to it.
     planned: Arc<PlannedRegistration>,
+    state_shards: Option<Arc<crate::state_shards::Group>>,
 }
 
 impl Registration {
@@ -696,7 +697,26 @@ impl Shared {
     fn plan_registration(&self, frames: &[Bytes]) -> Result<Registration, String> {
         let info = RegistrationInfo::from_frames(frames).map_err(|error| error.0)?;
         let planned = plan_registration(&self.layout, &info).map_err(|error| error.0)?;
+        let state_shards = if let Some(raw) = frames.get(10) {
+            if self.layerwise.is_some() || info.tp_size != 1 {
+                return Err(
+                    "distributed state requires whole-request transfer and Decode attention TP1"
+                        .to_owned(),
+                );
+            }
+            let group = crate::state_shards::Group::parse(
+                raw,
+                &info.cache_id,
+                &info.session_id,
+                &info.layout,
+            )?;
+            group.check_source(&self.layout.wire, &info.layout)?;
+            Some(Arc::new(group))
+        } else {
+            None
+        };
         Ok(Registration {
+            state_shards,
             endpoint: info.endpoint,
             port: info.port,
             cache_id: info.cache_id,
@@ -806,6 +826,32 @@ impl Shared {
                 .is_some_and(|previous| *previous != registration)
             {
                 return Err("conflicting registration for an active CachePD session".to_owned());
+            }
+            // A member still belongs to the same immutable group when another
+            // request owner registers. A partial restart cannot take over its pages.
+            for old in state.registrations.values() {
+                let compatible = match (&old.state_shards, &registration.state_shards) {
+                    (Some(a), Some(b)) => {
+                        a.members == b.members
+                            || !a.members.iter().any(|m| {
+                                b.members
+                                    .iter()
+                                    .any(|n| m.cache == n.cache || m.session == n.session)
+                            })
+                    }
+                    (Some(a), None) => !a
+                        .members
+                        .iter()
+                        .any(|m| m.cache == cache_id || m.session == registration.session_id),
+                    (None, Some(b)) => !b
+                        .members
+                        .iter()
+                        .any(|m| m.cache == old.cache_id || m.session == old.session_id),
+                    (None, None) => true,
+                };
+                if !compatible {
+                    return Err("conflicting distributed state membership".to_owned());
+                }
             }
             let retired: Vec<_> = state
                 .registrations
@@ -1178,6 +1224,23 @@ impl Shared {
         registration: &Registration,
         copies: &[Copy],
     ) -> Result<(), String> {
+        self.write_to(
+            room,
+            registration,
+            &registration.session_id,
+            &registration.cache_id,
+            copies,
+        )
+    }
+
+    fn write_to(
+        &self,
+        room: u64,
+        registration: &Registration,
+        session: &str,
+        cache: &str,
+        copies: &[Copy],
+    ) -> Result<(), String> {
         let gate = self
             .state()
             .registration_gates
@@ -1199,10 +1262,7 @@ impl Shared {
             return Err("CachePD transfer room was cancelled or ended".to_owned());
         }
         let started = Instant::now();
-        if let Err(error) =
-            self.transport
-                .write_cache(&registration.session_id, &registration.cache_id, copies)
-        {
+        if let Err(error) = self.transport.write_cache(session, cache, copies) {
             self.state().uncertain.insert(room);
             self.mark_session_failed(&registration.cache_id);
             return Err(format!(
@@ -1392,23 +1452,54 @@ impl Shared {
         let source = source.ok_or("Cache-transfer source manifest is unavailable")?;
         let mut prepared = Vec::with_capacity(destinations.len());
         for (destination, registration) in destinations.iter().zip(registrations) {
+            let fields = registration
+                .state_shards
+                .as_ref()
+                .map(|group| group.ordinary_fields(&self.layout.local));
+            let state_copies = if let Some(group) = &registration.state_shards {
+                group.plan(
+                    &self.layout.local,
+                    self.layout.arena_base,
+                    source,
+                    destination
+                        .manifest
+                        .as_deref()
+                        .ok_or("missing state destination manifest")?,
+                    &registration.planned.fragments,
+                )?
+            } else {
+                Vec::new()
+            };
             let copies = self
                 .plan_copies(
                     &registration,
                     Source::Manifest(source),
                     destination,
-                    &[None],
+                    &[fields],
                 )?
                 .pop()
                 .unwrap_or_default();
-            prepared.push((registration, copies));
+            prepared.push((registration, copies, state_copies));
         }
-        for (registration, copies) in &prepared {
+        for (registration, copies, state_copies) in &prepared {
             self.write_copies(room, registration, copies)?;
+            if let Some(group) = &registration.state_shards {
+                for (member, copy) in group.members.iter().zip(state_copies) {
+                    if copy.bytes() > 0 {
+                        self.write_to(
+                            room,
+                            registration,
+                            &member.session,
+                            &member.cache,
+                            std::slice::from_ref(copy),
+                        )?;
+                    }
+                }
+            }
         }
-        let registrations: Vec<Registration> = prepared
+        let registrations: Vec<_> = prepared
             .into_iter()
-            .map(|(registration, _)| registration)
+            .map(|(registration, _, _)| registration)
             .collect();
         self.report_success(room, &registrations, bootstrap_token, spec_candidate_ids);
         Ok(())
@@ -2401,6 +2492,7 @@ mod tests {
         state.registrations.insert(
             "s0".to_owned(),
             Registration {
+                state_shards: None,
                 endpoint: "decode".to_owned(),
                 port: 7,
                 cache_id: "s0".to_owned(),

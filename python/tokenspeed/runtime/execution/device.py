@@ -328,6 +328,7 @@ class DeviceSpecs:
     uses_eager_grammar: bool
     supports_disaggregation: bool
     requires_forward_coordination: bool
+    requires_cache_coordination: bool
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
@@ -486,6 +487,23 @@ class DeviceHandle:
     # ------------------------------------------------------------------
     # Per-round work
     # ------------------------------------------------------------------
+
+    def coordinate_cache_round(self, cache_ops: Sequence) -> None:
+        """Order remote page grants and retraction copies after every owner's writes."""
+        self.settle()
+        executor = self._executor
+        groups = (
+            tuple(group.group_id for group in self._l2.layout.groups)
+            if self._l2
+            else ()
+        )
+        slots = self._l2.max_retracted_requests if self._l2 else 0
+        with executor.device_module.stream(executor.execution_stream):
+            executor.attn_backend.materialize_recurrent_state(None)
+            for extension in executor.attn_backend.decode_cache_extensions():
+                extension.coordinate_cache_round(
+                    executor.execution_stream, cache_ops, groups, slots
+                )
 
     def retire_replay(self, retirement_id: int, slots: Sequence[int]) -> None:
         """Materialize old slots after settling drafting, ahead of their reuse."""
@@ -1444,7 +1462,11 @@ def _warm_rebound_draft(executor, server_args: ServerArgs, *, has_draft: bool) -
         and server_args.speculative_algorithm == "DFLASH"
         and not executor.config.prefill_only
     ):
-        with torch.no_grad():
+        from contextlib import ExitStack
+
+        with torch.no_grad(), ExitStack() as scope:
+            for extension in executor.attn_backend.decode_cache_extensions():
+                scope.enter_context(extension.rebound_draft_warmup())
             executor.forward_step.warmup_decode_path(
                 batch_sizes=(1,), graph_phase=False
             )
@@ -2223,6 +2245,9 @@ def build_device_side(
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
         requires_forward_coordination=server_args.mapping.requires_forward_coordination,
+        requires_cache_coordination=bool(
+            executor.attn_backend.decode_cache_extensions()
+        ),
         supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
             executor, server_args.mapping
         ),

@@ -2532,6 +2532,8 @@ class ModelExecutor:
                 (both ends share one owner by construction); a replicated
                 group copies every pair.
         """
+        for extension in self.attn_backend.decode_cache_extensions():
+            extension.validate_copy(pairs)
         local_pairs = {
             group_id: local
             for group_id, local in local_page_pairs_by_group(

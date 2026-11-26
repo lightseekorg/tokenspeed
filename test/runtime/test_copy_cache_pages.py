@@ -144,7 +144,10 @@ class TestCopyCachePagesContractTest:
                 ("copy", {gid: arr.tolist() for gid, arr in pairs.items()})
             )
         )
+        from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
         return types.SimpleNamespace(
+            attn_backend=CachePoolBinding(),
             token_to_kv_pool=types.SimpleNamespace(arena=arena),
             default_stream=_Stream(trace, "default"),
             execution_stream=_Stream(trace, "execution"),
