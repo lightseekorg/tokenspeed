@@ -6613,4 +6613,518 @@ TEST_F(HybridFullAndStateRequestAwareSuite, PageAlignedClaimedRestoreOpensFreshP
     EXPECT_NE(ParentOf(row[2], kPacking), bg_parent);
 }
 
+TEST_F(HybridFullAndStateRequestAwareSuite, GroupUsesParentAffinityPredicateCoversBoundariesAndOverflow) {
+    // Direct boundary check for CacheStore::GroupUsesParentAffinity across
+    // virtual packing, State, sliding window (including W=1, sink blocks,
+    // replayable, and near-INT32_MAX overflow bound), and KV-parallel shards.
+    constexpr std::int32_t kGranularity = 64;
+    constexpr std::int32_t kMaxInt32Window = std::numeric_limits<std::int32_t>::max();
+    const std::vector<CacheGroupSpec> specs{
+        // 0: full, packing == 1 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP},
+        // 1: full, packing == 2 -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = kP},
+        // 2: full, packing == 64 (ceiling inclusive) -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                       .cache_blocks_per_lcm_block = CacheStore::kMaxRequestAwarePacking,
+                       .block_granularity = kP},
+        // 3: full, packing == 65 (above ceiling) -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                       .cache_blocks_per_lcm_block = CacheStore::kMaxRequestAwarePacking + 1,
+                       .block_granularity = kP},
+        // 4: State, packing == 4 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 4, .block_granularity = 0},
+        // 5: sliding, W=1, G=128 -> steady-state 1 < packing 2 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 1,
+                       .cache_blocks_per_lcm_block = 2,
+                       .block_granularity = kP},
+        // 6: sliding, G=64, W=256 -> steady-state 5 == packing 5 -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .cache_blocks_per_lcm_block = 5,
+                       .block_granularity = kGranularity},
+        // 7: sliding, G=64, W=256 -> steady-state 5 < packing 6 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .cache_blocks_per_lcm_block = 6,
+                       .block_granularity = kGranularity},
+        // 8: sliding with sink=64 -> steady-state 5 + 1 = 6 == packing 6 -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .sink_tokens = 64,
+                       .cache_blocks_per_lcm_block = 6,
+                       .block_granularity = kGranularity},
+        // 9: sliding with sink=64 -> steady-state 6 < packing 7 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .sink_tokens = 64,
+                       .cache_blocks_per_lcm_block = 7,
+                       .block_granularity = kGranularity},
+        // 10: replayable sliding, G=64, W=256 -> steady-state 5 == packing 5 -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .replayable = true,
+                       .cache_blocks_per_lcm_block = 5,
+                       .block_granularity = kGranularity},
+        // 11: replayable sliding, G=64, W=256 -> steady-state 5 < packing 6 -> false
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 256,
+                       .replayable = true,
+                       .cache_blocks_per_lcm_block = 6,
+                       .block_granularity = kGranularity},
+        // 12: sharded full, physical 8 * 8 shards = virtual 64 <= 64 -> true
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 64, .block_granularity = kP, .shard_count = 8},
+        // 13: sharded full, physical 16 * 8 shards = virtual 128 > 64 -> false
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 128, .block_granularity = kP, .shard_count = 8},
+        // 14: sliding at INT32_MAX (naive int32 (W - 1 + G - 1) / G overflows) -> no overflow, >= packing 64 -> true
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = kMaxInt32Window,
+                       .cache_blocks_per_lcm_block = CacheStore::kMaxRequestAwarePacking,
+                       .block_granularity = kGranularity},
+    };
+    std::vector<std::int32_t> packings;
+    packings.reserve(specs.size());
+    for (const CacheGroupSpec& spec : specs) {
+        packings.push_back(spec.cache_blocks_per_lcm_block);
+    }
+    BlockPool pool(/*num_lcm_blocks=*/4, packings);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                        /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    const std::array<bool, 15> expected{
+        false, true, true, false, false, false, true, false, true, false, true, false, true, false, true,
+    };
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(coordinator.Store().GroupUsesParentAffinity(i), expected[i]) << "group index " << i;
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, HighPackingGroupStaysCompactHoleFirstWhileNormalFullIsolates) {
+    // Regression guard for CacheStore::kMaxRequestAwarePacking: full-history
+    // groups up to virtual packing 64 isolate concurrent requests into
+    // dedicated parents, while wider-packing groups (65, 1350, and sharded
+    // virtual packing 128) stay compact hole-first.
+    struct Case {
+        std::int32_t wide_packing;
+        std::int32_t wide_shards;
+    };
+    for (const Case& tc : {Case{CacheStore::kMaxRequestAwarePacking + 1, 1}, Case{1350, 1}, Case{128, 8}}) {
+        SCOPED_TRACE(::testing::Message() << "wide_packing=" << tc.wide_packing << " shards=" << tc.wide_shards);
+        constexpr std::int32_t kTotalLcmPages = 48;
+        constexpr std::int32_t kFullPacking = 12;
+        constexpr std::int32_t kBoundaryPacking = CacheStore::kMaxRequestAwarePacking;
+        SchedulerConfig cfg = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1,
+                                               /*disable_prefix_cache=*/true);
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "boundary_full",
+            .block_granularity = kP,
+            .total_pages = (kTotalLcmPages + 1) * kBoundaryPacking,
+            .cache_blocks_per_lcm_block = kBoundaryPacking,
+            .attn_kind = AttnKind::kFull,
+        });
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "wide_index",
+            .block_granularity = kP,
+            .total_pages = (kTotalLcmPages + 1) * tc.wide_packing,
+            .cache_blocks_per_lcm_block = tc.wide_packing,
+            .attn_kind = AttnKind::kFull,
+            .shard_count = tc.wide_shards,
+        });
+        cfg = WithHostPackingFromDevice(cfg);
+        Scheduler local_scheduler(cfg);
+
+        const std::vector<std::string> ids{"r0", "r1", "r2"};
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            local_scheduler.SubmitRequests(
+                {RequestSpec{.request_id = ids[i],
+                             .tokens = MakeTokens(kP, static_cast<std::int32_t>(1000 * (i + 1))),
+                             .max_new_tokens = 16}});
+        }
+        const ExecutionPlan plan = local_scheduler.NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->request_ids, ids);
+
+        std::set<std::int32_t> full_parents;
+        std::set<std::int32_t> boundary_parents;
+        std::set<std::int32_t> wide_parents;
+        for (const std::string& id : ids) {
+            const std::set<std::int32_t> fp = ParentsOf(NonZeroRowOf(*batch, "full", id), kFullPacking);
+            const std::set<std::int32_t> bp = ParentsOf(NonZeroRowOf(*batch, "boundary_full", id), kBoundaryPacking);
+            const std::set<std::int32_t> wp = ParentsOf(NonZeroRowOf(*batch, "wide_index", id), tc.wide_packing);
+            ASSERT_FALSE(fp.empty()) << id;
+            ASSERT_FALSE(bp.empty()) << id;
+            ASSERT_FALSE(wp.empty()) << id;
+            full_parents.insert(fp.begin(), fp.end());
+            boundary_parents.insert(bp.begin(), bp.end());
+            wide_parents.insert(wp.begin(), wp.end());
+        }
+        EXPECT_EQ(full_parents.size(), 3u);
+        EXPECT_EQ(boundary_parents.size(), 3u) << "virtual packing == kMaxRequestAwarePacking stays request-aware";
+        EXPECT_EQ(wide_parents.size(), 1u) << "virtual packing > kMaxRequestAwarePacking stays compact hole-first";
+    }
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, SmallWindowSlidingGroupStaysCompactHoleFirstWhileFullSizedWindowIsolates) {
+    // Regression guard: with a 128-token prompt (+1 decode reserve = 3 blocks
+    // at G=64), 3 concurrent requests hold 9 blocks total: hole-first packs
+    // them into ceil(9/5)=2 or ceil(9/6)=2 parents, while request-aware
+    // affinity isolates them into 3 pairwise-disjoint parents.
+    constexpr std::int32_t kTotalLcmPages = 64;
+    constexpr std::int32_t kFullPacking = 12;
+    constexpr std::int32_t kSmallTailPacking = 16;
+    constexpr std::int32_t kDraftSwaPacking = 16;
+    constexpr std::int32_t kExactWindowPacking = 5;  // G=64, W=256 -> ceil(255/64) + 1 = 5
+    constexpr std::int32_t kJustBelowPacking = 6;    // G=64, W=256, no sink -> 5 < 6
+    constexpr std::int32_t kSinkBoostPacking = 6;    // G=64, W=256, sink=64 -> 5 + 1 = 6
+    config_ = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/true);
+    // Keep one state group so 3 concurrent requests across all test groups fit easily.
+    config_.cache_groups.resize(2);
+    // Small tail window (G=128, W=8 -> steady-state 2 < 16): hole-first.
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "small_tail_swa",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kSmallTailPacking,
+        .cache_blocks_per_lcm_block = kSmallTailPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 8,
+    });
+    // Draft SWA window (G=128, W=1025 -> steady-state 9 < 16): hole-first.
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "draft_swa",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kDraftSwaPacking,
+        .cache_blocks_per_lcm_block = kDraftSwaPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 1025,
+    });
+    // Window matching packing exactly (G=64, W=256 -> steady-state 5 == 5): request-aware.
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "exact_window_swa",
+        .block_granularity = 64,
+        .total_pages = (kTotalLcmPages + 1) * kExactWindowPacking,
+        .cache_blocks_per_lcm_block = kExactWindowPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 256,
+    });
+    // Same window with packing 6 and no sink (5 < 6): hole-first (2 parents for 9 blocks).
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "just_below_swa",
+        .block_granularity = 64,
+        .total_pages = (kTotalLcmPages + 1) * kJustBelowPacking,
+        .cache_blocks_per_lcm_block = kJustBelowPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 256,
+    });
+    // Sink blocks push steady-state from 5 to 6 == packing 6: request-aware.
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "sink_boost_swa",
+        .block_granularity = 64,
+        .total_pages = (kTotalLcmPages + 1) * kSinkBoostPacking,
+        .cache_blocks_per_lcm_block = kSinkBoostPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 256,
+        .sink_tokens = 64,
+    });
+    config_ = WithHostPackingFromDevice(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    const std::vector<std::string> ids{"r0", "r1", "r2"};
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        Submit(RequestSpec{.request_id = ids[i],
+                           .tokens = MakeTokens(kP, static_cast<std::int32_t>(3000 * (i + 1))),
+                           .max_new_tokens = 16});
+    }
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, ids);
+
+    const auto expect_pairwise_disjoint_single_parent = [&](const std::string& group, std::int32_t packing) {
+        std::set<std::int32_t> union_parents;
+        for (const std::string& id : ids) {
+            const std::set<std::int32_t> p = ParentsOf(NonZeroRowOf(*batch, group, id), packing);
+            ASSERT_EQ(p.size(), 1u) << group << " " << id;
+            EXPECT_TRUE(union_parents.insert(*p.begin()).second) << group << " shared parent on " << id;
+        }
+        EXPECT_EQ(union_parents.size(), 3u) << group;
+    };
+    const auto collect_parents = [&](const std::string& group, std::int32_t packing) {
+        std::set<std::int32_t> parents;
+        for (const std::string& id : ids) {
+            const std::set<std::int32_t> p = ParentsOf(NonZeroRowOf(*batch, group, id), packing);
+            EXPECT_FALSE(p.empty()) << group << " " << id;
+            parents.insert(p.begin(), p.end());
+        }
+        return parents;
+    };
+    expect_pairwise_disjoint_single_parent("full", kFullPacking);
+    expect_pairwise_disjoint_single_parent("exact_window_swa", kExactWindowPacking);
+    expect_pairwise_disjoint_single_parent("sink_boost_swa", kSinkBoostPacking);
+    EXPECT_EQ(collect_parents("small_tail_swa", kSmallTailPacking).size(), 1u);
+    EXPECT_EQ(collect_parents("draft_swa", kDraftSwaPacking).size(), 1u);
+    EXPECT_EQ(collect_parents("just_below_swa", kJustBelowPacking).size(), 2u);
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, HighPackingAndSmallWindowPrefixHitAndHostExtensionStayHoleFirst) {
+    // Regression guard with prefix caching + Host L2 enabled: non-affinity
+    // groups (wide packing and small-window SWA) pass nullopt affinity through
+    // tail privatization, copy-in reservation, Host extension, and dense growth,
+    // packing concurrent hitters into one shared parent while normal full
+    // isolates each hitter into its own parent.
+    constexpr std::int32_t kTotalLcmPages = 48;
+    constexpr std::int32_t kFullPacking = 12;
+    constexpr std::int32_t kWidePacking = 128;
+    constexpr std::int32_t kSmallSwaPacking = 16;
+    config_ = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/false,
+                               /*enable_host_and_snapshot=*/true);
+    config_.cache_groups.resize(2);
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "wide_index",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kWidePacking,
+        .cache_blocks_per_lcm_block = kWidePacking,
+        .attn_kind = AttnKind::kFull,
+    });
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "small_swa",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kSmallSwaPacking,
+        .cache_blocks_per_lcm_block = kSmallSwaPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 8,
+    });
+    config_ = WithHostPackingFromDevice(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    // Seed finishes at 150 tokens (mid-page tail), publishing to Device + Host L2.
+    const std::vector<std::int32_t> seed_tokens = MakeTokens(150, 7000);
+    Submit(RequestSpec{.request_id = "seed", .tokens = seed_tokens, .max_new_tokens = 1});
+    const ExecutionPlan seed_plan = PlanOnce();
+    AckWriteBacks(seed_plan);
+    const ForwardBatch* seed_batch = FindForwardBatch(seed_plan);
+    ASSERT_NE(seed_batch, nullptr);
+    const std::set<std::int32_t> seed_full_parents = ParentsOf(NonZeroRowOf(*seed_batch, "full", "seed"), kFullPacking);
+    const std::set<std::int32_t> seed_wide_parents =
+        ParentsOf(NonZeroRowOf(*seed_batch, "wide_index", "seed"), kWidePacking);
+    const std::set<std::int32_t> seed_swa_parents =
+        ParentsOf(NonZeroRowOf(*seed_batch, "small_swa", "seed"), kSmallSwaPacking);
+    ASSERT_EQ(seed_full_parents.size(), 1u);
+    ASSERT_EQ(seed_wide_parents.size(), 1u);
+    ASSERT_EQ(seed_swa_parents.size(), 1u);
+    const std::int32_t seed_full_parent = *seed_full_parents.begin();
+    const std::int32_t seed_wide_parent = *seed_wide_parents.begin();
+    const std::int32_t seed_swa_parent = *seed_swa_parents.begin();
+    {
+        ExecutionEvent done;
+        done.With(forward::ExtendResult{.request_id = "seed", .tokens = {81001}});
+        done.With(forward::Finish{.request_id = "seed"});
+        scheduler_->Advance(done);
+    }
+    const ExecutionPlan finish_plan = PlanOnce();
+    AckWriteBacks(finish_plan);
+    ASSERT_EQ(scheduler_->RequestTokenSize("seed"), -1);
+
+    // Part A: two concurrent mid-page hitters exercising privatize_slot (copy-in
+    // and dense growth with unset preferred parent are guarded by Part B and
+    // the no-hit tests).
+    std::vector<std::int32_t> h0_tokens = seed_tokens;
+    const std::vector<std::int32_t> h0_extra = MakeTokens(200, 11000);
+    h0_tokens.insert(h0_tokens.end(), h0_extra.begin(), h0_extra.end());
+    std::vector<std::int32_t> h1_tokens = seed_tokens;
+    const std::vector<std::int32_t> h1_extra = MakeTokens(200, 22000);
+    h1_tokens.insert(h1_tokens.end(), h1_extra.begin(), h1_extra.end());
+
+    Submit(RequestSpec{.request_id = "h0", .tokens = h0_tokens, .max_new_tokens = 4});
+    Submit(RequestSpec{.request_id = "h1", .tokens = h1_tokens, .max_new_tokens = 4});
+    const ExecutionPlan hit_plan = PlanOnce();
+    const ForwardBatch* hit_batch = FindForwardBatch(hit_plan);
+    ASSERT_NE(hit_batch, nullptr);
+    ASSERT_EQ(hit_batch->request_ids, (std::vector<std::string>{"h0", "h1"}));
+
+    const std::vector<std::int32_t> h0_full = NonZeroRowOf(*hit_batch, "full", "h0");
+    const std::vector<std::int32_t> h1_full = NonZeroRowOf(*hit_batch, "full", "h1");
+    ASSERT_GE(h0_full.size(), 3u);
+    ASSERT_GE(h1_full.size(), 3u);
+    EXPECT_NE(ParentOf(h0_full[1], kFullPacking), seed_full_parent);
+    EXPECT_NE(ParentOf(h1_full[1], kFullPacking), seed_full_parent);
+    EXPECT_NE(ParentOf(h0_full[1], kFullPacking), ParentOf(h1_full[1], kFullPacking));
+
+    // Wide full-history and small-window SWA pack privatized tails, copy-ins,
+    // and growth back into seed's single partial parent (hole-first).
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*hit_batch, "wide_index", "h0"), kWidePacking),
+              (std::set<std::int32_t>{seed_wide_parent}));
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*hit_batch, "wide_index", "h1"), kWidePacking),
+              (std::set<std::int32_t>{seed_wide_parent}));
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*hit_batch, "small_swa", "h0"), kSmallSwaPacking),
+              (std::set<std::int32_t>{seed_swa_parent}));
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*hit_batch, "small_swa", "h1"), kSmallSwaPacking),
+              (std::set<std::int32_t>{seed_swa_parent}));
+
+    // Finish h0/h1, flush Device L1 so seed survives only in Host L2, then
+    // verify Host L2 extension (AppendHostExtension) packs wide_index and
+    // small_swa hole-first into one shared parent across two concurrent loaders.
+    {
+        ExecutionEvent done;
+        done.With(forward::ExtendResult{.request_id = "h0", .tokens = {81002}});
+        done.With(forward::Finish{.request_id = "h0"});
+        done.With(forward::ExtendResult{.request_id = "h1", .tokens = {81003}});
+        done.With(forward::Finish{.request_id = "h1"});
+        scheduler_->Advance(done);
+    }
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(SchedulerTestAccess::Coordinator(*scheduler_).ClearDeviceCache());
+
+    std::vector<std::int32_t> l0_tokens = seed_tokens;
+    const std::vector<std::int32_t> l0_extra = MakeTokens(150, 33000);
+    l0_tokens.insert(l0_tokens.end(), l0_extra.begin(), l0_extra.end());
+    std::vector<std::int32_t> l1_tokens = seed_tokens;
+    const std::vector<std::int32_t> l1_extra = MakeTokens(150, 44000);
+    l1_tokens.insert(l1_tokens.end(), l1_extra.begin(), l1_extra.end());
+    Submit(RequestSpec{.request_id = "l0", .tokens = l0_tokens, .max_new_tokens = 2});
+    Submit(RequestSpec{.request_id = "l1", .tokens = l1_tokens, .max_new_tokens = 2});
+    const ExecutionPlan load_plan = PlanOnce();
+    std::map<std::string, std::set<std::int32_t>> load_full_parents;
+    std::set<std::int32_t> load_dst_wide_parents;
+    std::set<std::int32_t> load_dst_swa_parents;
+    std::int32_t load_rows = 0;
+    for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(load_plan)) {
+        const auto& load = std::get<LoadBackBatch>(operation);
+        for (std::size_t i = 0; i < load.op_ids.size(); ++i) {
+            const std::string& req_id = load.request_ids[i];
+            for (std::size_t r = 0; r < load.dst_pages[i].size(); ++r) {
+                const std::uint32_t gid = load.group_ids[i][r];
+                const std::int32_t dst = load.dst_pages[i][r];
+                if (gid == 0) {
+                    load_full_parents[req_id].insert(ParentOf(dst, kFullPacking));
+                } else if (gid == 2) {
+                    load_dst_wide_parents.insert(ParentOf(dst, kWidePacking));
+                } else if (gid == 3) {
+                    load_dst_swa_parents.insert(ParentOf(dst, kSmallSwaPacking));
+                }
+            }
+            load_rows += static_cast<std::int32_t>(load.src_pages[i].size());
+            SendLoadBackDone(load.op_ids[i]);
+        }
+    }
+    ASSERT_GT(load_rows, 0) << "l0/l1 must load seed from Host L2 via AppendHostExtension";
+    ASSERT_EQ(load_full_parents["l0"].size(), 1u);
+    ASSERT_EQ(load_full_parents["l1"].size(), 1u);
+    EXPECT_NE(*load_full_parents["l0"].begin(), *load_full_parents["l1"].begin());
+    EXPECT_EQ(load_dst_wide_parents.size(), 1u);
+    EXPECT_EQ(load_dst_swa_parents.size(), 1u);
+
+    const ExecutionPlan run_plan = PlanOnce();
+    const ForwardBatch* load_batch = FindForwardBatch(run_plan);
+    ASSERT_NE(load_batch, nullptr);
+    ASSERT_EQ(load_batch->request_ids, (std::vector<std::string>{"l0", "l1"}));
+
+    // After Host-load publish dedup on the shared full page, each request's
+    // private suffix growth still sits in its own dedicated parent (disjoint
+    // from the other request and from both Host-load parents), while wide_index
+    // and small_swa keep all loaded + grown blocks in one shared parent.
+    const std::vector<std::int32_t> l0_full = NonZeroRowOf(*load_batch, "full", "l0");
+    const std::vector<std::int32_t> l1_full = NonZeroRowOf(*load_batch, "full", "l1");
+    ASSERT_GE(l0_full.size(), 3u);
+    ASSERT_GE(l1_full.size(), 3u);
+    const std::int32_t l0_growth_parent = ParentOf(l0_full.back(), kFullPacking);
+    const std::int32_t l1_growth_parent = ParentOf(l1_full.back(), kFullPacking);
+    EXPECT_NE(l0_growth_parent, l1_growth_parent);
+    EXPECT_NE(l0_growth_parent, *load_full_parents["l0"].begin());
+    EXPECT_NE(l1_growth_parent, *load_full_parents["l1"].begin());
+
+    std::set<std::int32_t> load_wide_parents = ParentsOf(NonZeroRowOf(*load_batch, "wide_index", "l0"), kWidePacking);
+    const std::set<std::int32_t> l1_wide = ParentsOf(NonZeroRowOf(*load_batch, "wide_index", "l1"), kWidePacking);
+    load_wide_parents.insert(l1_wide.begin(), l1_wide.end());
+    EXPECT_EQ(load_wide_parents, load_dst_wide_parents);
+
+    std::set<std::int32_t> load_swa_parents = ParentsOf(NonZeroRowOf(*load_batch, "small_swa", "l0"), kSmallSwaPacking);
+    const std::set<std::int32_t> l1_swa = ParentsOf(NonZeroRowOf(*load_batch, "small_swa", "l1"), kSmallSwaPacking);
+    load_swa_parents.insert(l1_swa.begin(), l1_swa.end());
+    EXPECT_EQ(load_swa_parents, load_dst_swa_parents);
+    EXPECT_TRUE(
+        CacheCoordinatorTestAccess::BoundaryTreeMismatches(SchedulerTestAccess::Coordinator(*scheduler_)).empty());
+}
+
+TEST_F(HybridFullAndStateRequestAwareSuite, HighPackingAndSmallWindowRestoreStaysCompactHoleFirst) {
+    // Regression guard: restore honors CacheStore::GroupUsesParentAffinity too,
+    // packing high-packing and small-window groups hole-first beside live
+    // background requests while isolating normal full-attention blocks.
+    constexpr std::int32_t kTotalLcmPages = 40;
+    constexpr std::int32_t kFullPacking = 6;
+    constexpr std::int32_t kWidePacking = 128;
+    constexpr std::int32_t kSmallSwaPacking = 16;
+    config_ = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/true,
+                               /*enable_host_and_snapshot=*/true);
+    config_.disable_l2_cache = true;
+    config_.host_allocator.total_pages = 0;
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "wide_index",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kWidePacking,
+        .cache_blocks_per_lcm_block = kWidePacking,
+        .attn_kind = AttnKind::kFull,
+    });
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "small_swa",
+        .block_granularity = kP,
+        .total_pages = (kTotalLcmPages + 1) * kSmallSwaPacking,
+        .cache_blocks_per_lcm_block = kSmallSwaPacking,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 8,
+    });
+    config_ = WithHostPackingFromDevice(config_);
+    config_.debug_force_retraction_interval = 4;
+    config_.debug_force_retraction_max_per_request = 1;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(RequestSpec{.request_id = "victim", .tokens = MakeTokens(2 * kP, 5000), .max_new_tokens = 0});
+    std::int32_t tok = 95001;
+    const ExecutionPlan p1 = PlanOnce();  // victim prefill
+    LandBatch(p1, tok);
+
+    Submit(RequestSpec{.request_id = "bg", .tokens = MakeTokens(2 * kP, 100), .max_new_tokens = 0});
+    const ExecutionPlan p2 = PlanOnce();  // bg prefill
+    const ForwardBatch* bg_batch = FindForwardBatch(p2);
+    ASSERT_NE(bg_batch, nullptr);
+    const std::set<std::int32_t> bg_full_parents = ParentsOf(NonZeroRowOf(*bg_batch, "full", "bg"), kFullPacking);
+    const std::set<std::int32_t> bg_wide_parents = ParentsOf(NonZeroRowOf(*bg_batch, "wide_index", "bg"), kWidePacking);
+    const std::set<std::int32_t> bg_swa_parents =
+        ParentsOf(NonZeroRowOf(*bg_batch, "small_swa", "bg"), kSmallSwaPacking);
+    ASSERT_EQ(bg_full_parents.size(), 1u);
+    ASSERT_EQ(bg_wide_parents.size(), 1u);
+    ASSERT_EQ(bg_swa_parents.size(), 1u);
+    const std::int32_t bg_full_parent = *bg_full_parents.begin();
+    const std::int32_t bg_wide_parent = *bg_wide_parents.begin();
+    const std::int32_t bg_swa_parent = *bg_swa_parents.begin();
+    LandBatch(p2, tok);
+
+    const ExecutionPlan p3 = PlanOnce();  // decode
+    LandBatch(p3, tok);
+
+    const ExecutionPlan p4 = PlanOnce();  // retract victim
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(p4);
+    LandBatch(p4, tok);
+
+    const ExecutionPlan p5 = PlanOnce();  // restore victim
+    ASSERT_NE(FindRestore(p5), nullptr);
+    AckRestores(p5);
+    LandBatch(p5, tok);
+
+    const ExecutionPlan p6 = PlanOnce();  // victim resumes
+    const ForwardBatch* resumed = FindForwardBatch(p6);
+    ASSERT_NE(resumed, nullptr);
+    EXPECT_FALSE(ParentsOf(NonZeroRowOf(*resumed, "full", "victim"), kFullPacking).contains(bg_full_parent));
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*resumed, "wide_index", "victim"), kWidePacking),
+              (std::set<std::int32_t>{bg_wide_parent}));
+    EXPECT_EQ(ParentsOf(NonZeroRowOf(*resumed, "small_swa", "victim"), kSmallSwaPacking),
+              (std::set<std::int32_t>{bg_swa_parent}));
+}
+
 }  // namespace tokenspeed::test

@@ -64,6 +64,7 @@ CacheStore::GroupMetadata CacheStore::buildGroupMetadata(std::span<const CacheGr
     _assert(prefix_granularity > 0, "coordinator needs positive prefix_granularity");
     GroupMetadata metadata;
     metadata.geometry.reserve(groups.size());
+    metadata.uses_parent_affinity.reserve(groups.size());
     for (std::size_t i = 0; i < groups.size(); ++i) {
         const CacheGroup& group = groups[i];
         const CacheGroupSpec& spec = group.Spec();
@@ -88,6 +89,17 @@ CacheStore::GroupMetadata CacheStore::buildGroupMetadata(std::span<const CacheGr
             metadata.checkpoint_granularity = spec.checkpoint_granularity;
         }
         metadata.geometry.emplace_back(spec.block_granularity);
+        bool use_affinity = spec.attn_kind != AttnKind::kState && spec.cache_blocks_per_lcm_block > 1 &&
+                            spec.cache_blocks_per_lcm_block <= kMaxRequestAwarePacking;
+        if (use_affinity && spec.attn_kind == AttnKind::kSlidingWindow) {
+            // Placement heuristic: if a single request's steady-state window
+            // cannot fill one parent, opening a dedicated parent per request
+            // leaves the remainder unused (accepting a sharp cliff right above
+            // packing where steady-state retention just exceeds one parent).
+            use_affinity = metadata.geometry.back().SteadyStateWindowBlocks(spec, group.Allocator().KeptHeadBlocks()) >=
+                           static_cast<std::int64_t>(spec.cache_blocks_per_lcm_block);
+        }
+        metadata.uses_parent_affinity.push_back(use_affinity ? 1 : 0);
         if (spec.replayable) {
             _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
             metadata.replay_window_tokens = std::max(metadata.replay_window_tokens, spec.sliding_window);

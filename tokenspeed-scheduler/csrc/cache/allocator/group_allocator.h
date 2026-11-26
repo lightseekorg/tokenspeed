@@ -179,13 +179,13 @@ public:
     // [first_placed_slot, first_placed_slot + placed.size()) of the appended
     // run, so that every bucket-exact block is acquired before the plan's
     // other blocks take any hole (the order the admission planner's fit
-    // assumes). `reserved_empty_parents` reserves empty parents for later
-    // groups in the same admission; `allow_tail_parent` controls whether the
-    // table's current tail parent is reused before opening a fresh one.
-    // Returns false when the pool is short of the other blocks, without
-    // mutating the table; the placed blocks go back then.
+    // assumes). When `affinity` is supplied, fresh blocks use request-aware
+    // placement (inheriting `placed.back()`'s parent when `preferred_parent`
+    // is unset); otherwise placement stays hole-first. Returns false when the
+    // pool is short of the other blocks, without mutating the table; the
+    // placed blocks go back then.
     bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan, std::int32_t first_placed_slot,
-                 std::vector<CacheBlockRef> placed, std::int64_t reserved_empty_parents, bool allow_tail_parent) const {
+                 std::vector<CacheBlockRef> placed, std::optional<ParentAffinity> affinity) const {
         const std::int32_t old_num_blocks = table.NumBlocks();
         // A dense append's run starts at the table's end; a sparse suffix's
         // after its head blocks, at the suffix's first slot.
@@ -205,18 +205,14 @@ public:
                     ++loads[static_cast<std::size_t>(block->Location().slot_index % shard_count_)];
                 }
             }
-            if (pool.Packing(group_id_) == 1) {
+            if (!affinity) {
                 block_refs = pool.AcquireBlocks(group_id_, num_others, loads);
             } else {
-                std::optional<std::int32_t> preferred = allow_tail_parent ? PreferredParent(table) : std::nullopt;
-                if (!preferred && !placed.empty() && placed.back()) {
-                    preferred = placed.back()->Location().lcm_block_id;
+                ParentAffinity effective = *affinity;
+                if (!effective.preferred_parent && !placed.empty() && placed.back()) {
+                    effective.preferred_parent = placed.back()->Location().lcm_block_id;
                 }
-                const ParentAffinity affinity{
-                    .preferred_parent = preferred,
-                    .reserved_empty_parents = reserved_empty_parents,
-                };
-                block_refs = pool.AcquireBlocksWithAffinity(group_id_, num_others, loads, affinity);
+                block_refs = pool.AcquireBlocksWithAffinity(group_id_, num_others, loads, effective);
             }
             if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;

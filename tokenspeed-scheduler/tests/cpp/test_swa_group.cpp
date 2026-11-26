@@ -336,7 +336,7 @@ TEST(GroupAllocatorTest, BucketBalanceCountsKeptHeadAfterReclaim) {
     pool.RegisterGroup(0, 4, 4);
     GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/1);
     BlockTable table;
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 8}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 8}, 0, {}, std::nullopt));
     allocator.ReclaimExpired(pool, table, 7);
     ASSERT_EQ(table.ReclaimedPrefixBlocks(), 7);
     ASSERT_TRUE(table.Blocks()[0]);
@@ -344,7 +344,7 @@ TEST(GroupAllocatorTest, BucketBalanceCountsKeptHeadAfterReclaim) {
 
     // The live tail keeps a second parent open with a hole in the head bucket.
     ASSERT_TRUE(table.Blocks()[7]);
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}, std::nullopt));
     ASSERT_TRUE(table.Blocks().back());
     EXPECT_NE(allocator.BucketOf(table.Blocks().back()->Location()), head_bucket);
 }
@@ -355,22 +355,22 @@ TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInter
     GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
     BlockTable table;
     ASSERT_TRUE(allocator.Acquire(
-        pool, table, AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}, 0, true));
+        pool, table, AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}, std::nullopt));
     ASSERT_EQ(table.ReclaimedPrefixBlocks(), 64);
     table.EvictToNull(65).reset();
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}, std::nullopt));
     std::vector<std::int32_t> buckets;
     for (const auto& ref : table.Blocks().subspan(67)) buckets.push_back(allocator.BucketOf(ref->Location()));
     std::sort(buckets.begin(), buckets.end());
     EXPECT_EQ(buckets, (std::vector<std::int32_t>{0, 1, 1, 3}));
     const auto before = allocator.BlockTablePageIds(table);
     const auto occupied = pool.NumOccupiedSlots();
-    EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}, 0, {}, 0, true));
+    EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}, 0, {}, std::nullopt));
     EXPECT_EQ(allocator.BlockTablePageIds(table), before);
     EXPECT_EQ(pool.NumOccupiedSlots(), occupied);
     allocator.Free(table);
     EXPECT_EQ(table.ReclaimedPrefixBlocks(), 0);
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}, std::nullopt));
     EXPECT_EQ(allocator.BucketOf(table.Blocks()[0]->Location()), 0);
 }
 
@@ -379,7 +379,7 @@ TEST(GroupAllocatorTest, ReclaimedSharedPrefixDoesNotCountTowardNewPlacement) {
     pool.RegisterGroup(0, 4, 4);
     GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
     BlockTable owner;
-    ASSERT_TRUE(allocator.Acquire(pool, owner, AcquirePlan{.num_blocks = 8}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, owner, AcquirePlan{.num_blocks = 8}, 0, {}, std::nullopt));
     const auto owner_ids = allocator.BlockTablePageIds(owner);
     PrefixMatch prefix;
     prefix.blocks.assign(owner.Blocks().begin(), owner.Blocks().end());
@@ -390,7 +390,7 @@ TEST(GroupAllocatorTest, ReclaimedSharedPrefixDoesNotCountTowardNewPlacement) {
     auto replaced = allocator.SwapInFreshBlock(pool, shared, 7, 0, std::nullopt, std::nullopt);
     ASSERT_TRUE(replaced);
     EXPECT_EQ(allocator.BucketOf(shared.Blocks()[7]->Location()), 3);
-    ASSERT_TRUE(allocator.Acquire(pool, shared, AcquirePlan{.num_blocks = 1}, 0, {}, 0, true));
+    ASSERT_TRUE(allocator.Acquire(pool, shared, AcquirePlan{.num_blocks = 1}, 0, {}, std::nullopt));
     EXPECT_EQ(allocator.BucketOf(shared.Blocks()[8]->Location()), 0);
     EXPECT_EQ(allocator.BlockTablePageIds(owner), owner_ids);
     allocator.Free(shared);

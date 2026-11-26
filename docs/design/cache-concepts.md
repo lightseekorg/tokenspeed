@@ -99,9 +99,10 @@ use; geometry is immutable once fixed). Free-slot counts and bucket indexes
 update together on every occupancy transition, and a parent with zero occupants
 is unbound and returned to the global empty-parent FIFO.
 
-For packed non-State Device groups (`packing > 1`), admission and restore apply
-**request-aware placement** (`ParentAffinity`) so concurrent requests do not
-interleave private pages across the same LCM parents and block whole-parent
+For packed non-State Device groups whose virtual packing
+(`physical_packing * shard_count`) lies in `(1, 64]`, admission and restore
+apply **request-aware placement** (`ParentAffinity`) so concurrent requests do
+not interleave private pages across the same LCM parents and block whole-parent
 reclamation when a request finishes. Affinity is derived from the request's
 private tail without extra per-request state, and never reuses shared or cached
 prefix parents. Each allocation step tries:
@@ -114,8 +115,12 @@ prefix parents. Each allocation step tries:
 * **Hole-first fallback** — the densest partial parent once empty parents reach
   that reserve floor.
 
-`State` groups, `packing == 1` groups, and compact Host/snapshot tiers bypass
-affinity and stay hole-first.
+`State` groups, `packing == 1` groups, and compact Host/snapshot tiers always
+bypass affinity and stay hole-first. As a placement heuristic, wider virtual
+packing groups and small-window `sliding_window` groups whose steady-state
+single-request retention (`ceil((W - 1) / G) + 1 + sink blocks`, at
+`decode_input_tokens = 1`) cannot fill one parent also stay hole-first so
+concurrent requests do not each pin a nearly empty parent.
 
 An allocated block never moves, with one exception: a lone request's compaction
 (`LoneRequestAdmission::Compact`, `scheduler.md` §1.4) gathers the

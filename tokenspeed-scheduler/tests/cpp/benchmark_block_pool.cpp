@@ -84,10 +84,12 @@ void AllocateAndRelease() {
                 const auto start = Clock::now();
                 for (int round = 0; round < rounds; ++round) {
                     for (auto& table : tables) {
-                        Require(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1},
-                                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
-                                                  /*reserved_empty_parents=*/0, /*allow_tail_parent=*/true),
-                                "benchmark workload exceeds configured capacity");
+                        Require(
+                            allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1},
+                                              /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
+                                              ParentAffinity{.preferred_parent = GroupAllocator::PreferredParent(table),
+                                                             .reserved_empty_parents = 0}),
+                            "benchmark workload exceeds configured capacity");
                     }
                 }
                 const auto acquired = Clock::now();

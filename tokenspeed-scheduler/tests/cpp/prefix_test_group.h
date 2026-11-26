@@ -59,14 +59,15 @@ public:
 
     // --- allocation (token API, converted through GroupGeometry) ---
     bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens = 0) {
-        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, num_tokens, reserve_tokens),
-                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
-                                  /*reserved_empty_parents=*/0, /*allow_tail_parent=*/true);
+        return allocator_.Acquire(
+            pool, table, geometry_.PlanAcquire(table, num_tokens, reserve_tokens),
+            /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
+            ParentAffinity{.preferred_parent = GroupAllocator::PreferredParent(table), .reserved_empty_parents = 0});
     }
     bool Acquire(BlockPool& pool, BlockTable& table, const GroupDemand& demand) {
-        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, demand),
-                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
-                                  /*reserved_empty_parents=*/0, /*allow_tail_parent=*/true);
+        return allocator_.Acquire(
+            pool, table, geometry_.PlanAcquire(table, demand), /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
+            ParentAffinity{.preferred_parent = GroupAllocator::PreferredParent(table), .reserved_empty_parents = 0});
     }
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         return geometry_.BlocksNeededFor(table, num_tokens);
