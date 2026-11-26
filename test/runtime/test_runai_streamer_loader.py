@@ -19,6 +19,7 @@
 # THE SOFTWARE.
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -1094,6 +1095,50 @@ class TestObjectStoreMetadataResolution:
         sharded_loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
         with pytest.raises(ValueError, match="runai_streamer"):
             sharded_loader._prepare_weights(uri, None)
+
+    def test_modelscope_downloads_tokenizer_for_object_store_model(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from tokenspeed.runtime.model_loader import weight_utils
+        from tokenspeed.runtime.utils.common import prepare_model_and_tokenizer
+
+        uri = "gs://example-bucket/org/model"
+        calls: list[tuple[str, dict]] = []
+
+        def fake_snapshot_download(repo_id, **kwargs):
+            calls.append((repo_id, kwargs))
+            return f"/modelscope-cache/{repo_id}"
+
+        fake_ms = types.ModuleType("modelscope")
+        fake_ms.snapshot_download = fake_snapshot_download  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "modelscope", fake_ms)
+        monkeypatch.setenv("TOKENSPEED_USE_MODELSCOPE", "1")
+        monkeypatch.setattr(
+            weight_utils, "get_lock", lambda *args, **kwargs: contextlib.nullcontext()
+        )
+
+        # A ModelScope tokenizer id is still downloaded; the model is not.
+        assert prepare_model_and_tokenizer(uri, "org/tok") == (
+            uri,
+            "/modelscope-cache/org/tok",
+        )
+        assert calls == [("org/tok", {"ignore_patterns": ["*.bin", "*.safetensors"]})]
+
+        # A tokenizer already on local disk is used as is.
+        calls.clear()
+        local_tokenizer = str(tmp_path)
+        assert prepare_model_and_tokenizer(uri, local_tokenizer) == (
+            uri,
+            local_tokenizer,
+        )
+        assert calls == []
+
+        # A ModelScope model id keeps downloading both, as before.
+        assert prepare_model_and_tokenizer("org/model", "org/tok") == (
+            "/modelscope-cache/org/model",
+            "/modelscope-cache/org/tok",
+        )
+        assert [repo_id for repo_id, _ in calls] == ["org/model", "org/tok"]
 
 
 class TestRunaiStreamerDistributedContract:

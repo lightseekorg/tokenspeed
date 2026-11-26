@@ -172,6 +172,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         weight_memory_policy=None,
         load_format="auto",
         download_dir=None,
+        model_loader_extra_config={},
         ext_yaml=None,
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,
