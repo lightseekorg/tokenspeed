@@ -672,6 +672,8 @@ class CacheArena:
         geometry until the replacement binds; its fields must not be read or
         written.
         """
+        if self.offload is not None:
+            self.offload.release_probe_storage()
         for buffer in self.regions.values():
             buffer.untyped_storage().resize_(0)
 
