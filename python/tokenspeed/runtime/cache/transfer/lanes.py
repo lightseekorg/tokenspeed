@@ -407,8 +407,8 @@ class HostTransferLane:
     workspace's pinned metadata staging. Two submissions that must never wait
     on each other's staging (L2's stream-ordered and pinned write-backs; the
     snapshot executor's stores and restores) take separate lanes.
-    Device metadata uses the arena's CPU-backed pool, including later growth
-    on the transfer stream, so it follows the drained weights sleep/wake.
+    Device metadata uses the cache transfer pool, including later growth
+    on the transfer stream.
     """
 
     __slots__ = ("metadata_done", "workspace", "_memory_saver_adapter")
@@ -445,7 +445,7 @@ class HostTransferLane:
         )
         with (
             device_module.stream(stream),
-            self._memory_saver_adapter.named_region("workspace"),
+            self._memory_saver_adapter.named_region("cache_transfer"),
         ):
             mode = self.workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend

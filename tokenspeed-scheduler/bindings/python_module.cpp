@@ -422,10 +422,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("Host", tokenspeed::PeerLandingTier::kHost);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
         .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t,
-                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t>(),
+                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t, bool>(),
              nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
              nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"), nb::arg("landing_tier"),
-             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"))
+             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"), nb::arg("versioned_shards"))
         .def_ro("name", &tokenspeed::PeerConfig::name)
         .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)

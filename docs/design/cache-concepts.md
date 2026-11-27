@@ -6,6 +6,48 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Cross-layout peer prefix reads
+
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
+All source members must pin the proposed checkpoint before the holder grants a
+read. All reader members must report retirement before sending RELEASE.
+Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
+Unknown retirement freezes the landing. A restarted holder or a conflicting
+close ends the business attempt with zero reused tokens.
+
+Wire revision 2 bounds the start of each member's last native read. Its local
+30-second monotonic submission window starts before the member votes READY.
+Workers check the same deadline at each batch, including after queue and
+destination-fence waits. The holder starts its own 30-second interval at
+GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
+Mixed wire revisions fall back to local prefill.
+
+A deployment with a guaranteed upper bound on the time from the reader's
+final submission check through the last possible source-memory access can
+set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
+scheduling pauses after the check, native queues, reconnects, retries, DMA
+drain after process failure, and timer drift/margin. All ranks follow their
+holder leader's configured value. After the submission interval plus this
+bound, the holder initiates an ABORT and releases its own source references
+even if the reader disappeared. This never releases a reader's frozen target.
+If the backend has no verified bound, leave the setting unset: a granted
+source remains pinned pending explicit closure. A timeout for polling one
+Mooncake batch alone does not establish the bound. No heartbeats extend it.
+
+After all reader members have retired their reads, a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement keeps the original landing frozen and cannot enter this retry path.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)

@@ -66,7 +66,8 @@ enum Driver {
 /// The protocol owner and its control-loop handoff.
 pub struct Peer {
     driver: Driver,
-    device_pin_gate: Option<Arc<servicer::DevicePinGate>>,
+    versioned: Option<super::coordinated::Control>,
+    device_pin_gate: Arc<servicer::DevicePinGate>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
@@ -105,7 +106,8 @@ impl Peer {
         let device_pin_gate = protocol
             .endpoint
             .as_ref()
-            .map(|e| e.holder.lock().device_pin_gate.clone());
+            .map(|e| e.holder.lock().device_pin_gate.clone())
+            .unwrap_or_default();
         let driver = if background {
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
@@ -132,6 +134,7 @@ impl Peer {
             Driver::Rounds(Box::new(protocol))
         };
         Ok(Self {
+            versioned: None,
             driver,
             device_pin_gate,
             port,
@@ -169,10 +172,60 @@ impl Peer {
 
     /// Report to the normal replica collective (empty for the independent owner).
     pub fn report(&mut self) -> Vec<u8> {
-        match &mut self.driver {
+        let legacy = match &mut self.driver {
             Driver::Rounds(p) => p.report(),
             Driver::Background(_) => Vec::new(),
+        };
+        match &mut self.versioned {
+            Some(v) => v.report(legacy),
+            None => legacy,
         }
+    }
+
+    /// Install the independently registered v1 control path.
+    pub fn enable_versioned(
+        &mut self,
+        layout: Arc<super::registered::Replica>,
+        name: String,
+        incarnation: u64,
+        channel: Option<super::VersionedChannel>,
+        retirement_bound_ms: u32,
+    ) {
+        let (control, fence) = super::coordinated::Control::new(
+            layout,
+            self.member,
+            name,
+            incarnation,
+            channel,
+            self.device_pin_gate.clone(),
+            retirement_bound_ms,
+        );
+        if control.reader() {
+            self.fence = fence;
+        }
+        self.versioned = Some(control);
+    }
+
+    /// Apply source votes under the same scheduler lock that protects cache writes.
+    pub fn agree_with_scheduler(
+        &mut self,
+        reports: &[Vec<u8>],
+        scheduler: &mut Scheduler,
+    ) -> Result<PeerRound, PeerError> {
+        if self.versioned.is_none() {
+            return self.agree(reports);
+        }
+        let (legacy, versioned) = super::coordinated::Control::unpack(reports)?;
+        let mut round = self.agree(&legacy)?;
+        let reads = match &self.driver {
+            Driver::Rounds(p) => Some(&p.reads),
+            Driver::Background(_) => None,
+        };
+        self.versioned
+            .as_mut()
+            .unwrap()
+            .advance(versioned, scheduler, reads, &mut round)?;
+        Ok(round)
     }
     /// Consume results already completed by the protocol owner.
     pub fn agree(&mut self, reports: &[Vec<u8>]) -> Result<PeerRound, PeerError> {
@@ -249,6 +302,10 @@ impl Peer {
         lookups: Vec<PeerLookupView>,
         now_us: i64,
     ) {
+        if let Some(reader) = self.versioned.as_mut().filter(|v| v.reader()) {
+            reader.dispatch(fetches, lookups, now_us);
+            return;
+        }
         match &mut self.driver {
             Driver::Rounds(p) => p.dispatch(fetches, lookups, now_us),
             Driver::Background(w) => {
@@ -270,9 +327,7 @@ impl Peer {
     }
     /// Gate new Device pins immediately, including when the protocol runs in the background.
     pub fn block_device_pins(&self, blocked: bool) {
-        if let Some(gate) = &self.device_pin_gate {
-            gate.block(blocked);
-        }
+        self.device_pin_gate.block(blocked);
     }
     /// The data-plane fence endpoint.
     pub fn fence(&self) -> PeerFence {
@@ -280,10 +335,11 @@ impl Peer {
     }
     /// Attempts which still own progress or await consumption.
     pub fn num_landings(&self) -> usize {
-        match &self.driver {
-            Driver::Rounds(p) => p.num_landings(),
-            Driver::Background(w) => w.pending,
-        }
+        self.versioned.as_ref().map_or(0, |v| v.len())
+            + match &self.driver {
+                Driver::Rounds(p) => p.num_landings(),
+                Driver::Background(w) => w.pending,
+            }
     }
     /// Update logical and per-rank observations.
     pub fn set_metrics(
@@ -292,6 +348,9 @@ impl Peer {
         physical: Option<Arc<ts_metrics::PeerMetrics>>,
     ) {
         self.metrics = logical.clone();
+        if let Some(v) = &mut self.versioned {
+            v.meter = physical.clone();
+        }
         match &mut self.driver {
             Driver::Rounds(p) => p.set_metrics(logical, physical),
             Driver::Background(w) => w.send(Command::Metrics(logical, physical)),
@@ -306,6 +365,9 @@ impl Peer {
     }
     /// Switch the namespace after outstanding work drains.
     pub fn set_weight_version(&mut self, version: &str) {
+        if let Some(v) = &mut self.versioned {
+            v.invalidate();
+        }
         match &mut self.driver {
             Driver::Rounds(p) => p.set_weight_version(version),
             Driver::Background(w) => w.send(Command::Version(version.into())),

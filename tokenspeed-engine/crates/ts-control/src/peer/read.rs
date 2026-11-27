@@ -25,9 +25,12 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -92,9 +95,79 @@ impl PushJob {
     }
 }
 
+/// One member's evidence for closing a versioned landing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadRetirement {
+    /// All submitted batches retired successfully (includes an empty plan).
+    Complete,
+    /// Submission was sealed and all previously submitted batches retired.
+    Aborted,
+    /// A transport failure did not establish retirement. Keep both endpoints pinned.
+    Unknown(String),
+}
+
+/// Owned by the lease controller even if its business request goes away.
+/// Sealing requests cancellation; only the retirement result can release pages.
+pub struct MemberRead {
+    sealed: Arc<AtomicBool>,
+    result: mpsc::Receiver<ReadRetirement>,
+}
+
+impl MemberRead {
+    /// Stop claiming new batches. A batch claimed just before seal remains in flight.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    /// Take the single retirement result. A disconnected worker cannot certify retirement.
+    pub fn try_retirement(&self) -> Result<ReadRetirement, mpsc::TryRecvError> {
+        self.result.try_recv()
+    }
+}
+
+struct MemberJob {
+    submit_until: Instant,
+    batches: Vec<(String, Spans, Option<ts_metrics::QueuedPeerRead>)>,
+    sealed: Arc<AtomicBool>,
+    done: mpsc::Sender<ReadRetirement>,
+}
+
+impl MemberJob {
+    fn run(self, reader: &dyn PageReader) {
+        for (session, spans, observation) in self.batches {
+            if self.sealed.load(Ordering::SeqCst) || Instant::now() >= self.submit_until {
+                let _ = self.done.send(ReadRetirement::Aborted);
+                return;
+            }
+            if !spans.is_empty() {
+                let start = std::time::Instant::now();
+                let result = reader.read(&session, &spans);
+                if let Some(observation) = observation {
+                    observation.finish(start, start.elapsed(), spans.host_bytes, 0, result.is_ok());
+                }
+                if let Err(error) = result {
+                    let _ = self.done.send(ReadRetirement::Unknown(error));
+                    return;
+                }
+            }
+        }
+        let result = if self.sealed.load(Ordering::SeqCst) {
+            ReadRetirement::Aborted
+        } else {
+            ReadRetirement::Complete
+        };
+        let _ = self.done.send(result);
+    }
+}
+
+enum Work {
+    Legacy(Box<ReadJob>, Option<ts_metrics::QueuedPeerRead>),
+    Member(MemberJob),
+}
+
 /// The member's bounded read workers: jobs in, outcomes out.
 pub struct Reads {
-    jobs: Option<mpsc::Sender<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>>,
+    jobs: Option<mpsc::Sender<Work>>,
     outcomes: mpsc::Receiver<(String, bool)>,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -108,7 +181,7 @@ impl Reads {
         pusher: Arc<dyn PagePusher>,
         concurrency: NonZeroUsize,
     ) -> std::io::Result<Self> {
-        let (jobs, incoming) = mpsc::channel::<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>();
+        let (jobs, incoming) = mpsc::channel::<Work>();
         let (done, outcomes) = mpsc::channel();
         let incoming = Arc::new(Mutex::new(incoming));
         // Own each worker as soon as it starts, so a later spawn failure
@@ -130,8 +203,13 @@ impl Reads {
                 .spawn(move || loop {
                     // Release the queue lock before the blocking transfer.
                     let job = incoming.lock().recv();
-                    let Ok((job, observation)) = job else {
-                        return;
+                    let (job, observation) = match job {
+                        Ok(Work::Member(member)) => {
+                            member.run(reader.as_ref());
+                            continue;
+                        }
+                        Ok(Work::Legacy(job, observation)) => (job, observation),
+                        Err(_) => return,
                     };
                     let started = std::time::Instant::now();
                     let ReadJob {
@@ -139,7 +217,7 @@ impl Reads {
                         session,
                         spans,
                         push,
-                    } = job;
+                    } = *job;
                     let total_spans = spans.lengths.len();
                     let host_bytes = spans.host_bytes;
                     tracing::debug!(
@@ -216,13 +294,49 @@ impl Reads {
         self.submit_observed(job, None);
     }
 
+    /// Queue this member's entire negotiated plan after its destination fence.
+    /// Every queue entry owns exactly one completion sender regardless of the
+    /// number of holder sessions. None means nothing was queued.
+    pub fn submit_member(&self, batches: Vec<(String, Spans)>) -> Option<MemberRead> {
+        self.submit_member_observed(batches, Instant::now() + super::v1::SUBMIT_WINDOW, None)
+    }
+
+    pub(super) fn submit_member_observed(
+        &self,
+        batches: Vec<(String, Spans)>,
+        submit_until: Instant,
+        metrics: Option<(&Arc<ts_metrics::PeerMetrics>, &str, usize)>,
+    ) -> Option<MemberRead> {
+        let (done, result) = mpsc::channel();
+        let sealed = Arc::new(AtomicBool::new(false));
+        let batches = batches
+            .into_iter()
+            .map(|(session, spans)| {
+                let observation = metrics.map(|(m, holder, rank)| {
+                    m.queue_read(holder.into(), rank, spans.total_bytes())
+                });
+                (session, spans, observation)
+            })
+            .collect();
+        self.jobs
+            .as_ref()?
+            .send(Work::Member(MemberJob {
+                submit_until,
+                batches,
+                sealed: sealed.clone(),
+                done,
+            }))
+            .ok()?;
+        Some(MemberRead { sealed, result })
+    }
+
     pub(super) fn submit_observed(
         &self,
         job: ReadJob,
         observation: Option<ts_metrics::QueuedPeerRead>,
     ) {
         if let Some(jobs) = &self.jobs {
-            let _ = jobs.send((job, observation));
+            let _ = jobs.send(Work::Legacy(Box::new(job), observation));
         }
     }
 
@@ -561,6 +675,72 @@ mod tests {
             },
             push: None,
         }
+    }
+
+    #[test]
+    fn member_seal_waits_for_the_claimed_read_and_skips_later_sessions() {
+        let arena = Arena::new(64);
+        let (started, incoming) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let reader = Arc::new(PausedReader {
+            arena,
+            started,
+            gate: gate.clone(),
+        });
+        let reads = Reads::start(reader, Arc::new(NoPushes), NonZeroUsize::MIN).unwrap();
+        let release = ReleaseReads(gate);
+        let spans = read_job("r", "unused", 16).spans;
+        let job = reads
+            .submit_member(vec![
+                ("paused".into(), spans.clone()),
+                ("skipped".into(), spans),
+            ])
+            .unwrap();
+        assert_eq!(
+            incoming.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "paused"
+        );
+        job.seal();
+        assert_eq!(job.try_retirement(), Err(mpsc::TryRecvError::Empty));
+        drop(release);
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Aborted
+        );
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[test]
+    fn expired_queue_entry_skips_native_submission() {
+        let reads = Reads::start(Arc::new(Failing), Arc::new(NoPushes), NonZeroUsize::MIN).unwrap();
+        let job = reads
+            .submit_member_observed(
+                vec![("unreachable".into(), read_job("r", "unused", 16).spans)],
+                Instant::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Aborted
+        );
+    }
+
+    #[test]
+    fn member_empty_read_votes_and_native_failure_has_unknown_retirement() {
+        let reads = Reads::start(Arc::new(Failing), Arc::new(NoPushes), NonZeroUsize::MIN).unwrap();
+        let empty = reads.submit_member(Vec::new()).unwrap();
+        assert_eq!(
+            empty.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Complete
+        );
+        let job = reads
+            .submit_member(vec![("failed".into(), read_job("r", "unused", 16).spans)])
+            .unwrap();
+        assert!(matches!(
+            job.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ReadRetirement::Unknown(_)
+        ));
     }
 
     #[test]

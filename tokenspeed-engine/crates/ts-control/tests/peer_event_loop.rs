@@ -112,7 +112,7 @@ fn peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
              cfg.peer_config = ts.PeerConfig(name='{name}', incarnation=1, max_leases=16, \
                soft_pin_us={soft_pin_us}, hard_pin_us=5_000_000, lookup_timeout_us=2_000_000, \
                min_fetch_tokens={PAGE}, landing_tier=ts.PeerLandingTier.Device, \
-               max_host_landing_blocks=0, host_ready_timeout_us=0)\n\
+               max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False)\n\
              result = ts.Scheduler(cfg)\n"
         );
         let g = PyDict::new(py);
@@ -190,7 +190,9 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
         request_token_history: false,
         request_token_history_lookback: None,
         controls: ControlConfig {
+            backup_device_kv: false,
             memory_saver: true,
+            replica_memory_transitions: false,
             memory_regions: vec!["kv_cache".into(), "weights".into()],
             shared_weight_version: None,
             allow_reload_forward: true,
@@ -407,6 +409,13 @@ impl DataPlane for HookedDevice {
     }
     fn profile(&mut self, _: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
         Ok((true, "ok".into()))
+    }
+    fn check_memory_transition(
+        &mut self,
+        _tags: &[String],
+        _release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("peer-only tests use protocol 2")
     }
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         self.hooks
@@ -859,6 +868,7 @@ fn sync_peer_holder_changes_preserves_hard_pins_on_tp_and_straddling_pin_blocks_
 
     fe0.push(EngineRequest::Control(Box::new(
         ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            transition_id: None,
             rid: None,
             http_worker_ipc: None,
             tags: Some(vec!["kv_cache".into()]),
@@ -986,7 +996,7 @@ fn compaction_peer_scheduler(name: &str, soft_pin_us: i64) -> Scheduler {
              cfg.peer_config = ts.PeerConfig(name='{name}', incarnation=1, max_leases=32,\n\
                soft_pin_us={soft_pin_us}, hard_pin_us=30_000_000, lookup_timeout_us=2_000_000,\n\
                min_fetch_tokens=8, landing_tier=ts.PeerLandingTier.Device,\n\
-               max_host_landing_blocks=0, host_ready_timeout_us=0)\n\
+               max_host_landing_blocks=0, host_ready_timeout_us=0, versioned_shards=False)\n\
              result = ts.Scheduler(cfg)\n"
         );
         let g = PyDict::new(py);

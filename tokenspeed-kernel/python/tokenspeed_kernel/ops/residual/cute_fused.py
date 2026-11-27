@@ -55,7 +55,9 @@ _WORKSPACES = {}
 _WORKSPACE_LOCK = threading.Lock()
 _WORKSPACE_REGION: Callable[[], AbstractContextManager[object]] = nullcontext
 _PROBE_SPLIT_K = 16
+_MAX_AUTO_TOKENS = 256
 _MAX_OVERRIDE_TOKENS = 1024
+_MAX_LAYOUT_BYTES = (1 << 31) - 1
 _PLANS = {}
 _CAPACITIES = {}
 _WARMED = set()
@@ -75,7 +77,7 @@ def _up_l2_prefetch_k(split_k: int, reuse_down_storage: bool) -> int:
 
 
 def supports_fused_hc_shape(hc_count: int, hidden_size: int, lowrank: int) -> bool:
-    """Whether the model has a validated fused HC tactic family.
+    """Whether the model dimensions fit the fused layouts and offset range.
 
     Args:
         hc_count: Number of residual branches.
@@ -83,10 +85,20 @@ def supports_fused_hc_shape(hc_count: int, hidden_size: int, lowrank: int) -> bo
         lowrank: Rank of the mix projection.
 
     Returns:
-        Whether the model dimensions select a validated fused implementation.
-        Other model shapes retain the ordinary GEMM/Triton selection.
+        Whether the dimensions satisfy the packed Down layout, Up row alignment,
+        and signed 32-bit byte extents of the BF16/FP16 layouts.
     """
-    return (hc_count, hidden_size, lowrank) in ((4, 2560, 320), (4, 8192, 1024))
+    # Down uses K64 slabs and the Up weights need 16-byte row alignment.
+    # Bound the largest layout so the epilogues can keep row offsets in i32.
+    return (
+        hc_count > 1
+        and hidden_size > 0
+        and hidden_size % 64 == 0
+        and lowrank > 0
+        and lowrank % 8 == 0
+        and 2 * hc_count * hidden_size * max(_MAX_OVERRIDE_TOKENS, lowrank + hc_count)
+        <= _MAX_LAYOUT_BYTES
+    )
 
 
 @cache
@@ -184,13 +196,22 @@ def _workspace_for_plan(
                 # post-SiLU activation.
                 # Persistent scratch can be reused by calls made outside the
                 # inference-mode context that first warmed this layout.
+                workspace_rows = workers * slot_rows
+                activation_shape = (workspace_rows, lowrank)
+                partials_shape = (workspace_rows, partial_stride * reduction_groups)
+                if workspace_rows * lowrank * 2 > _MAX_LAYOUT_BYTES or (
+                    reduction_groups > 1
+                    and workspace_rows * partial_stride * reduction_groups * 4
+                    > _MAX_LAYOUT_BYTES
+                ):
+                    raise ValueError("fused CuTe HC workspace exceeds 32-bit offsets")
                 with torch.inference_mode(False), _WORKSPACE_REGION():
                     activation_storage = torch.empty(
-                        (workers * slot_rows, lowrank), device=device, dtype=torch.int16
+                        activation_shape, device=device, dtype=torch.int16
                     )
                     partials = (
                         torch.empty(
-                            (workers * slot_rows, partial_stride * reduction_groups),
+                            partials_shape,
                             device=device,
                             dtype=torch.float32,
                         )
@@ -452,7 +473,10 @@ def _evict_up_weights_first_tactic(
 def _up_k_tactic(
     hc_count: int, hidden_size: int, lowrank: int, token_tile: int, split_k: int
 ) -> int:
-    if _legacy_up_tactic(hc_count, hidden_size, lowrank, token_tile, split_k):
+    # Ranks up to 64 fit in one packed TMA slab and use a K64 tile.
+    if lowrank <= 64 or _legacy_up_tactic(
+        hc_count, hidden_size, lowrank, token_tile, split_k
+    ):
         return 64
     if (
         hc_count == 4
@@ -922,8 +946,6 @@ def prefers_fused_hc(rows: int, hc_count: int, hidden_size: int, lowrank: int) -
     """Bound serialized MMA work before preferring fusion over library GEMMs.
 
     Count K16 instructions in M64 units using the conservative resident budget.
-    The existing decode tactics fit this budget; wider shapes can still select
-    CuTe explicitly while their cooperative pipeline is tuned.
 
     Args:
         rows: Number of token rows in this invocation.
@@ -934,11 +956,13 @@ def prefers_fused_hc(rows: int, hc_count: int, hidden_size: int, lowrank: int) -
     Returns:
         Whether conservative per-worker work fits the automatic selection budget.
     """
-    if rows < 1 or not supports_fused_hc_shape(hc_count, hidden_size, lowrank):
+    if not 1 <= rows <= _MAX_AUTO_TOKENS or not supports_fused_hc_shape(
+        hc_count, hidden_size, lowrank
+    ):
         return False
     if (hc_count, hidden_size, lowrank) == (4, 2560, 320):
         # Preserve the existing model's validated automatic row bound.
-        return rows <= 256
+        return True
     projection_rows = lowrank + hc_count
     s, m, n, lp, lb, stages, f, pin, reuse = _model_tactic(
         rows, hc_count, hidden_size, lowrank, projection_rows
@@ -1003,7 +1027,7 @@ def warmup(
         return
     from tokenspeed_kernel.ops.residual import select_gated_residual_mix_kernel
 
-    max_rows = 256 if effective_override is None else _MAX_OVERRIDE_TOKENS
+    max_rows = _MAX_AUTO_TOKENS if effective_override is None else _MAX_OVERRIDE_TOKENS
     key = (
         normalized.device.index,
         normalized.dtype,
@@ -1019,26 +1043,35 @@ def warmup(
     )
     if key in _WARMED:
         return
-    sample = normalized.new_zeros((max_rows, normalized.shape[1]))
-    selected, _ = select_gated_residual_mix_kernel(
-        sample[:1],
-        projection_weight,
-        up_weight,
-        hc_count,
-        hidden_size,
-        lowrank,
-        weights_independent=weights_independent,
-        override=override,
-        solution=solution,
-    )
-    if selected.name != "cute_fused_hyperconnection_mix":
+    token_counts = range(1, max_rows + 1)
+    if effective_override is None:
+        token_counts = [
+            rows
+            for rows in token_counts
+            if prefers_fused_hc(rows, hc_count, hidden_size, lowrank)
+        ]
+    if not token_counts:
+        _WARMED.add(key)
         return
-    # Row counts also select full/tail tiles and occupancy-dependent rounds.
-    # Walking the small supported range covers these without duplicating the
-    # cooperative scheduler's capacity calculation in a second planner.
-    for rows in range(1, max_rows + 1):
+    sample = normalized.new_zeros((token_counts[-1], normalized.shape[1]))
+    # Rows select both eligibility and bounded full/tail and scheduling variants.
+    for rows in token_counts:
+        inputs = sample[:rows]
+        selected, _ = select_gated_residual_mix_kernel(
+            inputs,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            weights_independent=weights_independent,
+            override=override,
+            solution=solution,
+        )
+        if selected.name != "cute_fused_hyperconnection_mix":
+            continue
         selected(
-            sample[:rows],
+            inputs,
             projection_weight,
             up_weight,
             hc_count,
@@ -1071,7 +1104,7 @@ if _AVAILABLE:
         traits={
             # Batch size selects a CTA tactic, not a separate implementation.
             # Larger batches use the GEMM/Triton path to avoid fused regressions.
-            "num_tokens": frozenset(range(1, 257)),
+            "num_tokens": frozenset(range(1, _MAX_AUTO_TOKENS + 1)),
             "fused_shape_supported": frozenset({True}),
             "fused_workload_supported": frozenset({True}),
             "contiguous": frozenset({True}),
@@ -1122,7 +1155,6 @@ if _AVAILABLE:
         # only logical rows instead of fetching model-loading padding.
         projection_weight = projection_weight[:projection_rows]
         tensors = (normalized, projection_weight, up_weight)
-        # These model dimensions and the row bound keep byte offsets below 2**31.
         if (
             not supports_fused_hc(normalized.device)
             or not supports_fused_hc_shape(hc_count, hidden_size, lowrank)
@@ -1132,8 +1164,8 @@ if _AVAILABLE:
         ):
             raise ValueError(
                 "fused CuTe HC requires six resident Blackwell clusters and 16-byte-aligned "
-                "contiguous BF16/FP16 tensors with validated model dimensions "
-                "(4, 2560, 320) or (4, 8192, 1024) and at most 1024 rows"
+                "contiguous BF16/FP16 tensors, H divisible by 64 and R by 8, "
+                f"32-bit layout byte extents, and at most {_MAX_OVERRIDE_TOKENS} rows"
             )
         with torch.cuda.device(normalized.device):
             out = torch.empty(
