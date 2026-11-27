@@ -5453,17 +5453,9 @@ def _check_fused_padded_shared_expert_survives_release() -> None:
                     plan, w, gu_w, gu_s, d_w, d_s
                 )
                 # Production WeightLoader.load_model runs post_quant_warmup
-                # inside the weights region, which initializes MegaMoE's
-                # persistent symmetric workspace buffer there.
-                mega_moe._get_symm_buffer(
-                    state=w._moe_backend_state,
-                    process_group=None,
-                    num_experts=experts,
-                    top_k=top_k,
-                    hidden_size=hidden,
-                    intermediate_size=target_inter,
-                    max_num_tokens=64,
-                )
+                # inside the weights region, initializing MegaMoE's
+                # persistent symmetric buffer and DeepGEMM per-device state.
+                mega_moe.warmup_deep_gemm_mxfp4_mega_moe(plan, w)
                 del raw_gu_w, raw_gu_s, raw_d_w, raw_d_s
 
             with saver.named_region("executor_inputs"):
