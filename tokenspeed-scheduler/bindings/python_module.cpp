@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
@@ -300,6 +301,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("drop_short_prompt_end_checkpoints", &tokenspeed::SchedulerConfig::drop_short_prompt_end_checkpoints)
         .def_rw("demote_superseded_state_checkpoints",
                 &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
+        .def_rw("prefix_cache_evict_policy", &tokenspeed::SchedulerConfig::prefix_cache_evict_policy)
+        .def_rw("prefix_cache_gds_prefill_cost", &tokenspeed::SchedulerConfig::prefix_cache_gds_prefill_cost)
+        .def_rw("prefix_cache_gds_disk_block_costs", &tokenspeed::SchedulerConfig::prefix_cache_gds_disk_block_costs)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
         .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
         // P role: the most tokens a prefill chunk that cannot finish gives up
@@ -515,6 +519,50 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
         .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
         .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
+    nb::class_<tokenspeed::CacheReleaseStats>(m, "CacheReleaseStats")
+        .def_ro("group_id", &tokenspeed::CacheReleaseStats::group_id)
+        .def_ro("tier", &tokenspeed::CacheReleaseStats::tier)
+        .def_ro("child_slots", &tokenspeed::CacheReleaseStats::child_slots)
+        .def_ro("parents", &tokenspeed::CacheReleaseStats::parents);
+
+    nb::class_<tokenspeed::GdsEvictionStats>(m, "GdsEvictionStats")
+        .def_ro("evicted_units", &tokenspeed::GdsEvictionStats::evicted_units)
+        .def_ro("retention_rejections", &tokenspeed::GdsEvictionStats::retention_rejections)
+        .def_ro("demoted_units", &tokenspeed::GdsEvictionStats::demoted_units)
+        .def_ro("mixed_tier_units", &tokenspeed::GdsEvictionStats::mixed_tier_units)
+        .def_ro("orphan_blocks", &tokenspeed::GdsEvictionStats::orphan_blocks)
+        .def_ro("fallback_blocks", &tokenspeed::GdsEvictionStats::fallback_blocks)
+        .def_ro("fallback_units", &tokenspeed::GdsEvictionStats::fallback_units)
+        .def_ro("logical_evictions", &tokenspeed::GdsEvictionStats::logical_evictions)
+        .def_ro("logical_rejections", &tokenspeed::GdsEvictionStats::logical_rejections)
+        .def_ro("device_copies_released", &tokenspeed::GdsEvictionStats::device_copies_released)
+        .def_ro("host_copies_reserved", &tokenspeed::GdsEvictionStats::host_copies_reserved)
+        .def_ro("host_copy_rejections", &tokenspeed::GdsEvictionStats::host_copy_rejections)
+        .def_ro("host_clean_copies_released", &tokenspeed::GdsEvictionStats::host_clean_copies_released)
+        .def_ro("disk_recoverable_units", &tokenspeed::GdsEvictionStats::disk_recoverable_units)
+        .def_ro("disk_route_losses", &tokenspeed::GdsEvictionStats::disk_route_losses)
+        .def_ro("checkpoint_planned", &tokenspeed::GdsEvictionStats::checkpoint_planned)
+        .def_ro("checkpoint_allocated", &tokenspeed::GdsEvictionStats::checkpoint_allocated)
+        .def_ro("checkpoint_materialized", &tokenspeed::GdsEvictionStats::checkpoint_materialized)
+        .def_ro("checkpoint_published", &tokenspeed::GdsEvictionStats::checkpoint_published)
+        .def_ro("checkpoint_cancelled", &tokenspeed::GdsEvictionStats::checkpoint_cancelled)
+        .def_ro("checkpoint_extra_blocks", &tokenspeed::GdsEvictionStats::checkpoint_extra_blocks)
+        .def_ro("checkpoint_chunk_end_fallbacks", &tokenspeed::GdsEvictionStats::checkpoint_chunk_end_fallbacks)
+        .def_ro("checkpoint_fresh_rejected", &tokenspeed::GdsEvictionStats::checkpoint_fresh_rejected)
+        .def_ro("checkpoint_rejected_extra_blocks", &tokenspeed::GdsEvictionStats::checkpoint_rejected_extra_blocks)
+        .def_ro("checkpoint_rejected_unmeasured", &tokenspeed::GdsEvictionStats::checkpoint_rejected_unmeasured)
+        .def_ro("committed_plans", &tokenspeed::GdsEvictionStats::committed_plans)
+        .def_ro("planning_nanoseconds", &tokenspeed::GdsEvictionStats::planning_nanoseconds)
+        .def_ro("ready_units", &tokenspeed::GdsEvictionStats::ready_units)
+        .def_ro("device_ready_units", &tokenspeed::GdsEvictionStats::device_ready_units)
+        .def_ro("pending_units", &tokenspeed::GdsEvictionStats::pending_units)
+        .def_ro("broken_units", &tokenspeed::GdsEvictionStats::broken_units)
+        .def_ro("dependency_points", &tokenspeed::GdsEvictionStats::dependency_points)
+        .def_ro("dependency_ranges", &tokenspeed::GdsEvictionStats::dependency_ranges)
+        .def_ro("dependency_leaves", &tokenspeed::GdsEvictionStats::dependency_leaves)
+        .def_ro("host_watermark", &tokenspeed::GdsEvictionStats::host_watermark)
+        .def_ro("watermark", &tokenspeed::GdsEvictionStats::watermark);
+
     nb::class_<tokenspeed::HostCacheStats>(m, "HostCacheStats")
         .def_ro("prefix_hits", &tokenspeed::HostCacheStats::prefix_hits)
         .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
@@ -528,6 +576,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("gds_evictions", &tokenspeed::HostCacheStats::gds_evictions)
         .def_ro("lone_compactions", &tokenspeed::HostCacheStats::lone_compactions)
         .def_ro("lone_compaction_moves", &tokenspeed::HostCacheStats::lone_compaction_moves)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
@@ -1090,7 +1139,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
              "Host L2 counters and the Device evictions they are read against, cumulative since start. "
              "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
-             "exports none, and reading them changes nothing.")
+             "exports selected counters, and reading them changes nothing.")
+        .def("cache_release_stats", &tokenspeed::Scheduler::GetCacheReleaseStats,
+             "Actual last-owner child-slot and parent releases by group and tier, cumulative since start.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("disk_stats", &tokenspeed::Scheduler::GetDiskStats)

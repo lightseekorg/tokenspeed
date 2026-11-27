@@ -360,9 +360,8 @@ class Eagle(HiddenStateDrafter):
         share = self.attn_backend.sparse_topk
         # QSA layout and logical candidates belong to one model invocation.
         # Draft steps reuse physical slots and rebuild their row geometry.
-        share.qsa_metadata = None
-        share.qsa_selection = None
         if self._model_shares_mtp_topk():
+            share.clear_qsa()
             share.prefill, share.decode = dsa_topk
         else:
             share.clear()

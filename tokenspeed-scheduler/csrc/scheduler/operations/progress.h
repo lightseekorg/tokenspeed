@@ -88,7 +88,9 @@ public:
           resumed_tail_hash_{live.resumed_tail_hash},
           state_checkpoint_tokens_{live.state_checkpoint_tokens},
           state_checkpoint_blocks_{live.state_checkpoint_blocks},
+          checkpoint_lifecycle_{live.checkpoint_lifecycle},
           published_state_checkpoint_blocks_{live.published_state_checkpoint_blocks},
+          published_checkpoint_lifecycle_{live.published_checkpoint_lifecycle},
           published_state_checkpoint_tokens_{live.published_state_checkpoint_tokens} {}
     StagedCacheProgress(const StagedCacheProgress&) = delete;
     StagedCacheProgress& operator=(const StagedCacheProgress&) = delete;
@@ -104,7 +106,9 @@ public:
         live_.resumed_tail_hash = std::move(resumed_tail_hash_);
         live_.state_checkpoint_tokens = state_checkpoint_tokens_;
         live_.state_checkpoint_blocks = std::move(state_checkpoint_blocks_);
+        live_.checkpoint_lifecycle = std::move(checkpoint_lifecycle_);
         live_.published_state_checkpoint_blocks = std::move(published_state_checkpoint_blocks_);
+        live_.published_checkpoint_lifecycle = std::move(published_checkpoint_lifecycle_);
         live_.published_state_checkpoint_tokens = published_state_checkpoint_tokens_;
     }
 
@@ -118,7 +122,9 @@ private:
     std::optional<std::string> resumed_tail_hash_;
     std::int32_t state_checkpoint_tokens_;
     std::vector<CacheBlockRef> state_checkpoint_blocks_;
+    std::shared_ptr<CheckpointLifecycle> checkpoint_lifecycle_;
     std::vector<CacheBlockRef> published_state_checkpoint_blocks_;
+    std::shared_ptr<CheckpointLifecycle> published_checkpoint_lifecycle_;
     std::int32_t published_state_checkpoint_tokens_;
     bool committed_{false};
 };

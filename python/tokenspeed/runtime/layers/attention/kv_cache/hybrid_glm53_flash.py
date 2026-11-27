@@ -71,7 +71,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
         workspace = getattr(self.arena, attribute, None)
         if workspace is None:
             with self.arena.memory_saver_adapter.region(
-                tag="kv_cache", enable_cpu_backup=False
+                tag="kv_cache", enable_cpu_backup=self.arena.backup_device_kv
             ):
                 storage = torch.zeros(
                     (

@@ -97,6 +97,7 @@ from tokenspeed.runtime.cache.transfer.observations import (
     CompletedObservations,
     CopyCounts,
     ObservationBatch,
+    PendingCopyTiming,
     count_owned_rows,
     observe_copy,
 )
@@ -163,6 +164,7 @@ class _Ack(NamedTuple):
     kind: _AckKind
     op_ids: list[int]
     observations: ObservationBatch = ObservationBatch()
+    timing: PendingCopyTiming | None = None
 
 
 def _num_host_lcm_blocks(
@@ -263,6 +265,7 @@ class HostCacheExecutor:
                 overflow reports a loss without changing scheduler ACKs.
         """
         self._cache_observations = CompletedObservations(cache_observation_capacity)
+        self._next_copy_batch_id: int = 0
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         if not l2_tier and snapshot_pool.disabled:
@@ -549,7 +552,7 @@ class HostCacheExecutor:
         self.load_stream = new_cache_stream(load_stream_priority())
         # Both streams consume these immutable tables; the kernel backend
         # publishes them to the Device once. One geometry per Host buffer.
-        with self._memory_saver_adapter.named_region("workspace"):
+        with self._memory_saver_adapter.named_region("cache_transfer"):
             if l2_tier:
                 self._transfer_geometry = build_transfer_geometry(
                     self.layout, self.host_storage, io_backend=io_backend
@@ -620,7 +623,7 @@ class HostCacheExecutor:
             ):
                 with (
                     device_module.stream(stream),
-                    self._memory_saver_adapter.named_region("workspace"),
+                    self._memory_saver_adapter.named_region("cache_transfer"),
                 ):
                     for workspace in workspaces:
                         workspace.prepare_backend(
@@ -1309,7 +1312,7 @@ class HostCacheExecutor:
             # Resolve the transport before choosing the consumer wait protocol.
             with (
                 device_module.stream(self.load_stream),
-                self._memory_saver_adapter.named_region("workspace"),
+                self._memory_saver_adapter.named_region("cache_transfer"),
             ):
                 mode = workspace.prepare_backend(
                     self.layout.buffers,
@@ -1326,6 +1329,18 @@ class HostCacheExecutor:
                     flags = workspace.prepare_layer_ready(len(layer_slices), device)
                     for load_events, _ in active_trackers:
                         load_events.layer_ready_init_event.record(self.load_stream)
+            timing = None
+            if self._cache_observations.enabled:
+                self._next_copy_batch_id += 1
+                timing = PendingCopyTiming(
+                    batch_id=self._next_copy_batch_id,
+                    backend=mode.backend,
+                    groups=self.layout.groups,
+                    rows=transfers,
+                    device_kind=device.type,
+                    device_module=device_module,
+                    stream=self.load_stream,
+                )
             if mode.layer_ready:
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
@@ -1382,9 +1397,17 @@ class HostCacheExecutor:
                         flat_layer_index += 1
             if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
+            if timing is not None and timing.finish is not None:
+                timing.finish.record(self.load_stream)
+                finish = timing.finish
             self._completions.push(
                 finish,
-                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, observations=observations),
+                _Ack(
+                    kind=_AckKind.LOAD_BACK,
+                    op_ids=op_ids,
+                    observations=observations,
+                    timing=timing,
+                ),
             )
             return load_index
         except BaseException as original_error:
@@ -1440,7 +1463,12 @@ class HostCacheExecutor:
                 results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
             if self._cache_observations.enabled:
                 with self._ack_lock:
-                    self._cache_observations.extend(ack.observations)
+                    observed = (
+                        ack.timing.complete(ack.observations)
+                        if ack.timing is not None
+                        else ack.observations
+                    )
+                    self._cache_observations.extend(observed)
         return results
 
     def poll_cache_observations(self) -> tuple[list[dict], int]:

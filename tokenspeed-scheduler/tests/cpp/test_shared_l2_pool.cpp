@@ -602,6 +602,29 @@ TEST(SharedL2Pool, MisusedCallsAreRefusedBeforeAnythingChanges) {
     pool.Release(2, hit.ticket);
 }
 
+TEST(SharedL2Pool, StateOnlyLookupClaimsHostCheckpointsWithoutADevicePrefix) {
+    for (const std::int32_t tokens : {1, 3, 4, 5, 8}) {
+        SCOPED_TRACE(tokens);
+        TwoStatePool pool(4, /*headroom_lcm_blocks=*/0);
+        const Prompt prompt{Sequence(tokens)};
+        const auto keys = StateKeys(prompt);
+        Write(pool, 1, keys, prompt.Checkpoint(1));
+
+        const auto probe = SharedL2PoolTestAccess::Cache(pool).Prober().ProbePromptPrefix(prompt.Prefix());
+        EXPECT_EQ(probe.device.num_common_tokens, 0);
+        EXPECT_EQ(probe.device.full_page_tokens, 0);
+        EXPECT_EQ(probe.host.num_common_tokens, tokens);
+
+        const auto hit = pool.Lookup(2, prompt.Prefix());
+        EXPECT_EQ(hit.num_tokens, tokens);
+        ASSERT_EQ(hit.pages.size(), keys.size());
+        for (std::size_t i = 0; i < keys.size(); ++i) EXPECT_EQ(hit.pages[i].key, keys[i]);
+        EXPECT_EQ(pool.GetStats().pinned_blocks, keys.size());
+        pool.Release(2, hit.ticket);
+        EXPECT_EQ(pool.GetStats().pinned_blocks, 0);
+    }
+}
+
 TEST(SharedL2Pool, EveryLookupCountsOneRequestOfTheRetentionWindow) {
     // The window is four requests. Until four lookups have arrived, every
     // entry counts as used within it, and A, which B supersedes, leaves before

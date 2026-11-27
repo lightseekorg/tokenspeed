@@ -60,7 +60,7 @@ class WeightLoader:
         Args:
             model_config: Model configuration
             server_args: Server arguments
-            device: Device type ("cuda", "cpu")
+            device: Device type ("cuda", "npu", "cpu")
             gpu_id: GPU ID
             memory_saver_adapter: Memory saver adapter
             checkpoint_load_group: Global ranks loading this model together,
@@ -93,6 +93,7 @@ class WeightLoader:
         load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
+            model_loader_extra_config=server_args.model_loader_extra_config,
             ext_yaml=server_args.ext_yaml,
             weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
             weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
@@ -101,12 +102,17 @@ class WeightLoader:
 
         # Shared target/draft tensors keep their original allocation policy.
         # Frozen draft allocations are backed up even when the target is discarded.
+        draft_policy = server_args.model_update_draft_weights
+        if device == "npu" and not is_draft_worker and draft_policy is None:
+            # An Ascend disk update can replace the target without an SDK.
+            # A real draft worker still needs an explicit backup policy.
+            draft_policy = "retain"
         with memory_saver_adapter.region(
             tag="weights",
             enable_cpu_backup=backup_weights(
                 policy=server_args.weight_memory_policy,
                 is_draft=is_draft_worker,
-                draft_policy=server_args.model_update_draft_weights,
+                draft_policy=draft_policy,
             ),
         ):
             model = get_model(
@@ -124,6 +130,7 @@ class WeightLoader:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     architectures=model_config.hf_config.architectures,
+                    download_dir=server_args.download_dir,
                     **model_config.tokenizer_kwargs,
                 )
                 initialize_engram(tokenizer)

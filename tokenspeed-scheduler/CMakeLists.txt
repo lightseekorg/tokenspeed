@@ -67,6 +67,10 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/coordinator/cache_admission.cpp
     csrc/cache/coordinator/session_registry.cpp
     csrc/cache/coordinator/cache_store.cpp
+    csrc/cache/coordinator/gds_planner.cpp
+    csrc/cache/coordinator/publication_preview.cpp
+    csrc/cache/coordinator/gds_tiered.cpp
+    csrc/cache/coordinator/recovery_index.cpp
     csrc/cache/coordinator/cache_evictor.cpp
     csrc/cache/coordinator/admission_history.cpp
     csrc/cache/coordinator/host_cache.cpp
@@ -170,6 +174,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_checkpoint_retention.cpp
+        tests/cpp/test_gds_eviction.cpp
         tests/cpp/test_checkpoint_demotion.cpp
         tests/cpp/test_peer_exports.cpp
         tests/cpp/test_peer_scheduler.cpp
@@ -229,6 +234,15 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     # Not registered with CTest: it reports timings on stdout rather than
     # asserting, so it is built on demand and read by a human.
+    add_executable(tokenspeed_scheduler_gds_benchmark tests/cpp/benchmark_gds_recovery.cpp)
+    target_link_libraries(tokenspeed_scheduler_gds_benchmark PRIVATE tokenspeed_scheduler_core)
+    target_include_directories(tokenspeed_scheduler_gds_benchmark PRIVATE csrc tests/cpp)
+    target_compile_definitions(tokenspeed_scheduler_gds_benchmark PRIVATE TOKENSPEED_PERSISTENT_RECOVERY_BENCHMARK)
+
+    add_executable(tokenspeed_scheduler_hybrid_policy_benchmark tests/cpp/benchmark_hybrid_policy.cpp)
+    target_link_libraries(tokenspeed_scheduler_hybrid_policy_benchmark PRIVATE tokenspeed_scheduler_core)
+    target_include_directories(tokenspeed_scheduler_hybrid_policy_benchmark PRIVATE csrc tests/cpp)
+
     add_executable(tokenspeed_scheduler_cache_scan_benchmark
         tests/cpp/benchmark_cache_scans.cpp
     )

@@ -70,6 +70,12 @@ def test_peer_identity_binds_the_generation_and_effective_state_encoding():
     assert peer_semantic_id("model", "main", "default", abi) == b""
     assert len(peer_semantic_id("model", "a" * 40, "default", abi)) == 32
     assert peer_semantic_id("model", None, "7", None) == b""
+    pair = peer_semantic_id("model", None, "7", abi, paired_weights=True)
+    assert len(pair) == 32 and pair != base
+    assert peer_semantic_id("model", None, "8", abi, paired_weights=True) != pair
+    assert (
+        peer_semantic_id("model", "a" * 40, "default", abi, paired_weights=True) == b""
+    )
 
 
 def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():

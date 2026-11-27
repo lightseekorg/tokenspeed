@@ -17,7 +17,11 @@ import json
 import os
 import sys
 
-def bootstrap(control_fd, outbox, protocol, host_spans=None, peer_outbox=None):
+def prepare_bootstrap(control_fd):
+    from functools import partial
+    return False, partial(start, control_fd)
+
+def start(control_fd, outbox, protocol, host_spans, peer_outbox, shared_l2_handle):
     # Exercise native stdlib modules and a separately loaded extension.
     import _ctypes
     import _socket

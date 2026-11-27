@@ -419,6 +419,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    acl_graph_memory_policy: str
     enable_dp_local_cuda_graph: bool
     prefix_granularity: int
     max_num_seqs: int
@@ -593,6 +594,7 @@ class ModelExecutorConfig:
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
+            acl_graph_memory_policy=server_args.acl_graph_memory_policy,
             data_parallel_size=server_args.mapping.attn.dp_size,
             attention_tp_size=server_args.mapping.attn.tp_size,
             moe_tp_ep_size=server_args.mapping.moe.tp_ep_size,
@@ -644,7 +646,7 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=config.device
         )
         register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
@@ -1144,12 +1146,12 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
-        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
-        if self.forward_step.disable and self.prefill_graph.disable:
-            return
-
-        # Freeze once for all captures; prefill and drafter captures collect on entry.
-        with freeze_gc(self.config.enable_cudagraph_gc):
+        # Eager and prefill-only boots still validate their managed weights and KV.
+        with (
+            contextlib.nullcontext()
+            if self.forward_step.disable and self.prefill_graph.disable
+            else freeze_gc(self.config.enable_cudagraph_gc)
+        ):
             if not self.forward_step.disable:
                 self.forward_step.capture(entries=entries, observer=observer)
             if not self.prefill_graph.disable:
@@ -1177,6 +1179,16 @@ class ModelExecutor:
                         ),
                         observer=observer,
                     )
+
+        if self.device == "npu" and self.config.enable_memory_saver:
+            models = [("target", self.model_runner.model)]
+            if self._draft_model_runner is not None:
+                models.append(("draft", self._draft_model_runner.model))
+            self.model_runner.memory_saver_adapter.validate_startup(
+                models=models,
+                kv_regions=self.token_to_kv_pool.arena.regions,
+                graphs=self.forward_step.graphs.values(),
+            )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:

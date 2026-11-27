@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "utils.h"
+#include "cache/coordinator/gds_tiered.h"
 
 namespace tokenspeed {
 
@@ -122,21 +123,30 @@ private:
 }  // namespace
 
 CacheEvictor::PendingHostStore::PendingHostStore(CacheEvictor& evictor, BoundaryTree::Node& node, const CacheKey& key,
-                                                 bool checkpoint)
-    : evictor_{&evictor} {
-    const auto [key_it, inserted] = evictor.pending_eviction_keys_.insert(key);
+                                                 bool checkpoint, bool reserved)
+    : evictor_{&evictor}, reserved_{reserved} {
+    const auto [key_it, inserted] = evictor.store_.pending_host_keys_.insert(key);
     if (!inserted) {
         ++evictor.pending_eviction_extra_refs_[key];
     }
     node_ = evictor.store_.Boundaries().HoldPendingStore(node, checkpoint);
     key_ = &*key_it;
+    if (reserved && ++evictor.store_.reserved_host_keys_[key] == 1)
+        evictor.store_.recovery_index_.Apply(RecoveryPromiseEvent{key, true});
 }
 
-void CacheEvictor::releasePendingKey(const CacheKey& key) noexcept {
+void CacheEvictor::releasePendingKey(const CacheKey& key, bool reserved) noexcept {
+    if (reserved) {
+        const auto it = store_.reserved_host_keys_.find(key);
+        if (--it->second == 0) {
+            store_.recovery_index_.Apply(RecoveryPromiseEvent{key, false});
+            store_.reserved_host_keys_.erase(it);
+        }
+    }
     // `key` may be the set's own element: find before erasing.
     const auto extra = pending_eviction_extra_refs_.find(key);
     if (extra == pending_eviction_extra_refs_.end()) {
-        pending_eviction_keys_.erase(pending_eviction_keys_.find(key));
+        store_.pending_host_keys_.erase(store_.pending_host_keys_.find(key));
     } else if (--extra->second == 0) {
         pending_eviction_extra_refs_.erase(extra);
     }
@@ -145,7 +155,8 @@ void CacheEvictor::releasePendingKey(const CacheKey& key) noexcept {
 CacheEvictor::PendingHostStore::PendingHostStore(PendingHostStore&& other) noexcept
     : evictor_{std::exchange(other.evictor_, nullptr)},
       node_{std::move(other.node_)},
-      key_{std::exchange(other.key_, nullptr)} {}
+      key_{std::exchange(other.key_, nullptr)},
+      reserved_{other.reserved_} {}
 
 CacheEvictor::PendingHostStore& CacheEvictor::PendingHostStore::operator=(PendingHostStore&& other) noexcept {
     if (this != &other) {
@@ -153,13 +164,14 @@ CacheEvictor::PendingHostStore& CacheEvictor::PendingHostStore::operator=(Pendin
         evictor_ = std::exchange(other.evictor_, nullptr);
         node_ = std::move(other.node_);
         key_ = std::exchange(other.key_, nullptr);
+        reserved_ = other.reserved_;
     }
     return *this;
 }
 
 void CacheEvictor::PendingHostStore::reset() noexcept {
     if (evictor_ != nullptr) {
-        evictor_->releasePendingKey(*key_);
+        evictor_->releasePendingKey(*key_, reserved_);
         evictor_ = nullptr;
         key_ = nullptr;
     }
@@ -227,7 +239,7 @@ std::optional<CacheEvictor::EvictedEntry> CacheEvictor::EvictCachedBlockAlone(
                              .metadata = metadata,
                              .host_block = store_.AcquireHostCachedBlock(key),
                              .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
-                             .pending = PendingHostStore{*this, *node, key, store_.GroupIsState(group_id)}});
+                             .pending = PendingHostStore{*this, *node, key, store_.GroupIsState(group_id), false}});
             write_back_segment->newest_access_epoch =
                 std::max(write_back_segment->newest_access_epoch, metadata.eviction.last_access_epoch);
         }
@@ -290,11 +302,37 @@ std::vector<CacheEvictor::UnevictedVictim> CacheEvictor::EvictPlanned(std::span<
             DeviceEvictionCounts DeviceEvictionStats::*reason = is_request_reclaim   ? reasons.request_reclaim
                                                                 : in_stranded_suffix ? reasons.stranded_suffix
                                                                                      : reasons.victim;
-            if (!EvictCachedBlock(group_id, location, reason, segment)) {
-                unevicted.push_back(UnevictedVictim{
-                    .group_id = group_id, .location = location, .reason = reason, .write_back_segment = segment});
+            const bool evicted = set.exact_removal
+                                     ? EvictCachedBlockAlone(group_id, location, reason, segment).has_value()
+                                     : EvictCachedBlock(group_id, location, reason, segment);
+            if (!evicted) {
+                unevicted.push_back(UnevictedVictim{.group_id = group_id,
+                                                    .location = location,
+                                                    .reason = reason,
+                                                    .write_back_segment = segment,
+                                                    .exact_removal = set.exact_removal});
             }
         }
+    }
+    return unevicted;
+}
+
+std::vector<CacheEvictor::UnevictedVictim> CacheEvictor::EvictPlanned(const PlannedEviction& plan, bool write_back,
+                                                                      const VictimReasons& reasons) {
+    if (!plan.gds) return EvictPlanned(plan.victims, write_back, reasons);
+    const auto& commit = *plan.gds;
+    if (commit.tiered) prepareTieredPlan(*commit.tiered);
+    for (const auto& hash : commit.fresh_rejections) store_.Checkpoints().RejectFreshProduction(hash);
+    auto unevicted = EvictPlanned(plan.victims, write_back && !commit.tiered, reasons);
+    if (commit.tiered) {
+        store_.Checkpoints().CommitWatermark(commit.tiered->stats.watermark);
+        store_.Checkpoints().CommitHostWatermark(commit.tiered->stats.host_watermark);
+        store_.CommitGdsStats(commit.tiered->stats);
+        CommitGdsTrace(commit.tiered->trace);
+    } else {
+        store_.Checkpoints().CommitWatermark(commit.stats.watermark);
+        store_.CommitGdsStats(commit.stats);
+        CommitGdsTrace(commit.trace);
     }
     return unevicted;
 }
@@ -339,7 +377,8 @@ std::vector<CacheEvictor::EvictedSegment> CacheEvictor::TakeSegments() {
                 segment_with_kv_page.emplace(node, s);
             }
             if (const auto [it, inserted] = segment_with_key.try_emplace(member.key, s); !inserted) {
-                merged_into[root_of(it->second)] = root_of(s);
+                if (recorded[it->second].reserved == recorded[s].reserved)
+                    merged_into[root_of(it->second)] = root_of(s);
             }
             if (segment_top_of[s] == nullptr || node->boundary_tokens < segment_top_of[s]->boundary_tokens) {
                 segment_top_of[s] = node;
@@ -351,7 +390,8 @@ std::vector<CacheEvictor::EvictedSegment> CacheEvictor::TakeSegments() {
     for (std::size_t s = 0; s < recorded.size(); ++s) {
         for (const BoundaryTree::Node* ancestor = segment_top_of[s]; ancestor != nullptr; ancestor = ancestor->parent) {
             if (const auto it = segment_with_kv_page.find(ancestor); it != segment_with_kv_page.end()) {
-                merged_into[root_of(it->second)] = root_of(s);
+                if (recorded[it->second].reserved == recorded[s].reserved)
+                    merged_into[root_of(it->second)] = root_of(s);
             }
         }
     }
@@ -368,6 +408,7 @@ std::vector<CacheEvictor::EvictedSegment> CacheEvictor::TakeSegments() {
             segments.emplace_back();
         }
         EvictedSegment& segment = segments[output_index];
+        segment.reserved = recorded[s].reserved;
         segment.newest_access_epoch = std::max(segment.newest_access_epoch, recorded[s].newest_access_epoch);
         segment.members.insert(segment.members.end(), std::make_move_iterator(recorded[s].members.begin()),
                                std::make_move_iterator(recorded[s].members.end()));
@@ -375,21 +416,82 @@ std::vector<CacheEvictor::EvictedSegment> CacheEvictor::TakeSegments() {
     return segments;
 }
 
+std::optional<CacheKey> CacheEvictor::evictHostEntry(std::uint32_t group_id, CacheBlockLocation location,
+                                                     HostEvictionCounts HostEvictionStats::*reason) {
+    auto removed = store_.Groups()[group_id].Index().Evict(*store_.HostPool(), location);
+    if (removed) {
+        auto& stats = host_evictions_.*reason;
+        ++stats.blocks;
+        if (store_.Groups()[group_id].Index().Contains(store_.DevicePool(), *removed)) ++stats.device_resident;
+    }
+    return removed;
+}
+
+void CacheEvictor::prepareTieredPlan(const TieredGdsPlan& plan) {
+    // A ready Host dependency is held through the last required ACK. Source
+    // Device addresses remain unpinned and follow the eviction stream contract.
+    for (const auto& member : plan.host_removals) {
+        FatalCheck(member.key && std::ranges::find(plan.host_kept, *member.key) == plan.host_kept.end(),
+                   "a joint plan both keeps and removes a Host key");
+        const auto entry = store_.Groups()[member.group].Index().Inspect(*store_.HostPool(), *member.key);
+        FatalCheck(entry && !entry->pinned, "a Host victim changed ownership after preview");
+    }
+    auto holds = std::make_shared<std::vector<CacheBlockRef>>();
+    for (const auto& key : plan.host_kept) {
+        auto block = store_.AcquireHostCachedBlock(key);
+        FatalCheck(bool(block), "a planned Host recovery dependency disappeared");
+        holds->push_back(std::move(block));
+    }
+    for (const auto& hash : plan.fresh_rejections) store_.Checkpoints().RejectFreshProduction(hash);
+    for (const auto& member : plan.host_removals) {
+        FatalCheck(store_.Groups()[member.group].Index().KeyOf(*store_.HostPool(), member.location) == member.key,
+                   "a planned Host location changed identity");
+        FatalCheck(evictHostEntry(member.group, member.location, &HostEvictionStats::lru).has_value(),
+                   "a planned Host victim became held");
+    }
+    if (plan.host_copies.empty()) return;
+    std::vector<CacheBlockRef> destinations(plan.host_copies.size());
+    for (std::size_t g = 0; g < store_.Groups().size(); ++g) {
+        std::vector<std::size_t> rows;
+        std::vector<std::int32_t> buckets;
+        for (std::size_t i = 0; i < plan.host_copies.size(); ++i) {
+            const auto& key = plan.host_copies[i];
+            if (key.group_id != g) continue;
+            const auto source = store_.LocationOf(store_.DevicePool(), g, key);
+            FatalCheck(source.has_value(), "a required Host copy lost its Device source");
+            rows.push_back(i);
+            buckets.push_back(store_.Groups()[g].Allocator().BucketOf(*source));
+        }
+        auto blocks = store_.HostPool()->AcquireBlocksInBuckets(static_cast<std::uint32_t>(g), buckets);
+        FatalCheck(blocks.size() == rows.size(), "joint Host reservation did not fit its preview");
+        for (std::size_t i = 0; i < rows.size(); ++i) destinations[rows[i]] = std::move(blocks[i]);
+    }
+    auto& segment = evicted_segments_.emplace_back();
+    segment.reserved = true;
+    for (std::size_t i = 0; i < plan.host_copies.size(); ++i) {
+        const auto& key = plan.host_copies[i];
+        const auto source = store_.Groups()[key.group_id].Index().Inspect(store_.DevicePool(), key);
+        FatalCheck(source.has_value(), "a required Host copy lost its indexed source");
+        auto* node = store_.Boundaries().Find(key.content_hash);
+        FatalCheck(node != nullptr, "a required copy has no publication boundary");
+        segment.members.push_back(
+            EvictedBlock{.key = key,
+                         .device_location = source->location,
+                         .metadata = source->metadata,
+                         .host_block = std::move(destinations[i]),
+                         .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
+                         .copy_required = true,
+                         .preservation_holds = holds,
+                         .pending = PendingHostStore{*this, *node, key, store_.GroupIsState(key.group_id), true}});
+        segment.newest_access_epoch =
+            std::max(segment.newest_access_epoch, source->metadata.eviction.last_access_epoch);
+    }
+}
+
 bool CacheEvictor::EvictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                         HostEvictionCounts HostEvictionStats::*reason) {
-    const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
-        std::optional<CacheKey> removed =
-            store_.Groups()[entry_group].Index().Evict(*store_.HostPool(), entry_location);
-        if (!removed) {
-            return removed;
-        }
-        HostEvictionCounts& evicted = host_evictions_.*reason;
-        ++evicted.blocks;
-        // Contains takes no reference, so it pins nothing on the Device tier.
-        if (store_.Groups()[entry_group].Index().Contains(store_.DevicePool(), *removed)) {
-            ++evicted.device_resident;
-        }
-        return removed;
+    const auto evict_entry = [&](std::uint32_t group, CacheBlockLocation entry) {
+        return evictHostEntry(group, entry, reason);
     };
     const std::optional<CacheKey> removed = evict_entry(group_id, location);
     if (!removed) {
@@ -409,6 +511,15 @@ bool CacheEvictor::EvictHostCachedBlock(std::uint32_t group_id, CacheBlockLocati
             }
         });
     }
+    return true;
+}
+
+bool CacheEvictor::InvalidateDiskEntry(const CacheKey& key) {
+    const auto& pool = store_.TierPool<CacheTier::kDisk>();
+    if (!store_.Groups()[key.group_id].Index().Invalidate(pool, key)) return false;
+    ++disk_evictions_.read_failure.blocks;
+    if (store_.Groups()[key.group_id].Index().Contains(*store_.HostPool(), key))
+        ++disk_evictions_.read_failure.host_resident;
     return true;
 }
 

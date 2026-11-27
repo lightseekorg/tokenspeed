@@ -102,6 +102,7 @@ struct HostCacheStats {
     // back; counted under the eviction's cause.
     std::uint64_t demoted_entries_not_written_back{0};
     CacheEvictor::DeviceEvictionStats device_evictions;
+    GdsEvictionStats gds_evictions;
     // LoneRequestAdmission::Compactions and CompactionMoves: lone-request
     // compactions (docs/design/scheduler.md §1.4) and the blocks they moved,
     // copied or re-placed.
@@ -188,6 +189,8 @@ public:
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
     bool ClearL1Cache();
+    // Same Device L1 readiness checks as ClearL1Cache, with no mutation.
+    bool CanClearL1Cache() const;
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
@@ -375,6 +378,7 @@ public:
     std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.Host().NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
+    std::vector<CacheReleaseStats> GetCacheReleaseStats() const { return coordinator_.ReleaseStats(); }
     std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
     std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
         return coordinator_.DemoteCacheGroups(ids, ended);
@@ -972,6 +976,8 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    const CheckpointConfig checkpoints_;
+    const std::shared_ptr<CheckpointProductionStats> checkpoint_stats_{std::make_shared<CheckpointProductionStats>()};
     std::unique_ptr<PrefillPolicy> prefill_policy_;
     // Declared before the allocator, tickets and requests: they release their
     // slots before the sink's last reference can be destroyed.

@@ -458,7 +458,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_kda_batched_retained_commit(**kwargs) -> None:
-        """Commit all AMD retained convolution windows, then publish lengths."""
+        """Commit all AMD retained convolution windows, then publish counts."""
         from tokenspeed_kernel.ops.attention.kda._retained import batched_commit
 
         batched_commit(**kwargs)

@@ -69,7 +69,7 @@ class LinearAttnConfig(AttnComponentSpec):
     draft_tree: bool = False
     # KDA: records each request slot keeps per layer between dense-state
     # folds, counting the verify window (--kda-history-capacity). None keeps
-    # the default of kv_cache/recipes/kda.py:kda_history_capacity.
+    # KDA_DEFAULT_HISTORY_CAPACITY of kv_cache/recipes/kda.py.
     kda_history_capacity: int | None = None
     # Whether that workspace exists: Mamba2 rebuilds a branch's state by replaying its ancestors instead.
     tree_node_state_workspace: ClassVar[bool] = True

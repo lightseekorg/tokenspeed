@@ -276,7 +276,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "page_size": frozenset({64}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),

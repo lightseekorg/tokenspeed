@@ -2482,3 +2482,41 @@ completed on the replica, since the source execution stream cannot order an
 incoming RDMA read. The reader can use local compute. PINs for prefixes held
 entirely in Host or Disk and existing leases continue independently. The same
 completion tracking protects cache clear and drain.
+
+## Checkpoint production and retention
+
+Resolve production configuration, publication rules and retention hints once at
+startup. Runtime capability validation still requires every State consumer to
+write an interior output. Scheduler production and finish paths consume the
+resolved contracts; default LRU preserves its filters and hints, while GDS
+suppresses superseded hints on both tiers. Unsupported configurations fail
+before constructing cache pools.
+
+The materialization plan carries each group's extra State output demand and
+history/window/sink requirements. These enter the existing allocation and
+publication-before-reclaim path. A materialized result records the computed
+frontier as well as owning output handles. `CheckpointPublication` describes
+completed views; `CompletedPages` remains its adapter name.
+
+The output's RAII lifecycle distinguishes allocated, materialized, published
+and cancelled outputs. A failed admission can retry its already materialized
+output without registering it or counting it twice. Only publication commit
+marks it published; destruction of an unpublished output records cancellation.
+
+`CheckpointMaterializationPlan` resolves chunk shaping, the existing checkpoint
+target and its in-forward offset together. Its extra State output is an
+allocation demand, not a published recovery point. If that output does not fit,
+`WithoutExtraOutput` keeps the same target and ends the chunk there; a carried
+prompt that must complete still waits instead. Both first and subsequent
+chunks use this contract. Existing runtime checkpoint offsets and output-block
+adapters remain unchanged.
+
+Once the computed frontier reaches a reserved checkpoint,
+`TakeMaterializedCheckpoint` returns its owning `MaterializedCheckpoint` value.
+Publication moves those outputs into the published holder and registers their
+existing canonical identities. Natural prompt/end filtering is unchanged.
+Retention is a later decision under capacity pressure, using the Device
+LRU/GDS policy described in [cache-concepts](cache-concepts.md#hybrid-recovery-eviction).
+Explicit demotion causes distinguish superseded retention hints from a peer
+handoff. A policy choice changes retention without adding another forward path
+or requesting different checkpoint targets.

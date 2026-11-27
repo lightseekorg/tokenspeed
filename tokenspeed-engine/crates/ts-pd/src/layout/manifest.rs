@@ -160,8 +160,26 @@ pub fn logical_slots(
     prompt_len: i64,
     state_prefix_cached: bool,
 ) -> Result<Vec<i64>, LayoutError> {
+    Ok(
+        logical_slot_ranges(spec, prefix_len, prompt_len, state_prefix_cached)?
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+}
+
+/// Sink and tail slots, without allocating from a peer's claimed token count.
+pub fn logical_slot_ranges(
+    spec: &GroupSpec,
+    prefix_len: i64,
+    prompt_len: i64,
+    state_prefix_cached: bool,
+) -> Result<[std::ops::Range<i64>; 2], LayoutError> {
     if spec.full_suffix() {
         let granularity = spec.block_granularity()?;
+        if granularity <= 0 {
+            return Err(LayoutError::new("invalid block granularity"));
+        }
         let mut begin = if spec.replayable {
             0
         } else {
@@ -177,14 +195,12 @@ pub fn logical_slots(
         let end = (prompt_len + granularity - 1).div_euclid(granularity);
         let sink_begin = prefix_len.div_euclid(granularity);
         let sink_end = (spec.sink_tokens.min(prompt_len) + granularity - 1).div_euclid(granularity);
-        let mut slots: Vec<i64> = (sink_begin..sink_end).collect();
-        slots.extend(begin.max(sink_end)..end);
-        return Ok(slots);
+        return Ok([sink_begin..sink_end, begin.max(sink_end)..end]);
     }
     Ok(if state_prefix_cached {
-        Vec::new()
+        [0..0, 0..0]
     } else {
-        vec![STATE_LIVE_SLOT]
+        [0..0, STATE_LIVE_SLOT..STATE_LIVE_SLOT + 1]
     })
 }
 
