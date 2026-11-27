@@ -57,6 +57,11 @@ def splitk_config_for(m: int) -> tuple[int, int]:
     return _SPLITK_CONFIG_BY_M[-1][1]
 
 
+def splitk_configs() -> tuple[tuple[int, int], ...]:
+    """Every distinct ``(split_k, num_stages)`` split-K specialization across M."""
+    return tuple(dict.fromkeys(config for _, config in _SPLITK_CONFIG_BY_M))
+
+
 def _cutedsl_available() -> bool:
     try:
         import cutlass  # noqa: F401
@@ -150,6 +155,49 @@ class LLBf16Router:
         """
         split_k, _ = splitk_config_for(m)
         return m <= MAX_M_DOTPROD or k < split_k * _SPLITK_TILE_K
+
+    @staticmethod
+    def supports_splitk_k(k: int) -> bool:
+        """Whether ``k`` is wide enough for at least one split-K configuration."""
+        return any(k >= split_k * _SPLITK_TILE_K for split_k, _ in splitk_configs())
+
+    def warm_splitk(
+        self,
+        device: torch.device,
+        *,
+        out_dtype: torch.dtype,
+        has_bias: bool,
+        enable_pdl: bool,
+    ) -> None:
+        """Compile every split-K M-threshold specialization for this signature.
+
+        ``LLBf16SplitK`` uses symbolic ``(M, K, N)`` but changes
+        ``(split_k, num_stages)`` across ``_SPLITK_CONFIG_BY_M`` (e.g.
+        ``num_stages=4`` for ``M <= 16`` and ``num_stages=2`` for
+        ``17 <= M <= 32``). Compiling every variant together keeps a server
+        warmed on one M range (or on large prefill M > MAX_M) from compiling a
+        second specialization during serving.
+        """
+        if out_dtype not in OUT_DTYPES:
+            raise ValueError(f"out_dtype must be one of {OUT_DTYPES}, got {out_dtype}")
+        if (
+            device.type != "cuda"
+            or not self.is_available()
+            or torch.cuda.get_device_capability(device)[0] < 9
+        ):
+            return
+        device_idx = device.index or 0
+        configs = splitk_configs()
+        if all(
+            (device_idx, *cfg, out_dtype, has_bias, enable_pdl) in self._splitk
+            for cfg in configs
+        ):
+            return
+        with self._compile_lock:
+            for cfg in configs:
+                key = (device_idx, *cfg, out_dtype, has_bias, enable_pdl)
+                if key not in self._splitk:
+                    self._compile_splitk(cfg, device, out_dtype, has_bias, enable_pdl)
 
     def _compile_dotprod(
         self,
@@ -342,11 +390,12 @@ class LLBf16Router:
 
         key = (device.index or 0, *config, out_dtype, has_bias, enable_pdl)
         if key not in self._splitk:
-            with self._compile_lock:
-                if key not in self._splitk:
-                    self._compile_splitk(
-                        config, device, out_dtype, has_bias, enable_pdl
-                    )
+            self.warm_splitk(
+                device,
+                out_dtype=out_dtype,
+                has_bias=has_bias,
+                enable_pdl=enable_pdl,
+            )
         self._splitk[key](a, b, out, bias_arg, stream, 1.0)
         return out
 
@@ -360,5 +409,6 @@ __all__ = [
     "LLBf16Router",
     "block_size_for",
     "splitk_config_for",
+    "splitk_configs",
     "ll_bf16_router",
 ]

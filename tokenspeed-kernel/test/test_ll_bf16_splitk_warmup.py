@@ -1,0 +1,108 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import (
+    LLBf16Router,
+    splitk_config_for,
+    splitk_configs,
+)
+
+
+def test_splitk_configs_covers_every_m_threshold():
+    configs = splitk_configs()
+    assert len(configs) >= 2
+    assert splitk_config_for(8) in configs
+    assert splitk_config_for(16) in configs
+    assert splitk_config_for(17) in configs
+    assert splitk_config_for(32) in configs
+    assert splitk_config_for(16) != splitk_config_for(17)
+
+
+def test_warm_splitk_compiles_all_stage_variants_once(monkeypatch):
+    router = LLBf16Router()
+    compiled: list[tuple[tuple[int, int], int, torch.dtype, bool, bool]] = []
+
+    def fake_compile_splitk(config, device, out_dtype, has_bias, enable_pdl):
+        key = (device.index or 0, *config, out_dtype, has_bias, enable_pdl)
+        router._splitk[key] = object()
+        compiled.append((config, device.index or 0, out_dtype, has_bias, enable_pdl))
+
+    monkeypatch.setattr(router, "is_available", lambda: True)
+    monkeypatch.setattr(router, "_compile_splitk", fake_compile_splitk)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _dev: (10, 3))
+
+    dev = torch.device("cuda", 0)
+    router.warm_splitk(dev, out_dtype=torch.float32, has_bias=False, enable_pdl=True)
+    expected = [(cfg, 0, torch.float32, False, True) for cfg in splitk_configs()]
+    assert compiled == expected
+
+    # Second call is a no-op once every threshold variant is cached.
+    router.warm_splitk(dev, out_dtype=torch.float32, has_bias=False, enable_pdl=True)
+    assert compiled == expected
+
+
+def test_supports_splitk_k_rejects_narrow_projections():
+    assert not LLBf16Router.supports_splitk_k(320)
+    assert not LLBf16Router.supports_splitk_k(512)
+    assert LLBf16Router.supports_splitk_k(1024)
+    assert LLBf16Router.supports_splitk_k(7168)
+
+
+def test_warm_splitk_skips_pre_hopper_and_cpu(monkeypatch):
+    router = LLBf16Router()
+    calls: list[object] = []
+    monkeypatch.setattr(router, "is_available", lambda: True)
+    monkeypatch.setattr(
+        router, "_compile_splitk", lambda *args, **kwargs: calls.append(args)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _dev: (8, 0))
+
+    router.warm_splitk(
+        torch.device("cpu"), out_dtype=torch.float32, has_bias=False, enable_pdl=False
+    )
+    router.warm_splitk(
+        torch.device("cuda", 0),
+        out_dtype=torch.float32,
+        has_bias=False,
+        enable_pdl=False,
+    )
+    assert calls == []
+
+
+def test_warm_ll_bf16_splitk_is_noop_on_cpu_and_narrow_weights(monkeypatch):
+    from tokenspeed_kernel.ops.gemm.cute_dsl import warm_ll_bf16_splitk
+    from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
+
+    called = False
+
+    def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(ll_bf16_router, "warm_splitk", fail_if_called)
+    x = torch.zeros((64, 7168), dtype=torch.bfloat16)
+    w = torch.zeros((896, 7168), dtype=torch.bfloat16)
+    warm_ll_bf16_splitk(
+        x, w, out_dtype=torch.float32, has_bias=False, enable_pdl=False
+    )
+    assert not called

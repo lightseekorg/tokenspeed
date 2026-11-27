@@ -2012,6 +2012,19 @@ def dsv4_linear_fp32(
 
     enable_pdl = pdl_enabled()
     k = int(weight.shape[1])
+    if (
+        is_warming_up()
+        and hidden_states.ndim == 2
+        and override is None
+        and solution in (None, "cute_dsl")
+    ):
+        warm_ll_bf16_splitk(
+            hidden_states,
+            weight,
+            out_dtype=torch.float32,
+            has_bias=False,
+            enable_pdl=enable_pdl,
+        )
     traits = {
         "n": int(weight.shape[0]),
         "k": k,
@@ -4534,6 +4547,14 @@ def kimi3_router_projection(
         ):
             solution = "gluon_decode"
         elif platform.is_hopper_plus and specialized:
+            if is_warming_up():
+                warm_ll_bf16_splitk(
+                    hidden_states,
+                    weight,
+                    out_dtype=torch.float32,
+                    has_bias=False,
+                    enable_pdl=pdl_enabled(),
+                )
             if _ll_bf16_usable(hidden_states, weight, m):
                 solution = "ll_bf16"
             elif m > _ROUTER_CUDA_MAX_TOKENS and _mm_out_dtype_supported():
@@ -4637,6 +4658,7 @@ from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm  # noqa: E402
 from tokenspeed_kernel.ops.gemm.cute_dsl import (  # noqa: E402
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
+    warm_ll_bf16_splitk,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     BF16_GEMM_MAX_M,

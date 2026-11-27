@@ -35,8 +35,11 @@ from tokenspeed_kernel.ops.activation import relu2
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
+    warm_ll_bf16_splitk,
 )
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm
+from tokenspeed_kernel.ops.tuning import is_warming_up
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
@@ -508,6 +511,14 @@ class NemotronHRouter(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if is_warming_up():
+            warm_ll_bf16_splitk(
+                hidden_states,
+                self.weight,
+                out_dtype=torch.float32,
+                has_bias=False,
+                enable_pdl=pdl_enabled(),
+            )
         if ll_bf16_router_supported(hidden_states, self.weight, hidden_states.shape[0]):
             return cute_dsl_ll_bf16_router(hidden_states, self.weight)
         return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)

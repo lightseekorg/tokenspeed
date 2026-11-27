@@ -23,7 +23,12 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops.gemm.flashinfer import cublas_fp8_gemm
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -202,6 +207,56 @@ def ll_bf16_router_supported(
     )
 
 
+def warm_ll_bf16_splitk(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+    has_bias: bool,
+    enable_pdl: bool,
+) -> None:
+    """Precompile every ``LLBf16SplitK`` stage variant reachable by ``weight``.
+
+    Safe to call at any ``M`` (including ``M > MAX_M`` during prefill startup
+    warmup) so serving batches with ``5 <= M <= 32`` never trigger a split-K
+    CuTe compilation. Does nothing on non-Hopper+ NVIDIA platforms or while
+    the current stream is capturing.
+
+    Args:
+        hidden_states: ``[M, K]`` activation tensor (only device, dtype, and
+            ``K`` are checked).
+        weight: ``[N, K]`` contiguous BF16 weight tensor.
+        out_dtype: Output dtype of the router projection.
+        has_bias: Whether the router epilogue adds a bias vector.
+        enable_pdl: PDL policy for compilation.
+    """
+    platform = current_platform()
+    if (
+        not (platform.is_nvidia and platform.is_hopper_plus)
+        or hidden_states.device.type != "cuda"
+        or weight.device != hidden_states.device
+        or hidden_states.ndim != 2
+        or hidden_states.dtype is not torch.bfloat16
+        or weight.dtype is not torch.bfloat16
+        or weight.ndim != 2
+        or not weight.is_contiguous()
+        or weight.shape[0] <= 0
+        or weight.shape[1] <= 0
+        or weight.shape[1] % 8 != 0
+        or weight.data_ptr() % 16 != 0
+        or hidden_states.shape[-1] != weight.shape[1]
+        or not ll_bf16_router.supports_splitk_k(weight.shape[1])
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    ll_bf16_router.warm_splitk(
+        hidden_states.device,
+        out_dtype=out_dtype,
+        has_bias=has_bias,
+        enable_pdl=enable_pdl,
+    )
+
+
 @register_kernel(
     "gemm",
     "dsv4_linear_fp32",
@@ -241,4 +296,5 @@ __all__ = [
     "cute_dsl_dsv4_linear_fp32",
     "cute_dsl_ll_bf16_router",
     "ll_bf16_router_supported",
+    "warm_ll_bf16_splitk",
 ]

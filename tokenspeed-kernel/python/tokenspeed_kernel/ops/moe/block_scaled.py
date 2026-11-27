@@ -39,9 +39,11 @@ from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
+    warm_ll_bf16_splitk,
 )
 from tokenspeed_kernel.ops.gemm.triton_skinny import skinny_mm, skinny_mm_supported
 from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
@@ -562,6 +564,14 @@ def block_scaled_router_mm(
         or not x.is_cuda
     ):
         raise ValueError("Router projection requires contiguous matching GPU matrices")
+    if is_warming_up():
+        warm_ll_bf16_splitk(
+            x,
+            weight,
+            out_dtype=torch.float32,
+            has_bias=False,
+            enable_pdl=pdl_enabled(),
+        )
     if x.shape[0] <= _LL_ROUTER_MAX_TOKENS and ll_bf16_router_supported(
         x, weight, x.shape[0]
     ):
