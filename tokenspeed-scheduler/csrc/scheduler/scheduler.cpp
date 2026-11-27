@@ -35,6 +35,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "cache/coordinator/cache_eviction_diagnostic.h"
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
 #include "core/profile_span.h"
@@ -553,7 +554,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     // a batch that passed validation is hashed, so a rejected one stays cheap.
     if (!config_.disable_prefix_cache) {
         for (const std::unique_ptr<Request>& request : pending_requests) {
-            request->PromptPrefixHashes();
+            const auto hashes = request->PromptPrefixHashes();
+            BindCacheEvictionDiagnostic(request->Id(), hashes, config_.prefix_granularity);
         }
     }
 

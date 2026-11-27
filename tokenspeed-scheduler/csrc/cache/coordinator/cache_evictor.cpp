@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/coordinator/cache_eviction_diagnostic.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -195,7 +196,8 @@ std::optional<CacheEvictor::EvictedEntry> CacheEvictor::EvictCachedBlockAlone(
         !demoted && metadata.eviction.last_access_epoch == CacheStore::kSupersededAccessEpoch &&
         (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
          reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim);
-    DeviceEvictionCounts& evicted = device_evictions_.*(superseded ? &DeviceEvictionStats::request_reclaim : reason);
+    const auto effective_reason = superseded ? &DeviceEvictionStats::request_reclaim : reason;
+    DeviceEvictionCounts& evicted = device_evictions_.*effective_reason;
     if (demoted && write_back_segment != nullptr) {
         ++demoted_entries_not_written_back_;
         // A request's own released slot the drain would have considered is
@@ -238,9 +240,11 @@ std::optional<CacheEvictor::EvictedEntry> CacheEvictor::EvictCachedBlockAlone(
     }
     ++evicted.blocks;
     // Contains takes no reference, so it pins nothing on the Host tier.
-    if (store_.HostPool() != nullptr && index.Contains(*store_.HostPool(), removed)) {
+    const bool host_present = store_.HostPool() != nullptr && index.Contains(*store_.HostPool(), removed);
+    if (host_present) {
         ++evicted.host_resident;
     }
+    LogCacheEviction(removed, effective_reason, metadata, host_present, pending_eviction_keys_);
     return EvictedEntry{.key = std::move(removed), .device_companions_left = device_companions_left};
 }
 
@@ -378,17 +382,19 @@ std::vector<CacheEvictor::EvictedSegment> CacheEvictor::TakeSegments() {
 bool CacheEvictor::EvictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                         HostEvictionCounts HostEvictionStats::*reason) {
     const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
-        std::optional<CacheKey> removed =
-            store_.Groups()[entry_group].Index().Evict(*store_.HostPool(), entry_location);
-        if (!removed) {
-            return removed;
-        }
+        auto& index = store_.Groups()[entry_group].Index();
+        auto entry = index.FindEvictable(*store_.HostPool(), entry_location);
+        if (!entry) return std::optional<CacheKey>{};
+        const auto metadata = entry.metadata();
+        std::optional<CacheKey> removed = index.Evict(std::move(entry));
         HostEvictionCounts& evicted = host_evictions_.*reason;
         ++evicted.blocks;
         // Contains takes no reference, so it pins nothing on the Device tier.
-        if (store_.Groups()[entry_group].Index().Contains(store_.DevicePool(), *removed)) {
+        const bool device_present = store_.Groups()[entry_group].Index().Contains(store_.DevicePool(), *removed);
+        if (device_present) {
             ++evicted.device_resident;
         }
+        LogCacheEviction(*removed, reason, metadata, device_present, pending_eviction_keys_);
         return removed;
     };
     const std::optional<CacheKey> removed = evict_entry(group_id, location);
@@ -453,9 +459,13 @@ void CacheEvictor::FlushDiskEntry(std::uint32_t group_id, CacheBlockLocation loc
 }
 
 void CacheEvictor::FlushHostEntry(std::uint32_t group_id, CacheBlockLocation location) {
-    _assert(store_.Groups()[group_id].Index().Evict(*store_.HostPool(), location).has_value(),
-            "clearable Host cache entry disappeared");
+    auto& index = store_.Groups()[group_id].Index();
+    auto entry = index.FindEvictable(*store_.HostPool(), location);
+    _assert(static_cast<bool>(entry), "clearable Host cache entry disappeared");
+    const auto metadata = entry.metadata();
+    const auto removed = index.Evict(std::move(entry));
     ++host_evictions_.flush.blocks;
+    LogCacheEviction(removed, &HostEvictionStats::flush, metadata, /*device_present=*/false, pending_eviction_keys_);
 }
 
 void CacheEvictor::InvalidateHostEntries() {

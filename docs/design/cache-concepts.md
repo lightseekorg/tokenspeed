@@ -3434,6 +3434,12 @@ turns, independently of trace estimates. The extra walk and logging are for
 attribution, not performance measurement; leaving
 the environment variable unset omits both and changes no cache policy.
 
+For [selected cache eviction diagnostics](../configuration/server.md#selected-cache-eviction-diagnostics),
+`CacheEvictor` supplies removal facts; a private helper owns selection and logging.
+The only scheduler hook reuses complete prompt hashes in `SubmitRequests` after
+batch validation. The helper retains no cache or request references, and diagnostic
+errors cannot interrupt cache operations.
+
 ## Session cache hints and native capacity reports
 
 A request may carry `cache_session_id` as cache ownership metadata. It does not
