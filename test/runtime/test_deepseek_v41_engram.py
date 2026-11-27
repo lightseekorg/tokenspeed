@@ -1033,24 +1033,24 @@ def test_engram_peer_gpu_alloc_and_server_args_validation():
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_host_table=True,
             engram_gpu_peer_sharded=True,
             engram_gpu_peer_handle_type="fabric",
         )
     with pytest.raises(ValueError, match="requires explicit"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_gpu_peer_sharded=True,
         )
     with pytest.raises(ValueError, match="requires --engram-gpu-peer-sharded"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_gpu_peer_handle_type="fabric",
         )
     with pytest.raises(ValueError, match="require --engram-gpu-peer-sharded"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_peer_rendezvous="127.0.0.1:29500",
             engram_peer_rendezvous_id="run-1",
             engram_peer_world_size=14,
@@ -1058,14 +1058,14 @@ def test_engram_peer_gpu_alloc_and_server_args_validation():
         )
     with pytest.raises(ValueError, match="must all be set together"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_gpu_peer_sharded=True,
             engram_gpu_peer_handle_type="fabric",
             engram_peer_rendezvous="127.0.0.1:29500",
         )
     with pytest.raises(ValueError, match="--enable-memory-saver is not supported"):
         ServerArgs(
-            model_path="dummy",
+            model="dummy",
             engram_gpu_peer_sharded=True,
             engram_gpu_peer_handle_type="fabric",
             engram_peer_rendezvous="127.0.0.1:29500",
@@ -1075,7 +1075,7 @@ def test_engram_peer_gpu_alloc_and_server_args_validation():
             enable_memory_saver=True,
         )
     args = ServerArgs(
-        model_path="dummy",
+        model="dummy",
         engram_gpu_peer_sharded=True,
         engram_gpu_peer_handle_type="fabric",
         engram_peer_rendezvous="[::1]:29500",

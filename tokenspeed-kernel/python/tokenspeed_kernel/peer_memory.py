@@ -768,6 +768,10 @@ def _receive_single_fd(address: str, *, uid: int) -> int:
         return int(fds[0])
 
 
+class _ViewOwner:
+    """Weak-referenceable sentinel keeping peer CUDA VMM mappings alive."""
+
+
 @dataclass
 class _VmmResources:
     """Mutable VMM resource box detached from ``PeerDeviceMemory`` for weakref cleanup."""
@@ -1102,7 +1106,7 @@ def create_peer_device_memory(
         mapped_ranges=[],
         handles=[],
     )
-    view_owner = object()
+    view_owner = _ViewOwner()
     finalizer: weakref.finalize | None = None
     try:
         tensor = vmm.tensor_view(
