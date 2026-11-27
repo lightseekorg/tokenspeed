@@ -127,6 +127,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
             return import_module("tokenspeed.runtime.cache.l2.executor")
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
+    host_transfer.StagingBuffer = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
@@ -1117,7 +1118,9 @@ class TestGroupAwareWireTest:
                 executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(executor_module, "StagingBuffer", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(HostCacheExecutor, "_warmup_restore_transfers"),
             patch.object(
                 lanes_module,
                 "build_host_transfer_geometry",
