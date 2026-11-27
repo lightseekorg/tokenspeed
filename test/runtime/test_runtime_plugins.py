@@ -186,8 +186,9 @@ def _register_fixture() -> None:
     registry.register_model(FixtureForCausalLM)
 
 
+@pytest.mark.parametrize("cli_policy", [False, True])
 def test_model_numerics_complete_deferred_configuration(
-    monkeypatch, tmp_path, isolated
+    monkeypatch, tmp_path, isolated, cli_policy
 ):
     from tokenspeed.runtime.configs import numerics
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -206,13 +207,22 @@ def test_model_numerics_complete_deferred_configuration(
             resolve=resolve, validate=numerics.STANDARD_RL_NUMERICS.validate
         )
 
-    # CLI preparation has supplied only the numerical policy. Config parsing
-    # and model-profile selection still need the deferred plugin's registration.
-    registry.register_model_rl_numerics("FixtureForCausalLM", policy)
+    def cli_factory(config):
+        return numerics.STANDARD_RL_NUMERICS
+
+    def register():
+        _register_fixture()
+        registry.register_model_rl_numerics("FixtureForCausalLM", policy)
+
+    # Full registration owns the final policy. A provisional CLI factory must
+    # be undone before re-registration; a plugin may also register no CLI policy.
+    with registry.recording() as record:
+        if cli_policy:
+            registry.register_model_rl_numerics("FixtureForCausalLM", cli_factory)
     monkeypatch.setattr(
         plugins,
         "_deferred_longcat",
-        (_EntryPoint("deferred_policy", _register_fixture), []),
+        (_EntryPoint("deferred_policy", register), record.undo),
     )
     (tmp_path / "config.json").write_text(
         json.dumps({"architectures": ["FixtureForCausalLM"], "vocab_size": 65536})

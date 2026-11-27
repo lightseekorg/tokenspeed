@@ -30,11 +30,13 @@ hierarchy, unimplemented):
    factorization (needs TP-invariant projection layouts on top of the
    vocab-block log-softmax of `alignment.trainer`).
 
-Two consequences of 3 are enforced at startup, so a model that cannot meet
-them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
-slot-order MoE combine folds over the EP group inside the leaf), and the
-vocabulary must be a whole number of `BLOCKWISE_VOCAB_BLOCK`-wide blocks (the
-trainer's log-softmax folds fixed blocks). Switches that trade batch
+The standard RL policy enforces two consequences of 3 at startup: MoE TP
+must be 1 (the slot-order MoE combine folds over the EP group inside the
+leaf), and the vocabulary must be a whole number of
+`BLOCKWISE_VOCAB_BLOCK`-wide blocks (the trainer's log-softmax folds fixed
+blocks). Registered model policies define their own checkpoint storage and
+vocabulary requirements, while shared launch checks still apply to the
+resolved choices. Switches that trade batch
 invariance for speed are refused too: `--dense-fp8-small-m` (only batches
 inside the FP8 row windows project in FP8, so a row's bits follow the batch's
 row count) under rl-bitwise or `--batch-invariant-collectives`.
@@ -200,7 +202,8 @@ the trainer's vocabulary-shard width independently of serving TP: folding
 eight narrow partials is not the same FP32 arithmetic as folding four wide
 partials. Prompt and output logprobs share the selected operation; logits
 and sampled tokens are unchanged. The model's existing rl-bitwise vocabulary
-eligibility remains a multiple of 32768.
+eligibility under the standard policy remains a multiple of 32768. Registered
+model policies apply their own checkpoint vocabulary requirements.
 
 The invariance layers make a deployment agree with itself. Trainer alignment
 makes it agree with a different program: the training framework's forward,
@@ -708,19 +711,22 @@ choices become fixed. Standard models retain the existing RL resolver.
 When plugins register model policies during headless CLI preparation, RL
 resolution completes their deferred registration before reading checkpoint
 configuration or selecting a model profile. `auto` retains deferred loading.
+
 Consumers with a narrower qualification scope can inspect the selected policy
 with `launch_rl_numerics(server_args)` without applying the resolver again.
+
 Only the target's resolver runs: its choices apply to the shared launch. A
 draft policy contributes a checkpoint validator, not another launch rewrite.
 Validators must stand alone from their paired resolver. Draft models enforce
 launch- and role-dependent restrictions in their `configure_attention` hook,
 and each target/draft combination needs end-to-end qualification.
+
 The target and draft still independently pass `ModelProfile.numerics_envelopes`
 admission. Their actual checkpoint quantization and vocabulary then pass the
 selected model validator; omitting the checkpoint context for a registered
 policy is an error. Support for quantized checkpoints is opt-in per model,
-not a blanket relaxation of the standard unquantized gate. Plugin-load rollback removes
-model-policy registrations too.
+not a blanket relaxation of the standard unquantized gate. Plugin-load rollback
+removes model-policy registrations too.
 
 Registration does not establish numerical correctness. Each declared precision,
 layout, and execution scope needs the invariance and independent trainer
@@ -804,12 +810,13 @@ than `auto` refuses any target or draft model that does not list it — every
 in-tree model included, since none has a profile. The declaration is the
 model's promise and the harnesses are what keep it honest: a model declares
 `rl-bitwise` when it is ready to run them, and a declared model that fails
-either has a bug to fix, not a flag to set. Two incompatibilities are refused
-regardless of the declaration: quantized checkpoints (no batch-invariant
-quantized GEMM leaf exists, so their linears would select shape-dependent
-ones) and a vocabulary that is not a multiple of `BLOCKWISE_VOCAB_BLOCK`
-(the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
-is refused by `resolve_numerics` for the same reason on the MoE side).
+either has a bug to fix, not a flag to set. The standard RL policy additionally
+refuses quantized checkpoints and a vocabulary that is not a multiple of
+`BLOCKWISE_VOCAB_BLOCK`. A registered model policy may admit other separately
+qualified precision and vocabulary configurations through its checkpoint
+validator; it still passes profile admission and the same acceptance harnesses.
+Shared launch constraints remain in force: for example, slot-order MoE combine
+requires MoE TP1 even when a model owns checkpoint validation.
 
 ### Shared torch-order correction-bias routing
 

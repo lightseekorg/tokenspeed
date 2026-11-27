@@ -174,24 +174,26 @@ def launch_rl_numerics(server_args: ServerArgs) -> RLNumericsPolicy:
             the checkpoint metadata used to select its registered profile.
 
     Returns:
-        The selected model policy. With no registered policy factories this
-        returns STANDARD_RL_NUMERICS without checkpoint IO. Otherwise it loads
+        The selected model policy after completing any deferred registration.
+        With no registered policy factories this returns STANDARD_RL_NUMERICS
+        without checkpoint IO. Otherwise it loads
         checkpoint configuration and follows model-loader architecture order;
         a checkpoint with no registered profile also selects the standard policy.
     """
+    from tokenspeed.runtime.plugins import finish_headless_plugins
+
+    # Full registration may introduce policies or replace CLI registrations.
+    # Resolve against that final registry, including when CLI registered none.
+    finish_headless_plugins()
     if not _MODEL_RL_POLICIES:
         return STANDARD_RL_NUMERICS
 
-    from tokenspeed.runtime.plugins import finish_headless_plugins
     from tokenspeed.runtime.plugins.registry import resolve_model_profile
     from tokenspeed.runtime.utils.hf_transformers_utils import (
         get_config,
         model_loader_architectures,
     )
 
-    # Model policies need the real config and loader profile before launch
-    # choices become fixed. CLI-only registration may have deferred both.
-    finish_headless_plugins()
     hf_config = get_config(
         server_args.model,
         trust_remote_code=server_args.trust_remote_code,
