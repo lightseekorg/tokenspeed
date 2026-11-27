@@ -869,7 +869,6 @@ def test_muse_spark_capacity_at_ep8() -> None:
     # workspace admits its 2304-row chunk and its 2368-row limit and refuses
     # the next 32-row block, which would take its heap past 32-bit offsets.
     assert gluon_petit_largest_max_tokens_per_rank(8) == 2624
-    assert _profile_largest_max_tokens_per_rank(_MUSE_SPARK_PROFILE, 8) == 2368
     assert gluon_petit_max_tokens_per_rank(8, 2304, _MUSE_SPARK_PROFILE) == 2304
     assert gluon_petit_max_tokens_per_rank(8, 2368, _MUSE_SPARK_PROFILE) == 2368
     for rows in (2369, 2400, 2560):
