@@ -325,7 +325,7 @@ class ExtendConfig:
         KV_DTYPE,
         q_strides,
     ):
-        assert HEAD_DIM in (64, 128)
+        assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         assert N_HEADS % N_KV_HEADS == 0
         padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
@@ -560,7 +560,7 @@ class ExtendProgram:
         # the arena's size), so its _CACHE_ALIGN_BYTES alignment, which the direct-to-LDS
         # copy needs (buffer_load_to_local has no lowering without it), is
         # stated here: the launcher checks the arena's base, and a page is a
-        # whole number of 16-byte rows (HEAD_DIM is 64 or 128, see
+        # whole number of 16-byte rows (HEAD_DIM is 64, 128 or 256, see
         # ExtendConfig).
         page = buffer.make_buffer_descriptor(
             gl.multiple_of(
@@ -1655,6 +1655,14 @@ _EXTEND_PIPELINE_MAX_LDS_BYTES = 64 * 1024
 # single-buffered, 512 and 1024 7% faster pipelined.
 _EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
 _EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
+# Head dim 256 needs 260-280 VGPRs a wave, so registers alone hold one 4-wave
+# or two 2-wave work-groups on a CU. A 2-deep K/V ring within the 64 KB above
+# keeps that residency, so those launches always pipeline 2 deep: FP8 K/V
+# (64 KB). 16-bit K/V would need 128 KB and stays single-buffered. MI355X, 24
+# query / 4 KV heads, FP8, 8192-row chunks of a 32k prompt: 8% faster than
+# single-buffered; the 4-deep ring (128 KB) gained 7% there but leaves one
+# 2-wave work-group a CU, and short extends ran up to 40% slower.
+_EXTEND_HEAD_DIM_256_STAGES = 2
 
 
 def _extend_stage_choices(
@@ -1664,6 +1672,10 @@ def _extend_stage_choices(
     if num_warps == _WARP_PIPELINE_NUM_WARPS:
         # The warp-pipelined loop always streams through 4-slot rings.
         return (_EXTEND_STAGES,)
+    if head_dim == 256:
+        stages = _EXTEND_HEAD_DIM_256_STAGES
+        pipeline_bytes = 2 * stages * page_size * head_dim * element_size
+        return (1,) if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES else (stages,)
     pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
     if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
         return (1,)
