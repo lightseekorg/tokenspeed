@@ -105,14 +105,14 @@ def test_source_offsets_beyond_int32():
 
 
 @pytest.mark.parametrize("actual_bs", [0, 2, 3])
-@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("width", [1, 4, 8])
 @pytest.mark.parametrize("atoms", [(2, 1, 4), (8, 3, 16)])
 def test_cpu_decode_buffers(actual_bs, width, atoms):
     ratios, pages, sizes = (2, 1, 4), (5, 7, 3), (4, 2, 2)
     raw = torch.tensor([[-1, 3, 0, 4], [5, 0, -1, 7], [2, 3, 4, 5]], dtype=torch.int32)
     source = raw.repeat_interleave(2, dim=1)[:, ::2]
     tables = torch.full((3, 4, 7), -99, dtype=torch.int32)
-    locations = torch.full((3, 16), -99, dtype=torch.int32)
+    locations = torch.full((3, 3 * width + 4), -99, dtype=torch.int32)
     lengths = torch.tensor([1, 9, 100], dtype=torch.int32)
     targets = tuple(
         (

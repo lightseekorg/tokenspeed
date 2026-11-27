@@ -60,6 +60,7 @@ import torch
 from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
+    StagingBuffer,
     transfer_cache_blocks,
     wait_layer_ready,
 )
@@ -564,12 +565,49 @@ class HostCacheExecutor:
         # One staging lane per submission kind a round may make, so none
         # waits on another's pinned metadata tables: the stream-ordered and
         # pinned L2 write-backs, the snapshot store, and the restore's two
-        # tiers.
-        self._ordered_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._pinned_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._snapshot_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._restore_l2_lane = HostTransferLane(self._memory_saver_adapter)
-        self._restore_pool_lane = HostTransferLane(self._memory_saver_adapter)
+        # tiers. On Ascend NPU, lanes sharing one transfer stream also share one
+        # discardable HBM staging buffer under ``kv_cache`` so colocated RL
+        # sleep frees it without CPU backup.
+        self._write_staging: StagingBuffer | None = None
+        self._load_staging: StagingBuffer | None = None
+        device = self.layout.buffers[0].device
+        if device.type == "npu" and io_backend == "kernel":
+
+            def _allocate_npu_staging(
+                nbytes: int, target_device: torch.device
+            ) -> torch.Tensor:
+                with self._memory_saver_adapter.region(
+                    tag="kv_cache", enable_cpu_backup=False
+                ):
+                    return torch.empty(nbytes, dtype=torch.uint8, device=target_device)
+
+            self._write_staging = StagingBuffer(allocator=_allocate_npu_staging)
+            self._load_staging = StagingBuffer(allocator=_allocate_npu_staging)
+        write_lane_kwargs = (
+            {"staging_buffer": self._write_staging}
+            if self._write_staging is not None
+            else {}
+        )
+        load_lane_kwargs = (
+            {"staging_buffer": self._load_staging}
+            if self._load_staging is not None
+            else {}
+        )
+        self._ordered_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._pinned_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._snapshot_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._restore_l2_lane = HostTransferLane(
+            self._memory_saver_adapter, **load_lane_kwargs
+        )
+        self._restore_pool_lane = HostTransferLane(
+            self._memory_saver_adapter, **load_lane_kwargs
+        )
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -585,6 +623,9 @@ class HostCacheExecutor:
             self._load_workspaces = tuple(
                 HostTransferWorkspace() for _ in range(load_workspace_count)
             )
+            if self._load_staging is not None:
+                for workspace in self._load_workspaces:
+                    workspace.bind_staging_buffer(self._load_staging)
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only). Every copy of every kind -- L2
@@ -634,16 +675,30 @@ class HostCacheExecutor:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
 
-        if snapshot_lcm_blocks and io_backend == "kernel":
+        if self._write_staging is not None and self._load_staging is not None:
+            min_staging_bytes = max(
+                (
+                    block_bytes
+                    for storage in (self.host_storage, self.snapshot_storage)
+                    if storage is not None
+                    for block_bytes in storage.host_cache_block_bytes
+                ),
+                default=1,
+            )
+            self._write_staging.acquire(min_staging_bytes, device)
+            self._load_staging.acquire(min_staging_bytes, device)
+
+        if (snapshot_lcm_blocks or device.type == "npu") and io_backend == "kernel":
             self._warmup_restore_transfers()
 
     def _warmup_restore_transfers(self) -> None:
         """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
         # Host blocks must still be unassigned for this scratch round trip.
-        # Use one group so compact Host-parent writes cannot overlap.
-        group_index = next(
+        # Warm one field-bearing group at a time so compact Host-parent writes
+        # never overlap while every group's alignment variant compiles at init.
+        group_indices = [
             i for i, group in enumerate(self.layout.groups) if group.fields
-        )
+        ]
         for storage, geometry, lane in (
             (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
             (
@@ -662,9 +717,10 @@ class HostCacheExecutor:
                 prerequisite_stream=device_module.current_stream(),
                 backend=self.transfer_backend,
             )
-            lane.start_d2h([(group_index, 1, 1)], **launch)
-            lane.start_h2d([(group_index, 1, 1)], **launch)
-            self.load_stream.synchronize()
+            for group_index in group_indices:
+                lane.start_d2h([(group_index, 1, 1)], **launch)
+                lane.start_h2d([(group_index, 1, 1)], **launch)
+                self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
