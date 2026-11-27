@@ -758,12 +758,19 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
 def _max_forward_tokens() -> int:
     """The most tokens one forward carries, as execution/device.py sizes it."""
     args = global_server_args_dict
-    chunk = int(args["chunked_prefill_size"])
-    tokens = (
-        chunk
-        if chunk > 0
-        else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
-    )
+    chunk_raw = args["chunked_prefill_size"]
+    chunk = 0 if chunk_raw is None else int(chunk_raw)
+    if chunk > 0:
+        tokens = chunk
+    else:
+        max_prefill = args["max_prefill_tokens"]
+        max_model_len = args["max_model_len"]
+        if max_prefill is None or max_model_len is None:
+            raise ValueError(
+                "V4.1 warmup requires chunked_prefill_size or both "
+                "max_prefill_tokens and max_model_len to be configured"
+            )
+        tokens = int(max_prefill) + int(max_model_len)
     decode_rows = max(
         int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
     )
@@ -2118,38 +2125,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         pending_post: V41HCPost | None,
         allow_ffn_reduce_fusion: bool,
         capture_input: bool,
-    ):
-        residual, ffn_pre, pending, captured, _ = self.forward_with_engram_prefetch(
-            hidden_states,
-            pre_mix,
-            positions,
-            image_mask,
-            ctx,
-            pending_post=pending_post,
-            allow_ffn_reduce_fusion=allow_ffn_reduce_fusion,
-            capture_input=capture_input,
-            engram_prefetch=None,
-        )
-        return residual, ffn_pre, pending, captured
-
-    def forward_with_engram_prefetch(
-        self,
-        hidden_states,
-        pre_mix,
-        positions,
-        image_mask,
-        ctx,
-        *,
-        pending_post: V41HCPost | None,
-        allow_ffn_reduce_fusion: bool,
-        capture_input: bool,
-        engram_prefetch: EngramPrefetchTask | None,
+        engram_prefetch: EngramPrefetchTask | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         V41HCPost | None,
         torch.Tensor | None,
-        EngramPrefetchedRows | None,
     ]:
         if ctx.forward_mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -2160,12 +2141,12 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.attn(positions, hidden_states[:, 0, :], ctx, reduce_output=True)
                 if rows.query_shard.total_rows == 0:
                     captured = hidden_states[:, 0, :] if capture_input else None
-                    return hidden_states, pre_mix, None, captured, None
+                    return hidden_states, pre_mix, None, captured
             self._forward_ffn(
                 hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
             )
             captured = hidden_states[:, 0, :] if capture_input else None
-            return hidden_states, pre_mix, None, captured, None
+            return hidden_states, pre_mix, None, captured
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             # Only the global cache producer runs for an open prefill chunk.
@@ -2190,7 +2171,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     ctx,
                     defer_reduce=False,
                 )
-            return residual[:0], pre_mix[:0], None, captured, None
+            return residual[:0], pre_mix[:0], None, captured
         decode_hc = ctx.forward_mode.is_decode()
         can_overlap = (
             hidden_states.is_cuda
@@ -2366,6 +2347,8 @@ class DeepseekV41DecoderLayer(nn.Module):
             if prefetched_engram is not None and prefetch_main is not None:
                 prefetch_main.wait_event(prefetched_engram.join_event)
             raise
+        if engram_prefetch is not None:
+            engram_prefetch.prefetched = prefetched_engram
         return (
             residual,
             ffn_pre,
@@ -2376,7 +2359,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.comm_manager.mapping.moe.tp_ep_group if defer_moe else None,
             ),
             captured,
-            prefetched_engram,
         )
 
     def _ffn_context(self, ctx: ForwardContext) -> ForwardContext:
@@ -2903,21 +2885,22 @@ class DeepseekV41Model(nn.Module):
                         fork_event=self._engram_fork_event,
                         join_event=self._engram_join_event,
                     )
-        hidden, pre_mix, pending_post, tap, next_prefetched = (
-            layer.forward_with_engram_prefetch(
-                hidden,
-                pre_mix,
-                state.positions,
-                state.image_mask,
-                ctx,
-                pending_post=pending_post,
-                # Stage handoffs and Engram require a complete HC stream. Admit
-                # deferred reduction only when the next input can consume it fused.
-                allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
-                and self.layers[layer.layer_id + 1].engram is None,
-                capture_input=layer.layer_id in self.dspark_capture_layers,
-                engram_prefetch=engram_prefetch,
-            )
+        hidden, pre_mix, pending_post, tap = layer(
+            hidden,
+            pre_mix,
+            state.positions,
+            state.image_mask,
+            ctx,
+            pending_post=pending_post,
+            # Stage handoffs and Engram require a complete HC stream. Admit
+            # deferred reduction only when the next input can consume it fused.
+            allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
+            and self.layers[layer.layer_id + 1].engram is None,
+            capture_input=layer.layer_id in self.dspark_capture_layers,
+            engram_prefetch=engram_prefetch,
+        )
+        next_prefetched = (
+            None if engram_prefetch is None else engram_prefetch.prefetched
         )
         if tap is not None:
             captured.append(tap)
