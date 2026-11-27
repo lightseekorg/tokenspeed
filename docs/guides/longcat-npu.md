@@ -67,7 +67,6 @@ python -m tokenspeed.cli serve <longcat-checkpoint> \
   --device npu \
   --dtype bfloat16 \
   --disable-pdl \
-  --disable-prefill-graph \
   --attention-backend mla \
   --sampling-backend greedy \
   --router-topk torch \
@@ -92,10 +91,13 @@ python -m tokenspeed.cli serve <longcat-checkpoint> \
 ```
 
 `<longcat-checkpoint>` is the local path to the LongCat-Flash-Lite checkpoint;
-substitute the actual weights path. Keep `--disable-prefill-graph` (the N-gram
-embedding reads request token history, so prefill must stay eager) and
-`--disable-pdl` (a hard NPU requirement), and do not pass `--enforce-eager`
-(it would also disable the decode ACL Graphs). The command captures decode
+substitute the actual weights path. Prefill graphs are **enabled**: the N-gram
+model implements the official `HistoryEmbeddingModel` protocol, so the prefill
+graph embeds the request token history eagerly through
+`compute_input_embeddings` before the captured forward replays — do not pass
+`--disable-prefill-graph`. Keep `--disable-pdl` (a hard NPU requirement), and
+do not pass `--enforce-eager` (it would disable both the decode ACL Graphs and
+the prefill graphs). The command captures decode
 batches 64 through 1 as ACL Graphs; all seven captures are validated. See the
 [recipe](../recipes/models.md#longcat-flash-lite-on-ascend-npu) for the
 scaling rules.
@@ -128,10 +130,16 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   exits otherwise. Add the flag to the serve command.
 
 - **The N-gram path errors or falls back inside a captured graph (ACL graph
-  error 107030).** Prefill must stay eager for LongCat-Flash-Lite because the
-  N-gram embedding reads request token history. Make sure `--disable-prefill-graph`
-  is present and that you did not pass `--enforce-eager` (which would also
-  kill the decode ACL Graphs).
+  error 107030).** Prefill graphs are enabled for LongCat-Flash-Lite through
+  the `HistoryEmbeddingModel` protocol, so the N-gram embedding runs eagerly
+  before the captured forward replays. When a capture or replay fails, check
+  that you did not pass `--enforce-eager` (it disables both the decode ACL
+  Graphs and the prefill graphs), that the zero-expert `_assert_async` guard is
+  skipped under breakable prefill capture on NPU (the device-side assert falls
+  back to a CPU D2H sync that the active capture rejects), and that the N-gram
+  staging preload matches the in-graph table lookups. If an environment still
+  needs to force eager execution (for example when debugging), pass
+  `--disable-prefill-graph` explicitly as a fallback.
 
 - **Missing `.so` / kernel import errors.** A `.so` from
   `tokenspeed-kernel-npu` can be stale after a rebuild or missing after a
