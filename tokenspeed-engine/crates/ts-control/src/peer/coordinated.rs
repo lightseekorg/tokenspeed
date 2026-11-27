@@ -189,8 +189,21 @@ struct ReadCost {
     next_probe_us: i64,
 }
 impl ReadCost {
+    const BASE_READ_US: f64 = 80_000.0;
+    const LOCAL_READ_US_PER_TOKEN: f64 = 15.0;
+    const REMOTE_READ_US_PER_TOKEN: f64 = 30.0;
+    const PREFILL_US_PER_TOKEN: f64 = 80.0;
+    const MARGIN_US: f64 = 20_000.0;
+    const PROBE_INTERVAL_US: i64 = 30_000_000;
+    const PROBE_COST_FRACTION: f64 = 0.25;
+
     fn nominal(extra: i32, remote: bool) -> f64 {
-        80_000.0 + f64::from(extra) * if remote { 30.0 } else { 15.0 }
+        let per_token = if remote {
+            Self::REMOTE_READ_US_PER_TOKEN
+        } else {
+            Self::LOCAL_READ_US_PER_TOKEN
+        };
+        Self::BASE_READ_US + f64::from(extra) * per_token
     }
     fn observe(&mut self, extra: i32, remote: bool, us: i64) {
         if extra <= 0 || us <= 0 {
@@ -206,13 +219,15 @@ impl ReadCost {
         }
         // DP's saved-compute estimate and margin. Use the measured group
         // critical path for the transfer estimate; periodically re-sample.
-        let saved = f64::from(extra) * 80.0;
+        let saved = f64::from(extra) * Self::PREFILL_US_PER_TOKEN;
         let nominal = Self::nominal(extra, remote);
-        if self.samples == 0 || saved > self.scale * nominal + 20_000.0 {
+        if self.samples == 0 || saved > self.scale * nominal + Self::MARGIN_US {
             return true;
         }
-        if now >= self.next_probe_us && saved > nominal * 0.25 + 20_000.0 {
-            self.next_probe_us = now.saturating_add(30_000_000);
+        if now >= self.next_probe_us
+            && saved > nominal * Self::PROBE_COST_FRACTION + Self::MARGIN_US
+        {
+            self.next_probe_us = now.saturating_add(Self::PROBE_INTERVAL_US);
             return true;
         }
         false

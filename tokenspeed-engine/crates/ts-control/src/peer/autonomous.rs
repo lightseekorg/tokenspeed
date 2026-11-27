@@ -154,7 +154,7 @@ impl Peer {
         })
     }
 
-    pub(crate) fn autonomous(&self) -> bool {
+    pub(crate) fn lends_scheduler(&self) -> bool {
         self.window.is_some() || matches!(&self.driver, Driver::Background(_))
     }
 
@@ -215,7 +215,9 @@ impl Peer {
             // The registered driver emits a terminal lookup answer on every path.
             // Keep shard admission deterministic across scheduler replicas.
             if !self.scheduler.lock().enable_async_device_peer(false) {
-                return Err(PeerError::Topology);
+                return Err(PeerError::Configuration(
+                    "a registered reader requires peer exports and device landing",
+                ));
             }
             self.fence = fence;
         }
@@ -228,7 +230,13 @@ impl Peer {
         &mut self,
         mesh: Option<(Mesh, Group)>,
     ) -> Result<(), PeerError> {
-        let control = self.versioned.as_ref().ok_or(PeerError::Topology)?.clone();
+        let control = self
+            .versioned
+            .as_ref()
+            .ok_or(PeerError::Configuration(
+                "register the versioned peer control before starting progress",
+            ))?
+            .clone();
         let reads = match &self.driver {
             Driver::Rounds(p) => Some(p.reads.clone()),
             _ => None,
@@ -271,16 +279,12 @@ impl Peer {
         if let Some(w) = &self.window {
             w.drain(&mut round)?;
         }
+        let mut control = self.versioned.as_ref().unwrap().lock();
         let reads = match &self.driver {
             Driver::Rounds(p) => Some(p.reads.lock()),
             Driver::Background(_) => None,
         };
-        self.versioned.as_mut().unwrap().lock().advance(
-            versioned,
-            scheduler,
-            reads.as_deref(),
-            &mut round,
-        )?;
+        control.advance(versioned, scheduler, reads.as_deref(), &mut round)?;
         Ok(round)
     }
     /// Consume results already completed by the protocol owner.
@@ -900,7 +904,7 @@ fn drive(
         out.events.extend(round.events);
         out.decisions.extend(round.decisions);
         out.landed.extend(round.landed);
-        if !(out.events.is_empty() && out.decisions.is_empty() && out.landed.is_empty()) {
+        if out.has_feedback() {
             let _ = results.send(Ok(out));
         }
         // The final RELEASE can finish the last landing during this pass.

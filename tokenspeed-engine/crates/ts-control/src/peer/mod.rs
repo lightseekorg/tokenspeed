@@ -221,6 +221,9 @@ pub enum PeerError {
     /// The configured peer driver cannot serve this replica.
     #[error("incompatible peer landing tier or replica size")]
     Topology,
+    /// The scheduler or registered control cannot support the requested peer operation.
+    #[error("peer configuration: {0}")]
+    Configuration(&'static str),
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -300,6 +303,12 @@ pub struct PeerRound {
     pub landed: Vec<(String, i32, i32)>,
     /// Attribution for lookup decisions and failed landings on the reporting owner.
     pub decisions: Vec<(String, &'static str)>,
+}
+
+impl PeerRound {
+    fn has_feedback(&self) -> bool {
+        !self.events.is_empty() || !self.decisions.is_empty() || !self.landed.is_empty()
+    }
 }
 
 /// A holder's layout, as a reader knows it.

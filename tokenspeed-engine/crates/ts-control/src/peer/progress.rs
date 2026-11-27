@@ -21,7 +21,8 @@
 //! Progress the same shard FSM while the scheduler waits for device work.
 //! The foreground holds the scheduler mutex when entering and leaving a window.
 //! A worker can change cache ownership only after every member locked its own
-//! scheduler at the same point in the same plan.
+//! scheduler at the same point in the same plan. When advancing the FSM, both
+//! paths acquire scheduler, control, then reads. The idle probe takes control alone.
 use super::{
     coordinated::Control, read::Reads, Group, Mesh, Mutex, PeerError, PeerRound, Scheduler,
 };
@@ -107,7 +108,7 @@ impl Progress {
                         let mut cache = scheduler.try_lock();
                         let point = cache.as_ref().and_then(|_| *point_worker.lock());
                         let mut row = point.unwrap_or_default().to_vec();
-                        row.push(origin.elapsed().as_micros() as i64);
+                        row.push(i64::try_from(origin.elapsed().as_micros()).unwrap_or(i64::MAX));
                         let now = if let Some((m, group)) = mesh.as_mut() {
                             let rows = m.all_gather_i64(group, &row)?;
                             if point.is_none() || !rows.iter().all(|r| r[..3] == row[..3]) {
@@ -138,9 +139,7 @@ impl Progress {
                             reads.as_deref(),
                             &mut round,
                         )?;
-                        if (!round.events.is_empty() || !round.landed.is_empty())
-                            && tx.send(Ok(round)).is_err()
-                        {
+                        if round.has_feedback() && tx.send(Ok(round)).is_err() {
                             break;
                         }
                     }

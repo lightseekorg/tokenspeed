@@ -122,6 +122,31 @@ enum Delivery {
     Late,
 }
 
+fn replica_meshes() -> Vec<Mesh> {
+    let sockets = (0..8)
+        .map(|_| Listener::bind("127.0.0.1").unwrap())
+        .collect::<Vec<_>>();
+    let addresses = sockets
+        .iter()
+        .map(|s| format!("127.0.0.1:{}", s.port().unwrap()))
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        sockets
+            .into_iter()
+            .enumerate()
+            .map(|(rank, s)| {
+                let addresses = &addresses;
+                scope.spawn(move || {
+                    Mesh::connect(rank, s, addresses, Duration::from_secs(5)).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>()
+    })
+}
+
 fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: impl FnOnce()) {
     let layout = layout();
     let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
@@ -156,28 +181,7 @@ fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: 
         caches[0].clone(),
     )
     .unwrap();
-    let sockets = (0..8)
-        .map(|_| Listener::bind("127.0.0.1").unwrap())
-        .collect::<Vec<_>>();
-    let addresses = sockets
-        .iter()
-        .map(|s| format!("127.0.0.1:{}", s.port().unwrap()))
-        .collect::<Vec<_>>();
-    let meshes = thread::scope(|scope| {
-        sockets
-            .into_iter()
-            .enumerate()
-            .map(|(rank, s)| {
-                let addresses = &addresses;
-                scope.spawn(move || {
-                    Mesh::connect(rank, s, addresses, Duration::from_secs(5)).unwrap()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|t| t.join().unwrap())
-            .collect::<Vec<_>>()
-    });
+    let meshes = replica_meshes();
     let mut channel = Some(ch);
     let mut controls = Vec::new();
     let mut workers = Vec::new();
@@ -703,4 +707,64 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             );
         }
     }
+}
+
+#[test]
+fn a_failed_progress_mesh_reports_the_error_before_worker_exit() {
+    let mut meshes = replica_meshes().into_iter();
+    let leader = meshes.next().unwrap();
+    let follower = meshes.next().unwrap();
+    let name = "mesh-failure";
+    let origin = Instant::now();
+    let (control, _) = Control::new(
+        origin,
+        layout(),
+        1,
+        Generation {
+            name: name.into(),
+            incarnation: 1,
+            epoch: 1,
+        },
+        None,
+        Arc::default(),
+        0,
+    );
+    let progress = Progress::start(
+        Some((follower, Group::new(0, (0..8).collect(), 1).unwrap())),
+        Arc::new(Mutex::new(control)),
+        scheduler(name, Duration::from_millis(50)),
+        None,
+        origin,
+    )
+    .unwrap();
+    drop(leader);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let next_error = || loop {
+        if let Err(e) = progress.drain(&mut PeerRound::default()) {
+            break e;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not report the mesh disconnect"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(matches!(next_error(), super::super::PeerError::Mesh(_)));
+    assert!(matches!(
+        next_error(),
+        super::super::PeerError::WorkerExited
+    ));
+}
+
+#[test]
+fn a_worker_forwards_attribution_even_without_scheduler_events() {
+    let mut round = PeerRound {
+        now_us: 1,
+        ..Default::default()
+    };
+    assert!(!round.has_feedback());
+    round
+        .decisions
+        .push(("follow".into(), "adaptive_recompute"));
+    assert!(round.has_feedback());
 }

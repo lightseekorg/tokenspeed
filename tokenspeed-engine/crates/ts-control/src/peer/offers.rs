@@ -314,6 +314,8 @@ impl Offers {
         };
         let expired = || (Some(Message::Expired(k.clone(), o.clone())), None);
         let Some(r) = self.records.get_mut(k) else {
+            // A forgotten offer cannot grant a PIN. Let the reader look it up
+            // once more and validate the exact pages under a fresh offer.
             return expired();
         };
         if *o != r.offer {

@@ -1880,7 +1880,10 @@ it can lend the scheduler to the peer worker when device copies are clear. Each
 member reports its scheduler round, wait site and forward sequence on that mesh.
 Only a matching window on every member permits a protocol step. The ordinary
 replica round also advances the same state machine and delivers its events to
-all eight schedulers. Device submission still requires the local plan fence.
+all eight schedulers. During protocol advancement, both paths take the local
+scheduler, protocol control and read-state locks in that order. A worker round
+forwards request attribution even when it has no scheduler events or landings.
+Device submission still requires the local plan fence.
 The reader publishes a landing only after member retirement and holder closure.
 
 Rank zero timestamps lookup dispatch and receipt on its monotonic clock. The
