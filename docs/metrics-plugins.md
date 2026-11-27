@@ -94,13 +94,13 @@ disabled through `TOKENSPEED_DISABLE_PLUGINS` causes an unknown-reporter startup
 error rather than silently dropping the requested output.
 
 The headless launcher's metrics relay uses a standalone Python entry point so it
-does not re-import the engine's main module. The launcher passes its `sys.path`
-and the entry-point targets of successfully loaded plugins that registered the
-selected reporters. The relay restores `sys.path`, registers those plugins in
-the same order, creates its sinks, and binds the event socket before
-acknowledging readiness. Unrelated model and kernel plugins are not discovered
-again. A lightweight reporter plugin can keep model dependencies out of its
-registration callback.
+does not re-import the engine's main module. The launcher passes a snapshot of
+its `sys.path` list and the entry-point targets of successfully loaded plugins
+that registered the selected reporters. The relay restores that list, registers
+those plugins in the same order, creates its sinks, and binds the event socket
+before acknowledging readiness. Unrelated model and kernel plugins are not
+discovered again. A lightweight reporter plugin can keep model dependencies out
+of its registration callback.
 
 Configuration preparation and other producers still perform normal discovery,
 including its loading lock and rollback behavior. Only the isolated relay replays

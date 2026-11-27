@@ -295,8 +295,10 @@ def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
     plugin_dir.mkdir()
     cwd_dir = tmp_path / "cwd"
     cwd_dir.mkdir()
-    (cwd_dir / "runtime_path_probe.py").write_text(
-        'raise RuntimeError("working directory shadowed runtime sys.path")\n'
+    # Pin python -P: without -P, python -c prepends cwd before restoring
+    # sys.path and picks up this decoy during the bootstrap stdlib import.
+    (cwd_dir / "multiprocessing.py").write_text(
+        'raise RuntimeError("working directory shadowed stdlib multiprocessing")\n'
     )
     (plugin_dir / "runtime_path_probe.py").write_text(textwrap.dedent(r"""
         import json
