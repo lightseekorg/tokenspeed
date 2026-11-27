@@ -5026,7 +5026,7 @@ def _megamoe_unsharded_dense_mapping(rank: int = 1, world_size: int = 2):
         moe_ep_size=world_size,
         moe_dp_size=1,
         vision_tp_size=1,
-        vision_dp_size=world_size,
+        vision_dp_size=1,
         linear_attn_tp_size=1,
         pp_size=1,
         pp_layer_partition=None,
@@ -5324,14 +5324,35 @@ def _check_fused_padded_shared_expert_survives_release() -> None:
         TorchMemorySaverAdapter,
     )
 
-    def _ordinary_bytes() -> int:
-        return sum(
-            segment["total_size"]
+    def _ordinary_report() -> tuple[int, str]:
+        dev = torch.cuda.current_device()
+        segs = [
+            segment
             for segment in torch.cuda.memory_snapshot()
-            if segment["device"] == torch.cuda.current_device()
-            and tuple(segment["segment_pool_id"]) == (0, 0)
-        )
+            if segment["device"] == dev and tuple(segment["segment_pool_id"]) == (0, 0)
+        ]
+        total = sum(seg["total_size"] for seg in segs)
+        if total == 0:
+            return 0, ""
+        details = []
+        for seg in segs:
+            active_blocks = [
+                block
+                for block in seg.get("blocks", [])
+                if block.get("state") == "active_allocated"
+            ]
+            details.append(
+                f"seg total={seg['total_size']} allocated={seg['allocated_size']} blocks={len(active_blocks)}"
+            )
+            for block in active_blocks[:5]:
+                frames = [
+                    f"{f.get('filename', '?')}:{f.get('line', 0)}:{f.get('name', '?')}"
+                    for f in block.get("frames", [])[-8:]
+                ]
+                details.append(f"  block size={block['size']} frames={frames}")
+        return total, "\n".join(details)
 
+    torch.cuda.memory._record_memory_history(max_entries=100000)
     global_server_args_dict["enable_memory_saver"] = True
     saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
@@ -5493,12 +5514,13 @@ def _check_fused_padded_shared_expert_survives_release() -> None:
                 saver.pause()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                ordinary = _ordinary_bytes()
-                assert ordinary == 0, ordinary
+                ordinary, report = _ordinary_report()
+                assert ordinary == 0, f"ordinary={ordinary}\n{report}"
                 saver.resume()
                 assert [tensor.data_ptr() for tensor in tracked] == ptrs
                 torch.testing.assert_close(run_cpu(), expected, rtol=0, atol=0)
         finally:
+            torch.cuda.memory._record_memory_history(enabled=None)
             dist.destroy_process_group()
 
 
